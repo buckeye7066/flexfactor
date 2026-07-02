@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*_repo_rewards_report.md
+*_audit_report.md
+flexfactor_audit_batch_report.md
