@@ -22,6 +22,11 @@ python flexfactor_dashboard.py --selftest
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →
   `_review_all` (parallel, judge tier, 35% budget frac) → `_fix_files` →
   `_commit_and_sync`; sandbox branch `flexfactor/audit-<slug>`
+- `_fix_files` pipelines generation: `--fix-prefetch N` (default 3, 0=serial)
+  first-attempt generations run in background threads while the current file is
+  applied/gated/verified; retries + all tree writes/commits stay serial. Scout
+  benefit-judging is parallel (8 workers). brain.json capped at
+  `MAX_BRAIN_PROJECTS` (40) most-recent projects.
 - Fix generation: `generate_file_fix_edits` (search/replace edit blocks,
   DEFAULT — output scales with the change) + `_apply_edits` (exact-unique-match,
   fails closed) → fallback `generate_file_fix` (whole file, 128k). Flag
