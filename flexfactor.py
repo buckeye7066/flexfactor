@@ -139,6 +139,7 @@ class CostMeter:
 # had to skip (e.g. too large to regenerate). Keyed by absolute project dir.
 # --------------------------------------------------------------------------- #
 BRAIN_PATH = os.path.join(os.path.expanduser("~"), ".flexfactor", "brain.json")
+MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the rest
 
 
 def _now_iso() -> str:
@@ -185,6 +186,14 @@ def _brain_record_run(project_dir: str, summary: dict, clean_files=None) -> None
     if clean_files is not None:
         rec["clean_files"] = sorted(set(clean_files))
     brain[project_dir] = rec
+    # The top-level dict is keyed by project dir and would otherwise grow (and be
+    # re-serialized) forever; keep the most recently audited projects only.
+    if len(brain) > MAX_BRAIN_PROJECTS:
+        def _last_when(key: str) -> str:
+            entry = brain.get(key) or {}
+            return str((entry.get("last_run") or {}).get("when") or "")
+        for stale in sorted(brain, key=_last_when)[: len(brain) - MAX_BRAIN_PROJECTS]:
+            del brain[stale]
     _save_brain(brain)
 
 
@@ -1809,8 +1818,11 @@ def run_scout(args) -> int:
         f"STACK: {', '.join(profile.get('stack') or [])}\n"
         f"GOALS: {', '.join(profile.get('goals') or [])}"
     )
-    evaluations = []
-    for c in ranked:
+    # Each candidate's judging call is independent, so run them in parallel
+    # (same pattern as _review_all). Order is preserved via executor.map; a
+    # single failed judge call degrades that candidate to SKIP instead of
+    # aborting the whole scout run.
+    def _judge_candidate(c: dict) -> dict:
         result = c["result"]
         repo = result.get("repo") or {}
         safety_verdict = (result.get("safety") or {}).get("verdict", "")
@@ -1820,13 +1832,22 @@ def run_scout(args) -> int:
             f"CANDIDATE REPOSITORY:\n{_summarize_repo_for_judge(result)}\n\n"
             "Would adopting this repository benefit the program? Judge fit specifically."
         )
-        benefit = _judge(provider, BENEFIT_SYSTEM, judge_prompt, BENEFIT_SCHEMA)
-        recommendation = classify_benefit(
-            benefit, result.get("finalScore") or 0, safety_verdict)
-        evaluations.append({
+        try:
+            benefit = _judge(provider, BENEFIT_SYSTEM, judge_prompt, BENEFIT_SCHEMA)
+            recommendation = classify_benefit(
+                benefit, result.get("finalScore") or 0, safety_verdict)
+        except Exception as ex:  # one bad LLM call must not abort the sweep
+            print(f"  [skip] {(repo.get('fullName') or '?')}: benefit judging failed ({ex})")
+            benefit = {"benefit_score": 0, "rationale": f"judging failed: {ex}"}
+            recommendation = "SKIP"
+        return {
             "need": c["need"], "repo": repo, "result": result,
             "benefit": benefit, "recommendation": recommendation,
-        })
+        }
+
+    n_workers = max(1, min(8, len(ranked)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+        evaluations = list(ex.map(_judge_candidate, ranked))
 
     # 4. Rank by recommendation tier, then benefit score, and report.
     tier = {"ADOPT": 0, "CONSIDER": 1, "SKIP": 2}
@@ -2778,6 +2799,7 @@ REVIEW_BUDGET_FRAC = 0.35
 # rate limits internally. This turns a ~19h serial sweep of a 3k-file repo into a
 # few hours. Override with --review-workers.
 REVIEW_WORKERS = 8
+FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead of the apply loop
 
 
 def _review_all(reviewers: list, project_dir: str,
@@ -2874,6 +2896,51 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     fixable_files = [rel for rel, fs in file_findings.items()
                      if any(should_fix_finding(f, args.fix_severity) for f in fs)]
 
+    def _targets_for(rel: str) -> list[dict]:
+        return [f for f in file_findings[rel] if should_fix_finding(f, args.fix_severity)]
+
+    # Pipeline: fix GENERATION (tens of seconds of author-model latency per file)
+    # dominates the wall-clock of this loop, and each file's FIRST attempt depends
+    # only on that file's own current on-disk contents — never on another file's
+    # fix. So generate a few upcoming files in background threads while the
+    # current file is applied/gated/cross-verified. Everything that touches the
+    # working tree (writes, gates, rollbacks, commits) plus all RETRY attempts
+    # (feedback-dependent, and rare) stays serial in this thread, so the commit
+    # checkpoints and rollback semantics are unchanged. In-flight prefetches can
+    # overshoot the cost cap by at most `prefetch_n` calls; new prefetches stop
+    # submitting the moment the meter is over.
+    prefetch_n = max(0, int(getattr(args, "fix_prefetch", FIX_PREFETCH_WORKERS)))
+    prefetch_pool = (concurrent.futures.ThreadPoolExecutor(max_workers=prefetch_n)
+                     if prefetch_n and len(fixable_files) > 1 else None)
+    prefetched: dict[str, concurrent.futures.Future] = {}
+
+    def _first_attempt(rel: str, targets: list[dict], use_edits: bool) -> tuple:
+        """Off-thread first-attempt generation. Returns (kind, original, payload)
+        where kind is 'edits'/'whole' and payload is the model's patch dict OR the
+        exception it raised (re-raised on the main thread so the existing fallback
+        and oversized handling behave exactly as in the serial path)."""
+        if meter is not None and meter.over_limit():
+            return ("capped", "", None)
+        original = _read_full(os.path.join(project_dir, rel))
+        kind = "edits" if use_edits else "whole"
+        try:
+            if use_edits:
+                return (kind, original, generate_file_fix_edits(author, rel, original, targets))
+            return (kind, original, generate_file_fix(author, rel, original, targets))
+        except Exception as ex:
+            return (kind, original, ex)
+
+    def _top_up_prefetch(after_idx: int) -> None:
+        if prefetch_pool is None or (meter is not None and meter.over_limit()):
+            return
+        for nxt in fixable_files[after_idx + 1:]:
+            if len(prefetched) >= prefetch_n:
+                break
+            if nxt not in prefetched:
+                prefetched[nxt] = prefetch_pool.submit(
+                    _first_attempt, nxt, _targets_for(nxt),
+                    not getattr(args, "whole_file_fixes", False))
+
     def _tick(rel: str) -> None:
         # Report CUMULATIVE progress: fix_done = files resolved across the whole run
         # (done_set), fix_total = total files to review. The bar climbs from cycle 1
@@ -2888,16 +2955,27 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 kw["cost"] = round(meter.usd, 4)
             report(**kw)
 
-    for rel in fixable_files:
-        targets = [f for f in file_findings[rel] if should_fix_finding(f, args.fix_severity)]
+    for idx, rel in enumerate(fixable_files):
+        targets = _targets_for(rel)
         if meter is not None and meter.over_limit():
             print(f"  [stop] cost cap reached ({meter.summary()}); skipping remaining fixes")
             notes.append(f"stopped fixing at cost cap: {meter.summary()}")
             _tick(rel)
             break
+        _top_up_prefetch(idx)  # keep the next few files' generations in flight
         _tick(rel)  # show this file as the one being worked on
         full = os.path.join(project_dir, rel)
-        original = _read_full(full)
+        # Consume this file's prefetched first attempt (if any). Its `original`
+        # snapshot is authoritative: it is exactly the text the model was shown.
+        pf = prefetched.pop(rel, None)
+        pre = None
+        if pf is not None:
+            try:
+                res = pf.result()
+                pre = res if res and res[0] != "capped" else None
+            except Exception:
+                pre = None  # cancelled/died -> generate inline exactly as before
+        original = pre[1] if pre is not None else _read_full(full)
         # Up to MAX_FIX_TRIES attempts per file: a build-break or a cross-model veto
         # is fed back as an objection so the author can SALVAGE the fix instead of
         # the file being abandoned. The file is left as the original unless an
@@ -2915,8 +2993,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             patch = None
             if edit_mode:
                 try:
-                    epatch = generate_file_fix_edits(author, rel, original, targets,
-                                                     feedback=feedback)
+                    if attempt == 1 and pre is not None and pre[0] == "edits":
+                        if isinstance(pre[2], Exception):
+                            raise pre[2]  # same fallback path as an inline failure
+                        epatch = pre[2]
+                    else:
+                        epatch = generate_file_fix_edits(author, rel, original, targets,
+                                                         feedback=feedback)
                     if not epatch.get("changed"):
                         outcome = ("noop", epatch.get("notes", ""))
                         break
@@ -2935,7 +3018,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                           " -> regenerating whole file")
             if patch is None:
                 try:
-                    patch = generate_file_fix(author, rel, original, targets, feedback=feedback)
+                    if attempt == 1 and pre is not None and pre[0] == "whole":
+                        if isinstance(pre[2], Exception):
+                            raise pre[2]  # keep oversized/skip handling identical
+                        patch = pre[2]
+                    else:
+                        patch = generate_file_fix(author, rel, original, targets,
+                                                  feedback=feedback)
                 except Exception as ex:
                     if "token budget" in str(ex) and oversized is not None:
                         oversized.append(rel)
@@ -3001,6 +3090,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             print(f"  [reject] {rel}: cross-model rejected after {MAX_FIX_TRIES} tries")
             notes.append(f"{rel}: rejected by cross-model review: {outcome[1]}")
         _tick(rel)
+    if prefetch_pool is not None:
+        prefetch_pool.shutdown(wait=False, cancel_futures=True)
     return applied, unverified, notes
 
 
@@ -3861,6 +3952,10 @@ def main(argv=None) -> int:
         parser.add_argument("--review-workers", type=int, default=REVIEW_WORKERS, dest="review_workers",
                             help=f"Parallel review threads for the whole-repo sweep "
                                  f"(default: {REVIEW_WORKERS}). Lower if you hit API rate limits.")
+        parser.add_argument("--fix-prefetch", type=int, default=FIX_PREFETCH_WORKERS, dest="fix_prefetch",
+                            help=f"Fix generations kept in flight ahead of the apply/verify loop "
+                                 f"(default: {FIX_PREFETCH_WORKERS}; 0 = fully serial). In-flight "
+                                 f"calls can overshoot --max-cost by at most this many calls.")
         parser.add_argument("--max-test-modules", type=int, default=12, dest="max_test_modules",
                             help="Max modules to generate unit tests for (default: 12).")
         parser.add_argument("--include", action="append", default=[],
