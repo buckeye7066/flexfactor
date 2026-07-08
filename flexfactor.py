@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import difflib
 import json
 import os
 import shutil
@@ -2366,10 +2367,14 @@ E2E_TEST_SYSTEM = (
 # Files audit will actually read and reason about.
 _CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
               ".svelte", ".go", ".rb", ".java", ".cs", ".php", ".rs", ".scala", ".kt"}
+# Per-file review ceiling. 300k (not 200k) because real hand-written modules do
+# reach 200k+ (flexfactor.py itself is 212k) - the old cap silently created
+# audit blind spots for exactly the largest, most defect-dense files.
+MAX_REVIEW_BYTES = 300_000
 _TEST_MARKERS = (".test.", ".spec.", "__tests__", "/tests/", "/test/", "test_")
 
 
-def _read_full(path: str, cap: int = 200_000) -> str:
+def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return fh.read(cap)
@@ -2432,7 +2437,7 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 size = os.path.getsize(full)
             except OSError:
                 continue
-            if size == 0 or size > 200_000:
+            if size == 0 or size > MAX_REVIEW_BYTES:
                 continue
             out.append((rel, size))
     out.sort(key=lambda t: (_is_test_path(t[0]),
@@ -2890,8 +2895,22 @@ def _finding_key(f: dict) -> tuple:
     return (f.get("file"), (f.get("line") or 0) // 5, str(f.get("title", ""))[:40].lower())
 
 
+def _upgrade_severity(dst: dict, src: dict) -> None:
+    """Merging two findings keeps the WORSE severity - never downgrade."""
+    cur = SEVERITY_RANK.get(str(dst.get("severity", "")).lower(), 0)
+    new = SEVERITY_RANK.get(str(src.get("severity", "")).lower(), 0)
+    if new > cur:
+        dst["severity"] = src.get("severity")
+
+
 def _dedupe_findings(items: list[dict]) -> list[dict]:
-    """Keep the first finding per key, but upgrade it to the highest severity seen."""
+    """Collapse duplicate findings, upgrading to the highest severity seen.
+
+    Two passes: exact key first, then a fuzzy pass within each (file, line
+    bucket) - two models reviewing the same file rarely word one bug with
+    byte-identical titles ("SQL injection in query builder" vs "possible SQL
+    injection in the query-builder"), and the exact key counted those twice,
+    inflating every dual-provider defect total."""
     out: dict[tuple, dict] = {}
     for f in items:
         key = _finding_key(f)
@@ -2899,11 +2918,25 @@ def _dedupe_findings(items: list[dict]) -> list[dict]:
         if existing is None:
             out[key] = f
         else:
-            cur = SEVERITY_RANK.get(str(existing.get("severity", "")).lower(), 0)
-            new = SEVERITY_RANK.get(str(f.get("severity", "")).lower(), 0)
-            if new > cur:
-                existing["severity"] = f.get("severity")
-    return list(out.values())
+            _upgrade_severity(existing, f)
+    merged: list[dict] = []
+    by_bucket: dict[tuple, list[dict]] = {}
+    for f in out.values():
+        by_bucket.setdefault((f.get("file"), (f.get("line") or 0) // 5), []).append(f)
+    for bucket in by_bucket.values():
+        kept: list[dict] = []
+        for f in bucket:
+            title = str(f.get("title", "")).lower()
+            dup = next((k for k in kept
+                        if difflib.SequenceMatcher(
+                            None, title, str(k.get("title", "")).lower()).ratio() >= 0.7),
+                       None)
+            if dup is None:
+                kept.append(f)
+            else:
+                _upgrade_severity(dup, f)
+        merged.extend(kept)
+    return merged
 
 
 def _severity_breakdown(findings: list[dict]) -> dict:
@@ -3270,6 +3303,71 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
 _E2E_LOCK = threading.Lock()
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is `pid` a live process? Windows-safe: os.kill(pid, 0) must NOT be used
+    here - on Windows any signal other than CTRL_C/CTRL_BREAK maps to
+    TerminateProcess, i.e. the "probe" would KILL the process it checks."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # can't tell -> assume alive (refusing beats double-spending)
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _audit_lock_path(project_dir: str) -> str:
+    slug = _slugify(os.path.basename(os.path.normpath(project_dir))) or "program"
+    return os.path.join(os.path.expanduser("~"), ".flexfactor", f"audit-{slug}.lock")
+
+
+def _acquire_audit_lock(project_dir: str) -> str | None:
+    """One audit per program at a time. Two simultaneous audits of one project
+    fight over the same sandbox branch and status slot and double-spend the
+    budget (a double-clicked launcher did exactly this). Returns the lock path
+    on success; None when a LIVE audit already holds it. A lock left behind by
+    a dead PID is stale and is taken over. Lock trouble (fs errors) fails open -
+    a lockfile hiccup must never block auditing."""
+    path = _audit_lock_path(project_dir)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            try:
+                pid = int(_read_text_safe(path, 100).strip() or 0)
+            except ValueError:
+                pid = 0
+            if pid and pid != os.getpid() and _pid_alive(pid):
+                return None
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return path
+    except OSError:
+        return path
+
+
+def _release_audit_lock(lock_path: str | None) -> None:
+    try:
+        if lock_path and os.path.isfile(lock_path):
+            os.remove(lock_path)
+    except OSError:
+        pass
+
+
 def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) -> dict:
     """Audit a SINGLE program end-to-end, fully isolated from any sibling program:
     its own resolved dir, its own rebuilt provider instances (never shared across
@@ -3281,6 +3379,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     result = {"name": str(program_arg), "dir": None, "branch": None, "defects": 0,
               "fixed": 0, "unverified": 0, "test_status": None, "e2e_status": "skipped",
               "commit_status": "n/a", "report_path": None, "cycles": 0, "error": None}
+    lock_path: str | None = None
     try:
         # 1. Resolve the program to a local source folder.
         display_name, _ctx = resolve_program_input(program_arg)
@@ -3293,6 +3392,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = f"could not resolve '{program_arg}' to a local source folder"
             return result
         result["dir"] = project_dir
+
+        # Refuse to run two audits of the same program at once (double launcher
+        # click) - they'd share one sandbox branch + status slot and double-spend.
+        lock_path = _acquire_audit_lock(project_dir)
+        if lock_path is None:
+            msg = (f"another FlexFactor audit of {display_name} is already running; "
+                   f"refusing to double-run (stale? delete {_audit_lock_path(project_dir)})")
+            print(f"{pfx}error: {msg}", file=sys.stderr)
+            result["error"] = msg
+            return result
 
         # Cost budget (hard cap; 0 disables) shared by every provider call, and the
         # persistent "brain" so we can recall what we did to this program before.
@@ -3725,6 +3834,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         except Exception:
             pass
         return result
+    finally:
+        _release_audit_lock(lock_path)
 
 
 def _launch_dashboard(total: int) -> None:

@@ -262,6 +262,14 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIn("src/app.js", slashed)
             self.assertNotIn("stale-copy/app.js", slashed)
 
+    def test_flexfactor_can_review_itself(self):
+        # Regression guard: the old 200k size cap silently excluded
+        # flexfactor.py (212k) from any audit of this repo - a permanent
+        # blind spot on the tool's own largest file.
+        files = [f.replace("\\", "/") for f in
+                 ff._enumerate_source_files(_HERE, max_files=0)]
+        self.assertIn("flexfactor.py", files)
+
     def test_non_git_dir_falls_back_to_walk(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,6 +279,78 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIsNone(ff._git_real_files(tmp))
             files = ff._enumerate_source_files(tmp, max_files=0)
             self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
+
+
+class FuzzyDedupeTests(unittest.TestCase):
+    """Cross-model dedupe: two models wording ONE bug differently must count once."""
+
+    def test_reworded_same_bug_merges_and_keeps_worse_severity(self):
+        items = [
+            {"file": "a.js", "line": 12, "severity": "medium",
+             "title": "SQL injection in query builder"},
+            {"file": "a.js", "line": 14, "severity": "high",
+             "title": "Possible SQL injection in the query builder"},
+        ]
+        out = ff._dedupe_findings(items)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["severity"], "high")
+
+    def test_distinct_bugs_in_same_bucket_survive(self):
+        items = [
+            {"file": "a.js", "line": 12, "severity": "high",
+             "title": "SQL injection in query builder"},
+            {"file": "a.js", "line": 13, "severity": "low",
+             "title": "unused variable shadows import"},
+        ]
+        self.assertEqual(len(ff._dedupe_findings(items)), 2)
+
+    def test_same_title_different_file_not_merged(self):
+        items = [
+            {"file": "a.js", "line": 12, "severity": "high", "title": "missing null check"},
+            {"file": "b.js", "line": 12, "severity": "high", "title": "missing null check"},
+        ]
+        self.assertEqual(len(ff._dedupe_findings(items)), 2)
+
+
+class AuditLockTests(unittest.TestCase):
+    """One audit per program: a live holder blocks, a dead holder's lock is stale."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._lock = os.path.join(self._tmp.name, "audit-test.lock")
+        self._orig_path = ff._audit_lock_path
+        self._orig_alive = ff._pid_alive
+        ff._audit_lock_path = lambda project_dir: self._lock
+
+    def tearDown(self):
+        ff._audit_lock_path = self._orig_path
+        ff._pid_alive = self._orig_alive
+        self._tmp.cleanup()
+
+    def test_acquire_then_live_holder_blocks_second(self):
+        got = ff._acquire_audit_lock("X")
+        self.assertEqual(got, self._lock)
+        with open(self._lock, "w", encoding="utf-8") as fh:
+            fh.write("999999")  # simulate a DIFFERENT process holding it
+        ff._pid_alive = lambda pid: True
+        self.assertIsNone(ff._acquire_audit_lock("X"))
+
+    def test_stale_lock_from_dead_pid_is_taken_over(self):
+        with open(self._lock, "w", encoding="utf-8") as fh:
+            fh.write("999999")
+        ff._pid_alive = lambda pid: False
+        self.assertEqual(ff._acquire_audit_lock("X"), self._lock)
+        self.assertEqual(open(self._lock, encoding="utf-8").read(), str(os.getpid()))
+
+    def test_release_removes_lock(self):
+        got = ff._acquire_audit_lock("X")
+        ff._release_audit_lock(got)
+        self.assertFalse(os.path.exists(self._lock))
+
+    def test_pid_alive_on_self_and_bogus(self):
+        self.assertTrue(ff._pid_alive(os.getpid()))
+        self.assertFalse(ff._pid_alive(-1))
 
 
 if __name__ == "__main__":
