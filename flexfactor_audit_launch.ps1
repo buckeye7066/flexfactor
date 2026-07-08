@@ -50,7 +50,8 @@ $extraArgs = @()
 if ($haveAnthropic -and $haveOpenai) {
     # Both keys present: run primary + cross-check. Do NOT pass --single - we
     # WANT both models reviewing the code.
-    Write-Host "Both keys detected - audit will use both models (primary + cross-check)." -ForegroundColor Green
+    Write-Host "Both keys detected - audit prefers both models (primary + cross-check)." -ForegroundColor Green
+    Write-Host "FlexFactor live-checks each key at start and auto-falls-back if one is dead (e.g. out of credits)." -ForegroundColor DarkGray
     $defaultProvider = "anthropic"
 } elseif ($haveAnthropic) {
     Write-Host "Only ANTHROPIC_API_KEY detected - using anthropic." -ForegroundColor Yellow

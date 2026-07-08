@@ -573,6 +573,70 @@ def _provider_key_present(name: str) -> bool:
     return False
 
 
+# Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
+# _provider_health() so a batch / --parallel run pings each provider at most once.
+_PROVIDER_HEALTH: dict[str, tuple[bool, str]] = {}
+
+
+def _provider_health(name: str) -> tuple[bool, str]:
+    """Is this provider's key actually USABLE right now? (not just present)
+
+    A key can be set but dead - out of credits, revoked, or org-disabled - in which
+    case the OLD code still picked it as the code AUTHOR and the whole audit crashed
+    on the first fix call (see the 'No module named' / 'credit balance too low'
+    incidents). We send one tiny 1-token judge-tier ping and classify the result:
+
+      - success -> (True, "ok")
+      - auth / permission / credit-balance error -> (False, <reason>): DROP it, so
+        build_audit_providers falls back to a provider that works.
+      - anything else (network blip, timeout, unknown 5xx) -> FAIL OPEN (True, ...):
+        we don't punish a transient hiccup by disabling a provider that may be fine.
+
+    Result is cached in _PROVIDER_HEALTH so repeated/parallel programs ping once."""
+    if name in _PROVIDER_HEALTH:
+        return _PROVIDER_HEALTH[name]
+    if not _provider_key_present(name):
+        res = (False, "no API key set")
+        _PROVIDER_HEALTH[name] = res
+        return res
+    try:
+        if name == "anthropic":
+            import anthropic
+            anthropic.Anthropic().messages.create(
+                model=JUDGE_MODELS.get("anthropic") or DEFAULT_MODELS["anthropic"],
+                max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+        elif name == "openai":
+            import openai
+            openai.OpenAI().chat.completions.create(
+                model=JUDGE_MODELS.get("openai") or DEFAULT_MODELS["openai"],
+                max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+        else:
+            res = (False, f"unknown provider {name}")
+            _PROVIDER_HEALTH[name] = res
+            return res
+        res = (True, "ok")
+    except Exception as e:  # noqa: BLE001 - we deliberately classify by message
+        msg = str(e).lower()
+        dead = ("credit balance is too low" in msg or "insufficient_quota" in msg
+                or "exceeded your current quota" in msg
+                or "authentication" in msg or "invalid_api_key" in msg
+                or "invalid x-api-key" in msg or "permission" in msg
+                or "billing" in msg or "account is not active" in msg)
+        if dead:
+            reason = str(e).strip().splitlines()[0][:160] if str(e).strip() else "key rejected"
+            res = (False, reason)
+        else:
+            # Transient/unknown: fail open so a network blip can't disable a good key.
+            res = (True, f"health check inconclusive ({type(e).__name__}); assuming usable")
+    _PROVIDER_HEALTH[name] = res
+    return res
+
+
+# Set by build_audit_providers when it returns [] so the caller can explain WHY
+# (e.g. keys are present but every one is out of credits / rejected).
+_PROVIDER_DIAGNOSIS: str = ""
+
+
 def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[str, object]]:
     """Build the active provider list for audit, keyed by which API keys exist.
 
@@ -581,13 +645,39 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     provider's key present, the second provider is appended for cross-model
     verification. All providers share `meter` so token spend bills into one
     budget. Returns [] if no key is set at all (caller errors out)."""
+    global _PROVIDER_DIAGNOSIS
+    _PROVIDER_DIAGNOSIS = ""
     primary = args.provider
     other = "openai" if primary == "anthropic" else "anthropic"
-    # Fall back to the provider that actually has a key if the primary's is missing.
-    if not _provider_key_present(primary) and _provider_key_present(other):
+
+    # "Usable" = key present AND (unless --no-preflight) verified live. A present
+    # but dead key (out of credits / revoked) must NOT be chosen as the author,
+    # or the audit crashes on the first fix call. Preflight defaults ON.
+    preflight = not getattr(args, "no_preflight", False)
+
+    def _usable(name: str) -> bool:
+        if not _provider_key_present(name):
+            return False
+        if not preflight:
+            return True
+        ok, reason = _provider_health(name)
+        if not ok:
+            print(f"  [preflight] {name} key is set but unusable: {reason}", file=sys.stderr)
+        return ok
+
+    # Fall back to the provider that actually WORKS if the primary's is unusable.
+    if not _usable(primary) and _usable(other):
+        print(f"  [preflight] falling back: primary '{primary}' unusable, using '{other}'.",
+              file=sys.stderr)
         primary, other = other, primary
-    if not _provider_key_present(primary):
-        return []  # no key anywhere
+    if not _usable(primary):
+        # Distinguish "no key at all" from "keys present but all dead" for the caller.
+        any_key = _provider_key_present(primary) or _provider_key_present(other)
+        _PROVIDER_DIAGNOSIS = (
+            "every configured API key was rejected at preflight (out of credits or "
+            "revoked); top up credits or set a working key"
+            if any_key else "no LLM API key found")
+        return []
 
     judge_override = getattr(args, "judge_model", None)
     out: list[tuple[str, object]] = []
@@ -599,7 +689,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                      or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
-    if args.use_both and _provider_key_present(other):
+    if args.use_both and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
         # defaults to the cheap model, not a second frontier model. This keeps the
@@ -3219,9 +3309,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 2nd provider (if any) cross-checks each fix. All share one cost meter.
         providers = build_audit_providers(args, meter)
         if not providers:
-            print(f"{pfx}error: no LLM API key found; set ANTHROPIC_API_KEY and/or OPENAI_API_KEY.",
-                  file=sys.stderr)
-            result["error"] = "no LLM API key found"
+            why = _PROVIDER_DIAGNOSIS or "no LLM API key found"
+            print(f"{pfx}error: {why}. Set/repair ANTHROPIC_API_KEY and/or OPENAI_API_KEY "
+                  f"(or pass --no-preflight to skip the live key check).", file=sys.stderr)
+            result["error"] = why
             return result
         author = providers[0][1]
         reviewers = [p for _, p in providers]
@@ -3950,6 +4041,10 @@ def main(argv=None) -> int:
                                  "(defaults to the cheap tier of the other provider).")
         parser.add_argument("--single", action="store_false", dest="use_both", default=True,
                             help="Use only the primary provider (no dual-model cross-check).")
+        parser.add_argument("--no-preflight", action="store_true", dest="no_preflight",
+                            help="Skip the live 1-token key check that drops providers whose key "
+                                 "is set but dead (out of credits / revoked). By default a dead "
+                                 "primary auto-falls-back to a working provider.")
         parser.add_argument("--cycles", type=int, default=3,
                             help="Cycle cap when NOT --until-clean (default: 3).")
         parser.add_argument("--no-until-clean", action="store_false", dest="until_clean",

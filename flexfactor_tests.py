@@ -103,6 +103,7 @@ class PricingAndEconomyTests(unittest.TestCase):
             use_both = False
             secondary_model = None
             judge_model = None
+            no_preflight = True  # this test checks model routing, not the live key ping
 
         picked = []
         real_key, real_make = ff._provider_key_present, ff.make_provider
@@ -122,6 +123,62 @@ class PricingAndEconomyTests(unittest.TestCase):
             self.assertEqual(picked, [ff.DEFAULT_MODELS["anthropic"]])
         finally:
             ff._provider_key_present, ff.make_provider = real_key, real_make
+
+    def test_preflight_drops_dead_primary_and_falls_back(self):
+        # anthropic key is present but DEAD (out of credits); openai is healthy.
+        # Preflight must drop anthropic as author and fall back to openai, not
+        # return [] and not crash a later fix call by picking the broke provider.
+        class Args:
+            provider = "anthropic"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        picked = []
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
+        ff._provider_health = lambda name: (
+            (False, "credit balance is too low") if name == "anthropic" else (True, "ok"))
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append(name) or object())
+        try:
+            out = ff.build_audit_providers(Args)
+            # Only openai survives, and it is the (fallback) primary author.
+            self.assertEqual([n for n, _ in out], ["openai"])
+            self.assertEqual(picked, ["openai"])
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_preflight_all_keys_dead_returns_empty_with_diagnosis(self):
+        # Every present key is rejected -> return [] AND set a credit-aware reason
+        # so the caller can tell the user to top up (vs "no key set").
+        class Args:
+            provider = "anthropic"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
+        ff._provider_health = lambda name: (False, "credit balance is too low")
+        try:
+            out = ff.build_audit_providers(Args)
+            self.assertEqual(out, [])
+            self.assertIn("credit", ff._PROVIDER_DIAGNOSIS.lower())
+        finally:
+            ff._provider_key_present = real_key
+            ff._provider_health = real_health
 
 
 class CrossVerifyPromptTests(unittest.TestCase):
