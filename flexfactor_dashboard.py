@@ -154,7 +154,8 @@ def _main() -> int:
             canvas.create_text(cx + col_w / 2, top + 16, text=name[:34], fill=title_col,
                                font=("Segoe UI", 11, "bold"))
             sub = ("DONE" if done else phase) + (
-                f"  (cycle {cyc}/{cycles})" if cyc and cycles and not done else "")
+                f"  (cycle {cyc}/{cycles})"
+                if cyc and cycles and not done and "cycle" not in phase else "")
             canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
                                font=("Segoe UI", 8))
 

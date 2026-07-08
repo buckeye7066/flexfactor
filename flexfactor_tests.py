@@ -233,5 +233,45 @@ class SchemaAndWiringTests(unittest.TestCase):
         self.assertEqual(cmd[1:], ["-V"])
 
 
+class GitAwareEnumerationTests(unittest.TestCase):
+    """Regression guard for the GrantFlow-public-audit trap: a gitignored stale
+    snapshot of the app inside its own repo must NOT be enumerated for review."""
+
+    def _make_repo(self, tmp):
+        import subprocess
+        subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+        env_files = {
+            os.path.join("src", "app.js"): "console.log('real');\n",
+            os.path.join("stale-copy", "app.js"): "console.log('stale');\n",
+            ".gitignore": "stale-copy/\n",
+        }
+        for rel, body in env_files.items():
+            full = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(full) or tmp, exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(body)
+
+    def test_gitignored_nested_copy_is_skipped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_repo(tmp)
+            if ff._git_real_files(tmp) is None:
+                self.skipTest("git unavailable")
+            files = ff._enumerate_source_files(tmp, max_files=0)
+            slashed = [f.replace("\\", "/") for f in files]
+            self.assertIn("src/app.js", slashed)
+            self.assertNotIn("stale-copy/app.js", slashed)
+
+    def test_non_git_dir_falls_back_to_walk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "app.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('x');\n")
+            self.assertIsNone(ff._git_real_files(tmp))
+            files = ff._enumerate_source_files(tmp, max_files=0)
+            self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

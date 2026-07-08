@@ -2382,6 +2382,21 @@ def _is_test_path(rel: str) -> bool:
     return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
 
 
+def _git_real_files(project_dir: str) -> set[str] | None:
+    """The repo's own answer to "what is real code here": tracked plus
+    untracked-but-not-ignored paths (forward-slash rel). Returns None when the
+    project isn't a git repo (or git fails), in which case the walk-based filters
+    stand alone. _SKIP_DIRS is a hardcoded denylist and can't know about
+    project-specific junk like a gitignored stale snapshot of the app inside
+    itself - the .gitignore can, so honor it."""
+    if not _is_git_repo(project_dir):
+        return None
+    r = _git(["ls-files", "-z", "-co", "--exclude-standard"], project_dir)
+    if r.returncode != 0 or not (r.stdout or "").strip("\0\n "):
+        return None
+    return {p.replace("\\", "/") for p in r.stdout.split("\0") if p}
+
+
 def _enumerate_source_files(project_dir: str, max_files: int,
                             include: list[str] | None = None,
                             exclude: list[str] | None = None,
@@ -2393,6 +2408,7 @@ def _enumerate_source_files(project_dir: str, max_files: int,
     already drove clean) are excluded so repeated runs continue where the last
     stopped instead of re-reviewing finished files."""
     skip_clean = skip_clean or set()
+    git_files = _git_real_files(project_dir)
     out: list[tuple[str, int]] = []
     for dirpath, dirnames, filenames in os.walk(project_dir):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
@@ -2404,6 +2420,8 @@ def _enumerate_source_files(project_dir: str, max_files: int,
             full = os.path.join(dirpath, f)
             rel = os.path.relpath(full, project_dir)
             relslash = rel.replace("\\", "/")
+            if git_files is not None and relslash not in git_files:
+                continue  # gitignored per the repo's own rules (stale copies, artifacts)
             if include and not any(p in relslash for p in include):
                 continue
             if exclude and any(p in relslash for p in exclude):
@@ -2977,8 +2995,11 @@ def _review_all(reviewers: list, project_dir: str,
                 tag = ", ".join(f"{v} {k}" for k, v in sev_counts.items()) or "clean"
                 print(f"  ({i}/{total}) {rel}: {tag}")
                 if report:
-                    report(current_file=rel, reviewed=i, files_total=total,
-                           defects=len(flat), severity=_severity_breakdown(flat))
+                    kw = dict(current_file=rel, reviewed=i, files_total=total,
+                              defects=len(flat), severity=_severity_breakdown(flat))
+                    if meter is not None:
+                        kw["cost"] = round(meter.usd, 4)
+                    report(**kw)
             if _capped():
                 stop.set()  # stop tasks that haven't started; in-flight ones finish
     if stop.is_set():
