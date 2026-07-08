@@ -484,7 +484,16 @@ class OpenAIProvider:
             ],
         )
         self._meter(resp, use_model)
-        return json.loads(resp.choices[0].message.content or "{}")
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            # Same guard AnthropicProvider.structured has: raising here (with the
+            # "token budget" phrasing the fix loop keys on to record the file as
+            # oversized) beats returning truncated JSON that dies downstream as an
+            # opaque "Unterminated string" parse error.
+            raise RuntimeError(
+                f"Model output hit the {min(max_tokens, 16384)}-token budget (file too "
+                "large to regenerate in one response); raise max_tokens for this call.")
+        return json.loads(choice.message.content or "{}")
 
 
 def _coerce_issue(item) -> str:
@@ -3151,9 +3160,14 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         feedback = ""
         # Token economics: try edit-block generation first (output scales with
         # the change, not the file — the single biggest cost lever in the tool).
-        # Any anchor failure permanently demotes THIS FILE to whole-file mode so
-        # a flaky anchor can't burn attempts. --whole-file-fixes opts out fully.
+        # An anchor failure gets ONE regenerate-with-feedback retry (edits are
+        # hunk-sized so they can't hit a provider's output ceiling) before the
+        # file demotes to whole-file mode — which on small-ceiling providers
+        # (gpt-4o: 16384 out) truncates large files into a [skip]. A second
+        # anchor failure demotes permanently so a flaky anchor can't burn all
+        # attempts. --whole-file-fixes opts out fully.
         edit_mode = not getattr(args, "whole_file_fixes", False)
+        edit_retries = 1
         for attempt in range(1, MAX_FIX_TRIES + 1):
             patch = None
             if edit_mode:
@@ -3173,6 +3187,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         patch = {"changed": True, "contents": new_text,
                                  "fixed_titles": epatch.get("fixed_titles") or [],
                                  "notes": epatch.get("notes", "")}
+                    elif edit_retries > 0:
+                        edit_retries -= 1
+                        feedback = (
+                            f"Your previous edits could not be applied: "
+                            f"{apply_err or 'they were a no-op'}. Regenerate ALL edits. "
+                            "Every `search` must be copied VERBATIM from CURRENT "
+                            "CONTENTS above — exact whitespace, indentation and line "
+                            "breaks — and must occur exactly once in the file.")
+                        print(f"  [edit-retry] {rel}: {apply_err or 'edits were a no-op'}"
+                              " -> regenerating edits with feedback")
+                        continue
                     else:
                         edit_mode = False
                         print(f"  [edit-fallback] {rel}: {apply_err or 'edits were a no-op'}"
