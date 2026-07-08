@@ -77,6 +77,84 @@ class FixDiffTests(unittest.TestCase):
         self.assertEqual(ff._fix_diff("same\n", "same\n", "f"), "")
 
 
+class PricingAndEconomyTests(unittest.TestCase):
+    def test_claude5_family_priced(self):
+        # Missing entries silently fall back to Opus-tier pricing (5/25), which
+        # overbills the meter and stops budget-capped runs early.
+        self.assertEqual(ff._price_for("claude-sonnet-5"), (3.0, 15.0))
+        self.assertEqual(ff._price_for("claude-fable-5"), (10.0, 50.0))
+        self.assertEqual(ff._price_for("claude-haiku-4-5"), (1.0, 5.0))
+        self.assertEqual(ff._price_for("claude-opus-4-8"), (5.0, 25.0))
+
+    def test_sonnet5_key_does_not_shadow_sonnet46(self):
+        self.assertEqual(ff._price_for("claude-sonnet-4-6"), (3.0, 15.0))
+
+    def test_economy_tier_defined_for_anthropic(self):
+        self.assertEqual(ff.ECONOMY_MODELS.get("anthropic"), "claude-sonnet-5")
+
+    def test_economy_routes_author_model(self):
+        # Exercise build_audit_providers itself (stubbed provider + key check):
+        # --economy picks the economy author when no explicit --model was given;
+        # an explicit --model always wins.
+        class Args:
+            provider = "anthropic"
+            model = None
+            economy = True
+            use_both = False
+            secondary_model = None
+            judge_model = None
+
+        picked = []
+        real_key, real_make = ff._provider_key_present, ff.make_provider
+        ff._provider_key_present = lambda name: name == "anthropic"
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append(model) or object())
+        try:
+            ff.build_audit_providers(Args)
+            self.assertEqual(picked, ["claude-sonnet-5"])
+            picked.clear()
+            Args.model = "claude-opus-4-8"
+            ff.build_audit_providers(Args)
+            self.assertEqual(picked, ["claude-opus-4-8"])
+            picked.clear()
+            Args.model, Args.economy = None, False
+            ff.build_audit_providers(Args)
+            self.assertEqual(picked, [ff.DEFAULT_MODELS["anthropic"]])
+        finally:
+            ff._provider_key_present, ff.make_provider = real_key, real_make
+
+
+class CrossVerifyPromptTests(unittest.TestCase):
+    def test_large_diff_is_capped_not_replaced_by_full_files(self):
+        # A whole-file rewrite used to fall back to sending BOTH full copies to
+        # the judge (~2x file size). Now it must always send a (capped) diff.
+        original = "\n".join(f"line {i}" for i in range(9000)) + "\n"
+        fixed = "\n".join(f"LINE {i}" for i in range(9000)) + "\n"
+        captured = {}
+        real = ff._judge
+
+        def fake_judge(prov, system, prompt, schema, max_tokens=8000):
+            captured["prompt"] = prompt
+            return {"resolves": True, "regressions": False, "issues": [], "verdict": "keep"}
+
+        ff._judge = fake_judge
+        try:
+            keep, _ = ff._cross_verify_fix(object(), "f.py", original, fixed, [])
+        finally:
+            ff._judge = real
+        self.assertTrue(keep)
+        p = captured["prompt"]
+        self.assertIn("UNIFIED DIFF", p)
+        self.assertNotIn("ORIGINAL FILE:", p)
+        self.assertIn("truncated for verification", p)
+        self.assertLess(len(p), 100_000)
+
+    def test_no_diff_short_circuits_keep(self):
+        keep, reason = ff._cross_verify_fix(object(), "f.py", "same\n", "same\n", [])
+        self.assertTrue(keep)
+        self.assertIn("no textual diff", reason)
+
+
 class SchemaAndWiringTests(unittest.TestCase):
     def test_edits_schema_shape(self):
         s = ff.FIX_EDITS_SCHEMA

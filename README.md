@@ -23,14 +23,21 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 - High-volume classification calls (review, grading, cross-verify, judging) run on
   the cheap JUDGE tier (`claude-haiku-4-5` / `gpt-4o-mini`); only code GENERATION
   uses the frontier author model.
+- **`--economy` (audit)** authors fixes/tests with `claude-sonnet-5` ($3/$15 per 1M
+  tokens vs Opus 4.8's $5/$25 - near-Opus code quality) instead of `claude-opus-4-8`.
+  The build gate + cross-model veto + rollback safety net is unchanged, so a weak
+  fix is vetoed and retried, never shipped. The Audit launcher asks and defaults
+  economy ON; explicit `--model` overrides it. No-op on the openai provider.
 - Fix generation returns minimal **search/replace edit blocks** (output scales with
   the size of the change, not the file), with automatic whole-file regeneration
   fallback when an edit anchor fails to apply. `--whole-file-fixes` restores legacy
   behavior.
-- Cross-model fix verification judges a **unified diff**, not two full copies of
-  the file.
-- Anthropic system prompts are cache-marked (`cache_control: ephemeral`), billed at
-  ~0.1x on repeat calls; the CostMeter accounts cache reads/writes.
+- Cross-model fix verification always judges a **unified diff** (capped at 96k
+  chars) - never two full copies of the file, which used to cost ~100k input
+  tokens on whole-file rewrites.
+- Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
+  minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
+  prompts don't actually cache today (harmless - a miss bills normal price).
 - Review sweep stops at 35% of the budget cap so there is always money left to fix.
 - The brain skips files marked clean in prior runs (`--recheck` to re-review).
 

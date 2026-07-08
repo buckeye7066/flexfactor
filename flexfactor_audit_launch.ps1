@@ -78,6 +78,17 @@ if ($apply -eq "report") {
     Write-Host "Apply mode: verified fixes are committed and pushed each cycle." -ForegroundColor DarkGray
 }
 
+# Economy mode: author fixes/tests with Claude Sonnet 5 (about 40% cheaper than
+# Opus, near-Opus code quality; the build gate + cross-model veto still protect
+# every fix). Default is YES because credits are the scarce resource here.
+$econ = Read-Host "Economy mode (Sonnet 5 author, cheaper credits)? [Y/n] (Enter = yes)"
+if ($econ -match '^(n|no)$') {
+    Write-Host "Full mode: Opus 4.8 authors every fix." -ForegroundColor DarkGray
+} else {
+    $extraArgs += "--economy"
+    Write-Host "Economy mode: Sonnet 5 authors fixes; review stays on the cheap judge tier." -ForegroundColor DarkGray
+}
+
 # Optionally merge verified fixes into the current branch.
 $merge = Read-Host "Merge verified fixes into the current branch? [y/N]"
 if ($merge -match '^(y|yes)$') {

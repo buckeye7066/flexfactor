@@ -15,7 +15,10 @@ python flexfactor_dashboard.py --selftest
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
-  `MODEL_PRICING`, `CostMeter` (hard `--max-cost` budget, default $50/program)
+  `ECONOMY_MODELS` (audit `--economy`: author = claude-sonnet-5 at $3/$15 vs
+  Opus 4.8's $5/$25, near-Opus code quality; launcher defaults economy ON),
+  `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
+  budget, default $50/program)
 - Providers: `AnthropicProvider` / `OpenAIProvider` (`complete`/`grade`/`structured`);
   `_cached_system()` marks Anthropic system prompts cacheable; `_judge()` routes
   classification calls to the judge tier
@@ -30,7 +33,9 @@ python flexfactor_dashboard.py --selftest
 - Fix generation: `generate_file_fix_edits` (search/replace edit blocks,
   DEFAULT — output scales with the change) + `_apply_edits` (exact-unique-match,
   fails closed) → fallback `generate_file_fix` (whole file, 128k). Flag
-  `--whole-file-fixes` = legacy. Cross-verify judges `_fix_diff` unified diff.
+  `--whole-file-fixes` = legacy. Cross-verify ALWAYS judges a `_fix_diff`
+  unified diff, capped at 96k chars (never two full file copies — that was
+  ~100k input tokens on big rewrites).
 - Scout: `run_scout` → repo-rewards service (localhost:3000, auto-started from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1`) → `generate_integration` /
   `apply_integration` with `_rollback`

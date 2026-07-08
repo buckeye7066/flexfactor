@@ -69,6 +69,18 @@ JUDGE_MODELS = {
     "openai": "gpt-4o-mini",
 }
 
+# ECONOMY author tier (audit --economy): a cheaper code-writing model for
+# credit-constrained runs. Claude Sonnet 5 delivers near-Opus coding/agentic
+# quality at $3/$15 per 1M tokens vs Opus 4.8's $5/$25 - a 40% cut on the
+# author calls that dominate an audit's spend (fix generation, unit-test and
+# e2e-spec generation). The audit's safety net (per-file build gate +
+# cross-model veto + retry + rollback) is unchanged, so a weaker fix is vetoed
+# and retried rather than shipped. OpenAI has no cheaper author tier worth
+# using (gpt-4o-mini writes poor code), so economy is a no-op there.
+ECONOMY_MODELS = {
+    "anthropic": "claude-sonnet-5",
+}
+
 # --------------------------------------------------------------------------- #
 # Cost metering. Every provider call records its token usage into a CostMeter so
 # a run can enforce a hard USD budget (--max-cost) and never overspend. Prices
@@ -77,9 +89,11 @@ JUDGE_MODELS = {
 # unrecognized model is never assumed free.
 # --------------------------------------------------------------------------- #
 MODEL_PRICING = {
+    "claude-fable-5": (10.0, 50.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
     "gpt-4o-mini": (0.15, 0.60),
@@ -577,7 +591,12 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
 
     judge_override = getattr(args, "judge_model", None)
     out: list[tuple[str, object]] = []
-    primary_model = args.model or DEFAULT_MODELS[primary]
+    # Author model: explicit --model wins; --economy routes authoring to the
+    # cheaper economy tier (Sonnet 5 on Anthropic); otherwise the default tier.
+    economy = getattr(args, "economy", False)
+    primary_model = (args.model
+                     or (ECONOMY_MODELS.get(primary) if economy else None)
+                     or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
     if args.use_both and _provider_key_present(other):
@@ -2725,22 +2744,24 @@ def _cross_verify_fix(reviewer, rel_path: str, original: str, fixed: str,
     bullets = "\n".join(
         f"- [{f.get('severity')}] line {f.get('line')} — {f.get('title')}: "
         f"{f.get('problem')}" for f in targets)
-    # Token economics: judge the DIFF, not two full copies of the file — the
-    # unchanged bulk of the file carries no verification signal. Fall back to
-    # full contents only when the diff is degenerate (empty) or so large that
-    # hunk context alone can't establish correctness.
+    # Token economics: judge the DIFF, never two full copies of the file — the
+    # unchanged bulk of the file carries no verification signal, and a big file
+    # sent twice was the single most expensive judge call in the tool (~100k
+    # input tokens). A huge diff (whole-file regen) is capped instead: the
+    # judge sees the first 96k chars (~24k tokens, still 4x cheaper than two
+    # full copies) which covers all but the most extreme rewrites entirely.
     diff = _fix_diff(original, fixed, rel_path)
-    if diff and len(diff) <= 24000:
-        prompt = (f"FILE: {rel_path}\n\nLISTED DEFECTS THE FIX MUST RESOLVE:\n{bullets}\n\n"
-                  f"UNIFIED DIFF OF THE FIX (everything outside these hunks is unchanged):\n"
-                  f"{diff}\n\n"
-                  "Decide whether this change resolves every listed defect without "
-                  "regressions or unrelated changes.")
-    else:
-        prompt = (f"FILE: {rel_path}\n\nLISTED DEFECTS THE FIX MUST RESOLVE:\n{bullets}\n\n"
-                  f"ORIGINAL FILE:\n{original}\n\nREWRITTEN FILE:\n{fixed}\n\n"
-                  "Decide whether the rewrite resolves every listed defect without "
-                  "regressions or unrelated changes.")
+    if not diff:
+        return True, "cross-verify skipped: fix produced no textual diff"
+    note = ""
+    if len(diff) > 96000:
+        diff = diff[:96000]
+        note = "\n[diff truncated for verification - judge the hunks shown]"
+    prompt = (f"FILE: {rel_path}\n\nLISTED DEFECTS THE FIX MUST RESOLVE:\n{bullets}\n\n"
+              f"UNIFIED DIFF OF THE FIX (everything outside these hunks is unchanged):\n"
+              f"{diff}{note}\n\n"
+              "Decide whether this change resolves every listed defect without "
+              "regressions or unrelated changes.")
     try:
         # Independent verification is a judging task -> cheap tier.
         data = _judge(reviewer, FIX_VERIFY_SYSTEM, prompt, FIX_VERIFY_SCHEMA)
@@ -3914,6 +3935,12 @@ def main(argv=None) -> int:
         parser.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the AUTHOR model id (code generation).")
+        parser.add_argument("--economy", action="store_true", dest="economy",
+                            help="Cheapest-credits mode: author fixes/tests with claude-sonnet-5 "
+                                 "($3/$15 per 1M vs Opus 4.8's $5/$25; near-Opus code quality). "
+                                 "Review + cross-verify already run on the cheap judge tier. "
+                                 "The build gate / cross-model veto / rollback safety net is "
+                                 "unchanged. --model overrides this; no-op on openai.")
         parser.add_argument("--judge-model", default=None, dest="judge_model",
                             help="Cheap model for judging calls (line-by-line review + cross-model "
                                  "fix verification - the bulk of the calls). Default: the provider's "
