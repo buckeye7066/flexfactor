@@ -1,17 +1,21 @@
 # CLAUDE.md — FlexFactor
 
 Local dual-provider code tool: refactor / scout / audit. Single-file core
-(`flexfactor.py`, ~4.7k lines) + Tkinter dashboard + PowerShell launchers.
+(`flexfactor.py`, ~4.3k lines) + Tkinter dashboard + PowerShell launchers.
 No app deployment — "prod" = the desktop shortcuts working.
 
 ## Run / test
 ```bash
+pip install anthropic openai                   # only deps; there is NO requirements.txt
 python flexfactor.py --file <f> --goal "..."   # refactor mode
 python flexfactor.py scout --program <p>
 python flexfactor.py audit --program <p>
 python flexfactor_tests.py                     # unit tests, no API keys needed
 python flexfactor_dashboard.py --selftest
 ```
+Key flags: `--economy` (cheap author tier), `--whole-file-fixes` (legacy, edit
+blocks are default), `--repo-rewards-url` (scout backend), `--max-cost` (USD
+budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3).
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
