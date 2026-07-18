@@ -1,8 +1,9 @@
 # FlexFactor Scout launcher - double-click the binoculars icon, or drag a
 # project folder / .lnk / file onto it. Goes straight into scout mode: search
-# Repo Rewards for repos that would IMPROVE the program you point it at, then
-# APPLY the improvements that clear the bar (verified build + committed/pushed
-# on a branch). Choose "report" to only get the report without changing code.
+# Repo Rewards for repos that would IMPROVE the program you point it at. The
+# SAFE DEFAULT is report-only. Choose "apply" (and confirm) to have it integrate
+# the improvements that clear the bar (verified build + committed LOCALLY on a
+# branch, no push).
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -29,15 +30,16 @@ if ([string]::IsNullOrWhiteSpace($program)) {
 $provider = Read-Host "Provider [openai / anthropic] (Enter = openai)"
 if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "openai" }
 
-# Mode: apply (default) makes the code changes; report only writes the report.
-$mode = Read-Host "Mode [apply / report] (Enter = apply)"
-if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "apply" }
+# Mode: report (SAFE DEFAULT) writes the report only; apply makes the code changes.
+$mode = Read-Host "Mode [report / apply] (Enter = report)"
+if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "report" }
 $applyArgs = @()
-if ($mode -eq "report") {
-    $applyArgs = @("--report-only")
+if ($mode -eq "apply") {
+    Write-Host "Apply mode: integrations that pass the build are committed LOCALLY to a" -ForegroundColor Yellow
+    Write-Host "flexfactor/adopt-* branch (no push). You will be asked to confirm." -ForegroundColor Yellow
+    $applyArgs = @("--apply")
 } else {
-    Write-Host "Apply mode: improvements that pass the build will be committed to a" -ForegroundColor DarkGray
-    Write-Host "flexfactor/adopt-* branch and pushed. Use Mode 'report' to skip changes." -ForegroundColor DarkGray
+    Write-Host "Report mode: writes the report only; no code changes." -ForegroundColor DarkGray
 }
 
 # Key sanity check.

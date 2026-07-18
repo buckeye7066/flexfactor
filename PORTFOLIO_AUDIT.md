@@ -1,0 +1,1079 @@
+# FlexFactor Portfolio Hardening Audit (spec 5.11)
+
+Branch: `claude/portfolio-hardening-2026-07-18`
+Scope: `flexfactor.py` (single-file core, ~4.3k lines), `flexfactor_scout_launch.ps1`,
+`flexfactor_tests.py`, new `pyproject.toml`. No wholesale rewrite (item 14 honored).
+
+## Baseline
+
+- Python 3.12.10.
+- `python flexfactor_tests.py` -> **30 tests GREEN** at baseline (no RED at baseline).
+- `python flexfactor_dashboard.py --selftest` -> GREEN.
+- Launchers ASCII + parse clean under Windows PowerShell tokenizer.
+- Working tree clean on `main` before branching.
+
+After hardening: **56 tests GREEN** (30 original + 26 new), dashboard GREEN,
+launchers still ASCII + parse-clean, `git diff --check` clean, no secrets in diff.
+
+## Contract matrix (spec section 5.11)
+
+| # | Requirement | Status | Evidence / fix |
+|---|---|---|---|
+| 1 | Scout default REPORT-ONLY; `--apply` + confirmation to mutate | **FIXED** | parser `--apply` default False + `_confirm_scout_apply`; launcher default "report" |
+| 2 | Treat 3rd-party README/issue/source/patch as untrusted (fence) | **FIXED** | `_fence_untrusted` applied to repo summaries + program context |
+| 3 | Never execute adopted code outside isolated sandbox w/ limits | **PARTIAL / documented** | tool integrates into user's own repo, not clone+exec; `npm install` still runs install scripts in project dir — see "Not fully reproduced" |
+| 4 | Classify PHI/genomic/financial/credential; redact; opt-in; local mode | **NOT DONE / documented** | larger feature; no redaction/local-only mode today — see blockers |
+| 5 | Reserve cost atomically BEFORE concurrent calls | **FIXED** | `CostMeter.reserve/release`, `over_limit` counts reservations, wired into prefetch `_first_attempt` |
+| 6 | `_run` non-throwing only if failure can't be read as success | **FIXED** | `_run` marks failures `flexfactor_launch_error`, traps all exceptions; `_git_current_branch` no longer fabricates "main" |
+| 7 | Clean-file memory keyed to content hash + policy version | **FIXED** | `clean_files` now `{policy, files:{rel:sha256}}`; skip only if hash matches |
+| 8 | brain/status: file locks + atomic replace; corrupt recovery | **FIXED (brain)** | atomic temp+fsync+replace, in-proc + cross-proc lock, corrupt quarantine; status.json already atomic |
+| 9 | pyproject.toml + pinned deps + supported Python | **FIXED** | `pyproject.toml`, `requires-python>=3.12`, pinned SDK ranges |
+| 10 | Unknown model pricing FAIL CLOSED | **FIXED** | `_DEFAULT_PRICE` = highest known rate; warn-once |
+| 11 | Keep changes on branch; never auto-push/merge/mutate dirty tree | **FIXED** | scout+audit `push` now opt-in (`--push`), default OFF; dirty-tree gate already present |
+| 12 | License/provenance/maintenance/vuln screen before adopting | **PARTIAL** | Repo Rewards `safety.verdict` + `licenseSpdx` consumed by `classify_benefit`; not a full gate |
+| 13 | Preserve PS 5.1 ASCII launchers + `_winify` | **PRESERVED** | verified ASCII + parse; `_winify` untouched, regression test intact |
+| 14 | Refactor large file incrementally, no wholesale rewrite | **HONORED** | all changes are surgical edits behind tests |
+
+## Findings + fixes (with evidence)
+
+### [HIGH] Item 1 — Scout applied+pushed by default (silent repo mutation)
+`main()` scout parser used `--report-only` (store_false, dest apply) so `apply`
+defaulted True, and `--no-push` left `push` default True. Running scout on any repo
+would generate, commit, AND push integrations with no confirmation.
+- Fix: `--apply` (store_true, default False) is now required; `_confirm_scout_apply`
+  demands an interactive "apply" (or `--yes`) and **fails safe on a non-TTY**.
+  `--push` is opt-in (default OFF). Launcher default flipped to "report".
+- Tests: `ScoutApplyDefaultTests` (5).
+- File:line: parser ~`flexfactor.py:4363`; gate `_confirm_scout_apply` ~`flexfactor.py:2020`;
+  wiring `run_scout` ~`flexfactor.py:1998`.
+
+### [HIGH] Item 5 — Prefetch/parallel workers overshoot `--max-cost`
+`CostMeter` had only post-hoc `record()` + a `usd`-only `over_limit()`. The prefetch
+pool (`_top_up_prefetch`/`_first_attempt`) let N background workers each pass the
+pre-check and then all spend (code comment even admitted "overshoot ... by at most
+prefetch_n calls").
+- Fix: `reserve(est)`/`release(est)` do a single locked check-and-add; `over_limit()`
+  now counts outstanding reservations; `_first_attempt` reserves an estimated cost
+  before generating and releases in `finally`. Parallel workers can no longer
+  collectively exceed the cap.
+- Residual (documented): the SERIAL main-thread generation is not itself reserved,
+  so the main thread can still make at most ONE unreserved call between its own
+  `over_limit()` checks — an inherent single-call boundary, not the concurrency bug.
+- Tests: `BudgetReservationTests` (5, incl. a 50-thread race asserting <=4 grants).
+- File:line: `CostMeter.reserve/release/over_limit` ~`flexfactor.py:157-185`;
+  `_estimate_call_cost` ~`flexfactor.py:193`; wiring ~`flexfactor.py:3260`.
+
+### [HIGH] Item 7 — Clean-file memory skipped by PATH, not content
+`clean_files` was a plain list of relative paths; `_enumerate_source_files(skip_clean=)`
+excluded any path in it. A file marked clean, then edited (human/merge/new bug), was
+silently skipped forever (until `--recheck`) — a permanent blind spot.
+- Fix: clean memory is now `{"policy": POLICY_VERSION, "files": {rel: sha256}}`. The
+  audit only skips a remembered file while its **current hash matches**; a changed
+  file is re-reviewed. Legacy list/old-policy records are ignored (re-review).
+- Tests: `CleanFileHashMemoryTests` (3).
+- File:line: `_clean_map`/`_file_sha` ~`flexfactor.py:236-320`; skip decision
+  ~`flexfactor.py:3600`; persist map ~`flexfactor.py:3854` + record call ~`flexfactor.py:4023`.
+
+### [HIGH] Item 10 — Unknown model priced at Opus tier (budget under-count)
+`_price_for` fell back to `(5.0, 25.0)` for unknown ids. A model pricier than Opus
+(e.g. a new `fable`-class or any unrecognized id) would be **under-billed**, letting a
+budget-capped run overspend.
+- Fix: `_DEFAULT_PRICE` = the highest known rate on each axis `(10.0, 50.0)`; unknown
+  ids warn once and bill at that rate (fail closed for budget). `PRICING_VERSION`
+  added so the table is versioned.
+- Tests: `UnknownModelPricingFailsClosedTests` (3).
+- File:line: `flexfactor.py:106-125`.
+
+### [MED] Item 6 — Failure could be read as success
+`_run` never raises (correct for resilience), but two gaps: (a) it caught only
+`Timeout/FileNotFound/OSError` (a `ValueError` on bad args could still propagate),
+and (b) `_git_current_branch` **fabricated "main"** on any git failure — a failure
+read as success that could later `git checkout main`, switching the user off their
+real branch.
+- Fix: `_run` traps all exceptions into a NON-ZERO result tagged
+  `flexfactor_launch_error` (documented contract: callers gate on `returncode == 0`,
+  so a non-launch is never success). `_git_current_branch` returns the exact SHA on
+  detached HEAD, `""` on hard failure, and all four checkout-back sites guard on a
+  truthy `prev_branch`.
+- Tests: `RunFailsClosedTests` (3), `GitCurrentBranchNoFabricationTests` (3).
+- File:line: `_run` ~`flexfactor.py:1520`; `_git_current_branch` ~`flexfactor.py:1553`;
+  guards ~`flexfactor.py:1935, 1964, 3487, 3986`.
+
+### [MED] Item 8 — brain.json non-atomic, unlocked, lossy on corrupt/concurrent write
+`_save_brain` wrote in place (a crash mid-write truncates it -> next `_load_brain`
+returns `{}` and loses ALL memory). With `--parallel` audits, concurrent
+`_brain_record_run` calls did read-modify-write with no lock -> last-writer-wins
+dropped sibling programs' records.
+- Fix: atomic temp+fsync+`os.replace`; in-process `threading.Lock` + cross-process
+  advisory lock file (`_brain_file_lock`, steals stale locks); corrupt file is
+  quarantined to `.corrupt` instead of silently overwritten.
+- Tests: `BrainPersistenceTests` (4, incl. a 20-thread no-clobber test).
+- File:line: `flexfactor.py:218-366`.
+
+### [MED] Item 2 — Untrusted third-party text unfenced in prompts
+Repo metadata/AI summaries (from Repo Rewards, i.e. third-party repos) and the raw
+program context were interpolated straight into LLM prompts — a prompt-injection
+surface.
+- Fix: `_fence_untrusted(label, text)` wraps them with an injection-resistant preamble
+  and hard-to-spoof markers (forged end-markers are broken). Applied to the benefit
+  judge, both integration passes, and the program-profiling call.
+- Tests: `test_untrusted_fence_neutralizes_forged_markers`.
+- File:line: `_fence_untrusted` ~`flexfactor.py:2050`; call sites ~`flexfactor.py:1808,1826,1954,1918`.
+
+### [LOW] Item 11 — Auto-push default (both modes)
+Covered with item 1. `push` is now opt-in for scout AND audit; merge already opt-in;
+dirty-tree gate already present.
+
+## Not fully reproduced / external blockers
+
+- **Item 3 (sandbox for adopted code).** FlexFactor does NOT clone and execute
+  arbitrary third-party repos; scout generates an integration into the USER's own
+  repo and runs the user's own build. However `apply_integration` runs
+  `npm install <adopted-packages>` in the project dir, which executes package
+  install scripts (arbitrary code) outside any isolation, and the build then runs.
+  Existing mitigations: build-gate + hard rollback + dedicated branch + clean-tree
+  gate. Full isolation (worktree/container, network/CPU/disk/time caps, secret
+  scrubbing, `--ignore-scripts`) is an infra change beyond a surgical fix and could
+  break legitimate packages if defaulted on — **deferred, documented as a real gap.**
+- **Item 4 (sensitive-content classification / redaction / local-only mode).** The
+  tool sends source file contents to cloud models with no PHI/secret classifier,
+  no redaction, and no local-only provider. This is a substantial new subsystem;
+  **not implemented** — flagged as the largest outstanding risk for repos containing
+  PHI/genomic/financial/credential data. Recommend: a pre-send secret/PII scan +
+  `--local-only` (e.g. Ollama) provider + explicit `--allow-sensitive` opt-in.
+- **Item 12 (OSS provenance/vuln/maintenance gate).** Partially covered: Repo
+  Rewards supplies `safety.verdict` + `licenseSpdx`, consumed by `classify_benefit`.
+  A dedicated license-compatibility + archive-status + CVE gate before apply is not
+  implemented here (belongs largely in the Repo Rewards screen). Documented.
+- **Live end-to-end audit/scout runs** were intentionally NOT executed (no cloud AI
+  calls in verification, no third-party repo clone+exec per operating rules). The
+  budget-reservation primitive, `_run` contract, hash memory, brain persistence, and
+  scout gating are proven at unit level with mocks/temp dirs/threads.
+
+## Verification
+
+- `python flexfactor_tests.py` -> 56 passed.
+- `python flexfactor_dashboard.py --selftest` -> OK.
+- `python flexfactor.py scout --help` / `audit --help` -> exit 0 (no argparse conflicts).
+- Launchers: ASCII-only; `[PSParser]::Tokenize` parses all three cleanly.
+- `git diff --check` clean; no API keys in the diff.
+
+---
+
+## Follow-up round (Codex review of commit 67690b5) — 6 defects: SCOUT fixed but the parallel AUDIT path had the same holes
+
+All 6 fixed with a regression test each, verified RED on 67690b5 first (via
+`git stash push flexfactor.py` then running the new suites) then GREEN post-fix.
+Notably the parallel-review test on the baseline recorded **$0.82 spend against a
+$0.30 cap** — defect 2 reproduced live.
+
+| # | Sev | Defect | Fix | file:line | Test |
+|---|---|---|---|---|---|
+| 1 | HIGH | Audit mutated without `--apply` (parser only had `--report-only` store_false, apply defaulted True) | `--apply` (default False) + `--yes` + `_confirm_audit_apply` up front in `run_audit`; audit launcher default flipped to report | parser ~`4519`, confirm ~`4188`, gate `report_only` ~`3730` | `AuditApplyDefaultTests` (3) |
+| 2 | HIGH | Parallel REVIEW calls bypassed CostMeter (per-file `over_limit()` once, then N workers spend) | `_review_one` reserves `_estimate_call_cost(judge_model,…,REVIEW_MAX_TOKENS)` before each review call, releases in finally, `stop.set()` on refusal | `_review_all._review_one` ~`3246` | `ParallelReviewBudgetTests` (1) |
+| 3 | HIGH | `_commit_and_sync` ignored checkout/merge return codes → could write next cycle on wrong branch | check every checkout/merge/abort rc; verify HEAD is back on the audit branch (1 retry) else raise `BranchStateError` (stops the program) | `_commit_and_sync` ~`3556-3585` | `CommitSyncBranchStateTests` (2) |
+| 4 | MED | Prefetch reserved ~1k output vs the call's real 32k/128k `max_tokens` | `_estimate_call_cost(model, chars, max_out_tokens)` reserves the requested ceiling; shared `REVIEW/FIX_EDITS/FIX_WHOLE_MAX_TOKENS` constants keep reserve == actual call | `_estimate_call_cost` ~`198`; `_first_attempt` ~`3347` | `EstimateReflectsMaxTokensTests` (2) |
+| 5 | MED | `_price_for` substring match mispriced `ft:gpt-4o-mini:…` / `my-gpt-4o-mini` at the cheap tier | match on exact id or `key + separator(-/:/@)` only; aliased/fine-tuned ids fall through to fail-closed `(10,50)` | `_price_for` ~`119` | `ModelPrefixPricingTests` (3) |
+| 6 | MED | Audit review/fix/verify/test-gen embedded raw source (hostile comment could suppress findings) | `_fence_untrusted("source"/"patch", …)` on review, both fix generators, cross-verify diff, and unit-test-gen; source-as-data language added to `AUDIT/FIX/FIX_EDITS/FIX_VERIFY_SYSTEM` | `review_file`/`generate_file_fix*`/`_cross_verify_fix` | `AuditSourceFencingTests` (3) |
+
+Follow-up verification: **70 tests GREEN**, dashboard OK, `audit`/`scout --help`
+exit 0, all three launchers ASCII + parse-clean, `git diff --check` clean, no
+secrets. Audit is now report-only by default (confirmed by test); the parallel
+review sweep cannot exceed `--max-cost` (reservation-gated, test-proven).
+
+---
+
+## Round 3 (Codex review) — 4 defects, fixed with CHOKEPOINTS (2 HIGH incl. a sandbox escape)
+
+The pattern (per-call-site fixes miss siblings) was addressed by routing whole
+CLASSES of operation through single chokepoints. Each fix has a regression test
+proven RED on the prior HEAD (`d302f60`) — the sandbox-escape test literally wrote
+a file OUTSIDE the repo on baseline.
+
+### Chokepoint 1 — budget reservation moved INTO the provider call (defect 1, HIGH)
+Round 2 only reserved `_first_attempt` prefetches; the main-thread retry/fallback
+`generate_file_fix*`, `_cross_verify_fix`, and unit/e2e test-gen all called the model
+with no reservation and could spend past `--max-cost`.
+- Fix: `_budget_guard(meter, model, prompt_chars, max_tokens)` context manager now
+  wraps **every** provider method — `AnthropicProvider` and `OpenAIProvider`
+  `.complete` / `.grade` / `.structured` (6 methods). It reserves before the call and
+  releases after; a refusal raises `BudgetExceededError`. The now-redundant external
+  reservations in `_first_attempt` and `_review_one` were removed (no double-reserve);
+  both, plus `_fix_files`, catch `BudgetExceededError` to stop cleanly.
+- Every provider call site is therefore bounded: review, benefit/profile judging,
+  cross-verify, fix-edits, whole-file fix, unit-test gen, e2e-spec gen, integration
+  plan/patch, refactor rewrite/grade — all go through `.structured/.complete/.grade`.
+- File:line: `_budget_guard` ~`flexfactor.py:213`; providers `~503-690`; removals
+  `_first_attempt ~3400`, `_review_one ~3300`; cap-stop in `_fix_files ~3520`.
+- Tests: `ProviderReservationChokepointTests` (3).
+
+### Chokepoint 2 — path containment for ALL generated-file writes (defect 2, HIGH — sandbox escape)
+`audit --apply` wrote `os.path.join(project_dir, model_path)` with no rejection of
+absolute / drive-relative / `..` paths, so a hostile/confused model response
+overwrote files OUTSIDE the repo (on Windows an absolute `C:\…` discards
+`project_dir`).
+- Fix: `_contained_path(project_dir, rel)` rejects absolute (POSIX + Windows), UNC,
+  drive-relative (`C:x`), `~`, and any `..` escape via realpath containment. Routed
+  **every** generated-file write through it: unit-test gen, e2e-spec gen,
+  scout `apply_integration` (escape -> `ApplyError` -> rollback), and fix-apply
+  (defense in depth).
+- File:line: `_contained_path` ~`flexfactor.py:238`; writes `apply_integration ~1983`,
+  e2e ~`3050`, unit-test ~`4108`, fix-apply ~`3452`.
+- Tests: `PathContainmentTests` (3) incl. `apply_integration` writes nothing outside.
+
+### Defect 3 (MED) — `_commit_and_sync` ignored `git add` / `git diff` rc
+`git add -A` rc unchecked and `git diff --cached --quiet` treated as binary though
+rc>1 is a real error — an index lock could report "nothing to commit" with fixes
+unstaged, or commit stale content.
+- Fix: check `add` rc (hard-fail `BranchStateError`); treat diff rc 0=none / 1=change
+  / >1=error (hard-fail) before any commit/push/merge. File:line ~`flexfactor.py:3600`.
+- Tests: `CommitSyncGitRcTests` (3).
+
+### Defect 4 (MED) — retry feedback was an unfenced injection channel
+Fix prompts fenced the source but appended `feedback` (populated from build logs +
+cross-reviewer reasons — both can carry attacker-controlled source excerpts) RAW as
+an `IMPORTANT` instruction outside the fence; model-generated finding `bullets` were
+also raw.
+- Fix: fence `feedback` (`UNTRUSTED feedback`) and `bullets` (`UNTRUSTED findings`) in
+  both fix generators and in `_cross_verify_fix`; only the wrapper stays trusted.
+  File:line `generate_file_fix*` ~`2882/2910`, `_cross_verify_fix` ~`3224`.
+- Tests: `FeedbackFencingTests` (3).
+
+Round-3 verification: **82 tests GREEN**, dashboard OK, `audit`/`scout`/refactor
+`--help` exit 0, all three launchers ASCII + parse-clean, `git diff --check` clean,
+no secrets. Confirmed: every provider call routes through the `_budget_guard`
+reservation chokepoint, and every generated-file write routes through
+`_contained_path`.
+
+---
+
+## Round 4 (Codex review) — 4 remaining budget/safety holes (2 HIGH)
+
+Path chokepoint confirmed ✅; these close the remaining gaps. Each fix has a
+regression test proven RED on the prior HEAD (`8ebbeaa`).
+
+### Defect 1 (HIGH) — OpenAI `complete`/`grade` reserved tokens but didn't cap the request
+`OpenAIProvider.complete` reserved 16384 and `grade` 4000, but neither
+`chat.completions.create` passed `max_tokens`, so the API could bill more output
+than reserved and concurrent workers could exceed `--max-cost`.
+- Fix: pass `max_tokens` == the reserved amount on both calls (`flexfactor.py:~660`,
+  `~674`). Audited Anthropic `complete`/`grade`/`structured` — reservation already
+  equals the requested `max_tokens` there (no change needed).
+- Test: `OpenAIOutputCapTests` (2) — the SDK kwargs carry the capped budget.
+
+### Defect 2 (HIGH) — git COMMIT failure wasn't fatal
+`_commit_and_sync` raised on `add`/`diff` errors but a non-zero `git commit` only
+returned stderr text, so callers continued into later cycles with staged-but-
+uncommitted changes and could still report "committed".
+- Fix: raise `BranchStateError` on commit failure (`flexfactor.py:~3684`); the final
+  status now only claims "committed" from a CONFIRMED clean tree (`_git_tree_clean`),
+  else reports "UNCOMMITTED changes remain" (`~4212`).
+- Test: `CommitFailureIsFatalTests` (1) — simulated hook failure → `BranchStateError`.
+
+### Defect 3 (MED) — health pings bypassed the meter + unsynchronized cache
+`_provider_health()` made raw `messages.create` / `chat.completions.create` pings
+ignoring the shared `CostMeter`, and the `_PROVIDER_HEALTH` cache was unlocked
+(parallel audits issued duplicate hidden pings).
+- Fix: pings now run inside `_budget_guard(meter, model, …)` and record their usage
+  against the shared meter; the cache is guarded by `_PROVIDER_HEALTH_LOCK`
+  (`flexfactor.py:~818-893`). `build_audit_providers` threads its `meter` through.
+- Test: `BudgetedHealthPingTests` (2) — the ping bills the meter + releases its
+  reservation; the cache lock exists.
+
+### Defect 4 (MED) — scout integration patch prompt embedded raw model/untrusted text
+The second pass fenced `repo_summary` but inserted the FIRST model's
+plan/packages/file-list AND raw project source directly into `patch_prompt` (whose
+output `apply_integration` later writes). `_contained_path` limits WHERE files land,
+not whether malicious text becomes instructions.
+- Fix: fence the plan fields (`UNTRUSTED plan`) and raw source (`UNTRUSTED source`)
+  in `patch_prompt`, and `package.json` + file tree (`UNTRUSTED package`/`filetree`)
+  in `plan_prompt` (`flexfactor.py:~1884`, `~1905`).
+- Test: `ScoutIntegrationPromptFencingTests` (1) — injected plan + source text land
+  inside their fences.
+
+Round-4 verification: **88 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
+OpenAI calls cap output == reservation; commit failure is fatal; health pings are
+budgeted + lock-guarded; the scout integration prompt fences all untrusted/model text.
+
+---
+
+## Round 5 (Codex review) — 3 SIBLING defects, fixed as EXHAUSTIVE audits (2 HIGH)
+
+Each was a sibling of an earlier fix; done as full audits (with the audit results
+enumerated below) so there is no round 6. Each has a test proven RED on `b3a1175`.
+
+### Defect 1 (HIGH) — reserve-vs-request-cap: full 6-method audit
+`OpenAIProvider.structured` reserved `max_tokens` but requested `min(max_tokens,16384)`
+— so a 32000/128000 request reserved more than it sent.
+- Fix: one `out_cap = min(max_tokens, 16384)` passed to BOTH `_budget_guard` and the
+  SDK (`flexfactor.py:~703`).
+- **AUDIT — reserved output == request output cap for all 6 methods:**
+
+  | Method | reserve | request cap | equal |
+  |---|---|---|---|
+  | Anthropic.complete | 64000 | `max_tokens=64000` | ✅ |
+  | Anthropic.grade | 4000 | `max_tokens=4000` | ✅ |
+  | Anthropic.structured | `max_tokens` | `max_tokens` | ✅ |
+  | OpenAI.complete | 16384 | `max_tokens=16384` | ✅ |
+  | OpenAI.grade | 4000 | `max_tokens=4000` | ✅ |
+  | OpenAI.structured | `min(mt,16384)` | `min(mt,16384)` | ✅ (was ✗) |
+- Test: `ReserveEqualsRequestCapTests` (6) — asserts equality for every method.
+
+### Defect 2 (HIGH) — untrusted fields in write-generating prompts: full audit
+- (a) scout `generate_integration` fenced repo/package/filetree/plan/source but left
+  `profile_blob` + `need` (from the profiling model over untrusted program context)
+  trusted. Fixed: fence both in plan AND patch prompts (`flexfactor.py:~1930/~1955`).
+- (b) refactor mode concatenated current file + prior feedback into the rewrite
+  prompt (written to `args.file`) and the candidate into the grade prompt. Fixed:
+  fence `source` + `feedback` (rewrite) and `candidate` (grade); source-as-data
+  language added to `REWRITE_SYSTEM`/`GRADE_SYSTEM` (`flexfactor.py:~1130/~1150`).
+- **AUDIT — every prompt whose model output is WRITTEN to disk, and its untrusted
+  fields (all now fenced):**
+
+  | Prompt (→ writes) | Untrusted fields fenced |
+  |---|---|
+  | `generate_integration` plan/patch → `apply_integration` writes files | profile, need, repo, package, filetree, plan, source |
+  | `generate_file_fix_edits` → fix written | source, findings, feedback |
+  | `generate_file_fix` (whole) → fix written | source, findings, feedback |
+  | refactor `complete` → `args.file` written | source, feedback (goal trusted) |
+  | refactor `grade` → feeds feedback | candidate |
+  | unit-test gen → tests written | source |
+  | e2e-spec gen → specs written | (no untrusted field: base URL + framework enum only) |
+- Test: `WriteGeneratingPromptFencingTests` (2) — scout profile/need + refactor
+  source/feedback/candidate fences.
+
+### Defect 3 (MED) — health pings via adapter + single-flight cache
+`_provider_health` still called the SDK directly (outside the six adapter methods)
+and released the lock before the ping, so parallel callers both missed the cache and
+double-pinged.
+- Fix: pings now run through `make_provider(name, …, meter).ping()` — a new adapter
+  method on BOTH providers that goes through `_budget_guard` + `_meter`; the cache is
+  SINGLE-FLIGHT via an in-flight `Event` so concurrent callers issue exactly one ping
+  (`flexfactor.py:~638/~745` ping methods, `~865` single-flight).
+- Test: `HealthPingSingleFlightTests` (1) — 25 concurrent checks → exactly 1 ping via
+  1 adapter build.
+
+Round-5 verification: **97 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
+reserve == request cap for all 6 provider methods; every write-generating prompt
+fences all untrusted/model/source fields (table above); health pings go through the
+adapter and are single-flight.
+
+---
+
+## Round 6 (Codex review) — 1 HIGH: containment guarded WRITES but not READS
+
+`_contained_path` protected writes, but `generate_integration` READ every
+`plan.get("modify_files")` entry (MODEL output influenced by untrusted repo/program
+text) via `os.path.join(project_dir, rel)` + `_read_text_safe` with no containment.
+A plan naming `..\..\.env` or an absolute path had that file's contents read into the
+SECOND provider prompt — fencing marks it untrusted but still DISCLOSES local secrets
+to the model.
+- Fix: route every `modify_files` entry through `_contained_path` BEFORE
+  `os.path.isfile`/`_read_text_safe`; an escaping/absolute/traversal path is skipped
+  (never opened, never included). `flexfactor.py:~1957`.
+- **AUDIT — every path READ into a prompt or opened, and whether it's model-named:**
+
+  | Read site | Path source | Contained? |
+  |---|---|---|
+  | `generate_integration` modify_files (`~1957`) | **MODEL** (`plan.modify_files`) | ✅ FIXED this round |
+  | `resolve_program_input` pkg/README/file (`~1539/1556/1598`) | user/tool (the program the user pointed at) | n/a (not model) |
+  | `_detect_verify` / `_detect_stack` package.json (`~1921/2864`) | tool (fixed filename) | n/a |
+  | `generate_integration` package.json (`~1935`) | tool (fixed filename) | n/a |
+  | `_review_all` / `_first_attempt` / fix-loop / unit-test-gen source reads (`~3418/3518/3581/4196`) | tool (`_enumerate_source_files` walk of the repo) | n/a (not model); fix-loop also `_contained_path`-guarded |
+  | refactor `_load_source_text` (`~1112`) | user (`--file`) | n/a |
+
+  Only ONE read site was model-named; it is now contained. All generated-file WRITES
+  were already contained (round 3).
+- Test: `ModelNamedReadPathContainmentTests` (1) — a `modify_files` entry
+  `../secret.txt` AND an absolute path are never read; the secret never appears in
+  the second prompt; a legitimate in-repo file still is.
+
+Round-6 verification: **98 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed: every
+model-named READ path is contained (table above), not just writes.
+
+---
+
+## Round 7 (Codex review) — 1 HIGH: enumerated reads could follow symlinks outside the repo
+
+The read chokepoint covered model-named paths but not repo-ENUMERATED ones.
+`_enumerate_source_files` (os.walk) could return a SYMLINKED file, and
+`_read_full(os.path.join(project_dir, rel))` followed it — so a repo containing
+`src/leak.py` as a symlink to `../secret.txt` (or an absolute target) disclosed
+outside-repo contents to the provider via review/fix/test prompts.
+- Fix (two layers):
+  1. `_enumerate_source_files` now skips symlinked files (`os.path.islink`) AND
+     symlinked directories (pruned from `os.walk` descent), and re-validates each
+     candidate through `_contained_path` (`flexfactor.py:~2823`).
+  2. A new `_read_contained(project_dir, rel)` — realpath-containment read — is the
+     single entry point for reading an enumerated file; a symlink whose realpath
+     resolves outside the repo returns `""` (never opened). Routed ALL enumerated
+     reads through it: review, first-attempt, unit-test-gen; the fix-loop already
+     read the `_contained_path`-resolved `full` (`flexfactor.py:~2790`).
+- **AUDIT — every enumerated read site, now symlink-safe:**
+
+  | Read site | Now via |
+  |---|---|
+  | `_review_all._review_one` (~3436) | `_read_contained` ✅ |
+  | `_fix_files._first_attempt` (~3542) | `_read_contained` ✅ |
+  | `_fix_files` main-thread (~3605) | `_read_full(full)` where `full=_contained_path` ✅ |
+  | unit-test-gen source read (~4220) | `_read_contained` ✅ |
+  | enumeration itself (~2823) | `islink` skip + `_contained_path` filter ✅ |
+- Test: `EnumeratedSymlinkContainmentTests` (2) — an in-repo `.py` symlink to an
+  outside secret is neither enumerated nor read (secret never reaches a prompt); a
+  normal in-repo file still is; traversal/absolute rel paths are refused.
+
+Round-7 verification: **100 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
+containment is now fully symmetric: EVERY read (model-named AND repo-enumerated) goes
+through the realpath containment chokepoint, and enumeration skips symlinks.
+
+---
+
+## Round 8 (Codex review) — 2 HIGH: containment now covers STATIC reads AND writes
+
+Containment covered model-named + enumerated paths but not STATIC (fixed-name) ones.
+Two exhaustive audits close the last asymmetry. Both tests RED on `02e4a1f` — the
+write one showed the baseline FOLLOWING a symlink and overwriting an outside file.
+
+### Defect 1 (HIGH) — static metadata READS bypassed containment into prompts
+`_gather_from_folder` (scout profiling) and `generate_integration`/`_detect_stack`/
+`_detect_verify` read `package.json`/`README.md` with `_read_text_safe(os.path.join(
+folder, …))`, which follows a symlink — so a repo could make one of those a symlink
+to an outside file and have its contents read into the LLM.
+- Fix: all such reads now go through `_read_contained` (realpath containment + explicit
+  symlink-leaf refusal). `_file_tree` also skips symlinked files/dirs (name leak).
+- **AUDIT — every file READ whose contents can enter a prompt → now via `_read_contained`:**
+
+  | Read site | Source | Via |
+  |---|---|---|
+  | `_gather_from_folder` package.json + README (~1537) | static | `_read_contained` ✅ |
+  | `generate_integration` package.json (~1937) | static | `_read_contained` ✅ |
+  | `_detect_verify` / `_detect_stack` package.json (~1918/2920) | static | `_read_contained` ✅ |
+  | `generate_integration` modify_files (~1957) | model | `_contained_path` (r6) ✅ |
+  | review / first-attempt / unit-test-gen (~3436/3542/4278) | enumerated | `_read_contained` (r7) ✅ |
+  | `resolve_program_input` single `--file` (~1598) | user's explicit input | n/a (user-chosen) |
+- Test: `StaticMetadataReadContainmentTests` (2).
+
+### Defect 2 (HIGH) — static report/config WRITES followed symlinks outside the repo
+`_write_audit_report` (and scout/low reports + the Playwright config) built a
+predictable name under `project_dir` and opened it `'w'`; if the audited repo
+pre-created that filename as a symlink to an outside file, generation FOLLOWED it and
+truncated/overwrote the outside target — even in report-only runs.
+- Fix: new `_write_contained(project_dir, rel, content)` — validates via
+  `_contained_path`, REJECTS a symlink leaf (`os.path.islink`), writes ATOMICALLY
+  (temp + `os.replace`, which replaces rather than follows a dest symlink), returns
+  None on refusal so callers fall back to FlexFactor's own cwd.
+- **AUDIT — every project WRITE → now via `_write_contained` (or already contained):**
+
+  | Write site | Kind | Via |
+  |---|---|---|
+  | `_write_audit_report` (~4650) | static report | `_write_contained` ✅ |
+  | `_write_scout_report` (~2524) | static report | `_write_contained` ✅ |
+  | `_write_low_findings_report` (~4682) | static report | `_write_contained` ✅ |
+  | Playwright config write (~3285) | static config | `_write_contained` ✅ |
+  | e2e spec writes (~3258) | model | `_write_contained` ✅ |
+  | unit-test-gen writes (~4280) | model | `_write_contained` ✅ |
+  | `apply_integration` writes (~2065) | model | `_contained_path` + islink-leaf refusal ✅ |
+  | fix-loop writes (~3729/3733/3742) | enumerated (symlink-skipped in r7) | `_contained_path` `full` ✅ |
+  | batch report (~C:\Users\firer) / status.json / brain.json / audit lock | FlexFactor-owned paths outside any audited repo | n/a |
+- Test: `StaticWriteContainmentTests` (4), incl. a symlinked `_audit_report.md` that
+  leaves the outside file intact.
+
+Round-8 verification: **106 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
+containment is now FULLY symmetric and covers static/fixed-name paths as well as
+model-named and enumerated ones — no read that enters a prompt and no write under the
+audited repo can follow a symlink outside it.
+
+---
+
+## Round 9 (Codex review) — 3 remaining raw-open bypasses (2 HIGH); EXHAUSTIVE grep
+
+The chokepoints existed but a few raw opens (report fallback, apply/fix/rollback
+writes, one read) still bypassed them. Fixed + an exhaustive grep of the whole module.
+
+### Defect 1 (HIGH) — report fallback raw-opened cwd (== repo) and followed a symlink
+`_write_*_report` used `_write_contained` but ON REFUSAL fell back to
+`open(os.path.join(os.getcwd(), name), 'w')`. When FlexFactor runs FROM the target
+repo (`cwd == project_dir`), a report-name symlink that was just refused is reopened
+raw and its outside target overwritten.
+- Fix: new `_safe_report_write` — on refusal it writes (still via the atomic no-follow
+  chokepoint) to a TRUSTED FlexFactor-owned dir (`_FLEXFACTOR_DIR`, then tempdir),
+  NEVER a raw cwd. Routed all four report writers (audit, scout, low-findings, batch).
+- Test: `ReportFallbackNoSymlinkFollowTests` (behavioral RED on baseline — the old
+  code overwrote the outside file when cwd==repo).
+
+### Defect 2 (HIGH) — apply/fix/rollback writes bypassed the write chokepoint (TOCTOU)
+`apply_integration` prechecked then wrote with plain `open(full,'w')` (non-atomic;
+a symlink swapped in between islink-check and open is followed); same raw writes in
+`_fix_files` (candidate + 2 rollbacks) and `_rollback` (binary restore).
+- Fix: new `_atomic_replace_nofollow(full, data, binary=)` (temp + `os.replace`, which
+  replaces a dest symlink instead of following it). `apply_integration` now writes via
+  `_write_contained` (re-validates); fix-loop + rollback + `_snapshot` (symlink-safe)
+  use the atomic no-follow primitive.
+- Test: `AtomicNoFollowWriteTests` (2) — replacing a symlink leaves its target intact.
+
+### Defect 3 (MED) — modify_files + serial-fix + single-file reads bypassed leaf refusal
+`generate_integration` read `modify_files` with `_contained_path` + `_read_text_safe`
+(not `_read_contained`), so a symlink leaf whose target is INSIDE the repo passed
+realpath containment and its contents entered the patch prompt; same for the serial
+fix read (`_read_full`) and the single-file scout read (`_read_text_safe`).
+- Fix: all three now use `_read_contained` (which refuses a symlink leaf).
+- Test: `ModifyFilesInRepoSymlinkReadTests` (RED on baseline — target contents leaked).
+
+### EXHAUSTIVE grep audit — every read/write, containment status
+
+**READS** (`open('r')` / `_read_text_safe` / `_read_full` / `_read_contained`):
+
+| Site | Path source | Status |
+|---|---|---|
+| `_gather_from_folder` pkg + README | static | `_read_contained` ✅ |
+| `generate_integration` package.json | static | `_read_contained` ✅ |
+| `generate_integration` modify_files | model | `_read_contained` ✅ (r9) |
+| `_detect_verify` / `_detect_stack` pkg | static | `_read_contained` ✅ |
+| `resolve_program_input` single file | user/static input | `_read_contained` ✅ (r9) |
+| review / first-attempt / serial-fix / unit-test-gen | enumerated | `_read_contained` ✅ (serial-fix r9) |
+| `_snapshot` backup read | model (pre-validated) | symlink-skipped + contained ✅ (r9) |
+| `_load_source_text` (`--file`) | refactor: user's explicit target | n/a (user-chosen) |
+| brain.json / status / audit-lock pid | FlexFactor-owned (`~/.flexfactor`) | n/a |
+| `_read_full` | (only called by `_read_contained`) | — |
+
+**WRITES** (`open('w'/'wb')` / `os.replace` / write helpers):
+
+| Site | Kind | Status |
+|---|---|---|
+| audit / scout / low / batch reports | static | `_safe_report_write` → `_write_contained` (no raw cwd) ✅ (r9) |
+| Playwright config | static | `_write_contained` ✅ |
+| e2e specs / unit-test-gen | model | `_write_contained` ✅ |
+| `apply_integration` file writes | model | `_write_contained` (re-validate) ✅ (r9) |
+| `_fix_files` candidate + rollbacks | enumerated | `_atomic_replace_nofollow` ✅ (r9) |
+| `_rollback` binary restore / new-file removal | model | `_atomic_replace_nofollow` / `lexists`+remove ✅ (r9) |
+| refactor backup + `--file` write | user's explicit target | n/a (user-chosen) |
+| brain.json / status.json / audit lock | FlexFactor-owned tmp+replace | n/a |
+| `_write_contained` / `_atomic_replace_nofollow` temp write | chokepoint internals (fresh temp name) | — |
+
+**Result: ZERO raw `open('w')` under an audited project_dir remains** (including
+fallbacks and rollback); every prompt-ingress read is `_read_contained`; every project
+write is atomic no-follow. Refactor's `--file` and `~/.flexfactor` paths are outside
+the audited-repo threat model.
+
+Round-9 verification: **110 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets.
+
+---
+
+## Round 10 (Codex review) — deepest layer: handle-based no-follow + identity re-check; refactor `--file`
+
+The chokepoints were still check-then-open (validate a pathname, then `open()` it) — a
+same-privilege local process could swap the leaf or a parent between the check and the
+syscall. Round 10 moves to handle/identity-based no-follow where the platform allows,
+narrows the window where it doesn't, and contains refactor `--file`. **This is the last
+deep containment round; the Windows residual is documented honestly below, not claimed
+closed.**
+
+### Defect 1 (HIGH) — refactor `--file` bypassed containment
+`_load_source_text` read `--file` with a raw `open()` (content → provider prompt) and
+the rewrite wrote it back with raw `open('w')`.
+- Fix: refuse a symlink-leaf `--file` (`SourceInputError`), read through `_read_contained`
+  (handle-based no-follow), and write the backup + result through `_atomic_replace_nofollow`.
+- Test: `RefactorFileContainmentTests` (2) — a symlinked `--file` is refused; a normal file still refactors.
+
+### Defect 2 (HIGH) — contained reads were check-then-open (leaf TOCTOU)
+- Fix: `_read_contained` now `lstat`s the leaf (must be a real regular file, not a
+  symlink), opens with `O_RDONLY | O_NOFOLLOW` (POSIX: kernel refuses a symlink leaf),
+  then **fstats the descriptor and requires (dev, inode) to match the pre-`lstat`** —
+  a swap between check and open changes the identity → returns `""` (fails closed).
+- Test: `ReadIdentityRecheckTests` — a descriptor whose identity differs from the
+  validated file yields `""` (the swapped secret is never returned).
+
+### Defect 3 (HIGH) — atomic writer not no-follow for parent races
+- Fix: `_atomic_replace_nofollow` now, on POSIX (`os.supports_dir_fd`), opens a
+  **verified parent-directory handle** (`O_DIRECTORY | O_NOFOLLOW`) once and does the
+  temp create + `os.replace` + cleanup **relative to that fd** (`dir_fd=`), so a parent
+  swapped after validation can't redirect the write. `_snapshot`/`_rollback` are already
+  no-follow. On no-dir_fd platforms it re-checks the parent directory identity around
+  the write and fails closed on change.
+- Test: `WriteParentSwapRecheckTests` — a parent identity change between validation and
+  replace fails closed (Windows path); a normal write succeeds.
+
+### Platform matrix + HONEST RESIDUAL
+
+| Capability | POSIX | Windows (this host) |
+|---|---|---|
+| `O_NOFOLLOW` leaf refusal (read) | ✅ kernel-enforced | ❌ absent → fstat identity re-check |
+| `dir_fd`-relative temp/replace/unlink (write) | ✅ handle-based | ❌ absent → parent-identity re-check |
+| fstat/dir-identity re-check | ✅ (belt-and-suspenders) | ✅ (primary defense) |
+
+This host reports `O_NOFOLLOW=False`, `dir_fd=False` (Windows), so containment relies
+on the **identity re-check at the syscall boundary**. **RESIDUAL (Windows, honest):** a
+*same-privilege local process* that swaps a leaf or a parent directory to a symlink/
+junction in the sub-millisecond window between the identity re-check and the very next
+syscall could still be followed. This is the same narrow pathname-TOCTOU that only a
+native handle API (`CreateFile` with `FILE_FLAG_OPEN_REPARSE_POINT` / `NtCreateFile`,
+not exposed by Python's `os`) can fully close; it is **not claimed closed on Windows** —
+only narrowed to sub-ms and always failing closed on a detected change. On POSIX it is
+fully closed via `O_NOFOLLOW` + `dir_fd`. Enumeration already skips symlinks up front,
+so reaching this residual additionally requires winning the race on a path that passed
+every earlier check.
+
+Round-10 verification: **115 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Refactor `--file`
+is contained; reads use `O_NOFOLLOW` + fstat identity re-check; writes/unlinks use
+`dir_fd`-relative no-follow on POSIX and parent-identity re-check on Windows; the
+Windows sub-ms residual is documented, not claimed closed.
+
+---
+
+## Round 11 (Codex review) — the ANCESTOR-directory race is POSIX too; definitive openat-walk
+
+Round 10 opened by pathname (`lstat(full)` + `os.open(full, O_NOFOLLOW)`); `O_NOFOLLOW`
+only protects the FINAL component, so swapping an ANCESTOR directory to a symlink after
+`_contained_path` but before the open makes both the pre-`lstat` and the `fstat` resolve
+to the OUTSIDE file (identity check passes) — an ancestor TOCTOU present on POSIX too,
+not just Windows. **This is the last containment round.**
+
+### Fix (POSIX, definitive TOCTOU-free): openat component-walk from a root fd
+- New `_rel_components(rel)` splits a repo-relative path into safe components (rejects
+  absolute / drive / UNC / `~` / any `..`).
+- New `_walked_parent_fd(root, comps)` opens `project_dir` once (realpath — its ancestors
+  are the user's trusted FS) then walks EACH component with
+  `os.open(comp, O_DIRECTORY|O_NOFOLLOW, dir_fd=parent)` (openat), yielding the anchored
+  parent dir fd. A symlink at **any** ancestor or the leaf is refused; no pathname is
+  ever re-resolved after validation.
+- `_read_contained` (POSIX) opens the leaf `O_RDONLY|O_NOFOLLOW` **relative to the walked
+  parent fd** and reads from that fd.
+- `_write_contained` / `_replace_contained` (POSIX) create the temp + `os.replace` +
+  `os.unlink` **relative to the walked parent fd** (`src_dir_fd`/`dst_dir_fd`).
+  `_write_contained` REFUSES a symlink leaf; `_replace_contained` REPLACES it (for
+  fix-loop candidate writes and rollback restores of an in-repo file).
+- Refactor `--file`, fix-loop writes, and rollback restores now call
+  `_read_contained` / `_replace_contained(project_dir, rel, …)` with the repo-relative
+  path, so the walk covers ALL ancestors from the repo root.
+
+### Platform matrix — HONEST
+
+| Guarantee | POSIX (openat-walk) | Windows (this host) |
+|---|---|---|
+| Leaf symlink refused | ✅ `O_NOFOLLOW` at leaf | ✅ `islink` + fstat identity re-check |
+| **Ancestor** symlink refused (to outside) | ✅ `O_NOFOLLOW` per component | ✅ realpath containment (`_contained_path`) |
+| **Ancestor** symlink refused (to *inside* repo) | ✅ per-component `O_NOFOLLOW` | ⚠️ followed (realpath resolves inside) — residual |
+| Post-validation swap of leaf/ancestor | ✅ fully closed (no pathname re-resolve) | ⚠️ narrowed to sub-ms, fails closed on detected change |
+
+This host reports `O_NOFOLLOW=False, dir_fd=False`, so the POSIX openat-walk tests
+(`PosixAncestorWalkTests`) are **skipped here and run on POSIX CI** — the Windows
+identity-re-check path is what executes and is tested (`WriteVsReplaceLeafSemanticsTests`,
+`RelComponentsTests`, and rounds 6-10).
+
+**RESIDUAL (Windows, honest — not claimed closed):** on Windows, `os` exposes neither
+`openat`/`dir_fd` nor `O_NOFOLLOW`, so containment resolves the path with `realpath` and
+re-checks leaf/parent identity at the syscall boundary. Two residuals remain, both
+requiring a **same-privilege local process**: (a) an ancestor directory that is a symlink
+resolving *inside* the repo is followed (POSIX refuses it per-component); (b) a leaf/
+ancestor swapped in the sub-millisecond window between the identity re-check and the next
+syscall. Only native Windows handle APIs (`NtCreateFile` with
+`FILE_FLAG_OPEN_REPARSE_POINT`, not exposed by Python's `os`) can fully close these. POSIX
+is fully closed via the openat component-walk. Enumeration also skips symlinks up front.
+
+Round-11 verification: **122 tests GREEN** (4 POSIX-only tests skipped on this Windows
+host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
+`git diff --check` clean, no secrets.
+
+---
+
+## Round 12 (Codex review) — the helpers are TOCTOU-free, but 5 CALL SITES bypassed them
+
+Codex (task-mode) confirmed the r11 openat-walk is TOCTOU-free *inside* the helpers, but
+found several call sites still re-resolving full pathnames — containment is only as good
+as the sites that route through it. Fixed all 5 + NUL-byte rejection.
+
+### Defect 1 (HIGH) — raw rollback deletion escaped via ancestor swap
+`_rollback` did `os.remove(full)` on stored ABSOLUTE paths; an ancestor swapped to a
+symlink after apply → the by-pathname remove deletes OUTSIDE the repo. Fix: backups are
+now keyed by REPO-RELATIVE path; new `_unlink_contained(project_dir, rel)`
+(openat-walk + `os.unlink(leaf, dir_fd=parent)`) is used in BOTH rollback branches.
+
+### Defect 2 (HIGH) — apply snapshot re-resolved full paths after validation
+`_snapshot(full)` used `os.path.islink/isfile/open(full,'rb')` on the resolved path; an
+ancestor swap → the snapshot reads outside-repo bytes. Fix: `_snapshot` takes REL; new
+binary `_read_bytes_contained` (openat-walk + `O_RDONLY|O_NOFOLLOW` leaf) reads the
+backup; missing vs empty distinguished so rollback removes/ restores correctly.
+
+### Defect 3 (HIGH) — fix-loop candidate write failed closed but caller ignored it
+`_replace_contained(...)` results were never checked; a refused write (ancestor swap /
+POSIX-fail-closed) still ran `_gate_file(...)` by pathname and could mark the file FIXED
+though nothing was written. Fix: check EVERY `_replace_contained` result — a refused
+candidate write skips WITHOUT gating; a refused rollback restore records an error and
+does not treat the file as fixed.
+
+### Defect 4 (MEDIUM) — `_HAS_DIR_FD == False` did not fail closed on POSIX
+The fallback routed to the pathname-based `_contained_path`/`_write_win` (not POSIX
+TOCTOU-free). Fix: `_CONTAINMENT_FALLBACK_OK = (os.name == "nt")`; on POSIX-without-openat
+every helper returns `""`/`None`/`False` (fails closed). `_write_win` is Windows-only.
+
+### Defect 5 (HIGH) — refactor `--file` lacked full-ancestor coverage / ignored resolved_path
+The write anchored at `dirname(abspath(args.file))` + `basename(...)`, trusting ancestors
+above that parent. Fix: `_project_root_and_rel(abspath)` anchors at the file's GIT repo
+root (else its own dir) and returns the repo-relative path; `_load_source_text` READ and
+`run()` WRITE (file + `.bak`) both use it (the resolved path), so the full ancestor chain
+is walked.
+
+### Hardening — `_rel_components` rejects a NUL byte (`\0`).
+
+### AUDIT — every remaining raw os.remove / open(full) / replace under project_dir
+| Former raw site | Now routes through |
+|---|---|
+| `_rollback` new-file delete (git + non-git) | `_unlink_contained` (openat-walk) ✅ |
+| `_rollback` restore | `_replace_contained` (openat-walk) ✅ |
+| `apply` `_snapshot` read | `_read_bytes_contained` (openat-walk) ✅ |
+| fix-loop candidate + rollback writes | `_replace_contained` + result checked ✅ |
+| refactor `--file` read / backup / write | `_read_contained` / `_replace_contained` via `_project_root_and_rel` ✅ |
+| reports / config / e2e / unit-test / apply writes | `_write_contained` / `_safe_report_write` (r8-9) ✅ |
+| `~/.flexfactor` brain/status/lock, batch report (home) | FlexFactor-owned, outside any audited repo — n/a |
+
+Every read that can reach a model and every write/delete under an audited repo now
+routes through a `_walked_parent_fd`-based contained helper with a repo-relative path;
+POSIX fails closed when `dir_fd` is unavailable.
+
+Round-12 verification: **133 tests GREEN** (5 POSIX-only tests skipped on this Windows
+host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
+`git diff --check` clean, no secrets.
+
+---
+
+## Round 13 (Codex review) — the `""` fail-OPEN sentinel + 5 residuals
+
+Codex confirmed r12's call sites are closed, but found the contained TEXT read used `""`
+for BOTH an empty file AND a containment refusal — a fail-OPEN conflation.
+
+### STRUCTURAL (HIGH, findings 2 & 3) — `_read_contained` now returns `str | None`
+`None` = ANY refusal / fail-closed (escape, symlink, missing, POSIX-without-openat, IO
+error); `str` (possibly `""`) = a genuine successful read.
+- **Review (`_review_all`/`_review_one`):** a `None` read is recorded in a new
+  `unreadable` set (returned as a 3rd tuple element); the audit adds those to
+  `manual_review` and NEVER marks them clean. Previously `""`→no findings→CLEAN, so on a
+  POSIX-without-openat host (or after a post-enumeration symlink swap) EVERY file would
+  be silently marked clean.
+- **Fix loop (`_first_attempt`/`_fix_files`):** a `None` read skips the file (records an
+  error) instead of feeding `""` to the model and `_replace_contained`-ing the leaf.
+- **All other readers** (`_load_source_text`, unit-test-gen, single-file scout,
+  metadata) handle `None` as skip/empty, never leaking `"None"` or treating refusal as
+  content.
+- Tests: `ReadContainedNoneVsEmptyTests`, `ReviewUnreadableNotCleanTests`.
+
+### Defect 1 (HIGH) — `_file_sha` bypassed containment (+ NUL → ValueError)
+Clean-file hashing did `open(join(project_dir, rel), 'rb')` — followed symlinks and a
+NUL-poisoned brain rel raised `ValueError` (uncaught). Fix: `_file_sha_contained(project_dir,
+rel)` streams the FULL file through the no-follow chokepoint (`_read_bytes_contained`,
+which rejects NUL via `_rel_components`); returns `None` on refusal → callers skip (never a
+stale-clean match). Test: `FileShaContainedTests`.
+
+### Defect 4 (MEDIUM) — `_rollback` swallowed refused deletes/restores
+Fix: `_rollback` now returns the list of rels whose contained delete/restore was refused;
+`apply_integration` appends a WARNING with those rels to `ApplyResult.detail` so a failed
+rollback is surfaced, not silent. Test: `RollbackSurfacesFailuresTests`.
+
+### Defect 5 (MEDIUM) — `_project_root_and_rel` not closed for symlink-spelled roots
+It computed `relpath(abspath, root)` without realpath-normalizing, so
+`link-to-repo/src/a.py` produced a `..` relpath and fell back to a re-trusted parent. Fix:
+realpath BOTH, require the real file to be strictly under the real root, return
+`(root_real, rel_from_root_real)`, else fail closed to the file's own real directory. Test:
+`ProjectRootRealpathTests`.
+
+### Defect 6 (MEDIUM) — `_write_walk_posix` could commit a short write
+A single `os.write` may write fewer bytes; the code `os.replace`d the temp anyway, committing
+a TRUNCATED file. Fix: loop `os.write` until all bytes are written; on a short/zero write,
+unlink the temp (dir_fd) and return `None` (no partial commit). Test: `PosixShortWriteTests`.
+
+### Confirmation
+Contained text reads return `None` on refusal (no `""` conflation; refusal never marks
+clean/fixed); `_file_sha` routes through the contained helper (NUL + symlink safe);
+`_rollback` surfaces failed rels; `_project_root_and_rel` realpath-anchors at the true repo
+root; `_write_walk_posix` never commits a short write. POSIX-closed / Windows-residual matrix
+from r11 unchanged.
+
+Round-13 verification: **142 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets.
+
+---
+
+## Round 14 (Codex review) — 6 residuals; the two clean-ACCOUNTING holes were the priority
+
+Codex confirmed r13's sentinel handling is closed but found two fail-open clean-accounting
+holes (a file reaching "clean" without a fresh verified read) plus 4 more.
+
+### Defect 1 (HIGH) — unreviewed files marked clean after an early stop
+`_review_all` dropped tasks skipped by the budget/stop cutoff; the audit then computed
+`run_clean` as "every file NOT still-fixable and NOT manual_review", so a file with NO
+review result became clean by default. Fix: `_review_all` now returns a `reviewed_clean`
+ALLOWLIST (files ACTUALLY reviewed this sweep with a fresh verified read AND empty
+findings); `run_clean` is built ONLY from that allowlist. A dropped/unreviewed file is
+never clean. Tests: `ReviewCleanAllowlistTests`.
+
+### Defect 5 (HIGH) — prior-clean persisted a stale hash without a final read
+`clean_map` carried `prior_clean.get(...)` forward before hashing, so a prior-clean file
+that was skipped then changed/swapped before save persisted the OLD hash. Fix: new
+`_build_clean_map` RE-HASHES every file through the contained reader AT SAVE TIME and keeps
+it clean ONLY if readable now AND (for carried-forward prior-clean) the current hash still
+equals the prior. Tests: `CleanMapRevalidateTests`.
+
+### Defect 2 (HIGH) — callers collapsed `None` to empty context
+`resolve_program_input` turned a refused single-file read into `""`; `generate_integration`
+passed `pkg_text=None` through `_fence_untrusted`'s `text or ""` → a silent empty package
+block. Fix: both branch on `is None` and insert an explicit TRUSTED "unreadable/refused"
+marker, never empty context. Test: `RefusedReadMarkerTests`.
+
+### Defect 3 (MEDIUM) — a refused package.json disabled verification
+`_detect_verify`/`_detect_stack` treated a refused read the same as missing → a Node
+project looked non-Node / verify-less (fix loop ran with the build gate silently off). Fix:
+tri-state `_read_package_json` → `ok | missing | refused`; only `missing` means not-Node.
+`refused` FAILS CLOSED: `_detect_verify` returns a `None` verify sentinel (`apply_integration`
+returns `skipped-config-refused`); `_detect_stack` sets `config_refused` and
+`audit_one_program` refuses to audit. Test: `PackageRefusedFailsClosedTests`.
+
+### Defect 4 (MEDIUM) — `_file_sha_contained` accumulated the whole file
+It called `_read_bytes_contained(cap=1<<62)` and hashed the full bytes (memory-blow on a
+brain-controlled large rel). Fix: new `_open_contained_fd` context manager + a chunked
+`os.read` loop updating `hashlib.sha256()` with a bounded 64k buffer; `None` on refusal.
+Test: `FileShaStreamingTests`.
+
+### Defect 6 (MEDIUM) — Windows fallback temp not exclusive/no-follow, single write
+`_write_win` used `open(tmp,'wb')` (predictable name, no O_EXCL/no-follow, single write).
+Fix: `os.open(... O_CREAT|O_EXCL|O_BINARY [+O_NOFOLLOW])` + a looped `os.write` (no short-write
+commit) + the parent-identity recheck. POSIX stays fully closed; Windows remains the
+narrowed fallback but with a tightened temp create. Test: `WinShortWriteAndExclTests`.
+
+Round-14 verification: **152 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. 'clean' is now a fresh-review allowlist; prior-clean is revalidated at
+save; the remaining `_read_contained` callers branch on `None`; `_file_sha` streams; the
+Windows temp is `O_EXCL`. POSIX-closed / Windows-residual matrix unchanged.
+
+---
+
+## Round 15 (Codex review) — 4 more; the two clean-ACCOUNTING ones were the priority
+
+Codex confirmed r14 is closed but found a FAILED or ABORTED review, and a SWAP between
+review and save, could still reach "clean".
+
+### Defect 1 (HIGH) — an aborted/failed review could be marked clean
+`_review_one` returned `(rel, [])` (→ clean) even when `review_file()` raised
+`BudgetExceededError` before any reviewer completed, or every reviewer threw a generic
+exception — empty findings from a FAILED review looked clean. Fix: track review
+COMPLETION explicitly; only a review where EVERY reviewer COMPLETED successfully with empty
+findings returns clean. A budget/refusal/provider-exception abort returns an `incomplete`
+sentinel and is NEVER added to `reviewed_clean` (re-reviewed next cycle). Tests:
+`ReviewCleanAllowlistTests.test_aborted_review_is_not_clean` / `test_budget_abort_review_is_not_clean`.
+
+### Defect 2 (HIGH) — a new-clean hash wasn't tied to the reviewed bytes
+`_build_clean_map` hashed a newly-clean file AT SAVE with no prior, so a swap/change
+between review and save persisted the NEW unreviewed hash as clean. Fix: `_review_all`
+now returns `reviewed_clean` as `{rel: reviewed_sha}` (sha of the EXACT bytes reviewed,
+via `_read_text_and_sha`); the audit carries `run_clean_sha`; `_build_clean_map` keeps a
+file clean ONLY if its save-time hash equals the reviewed_sha (new-clean) or the prior
+hash (carried-forward) — a file with no reference hash or a mismatch is DROPPED. Tests:
+`CleanMapRevalidateTests`.
+
+### Defect 3 (MEDIUM) — folder profiling silently omitted refused metadata
+`_gather_from_folder`'s `if raw:` skipped a refused package.json/README with no marker
+(model saw absence, not refusal). Fix: tri-state `_read_meta_tristate` → an explicit
+trusted "[EXISTS but could not be safely read - refused]" marker; an empty file is real
+(empty) content, distinct from missing. Test: `FolderGatherRefusedMarkerTests`.
+
+### Defect 4 (MEDIUM) — integration modify-reads used truthiness
+`generate_integration`'s `if body:` skipped a refused OR empty existing modify-target;
+if all skipped, the model was told "creating new files only" and apply could then write a
+file the model never saw. Fix: branch on `is None`; an EXISTING but refused modify-target
+FAILS CLOSED (integration refused); an empty existing file is shown as its real (empty)
+contents; a truly missing one is a create. Tests: `IntegrationModifyEmptyMissingTests`,
+`ModifyFilesInRepoSymlinkReadTests` (now asserts the refusal).
+
+Round-15 verification: **157 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Clean now requires a SUCCESSFULLY-COMPLETED review AND the persisted
+hash is the reviewed_sha of the exact bytes (a review->save swap drops it); the
+folder-gather + integration-modify readers branch on `None`. POSIX-closed / Windows-residual
+matrix unchanged.
+
+---
+
+## Round 16 (Codex review) — 3 narrower ordering/consistency residuals
+
+### Defect 1 (MEDIUM) — a whitespace-only file was clean WITHOUT a review
+`_review_one` early-returned `(rel, [], sha)` when `text.strip()` was empty, BEFORE any
+reviewer ran, so a whitespace-only candidate file (size > 0, not enumeration-skipped) went
+into `reviewed_clean` un-reviewed - "clean" again didn't mean "reviewed". Fix: removed the
+pre-review early return; every reviewer runs even for empty/whitespace text, so clean
+always means a COMPLETED review (skipping trivial files belongs at enumeration, not here).
+Tests: `WhitespaceFileReviewedTests`.
+
+### Defect 2 (MEDIUM) — a refused symlink modify-target pointing OUTSIDE wasn't fail-closed
+In `generate_integration`, a `modify_files` entry that is a symlink leaf pointing OUTSIDE
+the repo makes `_read_contained` return None AND `_contained_path` return None, so the old
+order `if _rel_components is None or _contained_path is None: continue` skipped it as
+"outside" BEFORE `_contained_lexists` could detect the existing leaf - the integration was
+NOT refused at generation time (fell through toward create-only). Fix: check
+`_contained_lexists` (existence) BEFORE the containment-None skip and RETURN THE REFUSAL if
+the target exists but couldn't be safely read. Test: `IntegrationModifyOutsideSymlinkTests`.
+
+### Defect 3 (MEDIUM) — an empty package.json looked like a missing one
+`_gather_from_folder`'s `elif pkg_status == "ok" and raw:` was false for an empty
+package.json (`("ok", "")`), so the prompt was identical to a MISSING one. Fix: branch on
+`pkg_status == "ok"` and append an explicit `[present but empty]` marker (parse only when
+`raw.strip()` is non-empty); missing (no marker) / present-but-empty / refused are now three
+distinct states. Test: `EmptyPackageJsonDistinctTests`.
+
+Round-16 verification: **161 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Whitespace-only files are never clean-without-review; a refused symlink
+modify-target fails closed (existence checked before the containment-None skip); empty
+package.json is distinct from missing/refused. POSIX-closed / Windows-residual matrix unchanged.
+
+---
+
+## Round 17 (Codex review) — ROOT: existence was binary (refused collapsed to missing)
+
+Codex confirmed r16's fixes but found both remaining issues shared ONE root:
+`_contained_lexists` returned `False` for BOTH "doesn't exist" AND "refused/couldn't-check",
+so a refused existence collapsed to "missing" and callers failed OPEN.
+
+### ROOT FIX — existence is now TRI-STATE
+Replaced the boolean `_contained_lexists` with `_contained_existence(project_dir, rel) ->
+'exists' | 'missing' | 'refused'`. On POSIX it walks each component with openat +
+`O_NOFOLLOW` and classifies the failure by errno: `ENOENT` on a component -> definitive
+`missing`; `ELOOP` (symlink) / `ENOTDIR` / anything else -> `refused`; a malformed path or
+POSIX-without-openat -> `refused`. A `refused` existence is NEVER treated as `missing`.
+
+### Defect 1 (caller) — integration treated a refused modify-target as CREATE
+Repro: repo has `real/app.js`; `alias` is a symlink DIRECTORY to `real`; plan
+`modify_files:["alias/app.js"]`. `_read_contained` refused (ancestor symlink) -> None;
+old `_contained_lexists` -> False; `_contained_path` -> non-None (realpath stays inside);
+code fell through as "missing -> create". Fix: use `_contained_existence`; only a
+DEFINITIVE `missing` is a create - `exists` OR `refused` FAILS CLOSED (integration refused).
+Tests: `IntegrationRefusedExistenceFailsClosedTests` (incl. a POSIX ancestor-symlink-dir).
+
+### Defect 2 (caller) — POSIX-without-openat wasn't fail-closed in metadata detection
+With `_POSIX_NOFOLLOW==False` and `_CONTAINMENT_FALLBACK_OK==False` and a REAL package.json,
+`_read_contained` -> None and old `_contained_lexists` -> False, so `_read_meta_tristate`
+returned `('missing', None)` -> disabled Node/build detection. Fix: `_read_meta_tristate`
+returns `('missing', None)` ONLY when `_contained_existence == 'missing'`; otherwise
+`('refused', None)` -> `_detect_verify`/`_detect_stack` fail closed (per r14/r15). Test:
+`MetaTristatePosixFailClosedTests`.
+
+### AUDIT — every `_contained_existence` caller maps `refused` to fail-closed
+| Caller | `missing` | `refused` | `exists` |
+|---|---|---|---|
+| `generate_integration` modify-read | create (skip blob) | REFUSE integration | REFUSE integration |
+| `_read_meta_tristate` (→ `_read_package_json`, `_gather_from_folder`) | `('missing',None)` | `('refused',None)` → fail closed / marker | `('refused',None)` (read already None) |
+No caller maps `refused` to missing/create/not-present.
+
+Round-17 verification: **168 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Existence is tri-state (`refused != missing`); the integration-create and
+package-detection callers both fail closed on a refused existence. POSIX-closed /
+Windows-residual matrix unchanged.
+
+---
+
+## Round 18 (Codex review) — one more None-as-create the tri-state hadn't reached
+
+Codex confirmed `_contained_existence` + its direct callers are closed, but found the SAME
+None-as-create pattern in `apply_integration._snapshot`.
+
+### Defect — `_snapshot` collapsed a refused read into "created"
+`_snapshot(rel)` did `data = _read_bytes_contained(...); if data is None: created.add(rel)`
+— treating a None read (missing OR symlink/refused/escape) as a newly-created file. Repro:
+non-git Node project, readable `package.json` but `package-lock.json` is a SYMLINK; an
+integration with non-empty `packages` — `_detect_verify` passes (package.json readable),
+`_snapshot("package-lock.json")` gets None and marks it CREATED; then on rollback
+`_rollback` `_unlink_contained()`s that pre-existing refused symlink as if we'd made it.
+- Fix: `_snapshot` gates on tri-state `_contained_existence`:
+  - `missing` → genuinely absent → `created.add(rel)` (rollback unlinks it — correct).
+  - `exists` (unreadable, e.g. a symlink leaf/manifest) → FAIL CLOSED (`ApplyError`).
+  - `refused` (can't determine) → FAIL CLOSED.
+  So a pre-existing unreadable/symlinked file is NEVER marked created, and `_rollback` only
+  unlinks rels that were genuinely `created` (definitively missing at snapshot).
+- Tests: `SnapshotTriStateTests` — a pre-existing symlinked `package-lock.json` +
+  non-empty packages fails closed (NOT marked created, rollback does NOT unlink it, target
+  intact); a genuinely-absent create-file is still snapshotted `created` and unlinked on
+  rollback.
+
+Round-18 verification: **170 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. `_snapshot` uses tri-state existence (a refused/exists read is never
+treated as created) and rollback only unlinks genuinely-created files. POSIX-closed /
+Windows-residual matrix unchanged.
+
+---
+
+## Round 19 (Codex review) — Windows reparse-point ancestor bypass + unit-test-gen refusal
+
+### Defect 1 (HIGH — real Windows containment bypass) — symlink/junction ancestors resolving INSIDE the repo
+The Windows fallback used `_contained_path` (realpath, which RESOLVES symlinks/junctions),
+so `repo\alias -> repo\real` made `_read_contained(repo,"alias/file.py")` read THROUGH the
+alias, `_write_win` write THROUGH it, and `_contained_existence` return `missing` — a static
+(not sub-ms) containment bypass violating the "symlink ancestor => refused" contract.
+- Fix: new `_win_walk(project_dir, comps)` — a LITERAL Windows ancestor walk that `lstat`s
+  each component and REJECTS any symlink OR reparse point (junction/mount, via
+  `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`) BEFORE any realpath-based open, plus
+  `_is_reparse()` for the leaf. Applied consistently across ALL SIX helpers: the read fd
+  chokepoint `_open_contained_fd` (now used by `_read_contained` + `_read_bytes_contained` +
+  `_file_sha_contained` + `_read_text_and_sha`), `_write_win`, `_contained_existence`, and
+  `_unlink_contained`. A symlink/junction ANYWHERE in the ancestor chain is now refused on
+  Windows too. Tests: `ReparseAncestorRefusedTests` (run on this host — dir symlinks work).
+
+### Defect 2 (MEDIUM) — unit-test-gen conflated a refusal with an empty module
+`if text is None or not text.strip(): continue` skipped a refused read (symlink/containment
+swap) the SAME as an empty module. Fix: `_classify_source_read` → `refused | empty | ok`;
+a `refused` file is added to `manual_review` + notes (never silently skipped), `empty` skips
+quietly. Test: `ClassifySourceReadTests`.
+
+### PLATFORM MATRIX — updated (Windows upgraded)
+
+| Guarantee | POSIX (openat-walk) | Windows (reparse-walk) |
+|---|---|---|
+| Leaf symlink/junction refused | ✅ `O_NOFOLLOW` | ✅ `lstat` + `_is_reparse` |
+| Ancestor symlink/junction refused (outside OR **inside** repo) | ✅ per-component `O_NOFOLLOW` | ✅ per-component `lstat` reparse-reject (**was a bypass, now closed**) |
+| Post-validation swap of leaf/ancestor | ✅ fully closed (dir_fd, no re-resolve) | ⚠️ sub-ms `lstat`→syscall TOCTOU only (documented) |
+
+**RESIDUAL (Windows, honest — narrowed):** with the literal reparse walk, the ONLY remaining
+Windows residual is the true sub-millisecond swap between the `lstat` classification and the
+very next syscall (no `dir_fd`/`O_NOFOLLOW` to bind the handle). Static symlink/junction
+ancestors — inside or outside the repo — are now REFUSED, at POSIX parity. Only native handle
+APIs (`NtCreateFile` + `FILE_FLAG_OPEN_REPARSE_POINT`, not exposed by Python's `os`) could
+close the final sub-ms window. POSIX remains fully closed.
+
+Round-19 verification: **173 tests GREEN** (7 POSIX-only tests skipped on this Windows host;
+the reparse-ancestor tests RAN here), dashboard OK, all `--help` exit 0, three launchers ASCII
++ parse-clean, `git diff --check` clean, no secrets. Windows refuses symlink/junction ancestors
+across all six helpers; unit-test-gen distinguishes refusal from empty.
+
+---
+
+## Round 20 (Codex review) — the last enumeration path outside `_win_walk`: `_file_tree`
+
+### Defect (info disclosure) — `_file_tree` walked junctions on Windows
+`_file_tree` (`os.walk` + an `os.path.islink` prune) did NOT catch a Windows JUNCTION/mount:
+`os.path.islink` returns False for a junction, so `os.walk` descended it and the junction
+TARGET's filenames (outside the repo) entered the profile / file-tree prompt (info disclosure).
+Repro: `mklink /J C:\repo\j C:\ff-outside` → `_file_tree("C:\repo")` listed `j\src\leaked.py`.
+This path never went through `_win_walk`.
+- Fix: prune any directory that is a symlink OR reparse point (junction/mount) in `_file_tree`'s
+  `os.walk` using the same `_is_reparse()` detection the containment walk uses, and skip a
+  reparse-point LEAF entry. Applied the same `islink → _is_reparse` upgrade to
+  `_enumerate_source_files` (the audit's review enumeration) for consistency, so no junction
+  target's paths enter ANY prompt. POSIX symlinked dirs stay pruned (`_is_reparse` covers
+  `S_ISLNK`).
+- Tests: `FileTreeReparsePruneTests` — a junction (and a dir symlink) inside the repo pointing
+  outside → its target's filenames are absent from `_file_tree`; a normal subdir still lists.
+  (The junction test RAN on this host — `mklink /J` works without admin.)
+
+Round-20 verification: **175 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. `_file_tree` (and `_enumerate_source_files`) prune junctions/reparse points,
+closing the last enumeration path outside `_win_walk` — no outside-repo filename enters a prompt.
+The Windows residual remains ONLY the documented sub-ms leaf/ancestor swap TOCTOU; POSIX fully
+closed.

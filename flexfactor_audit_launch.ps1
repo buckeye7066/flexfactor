@@ -1,9 +1,9 @@
 # FlexFactor Audit launcher - double-click the icon, or drag a project folder /
 # .lnk / file / URL onto it. Goes straight into audit mode: a line-by-line
-# review that tests every function and every button, then aggressively fixes
-# every defect it finds (committing/pushing/merging each cycle). When both API
-# keys are present it runs TWO models (primary + cross-check) for tougher review.
-# Choose "report" to get the findings without changing any code.
+# review that tests every function and every button. The SAFE DEFAULT is
+# report-only; choose "apply" to aggressively fix every defect it finds
+# (committing each verified cycle LOCALLY on the audit branch, no push). When
+# both API keys are present it runs TWO models (primary + cross-check).
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -70,13 +70,15 @@ $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultPr
 if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
 $primary = $provider
 
-# Apply vs report-only. Default is to apply fixes.
-$apply = Read-Host "Apply fixes? [yes/report] (Enter = yes)"
-if ($apply -eq "report") {
-    $extraArgs += "--report-only"
-    Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
+# Apply vs report-only. SAFE DEFAULT is report-only; type "apply" to opt in to
+# committing verified fixes LOCALLY on the audit branch (no push).
+$apply = Read-Host "Apply fixes? [report / apply] (Enter = report)"
+if ($apply -match '^(a|apply|y|yes)$') {
+    $extraArgs += "--apply"
+    $extraArgs += "--yes"
+    Write-Host "Apply mode: verified fixes are committed LOCALLY on the audit branch (no push)." -ForegroundColor Yellow
 } else {
-    Write-Host "Apply mode: verified fixes are committed and pushed each cycle." -ForegroundColor DarkGray
+    Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
 }
 
 # Economy mode: author fixes/tests with Claude Sonnet 5 (about 40% cheaper than
