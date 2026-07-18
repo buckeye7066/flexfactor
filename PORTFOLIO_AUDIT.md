@@ -1050,3 +1050,30 @@ Round-19 verification: **173 tests GREEN** (7 POSIX-only tests skipped on this W
 the reparse-ancestor tests RAN here), dashboard OK, all `--help` exit 0, three launchers ASCII
 + parse-clean, `git diff --check` clean, no secrets. Windows refuses symlink/junction ancestors
 across all six helpers; unit-test-gen distinguishes refusal from empty.
+
+---
+
+## Round 20 (Codex review) — the last enumeration path outside `_win_walk`: `_file_tree`
+
+### Defect (info disclosure) — `_file_tree` walked junctions on Windows
+`_file_tree` (`os.walk` + an `os.path.islink` prune) did NOT catch a Windows JUNCTION/mount:
+`os.path.islink` returns False for a junction, so `os.walk` descended it and the junction
+TARGET's filenames (outside the repo) entered the profile / file-tree prompt (info disclosure).
+Repro: `mklink /J C:\repo\j C:\ff-outside` → `_file_tree("C:\repo")` listed `j\src\leaked.py`.
+This path never went through `_win_walk`.
+- Fix: prune any directory that is a symlink OR reparse point (junction/mount) in `_file_tree`'s
+  `os.walk` using the same `_is_reparse()` detection the containment walk uses, and skip a
+  reparse-point LEAF entry. Applied the same `islink → _is_reparse` upgrade to
+  `_enumerate_source_files` (the audit's review enumeration) for consistency, so no junction
+  target's paths enter ANY prompt. POSIX symlinked dirs stay pruned (`_is_reparse` covers
+  `S_ISLNK`).
+- Tests: `FileTreeReparsePruneTests` — a junction (and a dir symlink) inside the repo pointing
+  outside → its target's filenames are absent from `_file_tree`; a normal subdir still lists.
+  (The junction test RAN on this host — `mklink /J` works without admin.)
+
+Round-20 verification: **175 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. `_file_tree` (and `_enumerate_source_files`) prune junctions/reparse points,
+closing the last enumeration path outside `_win_walk` — no outside-repo filename enters a prompt.
+The Windows residual remains ONLY the documented sub-ms leaf/ancestor swap TOCTOU; POSIX fully
+closed.

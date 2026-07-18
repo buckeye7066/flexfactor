@@ -3007,5 +3007,50 @@ class ClassifySourceReadTests(unittest.TestCase):
                 self.assertEqual(ff._classify_source_read(proj, "link.py"), (None, "refused"))
 
 
+class FileTreeReparsePruneTests(unittest.TestCase):
+    """Round-20: _file_tree prunes junctions/reparse points so no outside-repo filename
+    from a junction/symlink TARGET enters the profile/file-tree prompt."""
+
+    def test_junction_target_not_listed(self):
+        import subprocess
+        import tempfile
+        if os.name != "nt":
+            self.skipTest("Windows junction test")
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "ff-outside")
+            os.makedirs(os.path.join(outside, "src"))
+            with open(os.path.join(outside, "src", "leaked.py"), "w", encoding="utf-8") as fh:
+                fh.write("LEAK")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(repo, "realsub"))
+            with open(os.path.join(repo, "realsub", "ok.py"), "w", encoding="utf-8") as fh:
+                fh.write("ok")
+            junc = os.path.join(repo, "j")
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", junc, outside], capture_output=True)
+            if r.returncode != 0:
+                self.skipTest("cannot create junction on this host")
+            tree = [t.replace("\\", "/") for t in ff._file_tree(repo, max_entries=200)]
+            self.assertFalse(any("leaked" in t for t in tree))   # junction TARGET not leaked
+            self.assertNotIn("j/src/leaked.py", tree)
+            self.assertIn("realsub/ok.py", tree)                 # normal subdir still enumerated
+
+    def test_symlink_dir_target_not_listed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside")
+            os.makedirs(outside)
+            with open(os.path.join(outside, "leaked.py"), "w", encoding="utf-8") as fh:
+                fh.write("LEAK")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(repo, "realsub"))
+            with open(os.path.join(repo, "realsub", "ok.py"), "w", encoding="utf-8") as fh:
+                fh.write("ok")
+            if not _try_dir_symlink(os.path.join(repo, "alias"), outside):
+                self.skipTest("directory symlinks not permitted here")
+            tree = [t.replace("\\", "/") for t in ff._file_tree(repo, max_entries=200)]
+            self.assertFalse(any("leaked" in t for t in tree))   # symlink TARGET not leaked
+            self.assertIn("realsub/ok.py", tree)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

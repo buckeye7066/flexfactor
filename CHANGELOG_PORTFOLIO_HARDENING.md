@@ -355,6 +355,15 @@ raw pathname. All now go through the openat-walk helpers:
 - **Unit-test generation** now distinguishes a file it couldn't safely read (flagged for
   manual review) from a genuinely empty module (skipped quietly).
 
+## Round 20 (2026-07-18) — the folder listing no longer descends junctions
+
+- **The shallow folder listing sent to the model now skips Windows junctions and
+  reparse points**, not just plain symlinks. Previously a junction inside a repo (which
+  Windows doesn't report as a symlink) was walked, so filenames from the junction's
+  outside-the-repo target leaked into the profile prompt. Both the folder listing and
+  the audit's file enumeration now use the same reparse-point detection as the rest of
+  the containment code, so no outside-repo filename can enter a prompt.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

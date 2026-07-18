@@ -1590,19 +1590,21 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     without drowning in node_modules."""
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune noise/hidden AND symlinked dirs so the tree never lists names from a
-        # symlink target outside the repo.
+        # Prune noise/hidden AND reparse-point dirs (symlinks POSIX+Windows, PLUS Windows
+        # junctions/mounts - os.path.islink does NOT catch a junction, so os.walk would
+        # descend it and leak the junction TARGET's filenames outside the repo into the
+        # prompt). _is_reparse covers both.
         dirnames[:] = [d for d in dirnames
                        if d not in _SKIP_DIRS and not d.startswith(".")
-                       and not os.path.islink(os.path.join(dirpath, d))]
+                       and not _is_reparse(os.path.join(dirpath, d))]
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         if depth > 2:
             dirnames[:] = []
             continue
         for f in filenames:
-            if os.path.islink(os.path.join(dirpath, f)):
-                continue  # don't surface a symlinked file's name either
+            if _is_reparse(os.path.join(dirpath, f)):
+                continue  # don't surface a symlinked/reparse-point file's name either
             out.append(os.path.join(rel, f) if rel != "." else f)
             if len(out) >= max_entries:
                 return out
@@ -3529,20 +3531,21 @@ def _enumerate_source_files(project_dir: str, max_files: int,
     git_files = _git_real_files(project_dir)
     out: list[tuple[str, int]] = []
     for dirpath, dirnames, filenames in os.walk(project_dir):
-        # Prune noise/hidden dirs AND symlinked dirs: os.walk would otherwise descend
-        # a symlinked directory that points outside the repo.
+        # Prune noise/hidden dirs AND reparse-point dirs (symlinks + Windows junctions/
+        # mounts): os.walk would otherwise descend a junction pointing outside the repo
+        # (os.path.islink misses junctions). _is_reparse covers both.
         dirnames[:] = [d for d in dirnames
                        if d not in _SKIP_DIRS and not d.startswith(".")
-                       and not os.path.islink(os.path.join(dirpath, d))]
+                       and not _is_reparse(os.path.join(dirpath, d))]
         for f in filenames:
             if os.path.splitext(f)[1].lower() not in _CODE_EXTS:
                 continue
             if f.endswith((".min.js", ".min.css", ".bundle.js", ".d.ts")):
                 continue
             full = os.path.join(dirpath, f)
-            # SYMLINK GUARD: never enumerate a symlinked file - it can point at an
+            # REPARSE GUARD: never enumerate a symlinked/junction file - it can point at an
             # outside-repo secret whose contents would then be read into a prompt.
-            if os.path.islink(full):
+            if _is_reparse(full):
                 continue
             rel = os.path.relpath(full, project_dir)
             relslash = rel.replace("\\", "/")
