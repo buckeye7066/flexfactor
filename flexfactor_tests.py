@@ -2263,20 +2263,24 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
         real = ff._read_contained
         ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
         try:
-            ffindings, flat, unreadable = ff._review_all([], "/proj", ["x.py"], workers=1)
+            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+                [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_contained = real
         self.assertIn("x.py", unreadable)
-        self.assertNotIn("x.py", ffindings)   # not fixable, and NOT marked clean
+        self.assertNotIn("x.py", ffindings)      # not fixable
+        self.assertNotIn("x.py", reviewed_clean)  # and NOT in the clean allowlist
 
     def test_empty_file_is_clean_not_unreadable(self):
         real = ff._read_contained
         ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ""
         try:
-            ffindings, flat, unreadable = ff._review_all([], "/proj", ["x.py"], workers=1)
+            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+                [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_contained = real
-        self.assertEqual(unreadable, set())    # empty read is clean, not unreadable
+        self.assertEqual(unreadable, set())      # empty read is clean, not unreadable
+        self.assertIn("x.py", reviewed_clean)     # empty file = a fresh clean read
         self.assertNotIn("x.py", ffindings)
 
 
@@ -2343,6 +2347,183 @@ class PosixShortWriteTests(unittest.TestCase):
                 ff.os.write = real_write
             self.assertIsNone(out)                              # write failed closed
             self.assertFalse(os.path.exists(os.path.join(proj, "f.txt")))  # nothing committed
+
+
+class ReviewCleanAllowlistTests(unittest.TestCase):
+    """Round-14 defect 1: 'clean' is an ALLOWLIST of freshly-reviewed-empty files. A file
+    dropped by the budget/stop cutoff (never reviewed) is NEVER clean by default."""
+
+    def test_early_stop_leaves_files_not_clean(self):
+        # Meter already over the cap -> every _review_one returns None (capped) -> the
+        # files are dropped and NONE end up in the clean allowlist.
+        m = ff.CostMeter(limit_usd=0.01)
+        m.record("claude-opus-4-8", input_tokens=1_000_000)  # push well over the cap
+        ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            [], "/proj", ["a.py", "b.py", "c.py"], meter=m, workers=2)
+        self.assertEqual(reviewed_clean, set())  # nothing reviewed -> nothing clean
+        self.assertEqual(unreadable, set())
+
+    def test_reviewed_empty_files_are_clean(self):
+        real = ff._read_contained
+        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: "code\n"
+        real_rf = ff.review_file
+        ff.review_file = lambda reviewer, rel, text: ([], "")  # no findings
+        try:
+            _, _, unreadable, reviewed_clean = ff._review_all(
+                [object()], "/proj", ["a.py", "b.py"], workers=2)
+        finally:
+            ff._read_contained = real
+            ff.review_file = real_rf
+        self.assertEqual(reviewed_clean, {"a.py", "b.py"})  # fresh clean reads -> allowlist
+
+
+class RefusedReadMarkerTests(unittest.TestCase):
+    """Round-14 defect 2: a refused read yields an explicit marker, not empty context."""
+
+    def test_single_file_refusal_inserts_marker(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, "secret.py")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SECRET=1")
+            link = os.path.join(tmp, "link.py")
+            if not _try_symlink(link, secret):
+                self.skipTest("symlinks not permitted here")
+            name, ctx = ff.resolve_program_input(link)
+            self.assertNotIn("SECRET=1", ctx)                       # target not disclosed
+            self.assertIn("could not be safely read", ctx)          # explicit marker
+
+
+class PackageRefusedFailsClosedTests(unittest.TestCase):
+    """Round-14 defect 3: a refused package.json is tri-stated and fails closed - it does
+    NOT make a Node project look non-Node / verification-less."""
+
+    def test_tristate_and_verify_and_stack(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            # missing
+            self.assertEqual(ff._read_package_json(proj)[0], "missing")
+            self.assertEqual(ff._detect_verify(proj), (False, []))
+            self.assertFalse(ff._detect_stack(proj)["config_refused"])
+            # refused (symlinked package.json)
+            outside = os.path.join(tmp, "pkg.json")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write('{"scripts":{"build":"x"}}')
+            if not _try_symlink(os.path.join(proj, "package.json"), outside):
+                self.skipTest("symlinks not permitted here")
+            self.assertEqual(ff._read_package_json(proj)[0], "refused")
+            is_node, verify = ff._detect_verify(proj)
+            self.assertTrue(is_node)
+            self.assertIsNone(verify)   # refused sentinel -> caller fails closed
+            self.assertTrue(ff._detect_stack(proj)["config_refused"])
+
+
+class FileShaStreamingTests(unittest.TestCase):
+    """Round-14 defect 4: contained hash streams (multi-chunk) and matches a known
+    digest; refusal -> None."""
+
+    def test_multichunk_digest_matches_hashlib(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            blob = (b"abcdefgh" * 40000)  # 320 KB -> multiple 64k os.read chunks
+            with open(os.path.join(proj, "big.bin"), "wb") as fh:
+                fh.write(blob)
+            self.assertEqual(ff._file_sha_contained(proj, "big.bin"),
+                             hashlib.sha256(blob).hexdigest())
+
+    def test_symlink_refusal_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "s")
+            with open(secret, "wb") as fh:
+                fh.write(b"S")
+            if _try_symlink(os.path.join(proj, "link"), secret):
+                self.assertIsNone(ff._file_sha_contained(proj, "link"))
+
+
+class CleanMapRevalidateTests(unittest.TestCase):
+    """Round-14 defect 5: prior-clean is RE-HASHED at save; a file changed since run
+    start is NOT persisted as clean with the stale hash."""
+
+    def test_changed_prior_clean_dropped(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("clean-at-start")
+            start_hash = hashlib.sha256(b"clean-at-start").hexdigest()
+            # It CHANGES between run-start and save.
+            with open(os.path.join(proj, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("MUTATED before save")
+            cm = ff._build_clean_map(proj, ["a.py"], {"a.py": start_hash})
+            self.assertNotIn("a.py", cm)  # stale hash NOT persisted
+
+    def test_unchanged_prior_clean_kept_with_fresh_hash(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("stable")
+            h = hashlib.sha256(b"stable").hexdigest()
+            cm = ff._build_clean_map(proj, ["a.py"], {"a.py": h})
+            self.assertEqual(cm.get("a.py"), h)
+
+    def test_run_clean_file_hashed_fresh(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "b.py"), "w", encoding="utf-8") as fh:
+                fh.write("new-clean")
+            cm = ff._build_clean_map(proj, ["b.py"], {})  # no prior hash -> hash fresh
+            self.assertEqual(cm.get("b.py"), hashlib.sha256(b"new-clean").hexdigest())
+
+
+class WinShortWriteAndExclTests(unittest.TestCase):
+    """Round-14 defect 6: the Windows fallback temp create is exclusive and a short
+    write is not committed. Runs on the pathname-fallback platform (this Windows host)."""
+
+    def setUp(self):
+        if ff._POSIX_NOFOLLOW:
+            self.skipTest("this host uses the POSIX openat writer, not the win fallback")
+
+    def test_short_write_not_committed(self):
+        import tempfile
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_write(fd, data):
+            # Partial progress once, then STALL (return 0) -> the writer must fail closed
+            # and NOT commit the truncated temp.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd, data[:1])
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            ff.os.write = short_write
+            try:
+                out = ff._write_contained(proj, "f.txt", "HELLO WORLD")
+            finally:
+                ff.os.write = real_write
+            self.assertIsNone(out)
+            self.assertFalse(os.path.exists(os.path.join(proj, "f.txt")))
+            # no leftover temp files either
+            self.assertEqual([f for f in os.listdir(proj) if f.endswith(".tmp")], [])
 
 
 if __name__ == "__main__":

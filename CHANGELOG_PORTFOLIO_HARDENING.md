@@ -282,6 +282,23 @@ raw pathname. All now go through the openat-walk helpers:
 - **The POSIX atomic writer loops the write**, so a short write can never commit a
   truncated file.
 
+## Round 14 (2026-07-18) — clean is now an allowlist; 5 more residuals
+
+- **"Clean" is now an allowlist of freshly-reviewed files.** A file is only remembered
+  clean if it was actually reviewed this run with a verified read and no findings - a
+  file skipped because the budget/stop cutoff hit is never marked clean by default.
+- **Prior-clean memory is re-verified at save.** Each carried-forward clean file is
+  re-read and re-hashed when the run ends and kept clean only if it still matches - no
+  stale hash is persisted for a file that changed after the run started.
+- **A refused read is never passed on as empty content.** The remaining readers insert
+  an explicit "unreadable" marker instead of an empty block/context.
+- **A package.json that can't be safely read now fails closed** (tri-state read) instead
+  of making a Node project look non-Node and running with verification silently off.
+- **Clean-file hashing streams** with a bounded buffer instead of reading the whole file
+  into memory.
+- **The Windows atomic writer** creates its temp exclusively (O_EXCL) and loops the write
+  so a short write can't commit a truncated file.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

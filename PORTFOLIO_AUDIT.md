@@ -797,3 +797,57 @@ from r11 unchanged.
 Round-13 verification: **142 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
 dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
 clean, no secrets.
+
+---
+
+## Round 14 (Codex review) — 6 residuals; the two clean-ACCOUNTING holes were the priority
+
+Codex confirmed r13's sentinel handling is closed but found two fail-open clean-accounting
+holes (a file reaching "clean" without a fresh verified read) plus 4 more.
+
+### Defect 1 (HIGH) — unreviewed files marked clean after an early stop
+`_review_all` dropped tasks skipped by the budget/stop cutoff; the audit then computed
+`run_clean` as "every file NOT still-fixable and NOT manual_review", so a file with NO
+review result became clean by default. Fix: `_review_all` now returns a `reviewed_clean`
+ALLOWLIST (files ACTUALLY reviewed this sweep with a fresh verified read AND empty
+findings); `run_clean` is built ONLY from that allowlist. A dropped/unreviewed file is
+never clean. Tests: `ReviewCleanAllowlistTests`.
+
+### Defect 5 (HIGH) — prior-clean persisted a stale hash without a final read
+`clean_map` carried `prior_clean.get(...)` forward before hashing, so a prior-clean file
+that was skipped then changed/swapped before save persisted the OLD hash. Fix: new
+`_build_clean_map` RE-HASHES every file through the contained reader AT SAVE TIME and keeps
+it clean ONLY if readable now AND (for carried-forward prior-clean) the current hash still
+equals the prior. Tests: `CleanMapRevalidateTests`.
+
+### Defect 2 (HIGH) — callers collapsed `None` to empty context
+`resolve_program_input` turned a refused single-file read into `""`; `generate_integration`
+passed `pkg_text=None` through `_fence_untrusted`'s `text or ""` → a silent empty package
+block. Fix: both branch on `is None` and insert an explicit TRUSTED "unreadable/refused"
+marker, never empty context. Test: `RefusedReadMarkerTests`.
+
+### Defect 3 (MEDIUM) — a refused package.json disabled verification
+`_detect_verify`/`_detect_stack` treated a refused read the same as missing → a Node
+project looked non-Node / verify-less (fix loop ran with the build gate silently off). Fix:
+tri-state `_read_package_json` → `ok | missing | refused`; only `missing` means not-Node.
+`refused` FAILS CLOSED: `_detect_verify` returns a `None` verify sentinel (`apply_integration`
+returns `skipped-config-refused`); `_detect_stack` sets `config_refused` and
+`audit_one_program` refuses to audit. Test: `PackageRefusedFailsClosedTests`.
+
+### Defect 4 (MEDIUM) — `_file_sha_contained` accumulated the whole file
+It called `_read_bytes_contained(cap=1<<62)` and hashed the full bytes (memory-blow on a
+brain-controlled large rel). Fix: new `_open_contained_fd` context manager + a chunked
+`os.read` loop updating `hashlib.sha256()` with a bounded 64k buffer; `None` on refusal.
+Test: `FileShaStreamingTests`.
+
+### Defect 6 (MEDIUM) — Windows fallback temp not exclusive/no-follow, single write
+`_write_win` used `open(tmp,'wb')` (predictable name, no O_EXCL/no-follow, single write).
+Fix: `os.open(... O_CREAT|O_EXCL|O_BINARY [+O_NOFOLLOW])` + a looped `os.write` (no short-write
+commit) + the parent-identity recheck. POSIX stays fully closed; Windows remains the
+narrowed fallback but with a tightened temp create. Test: `WinShortWriteAndExclTests`.
+
+Round-14 verification: **152 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. 'clean' is now a fresh-review allowlist; prior-clean is revalidated at
+save; the remaining `_read_contained` callers branch on `None`; `_file_sha` streams; the
+Windows temp is `O_EXCL`. POSIX-closed / Windows-residual matrix unchanged.

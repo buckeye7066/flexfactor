@@ -389,6 +389,26 @@ def _clean_map(prior: dict) -> dict:
     return {}
 
 
+def _build_clean_map(project_dir: str, brain_clean, prior_clean: dict) -> dict:
+    """Persist the clean-file set keyed to each file's CURRENT content hash, RE-HASHED
+    through the contained no-follow reader AT SAVE TIME. A prior hash is NEVER carried
+    forward blind: a prior-clean file that was skipped this run could have been changed
+    or symlink-swapped between run-start and save. A file is kept clean ONLY if it is
+    readable NOW and, for a carried-forward prior-clean file, its CURRENT hash still
+    equals the prior hash; otherwise it is dropped so the next run re-reviews it."""
+    clean_map: dict[str, str] = {}
+    for rel in brain_clean:
+        key = rel.replace("\\", "/")
+        cur = _file_sha_contained(project_dir, rel)  # FRESH contained read at save
+        if cur is None:
+            continue  # can't verify now (refused/missing) -> not clean
+        prior = prior_clean.get(rel) or prior_clean.get(key)
+        if prior is not None and cur != prior:
+            continue  # prior-clean file CHANGED since run start -> drop, re-review next run
+        clean_map[key] = cur
+    return clean_map
+
+
 def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
     """Persist one audit run's outcome, roll up cumulative totals, and remember the
     set of files already driven clean (keyed to content hash + policy version) so
@@ -1652,8 +1672,11 @@ def resolve_program_input(program_arg: str) -> tuple[str, str]:
         name = os.path.basename(arg)
         body = _read_contained(os.path.dirname(os.path.abspath(arg)),
                                os.path.basename(arg), 6000)
-        # None => refused (symlink/escape); don't leak "None" into the prompt.
-        return name, f"PROGRAM FILE: {arg}\n\n{body if body is not None else ''}"
+        # None => refused (symlink/escape). Insert an explicit TRUSTED marker rather than
+        # passing an empty/absent body onward as if the file had no content.
+        shown = body if body is not None else (
+            "[FlexFactor: this file could not be safely read (symlink/containment refused)]")
+        return name, f"PROGRAM FILE: {arg}\n\n{shown}"
 
     # 4. A URL.
     if arg.lower().startswith("http://") or arg.lower().startswith("https://"):
@@ -1967,12 +1990,32 @@ def resolve_project_dir(program_arg: str, profile_name: str) -> str | None:
     return _find_local_project(profile_name)
 
 
-def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]]]:
-    """Return (is_node, verify_commands). For node projects we verify with the
-    project's own build (falling back to lint/test) so 'production-ready' means
-    what the project says it means."""
-    raw_pkg = _read_contained(project_dir, "package.json", 20000)
-    if not raw_pkg:
+def _read_package_json(project_dir: str, cap: int = 20000) -> tuple[str, str | None]:
+    """TRI-STATE read of package.json so a REFUSED read is never conflated with a
+    MISSING one. Returns:
+      ('ok', text)   - read succeeded (text may be "").
+      ('missing', None) - package.json does not exist -> genuinely not a Node project.
+      ('refused', None) - it EXISTS but the contained read refused it (symlink / ancestor
+                          swap / fail-closed) -> callers must FAIL CLOSED, never silently
+                          treat it as non-Node / verification-off."""
+    text = _read_contained(project_dir, "package.json", cap)
+    if text is not None:
+        return ("ok", text)
+    # package.json is a direct child of the repo root (single component), so lexists on
+    # the literal path tells existence without following a leaf symlink.
+    if os.path.lexists(os.path.join(project_dir, "package.json")):
+        return ("refused", None)
+    return ("missing", None)
+
+
+def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]] | None]:
+    """Return (is_node, verify_commands). `verify_commands is None` is the REFUSED
+    sentinel: package.json exists but couldn't be safely read, so the caller must NOT
+    proceed with verification silently off (a refused build config fails closed)."""
+    status, raw_pkg = _read_package_json(project_dir)
+    if status == "refused":
+        return True, None  # refused sentinel -> caller fails closed (checked FIRST)
+    if status == "missing" or not raw_pkg:
         return False, []
     scripts = {}
     try:
@@ -1993,6 +2036,11 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
     pkg_text = _read_contained(project_dir, "package.json", 6000)
     repo_summary = _summarize_repo_for_judge(result)
 
+    # A refused package.json must NOT silently become an empty fenced block; show an
+    # explicit TRUSTED marker so the model isn't misled into thinking there is none.
+    pkg_block = (_fence_untrusted("package", pkg_text) if pkg_text is not None
+                 else "package.json: [unreadable/refused - not shown]")
+
     # profile_blob + need come from the earlier profiling/eval model over UNTRUSTED
     # program context; the patch derived here is written to disk, so fence them too.
     fenced_profile = _fence_untrusted("profile", profile_blob)
@@ -2001,7 +2049,7 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
         "PROGRAM PROFILE:\n" + fenced_profile + "\n\n"
         "APPROVED IMPROVEMENT (need):\n" + fenced_need + "\n\n"
         f"LIBRARY TO INTEGRATE:\n{_fence_untrusted('repo', repo_summary)}\n\n"
-        "package.json:\n" + _fence_untrusted("package", pkg_text) + "\n\n"
+        "package.json:\n" + pkg_block + "\n\n"
         "PROJECT FILE TREE (shallow):\n" + _fence_untrusted("filetree", "  " + tree) + "\n\n"
         "Plan a minimal, concrete integration that actually uses this library."
     )
@@ -2069,6 +2117,10 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
 
     file_list = [f["path"] for f in files]
     is_node, verify_cmds = _detect_verify(project_dir)
+    if verify_cmds is None:  # package.json refused -> cannot verify safely, fail closed
+        return ApplyResult(repo_name, "skipped-config-refused",
+                           "package.json could not be safely read (symlink/containment); "
+                           "refusing to apply without a trustworthy build-verify gate.")
     git = _is_git_repo(project_dir)
 
     if opts.dry_run:
@@ -3070,8 +3122,22 @@ def _write_win(project_dir: str, comps: list[str], data: bytes, *, refuse_symlin
     try:
         os.makedirs(parent_full, exist_ok=True)
         pre = os.stat(parent_full)
-        with open(tmp, "wb") as fh:
-            fh.write(data)
+        # EXCLUSIVE temp create (O_EXCL, + O_NOFOLLOW where the OS has it) so we never
+        # write through a pre-existing temp/symlink; loop the writes so a short write can
+        # never be committed as a truncated file.
+        tflags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | (
+            os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+        tfd = os.open(tmp, tflags, 0o600)
+        try:
+            mv = memoryview(data)
+            written = 0
+            while written < len(mv):
+                n = os.write(tfd, mv[written:])
+                if n <= 0:
+                    raise OSError("short/zero write to temp file")
+                written += n
+        finally:
+            os.close(tfd)
         if not _same_id(os.stat(parent_full), pre):  # parent swapped since validation
             os.remove(tmp)
             return None
@@ -3180,16 +3246,74 @@ def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTE
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _open_contained_fd(project_dir: str, rel: str):
+    """Yield an OS read fd for a no-follow contained open of `rel` (POSIX openat-walk /
+    Windows fstat-identity re-check), or None on ANY refusal. Closes the fd (and any
+    parent dir fds) on exit. The single place a leaf fd is opened for streaming reads."""
+    comps = _rel_components(rel)
+    if comps is None:
+        yield None
+        return
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
+            if parent is None:
+                yield None
+                return
+            try:
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            except OSError:
+                yield None
+                return
+            try:
+                yield fd if stat.S_ISREG(os.fstat(fd).st_mode) else None
+            finally:
+                os.close(fd)
+        return
+    if not _CONTAINMENT_FALLBACK_OK:
+        yield None
+        return
+    full = _contained_path(project_dir, rel)
+    if full is None or os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
+        yield None
+        return
+    try:
+        pre = os.lstat(full)
+    except OSError:
+        yield None
+        return
+    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
+        yield None
+        return
+    try:
+        fd = os.open(full, os.O_RDONLY | _O_BINARY)
+    except OSError:
+        yield None
+        return
+    try:
+        yield fd if _same_id(os.fstat(fd), pre) else None
+    finally:
+        os.close(fd)
+
+
 def _file_sha_contained(project_dir: str, rel: str) -> str | None:
-    """SHA-256 of a repo file's FULL bytes, read through the no-follow containment
-    chokepoint (openat-walk on POSIX). Returns None on refusal / NUL-in-rel / symlink /
-    missing / fail-closed - callers treat None as skip (never a stale-clean match). This
-    replaces the old raw open(join(project_dir, rel), 'rb') that followed symlinks and
-    raised ValueError on a NUL-poisoned brain rel."""
-    data = _read_bytes_contained(project_dir, rel, cap=1 << 62)  # effectively uncapped
-    if data is None:
-        return None
-    return hashlib.sha256(data).hexdigest()
+    """SHA-256 of a repo file, STREAMED through the no-follow containment chokepoint with
+    a bounded 64k buffer (no full-file accumulation - a brain-controlled large rel can't
+    memory-blow). Returns None on refusal / NUL-in-rel / symlink / missing / fail-closed;
+    callers treat None as skip (never a stale-clean match)."""
+    with _open_contained_fd(project_dir, rel) as fd:
+        if fd is None:
+            return None
+        try:
+            h = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+            return h.hexdigest()
+        except OSError:
+            return None
 
 
 def _unlink_contained(project_dir: str, rel: str) -> bool:
@@ -3341,8 +3465,14 @@ def _detect_stack(project_dir: str) -> dict:
     info = {"is_node": False, "is_python": False, "framework": None, "scripts": {},
             "verify_cmds": [], "fast_verify": None, "test_cmd": None,
             "full_suite_cmd": None, "dev_script": None, "is_web": False,
-            "esbuild": None}
-    raw_pkg = _read_contained(project_dir, "package.json", 20000)
+            "esbuild": None, "config_refused": False}
+    status, raw_pkg = _read_package_json(project_dir)
+    if status == "refused":
+        # package.json EXISTS but couldn't be safely read: fail closed. Mark it so the
+        # audit refuses to run with build detection silently disabled.
+        info["is_node"] = True
+        info["config_refused"] = True
+        return info
     if raw_pkg:
         info["is_node"] = True
         try:
@@ -3873,16 +4003,19 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
-                workers: int = REVIEW_WORKERS) -> tuple[dict, list, set]:
+                workers: int = REVIEW_WORKERS) -> tuple[dict, list, set, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
-    per file. Returns (file_findings: rel->list, flat: list, unreadable: set of rels the
-    contained read REFUSED - these must NEVER be marked clean). `report` (if given) is
-    called with live counts so the dashboard's review bar moves. Stops submitting new
-    work once the cost cap (or the review reserve) is reached, so a huge codebase
-    can't blow the budget during review."""
+    per file. Returns (file_findings, flat, unreadable, reviewed_clean):
+      - unreadable: rels the contained read REFUSED (never clean - manual review).
+      - reviewed_clean: rels ACTUALLY reviewed this sweep with a fresh verified read AND
+        empty findings. 'clean' is an ALLOWLIST of these - a file that was SKIPPED by the
+        budget/stop cutoff (dropped, no result) is NEVER clean by default.
+    `report` (if given) is called with live counts. Stops submitting new work once the
+    cost cap (or the review reserve) is reached."""
     file_findings: dict[str, list[dict]] = {}
     flat: list[dict] = []
-    unreadable: set[str] = set()  # files the contained read REFUSED (never mark clean)
+    unreadable: set[str] = set()      # contained read REFUSED (never mark clean)
+    reviewed_clean: set[str] = set()  # freshly reviewed WITH empty findings -> clean allowlist
     total = len(files)
     lock = threading.Lock()
     done = {"n": 0}
@@ -3942,6 +4075,8 @@ def _review_all(reviewers: list, project_dir: str,
                 if merged:
                     file_findings[rel] = merged
                     flat.extend(merged)
+                else:
+                    reviewed_clean.add(rel)  # freshly reviewed, empty findings -> clean allowlist
                 sev_counts: dict[str, int] = {}
                 for f in merged:
                     sev_counts[f.get("severity", "?")] = sev_counts.get(f.get("severity", "?"), 0) + 1
@@ -3961,7 +4096,7 @@ def _review_all(reviewers: list, project_dir: str,
     if unreadable:
         print(f"  [warn] {len(unreadable)} file(s) could not be safely read "
               "(containment refused) - flagged for manual review, NOT marked clean")
-    return file_findings, flat, unreadable
+    return file_findings, flat, unreadable, reviewed_clean
 
 
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
@@ -4453,6 +4588,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                cost=0.0, cap=meter.limit_usd, done=False, errors=0, fixed=0, defects=0)
 
         stack = _detect_stack(project_dir)
+        if stack.get("config_refused"):
+            # package.json exists but couldn't be safely read: auditing WITH build
+            # verification silently off would ship unverified fixes. Fail closed.
+            print(f"{pfx}error: package.json could not be safely read (symlink/containment); "
+                  "refusing to audit with the build gate disabled.", file=sys.stderr)
+            result["error"] = "package.json unreadable (containment) - refused to audit"
+            return result
         git = _is_git_repo(project_dir)
         # report-only / dry-run review the code and report, but never modify, branch,
         # or commit. Decided up front so the sandbox setup below stays non-mutating.
@@ -4572,7 +4714,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
-            file_findings, flat, unreadable = _review_all(
+            file_findings, flat, unreadable, reviewed_clean = _review_all(
                 reviewers, project_dir, files, report=report, meter=meter, soft_cap_usd=soft,
                 workers=getattr(args, "review_workers", REVIEW_WORKERS))
             # A file the contained read REFUSED is never clean and never auto-fixed:
@@ -4608,8 +4750,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             for rel in still_fixable:
                 if fix_attempts.get(rel, 0) >= MAX_FIX_ATTEMPTS:
                     manual_review.add(rel)
-            # Clean = reviewed this cycle with nothing serious left (and not maxed-out).
-            run_clean.update(rel for rel in files
+            # Clean is an ALLOWLIST: only files ACTUALLY reviewed this sweep with a fresh
+            # verified read AND empty findings. A file dropped by the budget/stop cutoff
+            # (never reviewed) is NOT in reviewed_clean, so it is never clean by default.
+            run_clean.update(rel for rel in reviewed_clean
                              if rel not in still_fixable and rel not in manual_review)
             done_set |= run_clean  # clean files count as resolved (cumulative)
             report(fix_done=len(done_set), fix_total=total_to_review)
@@ -4682,17 +4826,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # A file fixed in the final cycle isn't re-confirmed, so it stays OUT of
         # this set and gets re-checked next run (conservative + correct).
         brain_clean = sorted(clean_files | run_clean)
-        # Persist clean files keyed to their CURRENT content hash (item: clean-file
-        # memory must be content-addressed). Carry forward the still-matching prior
-        # hashes and hash the files confirmed clean this run. A file whose hash we
-        # can't read now is dropped (re-reviewed next run) rather than trusted.
-        clean_map: dict[str, str] = {}
-        for rel in brain_clean:
-            key = rel.replace("\\", "/")
-            sha = prior_clean.get(rel) or prior_clean.get(key) or _file_sha_contained(
-                project_dir, rel)
-            if sha:
-                clean_map[key] = sha
+        clean_map = _build_clean_map(project_dir, brain_clean, prior_clean)
 
         # Low/info inventory: everything reviewed but below the auto-fix bar, gathered
         # across ALL cycles (not just the last) so the list is complete repo-wide.
