@@ -740,3 +740,60 @@ POSIX fails closed when `dir_fd` is unavailable.
 Round-12 verification: **133 tests GREEN** (5 POSIX-only tests skipped on this Windows
 host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
 `git diff --check` clean, no secrets.
+
+---
+
+## Round 13 (Codex review) — the `""` fail-OPEN sentinel + 5 residuals
+
+Codex confirmed r12's call sites are closed, but found the contained TEXT read used `""`
+for BOTH an empty file AND a containment refusal — a fail-OPEN conflation.
+
+### STRUCTURAL (HIGH, findings 2 & 3) — `_read_contained` now returns `str | None`
+`None` = ANY refusal / fail-closed (escape, symlink, missing, POSIX-without-openat, IO
+error); `str` (possibly `""`) = a genuine successful read.
+- **Review (`_review_all`/`_review_one`):** a `None` read is recorded in a new
+  `unreadable` set (returned as a 3rd tuple element); the audit adds those to
+  `manual_review` and NEVER marks them clean. Previously `""`→no findings→CLEAN, so on a
+  POSIX-without-openat host (or after a post-enumeration symlink swap) EVERY file would
+  be silently marked clean.
+- **Fix loop (`_first_attempt`/`_fix_files`):** a `None` read skips the file (records an
+  error) instead of feeding `""` to the model and `_replace_contained`-ing the leaf.
+- **All other readers** (`_load_source_text`, unit-test-gen, single-file scout,
+  metadata) handle `None` as skip/empty, never leaking `"None"` or treating refusal as
+  content.
+- Tests: `ReadContainedNoneVsEmptyTests`, `ReviewUnreadableNotCleanTests`.
+
+### Defect 1 (HIGH) — `_file_sha` bypassed containment (+ NUL → ValueError)
+Clean-file hashing did `open(join(project_dir, rel), 'rb')` — followed symlinks and a
+NUL-poisoned brain rel raised `ValueError` (uncaught). Fix: `_file_sha_contained(project_dir,
+rel)` streams the FULL file through the no-follow chokepoint (`_read_bytes_contained`,
+which rejects NUL via `_rel_components`); returns `None` on refusal → callers skip (never a
+stale-clean match). Test: `FileShaContainedTests`.
+
+### Defect 4 (MEDIUM) — `_rollback` swallowed refused deletes/restores
+Fix: `_rollback` now returns the list of rels whose contained delete/restore was refused;
+`apply_integration` appends a WARNING with those rels to `ApplyResult.detail` so a failed
+rollback is surfaced, not silent. Test: `RollbackSurfacesFailuresTests`.
+
+### Defect 5 (MEDIUM) — `_project_root_and_rel` not closed for symlink-spelled roots
+It computed `relpath(abspath, root)` without realpath-normalizing, so
+`link-to-repo/src/a.py` produced a `..` relpath and fell back to a re-trusted parent. Fix:
+realpath BOTH, require the real file to be strictly under the real root, return
+`(root_real, rel_from_root_real)`, else fail closed to the file's own real directory. Test:
+`ProjectRootRealpathTests`.
+
+### Defect 6 (MEDIUM) — `_write_walk_posix` could commit a short write
+A single `os.write` may write fewer bytes; the code `os.replace`d the temp anyway, committing
+a TRUNCATED file. Fix: loop `os.write` until all bytes are written; on a short/zero write,
+unlink the temp (dir_fd) and return `None` (no partial commit). Test: `PosixShortWriteTests`.
+
+### Confirmation
+Contained text reads return `None` on refusal (no `""` conflation; refusal never marks
+clean/fixed); `_file_sha` routes through the contained helper (NUL + symlink safe);
+`_rollback` surfaces failed rels; `_project_root_and_rel` realpath-anchors at the true repo
+root; `_write_walk_posix` never commits a short write. POSIX-closed / Windows-residual matrix
+from r11 unchanged.
+
+Round-13 verification: **142 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets.

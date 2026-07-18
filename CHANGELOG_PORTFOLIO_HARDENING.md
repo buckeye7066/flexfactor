@@ -265,6 +265,23 @@ raw pathname. All now go through the openat-walk helpers:
   the read and the backup/final writes walk the full ancestor chain.
 - **NUL bytes in a path are rejected.**
 
+## Round 13 (2026-07-18) — no more "empty == refused" fail-open, + 5 residuals
+
+- **Contained reads now distinguish a refusal from an empty file.** A read that is
+  refused (symlink, escape, or a platform that can't guarantee safety) returns a
+  distinct "refused" result, not an empty string. A refused file is flagged for manual
+  review and never marked clean or handed to the model as if it were empty content -
+  closing a fail-open where, on a platform without the safe file APIs, every file could
+  have been silently marked clean.
+- **Clean-file hashing** now reads through the same no-follow containment (and tolerates
+  a NUL-poisoned path) instead of a raw open that followed symlinks.
+- **A failed rollback is surfaced** in the apply result instead of being silently
+  swallowed.
+- **Refactor `--file` anchoring** resolves symlinks in the path first, so a
+  symlink-spelled repo root anchors at the true git root.
+- **The POSIX atomic writer loops the write**, so a short write can never commit a
+  truncated file.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

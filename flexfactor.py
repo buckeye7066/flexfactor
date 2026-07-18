@@ -1085,19 +1085,25 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
 def _project_root_and_rel(abspath: str) -> tuple[str, str]:
     """Anchor a file at its GIT repo root (if any) else its own directory, returning
     (root, repo-relative-path) so the containment openat-walk covers the FULL ancestor
-    chain from a stable root - not just the file's immediate parent."""
-    d = os.path.dirname(abspath) or "."
+    chain from a stable root. BOTH the file and the root are realpath-normalized first,
+    and the file must resolve STRICTLY UNDER the real root - otherwise a symlink-spelled
+    root (link-to-repo/src/a.py) would produce a '..' relpath and fall back to a
+    re-trusted parent. If the real file isn't under the real repo root, fail closed to
+    the file's OWN real directory (no re-trusted ancestor)."""
+    real_abs = os.path.realpath(abspath)
+    d = os.path.dirname(real_abs) or "."
     r = _git(["rev-parse", "--show-toplevel"], d)
     if r.returncode == 0 and r.stdout.strip():
-        root = os.path.normpath(r.stdout.strip())
-        if os.path.isdir(root):
+        root_real = os.path.realpath(r.stdout.strip())
+        if os.path.isdir(root_real) and (
+                real_abs == root_real or real_abs.startswith(root_real + os.sep)):
             try:
-                rel = os.path.relpath(abspath, root)
+                rel = os.path.relpath(real_abs, root_real)
                 if _rel_components(rel) is not None:
-                    return root, rel
+                    return root_real, rel
             except ValueError:
                 pass
-    return d, os.path.basename(abspath)
+    return d, os.path.basename(real_abs)
 
 
 def _load_source_text(file_arg: str) -> tuple[str, str]:
@@ -1141,11 +1147,7 @@ def _load_source_text(file_arg: str) -> tuple[str, str]:
     if _rel_components(rel) is None:
         raise SourceInputError(f"'{resolved}' resolves outside its project root (symlink escape).")
     content = _read_contained(root, rel)
-    try:
-        size = os.path.getsize(resolved_abs)
-    except OSError:
-        size = 0
-    if content == "" and size > 0:
+    if content is None:  # refused / fail-closed (NOT an empty file, which reads as "")
         raise SourceInputError(
             f"'{resolved}' could not be safely read (symlink/ancestor containment refused it).")
     if "\x00" in content:
@@ -1650,7 +1652,8 @@ def resolve_program_input(program_arg: str) -> tuple[str, str]:
         name = os.path.basename(arg)
         body = _read_contained(os.path.dirname(os.path.abspath(arg)),
                                os.path.basename(arg), 6000)
-        return name, f"PROGRAM FILE: {arg}\n\n{body}"
+        # None => refused (symlink/escape); don't leak "None" into the prompt.
+        return name, f"PROGRAM FILE: {arg}\n\n{body if body is not None else ''}"
 
     # 4. A URL.
     if arg.lower().startswith("http://") or arg.lower().startswith("https://"):
@@ -2177,31 +2180,42 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                            post_steps=patch.get("post_steps") or [])
 
     except (ApplyError, OSError, subprocess.SubprocessError) as e:
-        _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created)
+        failed = _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created)
         status = "verify-failed" if isinstance(e, ApplyError) else "error"
-        return ApplyResult(repo_name, status, str(e), branch=branch, files=file_list,
+        detail = str(e)
+        if failed:  # a refused rollback is NOT swallowed - surface it in the result
+            detail += (f"; WARNING rollback could not restore/remove {len(failed)} file(s) "
+                       f"(containment refused): {', '.join(sorted(failed)[:10])}")
+        return ApplyResult(repo_name, status, detail, branch=branch, files=file_list,
                            packages=packages)
 
 
-def _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created) -> None:
-    """Return the repo to exactly its pre-apply state. `backups` (rel -> bytes) are
-    RESTORED and `created` (rel of new files) are REMOVED, both through the contained
-    no-follow helpers so an ancestor swap can't redirect the delete/restore outside."""
+def _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created) -> list[str]:
+    """Return the repo to its pre-apply state. `backups` (rel -> bytes) are RESTORED and
+    `created` (rel of new files) are REMOVED, both through the contained no-follow helpers
+    so an ancestor swap can't redirect the delete/restore outside. Returns the list of
+    rels whose rollback was REFUSED (contained delete/restore returned False/None) so the
+    caller can SURFACE a failed rollback instead of silently leaving a broken candidate."""
+    failed: list[str] = []
     if git and created_branch and prev_branch:
         # Discard tracked-file changes + switch back, then drop the branch.
         _git(["checkout", "--force", prev_branch], project_dir)
         # Remove any NEW untracked files we created (don't `git clean` - that would
         # nuke unrelated untracked files). _unlink_contained can't escape the repo.
         for rel in created:
-            _unlink_contained(project_dir, rel)
+            if not _unlink_contained(project_dir, rel):
+                failed.append(rel)
         _git(["branch", "-D", branch], project_dir)
     else:
         for rel in created:
-            _unlink_contained(project_dir, rel)
+            if not _unlink_contained(project_dir, rel):
+                failed.append(rel)
         for rel, original in backups.items():
             # TOCTOU-free restore anchored at the repo root: replaces a symlink swapped
             # in at any component rather than writing through it to an outside target.
-            _replace_contained(project_dir, rel, original)
+            if _replace_contained(project_dir, rel, original) is None:
+                failed.append(rel)
+    return failed
 
 
 # --------------------------------------------------------------------------- #
@@ -2940,55 +2954,59 @@ def _read_from_fd(fd: int, cap: int) -> str:
     return bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str:
+def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str | None:
     """Read a repo-relative file's text ONLY if EVERY component of its path stays inside
     project_dir with no symlink anywhere. THE single entry point for reading a project
     file whose contents can enter a prompt (enumerated source AND static metadata).
-    POSIX: openat component-walk (ancestor + leaf TOCTOU-free). Windows: lstat + fstat
-    identity re-check (narrowed window). Returns "" on any refusal/error (fails closed)."""
+
+    Returns None on ANY refusal / fail-closed (escape, symlink, missing, POSIX-without-
+    openat, IO error) and a str (possibly "") on a genuine successful read. Callers MUST
+    distinguish None (refused -> skip / error / never clean / never fed to the model)
+    from "" (a real empty file, a valid clean read). POSIX: openat component-walk
+    (ancestor + leaf TOCTOU-free). Windows: lstat + fstat identity re-check (narrowed)."""
     comps = _rel_components(rel)
     if comps is None:
-        return ""
+        return None
     if _POSIX_NOFOLLOW:
         with _walked_parent_fd(project_dir, comps) as (parent, leaf):
             if parent is None:
-                return ""
+                return None
             try:
                 fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
             except OSError:
-                return ""  # leaf is a symlink / missing
+                return None  # leaf is a symlink / missing
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    return ""
+                    return None
                 return _read_from_fd(fd, cap)
             except OSError:
-                return ""
+                return None
             finally:
                 os.close(fd)
     if not _CONTAINMENT_FALLBACK_OK:
-        return ""  # POSIX without openat -> fail closed, never the pathname path
+        return None  # POSIX without openat -> fail closed, never the pathname path
     # Windows / no openat: lstat + fstat identity re-check narrows the swap window.
     full = _contained_path(project_dir, rel)
     if full is None:
-        return ""
+        return None
     if os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
-        return ""
+        return None
     try:
         pre = os.lstat(full)
     except OSError:
-        return ""
+        return None
     if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
-        return ""
+        return None
     try:
         fd = os.open(full, os.O_RDONLY | _O_BINARY)
     except OSError:
-        return ""
+        return None
     try:
         if not _same_id(os.fstat(fd), pre):
-            return ""  # identity changed between lstat and open -> fail closed
+            return None  # identity changed between lstat and open -> fail closed
         return _read_from_fd(fd, cap)
     except OSError:
-        return ""
+        return None
     finally:
         os.close(fd)
 
@@ -3011,7 +3029,15 @@ def _write_walk_posix(project_dir: str, comps: list[str], data: bytes,
             tfd = os.open(tmpname, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                           0o600, dir_fd=parent)
             try:
-                os.write(tfd, data)
+                # os.write may do a SHORT write; loop until every byte is written or
+                # fail closed (never os.replace a truncated temp into place).
+                mv = memoryview(data)
+                written = 0
+                while written < len(mv):
+                    n = os.write(tfd, mv[written:])
+                    if n <= 0:
+                        raise OSError("short/zero write to temp file")
+                    written += n
             finally:
                 os.close(tfd)
             os.replace(tmpname, leaf, src_dir_fd=parent, dst_dir_fd=parent)
@@ -3152,6 +3178,18 @@ def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTE
         return None
     finally:
         os.close(fd)
+
+
+def _file_sha_contained(project_dir: str, rel: str) -> str | None:
+    """SHA-256 of a repo file's FULL bytes, read through the no-follow containment
+    chokepoint (openat-walk on POSIX). Returns None on refusal / NUL-in-rel / symlink /
+    missing / fail-closed - callers treat None as skip (never a stale-clean match). This
+    replaces the old raw open(join(project_dir, rel), 'rb') that followed symlinks and
+    raised ValueError on a NUL-poisoned brain rel."""
+    data = _read_bytes_contained(project_dir, rel, cap=1 << 62)  # effectively uncapped
+    if data is None:
+        return None
+    return hashlib.sha256(data).hexdigest()
 
 
 def _unlink_contained(project_dir: str, rel: str) -> bool:
@@ -3835,14 +3873,16 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
-                workers: int = REVIEW_WORKERS) -> tuple[dict, list]:
+                workers: int = REVIEW_WORKERS) -> tuple[dict, list, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
-    per file. Returns (file_findings: rel->list, flat: list). `report` (if given) is
+    per file. Returns (file_findings: rel->list, flat: list, unreadable: set of rels the
+    contained read REFUSED - these must NEVER be marked clean). `report` (if given) is
     called with live counts so the dashboard's review bar moves. Stops submitting new
     work once the cost cap (or the review reserve) is reached, so a huge codebase
     can't blow the budget during review."""
     file_findings: dict[str, list[dict]] = {}
     flat: list[dict] = []
+    unreadable: set[str] = set()  # files the contained read REFUSED (never mark clean)
     total = len(files)
     lock = threading.Lock()
     done = {"n": 0}
@@ -3861,8 +3901,10 @@ def _review_all(reviewers: list, project_dir: str,
             stop.set()
             return None
         text = _read_contained(project_dir, rel)
+        if text is None:
+            return (rel, None)  # containment REFUSED -> NOT clean; flag as unreadable
         if not text.strip():
-            return (rel, [])
+            return (rel, [])     # genuinely empty file -> a valid clean read
         merged: list[dict] = []
         for reviewer in reviewers:
             # Budget is reserved inside the provider call (the single chokepoint), so
@@ -3893,6 +3935,10 @@ def _review_all(reviewers: list, project_dir: str,
             with lock:
                 done["n"] += 1
                 i = done["n"]
+                if merged is None:  # contained read refused -> record, never mark clean
+                    unreadable.add(rel)
+                    print(f"  ({i}/{total}) {rel}: UNREADABLE (containment refused)")
+                    continue
                 if merged:
                     file_findings[rel] = merged
                     flat.extend(merged)
@@ -3912,7 +3958,10 @@ def _review_all(reviewers: list, project_dir: str,
     if stop.is_set():
         print(f"  [stop] budget/reserve reached during review ({meter.summary() if meter else ''}); "
               f"reviewed {done['n']}/{total} file(s) this cycle")
-    return file_findings, flat
+    if unreadable:
+        print(f"  [warn] {len(unreadable)} file(s) could not be safely read "
+              "(containment refused) - flagged for manual review, NOT marked clean")
+    return file_findings, flat, unreadable
 
 
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
@@ -3961,6 +4010,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         if meter is not None and meter.over_limit():
             return ("capped", "", None)
         original = _read_contained(project_dir, rel)
+        if original is None:
+            return ("unreadable", "", None)  # containment refused -> never fix by pathname
         kind = "edits" if use_edits else "whole"
         # The budget reservation now lives in the provider call itself (the single
         # chokepoint), so this prefetch, the main-thread retries/fallbacks, and every
@@ -4020,10 +4071,18 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         if pf is not None:
             try:
                 res = pf.result()
-                pre = res if res and res[0] != "capped" else None
+                # 'capped'/'unreadable' are control sentinels, not a usable prefetch.
+                pre = res if res and res[0] not in ("capped", "unreadable") else None
             except Exception:
                 pre = None  # cancelled/died -> generate inline exactly as before
         original = pre[1] if pre is not None else _read_contained(project_dir, rel)
+        if original is None:
+            # Contained read REFUSED (swap / fail-closed): never feed "" to the model or
+            # gate/replace by pathname. Skip this file and flag it, don't mark it fixed.
+            notes.append(f"{rel}: skipped (contained read refused)")
+            errors += 1
+            _tick(rel)
+            continue
         # Up to MAX_FIX_TRIES attempts per file: a build-break or a cross-model veto
         # is fed back as an objection so the author can SALVAGE the fix instead of
         # the file being abandoned. The file is left as the original unless an
@@ -4375,7 +4434,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         clean_files: set[str] = set()
         if not getattr(args, "recheck", False):
             for rel, sha in _clean_map(prior).items():
-                cur = _file_sha(os.path.join(project_dir, rel))
+                cur = _file_sha_contained(project_dir, rel)  # no-follow + NUL-safe
                 if cur is not None and cur == sha:
                     prior_clean[rel] = sha
                     clean_files.add(rel.replace("\\", "/"))
@@ -4513,9 +4572,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
-            file_findings, flat = _review_all(reviewers, project_dir, files,
-                                              report=report, meter=meter, soft_cap_usd=soft,
-                                              workers=getattr(args, "review_workers", REVIEW_WORKERS))
+            file_findings, flat, unreadable = _review_all(
+                reviewers, project_dir, files, report=report, meter=meter, soft_cap_usd=soft,
+                workers=getattr(args, "review_workers", REVIEW_WORKERS))
+            # A file the contained read REFUSED is never clean and never auto-fixed:
+            # set it aside for manual review (a swapped symlink / fail-closed platform).
+            for rel in unreadable:
+                manual_review.add(rel)
+                fix_notes.append(f"{rel}: could not be safely read (containment refused) - manual review")
             all_findings = flat  # latest cycle reflects the current code state
             latest_findings_by_file.update(file_findings)  # keep each file's most-recent findings
             print(f"{pfx}Found {len(flat)} defect(s) across {len(file_findings)} file(s).")
@@ -4625,8 +4689,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         clean_map: dict[str, str] = {}
         for rel in brain_clean:
             key = rel.replace("\\", "/")
-            sha = prior_clean.get(rel) or prior_clean.get(key) or _file_sha(
-                os.path.join(project_dir, rel))
+            sha = prior_clean.get(rel) or prior_clean.get(key) or _file_sha_contained(
+                project_dir, rel)
             if sha:
                 clean_map[key] = sha
 
@@ -4646,8 +4710,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
                 text = _read_contained(project_dir, rel)
-                if not text.strip():
-                    continue
+                if text is None or not text.strip():
+                    continue  # refused/fail-closed OR empty -> don't test-gen this module
                 try:
                     gen = author.structured(
                         UNIT_TEST_SYSTEM,

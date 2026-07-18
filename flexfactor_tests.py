@@ -1537,9 +1537,8 @@ class EnumeratedSymlinkContainmentTests(unittest.TestCase):
             self.assertNotIn("src/leak.py", files)
 
             # (b) Even if a stale rel path names the symlink, the contained read
-            #     refuses it (realpath resolves outside the repo) -> no disclosure.
-            self.assertEqual(ff._read_contained(proj, "src/leak.py"), "")
-            self.assertNotIn("SECRET_TOKEN", ff._read_contained(proj, "src/leak.py"))
+            #     refuses it (None, NOT "") -> no disclosure, never a clean read.
+            self.assertIsNone(ff._read_contained(proj, "src/leak.py"))
             # A normal in-repo file still reads.
             self.assertIn("print('ok')", ff._read_contained(proj, "src/app.py"))
 
@@ -1551,8 +1550,8 @@ class EnumeratedSymlinkContainmentTests(unittest.TestCase):
             outside = os.path.join(tmp, "outside.txt")
             with open(outside, "w", encoding="utf-8") as fh:
                 fh.write("SECRET")
-            self.assertEqual(ff._read_contained(proj, "../outside.txt"), "")
-            self.assertEqual(ff._read_contained(proj, outside), "")
+            self.assertIsNone(ff._read_contained(proj, "../outside.txt"))
+            self.assertIsNone(ff._read_contained(proj, outside))
 
 
 class StaticMetadataReadContainmentTests(unittest.TestCase):
@@ -1590,7 +1589,7 @@ class StaticMetadataReadContainmentTests(unittest.TestCase):
                 fh.write("SECRET")
             if not self._symlink(os.path.join(proj, "package.json"), secret):
                 self.skipTest("symlinks not permitted here")
-            self.assertEqual(ff._read_contained(proj, "package.json", 100), "")
+            self.assertIsNone(ff._read_contained(proj, "package.json", 100))
 
 
 class StaticWriteContainmentTests(unittest.TestCase):
@@ -1852,8 +1851,8 @@ class ReadIdentityRecheckTests(unittest.TestCase):
                 out = ff._read_contained(proj, "a.txt")
             finally:
                 ff.os.open = real_open
-            self.assertNotIn("SWAPPED_SECRET", out)  # secret never returned
-            self.assertEqual(out, "")                # fails closed on identity mismatch
+            self.assertNotIn("SWAPPED_SECRET", out or "")  # secret never returned
+            self.assertIsNone(out)                          # fails closed on identity mismatch
 
 
 class WriteParentSwapRecheckTests(unittest.TestCase):
@@ -1958,7 +1957,7 @@ class PosixAncestorWalkTests(unittest.TestCase):
                 fh.write("INREPO")
             # aliasdir -> realdir : a symlinked ANCESTOR that points INSIDE the repo.
             os.symlink(os.path.join(proj, "realdir"), os.path.join(proj, "aliasdir"))
-            self.assertEqual(ff._read_contained(proj, "aliasdir/f.txt"), "")   # refused
+            self.assertIsNone(ff._read_contained(proj, "aliasdir/f.txt"))   # refused
             self.assertEqual(ff._read_contained(proj, "realdir/f.txt"), "INREPO")  # real ok
 
     def test_ancestor_symlink_to_outside_read_refused_no_disclosure(self):
@@ -1972,8 +1971,8 @@ class PosixAncestorWalkTests(unittest.TestCase):
                 fh.write("OUTSIDE_SECRET")
             os.symlink(outside, os.path.join(proj, "aliasdir"))
             out = ff._read_contained(proj, "aliasdir/f.txt")
-            self.assertNotIn("OUTSIDE_SECRET", out)
-            self.assertEqual(out, "")
+            self.assertNotIn("OUTSIDE_SECRET", out or "")
+            self.assertIsNone(out)
 
     def test_ancestor_symlink_write_refused(self):
         import tempfile
@@ -2093,7 +2092,7 @@ class PosixFailClosedTests(unittest.TestCase):
                 os.makedirs(proj)
                 with open(os.path.join(proj, "f.txt"), "w", encoding="utf-8") as fh:
                     fh.write("data")
-                self.assertEqual(ff._read_contained(proj, "f.txt"), "")
+                self.assertIsNone(ff._read_contained(proj, "f.txt"))
                 self.assertIsNone(ff._read_bytes_contained(proj, "f.txt"))
                 self.assertIsNone(ff._write_contained(proj, "g.txt", "x"))
                 self.assertIsNone(ff._replace_contained(proj, "g.txt", "x"))
@@ -2199,6 +2198,151 @@ class PosixAncestorUnlinkTests(unittest.TestCase):
             os.symlink(outside, os.path.join(proj, "aliasdir"))
             self.assertFalse(ff._unlink_contained(proj, "aliasdir/victim.txt"))
             self.assertTrue(os.path.exists(os.path.join(outside, "victim.txt")))
+
+
+class FileShaContainedTests(unittest.TestCase):
+    """Round-13 defect 1: clean-file hashing is no-follow + NUL-safe and returns None
+    (skip) on refusal - never a stale-clean match through a symlink."""
+
+    def test_hashes_in_repo_and_detects_change(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("one")
+            h1 = ff._file_sha_contained(proj, "f.py")
+            self.assertTrue(h1 and len(h1) == 64)
+            with open(os.path.join(proj, "f.py"), "w", encoding="utf-8") as fh:
+                fh.write("two")
+            self.assertNotEqual(ff._file_sha_contained(proj, "f.py"), h1)
+
+    def test_none_on_missing_nul_and_symlink(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            self.assertIsNone(ff._file_sha_contained(proj, "missing.py"))
+            self.assertIsNone(ff._file_sha_contained(proj, "a\x00b"))     # NUL, not ValueError
+            self.assertIsNone(ff._file_sha_contained(proj, "../escape"))
+            secret = os.path.join(tmp, "secret")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("S")
+            if _try_symlink(os.path.join(proj, "link.py"), secret):
+                self.assertIsNone(ff._file_sha_contained(proj, "link.py"))
+
+
+class ReadContainedNoneVsEmptyTests(unittest.TestCase):
+    """Round-13 defects 2 & 3: _read_contained returns None on REFUSAL and "" on a real
+    empty file - the two are never conflated."""
+
+    def test_empty_file_reads_as_empty_string_not_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "empty.py"), "w"):
+                pass
+            self.assertEqual(ff._read_contained(proj, "empty.py"), "")  # success, empty
+
+    def test_refusals_return_none(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            self.assertIsNone(ff._read_contained(proj, "missing.py"))
+            self.assertIsNone(ff._read_contained(proj, "../x"))
+            self.assertIsNone(ff._read_contained(proj, "a\x00b"))
+
+
+class ReviewUnreadableNotCleanTests(unittest.TestCase):
+    """Round-13 defect 2: a file the contained read REFUSES is flagged unreadable
+    (never added to findings, never marked clean); a genuinely empty file is clean."""
+
+    def test_refused_read_is_unreadable(self):
+        real = ff._read_contained
+        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
+        try:
+            ffindings, flat, unreadable = ff._review_all([], "/proj", ["x.py"], workers=1)
+        finally:
+            ff._read_contained = real
+        self.assertIn("x.py", unreadable)
+        self.assertNotIn("x.py", ffindings)   # not fixable, and NOT marked clean
+
+    def test_empty_file_is_clean_not_unreadable(self):
+        real = ff._read_contained
+        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ""
+        try:
+            ffindings, flat, unreadable = ff._review_all([], "/proj", ["x.py"], workers=1)
+        finally:
+            ff._read_contained = real
+        self.assertEqual(unreadable, set())    # empty read is clean, not unreadable
+        self.assertNotIn("x.py", ffindings)
+
+
+class RollbackSurfacesFailuresTests(unittest.TestCase):
+    """Round-13 defect 4: a refused rollback delete/restore is RETURNED, not swallowed."""
+
+    def test_refused_rollback_rels_returned(self):
+        real_unlink, real_repl = ff._unlink_contained, ff._replace_contained
+        ff._unlink_contained = lambda pd, rel: False       # every delete refused
+        ff._replace_contained = lambda pd, rel, data: None  # every restore refused
+        try:
+            failed = ff._rollback("/proj", False, False, None, None,
+                                  {"a.py": b"orig"}, {"new.py"})
+        finally:
+            ff._unlink_contained, ff._replace_contained = real_unlink, real_repl
+        self.assertIn("new.py", failed)   # created-file delete refused
+        self.assertIn("a.py", failed)     # restore refused
+
+
+class ProjectRootRealpathTests(unittest.TestCase):
+    """Round-13 defect 5: a symlink-spelled repo root anchors at the REAL git root, not
+    a re-trusted parent."""
+
+    def test_symlinked_root_spelling_anchors_at_real_root(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "realrepo")
+            os.makedirs(os.path.join(real, "sub"))
+            if subprocess.run(["git", "init", "-q", real], capture_output=True).returncode != 0:
+                self.skipTest("git unavailable")
+            with open(os.path.join(real, "sub", "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            alias = os.path.join(tmp, "aliasrepo")
+            if not _try_symlink(alias, real):
+                self.skipTest("directory symlinks not permitted here")
+            # Spell the file through the symlinked root.
+            root, rel = ff._project_root_and_rel(os.path.join(alias, "sub", "a.py"))
+            self.assertEqual(os.path.realpath(root), os.path.realpath(real))  # REAL root
+            self.assertEqual(ff._rel_components(rel), ["sub", "a.py"])         # not '..'
+
+
+class PosixShortWriteTests(unittest.TestCase):
+    """Round-13 defect 6: a short os.write must NOT commit a truncated file."""
+
+    def setUp(self):
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("POSIX openat write path unavailable on this platform")
+
+    def test_short_write_does_not_commit(self):
+        import tempfile
+        real_write = os.write
+
+        def short_write(fd, data):
+            return real_write(fd, data[:1]) if len(data) > 1 else real_write(fd, data)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            ff.os.write = short_write
+            try:
+                out = ff._write_contained(proj, "f.txt", "HELLO WORLD")
+            finally:
+                ff.os.write = real_write
+            self.assertIsNone(out)                              # write failed closed
+            self.assertFalse(os.path.exists(os.path.join(proj, "f.txt")))  # nothing committed
 
 
 if __name__ == "__main__":
