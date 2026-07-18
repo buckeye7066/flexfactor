@@ -158,6 +158,15 @@ Three sibling fixes of earlier work, done as full audits (all transparent):
   Pings use a new `ping()` adapter method (so they're budgeted + metered like any
   call), and concurrent audits issue exactly one ping per provider.
 
+## Round 6 (2026-07-18) — containment for reads, not just writes
+
+- **The containment check now guards READS too.** When scout plans an integration,
+  the files it says it wants to modify (model output) are now checked against the
+  repo boundary before being opened — so a plan naming `..\..\.env` or an absolute
+  path can no longer have its contents read into the model prompt. Previously only
+  file *writes* were contained; this closes the local-secret disclosure path. All
+  other file reads use tool/user paths (not model-named) and were audited as safe.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

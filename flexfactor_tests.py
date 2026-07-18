@@ -1462,5 +1462,48 @@ class HealthPingSingleFlightTests(unittest.TestCase):
         self.assertEqual(len(results), 25)
 
 
+class ModelNamedReadPathContainmentTests(unittest.TestCase):
+    """Round-6 defect: the containment chokepoint must guard READS too. A model
+    plan naming '../secret.txt' or an absolute path must never have its contents
+    read into the second provider prompt (local-secret disclosure)."""
+
+    def test_modify_files_escape_is_never_read_into_prompt(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "secret.txt")  # OUTSIDE the repo
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SUPERSECRET_TOKEN=abc123")
+            # a legit in-repo file, to confirm normal reads still work
+            with open(os.path.join(proj, "app.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('ok');\n")
+
+            class FakeProv:
+                def __init__(self):
+                    self.calls = 0
+                    self.prompts = []
+
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                    self.calls += 1
+                    self.prompts.append(prompt)
+                    if self.calls == 1:  # plan pass: name escaping + absolute paths
+                        return {"can_apply": True, "plan": "p", "packages": [],
+                                "create_files": [],
+                                "modify_files": ["../secret.txt", secret, "app.js"],
+                                "reason": ""}
+                    return {"files": [], "packages": []}
+
+            prov = FakeProv()
+            ff.generate_integration(prov, proj, "PROFILE", "need",
+                                    {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            patch_prompt = prov.prompts[1]
+            # The escaping/absolute reads must NOT have leaked the secret.
+            self.assertNotIn("SUPERSECRET_TOKEN", patch_prompt)
+            # The legitimate in-repo file is still read normally.
+            self.assertIn("console.log('ok');", patch_prompt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

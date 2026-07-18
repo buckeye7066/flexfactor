@@ -359,3 +359,37 @@ launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
 reserve == request cap for all 6 provider methods; every write-generating prompt
 fences all untrusted/model/source fields (table above); health pings go through the
 adapter and are single-flight.
+
+---
+
+## Round 6 (Codex review) — 1 HIGH: containment guarded WRITES but not READS
+
+`_contained_path` protected writes, but `generate_integration` READ every
+`plan.get("modify_files")` entry (MODEL output influenced by untrusted repo/program
+text) via `os.path.join(project_dir, rel)` + `_read_text_safe` with no containment.
+A plan naming `..\..\.env` or an absolute path had that file's contents read into the
+SECOND provider prompt — fencing marks it untrusted but still DISCLOSES local secrets
+to the model.
+- Fix: route every `modify_files` entry through `_contained_path` BEFORE
+  `os.path.isfile`/`_read_text_safe`; an escaping/absolute/traversal path is skipped
+  (never opened, never included). `flexfactor.py:~1957`.
+- **AUDIT — every path READ into a prompt or opened, and whether it's model-named:**
+
+  | Read site | Path source | Contained? |
+  |---|---|---|
+  | `generate_integration` modify_files (`~1957`) | **MODEL** (`plan.modify_files`) | ✅ FIXED this round |
+  | `resolve_program_input` pkg/README/file (`~1539/1556/1598`) | user/tool (the program the user pointed at) | n/a (not model) |
+  | `_detect_verify` / `_detect_stack` package.json (`~1921/2864`) | tool (fixed filename) | n/a |
+  | `generate_integration` package.json (`~1935`) | tool (fixed filename) | n/a |
+  | `_review_all` / `_first_attempt` / fix-loop / unit-test-gen source reads (`~3418/3518/3581/4196`) | tool (`_enumerate_source_files` walk of the repo) | n/a (not model); fix-loop also `_contained_path`-guarded |
+  | refactor `_load_source_text` (`~1112`) | user (`--file`) | n/a |
+
+  Only ONE read site was model-named; it is now contained. All generated-file WRITES
+  were already contained (round 3).
+- Test: `ModelNamedReadPathContainmentTests` (1) — a `modify_files` entry
+  `../secret.txt` AND an absolute path are never read; the secret never appears in
+  the second prompt; a legitimate in-repo file still is.
+
+Round-6 verification: **98 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed: every
+model-named READ path is contained (table above), not just writes.

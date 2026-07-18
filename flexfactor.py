@@ -1952,10 +1952,17 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
         return None, plan.get("reason") or "Model judged a concrete integration infeasible."
 
     # Read the real current contents of every file the plan wants to modify, so
-    # pass 2 edits the actual code instead of hallucinating it.
+    # pass 2 edits the actual code instead of hallucinating it. `modify_files` is
+    # MODEL output influenced by untrusted repo/program text, so every entry goes
+    # through the containment chokepoint BEFORE it is opened - a plan naming
+    # '..\..\.env' or an absolute path must never have its contents read into the
+    # prompt (disclosure of local secrets), not just be blocked from being written.
     existing_blobs = []
     for rel in plan.get("modify_files") or []:
-        full = os.path.join(project_dir, rel)
+        full = _contained_path(project_dir, rel)
+        if full is None:
+            print(f"    [skip] plan names a file outside the repo, not reading: {rel!r}")
+            continue
         if os.path.isfile(full):
             existing_blobs.append(f"--- {rel} ---\n{_read_text_safe(full, 16000)}")
     existing_text = "\n\n".join(existing_blobs) if existing_blobs else "(creating new files only)"
