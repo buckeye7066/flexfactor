@@ -51,6 +51,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -1108,15 +1109,23 @@ def _load_source_text(file_arg: str) -> tuple[str, str]:
     if not os.path.isfile(resolved):
         raise SourceInputError(f"file not found: {file_arg}")
 
-    try:
-        with open(resolved, "r", encoding="utf-8") as fh:
-            return resolved, fh.read()
-    except UnicodeDecodeError:
+    # Even though --file is user-named, its contents reach the provider prompt and the
+    # rewrite overwrites it, so contain it: refuse a symlink leaf and read through the
+    # handle-based no-follow chokepoint.
+    if os.path.islink(resolved):
+        raise SourceInputError(
+            f"'{resolved}' is a symlink - FlexFactor refuses to read/write through a "
+            "symlink leaf. Point it at the real source file.")
+    proj = os.path.dirname(os.path.abspath(resolved)) or "."
+    if _contained_path(proj, os.path.basename(resolved)) is None:
+        raise SourceInputError(f"'{resolved}' resolves outside its own folder (symlink escape).")
+    content = _read_contained(proj, os.path.basename(resolved))
+    if "\x00" in content:
         raise SourceInputError(
             f"'{resolved}' is not a UTF-8 text file - it looks binary "
             "(an image, executable, .lnk shortcut, etc.).\n"
-            "FlexFactor only refactors plain-text source files."
-        )
+            "FlexFactor only refactors plain-text source files.")
+    return resolved, content
 
 
 def run(args) -> int:
@@ -1194,12 +1203,16 @@ def run(args) -> int:
         print(f"\nReached max_iterations ({args.max_iterations}) without acceptance.")
         return 1
 
-    # Accepted - back up the original and write the improved code.
+    # Accepted - back up the original and write the improved code, both through the
+    # atomic no-follow writer so a symlink swapped in at the leaf is replaced, never
+    # followed to overwrite an outside target.
     backup = args.file + ".bak"
-    with open(backup, "w", encoding="utf-8") as fh:
-        fh.write(original)
-    with open(args.file, "w", encoding="utf-8") as fh:
-        fh.write(current)
+    if not _atomic_replace_nofollow(backup, original):
+        print(f"error: could not safely write backup {backup}", file=sys.stderr)
+        return 1
+    if not _atomic_replace_nofollow(args.file, current):
+        print(f"error: could not safely write {args.file}", file=sys.stderr)
+        return 1
     print(f"\nSwole. Backup written to {backup}; {args.file} updated.\n")
 
     print("=== Insertion prompt ===")
@@ -2799,37 +2812,121 @@ def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
         return ""
 
 
+# Handle-based no-follow support. O_NOFOLLOW + dir_fd are POSIX; on Windows they are
+# absent, so there we fall back to an fstat/identity re-check at the syscall boundary
+# that NARROWS (does not fully close) the pathname-TOCTOU window. See PORTFOLIO_AUDIT.md
+# "Residual" for the honest Windows caveat.
+_HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
+_HAS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+_O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: don't translate CRLF on os.open
+
+
+def _same_id(a, b) -> bool:
+    """Same file identity (device + inode). On Windows st_ino is populated on modern
+    Pythons; if it is 0/unavailable we compare (dev, size, mtime_ns) as a fallback."""
+    if a is None or b is None:
+        return False
+    if a.st_ino and b.st_ino:
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    return (a.st_dev, a.st_size, a.st_mtime_ns) == (b.st_dev, b.st_size, b.st_mtime_ns)
+
+
 def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str:
-    """Read a repo-relative file's text ONLY if it stays inside project_dir. Uses the
-    realpath containment chokepoint, so a file reached through a symlink that resolves
-    outside the repo is refused (returns "") rather than disclosing its contents into
-    a review/fix/test prompt. THE single entry point for reading a project file whose
-    contents can enter a prompt (enumerated source AND static metadata)."""
+    """Read a repo-relative file's text ONLY if it stays inside project_dir, using a
+    HANDLE-BASED no-follow open plus an fstat identity re-check so a symlink swapped in
+    at the leaf between validation and open is caught (fails closed to "").
+
+    - POSIX: os.open(..., O_NOFOLLOW) has the kernel refuse a symlink leaf outright.
+    - Everywhere: after opening, fstat the descriptor and require it to match the
+      pre-validated no-follow lstat (dev+inode) - a swap changes the identity.
+    THE single entry point for reading a project file whose contents can enter a
+    prompt (enumerated source AND static metadata)."""
     full = _contained_path(project_dir, rel)
     if full is None:
         return ""
-    # A symlink LEAF whose target is inside the repo would pass realpath containment,
-    # but we still must not read through it (it can be re-pointed) - refuse it.
     if os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
+        return ""  # symlink leaf (target may be re-pointed) -> refuse
+    try:
+        pre = os.lstat(full)
+    except OSError:
         return ""
-    return _read_full(full, cap)
+    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
+        return ""  # not a real regular file
+    flags = os.O_RDONLY | _O_BINARY | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+    try:
+        fd = os.open(full, flags)
+    except OSError:
+        return ""  # e.g. O_NOFOLLOW hit a symlink swapped in at the leaf
+    try:
+        if not _same_id(os.fstat(fd), pre):
+            return ""  # identity changed between lstat and open -> fail closed
+        buf = bytearray()
+        while len(buf) < cap:
+            chunk = os.read(fd, min(65536, cap - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+        # Normalize newlines like the old universal-newline text read, so prompt
+        # content / edit anchors / diffs stay \n-based across platforms.
+        return bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
 
 
 def _atomic_replace_nofollow(full: str, data, binary: bool = False, newline: str = "") -> bool:
-    """Write `data` to absolute path `full` via temp + os.replace. os.replace renames
-    the temp onto `full`'s directory entry, REPLACING a symlink there rather than
-    following it - so a symlink swapped in between validation and write cannot redirect
-    the bytes outside the repo (closes the check-then-open TOCTOU). Returns True on
-    success. `full` is expected to already be a contained realpath."""
-    tmp = f"{full}.{os.getpid()}.{threading.get_ident()}.tmp"
+    """Write `data` to absolute path `full` atomically WITHOUT following a symlink at
+    the leaf OR a swapped parent directory. `full` is expected to be a contained
+    realpath. Returns True on success.
+
+    - POSIX (dir_fd supported): open a VERIFIED parent-directory handle once and do the
+      temp create + os.replace + cleanup RELATIVE to that fd, so a parent swapped after
+      validation cannot redirect the write (the fd still refers to the original dir).
+    - Windows / no dir_fd: temp create + os.replace by path, re-checking the parent
+      directory identity at the syscall boundary to narrow the swap window (documented
+      residual). os.replace itself replaces a leaf symlink rather than following it."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")  # no newline translation (matches newline="")
+    parent = os.path.dirname(full) or "."
+    base = os.path.basename(full)
+    tmpbase = f"{base}.{os.getpid()}.{threading.get_ident()}.tmp"
+
+    if _HAS_DIR_FD and os.replace in os.supports_dir_fd:
+        dflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | (
+            os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+        try:
+            os.makedirs(parent, exist_ok=True)
+            dfd = os.open(parent, dflags)
+        except OSError:
+            return False
+        try:
+            tfd = os.open(tmpbase, os.O_WRONLY | os.O_CREAT | os.O_EXCL, dir_fd=dfd)
+            try:
+                os.write(tfd, data)
+            finally:
+                os.close(tfd)
+            os.replace(tmpbase, base, src_dir_fd=dfd, dst_dir_fd=dfd)
+            return True
+        except OSError:
+            try:
+                os.unlink(tmpbase, dir_fd=dfd)
+            except OSError:
+                pass
+            return False
+        finally:
+            os.close(dfd)
+
+    # Windows / no dir_fd path: narrow the parent-swap window with an identity re-check.
+    tmp = os.path.join(parent, tmpbase)
     try:
-        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-        if binary:
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-        else:
-            with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
-                fh.write(data)
+        os.makedirs(parent, exist_ok=True)
+        pre = os.stat(parent)
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        if not _same_id(os.stat(parent), pre):  # parent swapped since validation
+            os.remove(tmp)
+            return False
         os.replace(tmp, full)
         return True
     except OSError:

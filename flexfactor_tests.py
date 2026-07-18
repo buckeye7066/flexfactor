@@ -1796,5 +1796,104 @@ class ModifyFilesInRepoSymlinkReadTests(unittest.TestCase):
             self.assertNotIn("INNER_SECRET", prov.prompts[1])
 
 
+class RefactorFileContainmentTests(unittest.TestCase):
+    """Round-10 defect 1: refactor --file content reaches the provider and the rewrite
+    overwrites the target, so a symlinked --file must be refused."""
+
+    def test_symlinked_refactor_file_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = os.path.join(tmp, "secret.py")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SECRET_CONST = 1\n")
+            link = os.path.join(tmp, "link.py")
+            if not _try_symlink(link, secret):
+                self.skipTest("symlinks not permitted here")
+            with self.assertRaises(ff.SourceInputError):
+                ff._load_source_text(link)
+
+    def test_normal_refactor_file_still_reads(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "m.py")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            path, content = ff._load_source_text(src)
+            self.assertEqual(os.path.realpath(path), os.path.realpath(src))
+            self.assertEqual(content, "x = 1\n")
+
+
+class ReadIdentityRecheckTests(unittest.TestCase):
+    """Round-10 defect 2: _read_contained must FAIL CLOSED if the descriptor it opened
+    is not the file it validated (leaf swapped between lstat and open)."""
+
+    def test_identity_mismatch_returns_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "a.txt"), "w", encoding="utf-8") as fh:
+                fh.write("REAL_CONTENT")
+            secret = os.path.join(tmp, "secret.txt")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SWAPPED_SECRET")
+            full = ff._contained_path(proj, "a.txt")
+            real_open = os.open
+
+            def swap_open(path, flags, *a, **k):
+                # Simulate a leaf swap: opening the validated path yields a DIFFERENT
+                # file's descriptor (as if the name was re-pointed after validation).
+                if os.path.abspath(path) == os.path.abspath(full):
+                    return real_open(secret, os.O_RDONLY)
+                return real_open(path, flags, *a, **k)
+
+            ff.os.open = swap_open
+            try:
+                out = ff._read_contained(proj, "a.txt")
+            finally:
+                ff.os.open = real_open
+            self.assertNotIn("SWAPPED_SECRET", out)  # secret never returned
+            self.assertEqual(out, "")                # fails closed on identity mismatch
+
+
+class WriteParentSwapRecheckTests(unittest.TestCase):
+    """Round-10 defect 3: on the no-dir_fd (Windows) path, the atomic writer re-checks
+    the parent directory identity at the syscall boundary and fails closed on a swap."""
+
+    def test_parent_identity_change_fails_closed(self):
+        import tempfile
+        if ff._HAS_DIR_FD and os.replace in os.supports_dir_fd:
+            self.skipTest("POSIX dir_fd path uses a handle, not the stat re-check")
+        with tempfile.TemporaryDirectory() as tmp:
+            full = os.path.join(tmp, "sub", "f.txt")
+            os.makedirs(os.path.dirname(full))
+            parent = os.path.dirname(full)
+            real_stat = os.stat
+            seen = {"n": 0}
+
+            def changing_stat(path, *a, **k):
+                if os.path.abspath(path) == os.path.abspath(parent):
+                    seen["n"] += 1
+                    if seen["n"] >= 2:  # post-write stat differs -> simulate a swap
+                        return real_stat(tmp, *a, **k)  # a DIFFERENT directory
+                return real_stat(path, *a, **k)
+
+            ff.os.stat = changing_stat
+            try:
+                ok = ff._atomic_replace_nofollow(full, "DATA")
+            finally:
+                ff.os.stat = real_stat
+            self.assertFalse(ok)  # parent identity changed since validation -> refused
+            self.assertFalse(os.path.exists(full))  # nothing written
+
+    def test_normal_write_succeeds(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            full = os.path.join(tmp, "sub", "f.txt")
+            self.assertTrue(ff._atomic_replace_nofollow(full, "DATA"))
+            with open(full, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "DATA")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -562,3 +562,65 @@ the audited-repo threat model.
 
 Round-9 verification: **110 tests GREEN**, dashboard OK, all `--help` exit 0, three
 launchers ASCII + parse-clean, `git diff --check` clean, no secrets.
+
+---
+
+## Round 10 (Codex review) — deepest layer: handle-based no-follow + identity re-check; refactor `--file`
+
+The chokepoints were still check-then-open (validate a pathname, then `open()` it) — a
+same-privilege local process could swap the leaf or a parent between the check and the
+syscall. Round 10 moves to handle/identity-based no-follow where the platform allows,
+narrows the window where it doesn't, and contains refactor `--file`. **This is the last
+deep containment round; the Windows residual is documented honestly below, not claimed
+closed.**
+
+### Defect 1 (HIGH) — refactor `--file` bypassed containment
+`_load_source_text` read `--file` with a raw `open()` (content → provider prompt) and
+the rewrite wrote it back with raw `open('w')`.
+- Fix: refuse a symlink-leaf `--file` (`SourceInputError`), read through `_read_contained`
+  (handle-based no-follow), and write the backup + result through `_atomic_replace_nofollow`.
+- Test: `RefactorFileContainmentTests` (2) — a symlinked `--file` is refused; a normal file still refactors.
+
+### Defect 2 (HIGH) — contained reads were check-then-open (leaf TOCTOU)
+- Fix: `_read_contained` now `lstat`s the leaf (must be a real regular file, not a
+  symlink), opens with `O_RDONLY | O_NOFOLLOW` (POSIX: kernel refuses a symlink leaf),
+  then **fstats the descriptor and requires (dev, inode) to match the pre-`lstat`** —
+  a swap between check and open changes the identity → returns `""` (fails closed).
+- Test: `ReadIdentityRecheckTests` — a descriptor whose identity differs from the
+  validated file yields `""` (the swapped secret is never returned).
+
+### Defect 3 (HIGH) — atomic writer not no-follow for parent races
+- Fix: `_atomic_replace_nofollow` now, on POSIX (`os.supports_dir_fd`), opens a
+  **verified parent-directory handle** (`O_DIRECTORY | O_NOFOLLOW`) once and does the
+  temp create + `os.replace` + cleanup **relative to that fd** (`dir_fd=`), so a parent
+  swapped after validation can't redirect the write. `_snapshot`/`_rollback` are already
+  no-follow. On no-dir_fd platforms it re-checks the parent directory identity around
+  the write and fails closed on change.
+- Test: `WriteParentSwapRecheckTests` — a parent identity change between validation and
+  replace fails closed (Windows path); a normal write succeeds.
+
+### Platform matrix + HONEST RESIDUAL
+
+| Capability | POSIX | Windows (this host) |
+|---|---|---|
+| `O_NOFOLLOW` leaf refusal (read) | ✅ kernel-enforced | ❌ absent → fstat identity re-check |
+| `dir_fd`-relative temp/replace/unlink (write) | ✅ handle-based | ❌ absent → parent-identity re-check |
+| fstat/dir-identity re-check | ✅ (belt-and-suspenders) | ✅ (primary defense) |
+
+This host reports `O_NOFOLLOW=False`, `dir_fd=False` (Windows), so containment relies
+on the **identity re-check at the syscall boundary**. **RESIDUAL (Windows, honest):** a
+*same-privilege local process* that swaps a leaf or a parent directory to a symlink/
+junction in the sub-millisecond window between the identity re-check and the very next
+syscall could still be followed. This is the same narrow pathname-TOCTOU that only a
+native handle API (`CreateFile` with `FILE_FLAG_OPEN_REPARSE_POINT` / `NtCreateFile`,
+not exposed by Python's `os`) can fully close; it is **not claimed closed on Windows** —
+only narrowed to sub-ms and always failing closed on a detected change. On POSIX it is
+fully closed via `O_NOFOLLOW` + `dir_fd`. Enumeration already skips symlinks up front,
+so reaching this residual additionally requires winning the race on a path that passed
+every earlier check.
+
+Round-10 verification: **115 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Refactor `--file`
+is contained; reads use `O_NOFOLLOW` + fstat identity re-check; writes/unlinks use
+`dir_fd`-relative no-follow on POSIX and parent-identity re-check on Windows; the
+Windows sub-ms residual is documented, not claimed closed.

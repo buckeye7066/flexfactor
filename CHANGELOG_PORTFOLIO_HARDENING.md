@@ -216,6 +216,21 @@ chokepoints:
 After rounds 6-9 there are no raw file opens under an audited repo — every read that
 can reach a model and every write under the repo is symlink-safe and atomic.
 
+## Round 10 (2026-07-18) — handle-based no-follow + identity re-check; refactor --file
+
+- **Refactor `--file` is now contained.** A symlinked `--file` is refused; its contents
+  are read and its rewrite is written through the same symlink-safe helpers as scout/audit.
+- **Reads and writes now defend the check-then-open race.** Reads open with
+  `O_NOFOLLOW` (POSIX) and re-verify the opened file's identity (device+inode) against
+  what was validated, failing closed on any mismatch. Writes use directory-handle-relative
+  operations on POSIX (`dir_fd`) and a parent-directory identity re-check on Windows.
+- **Honest platform note:** the strongest guarantees (`O_NOFOLLOW`, `dir_fd`) are POSIX
+  features. On Windows they are unavailable, so containment there relies on the identity
+  re-check, which NARROWS the swap window to sub-millisecond and always fails closed on a
+  detected change but does not fully eliminate a same-privilege local-process pathname
+  race — that requires native Windows handle APIs not exposed by Python. This residual is
+  documented in PORTFOLIO_AUDIT.md and is not claimed closed on Windows.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
