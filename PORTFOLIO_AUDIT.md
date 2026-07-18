@@ -931,3 +931,47 @@ dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git dif
 clean, no secrets. Whitespace-only files are never clean-without-review; a refused symlink
 modify-target fails closed (existence checked before the containment-None skip); empty
 package.json is distinct from missing/refused. POSIX-closed / Windows-residual matrix unchanged.
+
+---
+
+## Round 17 (Codex review) — ROOT: existence was binary (refused collapsed to missing)
+
+Codex confirmed r16's fixes but found both remaining issues shared ONE root:
+`_contained_lexists` returned `False` for BOTH "doesn't exist" AND "refused/couldn't-check",
+so a refused existence collapsed to "missing" and callers failed OPEN.
+
+### ROOT FIX — existence is now TRI-STATE
+Replaced the boolean `_contained_lexists` with `_contained_existence(project_dir, rel) ->
+'exists' | 'missing' | 'refused'`. On POSIX it walks each component with openat +
+`O_NOFOLLOW` and classifies the failure by errno: `ENOENT` on a component -> definitive
+`missing`; `ELOOP` (symlink) / `ENOTDIR` / anything else -> `refused`; a malformed path or
+POSIX-without-openat -> `refused`. A `refused` existence is NEVER treated as `missing`.
+
+### Defect 1 (caller) — integration treated a refused modify-target as CREATE
+Repro: repo has `real/app.js`; `alias` is a symlink DIRECTORY to `real`; plan
+`modify_files:["alias/app.js"]`. `_read_contained` refused (ancestor symlink) -> None;
+old `_contained_lexists` -> False; `_contained_path` -> non-None (realpath stays inside);
+code fell through as "missing -> create". Fix: use `_contained_existence`; only a
+DEFINITIVE `missing` is a create - `exists` OR `refused` FAILS CLOSED (integration refused).
+Tests: `IntegrationRefusedExistenceFailsClosedTests` (incl. a POSIX ancestor-symlink-dir).
+
+### Defect 2 (caller) — POSIX-without-openat wasn't fail-closed in metadata detection
+With `_POSIX_NOFOLLOW==False` and `_CONTAINMENT_FALLBACK_OK==False` and a REAL package.json,
+`_read_contained` -> None and old `_contained_lexists` -> False, so `_read_meta_tristate`
+returned `('missing', None)` -> disabled Node/build detection. Fix: `_read_meta_tristate`
+returns `('missing', None)` ONLY when `_contained_existence == 'missing'`; otherwise
+`('refused', None)` -> `_detect_verify`/`_detect_stack` fail closed (per r14/r15). Test:
+`MetaTristatePosixFailClosedTests`.
+
+### AUDIT — every `_contained_existence` caller maps `refused` to fail-closed
+| Caller | `missing` | `refused` | `exists` |
+|---|---|---|---|
+| `generate_integration` modify-read | create (skip blob) | REFUSE integration | REFUSE integration |
+| `_read_meta_tristate` (→ `_read_package_json`, `_gather_from_folder`) | `('missing',None)` | `('refused',None)` → fail closed / marker | `('refused',None)` (read already None) |
+No caller maps `refused` to missing/create/not-present.
+
+Round-17 verification: **168 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Existence is tri-state (`refused != missing`); the integration-create and
+package-detection callers both fail closed on a refused existence. POSIX-closed /
+Windows-residual matrix unchanged.

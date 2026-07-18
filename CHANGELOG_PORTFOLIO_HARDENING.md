@@ -322,6 +322,17 @@ raw pathname. All now go through the openat-walk helpers:
 - **An empty package.json shows a distinct "present but empty" note** in the folder
   profile, so it is no longer indistinguishable from a missing one.
 
+## Round 17 (2026-07-18) — file existence is now three-state, not yes/no
+
+- **"Does this file exist?" now distinguishes yes / no / can't-safely-tell.** Previously a
+  file whose existence couldn't be safely checked (behind a symlinked directory, or on a
+  platform without the safe file APIs) was reported the same as "doesn't exist", which made
+  callers fall open. Now a can't-tell result is treated as a refusal, never as absent.
+- **Scout integration** refuses to proceed when a file it plans to modify can't be verified
+  as genuinely missing (rather than assuming it's a new file to create).
+- **Build detection** (is this a Node project? which verify command?) fails closed when
+  package.json exists but can't be safely read, instead of concluding "not a Node project".
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

@@ -2736,5 +2736,136 @@ class EmptyPackageJsonDistinctTests(unittest.TestCase):
             self.assertIn("present but empty", ctx)
 
 
+class ContainedExistenceTriStateTests(unittest.TestCase):
+    """Round-17 root: existence is TRI-STATE - exists | missing | refused. A refused
+    existence (can't safely determine) is NEVER 'missing'."""
+
+    def test_exists_missing_and_malformed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "real.py"), "w", encoding="utf-8") as fh:
+                fh.write("x")
+            self.assertEqual(ff._contained_existence(proj, "real.py"), "exists")
+            self.assertEqual(ff._contained_existence(proj, "ghost.py"), "missing")
+            self.assertEqual(ff._contained_existence(proj, "../escape"), "refused")
+            self.assertEqual(ff._contained_existence(proj, "a\x00b"), "refused")
+
+    def test_symlink_leaf_is_exists_not_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "s")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("S")
+            if not _try_symlink(os.path.join(proj, "link.py"), secret):
+                self.skipTest("symlinks not permitted here")
+            self.assertEqual(ff._contained_existence(proj, "link.py"), "exists")
+
+    def test_posix_without_facilities_is_refused_not_missing(self):
+        import tempfile
+        real_p, real_f = ff._POSIX_NOFOLLOW, ff._CONTAINMENT_FALLBACK_OK
+        ff._POSIX_NOFOLLOW = False
+        ff._CONTAINMENT_FALLBACK_OK = False  # simulate POSIX without openat/O_NOFOLLOW
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proj = os.path.join(tmp, "proj")
+                os.makedirs(proj)
+                with open(os.path.join(proj, "real.py"), "w", encoding="utf-8") as fh:
+                    fh.write("x")
+                # The file REALLY exists, but we can't safely check -> REFUSED (not missing).
+                self.assertEqual(ff._contained_existence(proj, "real.py"), "refused")
+        finally:
+            ff._POSIX_NOFOLLOW, ff._CONTAINMENT_FALLBACK_OK = real_p, real_f
+
+
+class MetaTristatePosixFailClosedTests(unittest.TestCase):
+    """Round-17 defect 2: POSIX-without-openat with a REAL package.json yields 'refused'
+    (fail closed), NOT 'missing' - so build detection fails closed, not 'not Node'."""
+
+    def test_real_package_json_refused_when_facility_unavailable(self):
+        import tempfile
+        real_p, real_f = ff._POSIX_NOFOLLOW, ff._CONTAINMENT_FALLBACK_OK
+        ff._POSIX_NOFOLLOW = False
+        ff._CONTAINMENT_FALLBACK_OK = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proj = os.path.join(tmp, "proj")
+                os.makedirs(proj)
+                with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                    fh.write('{"scripts":{"build":"x"}}')
+                self.assertEqual(ff._read_meta_tristate(proj, "package.json")[0], "refused")
+                self.assertEqual(ff._read_package_json(proj)[0], "refused")
+                is_node, verify = ff._detect_verify(proj)
+                self.assertTrue(is_node)
+                self.assertIsNone(verify)  # refused -> caller fails closed (not (False, []))
+                self.assertTrue(ff._detect_stack(proj)["config_refused"])
+        finally:
+            ff._POSIX_NOFOLLOW, ff._CONTAINMENT_FALLBACK_OK = real_p, real_f
+
+
+class IntegrationRefusedExistenceFailsClosedTests(unittest.TestCase):
+    """Round-17 defect 1: a modify-target whose refusal is an ancestor symlink resolving
+    INSIDE the repo (existence 'refused', not 'missing') FAILS CLOSED, not create-only."""
+
+    def _fake_prov(self):
+        class FakeProv:
+            def __init__(self):
+                self.calls = 0
+
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"can_apply": True, "plan": "p", "packages": [],
+                            "create_files": [], "modify_files": ["alias/app.js"], "reason": ""}
+                return {"files": [], "packages": []}
+        return FakeProv()
+
+    def test_refused_existence_modify_target_refuses_integration(self):
+        # Windows-testable via monkeypatch: read refused + existence 'refused' -> fail closed.
+        real_rc, real_ex = ff._read_contained, ff._contained_existence
+        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
+        ff._contained_existence = lambda pd, rel: "refused"
+        prov = self._fake_prov()
+        try:
+            patch, reason = ff.generate_integration(
+                prov, "/proj", "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+        finally:
+            ff._read_contained, ff._contained_existence = real_rc, real_ex
+        self.assertIsNone(patch)                 # refused-existence -> NOT create-only
+        self.assertIn("refusing integration", reason)
+        self.assertEqual(prov.calls, 1)
+
+    def test_missing_existence_modify_target_is_create(self):
+        real_rc, real_ex = ff._read_contained, ff._contained_existence
+        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
+        ff._contained_existence = lambda pd, rel: "missing"  # DEFINITIVELY missing
+        prov = self._fake_prov()
+        try:
+            patch, reason = ff.generate_integration(
+                prov, "/proj", "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+        finally:
+            ff._read_contained, ff._contained_existence = real_rc, real_ex
+        self.assertEqual(prov.calls, 2)  # missing -> proceeds (create-only), not refused
+
+    def test_posix_ancestor_symlink_dir_inside_repo_refuses(self):
+        import tempfile
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("POSIX openat component-walk unavailable on this platform")
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "real"))
+            with open(os.path.join(proj, "real", "app.js"), "w", encoding="utf-8") as fh:
+                fh.write("INSIDE_CODE")
+            os.symlink(os.path.join(proj, "real"), os.path.join(proj, "alias"))  # dir symlink INSIDE
+            prov = self._fake_prov()
+            patch, reason = ff.generate_integration(
+                prov, proj, "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            self.assertIsNone(patch)             # ancestor-symlink-inside -> fail closed
+            self.assertIn("refusing integration", reason)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

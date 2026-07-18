@@ -46,6 +46,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import difflib
+import errno
 import hashlib
 import json
 import os
@@ -2087,16 +2088,15 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
         if _rel_components(rel) is None:
             print(f"    [skip] plan names a malformed path, not reading: {rel!r}")
             continue
-        # EXISTENCE FIRST: a symlink leaf pointing OUTSIDE makes _contained_path None too,
-        # so check existence BEFORE the containment-None skip - an EXISTING but unreadable
-        # modify target must FAIL CLOSED, never fall through to create-only.
-        if _contained_lexists(project_dir, rel):
-            return None, (f"planned modify target {rel!r} exists but could not be safely "
-                          "read (symlink/containment refused) - refusing integration")
-        if _contained_path(project_dir, rel) is None:
-            print(f"    [skip] plan names a file outside the repo, not reading: {rel!r}")
-            continue
-        # else: truly missing -> the plan will CREATE it; nothing to show.
+        # TRI-STATE existence (refused != missing). Only a DEFINITIVE missing is a create;
+        # an EXISTS-but-unreadable OR a REFUSED-existence (ancestor symlink, incl. one
+        # resolving INSIDE the repo, or POSIX-without-openat) must FAIL CLOSED, never fall
+        # through to create-only.
+        exist = _contained_existence(project_dir, rel)
+        if exist == "missing":
+            continue  # truly missing -> the plan will CREATE it; nothing to show
+        return None, (f"planned modify target {rel!r} could not be safely read and is not "
+                      f"definitively missing (existence={exist}) - refusing integration")
     existing_text = "\n\n".join(existing_blobs) if existing_blobs else "(creating new files only)"
 
     # The plan fields come from the FIRST model pass (which read untrusted repo/source
@@ -3366,41 +3366,71 @@ def _read_text_and_sha(project_dir: str, rel: str,
             return None
 
 
-def _contained_lexists(project_dir: str, rel: str) -> bool:
-    """True if `rel` EXISTS by name inside project_dir (leaf lstat'd, symlink NOT
-    followed) - so a caller can tell a refused read (file exists) from a missing one.
-    An ancestor symlink / escape yields False (treated as missing by the caller)."""
+def _contained_existence(project_dir: str, rel: str) -> str:
+    """TRI-STATE existence: 'exists' | 'missing' | 'refused'. 'refused' means existence
+    could NOT be safely DETERMINED (a symlink ancestor/leaf, a malformed path, or the
+    containment facility is unavailable). A 'refused' existence must NEVER be treated as
+    'missing' - callers fail closed on it. Only a DEFINITIVE 'missing' (a component that
+    genuinely does not exist, ENOENT, reached without following any symlink) is 'missing'."""
     comps = _rel_components(rel)
     if comps is None:
-        return False
+        return "refused"  # malformed (NUL/traversal/absolute) -> can't vouch -> fail closed
     if _POSIX_NOFOLLOW:
-        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
-            if parent is None:
-                return False
+        root_real = os.path.realpath(project_dir)
+        dirflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+        fds: list[int] = []
+        try:
             try:
-                os.lstat(leaf, dir_fd=parent)
-                return True
+                parent = os.open(root_real, dirflags)
             except OSError:
-                return False
+                return "refused"  # can't even open the repo root safely
+            fds.append(parent)
+            for d in comps[:-1]:
+                try:
+                    fd = os.open(d, dirflags, dir_fd=parent)
+                except OSError as e:
+                    # ENOENT = an ancestor dir genuinely absent -> the file is MISSING.
+                    # ELOOP (symlink) / ENOTDIR / anything else -> couldn't check -> REFUSED.
+                    return "missing" if getattr(e, "errno", None) == errno.ENOENT else "refused"
+                fds.append(fd)
+                parent = fd
+            try:
+                os.lstat(comps[-1], dir_fd=parent)
+                return "exists"
+            except OSError as e:
+                return "missing" if getattr(e, "errno", None) == errno.ENOENT else "refused"
+        finally:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     if not _CONTAINMENT_FALLBACK_OK:
-        return False
+        return "refused"  # POSIX without openat -> can't safely check -> fail closed
+    # Windows: contain the PARENT, then lexists the literal leaf (leaf symlink not followed).
     leaf = comps[-1]
-    parent_full = (_contained_path(project_dir, "/".join(comps[:-1])) if len(comps) > 1
-                   else os.path.realpath(project_dir))
-    if parent_full is None:
-        return False
-    return os.path.lexists(os.path.join(parent_full, leaf))
+    if len(comps) > 1:
+        parent_full = _contained_path(project_dir, "/".join(comps[:-1]))
+        if parent_full is None:
+            return "refused"  # parent escapes the repo -> can't vouch
+    else:
+        parent_full = os.path.realpath(project_dir)
+    try:
+        return "exists" if os.path.lexists(os.path.join(parent_full, leaf)) else "missing"
+    except OSError:
+        return "refused"
 
 
 def _read_meta_tristate(project_dir: str, rel: str,
                         cap: int = MAX_REVIEW_BYTES) -> tuple[str, str | None]:
     """TRI-STATE contained read: ('ok', text) | ('missing', None) | ('refused', None).
-    Distinguishes a file that EXISTS but couldn't be safely read (refused - fail closed /
-    show a marker) from one that is genuinely absent (missing)."""
+    A file that EXISTS but couldn't be safely read - AND one whose existence itself
+    couldn't be determined (ancestor symlink / POSIX-without-openat) - is 'refused' (fail
+    closed / show a marker). Only a DEFINITIVE missing is 'missing'."""
     text = _read_contained(project_dir, rel, cap)
     if text is not None:
         return ("ok", text)
-    return ("refused", None) if _contained_lexists(project_dir, rel) else ("missing", None)
+    return ("missing", None) if _contained_existence(project_dir, rel) == "missing" else ("refused", None)
 
 
 def _unlink_contained(project_dir: str, rel: str) -> bool:
