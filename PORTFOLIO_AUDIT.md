@@ -429,3 +429,61 @@ Round-7 verification: **100 tests GREEN**, dashboard OK, all `--help` exit 0, th
 launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
 containment is now fully symmetric: EVERY read (model-named AND repo-enumerated) goes
 through the realpath containment chokepoint, and enumeration skips symlinks.
+
+---
+
+## Round 8 (Codex review) — 2 HIGH: containment now covers STATIC reads AND writes
+
+Containment covered model-named + enumerated paths but not STATIC (fixed-name) ones.
+Two exhaustive audits close the last asymmetry. Both tests RED on `02e4a1f` — the
+write one showed the baseline FOLLOWING a symlink and overwriting an outside file.
+
+### Defect 1 (HIGH) — static metadata READS bypassed containment into prompts
+`_gather_from_folder` (scout profiling) and `generate_integration`/`_detect_stack`/
+`_detect_verify` read `package.json`/`README.md` with `_read_text_safe(os.path.join(
+folder, …))`, which follows a symlink — so a repo could make one of those a symlink
+to an outside file and have its contents read into the LLM.
+- Fix: all such reads now go through `_read_contained` (realpath containment + explicit
+  symlink-leaf refusal). `_file_tree` also skips symlinked files/dirs (name leak).
+- **AUDIT — every file READ whose contents can enter a prompt → now via `_read_contained`:**
+
+  | Read site | Source | Via |
+  |---|---|---|
+  | `_gather_from_folder` package.json + README (~1537) | static | `_read_contained` ✅ |
+  | `generate_integration` package.json (~1937) | static | `_read_contained` ✅ |
+  | `_detect_verify` / `_detect_stack` package.json (~1918/2920) | static | `_read_contained` ✅ |
+  | `generate_integration` modify_files (~1957) | model | `_contained_path` (r6) ✅ |
+  | review / first-attempt / unit-test-gen (~3436/3542/4278) | enumerated | `_read_contained` (r7) ✅ |
+  | `resolve_program_input` single `--file` (~1598) | user's explicit input | n/a (user-chosen) |
+- Test: `StaticMetadataReadContainmentTests` (2).
+
+### Defect 2 (HIGH) — static report/config WRITES followed symlinks outside the repo
+`_write_audit_report` (and scout/low reports + the Playwright config) built a
+predictable name under `project_dir` and opened it `'w'`; if the audited repo
+pre-created that filename as a symlink to an outside file, generation FOLLOWED it and
+truncated/overwrote the outside target — even in report-only runs.
+- Fix: new `_write_contained(project_dir, rel, content)` — validates via
+  `_contained_path`, REJECTS a symlink leaf (`os.path.islink`), writes ATOMICALLY
+  (temp + `os.replace`, which replaces rather than follows a dest symlink), returns
+  None on refusal so callers fall back to FlexFactor's own cwd.
+- **AUDIT — every project WRITE → now via `_write_contained` (or already contained):**
+
+  | Write site | Kind | Via |
+  |---|---|---|
+  | `_write_audit_report` (~4650) | static report | `_write_contained` ✅ |
+  | `_write_scout_report` (~2524) | static report | `_write_contained` ✅ |
+  | `_write_low_findings_report` (~4682) | static report | `_write_contained` ✅ |
+  | Playwright config write (~3285) | static config | `_write_contained` ✅ |
+  | e2e spec writes (~3258) | model | `_write_contained` ✅ |
+  | unit-test-gen writes (~4280) | model | `_write_contained` ✅ |
+  | `apply_integration` writes (~2065) | model | `_contained_path` + islink-leaf refusal ✅ |
+  | fix-loop writes (~3729/3733/3742) | enumerated (symlink-skipped in r7) | `_contained_path` `full` ✅ |
+  | batch report (~C:\Users\firer) / status.json / brain.json / audit lock | FlexFactor-owned paths outside any audited repo | n/a |
+- Test: `StaticWriteContainmentTests` (4), incl. a symlinked `_audit_report.md` that
+  leaves the outside file intact.
+
+Round-8 verification: **106 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
+containment is now FULLY symmetric and covers static/fixed-name paths as well as
+model-named and enumerated ones — no read that enters a prompt and no write under the
+audited repo can follow a symlink outside it.

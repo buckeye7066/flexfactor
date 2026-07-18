@@ -1555,5 +1555,122 @@ class EnumeratedSymlinkContainmentTests(unittest.TestCase):
             self.assertEqual(ff._read_contained(proj, outside), "")
 
 
+class StaticMetadataReadContainmentTests(unittest.TestCase):
+    """Round-8 defect 1: static metadata reads (package.json/README) that enter the
+    profiling prompt must be symlink-safe."""
+
+    def _symlink(self, link, target):
+        try:
+            os.symlink(target, link)
+            return True
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+
+    def test_symlinked_readme_and_pkg_not_read_into_profile(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "secret.txt")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("OUTSIDE_SECRET=xyz")
+            if not (self._symlink(os.path.join(proj, "README.md"), secret)
+                    and self._symlink(os.path.join(proj, "package.json"), secret)):
+                self.skipTest("symlinks not permitted here")
+            name, ctx = ff._gather_from_folder(proj)
+            self.assertNotIn("OUTSIDE_SECRET", ctx)
+
+    def test_read_contained_refuses_symlink_leaf(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "s.txt")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SECRET")
+            if not self._symlink(os.path.join(proj, "package.json"), secret):
+                self.skipTest("symlinks not permitted here")
+            self.assertEqual(ff._read_contained(proj, "package.json", 100), "")
+
+
+class StaticWriteContainmentTests(unittest.TestCase):
+    """Round-8 defect 2: static report/config writes must never follow a symlink
+    out of the repo (would truncate/overwrite an outside file)."""
+
+    def _symlink(self, link, target):
+        try:
+            os.symlink(target, link)
+            return True
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+
+    def test_write_contained_refuses_symlinked_report_and_preserves_outside(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("PRECIOUS")
+            if not self._symlink(os.path.join(proj, "report.md"), outside):
+                self.skipTest("symlinks not permitted here")
+            # The write is refused and the outside file is untouched.
+            self.assertIsNone(ff._write_contained(proj, "report.md", "NEW REPORT"))
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")
+
+    def test_write_contained_refuses_traversal_and_absolute(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            self.assertIsNone(ff._write_contained(proj, "../escape.md", "x"))
+            self.assertIsNone(ff._write_contained(proj, os.path.join(tmp, "abs.md"), "x"))
+
+    def test_write_contained_writes_normal_report_atomically(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            out = ff._write_contained(proj, "sub/report.md", "hello")
+            self.assertIsNotNone(out)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "hello")
+            # no leftover temp files
+            self.assertEqual([f for f in os.listdir(os.path.dirname(out))
+                              if f.endswith(".tmp")], [])
+
+    def test_audit_report_refuses_symlink_and_falls_back(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("PRECIOUS")
+            # Pre-create the audit report name as a symlink to the outside file.
+            report_name = f"{ff._slugify('demo') or 'program'}_audit_report.md"
+            if not self._symlink(os.path.join(proj, report_name), outside):
+                self.skipTest("symlinks not permitted here")
+            audit = {"name": "demo", "dir": proj, "branch": None, "files_reviewed": 0,
+                     "findings": [], "file_findings": {}, "applied_files": [],
+                     "unverified_files": [], "test_files": [], "test_status": None,
+                     "e2e": {}, "fix_notes": [], "commit_status": "n/a",
+                     "baseline_ok": True, "cycles": 1, "providers": [],
+                     "converged": True, "stop_reason": "done", "suite_status": None,
+                     "clean_files": [], "usd": 0.0, "fix_severity": "high",
+                     "manual_review": [], "low_findings": []}
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                path = ff._write_audit_report(proj, audit)
+            finally:
+                os.chdir(cwd)
+            # The outside file is NOT overwritten; the report landed elsewhere.
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")
+            self.assertNotEqual(os.path.realpath(path), os.path.realpath(outside))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

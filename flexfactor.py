@@ -1516,13 +1516,19 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     without drowning in node_modules."""
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        # Prune noise/hidden AND symlinked dirs so the tree never lists names from a
+        # symlink target outside the repo.
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith(".")
+                       and not os.path.islink(os.path.join(dirpath, d))]
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         if depth > 2:
             dirnames[:] = []
             continue
         for f in filenames:
+            if os.path.islink(os.path.join(dirpath, f)):
+                continue  # don't surface a symlinked file's name either
             out.append(os.path.join(rel, f) if rel != "." else f)
             if len(out) >= max_entries:
                 return out
@@ -1534,9 +1540,11 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     name = os.path.basename(folder.rstrip("\\/")) or folder
     parts: list[str] = [f"PROGRAM FOLDER: {folder}"]
 
-    pkg = os.path.join(folder, "package.json")
-    if os.path.isfile(pkg):
-        raw = _read_text_safe(pkg, 8000)
+    # Metadata that enters the profiling prompt is read through the containment
+    # chokepoint - a package.json / README that is a symlink pointing OUTSIDE the
+    # repo must not have its target's contents read into the LLM.
+    raw = _read_contained(folder, "package.json", 8000)
+    if raw:
         try:
             data = json.loads(raw)
             name = data.get("name") or name
@@ -1551,9 +1559,9 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
             parts.append("package.json (unparsed):\n" + raw[:1500])
 
     for readme in ("README.md", "readme.md", "README.MD", "Readme.md"):
-        rp = os.path.join(folder, readme)
-        if os.path.isfile(rp):
-            parts.append("README excerpt:\n" + _read_text_safe(rp, 3000))
+        rp = _read_contained(folder, readme, 3000)
+        if rp:
+            parts.append("README excerpt:\n" + rp)
             break
 
     tree = _file_tree(folder)
@@ -1913,12 +1921,12 @@ def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]]]:
     """Return (is_node, verify_commands). For node projects we verify with the
     project's own build (falling back to lint/test) so 'production-ready' means
     what the project says it means."""
-    pkg = os.path.join(project_dir, "package.json")
-    if not os.path.isfile(pkg):
+    raw_pkg = _read_contained(project_dir, "package.json", 20000)
+    if not raw_pkg:
         return False, []
     scripts = {}
     try:
-        scripts = (json.loads(_read_text_safe(pkg, 20000)).get("scripts") or {})
+        scripts = (json.loads(raw_pkg).get("scripts") or {})
     except ValueError:
         pass
     for name in ("build", "lint", "typecheck"):
@@ -1932,7 +1940,7 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
     """Two-pass: plan, then full file contents. Returns a patch dict or None if
     the model judges a concrete integration infeasible."""
     tree = "\n  ".join(_file_tree(project_dir, max_entries=200))
-    pkg_text = _read_text_safe(os.path.join(project_dir, "package.json"), 6000)
+    pkg_text = _read_contained(project_dir, "package.json", 6000)
     repo_summary = _summarize_repo_for_judge(result)
 
     # profile_blob + need come from the earlier profiling/eval model over UNTRUSTED
@@ -2056,8 +2064,10 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
         # that tries to write outside the repo ABORTS the whole apply (-> rollback).
         for f in files:
             full = _contained_path(project_dir, f["path"])
-            if full is None:
-                raise ApplyError(f"generated file path escapes the repo, refused: {f['path']!r}")
+            if full is None or os.path.islink(os.path.join(project_dir, f["path"].replace("\\", "/"))):
+                # escapes the repo OR is a symlink leaf we must not follow-and-truncate
+                raise ApplyError(f"generated file path escapes the repo or is a symlink, "
+                                 f"refused: {f['path']!r}")
             os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
             _snapshot(full)
             with open(full, "w", encoding="utf-8", newline="") as fh:
@@ -2472,7 +2482,7 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
     fall back to the current directory."""
     base_dir = program_arg if os.path.isdir(program_arg) else (
         _find_local_project(name) or os.getcwd())
-    out_path = os.path.join(base_dir, f"{_slugify(name) or 'program'}_repo_rewards_report.md")
+    report_name = f"{_slugify(name) or 'program'}_repo_rewards_report.md"
     surfaced = [e for e in evaluations if e["recommendation"] != "SKIP"]
     skipped = [e for e in evaluations if e["recommendation"] == "SKIP"]
     lines = [f"# Repo Rewards benefit report — {name}", "",
@@ -2520,13 +2530,14 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
             lines.append(f"- [{repo.get('fullName')}]({repo.get('htmlUrl')}) "
                          f"({b.get('benefit_score')}/100) — {b.get('how_it_helps')}")
         lines.append("")
-    try:
+    body = "\n".join(lines)
+    out_path = _write_contained(base_dir, report_name, body)
+    if out_path is None:
+        # Refused (escapes repo / symlinked leaf) or failed: write to FlexFactor's own
+        # cwd instead of following a symlink in the target repo.
+        out_path = os.path.join(os.getcwd(), report_name)
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines))
-    except OSError:
-        out_path = os.path.join(os.getcwd(), f"{_slugify(name) or 'program'}_repo_rewards_report.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines))
+            fh.write(body)
     return out_path
 
 
@@ -2791,11 +2802,45 @@ def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> 
     """Read a repo-relative file's text ONLY if it stays inside project_dir. Uses the
     realpath containment chokepoint, so a file reached through a symlink that resolves
     outside the repo is refused (returns "") rather than disclosing its contents into
-    a review/fix/test prompt. The single entry point for reading an enumerated file."""
+    a review/fix/test prompt. THE single entry point for reading a project file whose
+    contents can enter a prompt (enumerated source AND static metadata)."""
     full = _contained_path(project_dir, rel)
     if full is None:
         return ""
+    # A symlink LEAF whose target is inside the repo would pass realpath containment,
+    # but we still must not read through it (it can be re-pointed) - refuse it.
+    if os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
+        return ""
     return _read_full(full, cap)
+
+
+def _write_contained(project_dir: str, rel: str, content: str, newline: str = "") -> str | None:
+    """THE symlink-safe project WRITE chokepoint. Returns the path written, or None if
+    the target escapes the repo or its leaf is a symlink (so a report/config filename
+    that the audited repo pre-created as a symlink to an outside file is REFUSED, never
+    followed-and-truncated). Writes atomically (temp + os.replace) so an existing
+    symlink at the destination is replaced, not followed - even in report-only runs."""
+    full = _contained_path(project_dir, rel)
+    if full is None:
+        return None
+    unresolved = os.path.join(project_dir, rel.replace("\\", "/"))
+    if os.path.islink(unresolved) or os.path.islink(full):
+        return None
+    tmp = None
+    try:
+        os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
+        tmp = f"{full}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
+            fh.write(content)
+        os.replace(tmp, full)  # atomic: replaces (never follows) a dest symlink
+        return full
+    except OSError:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return None
 
 
 def _is_test_path(rel: str) -> bool:
@@ -2881,11 +2926,11 @@ def _detect_stack(project_dir: str) -> dict:
             "verify_cmds": [], "fast_verify": None, "test_cmd": None,
             "full_suite_cmd": None, "dev_script": None, "is_web": False,
             "esbuild": None}
-    pkg = os.path.join(project_dir, "package.json")
-    if os.path.isfile(pkg):
+    raw_pkg = _read_contained(project_dir, "package.json", 20000)
+    if raw_pkg:
         info["is_node"] = True
         try:
-            data = json.loads(_read_text_safe(pkg, 20000))
+            data = json.loads(raw_pkg)
         except ValueError:
             data = {}
         scripts = data.get("scripts") or {}
@@ -3213,14 +3258,11 @@ def _setup_and_run_e2e(provider, project_dir: str, stack: dict, app_url: str,
             # re-validate through the containment chokepoint (a spec path already
             # 'inside' spec_dir could still carry a '..' escape).
             rel = f"{spec_dir}/{os.path.basename(rel.replace(chr(92), '/'))}"
-            full = _contained_path(project_dir, rel)
-            if full is None:
-                print(f"    [skip] generated e2e spec path escapes repo, refused: {f.get('path')!r}")
+            written = _write_contained(project_dir, rel, f.get("contents") or "")
+            if written is None:
+                print(f"    [skip] generated e2e spec path escapes/symlinked, refused: {f.get('path')!r}")
                 continue
-            os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
-            with open(full, "w", encoding="utf-8", newline="") as fh:
-                fh.write(f.get("contents") or "")
-            spec_files.append(os.path.relpath(full, project_dir))
+            spec_files.append(os.path.relpath(written, project_dir))
         if not spec_files:
             out["log"] = "model produced no e2e specs"
             return out
@@ -3239,8 +3281,9 @@ def _setup_and_run_e2e(provider, project_dir: str, stack: dict, app_url: str,
             "reuseExistingServer: true, timeout: 180000 },\n"
             "});\n"
         )
-        with open(os.path.join(project_dir, cfg_name), "w", encoding="utf-8", newline="") as fh:
-            fh.write(cfg)
+        if _write_contained(project_dir, cfg_name, cfg) is None:
+            out["log"] = f"playwright config path refused (symlink/escape): {cfg_name}; e2e skipped"
+            return out
 
         print("    e2e: driving the app (clicking buttons)...")
         r = _run(["npx", "playwright", "test", "-c", cfg_name], project_dir, timeout=1800)
@@ -4236,14 +4279,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     p = f.get("path") or ""
                     if not p or not (f.get("contents") or "").strip():
                         continue
-                    full = _contained_path(project_dir, p)
-                    if full is None:  # model-chosen path escapes the repo -> refuse
-                        print(f"{pfx}[skip] generated test path escapes repo, refused: {p!r}")
+                    written = _write_contained(project_dir, p, f["contents"])
+                    if written is None:  # escapes repo / symlinked leaf -> refuse
+                        print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
                         continue
-                    os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
-                    with open(full, "w", encoding="utf-8", newline="") as fh:
-                        fh.write(f["contents"])
-                    test_files.append(os.path.relpath(full, project_dir))
+                    test_files.append(os.path.relpath(written, project_dir))
             if test_files:
                 ok, log = _run_unit_tests(project_dir, stack)
                 test_status = ok
@@ -4570,7 +4610,7 @@ def _print_audit_summary(a: dict) -> None:
 
 
 def _write_audit_report(project_dir: str, a: dict) -> str:
-    out_path = os.path.join(project_dir, f"{_slugify(a['name']) or 'program'}_audit_report.md")
+    report_name = f"{_slugify(a['name']) or 'program'}_audit_report.md"
     L = [f"# FlexFactor audit — {a['name']}", "",
          f"- **Project:** `{a['dir']}`",
          f"- **Branch:** `{a['branch']}`" if a["branch"] else "- **Branch:** (not a git repo)",
@@ -4646,13 +4686,12 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if a["fix_notes"]:
         L += ["## Fix notes / left unfixed", ""] + [f"- {n}" for n in a["fix_notes"]] + [""]
 
-    try:
+    body = "\n".join(L)
+    out_path = _write_contained(project_dir, report_name, body)
+    if out_path is None:
+        out_path = os.path.join(os.getcwd(), report_name)
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
-    except OSError:
-        out_path = os.path.join(os.getcwd(), f"{_slugify(a['name']) or 'program'}_audit_report.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
+            fh.write(body)
     return out_path
 
 
@@ -4677,14 +4716,13 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
                      f"({f.get('category')}) — **{f.get('title')}**: {f.get('problem')} "
                      f"_Suggested fix:_ {f.get('fix')}")
         L.append("")
-    out_path = os.path.join(project_dir, f"{_slugify(name) or 'program'}_low_findings.md")
-    try:
+    report_name = f"{_slugify(name) or 'program'}_low_findings.md"
+    body = "\n".join(L)
+    out_path = _write_contained(project_dir, report_name, body)
+    if out_path is None:
+        out_path = os.path.join(os.getcwd(), report_name)
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
-    except OSError:
-        out_path = os.path.join(os.getcwd(), f"{_slugify(name) or 'program'}_low_findings.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
+            fh.write(body)
     return out_path
 
 

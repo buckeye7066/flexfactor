@@ -178,6 +178,23 @@ Three sibling fixes of earlier work, done as full audits (all transparent):
   the model or found by enumeration — is now contained to the repo, matching the
   write-side containment.
 
+## Round 8 (2026-07-18) — static reads and writes are symlink-safe too
+
+- **Static metadata reads are now contained.** `package.json` and `README.md` (read
+  into the scout profiling / integration prompts and build detection) go through the
+  realpath containment helper, so a repo that makes one of them a symlink to an
+  outside file can no longer have that file's contents read into the model.
+- **Static report/config writes can no longer follow a symlink out of the repo.**
+  The audit report, scout report, low-findings report, and Playwright config are now
+  written through a symlink-safe write chokepoint that refuses a report/config name
+  the repo pre-created as a symlink and writes atomically (so an outside file is never
+  truncated/overwritten — this could previously happen even in report-only runs).
+  If a name is refused, the report falls back to FlexFactor's own working directory.
+
+With rounds 6-8, file-path containment is fully symmetric: no read that can enter a
+prompt, and no write under the audited repo, follows a symlink outside it — whether
+the path is model-named, repo-enumerated, or a fixed/static name.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
