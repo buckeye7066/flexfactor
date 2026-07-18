@@ -1600,10 +1600,13 @@ def resolve_program_input(program_arg: str) -> tuple[str, str]:
     if os.path.isdir(arg):
         return _gather_from_folder(arg)
 
-    # 3. A single source file.
+    # 3. A single source file. Read through containment (relative to its own folder)
+    #    so a symlink leaf doesn't pull an outside file's contents into the prompt.
     if os.path.isfile(arg):
         name = os.path.basename(arg)
-        return name, f"PROGRAM FILE: {arg}\n\n{_read_text_safe(arg, 6000)}"
+        body = _read_contained(os.path.dirname(os.path.abspath(arg)),
+                               os.path.basename(arg), 6000)
+        return name, f"PROGRAM FILE: {arg}\n\n{body}"
 
     # 4. A URL.
     if arg.lower().startswith("http://") or arg.lower().startswith("https://"):
@@ -1967,12 +1970,13 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
     # prompt (disclosure of local secrets), not just be blocked from being written.
     existing_blobs = []
     for rel in plan.get("modify_files") or []:
-        full = _contained_path(project_dir, rel)
-        if full is None:
+        # _read_contained refuses BOTH an escaping path AND a symlink leaf whose target
+        # resolves inside the repo (which realpath containment alone would allow).
+        body = _read_contained(project_dir, rel, 16000)
+        if body:
+            existing_blobs.append(f"--- {rel} ---\n{body}")
+        elif _contained_path(project_dir, rel) is None:
             print(f"    [skip] plan names a file outside the repo, not reading: {rel!r}")
-            continue
-        if os.path.isfile(full):
-            existing_blobs.append(f"--- {rel} ---\n{_read_text_safe(full, 16000)}")
     existing_text = "\n\n".join(existing_blobs) if existing_blobs else "(creating new files only)"
 
     # The plan fields come from the FIRST model pass (which read untrusted repo/source
@@ -2039,7 +2043,11 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
     def _snapshot(full_path: str) -> None:
         if full_path in backups:
             return
-        if os.path.isfile(full_path):
+        # Never read THROUGH a symlink for a backup (its target may be outside the
+        # repo); treat a symlink leaf as "no original" so rollback just removes it.
+        if os.path.islink(full_path):
+            backups[full_path] = None
+        elif os.path.isfile(full_path):
             with open(full_path, "rb") as fh:
                 backups[full_path] = fh.read()
         else:
@@ -2068,10 +2076,10 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                 # escapes the repo OR is a symlink leaf we must not follow-and-truncate
                 raise ApplyError(f"generated file path escapes the repo or is a symlink, "
                                  f"refused: {f['path']!r}")
-            os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
             _snapshot(full)
-            with open(full, "w", encoding="utf-8", newline="") as fh:
-                fh.write(f["contents"])
+            # Re-validate + atomic no-follow write (closes the check-then-open TOCTOU).
+            if _write_contained(project_dir, f["path"], f["contents"]) is None:
+                raise ApplyError(f"could not safely write {f['path']!r} (escape/symlink swap)")
 
         # Install dependencies.
         if packages and is_node:
@@ -2141,9 +2149,9 @@ def _rollback(project_dir, git, created_branch, branch, prev_branch, backups) ->
         # Remove any NEW untracked files we created (don't `git clean` - that would
         # nuke unrelated untracked files).
         for full, original in backups.items():
-            if original is None and os.path.isfile(full):
+            if original is None and os.path.lexists(full):
                 try:
-                    os.remove(full)
+                    os.remove(full)  # remove a NEW file/symlink we created (link, not target)
                 except OSError:
                     pass
         _git(["branch", "-D", branch], project_dir)
@@ -2151,11 +2159,12 @@ def _rollback(project_dir, git, created_branch, branch, prev_branch, backups) ->
         for full, original in backups.items():
             try:
                 if original is None:
-                    if os.path.isfile(full):
+                    if os.path.lexists(full):
                         os.remove(full)
                 else:
-                    with open(full, "wb") as fh:
-                        fh.write(original)
+                    # Atomic no-follow restore: replaces a symlink swapped in at `full`
+                    # rather than writing through it to an outside target.
+                    _atomic_replace_nofollow(full, original, binary=True)
             except OSError:
                 pass
 
@@ -2530,15 +2539,7 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
             lines.append(f"- [{repo.get('fullName')}]({repo.get('htmlUrl')}) "
                          f"({b.get('benefit_score')}/100) — {b.get('how_it_helps')}")
         lines.append("")
-    body = "\n".join(lines)
-    out_path = _write_contained(base_dir, report_name, body)
-    if out_path is None:
-        # Refused (escapes repo / symlinked leaf) or failed: write to FlexFactor's own
-        # cwd instead of following a symlink in the target repo.
-        out_path = os.path.join(os.getcwd(), report_name)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(body)
-    return out_path
+    return _safe_report_write(base_dir, report_name, "\n".join(lines))
 
 
 # =========================================================================== #
@@ -2814,33 +2815,70 @@ def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> 
     return _read_full(full, cap)
 
 
+def _atomic_replace_nofollow(full: str, data, binary: bool = False, newline: str = "") -> bool:
+    """Write `data` to absolute path `full` via temp + os.replace. os.replace renames
+    the temp onto `full`'s directory entry, REPLACING a symlink there rather than
+    following it - so a symlink swapped in between validation and write cannot redirect
+    the bytes outside the repo (closes the check-then-open TOCTOU). Returns True on
+    success. `full` is expected to already be a contained realpath."""
+    tmp = f"{full}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        if binary:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+        else:
+            with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
+                fh.write(data)
+        os.replace(tmp, full)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def _write_contained(project_dir: str, rel: str, content: str, newline: str = "") -> str | None:
     """THE symlink-safe project WRITE chokepoint. Returns the path written, or None if
     the target escapes the repo or its leaf is a symlink (so a report/config filename
     that the audited repo pre-created as a symlink to an outside file is REFUSED, never
-    followed-and-truncated). Writes atomically (temp + os.replace) so an existing
-    symlink at the destination is replaced, not followed - even in report-only runs."""
+    followed-and-truncated). RE-VALIDATES immediately before writing and writes
+    atomically (temp + os.replace, no-follow) - even in report-only runs."""
     full = _contained_path(project_dir, rel)
     if full is None:
         return None
     unresolved = os.path.join(project_dir, rel.replace("\\", "/"))
     if os.path.islink(unresolved) or os.path.islink(full):
         return None
-    tmp = None
-    try:
-        os.makedirs(os.path.dirname(full) or project_dir, exist_ok=True)
-        tmp = f"{full}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
-            fh.write(content)
-        os.replace(tmp, full)  # atomic: replaces (never follows) a dest symlink
-        return full
-    except OSError:
-        if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        return None
+    return full if _atomic_replace_nofollow(full, content, newline=newline) else None
+
+
+# FlexFactor's own directory - a TRUSTED location for report fallbacks that is never
+# inside an audited repo (used when the in-repo report path is refused).
+_FLEXFACTOR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _safe_report_write(project_dir: str, report_name: str, body: str) -> str:
+    """Write a report to `project_dir` via the containment chokepoint; if that is
+    refused (escape / symlinked leaf), fall back to a TRUSTED FlexFactor-owned
+    directory - NEVER a raw cwd open, because cwd can equal the audited repo and would
+    re-open the very symlink we just refused. Always returns a written path."""
+    dest = _write_contained(project_dir, report_name, body)
+    if dest is not None:
+        return dest
+    # Fallback dirs, in order, all written through the atomic no-follow chokepoint and
+    # none of them inside the audited repo.
+    import tempfile
+    for fallback in (_FLEXFACTOR_DIR, tempfile.gettempdir()):
+        dest = _write_contained(fallback, report_name, body)
+        if dest is not None:
+            return dest
+    # Last-resort direct atomic write into temp (should never be reached).
+    last = os.path.join(tempfile.gettempdir(), report_name)
+    _atomic_replace_nofollow(last, body)
+    return last
 
 
 def _is_test_path(rel: str) -> bool:
@@ -3645,7 +3683,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 pre = res if res and res[0] != "capped" else None
             except Exception:
                 pre = None  # cancelled/died -> generate inline exactly as before
-        original = pre[1] if pre is not None else _read_full(full)
+        original = pre[1] if pre is not None else _read_contained(project_dir, rel)
         # Up to MAX_FIX_TRIES attempts per file: a build-break or a cross-model veto
         # is fed back as an objection so the author can SALVAGE the fix instead of
         # the file being abandoned. The file is left as the original unless an
@@ -3728,12 +3766,12 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             if not patch.get("changed") or not (patch.get("contents") or "").strip():
                 outcome = ("noop", patch.get("notes", ""))
                 break
-            with open(full, "w", encoding="utf-8", newline="") as fh:
-                fh.write(patch["contents"])
+            # Atomic no-follow write of the candidate (and of the rollbacks below): a
+            # symlink swapped in at `full` is replaced, never followed outside the repo.
+            _atomic_replace_nofollow(full, patch["contents"])
             ok, log = _gate_file(project_dir, rel, stack, baseline_ok)
             if ok is False:
-                with open(full, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(original)  # roll back the broken attempt
+                _atomic_replace_nofollow(full, original)  # roll back the broken attempt
                 outcome = ("revert", log[:200])
                 feedback = (f"Your previous attempt BROKE the build/verification:\n{log[:800]}\n"
                             "Fix the listed defects WITHOUT breaking the build.")
@@ -3741,8 +3779,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             if cross is not None:
                 keep, reason = _cross_verify_fix(cross, rel, original, patch["contents"], targets)
                 if not keep:
-                    with open(full, "w", encoding="utf-8", newline="") as fh:
-                        fh.write(original)  # the 2nd model vetoed it
+                    _atomic_replace_nofollow(full, original)  # the 2nd model vetoed it
                     outcome = ("reject", reason)
                     feedback = (f"A reviewer REJECTED your previous fix for this reason:\n{reason}\n"
                                 "Address that objection specifically and return a corrected fix "
@@ -4571,15 +4608,10 @@ def _write_batch_report(results: list[dict]) -> str:
         if r.get("report_path"):
             L.append(f"- **Per-program report:** `{r['report_path']}`")
         L.append("")
-    out_path = os.path.join(r"C:\Users\firer", "flexfactor_audit_batch_report.md")
-    try:
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
-    except OSError:
-        out_path = os.path.join(os.getcwd(), "flexfactor_audit_batch_report.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
-    return out_path
+    # Home dir is FlexFactor-owned (not an audited repo); _safe_report_write keeps the
+    # write atomic + no-follow and falls back to other trusted dirs, never a raw cwd.
+    return _safe_report_write(os.path.expanduser("~"), "flexfactor_audit_batch_report.md",
+                              "\n".join(L))
 
 
 def _print_audit_summary(a: dict) -> None:
@@ -4686,13 +4718,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if a["fix_notes"]:
         L += ["## Fix notes / left unfixed", ""] + [f"- {n}" for n in a["fix_notes"]] + [""]
 
-    body = "\n".join(L)
-    out_path = _write_contained(project_dir, report_name, body)
-    if out_path is None:
-        out_path = os.path.join(os.getcwd(), report_name)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(body)
-    return out_path
+    return _safe_report_write(project_dir, report_name, "\n".join(L))
 
 
 def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) -> str | None:
@@ -4717,13 +4743,7 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
                      f"_Suggested fix:_ {f.get('fix')}")
         L.append("")
     report_name = f"{_slugify(name) or 'program'}_low_findings.md"
-    body = "\n".join(L)
-    out_path = _write_contained(project_dir, report_name, body)
-    if out_path is None:
-        out_path = os.path.join(os.getcwd(), report_name)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(body)
-    return out_path
+    return _safe_report_write(project_dir, report_name, "\n".join(L))
 
 
 def main(argv=None) -> int:

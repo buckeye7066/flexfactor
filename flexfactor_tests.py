@@ -1672,5 +1672,129 @@ class StaticWriteContainmentTests(unittest.TestCase):
             self.assertNotEqual(os.path.realpath(path), os.path.realpath(outside))
 
 
+def _try_symlink(link, target):
+    try:
+        os.symlink(target, link)
+        return True
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+
+
+class ReportFallbackNoSymlinkFollowTests(unittest.TestCase):
+    """Round-9 defect 1: the report fallback must NOT raw-open cwd - when cwd == the
+    audited repo, a refused symlink report name would otherwise be reopened raw and
+    its outside target overwritten."""
+
+    def test_audit_report_no_symlink_follow_when_cwd_is_repo(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            trusted = os.path.join(tmp, "trusted")
+            os.makedirs(trusted)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("PRECIOUS")
+            report_name = f"{ff._slugify('demo') or 'program'}_audit_report.md"
+            if not _try_symlink(os.path.join(proj, report_name), outside):
+                self.skipTest("symlinks not permitted here")
+            audit = {"name": "demo", "dir": proj, "branch": None, "files_reviewed": 0,
+                     "findings": [], "file_findings": {}, "applied_files": [],
+                     "unverified_files": [], "test_files": [], "test_status": None,
+                     "e2e": {}, "fix_notes": [], "commit_status": "n/a",
+                     "baseline_ok": True, "cycles": 1, "providers": [],
+                     "converged": True, "stop_reason": "done", "suite_status": None,
+                     "clean_files": [], "usd": 0.0, "fix_severity": "high",
+                     "manual_review": [], "low_findings": []}
+            real_dir = getattr(ff, "_FLEXFACTOR_DIR", None)
+            if real_dir is not None:
+                ff._FLEXFACTOR_DIR = trusted  # route the fallback to a trusted temp dir
+            cwd = os.getcwd()
+            os.chdir(proj)  # cwd == the audited repo (the dangerous case)
+            try:
+                path = ff._write_audit_report(proj, audit)
+            finally:
+                os.chdir(cwd)
+                if real_dir is not None:
+                    ff._FLEXFACTOR_DIR = real_dir
+            # Pre-fix, the cwd fallback reopened the symlink raw and overwrote outside.
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")  # outside NOT overwritten
+            self.assertNotEqual(os.path.realpath(path), os.path.realpath(outside))
+            self.assertEqual(os.path.dirname(os.path.realpath(path)),
+                             os.path.realpath(trusted))  # landed in the trusted dir
+
+
+class AtomicNoFollowWriteTests(unittest.TestCase):
+    """Round-9 defect 2: the write primitive replaces a symlink rather than following
+    it (closes the check-then-open TOCTOU in apply/fix/rollback)."""
+
+    def test_atomic_replace_replaces_symlink_leaves_target_intact(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("PRECIOUS")
+            link = os.path.join(tmp, "link.txt")
+            if not _try_symlink(link, outside):
+                self.skipTest("symlinks not permitted here")
+            self.assertTrue(ff._atomic_replace_nofollow(link, "NEWDATA"))
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")  # target untouched
+            self.assertFalse(os.path.islink(link))       # symlink replaced by real file
+            with open(link, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "NEWDATA")
+
+    def test_binary_restore_replaces_symlink(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside.bin")
+            with open(outside, "wb") as fh:
+                fh.write(b"PRECIOUS")
+            link = os.path.join(tmp, "link.bin")
+            if not _try_symlink(link, outside):
+                self.skipTest("symlinks not permitted here")
+            self.assertTrue(ff._atomic_replace_nofollow(link, b"RESTORED", binary=True))
+            with open(outside, "rb") as fh:
+                self.assertEqual(fh.read(), b"PRECIOUS")
+
+
+class ModifyFilesInRepoSymlinkReadTests(unittest.TestCase):
+    """Round-9 defect 3: a modify_files entry that is a symlink LEAF whose target
+    resolves INSIDE the repo (passes realpath containment) must still be refused - its
+    target's contents must not enter the patch prompt."""
+
+    def test_inrepo_symlink_leaf_modify_file_not_read(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "src"))
+            realfile = os.path.join(proj, "config.py")
+            with open(realfile, "w", encoding="utf-8") as fh:
+                fh.write("INNER_SECRET = 'zzz'\n")
+            link = os.path.join(proj, "src", "alias.py")
+            if not _try_symlink(link, realfile):
+                self.skipTest("symlinks not permitted here")
+
+            class FakeProv:
+                def __init__(self):
+                    self.calls = 0
+                    self.prompts = []
+
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                    self.calls += 1
+                    self.prompts.append(prompt)
+                    if self.calls == 1:
+                        return {"can_apply": True, "plan": "p", "packages": [],
+                                "create_files": [], "modify_files": ["src/alias.py"],
+                                "reason": ""}
+                    return {"files": [], "packages": []}
+
+            prov = FakeProv()
+            ff.generate_integration(prov, proj, "PROFILE", "need",
+                                    {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            self.assertNotIn("INNER_SECRET", prov.prompts[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

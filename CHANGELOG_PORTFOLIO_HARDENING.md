@@ -195,6 +195,27 @@ With rounds 6-8, file-path containment is fully symmetric: no read that can ente
 prompt, and no write under the audited repo, follows a symlink outside it — whether
 the path is model-named, repo-enumerated, or a fixed/static name.
 
+## Round 9 (2026-07-18) — close the last raw-open bypasses
+
+An exhaustive grep found a few file operations that still bypassed the containment
+chokepoints:
+
+- **Report fallback no longer follows a symlink.** When a report/config name in the
+  repo is refused (symlink/escape), the report is written to a trusted FlexFactor
+  directory instead of being raw-opened in the current directory — which, when
+  FlexFactor is run from inside the audited repo, previously reopened and overwrote
+  the very symlink target that was just refused.
+- **Apply / fix / rollback writes are now atomic and never follow a symlink.** All
+  file writes during scout-apply, the fix loop, and rollback use a temp-file +
+  atomic-rename primitive that replaces a symlink rather than writing through it,
+  closing a check-then-write race.
+- **A few remaining reads now use the contained reader**, so a symlink whose target
+  is inside the repo (which passed the earlier realpath check) is refused rather than
+  read into a prompt.
+
+After rounds 6-9 there are no raw file opens under an audited repo — every read that
+can reach a model and every write under the repo is symlink-safe and atomic.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

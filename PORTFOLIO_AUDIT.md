@@ -487,3 +487,78 @@ launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
 containment is now FULLY symmetric and covers static/fixed-name paths as well as
 model-named and enumerated ones — no read that enters a prompt and no write under the
 audited repo can follow a symlink outside it.
+
+---
+
+## Round 9 (Codex review) — 3 remaining raw-open bypasses (2 HIGH); EXHAUSTIVE grep
+
+The chokepoints existed but a few raw opens (report fallback, apply/fix/rollback
+writes, one read) still bypassed them. Fixed + an exhaustive grep of the whole module.
+
+### Defect 1 (HIGH) — report fallback raw-opened cwd (== repo) and followed a symlink
+`_write_*_report` used `_write_contained` but ON REFUSAL fell back to
+`open(os.path.join(os.getcwd(), name), 'w')`. When FlexFactor runs FROM the target
+repo (`cwd == project_dir`), a report-name symlink that was just refused is reopened
+raw and its outside target overwritten.
+- Fix: new `_safe_report_write` — on refusal it writes (still via the atomic no-follow
+  chokepoint) to a TRUSTED FlexFactor-owned dir (`_FLEXFACTOR_DIR`, then tempdir),
+  NEVER a raw cwd. Routed all four report writers (audit, scout, low-findings, batch).
+- Test: `ReportFallbackNoSymlinkFollowTests` (behavioral RED on baseline — the old
+  code overwrote the outside file when cwd==repo).
+
+### Defect 2 (HIGH) — apply/fix/rollback writes bypassed the write chokepoint (TOCTOU)
+`apply_integration` prechecked then wrote with plain `open(full,'w')` (non-atomic;
+a symlink swapped in between islink-check and open is followed); same raw writes in
+`_fix_files` (candidate + 2 rollbacks) and `_rollback` (binary restore).
+- Fix: new `_atomic_replace_nofollow(full, data, binary=)` (temp + `os.replace`, which
+  replaces a dest symlink instead of following it). `apply_integration` now writes via
+  `_write_contained` (re-validates); fix-loop + rollback + `_snapshot` (symlink-safe)
+  use the atomic no-follow primitive.
+- Test: `AtomicNoFollowWriteTests` (2) — replacing a symlink leaves its target intact.
+
+### Defect 3 (MED) — modify_files + serial-fix + single-file reads bypassed leaf refusal
+`generate_integration` read `modify_files` with `_contained_path` + `_read_text_safe`
+(not `_read_contained`), so a symlink leaf whose target is INSIDE the repo passed
+realpath containment and its contents entered the patch prompt; same for the serial
+fix read (`_read_full`) and the single-file scout read (`_read_text_safe`).
+- Fix: all three now use `_read_contained` (which refuses a symlink leaf).
+- Test: `ModifyFilesInRepoSymlinkReadTests` (RED on baseline — target contents leaked).
+
+### EXHAUSTIVE grep audit — every read/write, containment status
+
+**READS** (`open('r')` / `_read_text_safe` / `_read_full` / `_read_contained`):
+
+| Site | Path source | Status |
+|---|---|---|
+| `_gather_from_folder` pkg + README | static | `_read_contained` ✅ |
+| `generate_integration` package.json | static | `_read_contained` ✅ |
+| `generate_integration` modify_files | model | `_read_contained` ✅ (r9) |
+| `_detect_verify` / `_detect_stack` pkg | static | `_read_contained` ✅ |
+| `resolve_program_input` single file | user/static input | `_read_contained` ✅ (r9) |
+| review / first-attempt / serial-fix / unit-test-gen | enumerated | `_read_contained` ✅ (serial-fix r9) |
+| `_snapshot` backup read | model (pre-validated) | symlink-skipped + contained ✅ (r9) |
+| `_load_source_text` (`--file`) | refactor: user's explicit target | n/a (user-chosen) |
+| brain.json / status / audit-lock pid | FlexFactor-owned (`~/.flexfactor`) | n/a |
+| `_read_full` | (only called by `_read_contained`) | — |
+
+**WRITES** (`open('w'/'wb')` / `os.replace` / write helpers):
+
+| Site | Kind | Status |
+|---|---|---|
+| audit / scout / low / batch reports | static | `_safe_report_write` → `_write_contained` (no raw cwd) ✅ (r9) |
+| Playwright config | static | `_write_contained` ✅ |
+| e2e specs / unit-test-gen | model | `_write_contained` ✅ |
+| `apply_integration` file writes | model | `_write_contained` (re-validate) ✅ (r9) |
+| `_fix_files` candidate + rollbacks | enumerated | `_atomic_replace_nofollow` ✅ (r9) |
+| `_rollback` binary restore / new-file removal | model | `_atomic_replace_nofollow` / `lexists`+remove ✅ (r9) |
+| refactor backup + `--file` write | user's explicit target | n/a (user-chosen) |
+| brain.json / status.json / audit lock | FlexFactor-owned tmp+replace | n/a |
+| `_write_contained` / `_atomic_replace_nofollow` temp write | chokepoint internals (fresh temp name) | — |
+
+**Result: ZERO raw `open('w')` under an audited project_dir remains** (including
+fallbacks and rollback); every prompt-ingress read is `_read_contained`; every project
+write is atomic no-follow. Refactor's `--file` and `~/.flexfactor` paths are outside
+the audited-repo threat model.
+
+Round-9 verification: **110 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets.
