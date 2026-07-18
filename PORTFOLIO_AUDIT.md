@@ -1,0 +1,159 @@
+# FlexFactor Portfolio Hardening Audit (spec 5.11)
+
+Branch: `claude/portfolio-hardening-2026-07-18`
+Scope: `flexfactor.py` (single-file core, ~4.3k lines), `flexfactor_scout_launch.ps1`,
+`flexfactor_tests.py`, new `pyproject.toml`. No wholesale rewrite (item 14 honored).
+
+## Baseline
+
+- Python 3.12.10.
+- `python flexfactor_tests.py` -> **30 tests GREEN** at baseline (no RED at baseline).
+- `python flexfactor_dashboard.py --selftest` -> GREEN.
+- Launchers ASCII + parse clean under Windows PowerShell tokenizer.
+- Working tree clean on `main` before branching.
+
+After hardening: **56 tests GREEN** (30 original + 26 new), dashboard GREEN,
+launchers still ASCII + parse-clean, `git diff --check` clean, no secrets in diff.
+
+## Contract matrix (spec section 5.11)
+
+| # | Requirement | Status | Evidence / fix |
+|---|---|---|---|
+| 1 | Scout default REPORT-ONLY; `--apply` + confirmation to mutate | **FIXED** | parser `--apply` default False + `_confirm_scout_apply`; launcher default "report" |
+| 2 | Treat 3rd-party README/issue/source/patch as untrusted (fence) | **FIXED** | `_fence_untrusted` applied to repo summaries + program context |
+| 3 | Never execute adopted code outside isolated sandbox w/ limits | **PARTIAL / documented** | tool integrates into user's own repo, not clone+exec; `npm install` still runs install scripts in project dir — see "Not fully reproduced" |
+| 4 | Classify PHI/genomic/financial/credential; redact; opt-in; local mode | **NOT DONE / documented** | larger feature; no redaction/local-only mode today — see blockers |
+| 5 | Reserve cost atomically BEFORE concurrent calls | **FIXED** | `CostMeter.reserve/release`, `over_limit` counts reservations, wired into prefetch `_first_attempt` |
+| 6 | `_run` non-throwing only if failure can't be read as success | **FIXED** | `_run` marks failures `flexfactor_launch_error`, traps all exceptions; `_git_current_branch` no longer fabricates "main" |
+| 7 | Clean-file memory keyed to content hash + policy version | **FIXED** | `clean_files` now `{policy, files:{rel:sha256}}`; skip only if hash matches |
+| 8 | brain/status: file locks + atomic replace; corrupt recovery | **FIXED (brain)** | atomic temp+fsync+replace, in-proc + cross-proc lock, corrupt quarantine; status.json already atomic |
+| 9 | pyproject.toml + pinned deps + supported Python | **FIXED** | `pyproject.toml`, `requires-python>=3.12`, pinned SDK ranges |
+| 10 | Unknown model pricing FAIL CLOSED | **FIXED** | `_DEFAULT_PRICE` = highest known rate; warn-once |
+| 11 | Keep changes on branch; never auto-push/merge/mutate dirty tree | **FIXED** | scout+audit `push` now opt-in (`--push`), default OFF; dirty-tree gate already present |
+| 12 | License/provenance/maintenance/vuln screen before adopting | **PARTIAL** | Repo Rewards `safety.verdict` + `licenseSpdx` consumed by `classify_benefit`; not a full gate |
+| 13 | Preserve PS 5.1 ASCII launchers + `_winify` | **PRESERVED** | verified ASCII + parse; `_winify` untouched, regression test intact |
+| 14 | Refactor large file incrementally, no wholesale rewrite | **HONORED** | all changes are surgical edits behind tests |
+
+## Findings + fixes (with evidence)
+
+### [HIGH] Item 1 — Scout applied+pushed by default (silent repo mutation)
+`main()` scout parser used `--report-only` (store_false, dest apply) so `apply`
+defaulted True, and `--no-push` left `push` default True. Running scout on any repo
+would generate, commit, AND push integrations with no confirmation.
+- Fix: `--apply` (store_true, default False) is now required; `_confirm_scout_apply`
+  demands an interactive "apply" (or `--yes`) and **fails safe on a non-TTY**.
+  `--push` is opt-in (default OFF). Launcher default flipped to "report".
+- Tests: `ScoutApplyDefaultTests` (5).
+- File:line: parser ~`flexfactor.py:4363`; gate `_confirm_scout_apply` ~`flexfactor.py:2020`;
+  wiring `run_scout` ~`flexfactor.py:1998`.
+
+### [HIGH] Item 5 — Prefetch/parallel workers overshoot `--max-cost`
+`CostMeter` had only post-hoc `record()` + a `usd`-only `over_limit()`. The prefetch
+pool (`_top_up_prefetch`/`_first_attempt`) let N background workers each pass the
+pre-check and then all spend (code comment even admitted "overshoot ... by at most
+prefetch_n calls").
+- Fix: `reserve(est)`/`release(est)` do a single locked check-and-add; `over_limit()`
+  now counts outstanding reservations; `_first_attempt` reserves an estimated cost
+  before generating and releases in `finally`. Parallel workers can no longer
+  collectively exceed the cap.
+- Residual (documented): the SERIAL main-thread generation is not itself reserved,
+  so the main thread can still make at most ONE unreserved call between its own
+  `over_limit()` checks — an inherent single-call boundary, not the concurrency bug.
+- Tests: `BudgetReservationTests` (5, incl. a 50-thread race asserting <=4 grants).
+- File:line: `CostMeter.reserve/release/over_limit` ~`flexfactor.py:157-185`;
+  `_estimate_call_cost` ~`flexfactor.py:193`; wiring ~`flexfactor.py:3260`.
+
+### [HIGH] Item 7 — Clean-file memory skipped by PATH, not content
+`clean_files` was a plain list of relative paths; `_enumerate_source_files(skip_clean=)`
+excluded any path in it. A file marked clean, then edited (human/merge/new bug), was
+silently skipped forever (until `--recheck`) — a permanent blind spot.
+- Fix: clean memory is now `{"policy": POLICY_VERSION, "files": {rel: sha256}}`. The
+  audit only skips a remembered file while its **current hash matches**; a changed
+  file is re-reviewed. Legacy list/old-policy records are ignored (re-review).
+- Tests: `CleanFileHashMemoryTests` (3).
+- File:line: `_clean_map`/`_file_sha` ~`flexfactor.py:236-320`; skip decision
+  ~`flexfactor.py:3600`; persist map ~`flexfactor.py:3854` + record call ~`flexfactor.py:4023`.
+
+### [HIGH] Item 10 — Unknown model priced at Opus tier (budget under-count)
+`_price_for` fell back to `(5.0, 25.0)` for unknown ids. A model pricier than Opus
+(e.g. a new `fable`-class or any unrecognized id) would be **under-billed**, letting a
+budget-capped run overspend.
+- Fix: `_DEFAULT_PRICE` = the highest known rate on each axis `(10.0, 50.0)`; unknown
+  ids warn once and bill at that rate (fail closed for budget). `PRICING_VERSION`
+  added so the table is versioned.
+- Tests: `UnknownModelPricingFailsClosedTests` (3).
+- File:line: `flexfactor.py:106-125`.
+
+### [MED] Item 6 — Failure could be read as success
+`_run` never raises (correct for resilience), but two gaps: (a) it caught only
+`Timeout/FileNotFound/OSError` (a `ValueError` on bad args could still propagate),
+and (b) `_git_current_branch` **fabricated "main"** on any git failure — a failure
+read as success that could later `git checkout main`, switching the user off their
+real branch.
+- Fix: `_run` traps all exceptions into a NON-ZERO result tagged
+  `flexfactor_launch_error` (documented contract: callers gate on `returncode == 0`,
+  so a non-launch is never success). `_git_current_branch` returns the exact SHA on
+  detached HEAD, `""` on hard failure, and all four checkout-back sites guard on a
+  truthy `prev_branch`.
+- Tests: `RunFailsClosedTests` (3), `GitCurrentBranchNoFabricationTests` (3).
+- File:line: `_run` ~`flexfactor.py:1520`; `_git_current_branch` ~`flexfactor.py:1553`;
+  guards ~`flexfactor.py:1935, 1964, 3487, 3986`.
+
+### [MED] Item 8 — brain.json non-atomic, unlocked, lossy on corrupt/concurrent write
+`_save_brain` wrote in place (a crash mid-write truncates it -> next `_load_brain`
+returns `{}` and loses ALL memory). With `--parallel` audits, concurrent
+`_brain_record_run` calls did read-modify-write with no lock -> last-writer-wins
+dropped sibling programs' records.
+- Fix: atomic temp+fsync+`os.replace`; in-process `threading.Lock` + cross-process
+  advisory lock file (`_brain_file_lock`, steals stale locks); corrupt file is
+  quarantined to `.corrupt` instead of silently overwritten.
+- Tests: `BrainPersistenceTests` (4, incl. a 20-thread no-clobber test).
+- File:line: `flexfactor.py:218-366`.
+
+### [MED] Item 2 — Untrusted third-party text unfenced in prompts
+Repo metadata/AI summaries (from Repo Rewards, i.e. third-party repos) and the raw
+program context were interpolated straight into LLM prompts — a prompt-injection
+surface.
+- Fix: `_fence_untrusted(label, text)` wraps them with an injection-resistant preamble
+  and hard-to-spoof markers (forged end-markers are broken). Applied to the benefit
+  judge, both integration passes, and the program-profiling call.
+- Tests: `test_untrusted_fence_neutralizes_forged_markers`.
+- File:line: `_fence_untrusted` ~`flexfactor.py:2050`; call sites ~`flexfactor.py:1808,1826,1954,1918`.
+
+### [LOW] Item 11 — Auto-push default (both modes)
+Covered with item 1. `push` is now opt-in for scout AND audit; merge already opt-in;
+dirty-tree gate already present.
+
+## Not fully reproduced / external blockers
+
+- **Item 3 (sandbox for adopted code).** FlexFactor does NOT clone and execute
+  arbitrary third-party repos; scout generates an integration into the USER's own
+  repo and runs the user's own build. However `apply_integration` runs
+  `npm install <adopted-packages>` in the project dir, which executes package
+  install scripts (arbitrary code) outside any isolation, and the build then runs.
+  Existing mitigations: build-gate + hard rollback + dedicated branch + clean-tree
+  gate. Full isolation (worktree/container, network/CPU/disk/time caps, secret
+  scrubbing, `--ignore-scripts`) is an infra change beyond a surgical fix and could
+  break legitimate packages if defaulted on — **deferred, documented as a real gap.**
+- **Item 4 (sensitive-content classification / redaction / local-only mode).** The
+  tool sends source file contents to cloud models with no PHI/secret classifier,
+  no redaction, and no local-only provider. This is a substantial new subsystem;
+  **not implemented** — flagged as the largest outstanding risk for repos containing
+  PHI/genomic/financial/credential data. Recommend: a pre-send secret/PII scan +
+  `--local-only` (e.g. Ollama) provider + explicit `--allow-sensitive` opt-in.
+- **Item 12 (OSS provenance/vuln/maintenance gate).** Partially covered: Repo
+  Rewards supplies `safety.verdict` + `licenseSpdx`, consumed by `classify_benefit`.
+  A dedicated license-compatibility + archive-status + CVE gate before apply is not
+  implemented here (belongs largely in the Repo Rewards screen). Documented.
+- **Live end-to-end audit/scout runs** were intentionally NOT executed (no cloud AI
+  calls in verification, no third-party repo clone+exec per operating rules). The
+  budget-reservation primitive, `_run` contract, hash memory, brain persistence, and
+  scout gating are proven at unit level with mocks/temp dirs/threads.
+
+## Verification
+
+- `python flexfactor_tests.py` -> 56 passed.
+- `python flexfactor_dashboard.py --selftest` -> OK.
+- `python flexfactor.py scout --help` / `audit --help` -> exit 0 (no argparse conflicts).
+- Launchers: ASCII-only; `[PSParser]::Tokenize` parses all three cleanly.
+- `git diff --check` clean; no API keys in the diff.
