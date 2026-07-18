@@ -180,3 +180,67 @@ Follow-up verification: **70 tests GREEN**, dashboard OK, `audit`/`scout --help`
 exit 0, all three launchers ASCII + parse-clean, `git diff --check` clean, no
 secrets. Audit is now report-only by default (confirmed by test); the parallel
 review sweep cannot exceed `--max-cost` (reservation-gated, test-proven).
+
+---
+
+## Round 3 (Codex review) — 4 defects, fixed with CHOKEPOINTS (2 HIGH incl. a sandbox escape)
+
+The pattern (per-call-site fixes miss siblings) was addressed by routing whole
+CLASSES of operation through single chokepoints. Each fix has a regression test
+proven RED on the prior HEAD (`d302f60`) — the sandbox-escape test literally wrote
+a file OUTSIDE the repo on baseline.
+
+### Chokepoint 1 — budget reservation moved INTO the provider call (defect 1, HIGH)
+Round 2 only reserved `_first_attempt` prefetches; the main-thread retry/fallback
+`generate_file_fix*`, `_cross_verify_fix`, and unit/e2e test-gen all called the model
+with no reservation and could spend past `--max-cost`.
+- Fix: `_budget_guard(meter, model, prompt_chars, max_tokens)` context manager now
+  wraps **every** provider method — `AnthropicProvider` and `OpenAIProvider`
+  `.complete` / `.grade` / `.structured` (6 methods). It reserves before the call and
+  releases after; a refusal raises `BudgetExceededError`. The now-redundant external
+  reservations in `_first_attempt` and `_review_one` were removed (no double-reserve);
+  both, plus `_fix_files`, catch `BudgetExceededError` to stop cleanly.
+- Every provider call site is therefore bounded: review, benefit/profile judging,
+  cross-verify, fix-edits, whole-file fix, unit-test gen, e2e-spec gen, integration
+  plan/patch, refactor rewrite/grade — all go through `.structured/.complete/.grade`.
+- File:line: `_budget_guard` ~`flexfactor.py:213`; providers `~503-690`; removals
+  `_first_attempt ~3400`, `_review_one ~3300`; cap-stop in `_fix_files ~3520`.
+- Tests: `ProviderReservationChokepointTests` (3).
+
+### Chokepoint 2 — path containment for ALL generated-file writes (defect 2, HIGH — sandbox escape)
+`audit --apply` wrote `os.path.join(project_dir, model_path)` with no rejection of
+absolute / drive-relative / `..` paths, so a hostile/confused model response
+overwrote files OUTSIDE the repo (on Windows an absolute `C:\…` discards
+`project_dir`).
+- Fix: `_contained_path(project_dir, rel)` rejects absolute (POSIX + Windows), UNC,
+  drive-relative (`C:x`), `~`, and any `..` escape via realpath containment. Routed
+  **every** generated-file write through it: unit-test gen, e2e-spec gen,
+  scout `apply_integration` (escape -> `ApplyError` -> rollback), and fix-apply
+  (defense in depth).
+- File:line: `_contained_path` ~`flexfactor.py:238`; writes `apply_integration ~1983`,
+  e2e ~`3050`, unit-test ~`4108`, fix-apply ~`3452`.
+- Tests: `PathContainmentTests` (3) incl. `apply_integration` writes nothing outside.
+
+### Defect 3 (MED) — `_commit_and_sync` ignored `git add` / `git diff` rc
+`git add -A` rc unchecked and `git diff --cached --quiet` treated as binary though
+rc>1 is a real error — an index lock could report "nothing to commit" with fixes
+unstaged, or commit stale content.
+- Fix: check `add` rc (hard-fail `BranchStateError`); treat diff rc 0=none / 1=change
+  / >1=error (hard-fail) before any commit/push/merge. File:line ~`flexfactor.py:3600`.
+- Tests: `CommitSyncGitRcTests` (3).
+
+### Defect 4 (MED) — retry feedback was an unfenced injection channel
+Fix prompts fenced the source but appended `feedback` (populated from build logs +
+cross-reviewer reasons — both can carry attacker-controlled source excerpts) RAW as
+an `IMPORTANT` instruction outside the fence; model-generated finding `bullets` were
+also raw.
+- Fix: fence `feedback` (`UNTRUSTED feedback`) and `bullets` (`UNTRUSTED findings`) in
+  both fix generators and in `_cross_verify_fix`; only the wrapper stays trusted.
+  File:line `generate_file_fix*` ~`2882/2910`, `_cross_verify_fix` ~`3224`.
+- Tests: `FeedbackFencingTests` (3).
+
+Round-3 verification: **82 tests GREEN**, dashboard OK, `audit`/`scout`/refactor
+`--help` exit 0, all three launchers ASCII + parse-clean, `git diff --check` clean,
+no secrets. Confirmed: every provider call routes through the `_budget_guard`
+reservation chokepoint, and every generated-file write routes through
+`_contained_path`.

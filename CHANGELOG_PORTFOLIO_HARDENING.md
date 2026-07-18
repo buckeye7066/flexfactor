@@ -104,6 +104,27 @@ the same holes. Six more fixes (one regression test each):
 No new user-facing flags beyond `audit --apply` / `audit --yes`. `audit --report-only`
 remains (now the default). Push stays opt-in (`--push`).
 
+## Round 3 (2026-07-18) — chokepoints
+
+Four more fixes, done as single chokepoints so whole classes of call/write can't
+regress (2 HIGH, including a real sandbox escape). All transparent — no new flags.
+
+- **Budget reservation now lives in the provider call itself.** Every model call
+  (fix, whole-file fallback, cross-verify, review, unit/e2e test gen, integration,
+  refactor) reserves before spending, so nothing can exceed `--max-cost` — not just
+  prefetched first attempts.
+- **Sandbox-escape fix:** all model-generated file paths (unit-test gen, e2e specs,
+  scout integration, fix-apply) now pass through a containment check that rejects
+  absolute / drive-relative / UNC / `..` paths. Previously `audit --apply` could
+  overwrite files OUTSIDE the target repo (on Windows an absolute `C:\…` path
+  discarded the project dir). A scout integration that tries to escape now rolls back.
+- **`_commit_and_sync` now checks git return codes:** a failed `git add` or a
+  `git diff --cached` error hard-fails the audit instead of silently committing stale
+  or unstaged content.
+- **Retry feedback is now fenced** as untrusted data (it can contain source excerpts
+  from build logs / reviewer comments), along with model-generated finding text — so
+  it can't inject instructions into the author prompt.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
