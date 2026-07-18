@@ -142,6 +142,22 @@ Four more fixes (2 HIGH), all transparent — no new flags:
   model's plan, the raw project source, `package.json`, and the file tree — not just
   the repo summary, so injected instructions can't drive unsafe in-repo edits.
 
+## Round 5 (2026-07-18) — exhaustive sibling sweeps
+
+Three sibling fixes of earlier work, done as full audits (all transparent):
+
+- **Every provider method now reserves exactly what it requests.** `OpenAI.structured`
+  reserved the un-clamped `max_tokens` while sending the 16384-clamped value; it now
+  reserves the clamped value. All six provider methods audited: reserve == request cap.
+- **All prompts whose output is written to disk now fence every untrusted field.**
+  Scout integration now fences the program profile + improvement need (not just the
+  repo/source); refactor mode now fences the current file, prior feedback, and the
+  graded candidate. (fix-edits/whole-file/unit-test gen were already fenced; e2e-spec
+  gen has no untrusted input.)
+- **Preflight health pings now go through the provider adapter and are single-flight.**
+  Pings use a new `ping()` adapter method (so they're budgeted + metered like any
+  call), and concurrent audits issue exactly one ping per provider.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

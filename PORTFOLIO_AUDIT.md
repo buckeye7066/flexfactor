@@ -295,3 +295,67 @@ Round-4 verification: **88 tests GREEN**, dashboard OK, all `--help` exit 0, thr
 launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
 OpenAI calls cap output == reservation; commit failure is fatal; health pings are
 budgeted + lock-guarded; the scout integration prompt fences all untrusted/model text.
+
+---
+
+## Round 5 (Codex review) — 3 SIBLING defects, fixed as EXHAUSTIVE audits (2 HIGH)
+
+Each was a sibling of an earlier fix; done as full audits (with the audit results
+enumerated below) so there is no round 6. Each has a test proven RED on `b3a1175`.
+
+### Defect 1 (HIGH) — reserve-vs-request-cap: full 6-method audit
+`OpenAIProvider.structured` reserved `max_tokens` but requested `min(max_tokens,16384)`
+— so a 32000/128000 request reserved more than it sent.
+- Fix: one `out_cap = min(max_tokens, 16384)` passed to BOTH `_budget_guard` and the
+  SDK (`flexfactor.py:~703`).
+- **AUDIT — reserved output == request output cap for all 6 methods:**
+
+  | Method | reserve | request cap | equal |
+  |---|---|---|---|
+  | Anthropic.complete | 64000 | `max_tokens=64000` | ✅ |
+  | Anthropic.grade | 4000 | `max_tokens=4000` | ✅ |
+  | Anthropic.structured | `max_tokens` | `max_tokens` | ✅ |
+  | OpenAI.complete | 16384 | `max_tokens=16384` | ✅ |
+  | OpenAI.grade | 4000 | `max_tokens=4000` | ✅ |
+  | OpenAI.structured | `min(mt,16384)` | `min(mt,16384)` | ✅ (was ✗) |
+- Test: `ReserveEqualsRequestCapTests` (6) — asserts equality for every method.
+
+### Defect 2 (HIGH) — untrusted fields in write-generating prompts: full audit
+- (a) scout `generate_integration` fenced repo/package/filetree/plan/source but left
+  `profile_blob` + `need` (from the profiling model over untrusted program context)
+  trusted. Fixed: fence both in plan AND patch prompts (`flexfactor.py:~1930/~1955`).
+- (b) refactor mode concatenated current file + prior feedback into the rewrite
+  prompt (written to `args.file`) and the candidate into the grade prompt. Fixed:
+  fence `source` + `feedback` (rewrite) and `candidate` (grade); source-as-data
+  language added to `REWRITE_SYSTEM`/`GRADE_SYSTEM` (`flexfactor.py:~1130/~1150`).
+- **AUDIT — every prompt whose model output is WRITTEN to disk, and its untrusted
+  fields (all now fenced):**
+
+  | Prompt (→ writes) | Untrusted fields fenced |
+  |---|---|
+  | `generate_integration` plan/patch → `apply_integration` writes files | profile, need, repo, package, filetree, plan, source |
+  | `generate_file_fix_edits` → fix written | source, findings, feedback |
+  | `generate_file_fix` (whole) → fix written | source, findings, feedback |
+  | refactor `complete` → `args.file` written | source, feedback (goal trusted) |
+  | refactor `grade` → feeds feedback | candidate |
+  | unit-test gen → tests written | source |
+  | e2e-spec gen → specs written | (no untrusted field: base URL + framework enum only) |
+- Test: `WriteGeneratingPromptFencingTests` (2) — scout profile/need + refactor
+  source/feedback/candidate fences.
+
+### Defect 3 (MED) — health pings via adapter + single-flight cache
+`_provider_health` still called the SDK directly (outside the six adapter methods)
+and released the lock before the ping, so parallel callers both missed the cache and
+double-pinged.
+- Fix: pings now run through `make_provider(name, …, meter).ping()` — a new adapter
+  method on BOTH providers that goes through `_budget_guard` + `_meter`; the cache is
+  SINGLE-FLIGHT via an in-flight `Event` so concurrent callers issue exactly one ping
+  (`flexfactor.py:~638/~745` ping methods, `~865` single-flight).
+- Test: `HealthPingSingleFlightTests` (1) — 25 concurrent checks → exactly 1 ping via
+  1 adapter build.
+
+Round-5 verification: **97 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
+reserve == request cap for all 6 provider methods; every write-generating prompt
+fences all untrusted/model/source fields (table above); health pings go through the
+adapter and are single-flight.
