@@ -2172,10 +2172,22 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
         if rel in backups or rel in created:
             return
         data = _read_bytes_contained(project_dir, rel)
-        if data is None:  # missing / symlink / escapes -> treat as newly created
-            created.add(rel)
+        if data is not None:
+            backups[rel] = data  # readable existing file -> restore on rollback
+            return
+        # A None read is NOT automatically "created". Use tri-state existence: only a
+        # DEFINITIVELY missing file is a legitimate to-be-created file. An existing-but-
+        # unreadable (e.g. a symlink leaf/manifest) or a refused-existence file must FAIL
+        # CLOSED - never mark it created (rollback would then unlink/replace a pre-existing
+        # file we did not make).
+        exist = _contained_existence(project_dir, rel)
+        if exist == "missing":
+            created.add(rel)  # genuinely absent -> we will create it; rollback unlinks it
         else:
-            backups[rel] = data
+            raise ApplyError(
+                f"cannot safely snapshot {rel!r} for rollback (existence={exist}); refusing "
+                "to apply - a pre-existing unreadable/symlinked file must not be treated as "
+                "newly created")
 
     try:
         if git:

@@ -2867,5 +2867,68 @@ class IntegrationRefusedExistenceFailsClosedTests(unittest.TestCase):
             self.assertIn("refusing integration", reason)
 
 
+class SnapshotTriStateTests(unittest.TestCase):
+    """Round-18: _snapshot uses tri-state existence. A refused/exists-but-unreadable
+    read is NEVER 'created' (so rollback never unlinks a pre-existing file); a genuinely
+    missing file IS created and rolled back by unlink."""
+
+    class _Opts:
+        dry_run = False
+        allow_dirty = True
+        verify = False
+        push = False
+        merge = False
+        branch_prefix = "flexfactor/adopt-"
+
+    def test_symlinked_manifest_fails_closed_not_created(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x"}')
+            outside = os.path.join(tmp, "outside-lock.json")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("LOCKDATA")
+            link = os.path.join(proj, "package-lock.json")
+            if not _try_symlink(link, outside):
+                self.skipTest("symlinks not permitted here")
+
+            unlinked = []
+            real_unlink, real_run = ff._unlink_contained, ff._run
+            ff._unlink_contained = lambda pd, rel: (unlinked.append(rel), real_unlink(pd, rel))[1]
+            ff._run = lambda cmd, cwd, timeout=900: ff.subprocess.CompletedProcess(cmd, 1, "", "mock")
+            patch = {"files": [], "packages": ["lodash"]}  # non-empty packages
+            try:
+                res = ff.apply_integration(proj, "repo", patch, self._Opts)
+            finally:
+                ff._unlink_contained, ff._run = real_unlink, real_run
+
+            self.assertIn(res.status, ("verify-failed", "error"))    # failed closed, not applied
+            self.assertNotIn("package-lock.json", unlinked)          # rollback did NOT unlink it
+            self.assertTrue(os.path.islink(link))                    # symlink still present
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "LOCKDATA")              # target intact
+
+    def test_genuinely_missing_created_and_unlinked_on_rollback(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x"}')  # no package-lock.json -> genuinely missing
+            real_run = ff._run
+            ff._run = lambda cmd, cwd, timeout=900: ff.subprocess.CompletedProcess(cmd, 1, "", "npm mock fail")
+            patch = {"files": [{"path": "new.js", "contents": "console.log(1)"}],
+                     "packages": ["lodash"]}
+            try:
+                res = ff.apply_integration(proj, "repo", patch, self._Opts)
+            finally:
+                ff._run = real_run
+            self.assertIn(res.status, ("verify-failed", "error"))    # npm mock failed -> rollback
+            # The genuinely-created new.js was snapshotted 'created' and unlinked on rollback.
+            self.assertFalse(os.path.exists(os.path.join(proj, "new.js")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

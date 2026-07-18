@@ -975,3 +975,34 @@ dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git dif
 clean, no secrets. Existence is tri-state (`refused != missing`); the integration-create and
 package-detection callers both fail closed on a refused existence. POSIX-closed /
 Windows-residual matrix unchanged.
+
+---
+
+## Round 18 (Codex review) — one more None-as-create the tri-state hadn't reached
+
+Codex confirmed `_contained_existence` + its direct callers are closed, but found the SAME
+None-as-create pattern in `apply_integration._snapshot`.
+
+### Defect — `_snapshot` collapsed a refused read into "created"
+`_snapshot(rel)` did `data = _read_bytes_contained(...); if data is None: created.add(rel)`
+— treating a None read (missing OR symlink/refused/escape) as a newly-created file. Repro:
+non-git Node project, readable `package.json` but `package-lock.json` is a SYMLINK; an
+integration with non-empty `packages` — `_detect_verify` passes (package.json readable),
+`_snapshot("package-lock.json")` gets None and marks it CREATED; then on rollback
+`_rollback` `_unlink_contained()`s that pre-existing refused symlink as if we'd made it.
+- Fix: `_snapshot` gates on tri-state `_contained_existence`:
+  - `missing` → genuinely absent → `created.add(rel)` (rollback unlinks it — correct).
+  - `exists` (unreadable, e.g. a symlink leaf/manifest) → FAIL CLOSED (`ApplyError`).
+  - `refused` (can't determine) → FAIL CLOSED.
+  So a pre-existing unreadable/symlinked file is NEVER marked created, and `_rollback` only
+  unlinks rels that were genuinely `created` (definitively missing at snapshot).
+- Tests: `SnapshotTriStateTests` — a pre-existing symlinked `package-lock.json` +
+  non-empty packages fails closed (NOT marked created, rollback does NOT unlink it, target
+  intact); a genuinely-absent create-file is still snapshotted `created` and unlinked on
+  rollback.
+
+Round-18 verification: **170 tests GREEN** (7 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. `_snapshot` uses tri-state existence (a refused/exists read is never
+treated as created) and rollback only unlinks genuinely-created files. POSIX-closed /
+Windows-residual matrix unchanged.

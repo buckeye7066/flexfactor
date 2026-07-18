@@ -333,6 +333,15 @@ raw pathname. All now go through the openat-walk helpers:
 - **Build detection** (is this a Node project? which verify command?) fails closed when
   package.json exists but can't be safely read, instead of concluding "not a Node project".
 
+## Round 18 (2026-07-18) — apply-backup no longer treats an unreadable file as "new"
+
+- **The rollback snapshot uses three-state existence too.** Before applying a scout
+  integration, FlexFactor snapshots files so it can undo the change. A file it couldn't
+  safely read is no longer assumed to be a brand-new file — if a pre-existing file (such as
+  a symlinked `package-lock.json`) can't be read, the integration fails closed instead of
+  proceeding and later deleting that pre-existing file during rollback. A genuinely absent
+  file is still recorded as created and cleaned up correctly on rollback.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
