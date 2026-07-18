@@ -71,6 +71,39 @@ No changes to: `_winify` Windows command resolution, edit-block default apply mo
 the dual-model review/veto/rollback safety net, or the PowerShell 5.1 ASCII launchers
 (verified still ASCII + parse-clean).
 
+## Follow-up round (2026-07-18) — parallel AUDIT path hardened
+
+A review found the first round hardened SCOUT but left the parallel AUDIT path with
+the same holes. Six more fixes (one regression test each):
+
+### Audit is now REPORT-ONLY by default (ACTION MAY BE NEEDED)
+- Before: a bare `flexfactor audit --program X` created a branch, wrote fixes, and
+  committed automatically.
+- After: audit only reviews + reports unless you pass `--apply` (with an interactive
+  confirmation, or `--yes` for automation; a non-TTY without `--yes` stays
+  report-only). The Audit desktop launcher now defaults to "report".
+- Migration: append `--apply --yes` to any script/shortcut that relied on audit
+  fixing code.
+
+### Other fixes (transparent)
+- Parallel review calls now reserve budget before spending, so a concurrent review
+  sweep can't exceed `--max-cost` (previously it could overshoot by up to
+  review-worker-count calls — measured $0.82 against a $0.30 cap at baseline).
+- Fix-generation reservations now reflect the call's real output ceiling (edit 32k /
+  whole-file 128k) instead of a ~1k guess.
+- `_commit_and_sync` now checks every git checkout/merge result and stops the audit
+  (raising `BranchStateError`) if it can't return to the audit branch — it can no
+  longer silently continue and commit the next cycle onto the wrong branch.
+- Unknown-but-lookalike model ids (`ft:gpt-4o-mini:…`, `my-gpt-4o-mini`,
+  `azure/gpt-4o-mini`) now fail closed to the highest rate instead of inheriting the
+  cheap base price; legitimate date/version suffixes (`claude-opus-4-8-20260101`)
+  are still priced correctly.
+- Audit review/fix/verify/test-gen prompts now fence the file's source/diff as
+  untrusted data, so a hostile comment can't instruct the model to suppress findings.
+
+No new user-facing flags beyond `audit --apply` / `audit --yes`. `audit --report-only`
+remains (now the default). Push stays opt-in (`--push`).
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

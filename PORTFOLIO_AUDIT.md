@@ -157,3 +157,26 @@ dirty-tree gate already present.
 - `python flexfactor.py scout --help` / `audit --help` -> exit 0 (no argparse conflicts).
 - Launchers: ASCII-only; `[PSParser]::Tokenize` parses all three cleanly.
 - `git diff --check` clean; no API keys in the diff.
+
+---
+
+## Follow-up round (Codex review of commit 67690b5) — 6 defects: SCOUT fixed but the parallel AUDIT path had the same holes
+
+All 6 fixed with a regression test each, verified RED on 67690b5 first (via
+`git stash push flexfactor.py` then running the new suites) then GREEN post-fix.
+Notably the parallel-review test on the baseline recorded **$0.82 spend against a
+$0.30 cap** — defect 2 reproduced live.
+
+| # | Sev | Defect | Fix | file:line | Test |
+|---|---|---|---|---|---|
+| 1 | HIGH | Audit mutated without `--apply` (parser only had `--report-only` store_false, apply defaulted True) | `--apply` (default False) + `--yes` + `_confirm_audit_apply` up front in `run_audit`; audit launcher default flipped to report | parser ~`4519`, confirm ~`4188`, gate `report_only` ~`3730` | `AuditApplyDefaultTests` (3) |
+| 2 | HIGH | Parallel REVIEW calls bypassed CostMeter (per-file `over_limit()` once, then N workers spend) | `_review_one` reserves `_estimate_call_cost(judge_model,…,REVIEW_MAX_TOKENS)` before each review call, releases in finally, `stop.set()` on refusal | `_review_all._review_one` ~`3246` | `ParallelReviewBudgetTests` (1) |
+| 3 | HIGH | `_commit_and_sync` ignored checkout/merge return codes → could write next cycle on wrong branch | check every checkout/merge/abort rc; verify HEAD is back on the audit branch (1 retry) else raise `BranchStateError` (stops the program) | `_commit_and_sync` ~`3556-3585` | `CommitSyncBranchStateTests` (2) |
+| 4 | MED | Prefetch reserved ~1k output vs the call's real 32k/128k `max_tokens` | `_estimate_call_cost(model, chars, max_out_tokens)` reserves the requested ceiling; shared `REVIEW/FIX_EDITS/FIX_WHOLE_MAX_TOKENS` constants keep reserve == actual call | `_estimate_call_cost` ~`198`; `_first_attempt` ~`3347` | `EstimateReflectsMaxTokensTests` (2) |
+| 5 | MED | `_price_for` substring match mispriced `ft:gpt-4o-mini:…` / `my-gpt-4o-mini` at the cheap tier | match on exact id or `key + separator(-/:/@)` only; aliased/fine-tuned ids fall through to fail-closed `(10,50)` | `_price_for` ~`119` | `ModelPrefixPricingTests` (3) |
+| 6 | MED | Audit review/fix/verify/test-gen embedded raw source (hostile comment could suppress findings) | `_fence_untrusted("source"/"patch", …)` on review, both fix generators, cross-verify diff, and unit-test-gen; source-as-data language added to `AUDIT/FIX/FIX_EDITS/FIX_VERIFY_SYSTEM` | `review_file`/`generate_file_fix*`/`_cross_verify_fix` | `AuditSourceFencingTests` (3) |
+
+Follow-up verification: **70 tests GREEN**, dashboard OK, `audit`/`scout --help`
+exit 0, all three launchers ASCII + parse-clean, `git diff --check` clean, no
+secrets. Audit is now report-only by default (confirmed by test); the parallel
+review sweep cannot exceed `--max-cost` (reservation-gated, test-proven).
