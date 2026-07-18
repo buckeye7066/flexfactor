@@ -1996,5 +1996,210 @@ class PosixAncestorWalkTests(unittest.TestCase):
             self.assertEqual(ff._read_contained(proj, "a/b/c.txt"), "NESTED")
 
 
+class RelComponentsNulTests(unittest.TestCase):
+    """Round-12 hardening: a NUL byte in a rel path is rejected."""
+
+    def test_nul_byte_rejected(self):
+        self.assertIsNone(ff._rel_components("a\x00b"))
+        self.assertIsNone(ff._rel_components("ok/\x00/x"))
+
+
+class UnlinkContainedTests(unittest.TestCase):
+    """Round-12 defect 1: contained delete never escapes the repo via an ancestor swap
+    and never deletes a symlink's target."""
+
+    def test_traversal_and_absolute_refused_outside_intact(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("KEEP")
+            self.assertFalse(ff._unlink_contained(proj, "../outside.txt"))
+            self.assertFalse(ff._unlink_contained(proj, outside))
+            self.assertTrue(os.path.exists(outside))
+
+    def test_removes_in_repo_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "f.txt"), "w", encoding="utf-8") as fh:
+                fh.write("x")
+            self.assertTrue(ff._unlink_contained(proj, "f.txt"))
+            self.assertFalse(os.path.exists(os.path.join(proj, "f.txt")))
+
+    def test_symlink_leaf_removed_not_target(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("KEEP")
+            link = os.path.join(proj, "link.txt")
+            if not _try_symlink(link, outside):
+                self.skipTest("symlinks not permitted here")
+            self.assertTrue(ff._unlink_contained(proj, "link.txt"))
+            self.assertFalse(os.path.lexists(link))       # the symlink is gone
+            self.assertTrue(os.path.exists(outside))       # the target survives
+
+
+class ReadBytesContainedTests(unittest.TestCase):
+    """Round-12 defect 2: snapshot reads use no-follow containment; missing vs empty
+    are distinguished."""
+
+    def test_reads_bytes_and_distinguishes_missing_from_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "a.bin"), "wb") as fh:
+                fh.write(b"\x01\x02")
+            with open(os.path.join(proj, "empty.bin"), "wb"):
+                pass
+            self.assertEqual(ff._read_bytes_contained(proj, "a.bin"), b"\x01\x02")
+            self.assertEqual(ff._read_bytes_contained(proj, "empty.bin"), b"")   # empty
+            self.assertIsNone(ff._read_bytes_contained(proj, "missing.bin"))      # missing
+            self.assertIsNone(ff._read_bytes_contained(proj, "../x"))             # escape
+
+    def test_symlink_leaf_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            secret = os.path.join(tmp, "s.bin")
+            with open(secret, "wb") as fh:
+                fh.write(b"SECRET")
+            if not _try_symlink(os.path.join(proj, "link.bin"), secret):
+                self.skipTest("symlinks not permitted here")
+            self.assertIsNone(ff._read_bytes_contained(proj, "link.bin"))
+
+
+class PosixFailClosedTests(unittest.TestCase):
+    """Round-12 defect 4: on POSIX-without-openat the helpers must FAIL CLOSED, never
+    downgrade to the pathname fallback (which is Windows-only, documented residual)."""
+
+    def test_no_nofollow_no_fallback_fails_closed(self):
+        import tempfile
+        real_posix = ff._POSIX_NOFOLLOW
+        real_fallback = ff._CONTAINMENT_FALLBACK_OK
+        ff._POSIX_NOFOLLOW = False
+        ff._CONTAINMENT_FALLBACK_OK = False  # simulate POSIX without dir_fd/O_NOFOLLOW
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                proj = os.path.join(tmp, "proj")
+                os.makedirs(proj)
+                with open(os.path.join(proj, "f.txt"), "w", encoding="utf-8") as fh:
+                    fh.write("data")
+                self.assertEqual(ff._read_contained(proj, "f.txt"), "")
+                self.assertIsNone(ff._read_bytes_contained(proj, "f.txt"))
+                self.assertIsNone(ff._write_contained(proj, "g.txt", "x"))
+                self.assertIsNone(ff._replace_contained(proj, "g.txt", "x"))
+                self.assertFalse(ff._unlink_contained(proj, "f.txt"))
+                self.assertTrue(os.path.exists(os.path.join(proj, "f.txt")))  # untouched
+        finally:
+            ff._POSIX_NOFOLLOW = real_posix
+            ff._CONTAINMENT_FALLBACK_OK = real_fallback
+
+
+class ProjectRootRelTests(unittest.TestCase):
+    """Round-12 defect 5: refactor --file anchors at the git repo root so the FULL
+    ancestor chain is walked."""
+
+    def test_git_root_and_relpath(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            if subprocess.run(["git", "init", "-q", tmp], capture_output=True).returncode != 0:
+                self.skipTest("git unavailable")
+            os.makedirs(os.path.join(tmp, "sub"))
+            f = os.path.join(tmp, "sub", "x.py")
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            root, rel = ff._project_root_and_rel(os.path.abspath(f))
+            self.assertEqual(os.path.realpath(root), os.path.realpath(tmp))
+            self.assertEqual(ff._rel_components(rel), ["sub", "x.py"])
+
+    def test_non_git_falls_back_to_dir_and_basename(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "y.py")
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write("y = 2\n")
+            root, rel = ff._project_root_and_rel(os.path.abspath(f))
+            self.assertEqual(os.path.realpath(root), os.path.realpath(tmp))
+            self.assertEqual(rel, "y.py")
+
+
+class FixLoopWriteRefusedTests(unittest.TestCase):
+    """Round-12 defect 3: if the contained candidate write is REFUSED (returns None),
+    the fix loop must NOT gate by pathname and must NOT mark the file fixed."""
+
+    def test_refused_write_does_not_gate_or_mark_fixed(self):
+        import tempfile
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            gate_calls = {"n": 0}
+            real = {"gen": ff.generate_file_fix_edits, "gate": ff._gate_file,
+                    "repl": ff._replace_contained}
+
+            ff.generate_file_fix_edits = lambda *a, **k: {
+                "changed": True, "edits": [{"search": "orig", "replace": "new"}],
+                "fixed_titles": ["t"], "notes": ""}
+            ff._replace_contained = lambda *a, **k: None  # every contained write REFUSED
+            def spy_gate(*a, **k):
+                gate_calls["n"] += 1
+                return (True, "")
+            ff._gate_file = spy_gate
+
+            args = types.SimpleNamespace(fix_severity="high", whole_file_fixes=False,
+                                         fix_prefetch=0)
+            findings = {"a.py": [{"severity": "high", "line": 1, "title": "t",
+                                  "problem": "p", "fix": "f", "category": "bug"}]}
+            try:
+                applied, unver, notes = ff._fix_files(
+                    object(), None, tmp, findings, {"is_node": False, "is_python": True},
+                    True, args)
+            finally:
+                ff.generate_file_fix_edits = real["gen"]
+                ff._gate_file = real["gate"]
+                ff._replace_contained = real["repl"]
+
+            self.assertEqual(gate_calls["n"], 0, "gate must NOT run when the write was refused")
+            self.assertNotIn("a.py", applied)
+            # The on-disk file is untouched (never written through a refused path).
+            with open(os.path.join(tmp, "a.py"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "orig\n")
+
+
+class PosixAncestorUnlinkTests(unittest.TestCase):
+    """Round-12: on POSIX, a delete through a swapped ancestor directory is refused
+    (openat-walk), so an outside file is never removed. Skipped where openat/dir_fd
+    are unavailable."""
+
+    def setUp(self):
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("POSIX openat component-walk unavailable on this platform")
+
+    def test_ancestor_symlink_delete_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outsidedir")
+            os.makedirs(outside)
+            with open(os.path.join(outside, "victim.txt"), "w", encoding="utf-8") as fh:
+                fh.write("VICTIM")
+            os.symlink(outside, os.path.join(proj, "aliasdir"))
+            self.assertFalse(ff._unlink_contained(proj, "aliasdir/victim.txt"))
+            self.assertTrue(os.path.exists(os.path.join(outside, "victim.txt")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

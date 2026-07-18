@@ -680,3 +680,63 @@ is fully closed via the openat component-walk. Enumeration also skips symlinks u
 Round-11 verification: **122 tests GREEN** (4 POSIX-only tests skipped on this Windows
 host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
 `git diff --check` clean, no secrets.
+
+---
+
+## Round 12 (Codex review) — the helpers are TOCTOU-free, but 5 CALL SITES bypassed them
+
+Codex (task-mode) confirmed the r11 openat-walk is TOCTOU-free *inside* the helpers, but
+found several call sites still re-resolving full pathnames — containment is only as good
+as the sites that route through it. Fixed all 5 + NUL-byte rejection.
+
+### Defect 1 (HIGH) — raw rollback deletion escaped via ancestor swap
+`_rollback` did `os.remove(full)` on stored ABSOLUTE paths; an ancestor swapped to a
+symlink after apply → the by-pathname remove deletes OUTSIDE the repo. Fix: backups are
+now keyed by REPO-RELATIVE path; new `_unlink_contained(project_dir, rel)`
+(openat-walk + `os.unlink(leaf, dir_fd=parent)`) is used in BOTH rollback branches.
+
+### Defect 2 (HIGH) — apply snapshot re-resolved full paths after validation
+`_snapshot(full)` used `os.path.islink/isfile/open(full,'rb')` on the resolved path; an
+ancestor swap → the snapshot reads outside-repo bytes. Fix: `_snapshot` takes REL; new
+binary `_read_bytes_contained` (openat-walk + `O_RDONLY|O_NOFOLLOW` leaf) reads the
+backup; missing vs empty distinguished so rollback removes/ restores correctly.
+
+### Defect 3 (HIGH) — fix-loop candidate write failed closed but caller ignored it
+`_replace_contained(...)` results were never checked; a refused write (ancestor swap /
+POSIX-fail-closed) still ran `_gate_file(...)` by pathname and could mark the file FIXED
+though nothing was written. Fix: check EVERY `_replace_contained` result — a refused
+candidate write skips WITHOUT gating; a refused rollback restore records an error and
+does not treat the file as fixed.
+
+### Defect 4 (MEDIUM) — `_HAS_DIR_FD == False` did not fail closed on POSIX
+The fallback routed to the pathname-based `_contained_path`/`_write_win` (not POSIX
+TOCTOU-free). Fix: `_CONTAINMENT_FALLBACK_OK = (os.name == "nt")`; on POSIX-without-openat
+every helper returns `""`/`None`/`False` (fails closed). `_write_win` is Windows-only.
+
+### Defect 5 (HIGH) — refactor `--file` lacked full-ancestor coverage / ignored resolved_path
+The write anchored at `dirname(abspath(args.file))` + `basename(...)`, trusting ancestors
+above that parent. Fix: `_project_root_and_rel(abspath)` anchors at the file's GIT repo
+root (else its own dir) and returns the repo-relative path; `_load_source_text` READ and
+`run()` WRITE (file + `.bak`) both use it (the resolved path), so the full ancestor chain
+is walked.
+
+### Hardening — `_rel_components` rejects a NUL byte (`\0`).
+
+### AUDIT — every remaining raw os.remove / open(full) / replace under project_dir
+| Former raw site | Now routes through |
+|---|---|
+| `_rollback` new-file delete (git + non-git) | `_unlink_contained` (openat-walk) ✅ |
+| `_rollback` restore | `_replace_contained` (openat-walk) ✅ |
+| `apply` `_snapshot` read | `_read_bytes_contained` (openat-walk) ✅ |
+| fix-loop candidate + rollback writes | `_replace_contained` + result checked ✅ |
+| refactor `--file` read / backup / write | `_read_contained` / `_replace_contained` via `_project_root_and_rel` ✅ |
+| reports / config / e2e / unit-test / apply writes | `_write_contained` / `_safe_report_write` (r8-9) ✅ |
+| `~/.flexfactor` brain/status/lock, batch report (home) | FlexFactor-owned, outside any audited repo — n/a |
+
+Every read that can reach a model and every write/delete under an audited repo now
+routes through a `_walked_parent_fd`-based contained helper with a repo-relative path;
+POSIX fails closed when `dir_fd` is unavailable.
+
+Round-12 verification: **133 tests GREEN** (5 POSIX-only tests skipped on this Windows
+host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
+`git diff --check` clean, no secrets.

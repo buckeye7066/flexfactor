@@ -1082,6 +1082,24 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
         return path, ""
 
 
+def _project_root_and_rel(abspath: str) -> tuple[str, str]:
+    """Anchor a file at its GIT repo root (if any) else its own directory, returning
+    (root, repo-relative-path) so the containment openat-walk covers the FULL ancestor
+    chain from a stable root - not just the file's immediate parent."""
+    d = os.path.dirname(abspath) or "."
+    r = _git(["rev-parse", "--show-toplevel"], d)
+    if r.returncode == 0 and r.stdout.strip():
+        root = os.path.normpath(r.stdout.strip())
+        if os.path.isdir(root):
+            try:
+                rel = os.path.relpath(abspath, root)
+                if _rel_components(rel) is not None:
+                    return root, rel
+            except ValueError:
+                pass
+    return d, os.path.basename(abspath)
+
+
 def _load_source_text(file_arg: str) -> tuple[str, str]:
     """Resolve `file_arg` to a real text source file and read it as UTF-8.
 
@@ -1116,10 +1134,20 @@ def _load_source_text(file_arg: str) -> tuple[str, str]:
         raise SourceInputError(
             f"'{resolved}' is a symlink - FlexFactor refuses to read/write through a "
             "symlink leaf. Point it at the real source file.")
-    proj = os.path.dirname(os.path.abspath(resolved)) or "."
-    if _contained_path(proj, os.path.basename(resolved)) is None:
-        raise SourceInputError(f"'{resolved}' resolves outside its own folder (symlink escape).")
-    content = _read_contained(proj, os.path.basename(resolved))
+    # Anchor at the file's git repo root (else its own dir) and read the RESOLVED path
+    # through the contained no-follow walk covering the full ancestor chain.
+    resolved_abs = os.path.abspath(resolved)
+    root, rel = _project_root_and_rel(resolved_abs)
+    if _rel_components(rel) is None:
+        raise SourceInputError(f"'{resolved}' resolves outside its project root (symlink escape).")
+    content = _read_contained(root, rel)
+    try:
+        size = os.path.getsize(resolved_abs)
+    except OSError:
+        size = 0
+    if content == "" and size > 0:
+        raise SourceInputError(
+            f"'{resolved}' could not be safely read (symlink/ancestor containment refused it).")
     if "\x00" in content:
         raise SourceInputError(
             f"'{resolved}' is not a UTF-8 text file - it looks binary "
@@ -1204,14 +1232,16 @@ def run(args) -> int:
         return 1
 
     # Accepted - back up the original and write the improved code, both through the
-    # atomic no-follow writer so a symlink swapped in at the leaf is replaced, never
-    # followed to overwrite an outside target.
+    # contained no-follow writer anchored at the file's git root so the FULL ancestor
+    # chain is walked (a symlink swapped in at any component is replaced, never
+    # followed to overwrite an outside target). args.file == the resolved source path.
+    file_abs = os.path.abspath(args.file)
+    root, rel = _project_root_and_rel(file_abs)
     backup = args.file + ".bak"
-    proj = os.path.dirname(os.path.abspath(args.file)) or "."
-    if _replace_contained(proj, os.path.basename(backup), original) is None:
+    if _replace_contained(root, rel + ".bak", original) is None:
         print(f"error: could not safely write backup {backup}", file=sys.stderr)
         return 1
-    if _replace_contained(proj, os.path.basename(args.file), current) is None:
+    if _replace_contained(root, rel, current) is None:
         print(f"error: could not safely write {args.file}", file=sys.stderr)
         return 1
     print(f"\nSwole. Backup written to {backup}; {args.file} updated.\n")
@@ -2051,21 +2081,21 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
 
     prev_branch = _git_current_branch(project_dir) if git else None
     branch = (opts.branch_prefix + _slugify(repo_name)) if git else None
-    backups: dict[str, bytes | None] = {}
+    # Backups are keyed by REPO-RELATIVE path and read/written through the contained
+    # no-follow helpers, so an ancestor swapped after validation can never redirect a
+    # snapshot READ or a rollback DELETE/RESTORE outside the repo.
+    backups: dict[str, bytes] = {}   # rel -> original bytes (existing files to restore)
+    created: set[str] = set()        # rel of NEW files we created (remove on rollback)
     created_branch = False
 
-    def _snapshot(full_path: str) -> None:
-        if full_path in backups:
+    def _snapshot(rel: str) -> None:
+        if rel in backups or rel in created:
             return
-        # Never read THROUGH a symlink for a backup (its target may be outside the
-        # repo); treat a symlink leaf as "no original" so rollback just removes it.
-        if os.path.islink(full_path):
-            backups[full_path] = None
-        elif os.path.isfile(full_path):
-            with open(full_path, "rb") as fh:
-                backups[full_path] = fh.read()
+        data = _read_bytes_contained(project_dir, rel)
+        if data is None:  # missing / symlink / escapes -> treat as newly created
+            created.add(rel)
         else:
-            backups[full_path] = None
+            backups[rel] = data
 
     try:
         if git:
@@ -2077,9 +2107,7 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
         # Snapshot package manifests too: npm install rewrites them and we must be
         # able to restore them on rollback in the non-git path.
         for manifest in ("package.json", "package-lock.json"):
-            mp = os.path.join(project_dir, manifest)
-            if os.path.isfile(mp):
-                _snapshot(mp)
+            _snapshot(manifest)
 
         # Write the generated files (backing up originals / marking new ones).
         # Every path goes through the containment chokepoint: an integration patch
@@ -2090,7 +2118,7 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                 # escapes the repo OR is a symlink leaf we must not follow-and-truncate
                 raise ApplyError(f"generated file path escapes the repo or is a symlink, "
                                  f"refused: {f['path']!r}")
-            _snapshot(full)
+            _snapshot(f["path"])
             # Re-validate + atomic no-follow write (closes the check-then-open TOCTOU).
             if _write_contained(project_dir, f["path"], f["contents"]) is None:
                 raise ApplyError(f"could not safely write {f['path']!r} (escape/symlink swap)")
@@ -2149,38 +2177,31 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                            post_steps=patch.get("post_steps") or [])
 
     except (ApplyError, OSError, subprocess.SubprocessError) as e:
-        _rollback(project_dir, git, created_branch, branch, prev_branch, backups)
+        _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created)
         status = "verify-failed" if isinstance(e, ApplyError) else "error"
         return ApplyResult(repo_name, status, str(e), branch=branch, files=file_list,
                            packages=packages)
 
 
-def _rollback(project_dir, git, created_branch, branch, prev_branch, backups) -> None:
-    """Return the repo to exactly its pre-apply state."""
+def _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created) -> None:
+    """Return the repo to exactly its pre-apply state. `backups` (rel -> bytes) are
+    RESTORED and `created` (rel of new files) are REMOVED, both through the contained
+    no-follow helpers so an ancestor swap can't redirect the delete/restore outside."""
     if git and created_branch and prev_branch:
         # Discard tracked-file changes + switch back, then drop the branch.
         _git(["checkout", "--force", prev_branch], project_dir)
         # Remove any NEW untracked files we created (don't `git clean` - that would
-        # nuke unrelated untracked files).
-        for full, original in backups.items():
-            if original is None and os.path.lexists(full):
-                try:
-                    os.remove(full)  # remove a NEW file/symlink we created (link, not target)
-                except OSError:
-                    pass
+        # nuke unrelated untracked files). _unlink_contained can't escape the repo.
+        for rel in created:
+            _unlink_contained(project_dir, rel)
         _git(["branch", "-D", branch], project_dir)
     else:
-        for full, original in backups.items():
-            try:
-                if original is None:
-                    if os.path.lexists(full):
-                        os.remove(full)
-                else:
-                    # TOCTOU-free restore anchored at the repo root: replaces a symlink
-                    # swapped in at any component rather than writing through it outside.
-                    _replace_contained(project_dir, os.path.relpath(full, project_dir), original)
-            except OSError:
-                pass
+        for rel in created:
+            _unlink_contained(project_dir, rel)
+        for rel, original in backups.items():
+            # TOCTOU-free restore anchored at the repo root: replaces a symlink swapped
+            # in at any component rather than writing through it to an outside target.
+            _replace_contained(project_dir, rel, original)
 
 
 # --------------------------------------------------------------------------- #
@@ -2828,6 +2849,10 @@ _HAS_DIR_FD = all(fn in getattr(os, "supports_dir_fd", set())
                   for fn in (os.open, os.replace, os.unlink, os.mkdir, os.lstat))
 _POSIX_NOFOLLOW = _HAS_O_NOFOLLOW and _HAS_DIR_FD  # full openat component-walk available
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: don't translate CRLF on os.open
+# The pathname-based fallback (realpath + identity re-check) is the DOCUMENTED Windows
+# residual and is only acceptable there. On POSIX without openat/O_NOFOLLOW we must FAIL
+# CLOSED rather than silently downgrade to a non-TOCTOU-free pathname path.
+_CONTAINMENT_FALLBACK_OK = (os.name == "nt")
 
 
 def _same_id(a, b) -> bool:
@@ -2844,6 +2869,8 @@ def _rel_components(rel: str) -> list[str] | None:
     """Split a repo-relative path into safe components, or None if it is absolute,
     drive-relative, UNC, '~'-rooted, or contains any '..' traversal."""
     if not rel or not isinstance(rel, str):
+        return None
+    if "\x00" in rel:  # NUL byte: truncation/injection guard
         return None
     r = rel.strip().strip('"').replace("\\", "/")
     if not r or r.startswith("~") or r.startswith("/") or re.match(r"^[A-Za-z]:", r):
@@ -2938,6 +2965,8 @@ def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> 
                 return ""
             finally:
                 os.close(fd)
+    if not _CONTAINMENT_FALLBACK_OK:
+        return ""  # POSIX without openat -> fail closed, never the pathname path
     # Windows / no openat: lstat + fstat identity re-check narrows the swap window.
     full = _contained_path(project_dir, rel)
     if full is None:
@@ -3042,6 +3071,8 @@ def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> 
     data = content.encode("utf-8") if isinstance(content, str) else content
     if _POSIX_NOFOLLOW:
         return _write_walk_posix(project_dir, comps, data, refuse_symlink_leaf=True)
+    if not _CONTAINMENT_FALLBACK_OK:
+        return None  # POSIX without openat -> fail closed
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=True)
 
 
@@ -3056,7 +3087,105 @@ def _replace_contained(project_dir: str, rel: str, content) -> str | None:
     data = content.encode("utf-8") if isinstance(content, str) else content
     if _POSIX_NOFOLLOW:
         return _write_walk_posix(project_dir, comps, data, refuse_symlink_leaf=False)
+    if not _CONTAINMENT_FALLBACK_OK:
+        return None  # POSIX without openat -> fail closed
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=False)
+
+
+def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> bytes | None:
+    """Read a repo-relative file's RAW BYTES with the same no-follow containment as
+    _read_contained (for backups/snapshots that must round-trip exactly). Returns the
+    bytes, or None if the file is missing / a symlink / escapes / (POSIX-without-openat)
+    fails closed. Distinguishes 'no original' (None) from 'empty file' (b"")."""
+    comps = _rel_components(rel)
+    if comps is None:
+        return None
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
+            if parent is None:
+                return None
+            try:
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            except OSError:
+                return None  # symlink / missing
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                buf = bytearray()
+                while len(buf) < cap:
+                    chunk = os.read(fd, min(65536, cap - len(buf)))
+                    if not chunk:
+                        break
+                    buf += chunk
+                return bytes(buf)
+            except OSError:
+                return None
+            finally:
+                os.close(fd)
+    if not _CONTAINMENT_FALLBACK_OK:
+        return None  # POSIX without openat -> fail closed
+    # Windows: contained-path + islink refusal + fstat identity re-check.
+    full = _contained_path(project_dir, rel)
+    if full is None or os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
+        return None
+    try:
+        pre = os.lstat(full)
+    except OSError:
+        return None
+    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
+        return None
+    try:
+        fd = os.open(full, os.O_RDONLY | _O_BINARY)
+    except OSError:
+        return None
+    try:
+        if not _same_id(os.fstat(fd), pre):
+            return None
+        buf = bytearray()
+        while len(buf) < cap:
+            chunk = os.read(fd, min(65536, cap - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+        return bytes(buf)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _unlink_contained(project_dir: str, rel: str) -> bool:
+    """Delete a repo-relative file WITHOUT following a symlink at the leaf OR any
+    ancestor - so a swapped ancestor directory can't redirect the deletion OUTSIDE the
+    repo. POSIX: openat component-walk + os.unlink(leaf, dir_fd=parent). Windows:
+    contained-parent + literal-leaf os.remove (removes a leaf symlink, not its target).
+    POSIX-without-openat fails closed (returns False). Returns True if removed."""
+    comps = _rel_components(rel)
+    if comps is None:
+        return False
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
+            if parent is None:
+                return False
+            try:
+                os.unlink(leaf, dir_fd=parent)
+                return True
+            except OSError:
+                return False
+    if not _CONTAINMENT_FALLBACK_OK:
+        return False  # POSIX without openat -> fail closed
+    leaf = comps[-1]
+    parent_full = (_contained_path(project_dir, "/".join(comps[:-1])) if len(comps) > 1
+                   else os.path.realpath(project_dir))
+    if parent_full is None:
+        return False
+    literal = os.path.join(parent_full, leaf)  # do NOT realpath the leaf
+    try:
+        if os.path.lexists(literal):
+            os.remove(literal)  # removes a leaf symlink itself, never its target
+        return True
+    except OSError:
+        return False
 
 
 def _atomic_replace_nofollow(full: str, data, binary: bool = False, newline: str = "") -> bool:
@@ -3978,12 +4107,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 outcome = ("noop", patch.get("notes", ""))
                 break
             # TOCTOU-free write of the candidate (and the rollbacks below), anchored at
-            # the repo root and walked per-component on POSIX: a symlink swapped in at
-            # any path component is replaced/refused, never followed outside the repo.
-            _replace_contained(project_dir, rel, patch["contents"])
+            # the repo root and walked per-component on POSIX. CHECK the result: if the
+            # contained write is refused (ancestor/leaf swap, or POSIX-fail-closed) we
+            # must NOT gate by pathname and mark the file fixed - nothing was written.
+            if _replace_contained(project_dir, rel, patch["contents"]) is None:
+                outcome = ("skip", "contained write refused (path escape/symlink)")
+                break
             ok, log = _gate_file(project_dir, rel, stack, baseline_ok)
             if ok is False:
-                _replace_contained(project_dir, rel, original)  # roll back the broken attempt
+                if _replace_contained(project_dir, rel, original) is None:  # rollback failed
+                    outcome = ("skip", "contained rollback refused after a broken attempt")
+                    break
                 outcome = ("revert", log[:200])
                 feedback = (f"Your previous attempt BROKE the build/verification:\n{log[:800]}\n"
                             "Fix the listed defects WITHOUT breaking the build.")
@@ -3991,7 +4125,9 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             if cross is not None:
                 keep, reason = _cross_verify_fix(cross, rel, original, patch["contents"], targets)
                 if not keep:
-                    _replace_contained(project_dir, rel, original)  # the 2nd model vetoed it
+                    if _replace_contained(project_dir, rel, original) is None:  # rollback failed
+                        outcome = ("skip", "contained rollback refused after a veto")
+                        break
                     outcome = ("reject", reason)
                     feedback = (f"A reviewer REJECTED your previous fix for this reason:\n{reason}\n"
                                 "Address that objection specifically and return a corrected fix "

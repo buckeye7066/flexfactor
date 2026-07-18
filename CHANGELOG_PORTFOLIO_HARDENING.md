@@ -249,6 +249,22 @@ With rounds 6-11, every file read that can reach a model and every write under a
 repo is symlink-safe; on POSIX it is TOCTOU-free via an openat component-walk, on Windows
 it is narrowed with an honestly documented residual.
 
+## Round 12 (2026-07-18) — route every call site through the contained helpers
+
+The containment helpers were TOCTOU-free, but several call sites still touched files by
+raw pathname. All now go through the openat-walk helpers:
+
+- **Rollback deletes and restores, and the apply snapshot read**, are now repo-relative
+  and use the contained no-follow helpers, so an ancestor directory swapped to a symlink
+  can't redirect a delete/restore/read outside the repo.
+- **The fix loop now checks the result of every contained write.** A refused write no
+  longer runs the build gate or marks a file "fixed" when nothing was written.
+- **On POSIX without the openat/O_NOFOLLOW facilities, containment fails closed** instead
+  of downgrading to the pathname path (which stays Windows-only, the documented residual).
+- **Refactor `--file` is anchored at its git repo root** (using the resolved path), so
+  the read and the backup/final writes walk the full ancestor chain.
+- **NUL bytes in a path are rejected.**
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
