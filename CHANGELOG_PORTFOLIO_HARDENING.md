@@ -167,6 +167,17 @@ Three sibling fixes of earlier work, done as full audits (all transparent):
   file *writes* were contained; this closes the local-secret disclosure path. All
   other file reads use tool/user paths (not model-named) and were audited as safe.
 
+## Round 7 (2026-07-18) — symlink-safe enumerated reads
+
+- **Repo file enumeration is now symlink-safe.** The audit walks the repo for source
+  files; it now skips symlinked files and symlinked directories, and every enumerated
+  file is read through a realpath-containment check. Previously a repo containing a
+  source file that was actually a symlink to an outside-repo secret (e.g.
+  `src/leak.py` → `../secret.txt`) would have that secret's contents read into the
+  review/fix/test prompts. Combined with round 6, EVERY file read — whether named by
+  the model or found by enumeration — is now contained to the repo, matching the
+  write-side containment.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

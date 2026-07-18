@@ -2787,6 +2787,17 @@ def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
         return ""
 
 
+def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str:
+    """Read a repo-relative file's text ONLY if it stays inside project_dir. Uses the
+    realpath containment chokepoint, so a file reached through a symlink that resolves
+    outside the repo is refused (returns "") rather than disclosing its contents into
+    a review/fix/test prompt. The single entry point for reading an enumerated file."""
+    full = _contained_path(project_dir, rel)
+    if full is None:
+        return ""
+    return _read_full(full, cap)
+
+
 def _is_test_path(rel: str) -> bool:
     low = rel.replace("\\", "/").lower()
     return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
@@ -2821,13 +2832,21 @@ def _enumerate_source_files(project_dir: str, max_files: int,
     git_files = _git_real_files(project_dir)
     out: list[tuple[str, int]] = []
     for dirpath, dirnames, filenames in os.walk(project_dir):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        # Prune noise/hidden dirs AND symlinked dirs: os.walk would otherwise descend
+        # a symlinked directory that points outside the repo.
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith(".")
+                       and not os.path.islink(os.path.join(dirpath, d))]
         for f in filenames:
             if os.path.splitext(f)[1].lower() not in _CODE_EXTS:
                 continue
             if f.endswith((".min.js", ".min.css", ".bundle.js", ".d.ts")):
                 continue
             full = os.path.join(dirpath, f)
+            # SYMLINK GUARD: never enumerate a symlinked file - it can point at an
+            # outside-repo secret whose contents would then be read into a prompt.
+            if os.path.islink(full):
+                continue
             rel = os.path.relpath(full, project_dir)
             relslash = rel.replace("\\", "/")
             if git_files is not None and relslash not in git_files:
@@ -2838,6 +2857,11 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 continue
             if relslash in skip_clean or rel in skip_clean:
                 continue  # already driven clean in a prior run
+            # Realpath containment: a file reached via any symlink in its path that
+            # resolves outside the repo is rejected here (belt-and-suspenders on top
+            # of the per-file islink check above).
+            if _contained_path(project_dir, rel) is None:
+                continue
             try:
                 size = os.path.getsize(full)
             except OSError:
@@ -3415,7 +3439,7 @@ def _review_all(reviewers: list, project_dir: str,
         if stop.is_set() or _capped():
             stop.set()
             return None
-        text = _read_full(os.path.join(project_dir, rel))
+        text = _read_contained(project_dir, rel)
         if not text.strip():
             return (rel, [])
         merged: list[dict] = []
@@ -3515,7 +3539,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         and oversized handling behave exactly as in the serial path)."""
         if meter is not None and meter.over_limit():
             return ("capped", "", None)
-        original = _read_full(os.path.join(project_dir, rel))
+        original = _read_contained(project_dir, rel)
         kind = "edits" if use_edits else "whole"
         # The budget reservation now lives in the provider call itself (the single
         # chokepoint), so this prefetch, the main-thread retries/fallbacks, and every
@@ -4193,7 +4217,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if args.tests and stack.get("test_cmd") and not report_only:
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
-                text = _read_full(os.path.join(project_dir, rel))
+                text = _read_contained(project_dir, rel)
                 if not text.strip():
                     continue
                 try:

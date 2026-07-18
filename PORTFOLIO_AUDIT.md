@@ -393,3 +393,39 @@ to the model.
 Round-6 verification: **98 tests GREEN**, dashboard OK, all `--help` exit 0, three
 launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed: every
 model-named READ path is contained (table above), not just writes.
+
+---
+
+## Round 7 (Codex review) — 1 HIGH: enumerated reads could follow symlinks outside the repo
+
+The read chokepoint covered model-named paths but not repo-ENUMERATED ones.
+`_enumerate_source_files` (os.walk) could return a SYMLINKED file, and
+`_read_full(os.path.join(project_dir, rel))` followed it — so a repo containing
+`src/leak.py` as a symlink to `../secret.txt` (or an absolute target) disclosed
+outside-repo contents to the provider via review/fix/test prompts.
+- Fix (two layers):
+  1. `_enumerate_source_files` now skips symlinked files (`os.path.islink`) AND
+     symlinked directories (pruned from `os.walk` descent), and re-validates each
+     candidate through `_contained_path` (`flexfactor.py:~2823`).
+  2. A new `_read_contained(project_dir, rel)` — realpath-containment read — is the
+     single entry point for reading an enumerated file; a symlink whose realpath
+     resolves outside the repo returns `""` (never opened). Routed ALL enumerated
+     reads through it: review, first-attempt, unit-test-gen; the fix-loop already
+     read the `_contained_path`-resolved `full` (`flexfactor.py:~2790`).
+- **AUDIT — every enumerated read site, now symlink-safe:**
+
+  | Read site | Now via |
+  |---|---|
+  | `_review_all._review_one` (~3436) | `_read_contained` ✅ |
+  | `_fix_files._first_attempt` (~3542) | `_read_contained` ✅ |
+  | `_fix_files` main-thread (~3605) | `_read_full(full)` where `full=_contained_path` ✅ |
+  | unit-test-gen source read (~4220) | `_read_contained` ✅ |
+  | enumeration itself (~2823) | `islink` skip + `_contained_path` filter ✅ |
+- Test: `EnumeratedSymlinkContainmentTests` (2) — an in-repo `.py` symlink to an
+  outside secret is neither enumerated nor read (secret never reaches a prompt); a
+  normal in-repo file still is; traversal/absolute rel paths are refused.
+
+Round-7 verification: **100 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Read/write
+containment is now fully symmetric: EVERY read (model-named AND repo-enumerated) goes
+through the realpath containment chokepoint, and enumeration skips symlinks.

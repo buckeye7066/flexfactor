@@ -711,14 +711,14 @@ class ParallelReviewBudgetTests(unittest.TestCase):
                     return {"findings": [], "summary": ""}
 
         m = ff.CostMeter(limit_usd=0.30)
-        real_read = ff._read_full
-        ff._read_full = lambda _p: "x\n" * 10  # tiny file
+        real_read = ff._read_contained
+        ff._read_contained = lambda pd, rel, cap=0: "x\n" * 10  # tiny in-repo file
         try:
             files = [f"src/f{i}.js" for i in range(40)]
             ff._review_all([FakeProvider(m)], "/proj", files, report=None, meter=m,
                            soft_cap_usd=None, workers=8)
         finally:
-            ff._read_full = real_read
+            ff._read_contained = real_read
         # The provider chokepoint bounds total spend under the cap and stops the
         # sweep early. Pre-fix (per-call over_limit() only), 8 workers overshot.
         self.assertLessEqual(m.usd, 0.30)
@@ -1503,6 +1503,56 @@ class ModelNamedReadPathContainmentTests(unittest.TestCase):
             self.assertNotIn("SUPERSECRET_TOKEN", patch_prompt)
             # The legitimate in-repo file is still read normally.
             self.assertIn("console.log('ok');", patch_prompt)
+
+
+class EnumeratedSymlinkContainmentTests(unittest.TestCase):
+    """Round-7 defect: repo-ENUMERATED reads must be symlink-safe. An in-repo .py
+    symlink pointing at an outside-repo secret must never be enumerated or read."""
+
+    def _make_symlink(self, link_path, target):
+        try:
+            os.symlink(target, link_path)
+            return True
+        except (OSError, NotImplementedError, AttributeError):
+            return False  # Windows without symlink privilege / dev mode
+
+    def test_symlink_to_outside_secret_is_not_enumerated_or_read(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "src"))
+            secret = os.path.join(tmp, "secret.py")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SECRET_TOKEN = 'abc123'\n")
+            with open(os.path.join(proj, "src", "app.py"), "w", encoding="utf-8") as fh:
+                fh.write("print('ok')\n")
+            link = os.path.join(proj, "src", "leak.py")
+            if not self._make_symlink(link, secret):
+                self.skipTest("symlinks not permitted in this environment")
+
+            # (a) Enumeration skips the symlink but keeps the real file.
+            files = [f.replace("\\", "/") for f in
+                     ff._enumerate_source_files(proj, max_files=0)]
+            self.assertIn("src/app.py", files)
+            self.assertNotIn("src/leak.py", files)
+
+            # (b) Even if a stale rel path names the symlink, the contained read
+            #     refuses it (realpath resolves outside the repo) -> no disclosure.
+            self.assertEqual(ff._read_contained(proj, "src/leak.py"), "")
+            self.assertNotIn("SECRET_TOKEN", ff._read_contained(proj, "src/leak.py"))
+            # A normal in-repo file still reads.
+            self.assertIn("print('ok')", ff._read_contained(proj, "src/app.py"))
+
+    def test_read_contained_rejects_traversal_and_absolute(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("SECRET")
+            self.assertEqual(ff._read_contained(proj, "../outside.txt"), "")
+            self.assertEqual(ff._read_contained(proj, outside), "")
 
 
 if __name__ == "__main__":
