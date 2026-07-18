@@ -1006,3 +1006,47 @@ dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git dif
 clean, no secrets. `_snapshot` uses tri-state existence (a refused/exists read is never
 treated as created) and rollback only unlinks genuinely-created files. POSIX-closed /
 Windows-residual matrix unchanged.
+
+---
+
+## Round 19 (Codex review) — Windows reparse-point ancestor bypass + unit-test-gen refusal
+
+### Defect 1 (HIGH — real Windows containment bypass) — symlink/junction ancestors resolving INSIDE the repo
+The Windows fallback used `_contained_path` (realpath, which RESOLVES symlinks/junctions),
+so `repo\alias -> repo\real` made `_read_contained(repo,"alias/file.py")` read THROUGH the
+alias, `_write_win` write THROUGH it, and `_contained_existence` return `missing` — a static
+(not sub-ms) containment bypass violating the "symlink ancestor => refused" contract.
+- Fix: new `_win_walk(project_dir, comps)` — a LITERAL Windows ancestor walk that `lstat`s
+  each component and REJECTS any symlink OR reparse point (junction/mount, via
+  `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`) BEFORE any realpath-based open, plus
+  `_is_reparse()` for the leaf. Applied consistently across ALL SIX helpers: the read fd
+  chokepoint `_open_contained_fd` (now used by `_read_contained` + `_read_bytes_contained` +
+  `_file_sha_contained` + `_read_text_and_sha`), `_write_win`, `_contained_existence`, and
+  `_unlink_contained`. A symlink/junction ANYWHERE in the ancestor chain is now refused on
+  Windows too. Tests: `ReparseAncestorRefusedTests` (run on this host — dir symlinks work).
+
+### Defect 2 (MEDIUM) — unit-test-gen conflated a refusal with an empty module
+`if text is None or not text.strip(): continue` skipped a refused read (symlink/containment
+swap) the SAME as an empty module. Fix: `_classify_source_read` → `refused | empty | ok`;
+a `refused` file is added to `manual_review` + notes (never silently skipped), `empty` skips
+quietly. Test: `ClassifySourceReadTests`.
+
+### PLATFORM MATRIX — updated (Windows upgraded)
+
+| Guarantee | POSIX (openat-walk) | Windows (reparse-walk) |
+|---|---|---|
+| Leaf symlink/junction refused | ✅ `O_NOFOLLOW` | ✅ `lstat` + `_is_reparse` |
+| Ancestor symlink/junction refused (outside OR **inside** repo) | ✅ per-component `O_NOFOLLOW` | ✅ per-component `lstat` reparse-reject (**was a bypass, now closed**) |
+| Post-validation swap of leaf/ancestor | ✅ fully closed (dir_fd, no re-resolve) | ⚠️ sub-ms `lstat`→syscall TOCTOU only (documented) |
+
+**RESIDUAL (Windows, honest — narrowed):** with the literal reparse walk, the ONLY remaining
+Windows residual is the true sub-millisecond swap between the `lstat` classification and the
+very next syscall (no `dir_fd`/`O_NOFOLLOW` to bind the handle). Static symlink/junction
+ancestors — inside or outside the repo — are now REFUSED, at POSIX parity. Only native handle
+APIs (`NtCreateFile` + `FILE_FLAG_OPEN_REPARSE_POINT`, not exposed by Python's `os`) could
+close the final sub-ms window. POSIX remains fully closed.
+
+Round-19 verification: **173 tests GREEN** (7 POSIX-only tests skipped on this Windows host;
+the reparse-ancestor tests RAN here), dashboard OK, all `--help` exit 0, three launchers ASCII
++ parse-clean, `git diff --check` clean, no secrets. Windows refuses symlink/junction ancestors
+across all six helpers; unit-test-gen distinguishes refusal from empty.

@@ -3043,61 +3043,70 @@ def _read_from_fd(fd: int, cap: int) -> str:
     return bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_reparse(path: str) -> bool:
+    """True if `path` is a symlink OR any other reparse point (Windows junction/mount).
+    A junction sets FILE_ATTRIBUTE_REPARSE_POINT but is NOT an os.path.islink, so an
+    ancestor junction would otherwise be silently followed by realpath. lstat does not
+    follow, so this classifies the leaf itself."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False  # doesn't exist / unstattable -> not a reparse point (missing handled elsewhere)
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _win_walk(project_dir: str, comps: list[str], *, make_dirs: bool = False) -> tuple[str, str | None]:
+    """Windows literal ancestor walk (no realpath of components). Anchors at
+    realpath(project_dir) (the repo root, whose own ancestors are the user's trusted FS),
+    then lstat()s EACH intermediate component and REJECTS any symlink/junction (reparse
+    point) or non-directory BEFORE any realpath-based open. Returns
+    (status, parent_literal): status is 'ok' (parent_literal is the literal dir that should
+    contain comps[-1]), 'missing' (an ancestor genuinely absent), or 'refused' (a reparse
+    ancestor / not-a-dir / couldn't classify). `make_dirs` creates a genuinely-missing
+    ancestor instead of returning 'missing'. This gives Windows POSIX-parity: a symlink or
+    junction ANYWHERE in the ancestor chain is refused."""
+    cur = os.path.realpath(project_dir)
+    for d in comps[:-1]:
+        cur = os.path.join(cur, d)
+        try:
+            st = os.lstat(cur)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.ENOENT:
+                if make_dirs:
+                    try:
+                        os.mkdir(cur)
+                        continue
+                    except OSError:
+                        return ("refused", None)
+                return ("missing", None)
+            return ("refused", None)
+        if stat.S_ISLNK(st.st_mode) or (getattr(st, "st_file_attributes", 0)
+                                        & _FILE_ATTRIBUTE_REPARSE_POINT):
+            return ("refused", None)  # symlink/junction ancestor -> refuse (no realpath-follow)
+        if not stat.S_ISDIR(st.st_mode):
+            return ("refused", None)  # a file where a directory is expected -> refuse
+    return ("ok", cur)
+
+
 def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str | None:
     """Read a repo-relative file's text ONLY if EVERY component of its path stays inside
-    project_dir with no symlink anywhere. THE single entry point for reading a project
-    file whose contents can enter a prompt (enumerated source AND static metadata).
-
-    Returns None on ANY refusal / fail-closed (escape, symlink, missing, POSIX-without-
-    openat, IO error) and a str (possibly "") on a genuine successful read. Callers MUST
-    distinguish None (refused -> skip / error / never clean / never fed to the model)
-    from "" (a real empty file, a valid clean read). POSIX: openat component-walk
-    (ancestor + leaf TOCTOU-free). Windows: lstat + fstat identity re-check (narrowed)."""
-    comps = _rel_components(rel)
-    if comps is None:
-        return None
-    if _POSIX_NOFOLLOW:
-        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
-            if parent is None:
-                return None
-            try:
-                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-            except OSError:
-                return None  # leaf is a symlink / missing
-            try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    return None
-                return _read_from_fd(fd, cap)
-            except OSError:
-                return None
-            finally:
-                os.close(fd)
-    if not _CONTAINMENT_FALLBACK_OK:
-        return None  # POSIX without openat -> fail closed, never the pathname path
-    # Windows / no openat: lstat + fstat identity re-check narrows the swap window.
-    full = _contained_path(project_dir, rel)
-    if full is None:
-        return None
-    if os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
-        return None
-    try:
-        pre = os.lstat(full)
-    except OSError:
-        return None
-    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
-        return None
-    try:
-        fd = os.open(full, os.O_RDONLY | _O_BINARY)
-    except OSError:
-        return None
-    try:
-        if not _same_id(os.fstat(fd), pre):
-            return None  # identity changed between lstat and open -> fail closed
-        return _read_from_fd(fd, cap)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+    project_dir with no symlink/junction anywhere. THE single entry point for reading a
+    project file whose contents can enter a prompt (enumerated source AND static metadata).
+    Returns None on ANY refusal / fail-closed and a str (possibly "") on a genuine read;
+    callers distinguish None (refused) from "" (a real empty file). Reads through the
+    single fd chokepoint `_open_contained_fd` (POSIX openat-walk / Windows reparse-walk)."""
+    with _open_contained_fd(project_dir, rel) as fd:
+        if fd is None:
+            return None
+        try:
+            return _read_from_fd(fd, cap)
+        except OSError:
+            return None
 
 
 def _write_walk_posix(project_dir: str, comps: list[str], data: bytes,
@@ -3140,23 +3149,23 @@ def _write_walk_posix(project_dir: str, comps: list[str], data: bytes,
 
 
 def _write_win(project_dir: str, comps: list[str], data: bytes, *, refuse_symlink_leaf: bool) -> str | None:
-    """Windows / no-openat write. Contains the PARENT directory (realpath, must stay in
-    the repo) and writes the LITERAL leaf name in it via temp + os.replace - so a symlink
-    LEAF is REPLACED (os.replace never follows it), not written through to its target.
-    A parent-directory identity re-check narrows the ancestor-swap window (documented
-    residual). `refuse_symlink_leaf` refuses instead of replacing an existing symlink."""
+    """Windows / no-openat write. Walks the PARENT chain LITERALLY, rejecting any
+    symlink/junction (reparse-point) ancestor (creating genuinely-missing dirs), then
+    writes the LITERAL leaf via temp + os.replace - so a symlink/junction LEAF is REPLACED
+    (os.replace never follows it), not written through to its target. A parent-identity
+    re-check narrows the remaining sub-ms swap window (documented residual).
+    `refuse_symlink_leaf` refuses instead of replacing an existing reparse-point leaf."""
+    status, parent_full = _win_walk(project_dir, comps, make_dirs=True)
+    if status != "ok":
+        return None  # reparse ancestor (or a non-dir/couldn't-create) -> refuse
     leaf = comps[-1]
-    if len(comps) > 1:
-        parent_full = _contained_path(project_dir, "/".join(comps[:-1]))
-    else:
-        parent_full = os.path.realpath(project_dir)
-    if parent_full is None:
-        return None
     literal = os.path.join(parent_full, leaf)  # do NOT realpath the leaf
-    if refuse_symlink_leaf and os.path.islink(literal):
-        return None
+    if refuse_symlink_leaf and _is_reparse(literal):
+        return None  # a symlink OR junction leaf -> refuse (don't follow-and-truncate)
     tmp = os.path.join(parent_full, f"{leaf}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
+        # The walk verified/created the intermediate chain; ensure the anchor parent
+        # itself exists (it is a realpath, so makedirs won't traverse a reparse point).
         os.makedirs(parent_full, exist_ok=True)
         pre = os.stat(parent_full)
         # EXCLUSIVE temp create (O_EXCL, + O_NOFOLLOW where the OS has it) so we never
@@ -3222,65 +3231,23 @@ def _replace_contained(project_dir: str, rel: str, content) -> str | None:
 
 
 def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> bytes | None:
-    """Read a repo-relative file's RAW BYTES with the same no-follow containment as
+    """Read a repo-relative file's RAW BYTES through the same fd chokepoint as
     _read_contained (for backups/snapshots that must round-trip exactly). Returns the
-    bytes, or None if the file is missing / a symlink / escapes / (POSIX-without-openat)
-    fails closed. Distinguishes 'no original' (None) from 'empty file' (b"")."""
-    comps = _rel_components(rel)
-    if comps is None:
-        return None
-    if _POSIX_NOFOLLOW:
-        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
-            if parent is None:
-                return None
-            try:
-                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-            except OSError:
-                return None  # symlink / missing
-            try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    return None
-                buf = bytearray()
-                while len(buf) < cap:
-                    chunk = os.read(fd, min(65536, cap - len(buf)))
-                    if not chunk:
-                        break
-                    buf += chunk
-                return bytes(buf)
-            except OSError:
-                return None
-            finally:
-                os.close(fd)
-    if not _CONTAINMENT_FALLBACK_OK:
-        return None  # POSIX without openat -> fail closed
-    # Windows: contained-path + islink refusal + fstat identity re-check.
-    full = _contained_path(project_dir, rel)
-    if full is None or os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
-        return None
-    try:
-        pre = os.lstat(full)
-    except OSError:
-        return None
-    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
-        return None
-    try:
-        fd = os.open(full, os.O_RDONLY | _O_BINARY)
-    except OSError:
-        return None
-    try:
-        if not _same_id(os.fstat(fd), pre):
+    bytes, or None on any refusal (missing / symlink / junction ancestor / escape /
+    fail-closed). Distinguishes 'no original' (None) from 'empty file' (b"")."""
+    with _open_contained_fd(project_dir, rel) as fd:
+        if fd is None:
             return None
-        buf = bytearray()
-        while len(buf) < cap:
-            chunk = os.read(fd, min(65536, cap - len(buf)))
-            if not chunk:
-                break
-            buf += chunk
-        return bytes(buf)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+        try:
+            buf = bytearray()
+            while len(buf) < cap:
+                chunk = os.read(fd, min(65536, cap - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+            return bytes(buf)
+        except OSError:
+            return None
 
 
 @contextlib.contextmanager
@@ -3310,20 +3277,24 @@ def _open_contained_fd(project_dir: str, rel: str):
     if not _CONTAINMENT_FALLBACK_OK:
         yield None
         return
-    full = _contained_path(project_dir, rel)
-    if full is None or os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
+    # Windows: reject a symlink/junction ANCESTOR via the literal reparse walk, then open
+    # the LITERAL leaf (no realpath-follow) with an fstat identity re-check.
+    status, parent_literal = _win_walk(project_dir, comps)
+    if status != "ok":
         yield None
         return
+    literal = os.path.join(parent_literal, comps[-1])
     try:
-        pre = os.lstat(full)
+        pre = os.lstat(literal)
     except OSError:
         yield None
         return
-    if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
-        yield None
+    if (stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode)
+            or (getattr(pre, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)):
+        yield None  # leaf is a symlink / reparse point / not a regular file
         return
     try:
-        fd = os.open(full, os.O_RDONLY | _O_BINARY)
+        fd = os.open(literal, os.O_RDONLY | _O_BINARY)
     except OSError:
         yield None
         return
@@ -3419,18 +3390,29 @@ def _contained_existence(project_dir: str, rel: str) -> str:
                     pass
     if not _CONTAINMENT_FALLBACK_OK:
         return "refused"  # POSIX without openat -> can't safely check -> fail closed
-    # Windows: contain the PARENT, then lexists the literal leaf (leaf symlink not followed).
-    leaf = comps[-1]
-    if len(comps) > 1:
-        parent_full = _contained_path(project_dir, "/".join(comps[:-1]))
-        if parent_full is None:
-            return "refused"  # parent escapes the repo -> can't vouch
-    else:
-        parent_full = os.path.realpath(project_dir)
+    # Windows: literal reparse walk (a symlink/junction ancestor -> 'refused', not
+    # 'missing'), then lstat the literal leaf (leaf reparse point still counts as exists).
+    status, parent_full = _win_walk(project_dir, comps)
+    if status != "ok":
+        return status  # 'missing' (ancestor absent) or 'refused' (reparse/non-dir ancestor)
     try:
-        return "exists" if os.path.lexists(os.path.join(parent_full, leaf)) else "missing"
-    except OSError:
-        return "refused"
+        os.lstat(os.path.join(parent_full, comps[-1]))
+        return "exists"
+    except OSError as e:
+        return "missing" if getattr(e, "errno", None) == errno.ENOENT else "refused"
+
+
+def _classify_source_read(project_dir: str, rel: str) -> tuple[str | None, str]:
+    """Read a source file for a generation loop and CLASSIFY the result so a REFUSAL is
+    never conflated with an empty module. Returns (text, status): 'refused' (contained read
+    refused -> record manual/error, never silently skip), 'empty' (a genuinely empty
+    module -> skip quietly), or 'ok' (usable content)."""
+    text = _read_contained(project_dir, rel)
+    if text is None:
+        return (None, "refused")
+    if not text.strip():
+        return ("", "empty")
+    return (text, "ok")
 
 
 def _read_meta_tristate(project_dir: str, rel: str,
@@ -3465,15 +3447,16 @@ def _unlink_contained(project_dir: str, rel: str) -> bool:
                 return False
     if not _CONTAINMENT_FALLBACK_OK:
         return False  # POSIX without openat -> fail closed
-    leaf = comps[-1]
-    parent_full = (_contained_path(project_dir, "/".join(comps[:-1])) if len(comps) > 1
-                   else os.path.realpath(project_dir))
-    if parent_full is None:
-        return False
-    literal = os.path.join(parent_full, leaf)  # do NOT realpath the leaf
+    # Windows: literal reparse walk - a symlink/junction ANCESTOR refuses the delete so it
+    # can't be redirected outside the repo; the literal leaf is removed (link/junction not
+    # followed to its target).
+    status, parent_full = _win_walk(project_dir, comps)
+    if status != "ok":
+        return False  # reparse/non-dir/missing ancestor -> refuse
+    literal = os.path.join(parent_full, comps[-1])  # do NOT realpath the leaf
     try:
         if os.path.lexists(literal):
-            os.remove(literal)  # removes a leaf symlink itself, never its target
+            os.remove(literal)  # removes a leaf symlink/junction itself, never its target
         return True
     except OSError:
         return False
@@ -4996,9 +4979,18 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if args.tests and stack.get("test_cmd") and not report_only:
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
-                text = _read_contained(project_dir, rel)
-                if text is None or not text.strip():
-                    continue  # refused/fail-closed OR empty -> don't test-gen this module
+                text, read_status = _classify_source_read(project_dir, rel)
+                if read_status == "refused":
+                    # REFUSED (symlink/containment swap before test-gen) is NOT the same as
+                    # an empty module: never silently skip it - record it and mark the run
+                    # partial / manual so it isn't mistaken for "covered".
+                    manual_review.add(rel)
+                    fix_notes.append(f"{rel}: could not be safely read for unit-test generation "
+                                     "(containment refused) - manual review")
+                    print(f"{pfx}[skip] unit-test gen for {rel}: containment refused (manual review)")
+                    continue
+                if read_status == "empty":
+                    continue  # a GENUINELY empty module -> nothing to test-gen, skip quietly
                 try:
                     gen = author.structured(
                         UNIT_TEST_SYSTEM,

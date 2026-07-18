@@ -342,6 +342,19 @@ raw pathname. All now go through the openat-walk helpers:
   proceeding and later deleting that pre-existing file during rollback. A genuinely absent
   file is still recorded as created and cleaned up correctly on rollback.
 
+## Round 19 (2026-07-18) — Windows now refuses symlink/junction directory ancestors
+
+- **On Windows, a symlinked or junctioned directory anywhere in a file's path is now
+  refused**, matching the POSIX behavior. Previously Windows resolved such links, so a
+  repo containing a directory symlink/junction pointing at another in-repo folder could be
+  read or written *through* — a static containment bypass, not just the documented
+  sub-millisecond race. All six contained file operations (read, read-bytes, hash, write,
+  existence-check, delete) now walk the directory chain literally and reject any reparse
+  point. The only remaining Windows caveat is the true sub-millisecond swap race, which
+  stays documented; POSIX remains fully closed.
+- **Unit-test generation** now distinguishes a file it couldn't safely read (flagged for
+  manual review) from a genuinely empty module (skipped quietly).
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

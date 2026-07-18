@@ -2930,5 +2930,82 @@ class SnapshotTriStateTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(proj, "new.js")))
 
 
+def _try_dir_symlink(link, target_dir):
+    try:
+        os.symlink(target_dir, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+
+
+class ReparseAncestorRefusedTests(unittest.TestCase):
+    """Round-19 defect 1: on Windows (and everywhere) a symlink/junction ANCESTOR that
+    resolves INSIDE the repo is REFUSED across all six helpers - not read/written/existence-
+    missing/unlinked through. Upgrades Windows from the static-ancestor bypass to parity."""
+
+    def _repo_with_alias(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(proj, "real"))
+        with open(os.path.join(proj, "real", "file.py"), "w", encoding="utf-8") as fh:
+            fh.write("INSIDE_CODE")
+        if not _try_dir_symlink(os.path.join(proj, "alias"), os.path.join(proj, "real")):
+            return None
+        return proj
+
+    def test_all_helpers_refuse_symlink_ancestor(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = self._repo_with_alias(tmp)
+            if proj is None:
+                self.skipTest("directory symlinks not permitted here")
+            # READ through the alias ancestor -> refused (None), no INSIDE_CODE disclosure.
+            self.assertIsNone(ff._read_contained(proj, "alias/file.py"))
+            self.assertIsNone(ff._read_bytes_contained(proj, "alias/file.py"))
+            self.assertIsNone(ff._file_sha_contained(proj, "alias/file.py"))
+            self.assertIsNone(ff._read_text_and_sha(proj, "alias/file.py"))
+            # EXISTENCE through the alias ancestor -> 'refused' (NOT 'missing').
+            self.assertEqual(ff._contained_existence(proj, "alias/new.py"), "refused")
+            # WRITE / REPLACE / UNLINK through the alias ancestor -> refused.
+            self.assertIsNone(ff._write_contained(proj, "alias/x.py", "data"))
+            self.assertIsNone(ff._replace_contained(proj, "alias/x.py", "data"))
+            self.assertFalse(ff._unlink_contained(proj, "alias/file.py"))
+            # The real file was never written/removed through the alias.
+            self.assertTrue(os.path.exists(os.path.join(proj, "real", "file.py")))
+            self.assertFalse(os.path.exists(os.path.join(proj, "real", "x.py")))
+
+    def test_direct_real_path_still_works(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = self._repo_with_alias(tmp)
+            if proj is None:
+                self.skipTest("directory symlinks not permitted here")
+            self.assertEqual(ff._read_contained(proj, "real/file.py"), "INSIDE_CODE")
+            self.assertEqual(ff._contained_existence(proj, "real/file.py"), "exists")
+            self.assertIsNotNone(ff._write_contained(proj, "real/new.py", "ok"))
+            self.assertEqual(ff._read_contained(proj, "real/new.py"), "ok")
+
+
+class ClassifySourceReadTests(unittest.TestCase):
+    """Round-19 defect 2: unit-test-gen distinguishes a REFUSED read from an empty module."""
+
+    def test_refused_empty_ok(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "code.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            with open(os.path.join(proj, "empty.py"), "w"):
+                pass
+            self.assertEqual(ff._classify_source_read(proj, "code.py"), ("x = 1\n", "ok"))
+            self.assertEqual(ff._classify_source_read(proj, "empty.py"), ("", "empty"))
+            self.assertEqual(ff._classify_source_read(proj, "../escape.py"), (None, "refused"))
+            secret = os.path.join(tmp, "secret.py")
+            with open(secret, "w", encoding="utf-8") as fh:
+                fh.write("SECRET")
+            if _try_symlink(os.path.join(proj, "link.py"), secret):
+                self.assertEqual(ff._classify_source_read(proj, "link.py"), (None, "refused"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
