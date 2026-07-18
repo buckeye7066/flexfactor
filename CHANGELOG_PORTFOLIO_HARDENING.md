@@ -299,6 +299,19 @@ raw pathname. All now go through the openat-walk helpers:
 - **The Windows atomic writer** creates its temp exclusively (O_EXCL) and loops the write
   so a short write can't commit a truncated file.
 
+## Round 15 (2026-07-18) — clean requires a completed review tied to the reviewed bytes
+
+- **A file is only clean if its review actually completed.** If the review was aborted by
+  the budget cutoff or a provider error (so no defects were seen because nothing ran), the
+  file is no longer treated as clean - it is re-reviewed next cycle.
+- **The remembered clean hash is the hash of the exact bytes reviewed.** If a file is
+  swapped or changed between when it was reviewed and when the run saves, it is dropped
+  from clean instead of persisting a hash of content that was never reviewed.
+- **Folder profiling shows an explicit "refused" marker** for a symlinked/unreadable
+  package.json or README instead of silently omitting it.
+- **Integration planning fails closed on an unreadable existing modify-target** (rather
+  than silently treating it as a new file), and shows a real empty file as empty content.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

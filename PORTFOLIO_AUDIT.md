@@ -851,3 +851,49 @@ dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git dif
 clean, no secrets. 'clean' is now a fresh-review allowlist; prior-clean is revalidated at
 save; the remaining `_read_contained` callers branch on `None`; `_file_sha` streams; the
 Windows temp is `O_EXCL`. POSIX-closed / Windows-residual matrix unchanged.
+
+---
+
+## Round 15 (Codex review) — 4 more; the two clean-ACCOUNTING ones were the priority
+
+Codex confirmed r14 is closed but found a FAILED or ABORTED review, and a SWAP between
+review and save, could still reach "clean".
+
+### Defect 1 (HIGH) — an aborted/failed review could be marked clean
+`_review_one` returned `(rel, [])` (→ clean) even when `review_file()` raised
+`BudgetExceededError` before any reviewer completed, or every reviewer threw a generic
+exception — empty findings from a FAILED review looked clean. Fix: track review
+COMPLETION explicitly; only a review where EVERY reviewer COMPLETED successfully with empty
+findings returns clean. A budget/refusal/provider-exception abort returns an `incomplete`
+sentinel and is NEVER added to `reviewed_clean` (re-reviewed next cycle). Tests:
+`ReviewCleanAllowlistTests.test_aborted_review_is_not_clean` / `test_budget_abort_review_is_not_clean`.
+
+### Defect 2 (HIGH) — a new-clean hash wasn't tied to the reviewed bytes
+`_build_clean_map` hashed a newly-clean file AT SAVE with no prior, so a swap/change
+between review and save persisted the NEW unreviewed hash as clean. Fix: `_review_all`
+now returns `reviewed_clean` as `{rel: reviewed_sha}` (sha of the EXACT bytes reviewed,
+via `_read_text_and_sha`); the audit carries `run_clean_sha`; `_build_clean_map` keeps a
+file clean ONLY if its save-time hash equals the reviewed_sha (new-clean) or the prior
+hash (carried-forward) — a file with no reference hash or a mismatch is DROPPED. Tests:
+`CleanMapRevalidateTests`.
+
+### Defect 3 (MEDIUM) — folder profiling silently omitted refused metadata
+`_gather_from_folder`'s `if raw:` skipped a refused package.json/README with no marker
+(model saw absence, not refusal). Fix: tri-state `_read_meta_tristate` → an explicit
+trusted "[EXISTS but could not be safely read - refused]" marker; an empty file is real
+(empty) content, distinct from missing. Test: `FolderGatherRefusedMarkerTests`.
+
+### Defect 4 (MEDIUM) — integration modify-reads used truthiness
+`generate_integration`'s `if body:` skipped a refused OR empty existing modify-target;
+if all skipped, the model was told "creating new files only" and apply could then write a
+file the model never saw. Fix: branch on `is None`; an EXISTING but refused modify-target
+FAILS CLOSED (integration refused); an empty existing file is shown as its real (empty)
+contents; a truly missing one is a create. Tests: `IntegrationModifyEmptyMissingTests`,
+`ModifyFilesInRepoSymlinkReadTests` (now asserts the refusal).
+
+Round-15 verification: **157 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Clean now requires a SUCCESSFULLY-COMPLETED review AND the persisted
+hash is the reviewed_sha of the exact bytes (a review->save swap drops it); the
+folder-gather + integration-modify readers branch on `None`. POSIX-closed / Windows-residual
+matrix unchanged.

@@ -711,14 +711,14 @@ class ParallelReviewBudgetTests(unittest.TestCase):
                     return {"findings": [], "summary": ""}
 
         m = ff.CostMeter(limit_usd=0.30)
-        real_read = ff._read_contained
-        ff._read_contained = lambda pd, rel, cap=0: "x\n" * 10  # tiny in-repo file
+        real_read = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=0: ("x\n" * 10, "deadbeef")  # tiny in-repo file
         try:
             files = [f"src/f{i}.js" for i in range(40)]
             ff._review_all([FakeProvider(m)], "/proj", files, report=None, meter=m,
                            soft_cap_usd=None, workers=8)
         finally:
-            ff._read_contained = real_read
+            ff._read_text_and_sha = real_read
         # The provider chokepoint bounds total spend under the cap and stops the
         # sweep early. Pre-fix (per-call over_limit() only), 8 workers overshot.
         self.assertLessEqual(m.usd, 0.30)
@@ -1790,9 +1790,14 @@ class ModifyFilesInRepoSymlinkReadTests(unittest.TestCase):
                     return {"files": [], "packages": []}
 
             prov = FakeProv()
-            ff.generate_integration(prov, proj, "PROFILE", "need",
-                                    {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
-            self.assertNotIn("INNER_SECRET", prov.prompts[1])
+            patch, reason = ff.generate_integration(
+                prov, proj, "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            # A planned modify of an in-repo symlink leaf FAILS CLOSED (round 15): the
+            # integration is refused and the secret never reaches a 2nd prompt.
+            self.assertIsNone(patch)
+            self.assertIn("could not be safely read", reason)
+            self.assertEqual(prov.calls, 1)  # no patch pass at all
+            self.assertTrue(all("INNER_SECRET" not in p for p in prov.prompts))
 
 
 class RefactorFileContainmentTests(unittest.TestCase):
@@ -2260,27 +2265,28 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
     (never added to findings, never marked clean); a genuinely empty file is clean."""
 
     def test_refused_read_is_unreadable(self):
-        real = ff._read_contained
-        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
         try:
             ffindings, flat, unreadable, reviewed_clean = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
-            ff._read_contained = real
+            ff._read_text_and_sha = real
         self.assertIn("x.py", unreadable)
         self.assertNotIn("x.py", ffindings)      # not fixable
         self.assertNotIn("x.py", reviewed_clean)  # and NOT in the clean allowlist
 
     def test_empty_file_is_clean_not_unreadable(self):
-        real = ff._read_contained
-        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ""
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("", "emptysha")
         try:
             ffindings, flat, unreadable, reviewed_clean = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
-            ff._read_contained = real
+            ff._read_text_and_sha = real
         self.assertEqual(unreadable, set())      # empty read is clean, not unreadable
-        self.assertIn("x.py", reviewed_clean)     # empty file = a fresh clean read
+        self.assertIn("x.py", reviewed_clean)     # empty file = a fresh clean read (dict key)
+        self.assertEqual(reviewed_clean["x.py"], "emptysha")
         self.assertNotIn("x.py", ffindings)
 
 
@@ -2360,21 +2366,57 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         m.record("claude-opus-4-8", input_tokens=1_000_000)  # push well over the cap
         ffindings, flat, unreadable, reviewed_clean = ff._review_all(
             [], "/proj", ["a.py", "b.py", "c.py"], meter=m, workers=2)
-        self.assertEqual(reviewed_clean, set())  # nothing reviewed -> nothing clean
+        self.assertEqual(reviewed_clean, {})  # nothing reviewed -> nothing clean
         self.assertEqual(unreadable, set())
 
     def test_reviewed_empty_files_are_clean(self):
-        real = ff._read_contained
-        ff._read_contained = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: "code\n"
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha-" + rel)
         real_rf = ff.review_file
-        ff.review_file = lambda reviewer, rel, text: ([], "")  # no findings
+        ff.review_file = lambda reviewer, rel, text: ([], "")  # no findings, COMPLETES
         try:
             _, _, unreadable, reviewed_clean = ff._review_all(
                 [object()], "/proj", ["a.py", "b.py"], workers=2)
         finally:
-            ff._read_contained = real
+            ff._read_text_and_sha = real
             ff.review_file = real_rf
-        self.assertEqual(reviewed_clean, {"a.py", "b.py"})  # fresh clean reads -> allowlist
+        self.assertEqual(set(reviewed_clean), {"a.py", "b.py"})  # fresh clean reads -> allowlist
+        self.assertEqual(reviewed_clean["a.py"], "sha-a.py")     # mapped to reviewed sha
+
+    def test_aborted_review_is_not_clean(self):
+        # Every reviewer throws -> the review did NOT complete -> the file is NOT clean.
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
+        real_rf = ff.review_file
+
+        def boom(reviewer, rel, text):
+            raise RuntimeError("provider exploded")
+
+        ff.review_file = boom
+        try:
+            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+                [object()], "/proj", ["a.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real
+            ff.review_file = real_rf
+        self.assertNotIn("a.py", reviewed_clean)  # aborted review -> never clean
+        self.assertNotIn("a.py", ffindings)
+
+    def test_budget_abort_review_is_not_clean(self):
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
+        real_rf = ff.review_file
+
+        def budget(reviewer, rel, text):
+            raise ff.BudgetExceededError("cap")
+
+        ff.review_file = budget
+        try:
+            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["a.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real
+            ff.review_file = real_rf
+        self.assertNotIn("a.py", reviewed_clean)  # budget-aborted review -> never clean
 
 
 class RefusedReadMarkerTests(unittest.TestCase):
@@ -2479,7 +2521,7 @@ class CleanMapRevalidateTests(unittest.TestCase):
             cm = ff._build_clean_map(proj, ["a.py"], {"a.py": h})
             self.assertEqual(cm.get("a.py"), h)
 
-    def test_run_clean_file_hashed_fresh(self):
+    def test_run_clean_file_kept_only_with_matching_reviewed_sha(self):
         import hashlib
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -2487,8 +2529,14 @@ class CleanMapRevalidateTests(unittest.TestCase):
             os.makedirs(proj)
             with open(os.path.join(proj, "b.py"), "w", encoding="utf-8") as fh:
                 fh.write("new-clean")
-            cm = ff._build_clean_map(proj, ["b.py"], {})  # no prior hash -> hash fresh
-            self.assertEqual(cm.get("b.py"), hashlib.sha256(b"new-clean").hexdigest())
+            h = hashlib.sha256(b"new-clean").hexdigest()
+            # With the reviewed_sha (run_clean_sha) matching current -> kept.
+            cm = ff._build_clean_map(proj, ["b.py"], {}, {"b.py": h})
+            self.assertEqual(cm.get("b.py"), h)
+            # With NO reference hash at all -> dropped (can't trust it clean).
+            self.assertNotIn("b.py", ff._build_clean_map(proj, ["b.py"], {}, {}))
+            # With a reviewed_sha that does NOT match current -> dropped.
+            self.assertNotIn("b.py", ff._build_clean_map(proj, ["b.py"], {}, {"b.py": "stale"}))
 
 
 class WinShortWriteAndExclTests(unittest.TestCase):
@@ -2524,6 +2572,71 @@ class WinShortWriteAndExclTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(proj, "f.txt")))
             # no leftover temp files either
             self.assertEqual([f for f in os.listdir(proj) if f.endswith(".tmp")], [])
+
+
+class FolderGatherRefusedMarkerTests(unittest.TestCase):
+    """Round-15 defect 3: folder profiling shows an explicit refused marker for a
+    symlinked/refused package.json or README, not silent absence."""
+
+    def test_refused_metadata_shows_marker_not_omission(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("OUTSIDE_SECRET")
+            if not (_try_symlink(os.path.join(proj, "package.json"), outside)
+                    and _try_symlink(os.path.join(proj, "README.md"), outside)):
+                self.skipTest("symlinks not permitted here")
+            _, ctx = ff._gather_from_folder(proj)
+            self.assertNotIn("OUTSIDE_SECRET", ctx)                 # target not disclosed
+            self.assertIn("could not be safely read", ctx)         # explicit marker(s)
+            self.assertIn("package.json:", ctx)
+
+
+class IntegrationModifyEmptyMissingTests(unittest.TestCase):
+    """Round-15 defect 4: a planned-modify EMPTY existing file is shown as empty content;
+    a MISSING one is a create (no fail); a refused one fails closed (covered elsewhere)."""
+
+    def _run(self, modify_files, make):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            make(proj)
+
+            class FakeProv:
+                def __init__(self):
+                    self.calls = 0
+                    self.prompts = []
+
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                    self.calls += 1
+                    self.prompts.append(prompt)
+                    if self.calls == 1:
+                        return {"can_apply": True, "plan": "p", "packages": [],
+                                "create_files": [], "modify_files": modify_files, "reason": ""}
+                    return {"files": [], "packages": []}
+
+            prov = FakeProv()
+            patch, reason = ff.generate_integration(
+                prov, proj, "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            return prov, patch, reason
+
+    def test_empty_existing_modify_shown_as_empty_content(self):
+        def make(proj):
+            with open(os.path.join(proj, "empty.js"), "w"):
+                pass  # a REAL empty file
+        prov, patch, reason = self._run(["empty.js"], make)
+        self.assertEqual(prov.calls, 2)                        # proceeded to the patch pass
+        self.assertIn("--- empty.js ---", prov.prompts[1])     # shown as (empty) content
+        self.assertNotIn("(creating new files only)", prov.prompts[1])
+
+    def test_missing_modify_is_create_only_no_fail(self):
+        prov, patch, reason = self._run(["ghost.js"], lambda proj: None)
+        self.assertEqual(prov.calls, 2)                        # not refused - proceeds
+        self.assertIn("(creating new files only)", prov.prompts[1])
 
 
 if __name__ == "__main__":
