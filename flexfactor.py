@@ -1621,19 +1621,24 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     pkg_status, raw = _read_meta_tristate(folder, "package.json", 8000)
     if pkg_status == "refused":
         parts.append("package.json: [EXISTS but could not be safely read - refused]")
-    elif pkg_status == "ok" and raw:
-        try:
-            data = json.loads(raw)
-            name = data.get("name") or name
-            deps = list((data.get("dependencies") or {}).keys())
-            dev = list((data.get("devDependencies") or {}).keys())
-            parts.append("package.json:")
-            parts.append(f"  name: {data.get('name')}  description: {data.get('description')}")
-            parts.append(f"  dependencies: {', '.join(deps) or '(none)'}")
-            parts.append(f"  devDependencies: {', '.join(dev) or '(none)'}")
-            parts.append(f"  scripts: {', '.join((data.get('scripts') or {}).keys())}")
-        except ValueError:
-            parts.append("package.json (unparsed):\n" + raw[:1500])
+    elif pkg_status == "ok":
+        # 'ok' with empty content is a PRESENT-BUT-EMPTY file - distinct from MISSING
+        # (no marker) and from REFUSED. Only parse when there is real content.
+        if not raw.strip():
+            parts.append("package.json: [present but empty]")
+        else:
+            try:
+                data = json.loads(raw)
+                name = data.get("name") or name
+                deps = list((data.get("dependencies") or {}).keys())
+                dev = list((data.get("devDependencies") or {}).keys())
+                parts.append("package.json:")
+                parts.append(f"  name: {data.get('name')}  description: {data.get('description')}")
+                parts.append(f"  dependencies: {', '.join(deps) or '(none)'}")
+                parts.append(f"  devDependencies: {', '.join(dev) or '(none)'}")
+                parts.append(f"  scripts: {', '.join((data.get('scripts') or {}).keys())}")
+            except ValueError:
+                parts.append("package.json (unparsed):\n" + raw[:1500])
 
     for readme in ("README.md", "readme.md", "README.MD", "Readme.md"):
         rd_status, rp = _read_meta_tristate(folder, readme, 3000)
@@ -2079,14 +2084,18 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
         if body is not None:
             existing_blobs.append(f"--- {rel} ---\n{body}")  # includes an empty file ("")
             continue
-        if _rel_components(rel) is None or _contained_path(project_dir, rel) is None:
-            print(f"    [skip] plan names a file outside the repo, not reading: {rel!r}")
+        if _rel_components(rel) is None:
+            print(f"    [skip] plan names a malformed path, not reading: {rel!r}")
             continue
+        # EXISTENCE FIRST: a symlink leaf pointing OUTSIDE makes _contained_path None too,
+        # so check existence BEFORE the containment-None skip - an EXISTING but unreadable
+        # modify target must FAIL CLOSED, never fall through to create-only.
         if _contained_lexists(project_dir, rel):
-            # It EXISTS but couldn't be safely read: refuse the whole integration rather
-            # than let apply overwrite a file the model never actually saw.
             return None, (f"planned modify target {rel!r} exists but could not be safely "
                           "read (symlink/containment refused) - refusing integration")
+        if _contained_path(project_dir, rel) is None:
+            print(f"    [skip] plan names a file outside the repo, not reading: {rel!r}")
+            continue
         # else: truly missing -> the plan will CREATE it; nothing to show.
     existing_text = "\n\n".join(existing_blobs) if existing_blobs else "(creating new files only)"
 
@@ -4117,8 +4126,9 @@ def _review_all(reviewers: list, project_dir: str,
         if got is None:
             return (rel, "unreadable")  # containment REFUSED -> NOT clean
         text, sha = got
-        if not text.strip():
-            return (rel, [], sha)       # genuinely empty file -> a valid clean read
+        # NOTE: no empty/whitespace early-return. 'clean' must ALWAYS mean a COMPLETED
+        # review, so even empty/whitespace files run every reviewer. (Skipping trivial
+        # files belongs at ENUMERATION, not as a pre-review 'clean'.)
         merged: list[dict] = []
         complete = True  # only a review where EVERY reviewer COMPLETED can be clean
         for reviewer in reviewers:

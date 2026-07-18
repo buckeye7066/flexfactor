@@ -312,6 +312,16 @@ raw pathname. All now go through the openat-walk helpers:
 - **Integration planning fails closed on an unreadable existing modify-target** (rather
   than silently treating it as a new file), and shows a real empty file as empty content.
 
+## Round 16 (2026-07-18) — three ordering/consistency fixes
+
+- **Whitespace-only files are reviewed, not shortcut to clean.** A file containing only
+  blank lines is now sent through the reviewers like any other, so "clean" always means a
+  completed review.
+- **A modify-target that is a symlink pointing outside the repo now refuses the
+  integration** instead of being mistaken for a brand-new file to create.
+- **An empty package.json shows a distinct "present but empty" note** in the folder
+  profile, so it is no longer indistinguishable from a missing one.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

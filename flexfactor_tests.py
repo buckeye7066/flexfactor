@@ -2639,5 +2639,102 @@ class IntegrationModifyEmptyMissingTests(unittest.TestCase):
         self.assertIn("(creating new files only)", prov.prompts[1])
 
 
+class WhitespaceFileReviewedTests(unittest.TestCase):
+    """Round-16 defect 1: a whitespace-only file is never clean via a PRE-review early
+    return - reviewers always run, so 'clean' still means a completed review."""
+
+    def test_whitespace_file_runs_reviewers(self):
+        ran = []
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("   \n\t  \n", "wsha")
+        real_rf = ff.review_file
+        ff.review_file = lambda reviewer, rel, text: (ran.append(rel) or ([], ""))
+        try:
+            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real
+            ff.review_file = real_rf
+        self.assertIn("ws.py", ran)             # the reviewer actually RAN
+        self.assertIn("ws.py", reviewed_clean)  # clean ONLY because the review completed
+
+    def test_whitespace_file_aborted_review_is_not_clean(self):
+        real = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("  \n  ", "s")
+        real_rf = ff.review_file
+
+        def boom(reviewer, rel, text):
+            raise RuntimeError("provider down")
+
+        ff.review_file = boom
+        try:
+            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real
+            ff.review_file = real_rf
+        # Pre-fix, the whitespace early-return marked it clean WITHOUT running the reviewer.
+        self.assertNotIn("ws.py", reviewed_clean)
+
+
+class IntegrationModifyOutsideSymlinkTests(unittest.TestCase):
+    """Round-16 defect 2: a symlink modify-target pointing OUTSIDE the repo (which makes
+    _contained_path None too) must FAIL CLOSED - existence is checked BEFORE the
+    containment-None skip, so it isn't silently treated as create-only."""
+
+    def test_outside_symlink_modify_refuses_integration(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "src"))
+            outside = os.path.join(tmp, "outside.js")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("OUTSIDE_CODE")
+            link = os.path.join(proj, "src", "link.js")
+            if not _try_symlink(link, outside):
+                self.skipTest("symlinks not permitted here")
+
+            class FakeProv:
+                def __init__(self):
+                    self.calls = 0
+                    self.prompts = []
+
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                    self.calls += 1
+                    self.prompts.append(prompt)
+                    if self.calls == 1:
+                        return {"can_apply": True, "plan": "p", "packages": [],
+                                "create_files": [], "modify_files": ["src/link.js"], "reason": ""}
+                    return {"files": [], "packages": []}
+
+            prov = FakeProv()
+            patch, reason = ff.generate_integration(
+                prov, proj, "PROFILE", "need", {"repo": {"fullName": "o/r", "htmlUrl": "u"}})
+            self.assertIsNone(patch)                          # REFUSED, not create-only
+            self.assertIn("could not be safely read", reason)
+            self.assertEqual(prov.calls, 1)                   # no patch pass
+            self.assertTrue(all("OUTSIDE_CODE" not in p for p in prov.prompts))
+
+
+class EmptyPackageJsonDistinctTests(unittest.TestCase):
+    """Round-16 defect 3: an empty package.json is 'present but empty', distinct from
+    missing (no marker) and refused."""
+
+    def test_empty_present_missing_distinct(self):
+        import tempfile
+        # missing -> no package.json marker at all
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            _, ctx = ff._gather_from_folder(proj)
+            self.assertNotIn("package.json", ctx)
+        # present but empty -> explicit marker, distinct from missing
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w"):
+                pass  # REAL empty file
+            _, ctx = ff._gather_from_folder(proj)
+            self.assertIn("present but empty", ctx)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

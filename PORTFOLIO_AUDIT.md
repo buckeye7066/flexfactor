@@ -897,3 +897,37 @@ clean, no secrets. Clean now requires a SUCCESSFULLY-COMPLETED review AND the pe
 hash is the reviewed_sha of the exact bytes (a review->save swap drops it); the
 folder-gather + integration-modify readers branch on `None`. POSIX-closed / Windows-residual
 matrix unchanged.
+
+---
+
+## Round 16 (Codex review) — 3 narrower ordering/consistency residuals
+
+### Defect 1 (MEDIUM) — a whitespace-only file was clean WITHOUT a review
+`_review_one` early-returned `(rel, [], sha)` when `text.strip()` was empty, BEFORE any
+reviewer ran, so a whitespace-only candidate file (size > 0, not enumeration-skipped) went
+into `reviewed_clean` un-reviewed - "clean" again didn't mean "reviewed". Fix: removed the
+pre-review early return; every reviewer runs even for empty/whitespace text, so clean
+always means a COMPLETED review (skipping trivial files belongs at enumeration, not here).
+Tests: `WhitespaceFileReviewedTests`.
+
+### Defect 2 (MEDIUM) — a refused symlink modify-target pointing OUTSIDE wasn't fail-closed
+In `generate_integration`, a `modify_files` entry that is a symlink leaf pointing OUTSIDE
+the repo makes `_read_contained` return None AND `_contained_path` return None, so the old
+order `if _rel_components is None or _contained_path is None: continue` skipped it as
+"outside" BEFORE `_contained_lexists` could detect the existing leaf - the integration was
+NOT refused at generation time (fell through toward create-only). Fix: check
+`_contained_lexists` (existence) BEFORE the containment-None skip and RETURN THE REFUSAL if
+the target exists but couldn't be safely read. Test: `IntegrationModifyOutsideSymlinkTests`.
+
+### Defect 3 (MEDIUM) — an empty package.json looked like a missing one
+`_gather_from_folder`'s `elif pkg_status == "ok" and raw:` was false for an empty
+package.json (`("ok", "")`), so the prompt was identical to a MISSING one. Fix: branch on
+`pkg_status == "ok"` and append an explicit `[present but empty]` marker (parse only when
+`raw.strip()` is non-empty); missing (no marker) / present-but-empty / refused are now three
+distinct states. Test: `EmptyPackageJsonDistinctTests`.
+
+Round-16 verification: **161 tests GREEN** (6 POSIX-only tests skipped on this Windows host),
+dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean, `git diff --check`
+clean, no secrets. Whitespace-only files are never clean-without-review; a refused symlink
+modify-target fails closed (existence checked before the containment-None skip); empty
+package.json is distinct from missing/refused. POSIX-closed / Windows-residual matrix unchanged.
