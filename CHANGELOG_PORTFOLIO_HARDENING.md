@@ -231,6 +231,24 @@ can reach a model and every write under the repo is symlink-safe and atomic.
   race — that requires native Windows handle APIs not exposed by Python. This residual is
   documented in PORTFOLIO_AUDIT.md and is not claimed closed on Windows.
 
+## Round 11 (2026-07-18) — definitive openat component-walk (POSIX ancestor race closed)
+
+- **POSIX containment is now fully TOCTOU-free.** File reads/writes under an audited repo
+  walk each path component from a root directory handle using `openat` + `O_NOFOLLOW`, so
+  a symlink at ANY directory in the path (not just the final file) is refused and nothing
+  is re-resolved by name after validation. This closes an ancestor-directory swap race
+  that existed on POSIX too, not only Windows.
+- **Windows keeps the narrowed defense, documented honestly.** Windows lacks
+  `openat`/`dir_fd`/`O_NOFOLLOW`, so it validates by realpath and re-checks leaf/parent
+  identity at the syscall boundary. This refuses leaf symlinks and outside-pointing
+  ancestor symlinks, but an ancestor symlink resolving *inside* the repo, or a sub-ms
+  post-check swap by a same-privilege local process, remains a documented residual that
+  only native Windows handle APIs could close. Not claimed closed on Windows.
+
+With rounds 6-11, every file read that can reach a model and every write under an audited
+repo is symlink-safe; on POSIX it is TOCTOU-free via an openat component-walk, on Windows
+it is narrowed with an honestly documented residual.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single

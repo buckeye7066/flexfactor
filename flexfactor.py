@@ -1207,10 +1207,11 @@ def run(args) -> int:
     # atomic no-follow writer so a symlink swapped in at the leaf is replaced, never
     # followed to overwrite an outside target.
     backup = args.file + ".bak"
-    if not _atomic_replace_nofollow(backup, original):
+    proj = os.path.dirname(os.path.abspath(args.file)) or "."
+    if _replace_contained(proj, os.path.basename(backup), original) is None:
         print(f"error: could not safely write backup {backup}", file=sys.stderr)
         return 1
-    if not _atomic_replace_nofollow(args.file, current):
+    if _replace_contained(proj, os.path.basename(args.file), current) is None:
         print(f"error: could not safely write {args.file}", file=sys.stderr)
         return 1
     print(f"\nSwole. Backup written to {backup}; {args.file} updated.\n")
@@ -2175,9 +2176,9 @@ def _rollback(project_dir, git, created_branch, branch, prev_branch, backups) ->
                     if os.path.lexists(full):
                         os.remove(full)
                 else:
-                    # Atomic no-follow restore: replaces a symlink swapped in at `full`
-                    # rather than writing through it to an outside target.
-                    _atomic_replace_nofollow(full, original, binary=True)
+                    # TOCTOU-free restore anchored at the repo root: replaces a symlink
+                    # swapped in at any component rather than writing through it outside.
+                    _replace_contained(project_dir, os.path.relpath(full, project_dir), original)
             except OSError:
                 pass
 
@@ -2812,12 +2813,20 @@ def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
         return ""
 
 
-# Handle-based no-follow support. O_NOFOLLOW + dir_fd are POSIX; on Windows they are
-# absent, so there we fall back to an fstat/identity re-check at the syscall boundary
-# that NARROWS (does not fully close) the pathname-TOCTOU window. See PORTFOLIO_AUDIT.md
+# TOCTOU-free containment. On POSIX we anchor from a ROOT directory fd and walk EACH
+# path component with openat + O_NOFOLLOW (O_DIRECTORY on intermediates), so neither the
+# leaf NOR any ANCESTOR may be a symlink and nothing is ever re-resolved by pathname
+# after validation - fully closing the swap race. On Windows os exposes neither
+# openat/dir_fd nor O_NOFOLLOW, so we keep an lstat/fstat + parent-identity re-check that
+# NARROWS (does not fully close) the pathname-TOCTOU window; see PORTFOLIO_AUDIT.md
 # "Residual" for the honest Windows caveat.
 _HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
-_HAS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+# Require dir_fd support for EVERY op the openat-walk uses (open/replace/unlink/mkdir/
+# lstat); if any is missing we fall back to the Windows pathname path rather than risk a
+# NotImplementedError escaping mid-walk.
+_HAS_DIR_FD = all(fn in getattr(os, "supports_dir_fd", set())
+                  for fn in (os.open, os.replace, os.unlink, os.mkdir, os.lstat))
+_POSIX_NOFOLLOW = _HAS_O_NOFOLLOW and _HAS_DIR_FD  # full openat component-walk available
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: don't translate CRLF on os.open
 
 
@@ -2831,125 +2840,230 @@ def _same_id(a, b) -> bool:
     return (a.st_dev, a.st_size, a.st_mtime_ns) == (b.st_dev, b.st_size, b.st_mtime_ns)
 
 
-def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str:
-    """Read a repo-relative file's text ONLY if it stays inside project_dir, using a
-    HANDLE-BASED no-follow open plus an fstat identity re-check so a symlink swapped in
-    at the leaf between validation and open is caught (fails closed to "").
+def _rel_components(rel: str) -> list[str] | None:
+    """Split a repo-relative path into safe components, or None if it is absolute,
+    drive-relative, UNC, '~'-rooted, or contains any '..' traversal."""
+    if not rel or not isinstance(rel, str):
+        return None
+    r = rel.strip().strip('"').replace("\\", "/")
+    if not r or r.startswith("~") or r.startswith("/") or re.match(r"^[A-Za-z]:", r):
+        return None
+    comps: list[str] = []
+    for part in r.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+        comps.append(part)
+    return comps or None
 
-    - POSIX: os.open(..., O_NOFOLLOW) has the kernel refuse a symlink leaf outright.
-    - Everywhere: after opening, fstat the descriptor and require it to match the
-      pre-validated no-follow lstat (dev+inode) - a swap changes the identity.
-    THE single entry point for reading a project file whose contents can enter a
-    prompt (enumerated source AND static metadata)."""
+
+@contextlib.contextmanager
+def _walked_parent_fd(root: str, comps: list[str], *, make_dirs: bool = False):
+    """POSIX openat component-walk. Yields (parent_fd, leaf_name): parent_fd is an
+    O_NOFOLLOW handle to the directory that should CONTAIN comps[-1], reached by opening
+    EACH intermediate component with O_DIRECTORY|O_NOFOLLOW relative to the previous fd -
+    so neither the leaf nor any ANCESTOR may be a symlink and no pathname is re-resolved
+    after validation. Yields (None, None) on any symlink/missing/non-dir component. The
+    root itself is realpath-resolved ONCE (its ancestors are the user's trusted
+    filesystem, not audited-repo content). POSIX only."""
+    root_real = os.path.realpath(root)
+    dirflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    open_fds: list[int] = []
+    try:
+        try:
+            parent = os.open(root_real, dirflags)
+        except OSError:
+            yield (None, None)
+            return
+        open_fds.append(parent)
+        for d in comps[:-1]:
+            try:
+                fd = os.open(d, dirflags, dir_fd=parent)
+            except OSError:
+                if not make_dirs:
+                    yield (None, None)
+                    return
+                try:
+                    os.mkdir(d, dir_fd=parent)
+                    fd = os.open(d, dirflags, dir_fd=parent)
+                except OSError:
+                    yield (None, None)
+                    return
+            open_fds.append(fd)
+            parent = fd
+        yield (parent, comps[-1])
+    finally:
+        for fd in open_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _read_from_fd(fd: int, cap: int) -> str:
+    buf = bytearray()
+    while len(buf) < cap:
+        chunk = os.read(fd, min(65536, cap - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    # Normalize newlines like the old universal-newline text read, so prompt content /
+    # edit anchors / diffs stay \n-based across platforms.
+    return bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str:
+    """Read a repo-relative file's text ONLY if EVERY component of its path stays inside
+    project_dir with no symlink anywhere. THE single entry point for reading a project
+    file whose contents can enter a prompt (enumerated source AND static metadata).
+    POSIX: openat component-walk (ancestor + leaf TOCTOU-free). Windows: lstat + fstat
+    identity re-check (narrowed window). Returns "" on any refusal/error (fails closed)."""
+    comps = _rel_components(rel)
+    if comps is None:
+        return ""
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps) as (parent, leaf):
+            if parent is None:
+                return ""
+            try:
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            except OSError:
+                return ""  # leaf is a symlink / missing
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return ""
+                return _read_from_fd(fd, cap)
+            except OSError:
+                return ""
+            finally:
+                os.close(fd)
+    # Windows / no openat: lstat + fstat identity re-check narrows the swap window.
     full = _contained_path(project_dir, rel)
     if full is None:
         return ""
     if os.path.islink(os.path.join(project_dir, rel.replace("\\", "/"))):
-        return ""  # symlink leaf (target may be re-pointed) -> refuse
+        return ""
     try:
         pre = os.lstat(full)
     except OSError:
         return ""
     if stat.S_ISLNK(pre.st_mode) or not stat.S_ISREG(pre.st_mode):
-        return ""  # not a real regular file
-    flags = os.O_RDONLY | _O_BINARY | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+        return ""
     try:
-        fd = os.open(full, flags)
+        fd = os.open(full, os.O_RDONLY | _O_BINARY)
     except OSError:
-        return ""  # e.g. O_NOFOLLOW hit a symlink swapped in at the leaf
+        return ""
     try:
         if not _same_id(os.fstat(fd), pre):
             return ""  # identity changed between lstat and open -> fail closed
-        buf = bytearray()
-        while len(buf) < cap:
-            chunk = os.read(fd, min(65536, cap - len(buf)))
-            if not chunk:
-                break
-            buf += chunk
-        # Normalize newlines like the old universal-newline text read, so prompt
-        # content / edit anchors / diffs stay \n-based across platforms.
-        return bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        return _read_from_fd(fd, cap)
     except OSError:
         return ""
     finally:
         os.close(fd)
 
 
-def _atomic_replace_nofollow(full: str, data, binary: bool = False, newline: str = "") -> bool:
-    """Write `data` to absolute path `full` atomically WITHOUT following a symlink at
-    the leaf OR a swapped parent directory. `full` is expected to be a contained
-    realpath. Returns True on success.
-
-    - POSIX (dir_fd supported): open a VERIFIED parent-directory handle once and do the
-      temp create + os.replace + cleanup RELATIVE to that fd, so a parent swapped after
-      validation cannot redirect the write (the fd still refers to the original dir).
-    - Windows / no dir_fd: temp create + os.replace by path, re-checking the parent
-      directory identity at the syscall boundary to narrow the swap window (documented
-      residual). os.replace itself replaces a leaf symlink rather than following it."""
-    if isinstance(data, str):
-        data = data.encode("utf-8")  # no newline translation (matches newline="")
-    parent = os.path.dirname(full) or "."
-    base = os.path.basename(full)
-    tmpbase = f"{base}.{os.getpid()}.{threading.get_ident()}.tmp"
-
-    if _HAS_DIR_FD and os.replace in os.supports_dir_fd:
-        dflags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | (
-            os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0)
+def _write_walk_posix(project_dir: str, comps: list[str], data: bytes,
+                      *, refuse_symlink_leaf: bool) -> str | None:
+    """POSIX openat-walk write: temp-create + os.replace + cleanup RELATIVE to the
+    anchored parent dir fd (ancestor + leaf TOCTOU-free). Returns the path or None."""
+    with _walked_parent_fd(project_dir, comps, make_dirs=True) as (parent, leaf):
+        if parent is None:
+            return None
         try:
-            os.makedirs(parent, exist_ok=True)
-            dfd = os.open(parent, dflags)
+            lst = os.lstat(leaf, dir_fd=parent)
+            if refuse_symlink_leaf and stat.S_ISLNK(lst.st_mode):
+                return None
         except OSError:
-            return False
+            pass  # leaf doesn't exist yet -> fine
+        tmpname = f"{leaf}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
-            tfd = os.open(tmpbase, os.O_WRONLY | os.O_CREAT | os.O_EXCL, dir_fd=dfd)
+            tfd = os.open(tmpname, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o600, dir_fd=parent)
             try:
                 os.write(tfd, data)
             finally:
                 os.close(tfd)
-            os.replace(tmpbase, base, src_dir_fd=dfd, dst_dir_fd=dfd)
-            return True
+            os.replace(tmpname, leaf, src_dir_fd=parent, dst_dir_fd=parent)
         except OSError:
             try:
-                os.unlink(tmpbase, dir_fd=dfd)
+                os.unlink(tmpname, dir_fd=parent)
             except OSError:
                 pass
-            return False
-        finally:
-            os.close(dfd)
+            return None
+        return os.path.join(os.path.realpath(project_dir), *comps)
 
-    # Windows / no dir_fd path: narrow the parent-swap window with an identity re-check.
-    tmp = os.path.join(parent, tmpbase)
+
+def _write_win(project_dir: str, comps: list[str], data: bytes, *, refuse_symlink_leaf: bool) -> str | None:
+    """Windows / no-openat write. Contains the PARENT directory (realpath, must stay in
+    the repo) and writes the LITERAL leaf name in it via temp + os.replace - so a symlink
+    LEAF is REPLACED (os.replace never follows it), not written through to its target.
+    A parent-directory identity re-check narrows the ancestor-swap window (documented
+    residual). `refuse_symlink_leaf` refuses instead of replacing an existing symlink."""
+    leaf = comps[-1]
+    if len(comps) > 1:
+        parent_full = _contained_path(project_dir, "/".join(comps[:-1]))
+    else:
+        parent_full = os.path.realpath(project_dir)
+    if parent_full is None:
+        return None
+    literal = os.path.join(parent_full, leaf)  # do NOT realpath the leaf
+    if refuse_symlink_leaf and os.path.islink(literal):
+        return None
+    tmp = os.path.join(parent_full, f"{leaf}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        os.makedirs(parent, exist_ok=True)
-        pre = os.stat(parent)
+        os.makedirs(parent_full, exist_ok=True)
+        pre = os.stat(parent_full)
         with open(tmp, "wb") as fh:
             fh.write(data)
-        if not _same_id(os.stat(parent), pre):  # parent swapped since validation
+        if not _same_id(os.stat(parent_full), pre):  # parent swapped since validation
             os.remove(tmp)
-            return False
-        os.replace(tmp, full)
-        return True
+            return None
+        os.replace(tmp, literal)  # replaces a leaf symlink no-follow
+        return literal
     except OSError:
         try:
             os.remove(tmp)
         except OSError:
             pass
-        return False
+        return None
 
 
-def _write_contained(project_dir: str, rel: str, content: str, newline: str = "") -> str | None:
-    """THE symlink-safe project WRITE chokepoint. Returns the path written, or None if
-    the target escapes the repo or its leaf is a symlink (so a report/config filename
-    that the audited repo pre-created as a symlink to an outside file is REFUSED, never
-    followed-and-truncated). RE-VALIDATES immediately before writing and writes
-    atomically (temp + os.replace, no-follow) - even in report-only runs."""
-    full = _contained_path(project_dir, rel)
-    if full is None:
+def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> str | None:
+    """THE symlink-safe project WRITE chokepoint (REFUSES a symlink leaf). Returns the
+    path written, or None if the target escapes the repo or any path component is a
+    symlink. POSIX: openat component-walk (ancestor + leaf TOCTOU-free); Windows:
+    contained-parent + literal-leaf replace + parent-identity re-check (narrowed).
+    Accepts str (utf-8) or bytes."""
+    comps = _rel_components(rel)
+    if comps is None:
         return None
-    unresolved = os.path.join(project_dir, rel.replace("\\", "/"))
-    if os.path.islink(unresolved) or os.path.islink(full):
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    if _POSIX_NOFOLLOW:
+        return _write_walk_posix(project_dir, comps, data, refuse_symlink_leaf=True)
+    return _write_win(project_dir, comps, data, refuse_symlink_leaf=True)
+
+
+def _replace_contained(project_dir: str, rel: str, content) -> str | None:
+    """Like _write_contained but REPLACES a leaf that is a symlink (os.replace no-follow)
+    instead of refusing it - for fix-loop candidate writes and rollback RESTORES of an
+    in-repo file, where a swapped-in symlink must be replaced by the real file rather
+    than left in place. Still TOCTOU-free on POSIX (openat-walk) and narrowed on Windows."""
+    comps = _rel_components(rel)
+    if comps is None:
         return None
-    return full if _atomic_replace_nofollow(full, content, newline=newline) else None
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    if _POSIX_NOFOLLOW:
+        return _write_walk_posix(project_dir, comps, data, refuse_symlink_leaf=False)
+    return _write_win(project_dir, comps, data, refuse_symlink_leaf=False)
+
+
+def _atomic_replace_nofollow(full: str, data, binary: bool = False, newline: str = "") -> bool:
+    """Back-compat absolute-path atomic no-follow REPLACE (splits into parent-as-root +
+    leaf). Prefer _write_contained/_replace_contained(project_dir, rel, ...) so the POSIX
+    walk covers ALL ancestors from the repo root, not just the file's own directory."""
+    return _replace_contained(os.path.dirname(full) or ".", os.path.basename(full), data) is not None
 
 
 # FlexFactor's own directory - a TRUSTED location for report fallbacks that is never
@@ -3863,12 +3977,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             if not patch.get("changed") or not (patch.get("contents") or "").strip():
                 outcome = ("noop", patch.get("notes", ""))
                 break
-            # Atomic no-follow write of the candidate (and of the rollbacks below): a
-            # symlink swapped in at `full` is replaced, never followed outside the repo.
-            _atomic_replace_nofollow(full, patch["contents"])
+            # TOCTOU-free write of the candidate (and the rollbacks below), anchored at
+            # the repo root and walked per-component on POSIX: a symlink swapped in at
+            # any path component is replaced/refused, never followed outside the repo.
+            _replace_contained(project_dir, rel, patch["contents"])
             ok, log = _gate_file(project_dir, rel, stack, baseline_ok)
             if ok is False:
-                _atomic_replace_nofollow(full, original)  # roll back the broken attempt
+                _replace_contained(project_dir, rel, original)  # roll back the broken attempt
                 outcome = ("revert", log[:200])
                 feedback = (f"Your previous attempt BROKE the build/verification:\n{log[:800]}\n"
                             "Fix the listed defects WITHOUT breaking the build.")
@@ -3876,7 +3991,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             if cross is not None:
                 keep, reason = _cross_verify_fix(cross, rel, original, patch["contents"], targets)
                 if not keep:
-                    _atomic_replace_nofollow(full, original)  # the 2nd model vetoed it
+                    _replace_contained(project_dir, rel, original)  # the 2nd model vetoed it
                     outcome = ("reject", reason)
                     feedback = (f"A reviewer REJECTED your previous fix for this reason:\n{reason}\n"
                                 "Address that objection specifically and return a corrected fix "

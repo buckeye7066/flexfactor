@@ -1895,5 +1895,106 @@ class WriteParentSwapRecheckTests(unittest.TestCase):
                 self.assertEqual(fh.read(), "DATA")
 
 
+class RelComponentsTests(unittest.TestCase):
+    """Round-11: the component splitter rejects every escaping path form."""
+
+    def test_rejects_escaping_forms(self):
+        for bad in ("../x", "a/../b", "/etc/passwd", "C:/x", "C:x", "//host/share",
+                    "~/x", "", "..", ".", "   "):
+            self.assertIsNone(ff._rel_components(bad), f"should reject {bad!r}")
+
+    def test_accepts_and_normalizes(self):
+        self.assertEqual(ff._rel_components("src/app.js"), ["src", "app.js"])
+        self.assertEqual(ff._rel_components("a\\b\\c.py"), ["a", "b", "c.py"])
+        self.assertEqual(ff._rel_components("./x/./y"), ["x", "y"])
+
+
+class WriteVsReplaceLeafSemanticsTests(unittest.TestCase):
+    """Round-11: _write_contained REFUSES a symlink leaf; _replace_contained REPLACES
+    it (os.replace no-follow) - both leaving an outside target intact."""
+
+    def test_write_refuses_replace_replaces_target_intact(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write("PRECIOUS")
+            leaf = os.path.join(proj, "x.txt")
+            if not _try_symlink(leaf, outside):
+                self.skipTest("symlinks not permitted here")
+
+            # REFUSE: _write_contained returns None, outside untouched.
+            self.assertIsNone(ff._write_contained(proj, "x.txt", "NEW"))
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")
+
+            # REPLACE: _replace_contained swaps the symlink for a real file no-follow.
+            path = ff._replace_contained(proj, "x.txt", "NEW")
+            self.assertIsNotNone(path)
+            self.assertFalse(os.path.islink(leaf))
+            with open(leaf, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "NEW")
+            with open(outside, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "PRECIOUS")  # STILL intact
+
+
+class PosixAncestorWalkTests(unittest.TestCase):
+    """Round-11: on POSIX, the openat component-walk refuses a symlink at ANY ancestor
+    (not just the leaf), even one pointing inside the repo. Skipped where openat/dir_fd
+    are unavailable (e.g. Windows), which relies on the narrowed identity re-check."""
+
+    def setUp(self):
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("POSIX openat component-walk unavailable on this platform")
+
+    def test_ancestor_symlink_read_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(os.path.join(proj, "realdir"))
+            with open(os.path.join(proj, "realdir", "f.txt"), "w", encoding="utf-8") as fh:
+                fh.write("INREPO")
+            # aliasdir -> realdir : a symlinked ANCESTOR that points INSIDE the repo.
+            os.symlink(os.path.join(proj, "realdir"), os.path.join(proj, "aliasdir"))
+            self.assertEqual(ff._read_contained(proj, "aliasdir/f.txt"), "")   # refused
+            self.assertEqual(ff._read_contained(proj, "realdir/f.txt"), "INREPO")  # real ok
+
+    def test_ancestor_symlink_to_outside_read_refused_no_disclosure(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outsidedir")
+            os.makedirs(outside)
+            with open(os.path.join(outside, "f.txt"), "w", encoding="utf-8") as fh:
+                fh.write("OUTSIDE_SECRET")
+            os.symlink(outside, os.path.join(proj, "aliasdir"))
+            out = ff._read_contained(proj, "aliasdir/f.txt")
+            self.assertNotIn("OUTSIDE_SECRET", out)
+            self.assertEqual(out, "")
+
+    def test_ancestor_symlink_write_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            outside = os.path.join(tmp, "outsidedir")
+            os.makedirs(outside)
+            os.symlink(outside, os.path.join(proj, "aliasdir"))
+            self.assertIsNone(ff._write_contained(proj, "aliasdir/f.txt", "X"))
+            self.assertFalse(os.path.exists(os.path.join(outside, "f.txt")))
+
+    def test_normal_nested_read_write_works(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            p = ff._write_contained(proj, "a/b/c.txt", "NESTED")
+            self.assertIsNotNone(p)
+            self.assertEqual(ff._read_contained(proj, "a/b/c.txt"), "NESTED")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

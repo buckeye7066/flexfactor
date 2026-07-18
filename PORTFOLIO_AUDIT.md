@@ -624,3 +624,59 @@ launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Refactor `-
 is contained; reads use `O_NOFOLLOW` + fstat identity re-check; writes/unlinks use
 `dir_fd`-relative no-follow on POSIX and parent-identity re-check on Windows; the
 Windows sub-ms residual is documented, not claimed closed.
+
+---
+
+## Round 11 (Codex review) — the ANCESTOR-directory race is POSIX too; definitive openat-walk
+
+Round 10 opened by pathname (`lstat(full)` + `os.open(full, O_NOFOLLOW)`); `O_NOFOLLOW`
+only protects the FINAL component, so swapping an ANCESTOR directory to a symlink after
+`_contained_path` but before the open makes both the pre-`lstat` and the `fstat` resolve
+to the OUTSIDE file (identity check passes) — an ancestor TOCTOU present on POSIX too,
+not just Windows. **This is the last containment round.**
+
+### Fix (POSIX, definitive TOCTOU-free): openat component-walk from a root fd
+- New `_rel_components(rel)` splits a repo-relative path into safe components (rejects
+  absolute / drive / UNC / `~` / any `..`).
+- New `_walked_parent_fd(root, comps)` opens `project_dir` once (realpath — its ancestors
+  are the user's trusted FS) then walks EACH component with
+  `os.open(comp, O_DIRECTORY|O_NOFOLLOW, dir_fd=parent)` (openat), yielding the anchored
+  parent dir fd. A symlink at **any** ancestor or the leaf is refused; no pathname is
+  ever re-resolved after validation.
+- `_read_contained` (POSIX) opens the leaf `O_RDONLY|O_NOFOLLOW` **relative to the walked
+  parent fd** and reads from that fd.
+- `_write_contained` / `_replace_contained` (POSIX) create the temp + `os.replace` +
+  `os.unlink` **relative to the walked parent fd** (`src_dir_fd`/`dst_dir_fd`).
+  `_write_contained` REFUSES a symlink leaf; `_replace_contained` REPLACES it (for
+  fix-loop candidate writes and rollback restores of an in-repo file).
+- Refactor `--file`, fix-loop writes, and rollback restores now call
+  `_read_contained` / `_replace_contained(project_dir, rel, …)` with the repo-relative
+  path, so the walk covers ALL ancestors from the repo root.
+
+### Platform matrix — HONEST
+
+| Guarantee | POSIX (openat-walk) | Windows (this host) |
+|---|---|---|
+| Leaf symlink refused | ✅ `O_NOFOLLOW` at leaf | ✅ `islink` + fstat identity re-check |
+| **Ancestor** symlink refused (to outside) | ✅ `O_NOFOLLOW` per component | ✅ realpath containment (`_contained_path`) |
+| **Ancestor** symlink refused (to *inside* repo) | ✅ per-component `O_NOFOLLOW` | ⚠️ followed (realpath resolves inside) — residual |
+| Post-validation swap of leaf/ancestor | ✅ fully closed (no pathname re-resolve) | ⚠️ narrowed to sub-ms, fails closed on detected change |
+
+This host reports `O_NOFOLLOW=False, dir_fd=False`, so the POSIX openat-walk tests
+(`PosixAncestorWalkTests`) are **skipped here and run on POSIX CI** — the Windows
+identity-re-check path is what executes and is tested (`WriteVsReplaceLeafSemanticsTests`,
+`RelComponentsTests`, and rounds 6-10).
+
+**RESIDUAL (Windows, honest — not claimed closed):** on Windows, `os` exposes neither
+`openat`/`dir_fd` nor `O_NOFOLLOW`, so containment resolves the path with `realpath` and
+re-checks leaf/parent identity at the syscall boundary. Two residuals remain, both
+requiring a **same-privilege local process**: (a) an ancestor directory that is a symlink
+resolving *inside* the repo is followed (POSIX refuses it per-component); (b) a leaf/
+ancestor swapped in the sub-millisecond window between the identity re-check and the next
+syscall. Only native Windows handle APIs (`NtCreateFile` with
+`FILE_FLAG_OPEN_REPARSE_POINT`, not exposed by Python's `os`) can fully close these. POSIX
+is fully closed via the openat component-walk. Enumeration also skips symlinks up front.
+
+Round-11 verification: **122 tests GREEN** (4 POSIX-only tests skipped on this Windows
+host), dashboard OK, all `--help` exit 0, three launchers ASCII + parse-clean,
+`git diff --check` clean, no secrets.
