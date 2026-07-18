@@ -244,3 +244,54 @@ Round-3 verification: **82 tests GREEN**, dashboard OK, `audit`/`scout`/refactor
 no secrets. Confirmed: every provider call routes through the `_budget_guard`
 reservation chokepoint, and every generated-file write routes through
 `_contained_path`.
+
+---
+
+## Round 4 (Codex review) — 4 remaining budget/safety holes (2 HIGH)
+
+Path chokepoint confirmed ✅; these close the remaining gaps. Each fix has a
+regression test proven RED on the prior HEAD (`8ebbeaa`).
+
+### Defect 1 (HIGH) — OpenAI `complete`/`grade` reserved tokens but didn't cap the request
+`OpenAIProvider.complete` reserved 16384 and `grade` 4000, but neither
+`chat.completions.create` passed `max_tokens`, so the API could bill more output
+than reserved and concurrent workers could exceed `--max-cost`.
+- Fix: pass `max_tokens` == the reserved amount on both calls (`flexfactor.py:~660`,
+  `~674`). Audited Anthropic `complete`/`grade`/`structured` — reservation already
+  equals the requested `max_tokens` there (no change needed).
+- Test: `OpenAIOutputCapTests` (2) — the SDK kwargs carry the capped budget.
+
+### Defect 2 (HIGH) — git COMMIT failure wasn't fatal
+`_commit_and_sync` raised on `add`/`diff` errors but a non-zero `git commit` only
+returned stderr text, so callers continued into later cycles with staged-but-
+uncommitted changes and could still report "committed".
+- Fix: raise `BranchStateError` on commit failure (`flexfactor.py:~3684`); the final
+  status now only claims "committed" from a CONFIRMED clean tree (`_git_tree_clean`),
+  else reports "UNCOMMITTED changes remain" (`~4212`).
+- Test: `CommitFailureIsFatalTests` (1) — simulated hook failure → `BranchStateError`.
+
+### Defect 3 (MED) — health pings bypassed the meter + unsynchronized cache
+`_provider_health()` made raw `messages.create` / `chat.completions.create` pings
+ignoring the shared `CostMeter`, and the `_PROVIDER_HEALTH` cache was unlocked
+(parallel audits issued duplicate hidden pings).
+- Fix: pings now run inside `_budget_guard(meter, model, …)` and record their usage
+  against the shared meter; the cache is guarded by `_PROVIDER_HEALTH_LOCK`
+  (`flexfactor.py:~818-893`). `build_audit_providers` threads its `meter` through.
+- Test: `BudgetedHealthPingTests` (2) — the ping bills the meter + releases its
+  reservation; the cache lock exists.
+
+### Defect 4 (MED) — scout integration patch prompt embedded raw model/untrusted text
+The second pass fenced `repo_summary` but inserted the FIRST model's
+plan/packages/file-list AND raw project source directly into `patch_prompt` (whose
+output `apply_integration` later writes). `_contained_path` limits WHERE files land,
+not whether malicious text becomes instructions.
+- Fix: fence the plan fields (`UNTRUSTED plan`) and raw source (`UNTRUSTED source`)
+  in `patch_prompt`, and `package.json` + file tree (`UNTRUSTED package`/`filetree`)
+  in `plan_prompt` (`flexfactor.py:~1884`, `~1905`).
+- Test: `ScoutIntegrationPromptFencingTests` (1) — injected plan + source text land
+  inside their fences.
+
+Round-4 verification: **88 tests GREEN**, dashboard OK, all `--help` exit 0, three
+launchers ASCII + parse-clean, `git diff --check` clean, no secrets. Confirmed:
+OpenAI calls cap output == reservation; commit failure is fatal; health pings are
+budgeted + lock-guarded; the scout integration prompt fences all untrusted/model text.

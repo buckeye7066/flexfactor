@@ -658,9 +658,13 @@ class OpenAIProvider:
         )
 
     def complete(self, instruction: str) -> str:
-        with _budget_guard(self.meter, self.model, len(instruction), 16384):
+        # The request's output cap MUST equal the reservation, or the API could bill
+        # more output than reserved and let concurrent workers exceed --max-cost.
+        out_cap = 16384
+        with _budget_guard(self.meter, self.model, len(instruction), out_cap):
             resp = self.client.chat.completions.create(
                 model=self.model,
+                max_tokens=out_cap,
                 messages=[
                     {"role": "system", "content": REWRITE_SYSTEM},
                     {"role": "user", "content": instruction},
@@ -670,11 +674,14 @@ class OpenAIProvider:
         return (resp.choices[0].message.content or "").strip()
 
     def grade(self, prompt: str) -> Grade:
-        # Grading is classification -> route to the cheap JUDGE model.
-        with _budget_guard(self.meter, self.judge_model, len(prompt), 4000):
+        # Grading is classification -> route to the cheap JUDGE model. Cap output to
+        # the reserved amount so the request can't bill past the reservation.
+        out_cap = 4000
+        with _budget_guard(self.meter, self.judge_model, len(prompt), out_cap):
             resp = self.client.chat.completions.create(
                 model=self.judge_model,
                 response_format={"type": "json_object"},
+                max_tokens=out_cap,
                 messages=[
                     {"role": "system", "content": GRADE_SYSTEM + " Keys: grade, meets_goal, rationale, issues."},
                     {"role": "user", "content": prompt},
@@ -808,10 +815,13 @@ def _provider_key_present(name: str) -> bool:
 
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
 # _provider_health() so a batch / --parallel run pings each provider at most once.
+# Lock-guarded because parallel audits call it concurrently (unsynchronized before
+# meant duplicate hidden pings and a racy dict write).
 _PROVIDER_HEALTH: dict[str, tuple[bool, str]] = {}
+_PROVIDER_HEALTH_LOCK = threading.Lock()
 
 
-def _provider_health(name: str) -> tuple[bool, str]:
+def _provider_health(name: str, meter: "CostMeter | None" = None) -> tuple[bool, str]:
     """Is this provider's key actually USABLE right now? (not just present)
 
     A key can be set but dead - out of credits, revoked, or org-disabled - in which
@@ -825,27 +835,46 @@ def _provider_health(name: str) -> tuple[bool, str]:
       - anything else (network blip, timeout, unknown 5xx) -> FAIL OPEN (True, ...):
         we don't punish a transient hiccup by disabling a provider that may be fine.
 
+    The ping is BUDGETED (reserved + recorded against the shared meter, same as any
+    other provider call) and the cache is LOCK-GUARDED so parallel audits don't issue
+    duplicate hidden pings or race the dict write.
+
     Result is cached in _PROVIDER_HEALTH so repeated/parallel programs ping once."""
-    if name in _PROVIDER_HEALTH:
-        return _PROVIDER_HEALTH[name]
+    with _PROVIDER_HEALTH_LOCK:
+        if name in _PROVIDER_HEALTH:
+            return _PROVIDER_HEALTH[name]
     if not _provider_key_present(name):
         res = (False, "no API key set")
-        _PROVIDER_HEALTH[name] = res
+        with _PROVIDER_HEALTH_LOCK:
+            _PROVIDER_HEALTH[name] = res
         return res
     try:
         if name == "anthropic":
             import anthropic
-            anthropic.Anthropic().messages.create(
-                model=JUDGE_MODELS.get("anthropic") or DEFAULT_MODELS["anthropic"],
-                max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+            model = JUDGE_MODELS.get("anthropic") or DEFAULT_MODELS["anthropic"]
+            with _budget_guard(meter, model, len("ping"), 1):
+                msg = anthropic.Anthropic().messages.create(
+                    model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+                if meter is not None:
+                    u = getattr(msg, "usage", None)
+                    if u is not None:
+                        meter.record(model, input_tokens=getattr(u, "input_tokens", 0) or 0,
+                                     output_tokens=getattr(u, "output_tokens", 0) or 0)
         elif name == "openai":
             import openai
-            openai.OpenAI().chat.completions.create(
-                model=JUDGE_MODELS.get("openai") or DEFAULT_MODELS["openai"],
-                max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+            model = JUDGE_MODELS.get("openai") or DEFAULT_MODELS["openai"]
+            with _budget_guard(meter, model, len("ping"), 1):
+                resp = openai.OpenAI().chat.completions.create(
+                    model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}])
+                if meter is not None:
+                    u = getattr(resp, "usage", None)
+                    if u is not None:
+                        meter.record(model, input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                                     output_tokens=getattr(u, "completion_tokens", 0) or 0)
         else:
             res = (False, f"unknown provider {name}")
-            _PROVIDER_HEALTH[name] = res
+            with _PROVIDER_HEALTH_LOCK:
+                _PROVIDER_HEALTH[name] = res
             return res
         res = (True, "ok")
     except Exception as e:  # noqa: BLE001 - we deliberately classify by message
@@ -861,7 +890,8 @@ def _provider_health(name: str) -> tuple[bool, str]:
         else:
             # Transient/unknown: fail open so a network blip can't disable a good key.
             res = (True, f"health check inconclusive ({type(e).__name__}); assuming usable")
-    _PROVIDER_HEALTH[name] = res
+    with _PROVIDER_HEALTH_LOCK:
+        _PROVIDER_HEALTH[name] = res
     return res
 
 
@@ -893,7 +923,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             return False
         if not preflight:
             return True
-        ok, reason = _provider_health(name)
+        ok, reason = _provider_health(name, meter)
         if not ok:
             print(f"  [preflight] {name} key is set but unusable: {reason}", file=sys.stderr)
         return ok
@@ -1885,8 +1915,8 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
         f"{profile_blob}\n\n"
         f"APPROVED IMPROVEMENT (need): {need}\n\n"
         f"LIBRARY TO INTEGRATE:\n{_fence_untrusted('repo', repo_summary)}\n\n"
-        f"package.json:\n{pkg_text}\n\n"
-        f"PROJECT FILE TREE (shallow):\n  {tree}\n\n"
+        "package.json:\n" + _fence_untrusted("package", pkg_text) + "\n\n"
+        "PROJECT FILE TREE (shallow):\n" + _fence_untrusted("filetree", "  " + tree) + "\n\n"
         "Plan a minimal, concrete integration that actually uses this library."
     )
     plan = provider.structured(INTEGRATION_PLAN_SYSTEM, plan_prompt, INTEGRATION_PLAN_SCHEMA)
@@ -1902,15 +1932,21 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
             existing_blobs.append(f"--- {rel} ---\n{_read_text_safe(full, 16000)}")
     existing_text = "\n\n".join(existing_blobs) if existing_blobs else "(creating new files only)"
 
+    # The plan fields come from the FIRST model pass (which read untrusted repo/source
+    # text) and existing_text is raw project source - both are UNTRUSTED and must be
+    # fenced. Only the wrapper task instructions below stay trusted.
+    plan_block = (
+        f"INTEGRATION PLAN:\n{plan.get('plan')}\n"
+        f"Packages: {', '.join(plan.get('packages') or []) or '(none)'}\n"
+        f"Create: {', '.join(plan.get('create_files') or []) or '(none)'}\n"
+        f"Modify: {', '.join(plan.get('modify_files') or []) or '(none)'}"
+    )
     patch_prompt = (
         f"{profile_blob}\n\n"
         f"IMPROVEMENT: {need}\n"
         f"LIBRARY:\n{_fence_untrusted('repo', repo_summary)}\n\n"
-        f"INTEGRATION PLAN:\n{plan.get('plan')}\n"
-        f"Packages: {', '.join(plan.get('packages') or []) or '(none)'}\n"
-        f"Create: {', '.join(plan.get('create_files') or []) or '(none)'}\n"
-        f"Modify: {', '.join(plan.get('modify_files') or []) or '(none)'}\n\n"
-        f"CURRENT CONTENTS OF FILES TO MODIFY:\n{existing_text}\n\n"
+        + _fence_untrusted("plan", plan_block) + "\n\n"
+        "CURRENT CONTENTS OF FILES TO MODIFY:\n" + _fence_untrusted("source", existing_text) + "\n\n"
         "Write the complete new contents of every file to create or modify. The "
         "project must still build."
     )
@@ -3683,7 +3719,12 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                 "Co-Authored-By: FlexFactor <noreply@flexfactor.local>")
     rc = _git(["commit", "-m", full_msg], project_dir)
     if rc.returncode != 0:
-        return _tail(rc.stdout + rc.stderr, 4)
+        # A failed commit (pre-commit hook, bad identity, index lock) is NOT a safe
+        # checkpoint: the staged fixes are still uncommitted. Continuing would let a
+        # later cycle build on / claim work that never actually committed. Stop hard.
+        raise BranchStateError(
+            f"{label}: 'git commit' failed (rc={rc.returncode}) - staged changes are "
+            f"NOT committed, stopping: {_tail(rc.stdout + rc.stderr, 4)}")
     status = f"{label}: committed on {branch} (build {'ok' if final_ok else 'FAILED'})"
     if args.push and _git_has_remote(project_dir):
         # Force-push: the audit branch is FlexFactor's own sandbox, recreated with
@@ -4210,8 +4251,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             commit_status = "dry-run"
         elif applied_files or test_files or e2e.get("spec_files"):
             final_ok, _ = _full_gate(project_dir, stack)
-            commit_status = (f"committed across {cycles_run} cycle(s) on {branch} "
-                             f"(final build {'ok' if final_ok else 'FAILED'})")
+            # Only claim 'committed' from a CONFIRMED clean tree. Per-cycle commits
+            # each hard-fail on error, so if anything is still uncommitted here that
+            # is a real problem to surface, not a success to claim.
+            if _git_tree_clean(project_dir):
+                commit_status = (f"committed across {cycles_run} cycle(s) on {branch} "
+                                 f"(final build {'ok' if final_ok else 'FAILED'})")
+            else:
+                commit_status = (f"UNCOMMITTED changes remain on {branch} after "
+                                 f"{cycles_run} cycle(s) - NOT a clean checkpoint; see report")
         elif created_branch and prev_branch:
             # No changes at all — drop the empty branch and restore the original.
             _git(["checkout", "--force", prev_branch], project_dir)

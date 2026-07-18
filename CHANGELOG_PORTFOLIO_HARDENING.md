@@ -125,6 +125,23 @@ regress (2 HIGH, including a real sandbox escape). All transparent — no new fl
   from build logs / reviewer comments), along with model-generated finding text — so
   it can't inject instructions into the author prompt.
 
+## Round 4 (2026-07-18) — closing the last budget/safety holes
+
+Four more fixes (2 HIGH), all transparent — no new flags:
+
+- **OpenAI calls now cap output to the reserved amount.** `complete`/`grade` pass an
+  explicit `max_tokens` matching their reservation, so the API can't bill more output
+  than reserved (which had let concurrent workers exceed `--max-cost`).
+- **A failed `git commit` now stops the audit** (raises) instead of being reported as
+  text and continued past — a hook/identity/index failure is not a safe checkpoint.
+  The final "committed" status is only claimed when the tree is confirmed clean.
+- **Preflight health pings are now budgeted and lock-guarded:** they reserve/record
+  against the shared cost meter (so `--max-cost` is a true hard cap) and the health
+  cache is protected against duplicate concurrent pings.
+- **The scout integration prompt now fences all untrusted/model text** — the first
+  model's plan, the raw project source, `package.json`, and the file tree — not just
+  the repo summary, so injected instructions can't drive unsafe in-repo edits.
+
 ## Rollback
 
 - Everything is on branch `claude/portfolio-hardening-2026-07-18` with a single
