@@ -3388,6 +3388,121 @@ class AdversarialFixLoopTests(unittest.TestCase):
             self._restore(real)
         self.assertEqual(self._read(tmp), "fixed\n")  # candidate left (rollback refused)
 
+    # ---- Materiality gate: only MATERIAL residuals cost another round -------------
+    @staticmethod
+    def _material(title="core bug", problem="realistic input breaks it"):
+        return {"severity": "high", "line": 1, "title": title, "problem": problem,
+                "realistic_input": True, "affects_core": True}
+
+    @staticmethod
+    def _minor(title="exotic edge", problem="only a crafted payload hits it"):
+        return {"severity": "low", "line": 1, "title": title, "problem": problem,
+                "realistic_input": False, "affects_core": False}
+
+    def _needs_work(self, residuals):
+        return {"verdict": "needs_work", "residual": list(residuals), "regressions": []}
+
+    def _clean(self):
+        return {"verdict": "clean", "residual": [], "regressions": []}
+
+    def test_material_residual_still_iterates(self):
+        # (a) A MATERIAL residual once, then clean -> rolls back + re-fixes (unchanged).
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        seq = iter([self._needs_work([self._material(problem="MATERIAL_MARKER")]), self._clean()])
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: next(seq)
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=3, materiality="material")
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)
+        self.assertEqual(len(fb), 2, "a material residual must drive a re-fix round")
+        self.assertTrue(any("MATERIAL_MARKER" in f for f in fb))  # fed back to the author
+        self.assertEqual(self._read(tmp), "fixed\n")
+
+    def test_minor_only_residual_accepted_and_documented(self):
+        # (b) Only MINOR residuals -> ACCEPT with them documented; no extra round, no rollback.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        judge_calls = {"n": 0}
+
+        def judge(*a, **k):
+            judge_calls["n"] += 1
+            return self._needs_work([self._minor(problem="EXOTIC_ONLY")])
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = judge
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2, materiality="material")
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)          # accepted
+        self.assertNotIn("a.py", unver)         # accepted as material-clean, not unverified
+        self.assertEqual(len(fb), 1, "minor-only residuals must NOT trigger a re-fix")
+        self.assertEqual(judge_calls["n"], 1)   # verified once, no extra round
+        self.assertEqual(self._read(tmp), "fixed\n")  # fix kept (not rolled back)
+        self.assertTrue(any("ACCEPTED with" in n and "documented low-impact" in n for n in notes),
+                        f"documented residual note missing: {notes}")
+
+    def test_cap_hit_with_material_rejects_and_rolls_back(self):
+        # (c) Always a MATERIAL residual -> after adversarial_rounds, reject + rollback.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: self._needs_work([self._material()])
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2, materiality="material")
+        finally:
+            self._restore(real)
+        self.assertNotIn("a.py", applied)
+        self.assertEqual(self._read(tmp), "orig\n")   # rolled back
+        self.assertTrue(any("rejected by cross-model review" in n and "material residual" in n
+                            for n in notes), f"expected material-reject note: {notes}")
+
+    def test_cap_reached_with_only_minor_accepts_documented(self):
+        # (d) Material for round 1, then ONLY minor at the last round -> accept+document
+        # (NOT reject). Demonstrates the cap never rejects when nothing material is open.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        seq = iter([self._needs_work([self._material()]),         # round 1: material -> refix
+                    self._needs_work([self._minor()])])           # round 2: minor only -> accept
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: next(seq)
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2, materiality="material")
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)               # accepted, not rejected
+        self.assertEqual(self._read(tmp), "fixed\n")  # kept
+        self.assertEqual(len(fb), 2)                 # one re-fix (for the material round)
+        self.assertTrue(any("ACCEPTED with" in n for n in notes))
+
+    def test_materiality_all_iterates_on_minor(self):
+        # (e) --adversarial-materiality all -> minor residuals iterate like anything
+        # else; always-minor -> cap hit -> reject + rollback (legacy behavior).
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: self._needs_work([self._minor()])
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2, materiality="all")
+        finally:
+            self._restore(real)
+        self.assertNotIn("a.py", applied)             # iterated then rejected
+        self.assertEqual(self._read(tmp), "orig\n")   # rolled back
+        self.assertEqual(len(fb), 2)                  # both rounds spent on minor residuals
+        self.assertTrue(any("rejected by cross-model review" in n for n in notes))
+
 
 class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
     """Sol HIGH r3: when _fix_files raises DirtyTreeError (a refused rollback left an
