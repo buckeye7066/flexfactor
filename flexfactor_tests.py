@@ -3399,11 +3399,24 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
 
     def _drive(self, fix_files_impl):
         """Run audit_one_program with the heavy surface stubbed. `fix_files_impl` is
-        the stand-in for _fix_files. Returns (commit_calls, result)."""
+        the stand-in for _fix_files. Returns (commit_calls, git_calls, result).
+        The _commit_and_sync stub reports a REAL commit for checkpoint labels and
+        'nothing to commit' otherwise, mirroring how committed_any is tracked."""
         import tempfile
         import types
         tmp = tempfile.mkdtemp()
         commit_calls = []
+        git_calls = []
+
+        def commit_sync(*a, **k):
+            label = a[4] if len(a) > 4 else "?"
+            commit_calls.append(label)
+            return (f"{label}: committed on br" if "checkpoint" in label
+                    else f"{label}: nothing to commit")
+
+        def git(*a, **k):
+            git_calls.append(list(a[0]) if a else [])
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         class _P:  # stub provider
             model = "m"
@@ -3447,13 +3460,12 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
             "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
             "_git_tree_clean": lambda pd: True,
             "_git_current_branch": lambda pd: "main",
-            "_git": lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+            "_git": git,
             "_enumerate_source_files": lambda *a, **k: ["a.py"],
             "_review_all": review_all,
             "_full_gate": lambda pd, st: (True, ""),
             "_fix_files": fix_files_impl,
-            "_commit_and_sync": lambda *a, **k: (commit_calls.append(a[4] if len(a) > 4 else "?"),
-                                                 "committed")[1],
+            "_commit_and_sync": commit_sync,
             "_brain_record_run": lambda *a, **k: None,
             "_build_clean_map": lambda *a, **k: {},
             "_write_audit_report": lambda *a, **k: os.path.join(tmp, "report.md"),
@@ -3469,12 +3481,16 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         finally:
             for name, o in orig.items():
                 setattr(ff, name, o)
-        return commit_calls, result
+        return commit_calls, git_calls, result
+
+    @staticmethod
+    def _branch_deletes(git_calls):
+        return [c for c in git_calls if c[:2] == ["branch", "-D"]]
 
     def test_dirty_abort_skips_commit(self):
         def raising_fix_files(*a, **k):
             raise ff.DirtyTreeError(["a.py"])
-        commit_calls, result = self._drive(raising_fix_files)
+        commit_calls, git_calls, result = self._drive(raising_fix_files)
         self.assertEqual(commit_calls, [], "must NOT commit a dirty tree from a refused rollback")
         self.assertIsNone(result.get("error"))  # handled cleanly, not a crash
         self.assertIn("aborted", (result.get("stop_reason") or ""))
@@ -3482,8 +3498,38 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
     def test_normal_return_still_commits(self):
         def ok_fix_files(*a, **k):
             return (["a.py"], [], [])
-        commit_calls, result = self._drive(ok_fix_files)
+        commit_calls, git_calls, result = self._drive(ok_fix_files)
         self.assertTrue(commit_calls, "a normal (non-dirty) fix pass must still commit")
+
+    def test_dirty_abort_after_checkpoint_preserves_branch(self):
+        # Sol MEDIUM r4: a checkpoint commit lands, THEN _fix_files raises
+        # DirtyTreeError. The audit branch holds a verified commit and must NOT be
+        # deleted, nor the run reported as "no changes".
+        def checkpoint_then_raise(*a, **k):
+            cb = k.get("commit_cb")
+            if cb:
+                cb()  # mid-cycle checkpoint commit lands on the branch
+            raise ff.DirtyTreeError(["a.py"])
+        commit_calls, git_calls, result = self._drive(checkpoint_then_raise)
+        # exactly the ONE checkpoint commit; no further commit after the dirty abort
+        self.assertEqual(len(commit_calls), 1, f"expected only the checkpoint commit; got {commit_calls}")
+        # the branch (with the checkpoint commit) must survive
+        self.assertEqual(self._branch_deletes(git_calls), [],
+                         "audit branch holding a checkpoint commit must NOT be deleted")
+        status = result.get("commit_status") or ""
+        self.assertNotIn("no changes", status)   # never misreported as empty
+        self.assertIn("DIRTY-ABORT", status)
+        self.assertIn("PRESERVED", status)
+
+    def test_empty_run_still_cleans_up_branch(self):
+        # A genuinely empty run (nothing applied, no checkpoint) still drops its
+        # empty branch - the committed_any guard doesn't block legitimate cleanup.
+        def empty_fix_files(*a, **k):
+            return ([], [], [])
+        commit_calls, git_calls, result = self._drive(empty_fix_files)
+        self.assertTrue(self._branch_deletes(git_calls),
+                        "a truly-empty run should clean up its empty branch")
+        self.assertIn("no changes", (result.get("commit_status") or ""))
 
 
 if __name__ == "__main__":

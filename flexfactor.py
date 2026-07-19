@@ -5060,6 +5060,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         errors_total = 0
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
+        committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
 
         for cycle in range(1, cycle_cap + 1):
@@ -5145,9 +5146,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             def _checkpoint(_c=cycle):
                 # Commit+push+merge progress mid-cycle so an interruption (e.g.
                 # credits running out) can't lose this cycle's accumulated fixes.
+                nonlocal committed_any
                 if git and not args.dry_run:
                     s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                          f"cycle {_c} checkpoint", stack)
+                    if "committed" in s:  # a real commit landed on the branch
+                        committed_any = True
                     print(f"{pfx}git (checkpoint): {s}")
 
             try:
@@ -5190,6 +5194,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if git:
                 status = _commit_and_sync(project_dir, branch, prev_branch, args,
                                           f"cycle {cycle}", stack)
+                if "committed" in status:  # a real commit landed on the branch
+                    committed_any = True
                 print(f"{pfx}git: {status}")
 
             if meter.over_limit():
@@ -5328,6 +5334,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             commit_status = "no-git"
         elif args.dry_run:
             commit_status = "dry-run"
+        elif dirty_abort:
+            # A refused rollback aborted the run mid-cycle. The audit branch may hold
+            # VERIFIED checkpoint (or prior-cycle) commits, so it must NEVER be treated
+            # as an empty branch and deleted (that would drop the only local ref to
+            # those commits). Preserve it and report the abort explicitly.
+            held = (" (holds verified commit(s) from earlier cycles/checkpoints)"
+                    if committed_any else "")
+            commit_status = (f"DIRTY-ABORT on {branch}: refused rollback left an unverified "
+                             f"candidate; branch PRESERVED{held} - inspect + clean up manually")
         elif applied_files or test_files or e2e.get("spec_files"):
             final_ok, _ = _full_gate(project_dir, stack)
             # Only claim 'committed' from a CONFIRMED clean tree. Per-cycle commits
@@ -5339,8 +5354,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             else:
                 commit_status = (f"UNCOMMITTED changes remain on {branch} after "
                                  f"{cycles_run} cycle(s) - NOT a clean checkpoint; see report")
-        elif created_branch and prev_branch:
-            # No changes at all — drop the empty branch and restore the original.
+        elif created_branch and prev_branch and not committed_any:
+            # No changes at all AND no commit ever landed - drop the empty branch and
+            # restore the original. The `not committed_any` guard ensures a branch that
+            # DID gain commits is never deleted here even if applied_files is empty.
             _git(["checkout", "--force", prev_branch], project_dir)
             _git(["branch", "-D", branch], project_dir)
             commit_status = "no changes (audit found nothing to fix)"
