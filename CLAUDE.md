@@ -17,7 +17,9 @@ Key flags: `--economy` (cheap author tier), `--whole-file-fixes` (legacy, edit
 blocks are default), `--repo-rewards-url` (scout backend), `--max-cost` (USD
 budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3),
 `--adversarial`/`--no-adversarial` (adversarial fable<->sol fix-verify loop, default
-ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2).
+ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2),
+`--adversarial-materiality {material,all}` (default material: don't burn rounds on
+exotic goal-irrelevant residuals; accept+document them instead).
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
@@ -43,6 +45,13 @@ ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2).
   catches it, git-restores the file, and ABORTS the cycle WITHOUT committing (so an
   un-rolled-back unverified candidate is never staged-and-committed).
   Flags: `--adversarial`/`--no-adversarial` (default ON), `--adversarial-rounds N`.
+  MATERIALITY GATE: the verifier classifies each residual (`realistic_input`,
+  `affects_core`); the loop re-iterates only if >=1 residual is MATERIAL (either true).
+  If the sole remaining residuals are sub-threshold (exotic AND goal-irrelevant) the fix
+  is ACCEPTED + the residuals DOCUMENTED in the report (no wasted round/credits); cap-hit
+  rejects only with a material residual still open. `--adversarial-materiality all`
+  restores iterate-on-everything (default `material`). `_residual_is_material()` fail-safe:
+  missing keys => material (never silently drop). All fail-closed invariants unchanged.
   `MAX_REVIEW_BYTES` raised 300k->400k so flexfactor.py (now ~310k) stays reviewable.
 - `_fix_files` pipelines generation: `--fix-prefetch N` (default 3, 0=serial)
   first-attempt generations run in background threads while the current file is
