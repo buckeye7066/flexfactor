@@ -3052,5 +3052,215 @@ class FileTreeReparsePruneTests(unittest.TestCase):
             self.assertIn("realsub/ok.py", tree)
 
 
+class AdversarialVerifyUnitTests(unittest.TestCase):
+    """`_adversarial_verify_fix` maps verdicts to (clean, residual, reason) and FAILS
+    CLOSED (not clean, but empty residual) when the verifier transport dies."""
+
+    ORIG = "def f():\n    return 1\n"
+    FIXED = "def f():\n    return 2\n"
+    TARGETS = [{"severity": "high", "line": 2, "title": "wrong return",
+                "problem": "returns 1 not 2"}]
+
+    def _run(self, judge_impl, retries=1):
+        real = ff._judge
+        ff._judge = judge_impl
+        try:
+            return ff._adversarial_verify_fix(object(), "f.py", self.ORIG, self.FIXED,
+                                              self.TARGETS, retries=retries)
+        finally:
+            ff._judge = real
+
+    def test_clean_verdict(self):
+        clean, residual, reason = self._run(
+            lambda *a, **k: {"verdict": "clean", "residual": [], "regressions": []})
+        self.assertTrue(clean)
+        self.assertEqual(residual, [])
+
+    def test_needs_work_returns_residual(self):
+        clean, residual, reason = self._run(
+            lambda *a, **k: {"verdict": "needs_work",
+                             "residual": [{"severity": "high", "line": 2,
+                                           "title": "still wrong", "problem": "off by one remains"}],
+                             "regressions": ["broke g()"]})
+        self.assertFalse(clean)
+        self.assertTrue(residual)
+        # regression folded in as a residual finding so the caller sees it too
+        self.assertTrue(any("off by one" in f.get("problem", "") for f in residual))
+        self.assertTrue(any("broke g()" in f.get("problem", "") for f in residual))
+
+    def test_transport_failure_fails_closed(self):
+        calls = {"n": 0}
+
+        def boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("network down")
+        clean, residual, reason = self._run(boom, retries=1)
+        self.assertFalse(clean)           # NOT clean
+        self.assertEqual(residual, [])    # but no residual -> transport-fail signal
+        self.assertIn("unavailable", reason)
+        self.assertEqual(calls["n"], 2)   # 1 initial + 1 retry
+
+    def test_budget_error_propagates(self):
+        def over(*a, **k):
+            raise ff.BudgetExceededError("cap")
+        with self.assertRaises(ff.BudgetExceededError):
+            self._run(over)
+
+    def test_empty_diff_is_clean(self):
+        clean, residual, reason = ff._adversarial_verify_fix(
+            object(), "f.py", self.ORIG, self.ORIG, self.TARGETS)
+        self.assertTrue(clean)
+        self.assertIn("no textual diff", reason)
+
+
+class AdversarialFixLoopTests(unittest.TestCase):
+    """End-to-end drive of `_fix_files` adversarial loop with a controlled reviewer
+    (patched `_judge`) and a deterministic author (patched `generate_file_fix_edits`)."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def _harness(self):
+        import tempfile
+        import types
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("orig\n")
+        author_feedback = []  # every feedback string handed to the author
+
+        def fake_author(author, rel, original, targets, feedback=""):
+            author_feedback.append(feedback)
+            return {"changed": True, "edits": [{"search": "orig", "replace": "fixed"}],
+                    "fixed_titles": ["t"], "notes": ""}
+
+        args = types.SimpleNamespace(fix_severity="high", whole_file_fixes=False,
+                                     fix_prefetch=0)
+        findings = {"a.py": [{"severity": "high", "line": 1, "title": "t",
+                              "problem": "p", "fix": "f", "category": "bug"}]}
+        return tmp, author_feedback, fake_author, args, findings
+
+    def _patch(self):
+        real = {"gen": ff.generate_file_fix_edits, "gate": ff._gate_file, "judge": ff._judge}
+        ff._gate_file = lambda *a, **k: (True, "")
+        return real
+
+    def _restore(self, real):
+        ff.generate_file_fix_edits = real["gen"]
+        ff._gate_file = real["gate"]
+        ff._judge = real["judge"]
+
+    def _read(self, tmp):
+        with open(os.path.join(tmp, "a.py"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_a_clean_first_pass_accepts_no_extra_rounds(self):
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        judge_calls = {"n": 0}
+
+        def judge(*a, **k):
+            judge_calls["n"] += 1
+            return {"verdict": "clean", "residual": [], "regressions": []}
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = judge
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2)
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)
+        self.assertNotIn("a.py", unver)   # cleanly verified
+        self.assertEqual(judge_calls["n"], 1)
+        self.assertEqual(len(fb), 1)       # author called exactly once
+        self.assertEqual(self._read(tmp), "fixed\n")
+
+    def test_b_needs_work_then_clean_feeds_residual_back(self):
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        seq = iter([
+            {"verdict": "needs_work",
+             "residual": [{"severity": "high", "line": 1, "title": "leftover",
+                           "problem": "UNIQUE_RESIDUAL_MARKER still present"}],
+             "regressions": []},
+            {"verdict": "clean", "residual": [], "regressions": []},
+        ])
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: next(seq)
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=3)
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)
+        self.assertNotIn("a.py", unver)
+        # The residual text reached the author as feedback on the re-fix.
+        self.assertTrue(any("UNIQUE_RESIDUAL_MARKER" in f for f in fb),
+                        f"residual not fed back; feedback seen: {fb}")
+        self.assertEqual(self._read(tmp), "fixed\n")
+
+    def test_c_transport_failure_accepts_but_marks_unverified(self):
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        calls = {"n": 0}
+
+        def boom(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("verifier offline")
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = boom
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2)
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)          # not punished
+        self.assertIn("a.py", unver)            # but flagged UNVERIFIED, not clean
+        self.assertTrue(any("UNVERIFIED" in n for n in notes))
+        self.assertEqual(calls["n"], 2)         # 1 initial + 1 retry, then give up
+        self.assertEqual(self._read(tmp), "fixed\n")  # fix kept on disk
+
+    def test_d_always_needs_work_rejects_and_rolls_back(self):
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = lambda *a, **k: {
+            "verdict": "needs_work",
+            "residual": [{"severity": "high", "line": 1, "title": "never fixed",
+                          "problem": "still broken"}],
+            "regressions": []}
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2)
+        finally:
+            self._restore(real)
+        self.assertNotIn("a.py", applied)                 # never kept
+        self.assertEqual(self._read(tmp), "orig\n")        # rolled back to original
+        self.assertTrue(any("rejected by cross-model review" in n for n in notes))
+
+    def test_e_no_adversarial_uses_legacy_single_veto(self):
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        judge_calls = {"n": 0}
+
+        def legacy_judge(*a, **k):
+            judge_calls["n"] += 1
+            # FIX_VERIFY_SCHEMA shape (keep verdict, no regressions) -> fix accepted.
+            return {"resolves": True, "regressions": False, "issues": [], "verdict": "keep"}
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = legacy_judge
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=False, adversarial_rounds=2)
+        finally:
+            self._restore(real)
+        self.assertIn("a.py", applied)
+        self.assertEqual(judge_calls["n"], 1)
+        self.assertEqual(self._read(tmp), "fixed\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

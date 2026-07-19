@@ -15,7 +15,9 @@ python flexfactor_dashboard.py --selftest
 ```
 Key flags: `--economy` (cheap author tier), `--whole-file-fixes` (legacy, edit
 blocks are default), `--repo-rewards-url` (scout backend), `--max-cost` (USD
-budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3).
+budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3),
+`--adversarial`/`--no-adversarial` (adversarial fable<->sol fix-verify loop, default
+ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2).
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
@@ -29,6 +31,15 @@ budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →
   `_review_all` (parallel, judge tier, 35% budget frac) → `_fix_files` →
   `_commit_and_sync`; sandbox branch `flexfactor/audit-<slug>`
+- Adversarial fix-verify (fable<->sol): with a 2nd provider present, `_fix_files`
+  runs `_adversarial_verify_fix` (`ADVERSARIAL_VERIFY_SYSTEM`/`_SCHEMA`) instead of
+  the legacy single-shot `_cross_verify_fix`. The reviewer ASSUMES the fix is wrong,
+  hunts residual/new/uncovered defects, and each `needs_work` verdict feeds the
+  residual list back so the author re-fixes; loops until a genuinely CLEAN verdict
+  or `--adversarial-rounds` (default 2) is hit (then reject+rollback). Fail-CLOSED:
+  a downed verifier accepts the fix but marks it `[unverified]` (never a clean pass).
+  Flags: `--adversarial`/`--no-adversarial` (default ON), `--adversarial-rounds N`.
+  `MAX_REVIEW_BYTES` raised 300k->400k so flexfactor.py (now ~310k) stays reviewable.
 - `_fix_files` pipelines generation: `--fix-prefetch N` (default 3, 0=serial)
   first-attempt generations run in background threads while the current file is
   applied/gated/verified; retries + all tree writes/commits stay serial. Scout
