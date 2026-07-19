@@ -3261,6 +3261,81 @@ class AdversarialFixLoopTests(unittest.TestCase):
         self.assertEqual(judge_calls["n"], 1)
         self.assertEqual(self._read(tmp), "fixed\n")
 
+    def test_f_budget_at_verify_rolls_back_candidate(self):
+        # Sol HIGH: a BudgetExceededError raised DURING adversarial verify (after the
+        # candidate is written to disk) must ROLL THE CANDIDATE BACK, not leave an
+        # unverified fix on disk for the caller to commit.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+
+        def over(*a, **k):
+            raise ff.BudgetExceededError("cap")
+        ff.generate_file_fix_edits = fake_author
+        ff._judge = over  # verify reserves budget -> refuses AFTER the write
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=2)
+        finally:
+            self._restore(real)
+        self.assertNotIn("a.py", applied)              # NOT recorded as fixed
+        self.assertNotIn("a.py", unver)                # not recorded at all
+        self.assertEqual(self._read(tmp), "orig\n")    # candidate rolled back off disk
+
+    def test_g_build_failures_bounded_independently_of_adv_rounds(self):
+        # Sol MEDIUM: build-breaking attempts are bounded by MAX_FIX_TRIES and
+        # adversarial rounds by adversarial_rounds INDEPENDENTLY. A run of build
+        # failures must neither starve nor be starved by the adversarial rounds.
+        # Scenario: 2 build failures, then clean builds that the adversary keeps
+        # rejecting; with adversarial_rounds=3 the author must still get all 3
+        # adversarial rounds (a shared counter would have stopped after 3 passes
+        # total, granting only 1 adversarial round).
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        gate = {"n": 0}
+
+        def flaky_gate(*a, **k):
+            gate["n"] += 1
+            return (False, "boom") if gate["n"] <= 2 else (True, "")
+        ff.generate_file_fix_edits = fake_author
+        ff._gate_file = flaky_gate
+        ff._judge = lambda *a, **k: {
+            "verdict": "needs_work",
+            "residual": [{"severity": "high", "line": 1, "title": "still",
+                          "problem": "unresolved"}],
+            "regressions": []}
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=3)
+        finally:
+            self._restore(real)
+        # 2 build-fail passes + 3 adversarial rounds = 5 author generations total.
+        self.assertEqual(len(fb), 5, f"expected 2 build + 3 adv passes; got {len(fb)}")
+        self.assertNotIn("a.py", applied)              # never kept
+        self.assertEqual(self._read(tmp), "orig\n")    # rolled back to original
+        self.assertTrue(any("rejected by cross-model review" in n for n in notes))
+
+    def test_g2_build_failures_bounded_by_max_fix_tries(self):
+        # The converse bound: with a high --adversarial-rounds, pure build failures
+        # still stop at MAX_FIX_TRIES (they don't borrow the adversarial budget).
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        ff.generate_file_fix_edits = fake_author
+        ff._gate_file = lambda *a, **k: (False, "boom")   # build always breaks
+        ff._judge = lambda *a, **k: {"verdict": "clean", "residual": [], "regressions": []}
+        try:
+            applied, unver, notes = ff._fix_files(
+                object(), object(), tmp, findings, self.STACK, True, args,
+                adversarial=True, adversarial_rounds=5)   # high adv budget
+        finally:
+            self._restore(real)
+        self.assertEqual(len(fb), 3,      # MAX_FIX_TRIES == 3 (function-local), not 5
+                         f"build retries must cap at MAX_FIX_TRIES(3); got {len(fb)}")
+        self.assertNotIn("a.py", applied)
+        self.assertEqual(self._read(tmp), "orig\n")
+        self.assertTrue(any("rolled back (broke build)" in n for n in notes))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

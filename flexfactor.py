@@ -4499,11 +4499,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         budget_hit = False
         # Adversarial re-verify loop: when a secondary provider is present and
         # --adversarial is on, the reviewer ADVERSARIALLY hunts for residual defects
-        # and each 'needs_work' verdict feeds back as a re-fix. Count those rounds
-        # SEPARATELY from build-retry attempts, and cap them at `adversarial_rounds`.
+        # and each substantive 'needs_work' verdict feeds back as a re-fix. Build/
+        # generation attempts and adversarial rounds are counted and bounded
+        # INDEPENDENTLY: build-breaking attempts by MAX_FIX_TRIES, substantive
+        # verifier needs_work rounds by adversarial_rounds. A build failure never
+        # consumes an adversarial round and vice-versa; a transport-fail/unverified
+        # consumes neither (it is accepted-unverified and terminates). The for-range
+        # is only a generous hard ceiling - the two counters always bind first.
         adv_active = adversarial and cross is not None
-        adv_rounds = 0
-        max_tries = max(MAX_FIX_TRIES, adversarial_rounds) if adv_active else MAX_FIX_TRIES
+        adv_rounds = 0     # substantive adversarial needs_work rounds used
+        build_tries = 0    # build-breaking attempts used (adversarial path only)
+        max_tries = (MAX_FIX_TRIES + adversarial_rounds + 2) if adv_active else MAX_FIX_TRIES
         for attempt in range(1, max_tries + 1):
             patch = None
             if edit_mode:
@@ -4582,6 +4588,14 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 outcome = ("revert", log[:200])
                 feedback = (f"Your previous attempt BROKE the build/verification:\n{log[:800]}\n"
                             "Fix the listed defects WITHOUT breaking the build.")
+                if adv_active:
+                    # Build breaks are bounded by MAX_FIX_TRIES INDEPENDENTLY of the
+                    # adversarial-round budget, so a run of build failures can neither
+                    # starve nor inflate the adversarial rounds. (Legacy path is bounded
+                    # by the for-range exactly as before - untouched.)
+                    build_tries += 1
+                    if build_tries >= MAX_FIX_TRIES:
+                        break  # exhausted build attempts -> keep the 'revert' outcome
                 continue  # retry with the build error as feedback
             if cross is not None and not adv_active:
                 # Backward-compatible single-shot, fail-OPEN veto (adversarial OFF).
@@ -4601,8 +4615,18 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     clean, residual, reason = _adversarial_verify_fix(
                         cross, rel, original, patch["contents"], targets)
                 except BudgetExceededError:
+                    # Fail-CLOSED: the candidate is already WRITTEN to disk but NOT yet
+                    # verified. Roll it back BEFORE stopping so a budget refusal never
+                    # persists an unverified fix - otherwise the caller commits the dirty
+                    # tree (it commits this cycle's work before it re-checks the meter),
+                    # shipping an un-adversarially-verified change the report calls "not
+                    # applied". A refused rollback surfaces as a skip like every other
+                    # rollback-failure path.
+                    if _replace_contained(project_dir, rel, original) is None:
+                        outcome = ("skip", "contained rollback refused at cost cap")
+                    else:
+                        outcome = ("skip", "cost cap reached during adversarial verify")
                     budget_hit = True
-                    outcome = ("skip", "cost cap reached")
                     break
                 if not clean:
                     if not residual:
