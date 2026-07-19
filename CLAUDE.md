@@ -38,6 +38,10 @@ ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2).
   residual list back so the author re-fixes; loops until a genuinely CLEAN verdict
   or `--adversarial-rounds` (default 2) is hit (then reject+rollback). Fail-CLOSED:
   a downed verifier accepts the fix but marks it `[unverified]` (never a clean pass).
+  If a candidate is WRITTEN but its rollback is REFUSED (any of the build-gate / veto /
+  adversarial / budget paths), `_fix_files` raises `DirtyTreeError`; `audit_one_program`
+  catches it, git-restores the file, and ABORTS the cycle WITHOUT committing (so an
+  un-rolled-back unverified candidate is never staged-and-committed).
   Flags: `--adversarial`/`--no-adversarial` (default ON), `--adversarial-rounds N`.
   `MAX_REVIEW_BYTES` raised 300k->400k so flexfactor.py (now ~310k) stays reviewable.
 - `_fix_files` pipelines generation: `--fix-prefetch N` (default 3, 0=serial)

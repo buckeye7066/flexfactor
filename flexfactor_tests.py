@@ -3336,6 +3336,155 @@ class AdversarialFixLoopTests(unittest.TestCase):
         self.assertEqual(self._read(tmp), "orig\n")
         self.assertTrue(any("rolled back (broke build)" in n for n in notes))
 
+    def _refuse_rollback(self):
+        # Stub _replace_contained: the CANDIDATE write ("fixed\n") succeeds for real,
+        # but any rollback to the ORIGINAL ("orig\n") is REFUSED (returns None).
+        real_repl = ff._replace_contained
+
+        def repl(pd, rel, data):
+            if data == "orig\n":
+                return None            # rollback to original -> REFUSED
+            return real_repl(pd, rel, data)
+        ff._replace_contained = repl
+        return real_repl
+
+    def test_h_budget_rollback_refused_raises_dirty(self):
+        # Sol HIGH r3: budget cap DURING verify + a REFUSED rollback must raise
+        # DirtyTreeError (the candidate could not be removed) so the caller never
+        # commits the dirty tree.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        real_repl = self._refuse_rollback()
+        ff.generate_file_fix_edits = fake_author
+
+        def over(*a, **k):
+            raise ff.BudgetExceededError("cap")
+        ff._judge = over
+        try:
+            with self.assertRaises(ff.DirtyTreeError) as cm:
+                ff._fix_files(object(), object(), tmp, findings, self.STACK, True, args,
+                              adversarial=True, adversarial_rounds=2)
+            self.assertIn("a.py", cm.exception.files)
+        finally:
+            ff._replace_contained = real_repl
+            self._restore(real)
+        self.assertEqual(self._read(tmp), "fixed\n")  # candidate left (rollback refused)
+
+    def test_i_build_gate_rollback_refused_raises_dirty(self):
+        # Same fail-closed guarantee on the build-gate path: gate fails, rollback is
+        # refused -> DirtyTreeError, not a silent skip-with-dirty-tree.
+        tmp, fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        real_repl = self._refuse_rollback()
+        ff.generate_file_fix_edits = fake_author
+        ff._gate_file = lambda *a, **k: (False, "boom")  # build breaks -> rollback -> refused
+        try:
+            with self.assertRaises(ff.DirtyTreeError) as cm:
+                ff._fix_files(object(), object(), tmp, findings, self.STACK, True, args,
+                              adversarial=True, adversarial_rounds=2)
+            self.assertIn("a.py", cm.exception.files)
+        finally:
+            ff._replace_contained = real_repl
+            self._restore(real)
+        self.assertEqual(self._read(tmp), "fixed\n")  # candidate left (rollback refused)
+
+
+class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
+    """Sol HIGH r3: when _fix_files raises DirtyTreeError (a refused rollback left an
+    unverified candidate on disk), audit_one_program must NOT call _commit_and_sync -
+    it must abort the cycle. A normal return still commits."""
+
+    FINDING = {"severity": "high", "line": 1, "title": "t", "problem": "p",
+               "fix": "f", "category": "bug"}
+
+    def _drive(self, fix_files_impl):
+        """Run audit_one_program with the heavy surface stubbed. `fix_files_impl` is
+        the stand-in for _fix_files. Returns (commit_calls, result)."""
+        import tempfile
+        import types
+        tmp = tempfile.mkdtemp()
+        commit_calls = []
+
+        class _P:  # stub provider
+            model = "m"
+
+        stack = {"is_node": False, "is_python": True, "framework": None, "scripts": {},
+                 "verify_cmds": [], "fast_verify": None, "test_cmd": None,
+                 "full_suite_cmd": None, "dev_script": None, "is_web": False,
+                 "esbuild": None, "config_refused": False}
+        review_once = {"n": 0}
+
+        def review_all(*a, **k):
+            review_once["n"] += 1
+            if review_once["n"] == 1:
+                return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {})
+            return ({}, [], set(), {})  # converge on later cycles
+
+        class _Prog:
+            def update(self, *a, **k):
+                pass
+
+        args = types.SimpleNamespace(
+            max_cost=100.0, apply=True, dry_run=False, recheck=False, allow_dirty=False,
+            provider="anthropic", model=None, economy=False, judge_model=None,
+            secondary_model=None, use_both=True, no_preflight=True,
+            branch_prefix="flexfactor/audit-", fix_severity="high", max_files=0,
+            cycles=1, max_cycles=1, until_clean=False, include=[], exclude=[],
+            review_workers=2, adversarial=True, adversarial_rounds=2, fix_prefetch=0,
+            push=False, merge=False, tests=False, e2e=False, app_url=None,
+            full_suite=False, max_test_modules=4)
+
+        orig = {}
+        stubs = {
+            "resolve_program_input": lambda arg: ("prog", ""),
+            "resolve_project_dir": lambda arg, name: tmp,
+            "_acquire_audit_lock": lambda pd: "lock",
+            "_release_audit_lock": lambda lp: None,
+            "_load_brain": lambda: {},
+            "_clean_map": lambda prior: {},
+            "_detect_stack": lambda pd: stack,
+            "_is_git_repo": lambda pd: True,
+            "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
+            "_git_tree_clean": lambda pd: True,
+            "_git_current_branch": lambda pd: "main",
+            "_git": lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+            "_enumerate_source_files": lambda *a, **k: ["a.py"],
+            "_review_all": review_all,
+            "_full_gate": lambda pd, st: (True, ""),
+            "_fix_files": fix_files_impl,
+            "_commit_and_sync": lambda *a, **k: (commit_calls.append(a[4] if len(a) > 4 else "?"),
+                                                 "committed")[1],
+            "_brain_record_run": lambda *a, **k: None,
+            "_build_clean_map": lambda *a, **k: {},
+            "_write_audit_report": lambda *a, **k: os.path.join(tmp, "report.md"),
+            "_write_low_findings_report": lambda *a, **k: None,
+            "_print_audit_summary": lambda *a, **k: None,
+            "_PROGRESS": _Prog(),
+        }
+        for name, fn in stubs.items():
+            orig[name] = getattr(ff, name)
+            setattr(ff, name, fn)
+        try:
+            result = ff.audit_one_program("prog", args, 1, 1, 4100)
+        finally:
+            for name, o in orig.items():
+                setattr(ff, name, o)
+        return commit_calls, result
+
+    def test_dirty_abort_skips_commit(self):
+        def raising_fix_files(*a, **k):
+            raise ff.DirtyTreeError(["a.py"])
+        commit_calls, result = self._drive(raising_fix_files)
+        self.assertEqual(commit_calls, [], "must NOT commit a dirty tree from a refused rollback")
+        self.assertIsNone(result.get("error"))  # handled cleanly, not a crash
+        self.assertIn("aborted", (result.get("stop_reason") or ""))
+
+    def test_normal_return_still_commits(self):
+        def ok_fix_files(*a, **k):
+            return (["a.py"], [], [])
+        commit_calls, result = self._drive(ok_fix_files)
+        self.assertTrue(commit_calls, "a normal (non-dirty) fix pass must still commit")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -221,6 +221,18 @@ class BudgetExceededError(RuntimeError):
     Raised by the reservation chokepoint so no call site can spend past the cap."""
 
 
+class DirtyTreeError(RuntimeError):
+    """A candidate fix was WRITTEN to disk but the subsequent rollback to the
+    original was REFUSED (contained-write fail-closed), so the working tree still
+    holds an UNVERIFIED candidate that could not be removed. Raised by _fix_files
+    so the caller NEVER stages-and-commits that dirty tree (fail-CLOSED). Carries
+    the affected rel path(s) in `.files`."""
+
+    def __init__(self, files):
+        self.files = list(files)
+        super().__init__("un-rolled-back candidate(s) left on disk: " + ", ".join(self.files))
+
+
 @contextlib.contextmanager
 def _budget_guard(meter, model: str, prompt_chars: int, max_tokens: int):
     """THE budget chokepoint: every provider call runs inside this. It atomically
@@ -4372,6 +4384,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     applied: list[str] = []
     unverified: list[str] = []
     notes: list[str] = []
+    dirty_files: list[str] = []  # candidates written but rollback REFUSED (dirty tree)
     errors = 0  # this cycle's reverts + rejects + skips (added to err_base for display)
     defects_fixed = 0  # individual defects addressed across kept fixes (for the dashboard)
     since_commit = 0    # kept fixes since the last incremental commit
@@ -4582,7 +4595,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 break
             ok, log = _gate_file(project_dir, rel, stack, baseline_ok)
             if ok is False:
-                if _replace_contained(project_dir, rel, original) is None:  # rollback failed
+                if _replace_contained(project_dir, rel, original) is None:  # rollback REFUSED
+                    dirty_files.append(rel)  # dirty tree -> signal the caller not to commit
                     outcome = ("skip", "contained rollback refused after a broken attempt")
                     break
                 outcome = ("revert", log[:200])
@@ -4601,7 +4615,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 # Backward-compatible single-shot, fail-OPEN veto (adversarial OFF).
                 keep, reason = _cross_verify_fix(cross, rel, original, patch["contents"], targets)
                 if not keep:
-                    if _replace_contained(project_dir, rel, original) is None:  # rollback failed
+                    if _replace_contained(project_dir, rel, original) is None:  # rollback REFUSED
+                        dirty_files.append(rel)  # dirty tree -> signal the caller not to commit
                         outcome = ("skip", "contained rollback refused after a veto")
                         break
                     outcome = ("reject", reason)
@@ -4623,6 +4638,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     # applied". A refused rollback surfaces as a skip like every other
                     # rollback-failure path.
                     if _replace_contained(project_dir, rel, original) is None:
+                        dirty_files.append(rel)  # dirty tree -> caller must NOT commit
                         outcome = ("skip", "contained rollback refused at cost cap")
                     else:
                         outcome = ("skip", "cost cap reached during adversarial verify")
@@ -4639,7 +4655,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         break
                     # Substantive 'needs_work': roll back and feed the residual list back.
                     adv_rounds += 1
-                    if _replace_contained(project_dir, rel, original) is None:  # rollback failed
+                    if _replace_contained(project_dir, rel, original) is None:  # rollback REFUSED
+                        dirty_files.append(rel)  # dirty tree -> signal the caller not to commit
                         outcome = ("skip", "contained rollback refused after an adversarial veto")
                         break
                     if adv_rounds >= adversarial_rounds:
@@ -4662,6 +4679,16 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         if budget_hit:
             print(f"  [stop] cost cap reached while fixing; stopping remaining fixes")
             notes.append("stopped fixing at cost cap (budget reservation refused)")
+            _tick(rel)
+            break
+
+        if dirty_files:
+            # A rollback was REFUSED after a candidate write (any of the build-gate,
+            # veto, adversarial, or budget paths): the tree holds an unverified
+            # candidate we could not remove. Stop the whole fix pass NOW and raise
+            # below so the caller never stages-and-commits this dirty tree.
+            print(f"  [dirty-abort] {rel}: rollback refused - unverified candidate left on disk")
+            notes.append(f"{rel}: DIRTY - rollback refused after a candidate write")
             _tick(rel)
             break
 
@@ -4700,6 +4727,11 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         _tick(rel)
     if prefetch_pool is not None:
         prefetch_pool.shutdown(wait=False, cancel_futures=True)
+    if dirty_files:
+        # Fail-CLOSED: a candidate could not be rolled back. Signal the caller (which
+        # commits the cycle's tree UNCONDITIONALLY) so it aborts the commit instead of
+        # shipping an unverified candidate. Raised AFTER pool shutdown so no threads leak.
+        raise DirtyTreeError(dirty_files)
     return applied, unverified, notes
 
 
@@ -5027,6 +5059,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         cycles_run = 0
         errors_total = 0
         converged = False
+        dirty_abort = False  # a refused rollback left an unverified candidate on disk
         stop_reason = f"reached cycle cap ({cycle_cap})"
 
         for cycle in range(1, cycle_cap + 1):
@@ -5117,13 +5150,33 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                          f"cycle {_c} checkpoint", stack)
                     print(f"{pfx}git (checkpoint): {s}")
 
-            applied_c, unver_c, notes_c = _fix_files(
-                author, cross, project_dir, cycle_findings, stack, baseline_ok, args,
-                meter=meter, oversized=oversized, report=report, err_base=errors_total,
-                done_set=done_set, total_overall=total_to_review,
-                commit_cb=(_checkpoint if (git and not args.dry_run) else None),
-                adversarial=getattr(args, "adversarial", True),
-                adversarial_rounds=getattr(args, "adversarial_rounds", 2))
+            try:
+                applied_c, unver_c, notes_c = _fix_files(
+                    author, cross, project_dir, cycle_findings, stack, baseline_ok, args,
+                    meter=meter, oversized=oversized, report=report, err_base=errors_total,
+                    done_set=done_set, total_overall=total_to_review,
+                    commit_cb=(_checkpoint if (git and not args.dry_run) else None),
+                    adversarial=getattr(args, "adversarial", True),
+                    adversarial_rounds=getattr(args, "adversarial_rounds", 2))
+            except DirtyTreeError as dte:
+                # Fail-CLOSED: _fix_files could not roll back a written candidate (a
+                # contained-write refusal during rollback = the FS is swapping paths
+                # under us). The tree holds an UNVERIFIED candidate. NEVER commit it:
+                # best-effort git-restore the affected file(s), then abort the cycle
+                # WITHOUT committing (this `break` skips the cycle commit below, and
+                # `dirty_abort` skips the post-loop test/e2e commits).
+                dirty_abort = True
+                for df in dte.files:
+                    if git and not args.dry_run:
+                        _git(["checkout", "--", df], project_dir)
+                msg = ("dirty-abort: a refused rollback left an unverified candidate on "
+                       f"disk ({', '.join(dte.files)}); NOT committing this cycle")
+                print(f"{pfx}{msg}", file=sys.stderr)
+                fix_notes.append(msg)
+                stop_reason = "aborted: refused rollback left an unverified candidate (see notes)"
+                errors_total += len(dte.files)
+                report(errors=errors_total, cost=round(meter.usd, 4))
+                break
             applied_set |= set(applied_c)
             unverified_set |= set(unver_c)
             fix_notes += notes_c
@@ -5175,7 +5228,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 5. Generate + run unit tests (test each function). Failures are real defects.
         test_files: list[str] = []
         test_status = None
-        if args.tests and stack.get("test_cmd") and not report_only:
+        if args.tests and stack.get("test_cmd") and not report_only and not dirty_abort:
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
                 text, read_status = _classify_source_read(project_dir, rel)
@@ -5229,7 +5282,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 6. Drive every button (Playwright) in the live-like sandbox. The lock keeps
         #    one program driving Playwright at a time; the port keeps dev servers apart.
         e2e = {"ran": False, "ok": None, "log": "", "spec_files": []}
-        if args.e2e and not report_only:
+        if args.e2e and not report_only and not dirty_abort:
             print(f"{pfx}Button/UI testing (Playwright)...")
             lock = _E2E_LOCK if total > 1 else None
             try:
