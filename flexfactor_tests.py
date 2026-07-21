@@ -3922,6 +3922,14 @@ class CmdPolicyTests(unittest.TestCase):
             (["bash", "-c", "rm -rf /"], "destructive"),
             (["docker", "system", "prune", "-af"], "destructive"),
             (["docker", "rmi", "img"], "destructive"),
+            # Sol cycle-2: nested launchers and inline-call options must not
+            # launder through option-stripping or shallow docker subcommands.
+            (["npx", "bash", "-c", "rm -rf /"], "destructive"),
+            (["npx", "-c", "vercel deploy"], "destructive"),
+            (["npm", "exec", "--", "bash", "-c", "x"], "destructive"),
+            (["npm", "exec", "vercel", "--", "deploy"], "deploy"),
+            (["docker", "image", "rm", "x"], "destructive"),
+            (["docker", "--context", "c", "system", "prune"], "destructive"),
         ):
             ok, reason, classes = self.cp.command_allowed(cmd, allow=self.NO_ALLOW)
             self.assertFalse(ok, f"{cmd} must be blocked")
@@ -4188,16 +4196,77 @@ class NpmSpecValidationTests(unittest.TestCase):
                                          verify=True, push=False, merge=False,
                                          branch_prefix="flexfactor/adopt-",
                                          allow_scripts=False)
-            res = ff.apply_integration(
-                tmp, "bad/pkg",
-                {"files": [{"path": "x.js", "contents": "1;"}],
-                 "packages": ["--prefix=.."]}, opts)
-            self.assertEqual(res.status, "verify-failed")
-            self.assertIn("unsafe package spec", res.detail)
-            self.assertFalse(os.path.exists(os.path.join(tmp, "x.js")))
-            st = subprocess.run(["git", "-C", tmp, "status", "--porcelain"],
-                                capture_output=True, text=True).stdout.strip()
-            self.assertEqual(st, "", f"tree not pristine: {st}")
+            # Sol cycle-2: validation must happen BEFORE any mutation, and
+            # non-string entries (any JSON type is possible model output) must
+            # be refused, not coerced or crash past the rollback.
+            for bad_packages in (["--prefix=.."], [123], [None], "not-a-list"):
+                res = ff.apply_integration(
+                    tmp, "bad/pkg",
+                    {"files": [{"path": "x.js", "contents": "1;"}],
+                     "packages": bad_packages}, opts)
+                self.assertEqual(res.status, "refused-unsafe-packages",
+                                 f"{bad_packages!r} -> {res.status}: {res.detail}")
+                self.assertFalse(os.path.exists(os.path.join(tmp, "x.js")),
+                                 f"{bad_packages!r} wrote a file before refusing")
+                st = subprocess.run(["git", "-C", tmp, "status", "--porcelain"],
+                                    capture_output=True, text=True).stdout.strip()
+                self.assertEqual(st, "", f"tree not pristine: {st}")
+                br = subprocess.run(["git", "-C", tmp, "branch", "--list"],
+                                    capture_output=True, text=True).stdout
+                self.assertNotIn("flexfactor/adopt-", br)
+
+
+class VerifyDisclosureTests(unittest.TestCase):
+    """Sol cycle-2 finding 5: the approval card's verify line must state the
+    ACTUAL verify state for the run, not an unconditional claim."""
+
+    def _args(self, verify=True, allow_scripts=False):
+        import types
+        return types.SimpleNamespace(verify=verify, allow_scripts=allow_scripts)
+
+    def test_disabled_verify_disclosed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            note = ff._verify_disclosure(self._args(verify=False), tmp)
+            self.assertIn("DISABLED", note)
+            self.assertIn("WITHOUT any build check", note)
+
+    def test_no_verifier_detected_disclosed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:  # no package.json at all
+            note = ff._verify_disclosure(self._args(), tmp)
+            self.assertIn("no build/lint script detected", note)
+
+    def test_real_verifier_disclosed_with_command(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name": "t", "scripts": {"build": "x"}}')
+            note = ff._verify_disclosure(self._args(), tmp)
+            self.assertIn("npm run build", note)
+            self.assertIn("rolled back", note)
+
+
+class ShortcutQuoteEscapeTests(unittest.TestCase):
+    """Sol cycle-2 finding 4: the .lnk path is embedded in a PowerShell
+    single-quoted literal - quotes must be doubled and control chars refused."""
+
+    def test_non_lnk_passthrough(self):
+        self.assertEqual(ff._resolve_shortcut("plain.txt"), ("plain.txt", ""))
+
+    def test_control_char_path_refused_without_launch(self):
+        p = "evil\n'; Remove-Item x; '.lnk"
+        self.assertEqual(ff._resolve_shortcut(p), (p, ""))
+
+    def test_quote_in_path_does_not_break_out(self):
+        # A quoted path must survive resolution without a PowerShell parse
+        # error being treated as data: nonexistent shortcut -> falls back to
+        # (path, "") either via empty output or the exception guard, and never
+        # raises. (The doubled-quote literal is what prevents breakout.)
+        p = "no'such'file.lnk"
+        target, arguments = ff._resolve_shortcut(p)
+        self.assertEqual(target, p)
+        self.assertEqual(arguments, "")
 
 
 class ScoutEvalFixtureTests(unittest.TestCase):

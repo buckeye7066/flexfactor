@@ -11,11 +11,13 @@ playwright, node, python) stays allowed, so this gate is additive safety, not
 a behavior change.
 
 SCOPE (stated precisely, not aspirationally): the gate governs the `_run`
-chokepoint. Three call sites intentionally do NOT go through `_run`, and all
-three execute owner-owned constants with zero model/candidate influence:
-the Repo Rewards launcher (hardcoded local .ps1 path), the dashboard
-(`pythonw flexfactor_dashboard.py`), and .lnk shortcut resolution. No string
-from a repo, README, LLM response, or generated patch reaches those calls.
+chokepoint. Three call sites intentionally do NOT go through `_run`: the Repo
+Rewards launcher (hardcoded local .ps1 path), the dashboard
+(`pythonw flexfactor_dashboard.py`) - both owner-owned constants - and .lnk
+shortcut resolution, whose single variable (the user-supplied shortcut path)
+is embedded as a quote-escaped PowerShell single-quoted literal with
+control-character rejection. No string from a repo, README, LLM response, or
+generated patch reaches any of those calls.
 
 Policy opt-in, either of:
   * env FLEXFACTOR_ALLOW_CLASSES="deploy,destructive"  (comma-separated)
@@ -106,6 +108,47 @@ def _has_flag(args: list[str], *flags: str) -> bool:
     return any(f in low for f in flags)
 
 
+def _classify_launched_tool(args: list[str], after: str | None,
+                            value_opts: set[str],
+                            inline_opts: set[str] = frozenset()) -> set[str]:
+    """Classify a launcher (`npx <tool> ...`, `npm exec <tool> ...`) by the
+    tool it launches, recursing on the RAW argument tail from the tool token
+    onward - not on an option-stripped view, so `npx bash -c '...'` hands
+    `bash -c '...'` (inline shell -> destructive) to the classifier instead of
+    losing the inline string to an option-value skip. `after` positions the
+    scan after a subcommand token (e.g. 'exec'); network is always added
+    (launchers may download the tool)."""
+    start = 0
+    if after is not None:
+        low = [a.lower() for a in args]
+        if after in low:
+            start = low.index(after) + 1
+        else:
+            return {"unknown", "network"}
+    skip = False
+    for i in range(start, len(args)):
+        a = args[i]
+        if skip:
+            skip = False
+            continue
+        if a.lower() in inline_opts:
+            # `npx -c/--call "<string>"` executes an arbitrary shell string:
+            # same laundering capability as `bash -c` -> worst-case class.
+            return {"destructive"}
+        if a in value_opts:
+            skip = True
+            continue
+        if a == "--":
+            continue
+        if a.startswith("-"):
+            continue
+        if a.lower() == "playwright":
+            return {"test", "network"}
+        inner = classify_command(args[i:])
+        return (inner - {"unknown"} or {"install"}) | {"network"}
+    return {"install", "network"}
+
+
 def classify_command(cmd: list[str]) -> set[str]:
     """Classify a command line into behavior classes. Pure + deterministic."""
     exe = _exe_name(cmd)
@@ -125,11 +168,13 @@ def classify_command(cmd: list[str]) -> set[str]:
             return {"destructive"}  # inline shell string = arbitrary command
         return {"unknown"}
     if exe == "docker":
-        pos = [p.lower() for p in _positionals(args)]
-        sub = pos[0] if pos else ""
-        if sub == "push":
+        # Scan ALL positionals (skipping global value options) so nested forms
+        # (`docker image rm`, `docker --context x system prune`) are caught.
+        pos = [p.lower() for p in _positionals(
+            args, {"--context", "--config", "-H", "--host", "-l", "--log-level"})]
+        if "push" in pos:
             return {"deploy", "network"}
-        if sub in ("rm", "rmi") or "prune" in pos:
+        if any(p in ("rm", "rmi", "prune") for p in pos):
             return {"destructive"}
         return {"unknown"}
     if exe == "gh":
@@ -191,21 +236,16 @@ def classify_command(cmd: list[str]) -> set[str]:
         if sub in ("test", "t"):
             return {"test"}
         if exe == "npm" and sub == "exec":
-            rest = pos[1:]
-            if rest:
-                return classify_command(rest) | {"network"}
-            return {"install", "network"}
+            return _classify_launched_tool(args, after="exec",
+                                           value_opts={"--package", "-p"},
+                                           inline_opts={"-c", "--call"})
         return {"unknown"}
     if exe == "npx":
         # npx downloads-and-runs a tool: classify the TOOL it launches (so
         # `npx vercel deploy` is a deploy, not a benign install) plus network.
-        pos = _positionals(args, {"-p", "--package", "-c", "--call"})
-        if pos:
-            if pos[0].lower() == "playwright":
-                return {"test", "network"}
-            inner = classify_command(pos)
-            return (inner - {"unknown"} or {"install"}) | {"network"}
-        return {"install", "network"}
+        return _classify_launched_tool(args, after=None,
+                                       value_opts={"-p", "--package"},
+                                       inline_opts={"-c", "--call"})
 
     if exe in ("pytest", "unittest", "vitest", "jest"):
         return {"test"}

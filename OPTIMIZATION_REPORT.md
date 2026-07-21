@@ -187,7 +187,25 @@ Diagnosis of the pre-existing gaps:
      npm install command shape (`--ignore-scripts`, `--`, spec ordering) via
      a spying `_run`; characterization extended with the wrapper/indirection
      block cases.
-- Sol cycle 2+: see commit history for final verdict.
+- Sol cycle 2: FIX FIRST(5) — all addressed:
+  1. Package entries now require `isinstance(str)` + strict spec match and are
+     validated at the TOP of `apply_integration`, before any file write,
+     branch, or dry-run report (`refused-unsafe-packages`); non-list /
+     numeric / None payloads refuse cleanly instead of raising past rollback.
+  2. `npx`/`npm exec` recurse on the RAW argument tail from the launched tool
+     onward (no option-stripped view), and inline-call options (`-c/--call`)
+     are classified worst-case — nested-launcher laundering closed.
+  3. Docker classification scans all positionals (global value options
+     skipped): `docker image rm`, `docker --context x system prune` etc.
+  4. The `.lnk` resolution PowerShell literal is quote-escaped (doubled
+     single quotes) with control-character rejection; the chokepoint scope
+     doc states this precisely.
+  5. The approval card's verify line now reflects the ACTUAL state per run
+     (`_verify_disclosure`): enabled-with-commands, none-detected, DISABLED
+     by `--no-verify`, or config-refused fail-closed; the verdict note is
+     conditional-accurate.
+- Sol cycle 3: see commit history for final verdict.
+- Final suite: **243 OK / 7 skipped**.
 
 ## Roadmap
 

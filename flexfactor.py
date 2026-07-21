@@ -1113,9 +1113,16 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
     hand back the original path and let the caller report a clear error."""
     if not path.lower().endswith(".lnk"):
         return path, ""
+    # The path is interpolated into a PowerShell SINGLE-QUOTED literal: the only
+    # metacharacter inside one is the quote itself, escaped by doubling. NTFS
+    # forbids control characters in file names, so quote-doubling closes the
+    # injection surface; refuse defensively if a control char shows up anyway.
+    if any(ord(ch) < 32 for ch in path):
+        return path, ""
+    ps_path = path.replace("'", "''")
     ps = (
         "$ws = New-Object -ComObject WScript.Shell; "
-        f"$s = $ws.CreateShortcut('{path}'); "
+        f"$s = $ws.CreateShortcut('{ps_path}'); "
         "Write-Output $s.TargetPath; Write-Output $s.Arguments"
     )
     try:
@@ -2188,7 +2195,11 @@ _NPM_SPEC_RX = re.compile(
 
 
 def _valid_npm_spec(spec) -> bool:
-    s = str(spec or "").strip()
+    # STRICT type check: model output can be any JSON type; a non-string (e.g.
+    # 123) must fail validation, never be coerced into a command argument.
+    if not isinstance(spec, str):
+        return False
+    s = spec.strip()
     return bool(s) and len(s) <= 214 and bool(_NPM_SPEC_RX.match(s))
 
 
@@ -2202,7 +2213,19 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
     """
     files = [f for f in (patch.get("files") or [])
              if f.get("path") and f.get("contents") is not None]
+    # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
+    # mutation (before dry-run reporting too), so a malformed or option-like
+    # entry can never write a file, raise past the rollback, or reach npm.
     packages = patch.get("packages") or []
+    if not isinstance(packages, list):
+        return ApplyResult(repo_name, "refused-unsafe-packages",
+                           f"generated 'packages' is not a list ({type(packages).__name__})")
+    bad_specs = [p for p in packages if not _valid_npm_spec(p)]
+    if bad_specs:
+        return ApplyResult(repo_name, "refused-unsafe-packages",
+                           f"refused unsafe package spec(s) from the generated plan: "
+                           f"{bad_specs!r} (only plain registry names, optionally @scoped "
+                           "and @versioned, are installable)")
     if not files and not packages:
         return ApplyResult(repo_name, "infeasible", "No concrete edits were produced.")
 
@@ -2674,10 +2697,11 @@ def candidate_verdicts(evidence: dict) -> dict:
         reasons.append("execution-risk indicators: " + ", ".join(exec_flags))
     reasons.append("execution requires explicit --allow-scripts (lifecycle "
                    "scripts stay blocked by default)")
-    reasons.append("NOTE: if this candidate is APPROVED for apply, the "
-                   "build-verify gate runs the project's own build with the "
-                   "generated files applied - that execution is part of what "
-                   "the per-candidate approval covers")
+    reasons.append("NOTE: if this candidate is APPROVED for apply and "
+                   "verification is enabled (the default), the build-verify "
+                   "gate runs the project's own build with the generated files "
+                   "applied - that execution is covered by the approval; the "
+                   "approval card states the exact verify state for the run")
     return {"safe_to_inspect": inspect_v,
             "safe_to_integrate": integrate,
             "safe_to_execute": execute,
@@ -2912,9 +2936,30 @@ def _policy_approves(policy: dict, evaluation: dict) -> bool:
     return bool(allowed) and lic in allowed
 
 
-def _candidate_approval_summary(evaluation: dict, args) -> str:
+def _verify_disclosure(args, project_dir: str) -> str:
+    """The HONEST verify line for the approval card: states exactly what will
+    (or will not) execute for THIS run - enabled with detected commands,
+    enabled with none detected, disabled by --no-verify, or refused config."""
+    if not getattr(args, "verify", True):
+        return ("  Verify:    DISABLED (--no-verify) - the generated files are "
+                "committed WITHOUT any build check; nothing executes them")
+    is_node, cmds = _detect_verify(project_dir)
+    if cmds is None:
+        return ("  Verify:    package.json unreadable (containment) - the apply "
+                "will be REFUSED fail-closed; nothing will run")
+    if not cmds:
+        return ("  Verify:    no build/lint script detected - the change is "
+                "committed WITHOUT executing the project's code")
+    joined = "; ".join(" ".join(c) for c in cmds)
+    return (f"  Verify:    the project's own build ({joined}) runs WITH the "
+            "generated files applied - approving consents to that execution; "
+            "a failing build is rolled back")
+
+
+def _candidate_approval_summary(evaluation: dict, args, verify_note: str) -> str:
     """Plain-language, per-candidate summary shown before approval: what would
-    change, under what license, with which risks and rollback plan."""
+    change, under what license, with which risks, what will execute, and the
+    rollback plan."""
     ev = evaluation.get("evidence") or {}
     v = evaluation.get("verdicts") or {}
     b = evaluation.get("benefit") or {}
@@ -2930,9 +2975,7 @@ def _candidate_approval_summary(evaluation: dict, args) -> str:
         "  Installs:  npm --ignore-scripts"
         + (" OVERRIDDEN by --allow-scripts (lifecycle scripts WILL run)"
            if getattr(args, "allow_scripts", False) else " (lifecycle scripts blocked)"),
-        "  Verify:    the project's own build/lint runs WITH the generated "
-        "files applied (approving this candidate consents to that execution; "
-        "a failing build is rolled back)",
+        verify_note,
         f"  Rollback:  {ev.get('rollback_plan')}",
     ]
     if v.get("reasons"):
@@ -2949,7 +2992,8 @@ def _approve_candidate(args, evaluation: dict, project_dir: str) -> bool:
     if getattr(args, "dry_run", False):
         return True
     print("\n" + "-" * 70)
-    print(_candidate_approval_summary(evaluation, args))
+    print(_candidate_approval_summary(evaluation, args,
+                                      _verify_disclosure(args, project_dir)))
     print("-" * 70)
     if getattr(args, "assume_yes", False):
         return True
