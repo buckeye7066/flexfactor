@@ -786,12 +786,17 @@ class AuditApplyDefaultTests(unittest.TestCase):
         self.assertTrue(cap["args"].apply)
         self.assertTrue(cap["args"].assume_yes)
 
-    def test_report_only_derives_from_apply_false(self):
-        # The audit gate is `report_only = not args.apply or dry_run`; prove it.
-        class A:
-            apply = False
-            dry_run = False
-        self.assertTrue(not A.apply or A.dry_run)
+    def test_report_only_gate_pinned_in_production_code(self):
+        # Pin the PRODUCTION gate, not a locally recreated boolean: the exact
+        # report-only expression must exist in audit_one_program and must guard
+        # the mutating steps (branch creation / commit / tests / e2e). If the
+        # gate is renamed or removed, this fails.
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("report_only = not args.apply or args.dry_run", src)
+        self.assertGreaterEqual(src.count("not report_only"), 3,
+                                "report_only must guard multiple mutating steps")
+        self.assertIn("if report_only", src)
 
 
 class TopLevelHelpTests(unittest.TestCase):
@@ -3873,13 +3878,18 @@ class CmdPolicyTests(unittest.TestCase):
             ["git", "push", "-u", "origin", "branch"],
             ["git", "push", "--force-with-lease", "origin", "branch"],
             ["npm", "install", "left-pad", "--ignore-scripts"],
+            ["npm", "install", "--ignore-scripts", "--", "left-pad"],
             ["npm", "run", "build"],
             ["npm", "run", "typecheck"],
             ["npm", "run", "test:all"],
+            ["npm", "run", "ci"],
             ["npm", "test"],
             ["npx", "playwright", "test"],
+            ["npx", "playwright", "install", "chromium"],
             ["node", "--check", "x.js"],
+            ["node", "script.js"],
             ["python", "-V"],
+            ["python", "flexfactor_tests.py"],
         ):
             ok, classes = self._allowed(cmd)
             self.assertTrue(ok, f"{cmd} must stay allowed (classes={classes})")
@@ -3898,6 +3908,20 @@ class CmdPolicyTests(unittest.TestCase):
             (["git", "clean", "-fdx"], "destructive"),
             (["git", "push", "--force", "origin", "main"], "destructive"),
             (["format", "C:"], "destructive"),
+            # Wrapper/indirection forms (Sol findings): options, launchers and
+            # refspecs must not launder a high-risk command into a benign class.
+            (["npx", "vercel", "deploy", "--prod"], "deploy"),
+            (["git", "-C", "repo", "clean", "-fdx"], "destructive"),
+            (["git", "push", "origin", "+HEAD:main"], "destructive"),
+            (["npm", "--prefix", "repo", "publish"], "deploy"),
+            (["npm", "exec", "vercel", "deploy"], "deploy"),
+            (["powershell", "-Command", "Remove-Item -Recurse -Force C:\\x"],
+             "destructive"),
+            (["pwsh", "-EncodedCommand", "QQBiAGMA"], "destructive"),
+            (["cmd", "/c", "rmdir /s /q C:\\x"], "destructive"),
+            (["bash", "-c", "rm -rf /"], "destructive"),
+            (["docker", "system", "prune", "-af"], "destructive"),
+            (["docker", "rmi", "img"], "destructive"),
         ):
             ok, reason, classes = self.cp.command_allowed(cmd, allow=self.NO_ALLOW)
             self.assertFalse(ok, f"{cmd} must be blocked")
@@ -4084,6 +4108,97 @@ class ScoutPolicyFileTests(unittest.TestCase):
             A.dry_run, A.assume_yes = False, True
             self.assertTrue(ff._approve_candidate(A(), e, tmp))
 
+    def test_approve_candidate_policy_file_approves_no_tty(self):
+        # A reviewed policy file must work WITHOUT a TTY and WITHOUT --yes
+        # (the automation path), still gated per candidate.
+        import tempfile
+
+        class A:
+            dry_run = False
+            assume_yes = False
+            allow_scripts = False
+        good = {"need": "n", "evidence": {"license": "MIT"},
+                "verdicts": {"safe_to_integrate": True}, "benefit": {}}
+        gpl = {"need": "n", "evidence": {"license": "GPL-3.0"},
+               "verdicts": {"safe_to_integrate": False}, "benefit": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
+            self.assertTrue(ff._approve_candidate(A(), good, tmp))
+            self.assertFalse(ff._approve_candidate(A(), gpl, tmp))
+
+    def test_confirm_scout_apply_policy_authorizes_no_tty(self):
+        # Sol finding: the blanket gate refused before the policy file could
+        # ever authorize non-interactive automation. auto_approve must let the
+        # run REACH the per-candidate stage; absent policy still fails safe.
+        import tempfile
+
+        class A:
+            dry_run = False
+            assume_yes = False
+            apply_tier = "adopt"
+            branch_prefix = "flexfactor/adopt-"
+            push = False
+            merge = False
+        evals = [{"recommendation": "ADOPT", "repo": {"fullName": "o/r"},
+                  "need": "x", "benefit": {"benefit_score": 90},
+                  "evidence": {"license": "MIT"},
+                  "verdicts": {"safe_to_integrate": True}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(ff._confirm_scout_apply(A(), evals, tmp))
+            with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
+            self.assertTrue(ff._confirm_scout_apply(A(), evals, tmp))
+
+
+class NpmSpecValidationTests(unittest.TestCase):
+    """Model-produced package lists must never smuggle npm options, paths or
+    URLs into the install command (Sol finding 3)."""
+
+    def test_valid_specs(self):
+        for spec in ("left-pad", "@scope/pkg", "pkg@1.2.3", "@scope/pkg@^2.0.0",
+                     "lodash.merge", "typescript@next"):
+            self.assertTrue(ff._valid_npm_spec(spec), spec)
+
+    def test_invalid_specs_rejected(self):
+        for spec in ("--prefix=..", "-g", "--global", "../evil", "./local",
+                     "~/x", "git+https://evil/x.git", "https://evil/x.tgz",
+                     "a b", "", None, "pkg@1.2.3 --save", "C:\\evil",
+                     "@scope/", "/abs/path"):
+            self.assertFalse(ff._valid_npm_spec(spec), repr(spec))
+
+    def test_apply_refuses_bad_spec_and_stays_pristine(self):
+        import subprocess
+        import tempfile
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+            subprocess.run(["git", "-C", tmp, "config", "user.email", "t@t"],
+                           capture_output=True)
+            subprocess.run(["git", "-C", tmp, "config", "user.name", "t"],
+                           capture_output=True)
+            with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name": "t"}')
+            subprocess.run(["git", "-C", tmp, "add", "-A"], capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-q", "-m", "init"],
+                           capture_output=True)
+            opts = types.SimpleNamespace(dry_run=False, allow_dirty=False,
+                                         verify=True, push=False, merge=False,
+                                         branch_prefix="flexfactor/adopt-",
+                                         allow_scripts=False)
+            res = ff.apply_integration(
+                tmp, "bad/pkg",
+                {"files": [{"path": "x.js", "contents": "1;"}],
+                 "packages": ["--prefix=.."]}, opts)
+            self.assertEqual(res.status, "verify-failed")
+            self.assertIn("unsafe package spec", res.detail)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "x.js")))
+            st = subprocess.run(["git", "-C", tmp, "status", "--porcelain"],
+                                capture_output=True, text=True).stdout.strip()
+            self.assertEqual(st, "", f"tree not pristine: {st}")
+
 
 class ScoutEvalFixtureTests(unittest.TestCase):
     """Reproducible eval on labeled fixture candidates:
@@ -4179,10 +4294,24 @@ class ScoutEndToEndTests(unittest.TestCase):
                 "risks": []}
 
     def _run_scenario(self, tmp, verify_rc):
+        import subprocess
         import types
         saved = {n: getattr(ff, n) for n in
                  ("_server_is_up", "repo_rewards_search", "_judge",
-                  "make_provider", "generate_integration", "_detect_verify")}
+                  "make_provider", "generate_integration", "_detect_verify",
+                  "_run")}
+        self.npm_calls: list[list[str]] = []
+        real_run = ff._run
+
+        def spy_run(cmd, cwd, timeout=900):
+            # Intercept ONLY npm (no real installs in tests); everything else
+            # (git, the python verify command) runs for real through the actual
+            # chokepoint incl. the command-policy gate.
+            if cmd and str(cmd[0]).lower() == "npm":
+                self.npm_calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return real_run(cmd, cwd, timeout=timeout)
+
         ff._server_is_up = lambda url, timeout=1.5: True
         ff.repo_rewards_search = lambda base, q, lens=None, attempts=3: \
             [self.GOOD, self.HOSTILE]
@@ -4191,10 +4320,12 @@ class ScoutEndToEndTests(unittest.TestCase):
         ff.generate_integration = lambda provider, project_dir, blob, need, result: (
             {"files": [{"path": "widget_integration.js",
                         "contents": "export const widget = 1;\n"}],
-             "packages": [], "commit_message": "Integrate good/widget",
+             "packages": ["left-pad"], "commit_message": "Integrate good/widget",
              "post_steps": []}, "plan")
+        # is_node=True so the (spied) npm install path is actually exercised.
         ff._detect_verify = lambda project_dir: (
-            False, [[sys.executable, "-c", f"import sys; sys.exit({verify_rc})"]])
+            True, [[sys.executable, "-c", f"import sys; sys.exit({verify_rc})"]])
+        ff._run = spy_run
         try:
             rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
                           "--top", "5"])
@@ -4230,6 +4361,16 @@ class ScoutEndToEndTests(unittest.TestCase):
             self.assertIn("safe_to_integrate=False", body)  # ...as unsafe
             self.assertIn("manifest", body)              # applied change manifest
             self.assertIn("blocked (--ignore-scripts)", body)
+            # The npm install command itself must be script-blocked and
+            # option-injection-proof: options first, then `--`, then specs.
+            self.assertEqual(len(self.npm_calls), 1, self.npm_calls)
+            npm = self.npm_calls[0]
+            self.assertEqual(npm[:2], ["npm", "install"])
+            self.assertIn("--ignore-scripts", npm)
+            self.assertIn("--", npm)
+            self.assertIn("left-pad", npm)
+            self.assertLess(npm.index("--ignore-scripts"), npm.index("--"))
+            self.assertGreater(npm.index("left-pad"), npm.index("--"))
 
     def test_verification_failure_rolls_back(self):
         import tempfile

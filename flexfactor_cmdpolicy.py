@@ -1,22 +1,38 @@
 """Command classification + policy gate for FlexFactor's subprocess chokepoint.
 
-Every subprocess FlexFactor launches goes through flexfactor._run, which calls
-`command_allowed` before executing. Commands are classified into behavior
-classes; the HIGH-RISK classes (destructive / credentialed / deploy) are DENIED
-by default and require an explicit policy opt-in. Everything FlexFactor
-legitimately runs today (git workflow incl. rollback, npm/yarn/pnpm
-build/test/install, npx playwright, node, python) stays allowed, so this gate
-is additive safety, not a behavior change.
+Every subprocess FlexFactor launches THROUGH flexfactor._run (all build/test/
+install/git/verify commands, including everything a model-generated fix or
+integration can influence) goes through `command_allowed` before executing.
+Commands are classified into behavior classes; the HIGH-RISK classes
+(destructive / credentialed / deploy) are DENIED by default and require an
+explicit owner policy opt-in. Everything FlexFactor legitimately runs today
+(git workflow incl. rollback, npm/yarn/pnpm build/test/install, npx
+playwright, node, python) stays allowed, so this gate is additive safety, not
+a behavior change.
+
+SCOPE (stated precisely, not aspirationally): the gate governs the `_run`
+chokepoint. Three call sites intentionally do NOT go through `_run`, and all
+three execute owner-owned constants with zero model/candidate influence:
+the Repo Rewards launcher (hardcoded local .ps1 path), the dashboard
+(`pythonw flexfactor_dashboard.py`), and .lnk shortcut resolution. No string
+from a repo, README, LLM response, or generated patch reaches those calls.
 
 Policy opt-in, either of:
   * env FLEXFACTOR_ALLOW_CLASSES="deploy,destructive"  (comma-separated)
   * ~/.flexfactor/policy.json  {"allow_classes": ["deploy", ...]}
 
-Fail-closed direction: an unknown command is allowed (it is what the tool did
-before this module existed, and the audit runs arbitrary project test runners),
-but a command that MATCHES a high-risk signature is blocked even when it also
-matches a benign class. Classification of an empty/malformed command is
-{"unknown"} and allowed (the launch will fail on its own in _run).
+Design decisions (deliberate, documented):
+  * `unknown` is ALLOWED: audits run arbitrary project test runners and
+    blocking unknowns would break the tool's core function. The mitigation is
+    that wrapper/indirection paths that could LAUNDER a high-risk command are
+    classified high-risk themselves: shell interpreters with inline command
+    strings, `npx <deploy-tool>`, `npm --prefix ... publish`, forced
+    refspecs, `git -C ... clean`.
+  * In-repo git state commands (`checkout --force`, `reset`, `branch -D`) are
+    plain `vcs`: they are the tool's OWN rollback machinery and their blast
+    radius is the repo the user pointed FlexFactor at. The destructive class
+    is for host/remote-level damage (rm -rf, git clean's untracked-file
+    deletion, lease-less force push, format/dd, shell -c ...).
 
 This module is deliberately standalone (stdlib-only, no import of flexfactor)
 so it is unit-testable in isolation and reusable by scout/audit/refactor alike.
@@ -37,6 +53,13 @@ HIGH_RISK = frozenset({"destructive", "credentialed", "deploy"})
 _GIT_READ = {"status", "log", "diff", "show", "ls-files", "rev-parse",
              "branch", "config", "remote", "describe", "check-ignore"}
 _GIT_NETWORK = {"push", "fetch", "pull", "clone", "ls-remote"}
+# git global options that take a separate value (so `git -C repo clean` cannot
+# smuggle `clean` past a naive first-positional scan).
+_GIT_VALUE_OPTS = {"-c", "-C", "--git-dir", "--work-tree", "--exec-path",
+                   "--namespace"}
+# npm/yarn/pnpm options that take a separate value.
+_NPM_VALUE_OPTS = {"--prefix", "--registry", "--cwd", "-w", "--workspace",
+                   "-C", "--dir", "--loglevel"}
 
 _DEPLOY_EXES = {"vercel", "railway", "netlify", "flyctl", "fly", "heroku",
                 "kubectl", "helm", "terraform", "pulumi", "serverless", "sls",
@@ -45,6 +68,12 @@ _CREDENTIALED_EXES = {"aws", "az", "gcloud", "ssh", "scp", "sftp", "op",
                       "vault", "doppler", "pass", "keytool"}
 _DESTRUCTIVE_EXES = {"format", "mkfs", "diskpart", "shutdown", "reboot",
                      "fdisk", "dd"}
+# Shell interpreters: with an inline-command flag they can launder ANY command
+# through the gate, so that form is classified destructive (worst-case
+# capability, fail closed). FlexFactor itself never runs shells through _run.
+_SHELL_EXES = {"powershell", "pwsh", "cmd", "bash", "sh", "zsh", "dash", "ksh"}
+_SHELL_INLINE_FLAGS = {"-command", "-c", "/c", "/k", "-encodedcommand", "-e",
+                       "-enc", "-ec"}
 
 
 def _exe_name(cmd: list[str]) -> str:
@@ -52,6 +81,24 @@ def _exe_name(cmd: list[str]) -> str:
         return ""
     base = os.path.basename(str(cmd[0]))
     return os.path.splitext(base)[0].lower()
+
+
+def _positionals(args: list[str], value_opts: set[str] = frozenset()) -> list[str]:
+    """Positional (non-option) arguments, skipping the VALUES of options known
+    to take one - so `-C repo` never surfaces `repo` as a subcommand."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in value_opts:
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue
+        out.append(a)
+    return out
 
 
 def _has_flag(args: list[str], *flags: str) -> bool:
@@ -72,53 +119,70 @@ def classify_command(cmd: list[str]) -> set[str]:
         return {"credentialed"}
     if exe in _DEPLOY_EXES:
         return {"deploy", "network"}
+    if exe in _SHELL_EXES:
+        low = [a.lower() for a in args]
+        if any(f in low for f in _SHELL_INLINE_FLAGS):
+            return {"destructive"}  # inline shell string = arbitrary command
+        return {"unknown"}
     if exe == "docker":
-        sub = args[0].lower() if args else ""
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
         if sub == "push":
             return {"deploy", "network"}
+        if sub in ("rm", "rmi") or "prune" in pos:
+            return {"destructive"}
         return {"unknown"}
     if exe == "gh":
-        sub = args[0].lower() if args else ""
-        if sub in ("release", "deploy", "workflow", "secret", "auth"):
-            return {"deploy", "network"} if sub in ("release", "deploy", "workflow") \
-                else {"credentialed", "network"}
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
+        if sub in ("release", "deploy", "workflow"):
+            return {"deploy", "network"}
+        if sub in ("secret", "auth"):
+            return {"credentialed", "network"}
         return {"network"}
 
-    if exe in ("rm", "del", "rmdir", "rd"):
-        # Recursive/forced deletes are the destructive form; a plain single-file
-        # rm is still flagged (FlexFactor never shells out to delete - it uses
-        # contained unlink helpers - so any rm here is out-of-contract).
+    if exe in ("rm", "del", "rmdir", "rd", "erase"):
+        # FlexFactor never shells out to delete (it uses contained unlink
+        # helpers), so ANY delete command here is out-of-contract.
         return {"destructive"}
     if exe == "reg" and args and args[0].lower() == "delete":
         return {"destructive"}
 
     if exe == "git":
-        sub = next((a for a in args if not a.startswith("-")), "").lower()
-        low = [a.lower() for a in args]
+        pos = _positionals(args, _GIT_VALUE_OPTS)
+        sub = pos[0].lower() if pos else ""
         if sub == "clean":
             # _rollback deliberately never uses git clean (it would nuke
             # unrelated untracked files); anything reaching for it is
             # out-of-contract.
             return {"vcs", "destructive"}
-        if sub == "push" and _has_flag(args, "--force", "-f") \
-                and not _has_flag(args, "--force-with-lease"):
-            return {"vcs", "network", "destructive"}  # lease-less force push
+        if sub == "push":
+            forced_flag = _has_flag(args, "--force", "-f") \
+                and not _has_flag(args, "--force-with-lease")
+            forced_refspec = any(p.startswith("+") for p in pos[1:])
+            if forced_flag or forced_refspec:
+                return {"vcs", "network", "destructive"}  # lease-less force push
+            return {"vcs", "network"}
         if sub in _GIT_NETWORK:
             return {"vcs", "network"}
-        if sub in _GIT_READ and "-d" not in low and "-D" not in args:
+        if sub in _GIT_READ and "-D" not in args and "-d" not in args:
             return {"vcs", "read_only"}
-        # checkout --force / reset / branch -D etc. are the rollback machinery.
+        # checkout --force / reset / branch -D etc.: the rollback machinery,
+        # scoped to the repo the user pointed the tool at (see module doc).
         return {"vcs"}
 
     if exe in ("npm", "yarn", "pnpm", "bun"):
-        sub = next((a for a in args if not a.startswith("-")), "").lower()
-        if sub == "publish":
+        pos = [p for p in _positionals(args, _NPM_VALUE_OPTS)]
+        low = [p.lower() for p in pos]
+        sub = low[0] if low else ""
+        # `publish` anywhere outside a `run <script>` invocation is a deploy,
+        # regardless of what options precede it (--prefix etc.).
+        if sub != "run" and "publish" in low:
             return {"deploy", "network"}
         if sub in ("install", "i", "ci", "add", "update", "upgrade"):
             return {"install", "network"}
         if sub == "run":
-            positional = [a for a in args if not a.startswith("-")]
-            script = positional[1].lower() if len(positional) > 1 else ""
+            script = low[1] if len(low) > 1 else ""
             if script.startswith(("deploy", "publish", "release")):
                 return {"deploy", "network"}
             if "test" in script or script in ("unit", "e2e", "smoke", "ci"):
@@ -126,12 +190,21 @@ def classify_command(cmd: list[str]) -> set[str]:
             return {"build"}
         if sub in ("test", "t"):
             return {"test"}
+        if exe == "npm" and sub == "exec":
+            rest = pos[1:]
+            if rest:
+                return classify_command(rest) | {"network"}
+            return {"install", "network"}
         return {"unknown"}
     if exe == "npx":
-        # npx may download the tool it runs -> network; playwright is the one
-        # runner FlexFactor drives through it.
-        if _has_flag(args, "playwright") or any("playwright" in a.lower() for a in args):
-            return {"test", "network"}
+        # npx downloads-and-runs a tool: classify the TOOL it launches (so
+        # `npx vercel deploy` is a deploy, not a benign install) plus network.
+        pos = _positionals(args, {"-p", "--package", "-c", "--call"})
+        if pos:
+            if pos[0].lower() == "playwright":
+                return {"test", "network"}
+            inner = classify_command(pos)
+            return (inner - {"unknown"} or {"install"}) | {"network"}
         return {"install", "network"}
 
     if exe in ("pytest", "unittest", "vitest", "jest"):

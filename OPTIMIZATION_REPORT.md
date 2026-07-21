@@ -154,12 +154,40 @@ Diagnosis of the pre-existing gaps:
 
 ## Verification evidence
 
-- `python flexfactor_tests.py`: **232 OK / 7 skipped** (was 209/7; +23 tests:
-  5 cmdpolicy, 8 verdict/evidence, 5 policy-file/approval, 3 eval-fixture,
-  2 end-to-end).
+- `python flexfactor_tests.py`: **237 OK / 7 skipped** (was 209/7; +28 tests).
 - `python flexfactor_dashboard.py --selftest`: PASS.
 - `py_compile` clean on `flexfactor.py` + `flexfactor_cmdpolicy.py`.
-- Adversarial review (Sol, gpt-5.6-sol): see commit history for verdicts.
+- Adversarial review (Sol, gpt-5.6-sol) cycle 1: FIX FIRST(6). All six
+  addressed in the follow-up commit:
+  1. Verification-executes-candidate-code: resolved as **informed consent** —
+     the per-candidate approval card and verdict notes now disclose that the
+     build-verify gate runs the project's own build with the generated files
+     applied (skipping verification would break the build-gate invariant; the
+     consent now covers it explicitly).
+  2. Classifier launder paths closed: `npx <tool>` classifies the tool it
+     launches; git global value-options (`-C`/`-c`/...) are skipped when
+     finding the subcommand; forced refspecs (`+HEAD:main`) = lease-less
+     force push; `npm --prefix ... publish` and `npm exec` handled; shell
+     interpreters with inline-command flags are high-risk; docker
+     prune/rm/rmi destructive. In-repo `git reset/checkout --force/branch -D`
+     stay `vcs` by documented design (rollback machinery; blast radius = the
+     user-chosen repo).
+  3. Model-produced package specs validated against a strict registry-shape
+     regex (no options/paths/URLs/git specs) and passed after `--` so npm can
+     never parse one as an option.
+  4. Chokepoint scope stated precisely: the three non-`_run` Popen sites
+     (Repo Rewards launcher, dashboard, .lnk resolution) are owner-owned
+     constants with zero model/candidate influence — documented in the module
+     docstring instead of over-claiming "every subprocess".
+  5. The reviewed policy file now authorizes non-interactive automation: the
+     blanket confirm consults `auto_approve` before the no-TTY refusal, and
+     every candidate is still individually gated by `_policy_approves`.
+  6. Weak tests replaced/strengthened: the audit report-only test now pins
+     the production gate expression + its guards; the E2E exercises the real
+     npm install command shape (`--ignore-scripts`, `--`, spec ordering) via
+     a spying `_run`; characterization extended with the wrapper/indirection
+     block cases.
+- Sol cycle 2+: see commit history for final verdict.
 
 ## Roadmap
 

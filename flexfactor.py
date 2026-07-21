@@ -2175,6 +2175,23 @@ def generate_integration(provider, project_dir: str, profile_blob: str,
     return patch, plan.get("plan", "")
 
 
+# Strict npm registry package spec: optional @scope/, a plain name, optional
+# @version/tag/range. Explicitly EXCLUDES anything option-like (leading -),
+# paths (/ \ . ~ prefixes), URLs (://), git specs and whitespace - model output
+# must never be able to smuggle an npm OPTION or an out-of-repo install target
+# through the packages list.
+_NPM_SPEC_RX = re.compile(
+    r"^(@[a-z0-9][a-z0-9._-]*/)?"          # optional @scope/
+    r"[a-z0-9][a-z0-9._-]*"                # package name
+    r"(@[a-zA-Z0-9^~><=.+\-*]{1,64})?$",   # optional @version/tag/range
+    re.IGNORECASE)
+
+
+def _valid_npm_spec(spec) -> bool:
+    s = str(spec or "").strip()
+    return bool(s) and len(s) <= 214 and bool(_NPM_SPEC_RX.match(s))
+
+
 def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> ApplyResult:
     """Apply a generated patch with a build-gated, reversible workflow.
 
@@ -2268,12 +2285,21 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
         # (preinstall/postinstall = arbitrary code execution from the network)
         # are blocked with --ignore-scripts unless the owner explicitly granted
         # execution with --allow-scripts. This is the enforcement half of the
-        # safe_to_execute verdict.
+        # safe_to_execute verdict. Package names are MODEL OUTPUT: each must
+        # match a strict registry-spec shape (no options, paths, URLs or git
+        # specs), and they are passed after `--` so npm can never parse one as
+        # an option (e.g. `--prefix=..` escaping the repo + rollback + manifest).
         allow_scripts = bool(getattr(opts, "allow_scripts", False))
         if packages and is_node:
-            install_cmd = ["npm", "install", *packages]
+            bad = [p for p in packages if not _valid_npm_spec(p)]
+            if bad:
+                raise ApplyError(f"refused unsafe package spec(s) from the generated "
+                                 f"plan: {bad!r} (only plain registry names, optionally "
+                                 "@scoped and @versioned, are installable)")
+            install_cmd = ["npm", "install"]
             if not allow_scripts:
                 install_cmd.append("--ignore-scripts")
+            install_cmd += ["--", *packages]
             print(f"    installing: {', '.join(packages)}"
                   + ("" if allow_scripts else "  [lifecycle scripts blocked]"))
             r = _run(install_cmd, project_dir, timeout=900)
@@ -2648,6 +2674,10 @@ def candidate_verdicts(evidence: dict) -> dict:
         reasons.append("execution-risk indicators: " + ", ".join(exec_flags))
     reasons.append("execution requires explicit --allow-scripts (lifecycle "
                    "scripts stay blocked by default)")
+    reasons.append("NOTE: if this candidate is APPROVED for apply, the "
+                   "build-verify gate runs the project's own build with the "
+                   "generated files applied - that execution is part of what "
+                   "the per-candidate approval covers")
     return {"safe_to_inspect": inspect_v,
             "safe_to_integrate": integrate,
             "safe_to_execute": execute,
@@ -2771,7 +2801,8 @@ def run_scout(args) -> int:
     #    scout run silently changing/committing a repo.
     applied: list[ApplyResult] = []
     if getattr(args, "apply", False):
-        if _confirm_scout_apply(args, evaluations):
+        apply_dir = resolve_project_dir(args.program, profile_name)
+        if _confirm_scout_apply(args, evaluations, apply_dir):
             applied = _apply_phase(args, profile_name, profile, evaluations, provider)
         else:
             print("\nApply cancelled - report only. (Re-run with --apply --yes to skip this prompt.)")
@@ -2807,10 +2838,11 @@ def _profile_blob(profile_name: str, profile: dict) -> str:
     )
 
 
-def _confirm_scout_apply(args, evaluations: list[dict]) -> bool:
+def _confirm_scout_apply(args, evaluations: list[dict],
+                         project_dir: str | None = None) -> bool:
     """Require an explicit yes before scout mutates a repository. --yes (or a
-    non-interactive stdin) proceeds without prompting; a dry-run never needs it.
-    Returns True to proceed with the apply phase."""
+    reviewed project policy file with auto_approve) proceeds without prompting;
+    a dry-run never needs it. Returns True to proceed with the apply phase."""
     if getattr(args, "dry_run", False):
         return True  # dry-run changes nothing; no confirmation needed
     targets = [e for e in evaluations if _qualifies_for_apply(e, args.apply_tier)]
@@ -2819,6 +2851,16 @@ def _confirm_scout_apply(args, evaluations: list[dict]) -> bool:
         return True  # nothing qualifies; apply phase will no-op and report
     if getattr(args, "assume_yes", False):
         return True
+    # A reviewed project policy file can authorize NON-INTERACTIVE automation:
+    # auto_approve lets the run reach the per-candidate stage, where
+    # _policy_approves still gates EVERY candidate on verdict + license
+    # allowlist. Without it, no TTY still fails safe below.
+    if project_dir:
+        policy = _load_scout_policy(project_dir)
+        if policy is not None and policy.get("auto_approve") is True:
+            print(f"\n--apply authorized by {SCOUT_POLICY_FILE} "
+                  "(per-candidate policy checks still apply).")
+            return True
     print("\n" + "!" * 70)
     print(f"  --apply will MODIFY the program's repository: generate and commit "
           f"{n} integration(s)")
@@ -2888,6 +2930,9 @@ def _candidate_approval_summary(evaluation: dict, args) -> str:
         "  Installs:  npm --ignore-scripts"
         + (" OVERRIDDEN by --allow-scripts (lifecycle scripts WILL run)"
            if getattr(args, "allow_scripts", False) else " (lifecycle scripts blocked)"),
+        "  Verify:    the project's own build/lint runs WITH the generated "
+        "files applied (approving this candidate consents to that execution; "
+        "a failing build is rolled back)",
         f"  Rollback:  {ev.get('rollback_plan')}",
     ]
     if v.get("reasons"):
