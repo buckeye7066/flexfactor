@@ -276,11 +276,14 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIn(".gitignore", tree)  # tracked dotFILE stays visible
             self.assertNotIn("stale-copy/app.js", tree)
 
-    def test_embedded_repo_files_stay_visible(self):
-        # Sol finding 2: `git ls-files` lists an untracked embedded repo as a
-        # single 'embedded/' entry, never its descendants. Exact membership
-        # would hide every file inside it; _git_visible's ancestor check must
-        # keep them visible in BOTH the scout tree and the audit enumerator.
+    def test_embedded_repo_scout_visible_audit_excluded(self):
+        # Sol cycle-1 finding 2 + cycle-2 findings 1/2: `git ls-files` lists an
+        # untracked embedded repo as a single 'embedded/' entry, never its
+        # descendants. SCOUT (_file_tree, prompt-context only) must show the
+        # inner repo's real files while honoring the INNER repo's own ignore
+        # rules. AUDIT (_enumerate_source_files) must EXCLUDE nested-repo
+        # contents entirely: a fix there escapes the outer sandbox branch's
+        # commit/rollback boundary.
         import subprocess
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,16 +291,24 @@ class GitAwareEnumerationTests(unittest.TestCase):
             if ff._git_real_files(tmp) is None:
                 self.skipTest("git unavailable")
             inner = os.path.join(tmp, "embedded")
-            os.makedirs(inner)
+            os.makedirs(os.path.join(inner, "junk"))
             subprocess.run(["git", "init", "-q", inner], capture_output=True)
             with open(os.path.join(inner, "real.js"), "w", encoding="utf-8") as fh:
                 fh.write("console.log('embedded');\n")
+            with open(os.path.join(inner, ".gitignore"), "w", encoding="utf-8") as fh:
+                fh.write("junk/\n")
+            with open(os.path.join(inner, "junk", "ignored.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('ignored');\n")
             tree = [p.replace("\\", "/") for p in ff._file_tree(tmp)]
             self.assertIn("embedded/real.js", tree)
+            # Inner repo's OWN gitignore is honored - not resurrected by the
+            # ancestor admission.
+            self.assertNotIn("embedded/junk/ignored.js", tree)
             files = [p.replace("\\", "/") for p in
                      ff._enumerate_source_files(tmp, max_files=0)]
-            self.assertIn("embedded/real.js", files)
-            # The gitignored stale copy stays hidden even with the new checks.
+            self.assertNotIn("embedded/real.js", files)
+            self.assertNotIn("embedded/junk/ignored.js", files)
+            # The outer gitignored stale copy stays hidden everywhere.
             self.assertNotIn("stale-copy/app.js", tree)
             self.assertNotIn("stale-copy/app.js", files)
 

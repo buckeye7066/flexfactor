@@ -1605,9 +1605,11 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     # _SKIP_DIRS but would otherwise eat the max_entries budget with duplicate
     # paths and dilute the scout profile. None (not a git repo / git failed)
     # keeps the walk-only filters. Membership goes through _git_visible so
-    # embedded repos / submodules / Windows case drift are not wrongly hidden.
+    # embedded repos / submodules / Windows case drift are not wrongly hidden,
+    # while each nested subtree's own ignore rules are still honored.
     git_files = _git_real_files(root)
     git_norm = _git_norm_set(git_files) if git_files is not None else None
+    subtree_cache: dict[str, set[str] | None] = {}
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune noise/hidden AND reparse-point dirs (symlinks POSIX+Windows, PLUS Windows
@@ -1626,7 +1628,8 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
             if _is_reparse(os.path.join(dirpath, f)):
                 continue  # don't surface a symlinked/reparse-point file's name either
             rel_f = os.path.join(rel, f) if rel != "." else f
-            if git_norm is not None and not _git_visible(rel_f, git_norm):
+            if git_norm is not None and not _git_visible(rel_f, git_norm, root,
+                                                         subtree_cache):
                 continue  # gitignored per the repo's own rules (stale copies, artifacts)
             out.append(rel_f)
             if len(out) >= max_entries:
@@ -3541,25 +3544,53 @@ def _git_real_files(project_dir: str) -> set[str] | None:
     return {p.replace("\\", "/") for p in r.stdout.split("\0") if p}
 
 
+def _git_norm_path(p: str) -> str:
+    """Forward-slash + os.path.normcase a rel path so a case-insensitive
+    filesystem (Windows) can't hide a tracked file whose on-disk case drifted
+    from the index. Identity (case-sensitive) on POSIX."""
+    return os.path.normcase(p).replace("\\", "/")
+
+
 def _git_norm_set(git_files: set[str]) -> set[str]:
     """Normalize a _git_real_files set for membership tests: forward slashes,
     trailing '/' stripped (an untracked embedded repo is listed as 'embedded/'),
-    and os.path.normcase so a case-insensitive filesystem (Windows) can't hide a
-    tracked file whose on-disk case drifted from the index."""
-    return {os.path.normcase(p).replace("\\", "/").rstrip("/") for p in git_files}
+    and os.path.normcase (see _git_norm_path)."""
+    return {_git_norm_path(p).rstrip("/") for p in git_files}
 
 
-def _git_visible(relslash: str, git_norm: set[str]) -> bool:
-    """True when a walked path is real per git: the path itself is a git entry,
-    OR an ANCESTOR directory is one. `git ls-files` never lists the descendants
-    of an untracked embedded repo (entry 'embedded/') or a tracked submodule
-    (gitlink entry 'embedded'), so exact membership alone would wrongly hide
-    every file inside them."""
-    rf = os.path.normcase(relslash).replace("\\", "/")
+def _git_visible(rel_f: str, git_norm: set[str], root: str,
+                 subtree_cache: dict[str, set[str] | None]) -> bool:
+    """True when a walked path is real per git (SCOUT prompt-context listing).
+    Exact membership first; otherwise the NEAREST ancestor that is itself a git
+    entry (untracked embedded repo listed as 'embedded/', tracked submodule
+    gitlink 'embedded' - `git ls-files` never lists their descendants) delegates
+    to THAT subtree's own git view: _git_real_files run AT the ancestor honors
+    the inner repo's (or, for a plain directory, the outer repo's) ignore rules,
+    so embedded-repo files stay visible WITHOUT resurrecting their ignored
+    files. Fails open (visible) only when git itself fails for an admitted
+    subtree. `subtree_cache` is keyed by absolute subtree path and must persist
+    across calls within one walk (one git invocation per subtree, not per file).
+
+    NOT used by the audit enumerator: audit fixes must stay commit/rollback-able
+    on the OUTER repo's sandbox branch, so nested-repo contents are excluded
+    there by exact membership (see _enumerate_source_files)."""
+    rf = _git_norm_path(rel_f)
     if rf in git_norm:
         return True
     parts = rf.split("/")
-    return any("/".join(parts[:i]) in git_norm for i in range(1, len(parts)))
+    for i in range(len(parts) - 1, 0, -1):
+        if "/".join(parts[:i]) not in git_norm:
+            continue
+        sub_root = os.path.join(root, *parts[:i])
+        key = os.path.normcase(sub_root)
+        if key not in subtree_cache:
+            inner = _git_real_files(sub_root)
+            subtree_cache[key] = _git_norm_set(inner) if inner is not None else None
+        inner_norm = subtree_cache[key]
+        if inner_norm is None:
+            return True  # git failed for this subtree: fail open like non-git roots
+        return _git_visible("/".join(parts[i:]), inner_norm, sub_root, subtree_cache)
+    return False
 
 
 def _enumerate_source_files(project_dir: str, max_files: int,
@@ -3595,8 +3626,15 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 continue
             rel = os.path.relpath(full, project_dir)
             relslash = rel.replace("\\", "/")
-            if git_norm is not None and not _git_visible(relslash, git_norm):
-                continue  # gitignored per the repo's own rules (stale copies, artifacts)
+            if git_norm is not None and _git_norm_path(relslash) not in git_norm:
+                # Gitignored per the repo's own rules (stale copies, artifacts).
+                # EXACT membership on purpose: descendants of a nested repo /
+                # tracked submodule are also excluded here, because a fix inside
+                # one could be neither staged by the outer `git add -A` nor
+                # reverted by an outer branch switch - it would escape the audit
+                # sandbox branch's commit/rollback boundary. (The scout listing
+                # _file_tree, which never mutates, DOES descend via _git_visible.)
+                continue
             if include and not any(p in relslash for p in include):
                 continue
             if exclude and any(p in relslash for p in exclude):
