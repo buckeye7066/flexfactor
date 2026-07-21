@@ -1600,6 +1600,12 @@ def _read_text_safe(path: str, limit: int = 4000) -> str:
 def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     """A shallow, noise-filtered listing so the model sees the program's shape
     without drowning in node_modules."""
+    # Same git-aware filter as the audit enumerator (_git_real_files): a
+    # gitignored stale self-copy (e.g. GrantFlow-public-audit/) isn't in
+    # _SKIP_DIRS but would otherwise eat the max_entries budget with duplicate
+    # paths and dilute the scout profile. None (not a git repo / git failed)
+    # keeps the walk-only filters.
+    git_files = _git_real_files(root)
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune noise/hidden AND reparse-point dirs (symlinks POSIX+Windows, PLUS Windows
@@ -1617,7 +1623,10 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
         for f in filenames:
             if _is_reparse(os.path.join(dirpath, f)):
                 continue  # don't surface a symlinked/reparse-point file's name either
-            out.append(os.path.join(rel, f) if rel != "." else f)
+            rel_f = os.path.join(rel, f) if rel != "." else f
+            if git_files is not None and rel_f.replace("\\", "/") not in git_files:
+                continue  # gitignored per the repo's own rules (stale copies, artifacts)
+            out.append(rel_f)
             if len(out) >= max_entries:
                 return out
     return out
@@ -5758,8 +5767,34 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
     return _safe_report_write(project_dir, report_name, "\n".join(L))
 
 
+_TOP_LEVEL_USAGE = """\
+usage: flexfactor [-h] {refactor,scout,audit} ...
+
+FlexFactor - local, build-gated, budget-capped dual-provider code tool.
+
+modes:
+  refactor   Self-grading rewrite loop on ONE source file (the default: any
+             invocation whose first argument is not a mode name, e.g.
+             `flexfactor --file f.py --goal "..."`, runs refactor).
+  scout      Profile a program and search Repo Rewards for repos that would
+             benefit it (report-only by default; --apply to integrate).
+  audit      Aggressive line-by-line defect hunt + auto-fix across a whole
+             project (report-only by default; --apply to fix).
+
+Run `flexfactor <mode> --help` (e.g. `flexfactor scout --help`) for that
+mode's full options."""
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
+    # rewrite below would turn `flexfactor --help` into `flexfactor refactor
+    # --help`, hiding the scout/audit modes entirely. Only the FIRST token is
+    # intercepted, so `refactor --help` / `scout --help` / `audit --help` and a
+    # later `--help` among real refactor args still reach argparse unchanged.
+    if argv and argv[0] in ("-h", "--help"):
+        print(_TOP_LEVEL_USAGE)
+        return 0
     # Backward compatibility: the original CLI had no subcommand (just --file/--goal).
     # If the first token isn't a known mode, assume the classic "refactor" mode.
     if not argv or argv[0] not in ("refactor", "scout", "audit"):

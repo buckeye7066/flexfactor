@@ -262,6 +262,30 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIn("src/app.js", slashed)
             self.assertNotIn("stale-copy/app.js", slashed)
 
+    def test_scout_file_tree_skips_gitignored_copy(self):
+        # Scout's program profiler must honor the same git-aware filter as the
+        # audit enumerator: a gitignored stale self-copy must not eat the
+        # max_entries prompt budget.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_repo(tmp)
+            if ff._git_real_files(tmp) is None:
+                self.skipTest("git unavailable")
+            tree = [p.replace("\\", "/") for p in ff._file_tree(tmp)]
+            self.assertIn("src/app.js", tree)
+            self.assertIn(".gitignore", tree)  # tracked dotFILE stays visible
+            self.assertNotIn("stale-copy/app.js", tree)
+
+    def test_scout_file_tree_non_git_falls_back_to_walk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "app.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('x');\n")
+            self.assertIsNone(ff._git_real_files(tmp))
+            self.assertEqual([p.replace("\\", "/") for p in ff._file_tree(tmp)],
+                             ["src/app.js"])
+
     def test_flexfactor_can_review_itself(self):
         # Regression guard: the old 200k size cap silently excluded
         # flexfactor.py (212k) from any audit of this repo - a permanent
@@ -676,6 +700,67 @@ class AuditApplyDefaultTests(unittest.TestCase):
             apply = False
             dry_run = False
         self.assertTrue(not A.apply or A.dry_run)
+
+
+class TopLevelHelpTests(unittest.TestCase):
+    """Defect: the implicit-refactor argv rewrite turned `flexfactor --help` into
+    `flexfactor refactor --help`, hiding the scout/audit modes. Top-level --help/-h
+    must list ALL THREE modes and point to per-mode --help."""
+
+    def _capture_help(self, argv):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ff.main(argv)
+        return rc, buf.getvalue()
+
+    def test_top_level_help_lists_all_three_modes(self):
+        for flag in ("--help", "-h"):
+            rc, out = self._capture_help([flag])
+            self.assertEqual(rc, 0, f"{flag} must exit 0")
+            for mode in ("refactor", "scout", "audit"):
+                self.assertIn(mode, out, f"{flag} output must mention '{mode}'")
+            # Must point users at each mode's own detailed help.
+            self.assertIn("--help", out)
+
+    def test_mode_level_help_still_reaches_argparse(self):
+        # `scout --help` must remain the mode parser's help (mentions --program),
+        # not the new top-level usage.
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                ff.main(["scout", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("--program", buf.getvalue())
+
+    def test_implicit_refactor_untouched_for_real_args(self):
+        # A classic no-subcommand invocation must still route to refactor and
+        # accept "--help" as a literal --goal VALUE (not intercepted: it isn't
+        # the first token; `--goal=--help` is argparse's literal-value form).
+        real = ff.run
+        cap = {}
+        ff.run = lambda a: cap.__setitem__("args", a) or 0
+        try:
+            rc = ff.main(["--file", "x.py", "--goal=--help"])
+        finally:
+            ff.run = real
+        self.assertEqual(rc, 0)
+        self.assertEqual(cap["args"].file, "x.py")
+        self.assertEqual(cap["args"].goal, "--help")
+
+    def test_empty_argv_still_errors_via_refactor_parser(self):
+        # Bare `flexfactor` keeps the legacy behavior: refactor parser demands
+        # --file/--goal and argparse exits 2 (usage error), not the help page.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                ff.main([])
+        self.assertEqual(cm.exception.code, 2)
 
 
 class ParallelReviewBudgetTests(unittest.TestCase):
