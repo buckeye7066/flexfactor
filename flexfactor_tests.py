@@ -312,6 +312,33 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertNotIn("stale-copy/app.js", tree)
             self.assertNotIn("stale-copy/app.js", files)
 
+    def test_all_ignored_subtree_is_empty_set_not_fail_open(self):
+        # Sol cycle-3 finding: `git ls-files` succeeding with ZERO visible files
+        # (everything ignored, e.g. via .git/info/exclude) is a real answer -
+        # an EMPTY SET - not a git failure. Conflating it with None (fail open)
+        # exposed the subtree's ignored files in the scout listing.
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_repo(tmp)
+            if ff._git_real_files(tmp) is None:
+                self.skipTest("git unavailable")
+            inner = os.path.join(tmp, "embedded")
+            os.makedirs(inner)
+            subprocess.run(["git", "init", "-q", inner], capture_output=True)
+            # Ignore the inner repo's ONLY file via info/exclude (no visible
+            # .gitignore), so inner ls-files succeeds with empty output.
+            with open(os.path.join(inner, ".git", "info", "exclude"), "a",
+                      encoding="utf-8") as fh:
+                fh.write("ignored.js\n")
+            with open(os.path.join(inner, "ignored.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('ignored');\n")
+            got = ff._git_real_files(inner)
+            self.assertEqual(got, set())  # empty SET, not None
+            tree = [p.replace("\\", "/") for p in ff._file_tree(tmp)]
+            self.assertNotIn("embedded/ignored.js", tree)
+            self.assertIn("src/app.js", tree)  # outer files unaffected
+
     def test_case_drift_does_not_hide_tracked_file(self):
         # Sol finding 3: on a case-insensitive filesystem (Windows) the index
         # can say 'Camel.js' while the disk says 'camel.js'. normcase on both

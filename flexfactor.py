@@ -3539,9 +3539,13 @@ def _git_real_files(project_dir: str) -> set[str] | None:
     if not _is_git_repo(project_dir):
         return None
     r = _git(["ls-files", "-z", "-co", "--exclude-standard"], project_dir)
-    if r.returncode != 0 or not (r.stdout or "").strip("\0\n "):
+    if r.returncode != 0:
         return None
-    return {p.replace("\\", "/") for p in r.stdout.split("\0") if p}
+    # A SUCCESSFUL empty listing is a real answer (every file in this tree is
+    # ignored - e.g. via .git/info/exclude) and must be an EMPTY SET, not None:
+    # None means "git failed, fail open to walk-only", and conflating the two
+    # would expose a subtree's ignored files.
+    return {p.replace("\\", "/") for p in (r.stdout or "").split("\0") if p.strip()}
 
 
 def _git_norm_path(p: str) -> str:
