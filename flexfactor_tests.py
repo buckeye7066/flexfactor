@@ -276,6 +276,53 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIn(".gitignore", tree)  # tracked dotFILE stays visible
             self.assertNotIn("stale-copy/app.js", tree)
 
+    def test_embedded_repo_files_stay_visible(self):
+        # Sol finding 2: `git ls-files` lists an untracked embedded repo as a
+        # single 'embedded/' entry, never its descendants. Exact membership
+        # would hide every file inside it; _git_visible's ancestor check must
+        # keep them visible in BOTH the scout tree and the audit enumerator.
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_repo(tmp)
+            if ff._git_real_files(tmp) is None:
+                self.skipTest("git unavailable")
+            inner = os.path.join(tmp, "embedded")
+            os.makedirs(inner)
+            subprocess.run(["git", "init", "-q", inner], capture_output=True)
+            with open(os.path.join(inner, "real.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('embedded');\n")
+            tree = [p.replace("\\", "/") for p in ff._file_tree(tmp)]
+            self.assertIn("embedded/real.js", tree)
+            files = [p.replace("\\", "/") for p in
+                     ff._enumerate_source_files(tmp, max_files=0)]
+            self.assertIn("embedded/real.js", files)
+            # The gitignored stale copy stays hidden even with the new checks.
+            self.assertNotIn("stale-copy/app.js", tree)
+            self.assertNotIn("stale-copy/app.js", files)
+
+    def test_case_drift_does_not_hide_tracked_file(self):
+        # Sol finding 3: on a case-insensitive filesystem (Windows) the index
+        # can say 'Camel.js' while the disk says 'camel.js'. normcase on both
+        # sides must keep the file visible. (On case-sensitive POSIX the rename
+        # makes camel.js untracked-but-not-ignored, visible via ls-files -o, so
+        # the assertion holds on every platform.)
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._make_repo(tmp)
+            if ff._git_real_files(tmp) is None:
+                self.skipTest("git unavailable")
+            with open(os.path.join(tmp, "Camel.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log('camel');\n")
+            subprocess.run(["git", "-C", tmp, "add", "Camel.js"], capture_output=True)
+            os.rename(os.path.join(tmp, "Camel.js"), os.path.join(tmp, "camel.js"))
+            tree_lower = [p.replace("\\", "/").lower() for p in ff._file_tree(tmp)]
+            self.assertIn("camel.js", tree_lower)
+            files_lower = [p.replace("\\", "/").lower() for p in
+                           ff._enumerate_source_files(tmp, max_files=0)]
+            self.assertIn("camel.js", files_lower)
+
     def test_scout_file_tree_non_git_falls_back_to_walk(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -736,10 +783,26 @@ class TopLevelHelpTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
         self.assertIn("--program", buf.getvalue())
 
+    def test_help_mixed_with_legacy_flags_reaches_refactor_argparse(self):
+        # Sol finding 1: only a STANDALONE -h/--help is intercepted. Mixed with
+        # legacy refactor flags it must keep the pre-fix behavior: implicit
+        # refactor -> argparse prints REFACTOR help (SystemExit 0, mentions
+        # --goal), not the top-level modes page.
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                ff.main(["-h", "--file", "x.py", "--goal", "g"])
+        self.assertEqual(cm.exception.code, 0)
+        out = buf.getvalue()
+        self.assertIn("--goal", out)
+        self.assertNotIn("modes:", out)
+
     def test_implicit_refactor_untouched_for_real_args(self):
         # A classic no-subcommand invocation must still route to refactor and
-        # accept "--help" as a literal --goal VALUE (not intercepted: it isn't
-        # the first token; `--goal=--help` is argparse's literal-value form).
+        # accept "--help" as a literal --goal VALUE (not intercepted: the help
+        # flag is not standalone; `--goal=--help` is argparse's literal form).
         real = ff.run
         cap = {}
         ff.run = lambda a: cap.__setitem__("args", a) or 0

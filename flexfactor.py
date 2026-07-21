@@ -1604,8 +1604,10 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     # gitignored stale self-copy (e.g. GrantFlow-public-audit/) isn't in
     # _SKIP_DIRS but would otherwise eat the max_entries budget with duplicate
     # paths and dilute the scout profile. None (not a git repo / git failed)
-    # keeps the walk-only filters.
+    # keeps the walk-only filters. Membership goes through _git_visible so
+    # embedded repos / submodules / Windows case drift are not wrongly hidden.
     git_files = _git_real_files(root)
+    git_norm = _git_norm_set(git_files) if git_files is not None else None
     out: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune noise/hidden AND reparse-point dirs (symlinks POSIX+Windows, PLUS Windows
@@ -1624,7 +1626,7 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
             if _is_reparse(os.path.join(dirpath, f)):
                 continue  # don't surface a symlinked/reparse-point file's name either
             rel_f = os.path.join(rel, f) if rel != "." else f
-            if git_files is not None and rel_f.replace("\\", "/") not in git_files:
+            if git_norm is not None and not _git_visible(rel_f, git_norm):
                 continue  # gitignored per the repo's own rules (stale copies, artifacts)
             out.append(rel_f)
             if len(out) >= max_entries:
@@ -3539,6 +3541,27 @@ def _git_real_files(project_dir: str) -> set[str] | None:
     return {p.replace("\\", "/") for p in r.stdout.split("\0") if p}
 
 
+def _git_norm_set(git_files: set[str]) -> set[str]:
+    """Normalize a _git_real_files set for membership tests: forward slashes,
+    trailing '/' stripped (an untracked embedded repo is listed as 'embedded/'),
+    and os.path.normcase so a case-insensitive filesystem (Windows) can't hide a
+    tracked file whose on-disk case drifted from the index."""
+    return {os.path.normcase(p).replace("\\", "/").rstrip("/") for p in git_files}
+
+
+def _git_visible(relslash: str, git_norm: set[str]) -> bool:
+    """True when a walked path is real per git: the path itself is a git entry,
+    OR an ANCESTOR directory is one. `git ls-files` never lists the descendants
+    of an untracked embedded repo (entry 'embedded/') or a tracked submodule
+    (gitlink entry 'embedded'), so exact membership alone would wrongly hide
+    every file inside them."""
+    rf = os.path.normcase(relslash).replace("\\", "/")
+    if rf in git_norm:
+        return True
+    parts = rf.split("/")
+    return any("/".join(parts[:i]) in git_norm for i in range(1, len(parts)))
+
+
 def _enumerate_source_files(project_dir: str, max_files: int,
                             include: list[str] | None = None,
                             exclude: list[str] | None = None,
@@ -3551,6 +3574,7 @@ def _enumerate_source_files(project_dir: str, max_files: int,
     stopped instead of re-reviewing finished files."""
     skip_clean = skip_clean or set()
     git_files = _git_real_files(project_dir)
+    git_norm = _git_norm_set(git_files) if git_files is not None else None
     out: list[tuple[str, int]] = []
     for dirpath, dirnames, filenames in os.walk(project_dir):
         # Prune noise/hidden dirs AND reparse-point dirs (symlinks + Windows junctions/
@@ -3571,7 +3595,7 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 continue
             rel = os.path.relpath(full, project_dir)
             relslash = rel.replace("\\", "/")
-            if git_files is not None and relslash not in git_files:
+            if git_norm is not None and not _git_visible(relslash, git_norm):
                 continue  # gitignored per the repo's own rules (stale copies, artifacts)
             if include and not any(p in relslash for p in include):
                 continue
@@ -5789,10 +5813,11 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
     # rewrite below would turn `flexfactor --help` into `flexfactor refactor
-    # --help`, hiding the scout/audit modes entirely. Only the FIRST token is
-    # intercepted, so `refactor --help` / `scout --help` / `audit --help` and a
-    # later `--help` among real refactor args still reach argparse unchanged.
-    if argv and argv[0] in ("-h", "--help"):
+    # --help`, hiding the scout/audit modes entirely. ONLY a STANDALONE help
+    # flag is intercepted: `flexfactor -h --file x --goal g` (help mixed with
+    # legacy refactor flags), `refactor/scout/audit --help`, and a later
+    # `--help` among real args all still reach argparse unchanged.
+    if len(argv) == 1 and argv[0] in ("-h", "--help"):
         print(_TOP_LEVEL_USAGE)
         return 0
     # Backward compatibility: the original CLI had no subcommand (just --file/--goal).
