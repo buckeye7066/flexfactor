@@ -67,8 +67,23 @@ exotic goal-irrelevant residuals; accept+document them instead).
 - Scout: `run_scout` → repo-rewards service (localhost:3000, auto-started from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1`) → `generate_integration` /
   `apply_integration` with `_rollback`
+- Scout safety (2026-07-21): per-candidate `build_evidence_matrix` +
+  `candidate_verdicts` — THREE deterministic verdicts (safe_to_inspect /
+  safe_to_integrate / safe_to_execute), fail-closed on unknowns;
+  `_qualifies_for_apply` hard-gates on safe_to_integrate (LLM/repo text can
+  never reach apply alone). `_injection_scan`/`_execution_risk_scan` feed the
+  gate; `_approve_candidate` = per-candidate approval (dry-run / --yes /
+  reviewed `.flexfactor-scout-policy.json` / TTY prompt; else skip).
+  npm installs run `--ignore-scripts` unless `--allow-scripts`;
+  `ApplyResult.manifest` records files/deps delta + script policy.
+  Eval corpus: `eval_fixtures/scout_candidates.json` (zero unsafe
+  false-negatives is a hard test invariant).
 - Subprocess chokepoint: `_run` + `_winify` (PATHEXT-aware; npm/npx are .cmd shims —
   removing _winify breaks every Node-repo audit with WinError 2). `_run` never raises.
+  COMMAND POLICY GATE: `flexfactor_cmdpolicy.py` classifies every command;
+  destructive/credentialed/deploy are refused (rc 126 +
+  `flexfactor_policy_blocked`) unless allowed via `FLEXFACTOR_ALLOW_CLASSES`
+  env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
 

@@ -59,6 +59,15 @@ import threading
 import time
 from dataclasses import dataclass
 
+# Command classification + policy gate for the _run subprocess chokepoint.
+# Sibling module (same directory); a HARD import on purpose - silently running
+# without the policy gate would fail open.
+try:
+    import flexfactor_cmdpolicy as _cmd_policy
+except ImportError:  # running as a spec-loaded module: try the file's own dir
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_cmdpolicy as _cmd_policy
+
 # Model defaults per provider. Claude Opus 4.8 is the strongest current Claude
 # model; override either with --model. This is the AUTHOR tier - used only where
 # the model writes code (whole-file rewrite, defect fix, integration, test-gen).
@@ -1891,6 +1900,7 @@ class ApplyResult:
     packages: list[str] | None = None
     commit_message: str | None = None
     post_steps: list[str] | None = None
+    manifest: dict | None = None  # before/after change manifest (files + deps + script policy)
 
 
 def _winify(cmd: list[str]) -> list[str]:
@@ -1929,6 +1939,17 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900) -> subprocess.CompletedPr
     def _fail(rc: int, out: str, err: str) -> subprocess.CompletedProcess:
         cp = subprocess.CompletedProcess(cmd, rc, out, err)
         cp.flexfactor_launch_error = True  # unambiguous: the process did not run to a real exit
+        return cp
+    # COMMAND CLASSIFICATION GATE (flexfactor_cmdpolicy): destructive /
+    # credentialed / deploy command classes are refused here at the single
+    # chokepoint unless the owner's policy explicitly allows them. The refusal
+    # keeps the never-raises contract: rc 126 + launch-error marker + an extra
+    # `flexfactor_policy_blocked` tag so callers/tests can tell policy from a
+    # missing executable.
+    ok, reason, _classes = _cmd_policy.command_allowed(cmd)
+    if not ok:
+        cp = _fail(126, "", f"[flexfactor-policy] {reason}")
+        cp.flexfactor_policy_blocked = True
         return cp
     try:
         return subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
@@ -2243,10 +2264,19 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
             if _write_contained(project_dir, f["path"], f["contents"]) is None:
                 raise ApplyError(f"could not safely write {f['path']!r} (escape/symlink swap)")
 
-        # Install dependencies.
+        # Install dependencies - ISOLATED by default: lifecycle scripts
+        # (preinstall/postinstall = arbitrary code execution from the network)
+        # are blocked with --ignore-scripts unless the owner explicitly granted
+        # execution with --allow-scripts. This is the enforcement half of the
+        # safe_to_execute verdict.
+        allow_scripts = bool(getattr(opts, "allow_scripts", False))
         if packages and is_node:
-            print(f"    installing: {', '.join(packages)}")
-            r = _run(["npm", "install", *packages], project_dir, timeout=900)
+            install_cmd = ["npm", "install", *packages]
+            if not allow_scripts:
+                install_cmd.append("--ignore-scripts")
+            print(f"    installing: {', '.join(packages)}"
+                  + ("" if allow_scripts else "  [lifecycle scripts blocked]"))
+            r = _run(install_cmd, project_dir, timeout=900)
             if r.returncode != 0:
                 raise ApplyError("npm install failed:\n" + _tail(r.stderr))
 
@@ -2258,6 +2288,34 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                 if r.returncode != 0:
                     raise ApplyError(f"verify '{' '.join(cmd)}' failed:\n"
                                      + _tail(r.stdout + "\n" + r.stderr))
+
+        # BEFORE/AFTER MANIFEST: exactly what this integration changed - files
+        # (from git's own view when available) and the dependency delta from the
+        # snapshotted package.json vs the post-install one - plus the lifecycle
+        # script policy in force. Recorded on the result + report so an applied
+        # integration is auditable after the fact.
+        def _deps_of(raw: bytes | str | None) -> dict:
+            try:
+                data = json.loads(raw if isinstance(raw, str) else (raw or b"{}").decode("utf-8"))
+                return {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
+            except (ValueError, UnicodeDecodeError):
+                return {}
+        deps_before = _deps_of(backups.get("package.json"))
+        deps_after = _deps_of(_read_bytes_contained(project_dir, "package.json"))
+        changed_files = sorted(file_list)
+        if git:
+            st = _git(["status", "--porcelain"], project_dir)
+            if st.returncode == 0:
+                changed_files = sorted({ln[3:].strip().strip('"') for ln in
+                                        st.stdout.splitlines() if len(ln) > 3})
+        manifest = {
+            "files_changed": changed_files,
+            "deps_added": sorted(set(deps_after) - set(deps_before)),
+            "deps_removed": sorted(set(deps_before) - set(deps_after)),
+            "packages_requested": list(packages),
+            "lifecycle_scripts": "allowed (--allow-scripts)" if allow_scripts
+                                 else "blocked (--ignore-scripts)",
+        }
 
         # Commit (and push / merge) - the change lands in the repo.
         if git:
@@ -2289,12 +2347,14 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                     detail += f"; auto-merge into {prev_branch} skipped (conflicts)"
             return ApplyResult(repo_name, status, detail, branch=branch, files=file_list,
                                packages=packages, commit_message=msg,
-                               post_steps=patch.get("post_steps") or [])
+                               post_steps=patch.get("post_steps") or [],
+                               manifest=manifest)
 
         return ApplyResult(repo_name, "applied-local",
                            f"wrote {len(file_list)} file(s); .bak backups kept",
                            files=file_list, packages=packages,
-                           post_steps=patch.get("post_steps") or [])
+                           post_steps=patch.get("post_steps") or [],
+                           manifest=manifest)
 
     except (ApplyError, OSError, subprocess.SubprocessError) as e:
         failed = _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created)
@@ -2404,6 +2464,196 @@ def _summarize_repo_for_judge(result: dict) -> str:
     return "\n".join(str(x) for x in lines)
 
 
+# --------------------------------------------------------------------------- #
+# Candidate safety: evidence matrix + THREE SEPARATE VERDICTS.
+#
+# "Readable" is not "safe to install" is not "safe to run". Every candidate
+# gets three independent verdicts, computed DETERMINISTICALLY from evidence -
+# never by the LLM and never influenceable by repo-authored text (which is
+# untrusted DATA, fenced before it ever reaches a prompt):
+#   safe_to_inspect   - is the candidate's text safe to treat as data? "caution"
+#                       when prompt-injection indicators fire (still reported,
+#                       but hard-excluded from integrate/execute).
+#   safe_to_integrate - may scout ADD this code to the project? Requires a
+#                       verified-compatible license, a clean safety verdict and
+#                       zero injection flags. Unknowns FAIL CLOSED.
+#   safe_to_execute   - may the candidate's own code/lifecycle scripts RUN?
+#                       Never granted automatically: installs run with
+#                       --ignore-scripts and execution needs the owner's
+#                       explicit --allow-scripts.
+# --------------------------------------------------------------------------- #
+
+# Injection indicators: text that tries to steer the MODEL. Deliberately
+# narrow - a false positive only demotes a candidate to report-only.
+_INJECTION_PATTERNS: list[tuple[str, "re.Pattern"]] = [
+    ("override-instructions",
+     re.compile(r"(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|"
+                r"above|earlier|the)\s.{0,30}?(instruction|rule|prompt|context)", re.I)),
+    ("role-hijack",
+     re.compile(r"\byou\s+are\s+now\s+(a\s+|an\s+|in\s+)?(system|admin|root|"
+                r"developer\s+mode|unrestricted)", re.I)),
+    ("fence-forgery", re.compile(r"<<<\s*UNTRUSTED", re.I)),
+    ("secret-exfiltration",
+     re.compile(r"(reveal|print|send|exfiltrate|leak|echo)\s.{0,40}?"
+                r"(secret|api[\s_-]?key|token|password|credential)", re.I)),
+    ("tool-trigger",
+     re.compile(r"(run|execute)\s+(the\s+following|this)\s+(command|script|shell)", re.I)),
+]
+
+# Execution-risk indicators: text describing install/run behavior that would
+# execute foreign code on the host (legit in many READMEs - which is exactly
+# why they gate EXECUTE, not INSPECT/INTEGRATE).
+_EXECUTION_RISK_PATTERNS: list[tuple[str, "re.Pattern"]] = [
+    ("curl-pipe-shell",
+     re.compile(r"(curl|wget|iwr|irm)\b[^\n]{0,160}\|\s*"
+                r"(bash|sh|zsh|iex|powershell)", re.I)),
+    ("postinstall-script", re.compile(r"\b(pre|post)install\b", re.I)),
+    ("native-build", re.compile(r"\b(node-gyp|prebuild-install|binding\.gyp)\b", re.I)),
+]
+
+
+def _scan_patterns(text: str, patterns: list[tuple[str, "re.Pattern"]]) -> list[str]:
+    t = text or ""
+    return [label for label, rx in patterns if rx.search(t)]
+
+
+def _injection_scan(text: str) -> list[str]:
+    """Labels of prompt-injection indicators found in untrusted text."""
+    return _scan_patterns(text, _INJECTION_PATTERNS)
+
+
+def _execution_risk_scan(text: str) -> list[str]:
+    """Labels of code-execution-risk indicators found in untrusted text."""
+    return _scan_patterns(text, _EXECUTION_RISK_PATTERNS)
+
+
+# License policy for INTEGRATING third-party code into the user's projects.
+# Compatible = permissive licenses that don't impose copyleft obligations on
+# the (mostly proprietary) target projects. Unknown/unrecognized => None,
+# which candidate_verdicts treats as NOT compatible (fail closed).
+_LICENSE_COMPATIBLE = {
+    "mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "0bsd",
+    "unlicense", "cc0-1.0", "zlib", "mpl-2.0", "python-2.0", "bsl-1.0",
+}
+_LICENSE_INCOMPATIBLE = {
+    "gpl-2.0", "gpl-3.0", "agpl-3.0", "lgpl-2.1", "lgpl-3.0",
+    "sspl-1.0", "busl-1.1", "cc-by-nc-4.0", "proprietary",
+}
+
+
+def _license_compatible(spdx: str | None) -> bool | None:
+    """True = verified compatible, False = verified incompatible,
+    None = unknown (treated as incompatible by the integrate gate)."""
+    if not spdx:
+        return None
+    s = str(spdx).strip().lower()
+    if s in _LICENSE_COMPATIBLE:
+        return True
+    if s in _LICENSE_INCOMPATIBLE or s.startswith(("gpl", "agpl", "lgpl", "sspl")):
+        return False
+    return None
+
+
+def _candidate_untrusted_text(result: dict) -> str:
+    """Every repo-authored string scout will ever show a model for this
+    candidate (description + AI summaries derived from repo content)."""
+    repo = result.get("repo") or {}
+    ai = result.get("ai") or {}
+    uses = ai.get("suggestedUses")
+    if isinstance(uses, list):
+        uses = "; ".join(str(u) for u in uses)
+    parts = [repo.get("description"), ai.get("purposeSummary"), uses]
+    return "\n".join(str(p) for p in parts if p)
+
+
+def build_evidence_matrix(evaluation: dict) -> dict:
+    """Per-candidate evidence, one field per decision input. Anything scout
+    hasn't verified is recorded as 'unknown' - and unknowns fail closed in
+    candidate_verdicts, they are never assumed safe."""
+    result = evaluation.get("result") or {}
+    repo = result.get("repo") or {}
+    benefit = evaluation.get("benefit") or {}
+    text = _candidate_untrusted_text(result)
+    spdx = repo.get("licenseSpdx")
+    ev = {
+        "repo": repo.get("fullName") or repo.get("htmlUrl") or "(unknown)",
+        "provenance": repo.get("htmlUrl") or "unknown",
+        "goal_fit": benefit.get("benefit_score"),
+        "language": repo.get("primaryLanguage") or "unknown",
+        "stars": repo.get("stars"),
+        "last_activity": repo.get("pushedAt") or repo.get("updatedAt") or "unknown",
+        "license": spdx or "UNKNOWN",
+        "license_compatible": _license_compatible(spdx),
+        "safety_verdict": ((result.get("safety") or {}).get("verdict") or "unknown"),
+        "advisories": result.get("advisories", "unknown"),
+        "injection_flags": _injection_scan(text),
+        "execution_flags": _execution_risk_scan(text),
+        "install_scripts": "unknown (installs run --ignore-scripts until --allow-scripts)",
+        "network_behavior": "unknown until inspected",
+        "native_build": "unknown until inspected",
+        "dependency_burden": "unknown until inspected",
+        "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; "
+                         "hard rollback on any failure",
+    }
+    known = [
+        ev["license_compatible"] is not None,
+        ev["language"] != "unknown",
+        ev["stars"] is not None,
+        ev["last_activity"] != "unknown",
+        ev["goal_fit"] is not None,
+        ev["safety_verdict"] != "unknown",
+    ]
+    ev["confidence"] = round(sum(known) / len(known), 2)
+    return ev
+
+
+# Safety verdicts from Repo Rewards that count as clean. "" is intentionally
+# NOT in this list at the evidence layer: build_evidence_matrix maps an absent
+# verdict to "unknown", and unknown fails closed.
+_CLEAN_SAFETY_VERDICTS = ("allow", "safe", "ready", "ok", "warn")
+
+
+def candidate_verdicts(evidence: dict) -> dict:
+    """The three verdicts, computed deterministically from the evidence matrix.
+    Missing evidence keys fail CLOSED (never silently safe). Repo text and LLM
+    output cannot change this function's result - the only inputs are the
+    structured evidence fields."""
+    reasons: list[str] = []
+    inj = evidence.get("injection_flags")
+    inj = list(inj) if isinstance(inj, (list, tuple)) else ["injection-evidence-missing"]
+    inspect_v = "yes" if not inj else "caution"
+    if inj:
+        reasons.append("prompt-injection indicators in repo text: " + ", ".join(inj))
+
+    integrate = True
+    lic = evidence.get("license_compatible")
+    if lic is not True:
+        integrate = False
+        reasons.append("license not verified compatible"
+                       if lic is None else
+                       f"license {evidence.get('license')} is copyleft/incompatible")
+    safety = str(evidence.get("safety_verdict") or "unknown").strip().lower()
+    if safety not in _CLEAN_SAFETY_VERDICTS:
+        integrate = False
+        reasons.append(f"safety verdict '{safety}' is not clean")
+    if inj:
+        integrate = False
+
+    # Execution is NEVER cleared automatically: lifecycle scripts and network
+    # behavior are uninspected pre-clone, installs run --ignore-scripts, and
+    # only the owner's explicit --allow-scripts grants execution.
+    execute = False
+    exec_flags = evidence.get("execution_flags")
+    if isinstance(exec_flags, (list, tuple)) and exec_flags:
+        reasons.append("execution-risk indicators: " + ", ".join(exec_flags))
+    reasons.append("execution requires explicit --allow-scripts (lifecycle "
+                   "scripts stay blocked by default)")
+    return {"safe_to_inspect": inspect_v,
+            "safe_to_integrate": integrate,
+            "safe_to_execute": execute,
+            "reasons": reasons}
+
+
 def run_scout(args) -> int:
     base_url = args.repo_rewards_url.rstrip("/")
 
@@ -2494,10 +2744,16 @@ def run_scout(args) -> int:
             print(f"  [skip] {(repo.get('fullName') or '?')}: benefit judging failed ({ex})")
             benefit = {"benefit_score": 0, "rationale": f"judging failed: {ex}"}
             recommendation = "SKIP"
-        return {
+        evaluation = {
             "need": c["need"], "repo": repo, "result": result,
             "benefit": benefit, "recommendation": recommendation,
         }
+        # Deterministic safety layer: evidence matrix + three verdicts. Computed
+        # AFTER (and independently of) the LLM judgment - repo text cannot
+        # influence it, and _qualifies_for_apply hard-gates on it.
+        evaluation["evidence"] = build_evidence_matrix(evaluation)
+        evaluation["verdicts"] = candidate_verdicts(evaluation["evidence"])
+        return evaluation
 
     n_workers = max(1, min(8, len(ranked)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
@@ -2528,7 +2784,15 @@ def run_scout(args) -> int:
 def _qualifies_for_apply(evaluation: dict, apply_tier: str) -> bool:
     """Which recommendations get applied. Default is ADOPT only (the strict
     'clear, worth-the-cost improvement' bar); --apply-tier consider also applies
-    situational CONSIDERs. SKIPs are never applied."""
+    situational CONSIDERs. SKIPs are never applied.
+
+    HARD SAFETY GATE on top of the tier: the candidate's deterministic
+    safe_to_integrate verdict must be exactly True. A missing/false verdict
+    fails closed - an LLM recommendation (or injected repo text that swayed
+    one) can never reach apply on its own."""
+    v = evaluation.get("verdicts")
+    if not isinstance(v, dict) or v.get("safe_to_integrate") is not True:
+        return False
     rec = evaluation["recommendation"]
     if apply_tier == "consider":
         return rec in ("ADOPT", "CONSIDER")
@@ -2574,6 +2838,91 @@ def _confirm_scout_apply(args, evaluations: list[dict]) -> bool:
     return resp == "apply"
 
 
+SCOUT_POLICY_FILE = ".flexfactor-scout-policy.json"
+
+
+def _load_scout_policy(project_dir: str) -> dict | None:
+    """A reviewed, project-local policy file that can stand in for interactive
+    per-candidate approval. Read through the containment chokepoint; any parse
+    problem returns None (no policy -> interactive/--yes approval required)."""
+    raw = _read_contained(project_dir, SCOUT_POLICY_FILE, 20000)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except ValueError:
+        return None
+
+
+def _policy_approves(policy: dict, evaluation: dict) -> bool:
+    """Does the project's reviewed policy file approve this candidate without a
+    prompt? Fail closed: approval requires auto_approve true, the deterministic
+    safe_to_integrate verdict, AND the candidate's license to be explicitly
+    listed in the policy's allowlist."""
+    if not policy or policy.get("auto_approve") is not True:
+        return False
+    v = evaluation.get("verdicts") or {}
+    if v.get("safe_to_integrate") is not True:
+        return False
+    allowed = {str(x).strip().lower() for x in (policy.get("licenses") or [])}
+    lic = str((evaluation.get("evidence") or {}).get("license") or "").strip().lower()
+    return bool(allowed) and lic in allowed
+
+
+def _candidate_approval_summary(evaluation: dict, args) -> str:
+    """Plain-language, per-candidate summary shown before approval: what would
+    change, under what license, with which risks and rollback plan."""
+    ev = evaluation.get("evidence") or {}
+    v = evaluation.get("verdicts") or {}
+    b = evaluation.get("benefit") or {}
+    lines = [
+        f"  Candidate: {ev.get('repo')}   ({ev.get('provenance')})",
+        f"  Need:      {evaluation.get('need')}",
+        f"  Benefit:   {b.get('benefit_score')}/100 - "
+        f"{b.get('how_it_helps') or b.get('rationale') or ''}",
+        f"  License:   {ev.get('license')}  (compatible: {ev.get('license_compatible')})",
+        f"  Safety:    verdict={ev.get('safety_verdict')}  advisories={ev.get('advisories')}",
+        f"  Verdicts:  inspect={v.get('safe_to_inspect')}  "
+        f"integrate={v.get('safe_to_integrate')}  execute={v.get('safe_to_execute')}",
+        "  Installs:  npm --ignore-scripts"
+        + (" OVERRIDDEN by --allow-scripts (lifecycle scripts WILL run)"
+           if getattr(args, "allow_scripts", False) else " (lifecycle scripts blocked)"),
+        f"  Rollback:  {ev.get('rollback_plan')}",
+    ]
+    if v.get("reasons"):
+        lines.append("  Notes:     " + "; ".join(v["reasons"]))
+    return "\n".join(lines)
+
+
+def _approve_candidate(args, evaluation: dict, project_dir: str) -> bool:
+    """PER-CANDIDATE approval, on top of the blanket _confirm_scout_apply gate.
+    Approval paths, in order: dry-run (changes nothing), --yes (explicit blanket
+    consent for automation), a reviewed project policy file that matches this
+    candidate, or an interactive per-candidate prompt. No TTY and none of the
+    above -> refuse (fail closed)."""
+    if getattr(args, "dry_run", False):
+        return True
+    print("\n" + "-" * 70)
+    print(_candidate_approval_summary(evaluation, args))
+    print("-" * 70)
+    if getattr(args, "assume_yes", False):
+        return True
+    policy = _load_scout_policy(project_dir)
+    if policy is not None and _policy_approves(policy, evaluation):
+        print(f"  approved by {SCOUT_POLICY_FILE}")
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        print("  refusing without per-candidate approval (no TTY, no --yes, "
+              "no matching policy file).", file=sys.stderr)
+        return False
+    try:
+        resp = input("  Type 'approve' to apply THIS candidate, anything else to skip: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return resp.strip().lower() == "approve"
+
+
 def _apply_phase(args, profile_name: str, profile: dict,
                  evaluations: list[dict], provider) -> list[ApplyResult]:
     """Generate and apply a code change for every qualifying recommendation."""
@@ -2600,6 +2949,11 @@ def _apply_phase(args, profile_name: str, profile: dict,
         repo = e["repo"]
         name = repo.get("fullName") or repo.get("htmlUrl") or e["need"]
         print(f"\n-> {name}  (for: {e['need']})")
+        if not _approve_candidate(args, e, project_dir):
+            print("   skipped: not approved")
+            results.append(ApplyResult(name, "skipped-unapproved",
+                                       "per-candidate approval was not given"))
+            continue
         try:
             patch, plan = generate_integration(provider, project_dir, blob, e["need"], e["result"])
         except Exception as ex:  # one bad LLM call must not abort the whole apply phase
@@ -2644,6 +2998,12 @@ def _print_scout_report(name: str, profile: dict, evaluations: list[dict]) -> No
             print(f"    fit:   {b.get('integration_note')}")
         if b.get("risks"):
             print("    risks: " + "; ".join(b["risks"]))
+        ev, v = e.get("evidence") or {}, e.get("verdicts") or {}
+        if ev or v:
+            print(f"    license: {ev.get('license')}  |  verdicts: "
+                  f"inspect={v.get('safe_to_inspect')} "
+                  f"integrate={v.get('safe_to_integrate')} "
+                  f"execute={v.get('safe_to_execute')}")
     if skipped:
         print(f"\n({skipped} other candidate(s) evaluated and judged unnecessary - "
               "they don't improve the program.)")
@@ -2679,6 +3039,12 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
                 lines.append(f"  - commit: {r.commit_message}")
             if r.post_steps:
                 lines.append(f"  - follow-ups: {'; '.join(r.post_steps)}")
+            if r.manifest:
+                m = r.manifest
+                lines.append(f"  - manifest: files_changed={', '.join(m.get('files_changed') or []) or '(none)'}"
+                             f"; deps_added={', '.join(m.get('deps_added') or []) or '(none)'}"
+                             f"; deps_removed={', '.join(m.get('deps_removed') or []) or '(none)'}"
+                             f"; lifecycle_scripts={m.get('lifecycle_scripts')}")
         lines.append("")
 
     lines += ["## Recommendations", ""]
@@ -2694,6 +3060,22 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
         lines.append(f"- **Integration:** {b.get('integration_note')}")
         if b.get("risks"):
             lines.append(f"- **Risks:** {'; '.join(b['risks'])}")
+        ev, v = e.get("evidence") or {}, e.get("verdicts") or {}
+        if v:
+            lines.append(f"- **Verdicts:** safe_to_inspect={v.get('safe_to_inspect')}, "
+                         f"safe_to_integrate={v.get('safe_to_integrate')}, "
+                         f"safe_to_execute={v.get('safe_to_execute')}")
+            if v.get("reasons"):
+                lines.append(f"- **Verdict notes:** {'; '.join(v['reasons'])}")
+        if ev:
+            lines.append("- **Evidence:** "
+                         f"license={ev.get('license')} (compatible={ev.get('license_compatible')}); "
+                         f"language={ev.get('language')}; stars={ev.get('stars')}; "
+                         f"last_activity={ev.get('last_activity')}; "
+                         f"safety={ev.get('safety_verdict')}; advisories={ev.get('advisories')}; "
+                         f"injection_flags={ev.get('injection_flags') or '[]'}; "
+                         f"execution_flags={ev.get('execution_flags') or '[]'}; "
+                         f"confidence={ev.get('confidence')}")
         lines.append("")
     # Record what was evaluated and rejected, so the report is honest about
     # coverage rather than silently hiding the misses.
@@ -5902,6 +6284,13 @@ def main(argv=None) -> int:
                             help="Which recommendations to apply: 'adopt' (default) or also 'consider'.")
         parser.add_argument("--no-verify", action="store_false", dest="verify",
                             help="Skip the build-verify gate before committing (not recommended).")
+        parser.add_argument("--allow-scripts", action="store_true", dest="allow_scripts",
+                            default=False,
+                            help="Let npm lifecycle scripts (preinstall/postinstall) RUN during "
+                                 "an applied integration's dependency install. Default: OFF - "
+                                 "installs use --ignore-scripts, because lifecycle scripts are "
+                                 "arbitrary code execution (the safe_to_execute verdict is never "
+                                 "granted automatically).")
         parser.add_argument("--push", action="store_true", dest="push", default=False,
                             help="Push the apply branch to origin (default: OFF - commit locally only, "
                                  "never auto-push).")
