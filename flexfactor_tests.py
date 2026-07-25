@@ -4772,7 +4772,8 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         import subprocess
 
         def runner(cmd, cwd, timeout=900, env=None):
-            self.assertEqual(cmd[:4], ["git", "clone", "--depth", "1"])
+            self.assertEqual(cmd[0], "git")
+            self.assertIn("clone", cmd)
             self.last_cmd, self.last_env = list(cmd), env
             if rc == 0:
                 builder(cmd[-1])
@@ -4808,13 +4809,56 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertIs(ev["clone_inspection_ok"], True)
         self.assertIs(e["verdicts"]["safe_to_integrate"], True)
         # The clone is HERMETIC (Sol finding 2): no worktree checkout, no
-        # option smuggling, no inherited git config, no prompts, no LFS.
+        # option smuggling, no inherited git config, no prompts, no LFS,
+        # https-only transport.
         self.assertIn("--no-checkout", self.last_cmd)
         self.assertIn("--", self.last_cmd)
+        self.assertIn("protocol.allow=never", self.last_cmd)
+        self.assertIn("protocol.https.allow=always", self.last_cmd)
         self.assertEqual(self.last_env["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(self.last_env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(self.last_env["GIT_CONFIG_COUNT"], "0")
         self.assertEqual(self.last_env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(self.last_env["GIT_LFS_SKIP_SMUDGE"], "1")
+
+    def test_hermetic_env_strips_env_injected_git_config(self):
+        # git honors GIT_CONFIG_COUNT/KEY_n/VALUE_n from the environment; an
+        # inherited insteadOf there could rewrite the https transport (Sol).
+        from unittest import mock
+        with mock.patch.dict(os.environ, {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "url.ssh://x/.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://github.com/",
+                "GIT_SSH_COMMAND": "evil-helper"}):
+            env = ff._hermetic_git_env()
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "0")
+        self.assertNotIn("GIT_CONFIG_KEY_0", env)
+        self.assertNotIn("GIT_CONFIG_VALUE_0", env)
+        self.assertNotIn("GIT_SSH_COMMAND", env)
+
+    def test_inspect_checkout_reads_the_git_object_db(self):
+        # Build a REAL git repo, then DELETE the worktree files: correct
+        # results prove the reads come from `git ls-tree/show` (the hardened
+        # path a real --no-checkout clone uses), not the filesystem fallback.
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            def g(*a):
+                subprocess.run(["git", "-C", tmp, *a], capture_output=True)
+            subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+            g("config", "user.email", "t@t")
+            g("config", "user.name", "t")
+            self._write(tmp, "package.json", json.dumps(
+                {"scripts": {"postinstall": "x"}, "dependencies": {"a": "1"}}))
+            self._write(tmp, "LICENSE", self.MIT_TEXT)
+            g("add", "-A")
+            g("commit", "-q", "-m", "init")
+            os.remove(os.path.join(tmp, "package.json"))
+            os.remove(os.path.join(tmp, "LICENSE"))
+            info = ff.inspect_checkout(tmp)
+        self.assertEqual(info["install_scripts"], "present: postinstall")
+        self.assertEqual(info["dependency_burden"], "1 runtime + 0 dev deps")
+        self.assertEqual(info["license_families"], {"mit"})
 
     def test_lifecycle_scripts_recorded_and_reasoned(self):
         e = self._evaluation("MIT")
@@ -5087,15 +5131,18 @@ class OllamaProviderTests(unittest.TestCase):
                 return False
         return _R(json.dumps(body).encode("utf-8"))
 
-    def _patch_urlopen(self, captured, body=None):
-        from unittest import mock
+    def _fake_opener(self, p, captured, body=None):
+        """Swap the provider's dedicated opener (the ONLY http path it uses)
+        for a capturing fake."""
+        outer = self
         body = body or {"message": {"content": "hello"},
                         "prompt_eval_count": 7, "eval_count": 3}
 
-        def fake_urlopen(req, timeout=None):
-            captured.append(req)
-            return self._resp(body)
-        return mock.patch("urllib.request.urlopen", fake_urlopen)
+        class _Opener:
+            def open(self, req, timeout=None):
+                captured.append(req)
+                return outer._resp(body)
+        p._opener = _Opener()
 
     def test_refuses_non_local_base_url(self):
         # The zero-egress guarantee: a non-loopback OLLAMA_BASE_URL is refused
@@ -5108,8 +5155,8 @@ class OllamaProviderTests(unittest.TestCase):
         captured = []
         p = ff.OllamaProvider("coder", base_url="http://localhost:11434")
         p.meter = ff.CostMeter(limit_usd=1.0)
-        with self._patch_urlopen(captured):
-            out = p.complete("rewrite this")
+        self._fake_opener(p, captured)
+        out = p.complete("rewrite this")
         self.assertEqual(out, "hello")
         self.assertEqual(p.meter.usd, 0.0)  # local inference is FREE
         self.assertEqual(p.meter.in_tok, 7)
@@ -5122,8 +5169,8 @@ class OllamaProviderTests(unittest.TestCase):
         body = {"message": {"content": "{\"a\": 1}"}}
         p = ff.OllamaProvider("coder")
         schema = {"type": "object"}
-        with self._patch_urlopen(captured, body):
-            out = p.structured("sys", "user", schema)
+        self._fake_opener(p, captured, body)
+        out = p.structured("sys", "user", schema)
         self.assertEqual(out, {"a": 1})
         payload = json.loads(captured[0].data.decode("utf-8"))
         self.assertEqual(payload["format"], schema)  # Ollama structured output
@@ -5133,8 +5180,8 @@ class OllamaProviderTests(unittest.TestCase):
         body = {"message": {"content": json.dumps(
             {"grade": 88, "meets_goal": True, "rationale": "ok", "issues": []})}}
         p = ff.OllamaProvider("coder")
-        with self._patch_urlopen([], body):
-            g = p.grade("grade this")
+        self._fake_opener(p, [], body)
+        g = p.grade("grade this")
         self.assertEqual(g.grade, 88)
 
     def test_no_egress_gate_on_local_provider(self):
@@ -5144,11 +5191,59 @@ class OllamaProviderTests(unittest.TestCase):
         from unittest import mock
         secret = "creds: AKIAJQ7WZ5X2K9V4M3TN"
         p = ff.OllamaProvider("coder")
+        self._fake_opener(p, [])
         with mock.patch.object(ff, "EGRESS_MODE", "block"), \
              mock.patch.object(ff._egress, "_load_policy_allow",
-                               return_value=set()), \
-             self._patch_urlopen([]):
+                               return_value=set()):
             self.assertEqual(p.complete(secret), "hello")
+
+    def test_opener_ignores_proxies_and_refuses_redirects(self):
+        # Sol findings 1+2: the default urllib opener honors HTTP_PROXY (the
+        # payload would go to the proxy host) and follows redirects (a 302
+        # could bounce request-derived data off-box). The dedicated opener
+        # must do neither.
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+        # Differential pin: with a proxy in the env, the DEFAULT opener wires
+        # a ProxyHandler for it; the hardened opener must wire NONE (passing
+        # ProxyHandler({}) suppresses the default, and an empty handler has
+        # no scheme methods so nothing proxy-capable is registered at all).
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://evil-proxy:1"}):
+            default_op = urllib.request.build_opener()
+            self.assertTrue(any(isinstance(h, urllib.request.ProxyHandler)
+                                for h in default_op.handlers))
+            op = ff._local_only_opener()
+            self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler)
+                                 for h in op.handlers))
+        redirectors = [h for h in op.handlers
+                       if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        self.assertEqual(len(redirectors), 1)  # ours replaced the default
+        req = urllib.request.Request("http://localhost:11434/api/chat")
+        with self.assertRaises(urllib.error.HTTPError):
+            redirectors[0].redirect_request(
+                req, None, 302, "Found", {}, "https://evil.example/collect")
+
+    def test_default_preflight_pings_local_server_and_fails_closed(self):
+        # Sol finding 3: default preflight must PING ollama (not reject it as
+        # unknown), and a DOWN local server must fail CLOSED, never
+        # "transient - assume usable".
+        import argparse
+        from unittest import mock
+        args = argparse.Namespace(provider="ollama", use_both=True, model=None,
+                                  secondary_model=None, judge_model=None,
+                                  economy=False, no_preflight=False)
+        with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+             mock.patch.object(ff.OllamaProvider, "ping", lambda self: None):
+            provs = ff.build_audit_providers(args, meter=None)
+        self.assertEqual([n for n, _ in provs], ["ollama"])
+
+        def dead(self):
+            raise OSError("connection refused")
+        with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+             mock.patch.object(ff.OllamaProvider, "ping", dead):
+            provs = ff.build_audit_providers(args, meter=None)
+        self.assertEqual(provs, [])
 
     def test_make_provider_wires_meter_and_judge_tier(self):
         m = ff.CostMeter(limit_usd=1.0)
@@ -5172,8 +5267,12 @@ class OllamaProviderTests(unittest.TestCase):
 
     def test_ollama_billing_ids_price_at_zero(self):
         self.assertEqual(ff._price_for("ollama:deepseek-coder:33b"), (0.0, 0.0))
-        # ...without weakening the fail-closed default for other unknowns.
+        # ...without weakening the fail-closed default for other unknowns,
+        # and ONLY for the exact 'ollama:' namespace the provider generates -
+        # 'ollama-x'/'ollama@x' on a cloud adapter must NOT bill $0 (Sol).
         self.assertEqual(ff._price_for("mystery-model"), ff._DEFAULT_PRICE)
+        self.assertEqual(ff._price_for("ollama-gpt-4o"), ff._DEFAULT_PRICE)
+        self.assertEqual(ff._price_for("ollama@gpt-4o"), ff._DEFAULT_PRICE)
 
 
 class PolicyCommandTests(unittest.TestCase):

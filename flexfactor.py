@@ -132,10 +132,6 @@ MODEL_PRICING = {
     "claude-haiku-4-5": (1.0, 5.0),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.0),
-    # Local inference is free. OllamaProvider bills under 'ollama:<model>' ids,
-    # which prefix-match this entry via the ':' separator rule in _price_for -
-    # NEVER the fail-closed default rate, so local runs don't eat --max-cost.
-    "ollama": (0.0, 0.0),
 }
 # Fail-closed default: the most expensive known model on each axis, so budget
 # enforcement over-counts (stops early) rather than under-counts an unknown id.
@@ -145,6 +141,13 @@ _WARNED_UNKNOWN_MODELS: set[str] = set()
 
 
 def _price_for(model: str) -> tuple[float, float]:
+    # Local inference is free. ONLY the exact 'ollama:<model>' namespace that
+    # OllamaProvider itself generates bills at $0 - not 'ollama-*' or
+    # 'ollama@*' (Sol finding: a cloud adapter configured with such an id
+    # would ride the generic separator rules to a $0 price and dodge
+    # --max-cost). Everything else keeps the fail-closed default.
+    if model.startswith("ollama:"):
+        return (0.0, 0.0)
     # Match by EXACT id or a known id followed by a separator (date/version suffix
     # like 'claude-opus-4-8-20260101'). NOT a bare substring: an aliased or
     # fine-tuned id ('ft:gpt-4o-mini:org::x', 'my-gpt-4o-mini') must NOT inherit a
@@ -858,6 +861,26 @@ class OpenAIProvider:
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 
+def _local_only_opener():
+    """urllib opener for the local-only provider (Sol findings 1+2): NO proxy
+    (an inherited HTTP_PROXY would ship the payload to the proxy host - the
+    default opener honors proxy env vars) and NO redirects (a compromised
+    local endpoint could 302 request-derived data off-box; Ollama never
+    legitimately redirects, so refuse them all, fail closed)."""
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"redirect refused (local-only provider): -> {str(newurl)[:80]}",
+                headers, fp)
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                       _NoRedirect())
+
+
 class OllamaProvider:
     """LOCAL-ONLY provider (ULTRAPLAN 1.2): same complete/grade/structured/ping
     surface as the cloud adapters, served by an Ollama instance on localhost.
@@ -887,6 +910,7 @@ class OllamaProvider:
                 f"OllamaProvider refuses non-local base url '{base}': the "
                 "local-only provider must never send source off this machine.")
         self.base_url = base
+        self._opener = _local_only_opener()  # proxy-free, redirect-refusing
 
     def _chat(self, model: str, system: str, user: str, max_tokens: int,
               schema: dict | None = None) -> str:
@@ -905,7 +929,7 @@ class OllamaProvider:
                 self.base_url + "/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with self._opener.open(req, timeout=600) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             if self.meter is not None:
                 self.meter.record(f"ollama:{model}",
@@ -933,7 +957,7 @@ class OllamaProvider:
         preflight can drop an ollama that isn't running."""
         import urllib.request
         req = urllib.request.Request(self.base_url + "/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with self._opener.open(req, timeout=10) as resp:
             resp.read(64)
 
 
@@ -1043,8 +1067,17 @@ def _compute_provider_health(name: str, meter: "CostMeter | None" = None) -> tup
     adapter methods + the _budget_guard reservation chokepoint + the meter."""
     if not _provider_key_present(name):
         return (False, "no API key set")
-    if name not in ("anthropic", "openai"):
+    if name not in ("anthropic", "openai", "ollama"):
         return (False, f"unknown provider {name}")
+    if name == "ollama":
+        # Local server: a failed ping means Ollama isn't RUNNING - that is a
+        # hard "not usable" (fail closed), never a transient network blip.
+        try:
+            make_provider(name, DEFAULT_MODELS[name], meter).ping()
+            return (True, "ok")
+        except Exception as e:  # noqa: BLE001
+            return (False, f"local Ollama server unreachable ({type(e).__name__}); "
+                           "start Ollama and re-run")
     try:
         make_provider(name, DEFAULT_MODELS[name], meter).ping()
         return (True, "ok")
@@ -3010,13 +3043,16 @@ def _rmtree_force(path: str) -> None:
 
 
 def _hermetic_git_env() -> dict:
-    """Environment for the inspection clone: NO inherited git config (a user
-    or system `url.<x>.insteadOf` could rewrite the https url onto another
-    transport, and configured filters like git-lfs would execute during
-    checkout - Sol finding 2), no terminal prompts, no LFS smudge."""
-    env = dict(os.environ)
+    """Environment for the inspection clone: NO inherited git config of ANY
+    kind. File config is disabled (NOSYSTEM + devnull global), and every
+    inherited `GIT_*` variable is STRIPPED - git also honors env-injected
+    config via GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n (Sol
+    finding: an inherited insteadOf there could rewrite the https transport
+    despite the devnull global). No terminal prompts, no LFS smudge."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update({"GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_COUNT": "0",
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_LFS_SKIP_SMUDGE": "1"})
     return env
@@ -3073,7 +3109,11 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
         tmp = tempfile.mkdtemp(prefix="ffscout-inspect-")
         dest = os.path.join(tmp, "checkout")
         try:
-            cp = runner(["git", "clone", "--depth", "1", "--no-tags",
+            # protocol.allow=never + https.allow=always: even if some config
+            # layer survived, no transport other than https can ever be used.
+            cp = runner(["git", "-c", "protocol.allow=never",
+                         "-c", "protocol.https.allow=always",
+                         "clone", "--depth", "1", "--no-tags",
                          "--no-checkout", "--", url, dest],
                         cwd=tmp, timeout=180, env=_hermetic_git_env())
             if cp.returncode != 0:
