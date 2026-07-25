@@ -49,6 +49,16 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 - Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
   minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
   prompts don't actually cache today (harmless - a miss bills normal price).
+- **Secret/PII egress gate (default ON).** Before ANY repo text reaches a cloud
+  model, a deterministic pre-send scan (`flexfactor_egress.py`) checks for
+  private keys, vendor API tokens, credential-like assignments, secret env
+  lines, and SSN-shaped PII. A finding REFUSES the call (fail closed, marked
+  `flexfactor_egress_blocked` — the file is skipped, never sent). Escape
+  hatches: `--redact` (mask the spans and send the rest), `--allow-sensitive`
+  (send anyway), or allow single categories via `FLEXFACTOR_ALLOW_EGRESS` /
+  `~/.flexfactor/policy.json {"allow_egress": [...]}`. The block tier is
+  high-confidence patterns only, so lockfile hashes and `token = "sentinel"`
+  test fixtures never block a legitimate audit.
 - Review sweep stops at 35% of the budget cap so there is always money left to fix.
 - The brain skips files marked clean in prior runs (`--recheck` to re-review).
 

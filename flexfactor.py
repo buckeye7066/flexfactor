@@ -68,6 +68,14 @@ except ImportError:  # running as a spec-loaded module: try the file's own dir
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_cmdpolicy as _cmd_policy
 
+# Secret/PII egress gate for the provider chokepoint. Same hard-import rule as
+# the command policy: silently running without the gate would fail open.
+try:
+    import flexfactor_egress as _egress
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_egress as _egress
+
 # Model defaults per provider. Claude Opus 4.8 is the strongest current Claude
 # model; override either with --model. This is the AUTHOR tier - used only where
 # the model writes code (whole-file rewrite, defect fix, integration, test-gen).
@@ -573,6 +581,36 @@ class Grade:
 # Provider adapters: each exposes complete() for long free-form output and
 # grade() for short structured output. The loop below never knows which is live.
 # --------------------------------------------------------------------------- #
+# SECRET/PII EGRESS GATE (flexfactor_egress): every repo-derived payload the
+# providers send to a cloud model passes through _egress_gate first. The
+# `system` prompts are FlexFactor-authored constants and are NOT gated; the
+# `instruction`/`prompt` arguments carry repo text and ARE. Default mode
+# "block" refuses the call (fail closed); the CLI sets "redact"
+# (--redact: mask + send) or "allow" (--allow-sensitive). Read-only after CLI
+# parse, so the parallel review sweep needs no locking.
+EGRESS_MODE = "block"
+
+
+class EgressBlockedError(RuntimeError):
+    """A provider call was refused because its payload contains secret/PII
+    material. Subclasses RuntimeError so every existing 'one bad LLM call
+    must not abort the sweep' handler degrades it to a per-file skip."""
+
+
+def _egress_gate(text: str) -> str:
+    action, out, findings = _egress.gate_text(text, mode=EGRESS_MODE)
+    if action == "blocked":
+        cats = sorted({f["category"] for f in findings})
+        lines = sorted({f["line"] for f in findings})[:8]
+        raise EgressBlockedError(
+            f"flexfactor_egress_blocked: payload contains {cats} "
+            f"(near line(s) {lines}); refusing to send to a cloud model. "
+            "Re-run with --redact to mask and send, --allow-sensitive to send "
+            "anyway, or allow categories via FLEXFACTOR_ALLOW_EGRESS / "
+            "~/.flexfactor/policy.json {\"allow_egress\": [...]}.")
+    return out
+
+
 def _cached_system(system: str) -> list[dict]:
     """Wrap a (constant) system prompt as a cacheable Anthropic content block.
 
@@ -614,6 +652,7 @@ class AnthropicProvider:
     def complete(self, instruction: str) -> str:
         # Long output (a whole file) -> stream so we don't hit the SDK's HTTP
         # timeout guard, and let the model think adaptively. AUTHOR tier.
+        instruction = _egress_gate(instruction)
         with _budget_guard(self.meter, self.model, len(instruction), 64000):
             with self.client.messages.stream(
                 model=self.model,
@@ -632,6 +671,7 @@ class AnthropicProvider:
         # Short, structured output -> constrain the response to GRADE_SCHEMA so it
         # is guaranteed parseable instead of fishing a number out of prose. Grading
         # is a classification task -> route to the cheap JUDGE model.
+        prompt = _egress_gate(prompt)
         with _budget_guard(self.meter, self.judge_model, len(prompt), 4000):
             message = self.client.messages.create(
                 model=self.judge_model,
@@ -661,6 +701,7 @@ class AnthropicProvider:
         # `model` lets a caller route a judging call to the cheap tier; defaults to
         # the author model so code-generation callers are unchanged.
         use_model = model or self.model
+        prompt = _egress_gate(prompt)
         fmt = {"format": {"type": "json_schema", "schema": schema}}
         sys_blocks = _cached_system(system)
         with _budget_guard(self.meter, use_model, len(prompt) + len(system), max_tokens):
@@ -723,6 +764,7 @@ class OpenAIProvider:
     def complete(self, instruction: str) -> str:
         # The request's output cap MUST equal the reservation, or the API could bill
         # more output than reserved and let concurrent workers exceed --max-cost.
+        instruction = _egress_gate(instruction)
         out_cap = 16384
         with _budget_guard(self.meter, self.model, len(instruction), out_cap):
             resp = self.client.chat.completions.create(
@@ -739,6 +781,7 @@ class OpenAIProvider:
     def grade(self, prompt: str) -> Grade:
         # Grading is classification -> route to the cheap JUDGE model. Cap output to
         # the reserved amount so the request can't bill past the reservation.
+        prompt = _egress_gate(prompt)
         out_cap = 4000
         with _budget_guard(self.meter, self.judge_model, len(prompt), out_cap):
             resp = self.client.chat.completions.create(
@@ -764,6 +807,7 @@ class OpenAIProvider:
         # `model` lets a caller route a judging call to the cheap tier; defaults to
         # the author model so code-generation callers are unchanged.
         use_model = model or self.model
+        prompt = _egress_gate(prompt)
         # The reservation MUST equal the request's output cap. OpenAI clamps to
         # gpt-4o's 16384 ceiling, so reserve that SAME clamped value (not the larger
         # requested max_tokens) or we'd over-reserve and over-throttle the budget.
@@ -6322,6 +6366,32 @@ Run `flexfactor <mode> --help` (e.g. `flexfactor scout --help`) for that
 mode's full options."""
 
 
+def _add_egress_args(parser) -> None:
+    """Egress-gate flags, shared by ALL THREE modes (every mode sends repo
+    text to a cloud model, so every mode needs the same escape hatches)."""
+    parser.add_argument("--redact", action="store_true", dest="redact", default=False,
+                        help="When the pre-send scan finds secret/PII material, MASK the "
+                             "matched spans ([EGRESS-REDACTED:<category>]) and send the "
+                             "rest instead of refusing the call.")
+    parser.add_argument("--allow-sensitive", action="store_true", dest="allow_sensitive",
+                        default=False,
+                        help="Send payloads to the cloud model even when the pre-send "
+                             "scan finds secret/PII material (default: OFF - such calls "
+                             "are REFUSED, marked flexfactor_egress_blocked). Prefer "
+                             "--redact, or allow single categories via "
+                             "FLEXFACTOR_ALLOW_EGRESS / ~/.flexfactor/policy.json.")
+
+
+def _set_egress_mode(args) -> None:
+    """--allow-sensitive wins over --redact if both are passed (the broader,
+    explicit consent). Default stays 'block' (fail closed)."""
+    global EGRESS_MODE
+    if getattr(args, "allow_sensitive", False):
+        EGRESS_MODE = "allow"
+    elif getattr(args, "redact", False):
+        EGRESS_MODE = "redact"
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
@@ -6391,7 +6461,10 @@ def main(argv=None) -> int:
                             help="Apply even if the git working tree isn't clean.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                             help="Show what would be installed/written without changing anything.")
-        return run_scout(parser.parse_args(rest))
+        _add_egress_args(parser)
+        args = parser.parse_args(rest)
+        _set_egress_mode(args)
+        return run_scout(args)
 
     if mode == "audit":
         parser = argparse.ArgumentParser(
@@ -6514,7 +6587,10 @@ def main(argv=None) -> int:
                             help="Audit even if the git working tree isn't clean.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                             help="Review + report only; create no branch and change no files.")
-        return run_audit(parser.parse_args(rest))
+        _add_egress_args(parser)
+        args = parser.parse_args(rest)
+        _set_egress_mode(args)
+        return run_audit(args)
 
     parser = argparse.ArgumentParser(
         prog="flexfactor",
@@ -6531,7 +6607,9 @@ def main(argv=None) -> int:
     parser.add_argument("--threshold", type=int, default=90, help="Minimum grade to accept (default: 90).")
     parser.add_argument("--max-iterations", type=int, default=5, dest="max_iterations",
                         help="Maximum rewrite/grade reps (default: 5).")
+    _add_egress_args(parser)
     args = parser.parse_args(rest)
+    _set_egress_mode(args)
     return run(args)
 
 

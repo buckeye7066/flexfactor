@@ -78,6 +78,21 @@ exotic goal-irrelevant residuals; accept+document them instead).
   `ApplyResult.manifest` records files/deps delta + script policy.
   Eval corpus: `eval_fixtures/scout_candidates.json` (zero unsafe
   false-negatives is a hard test invariant).
+- EGRESS GATE (2026-07-25): `flexfactor_egress.py` scans every repo-derived
+  provider payload (the `instruction`/`prompt` args of `complete`/`grade`/
+  `structured` in BOTH providers — system prompts are FlexFactor-authored
+  constants, not gated) for secrets/PII BEFORE any cloud call. Default
+  refuses (fail closed, `EgressBlockedError` subclasses RuntimeError so
+  sweeps degrade to a per-file skip, marker `flexfactor_egress_blocked`);
+  `--redact` masks-and-sends, `--allow-sensitive` sends anyway; category
+  allow via `FLEXFACTOR_ALLOW_EGRESS` env or policy.json `allow_egress`.
+  Block tier = high-confidence only (PEM, vendor-prefix tokens, JWT,
+  secret env lines, credential-like assignments, SSN) with placeholder +
+  letter-and-digit-value filters so `token = "sentinel"` fixtures never
+  block an audit. Eval corpus `eval_fixtures/egress_corpus.json`: zero
+  false negatives AND zero false positives are both hard test invariants.
+  `EGRESS_MODE` global is set once by `_set_egress_mode` at CLI parse
+  (allow > redact precedence), read-only afterward (thread-safe by design).
 - Subprocess chokepoint: `_run` + `_winify` (PATHEXT-aware; npm/npx are .cmd shims —
   removing _winify breaks every Node-repo audit with WinError 2). `_run` never raises.
   COMMAND POLICY GATE: `flexfactor_cmdpolicy.py` classifies every command;

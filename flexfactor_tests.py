@@ -4456,5 +4456,206 @@ class ScoutEndToEndTests(unittest.TestCase):
             self.assertEqual(status, [], f"tree not pristine after rollback: {status}")
 
 
+class EgressScanTests(unittest.TestCase):
+    """Unit tests for the secret/PII egress scanner (flexfactor_egress)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.eg = ff._egress  # the module flexfactor actually gates through
+
+    def test_pem_private_key_detected(self):
+        f = self.eg.scan_text("x\n-----BEGIN RSA PRIVATE KEY-----\n...")
+        self.assertEqual([x["category"] for x in f], ["private_key"])
+        self.assertEqual(f[0]["line"], 2)
+
+    def test_placeholder_tokens_pass(self):
+        # AWS's canonical docs key + an all-x Anthropic key: documentation, not
+        # secrets. Both match the token SHAPES; the placeholder filter spares them.
+        self.assertEqual(self.eg.scan_text("AKIAIOSFODNN7EXAMPLE"), [])
+        self.assertEqual(self.eg.scan_text("k = 'sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx'"), [])
+
+    def test_sentinel_assignment_passes(self):
+        # No digits in the value -> not credential-like -> audits of code full
+        # of string sentinels must not be blocked.
+        self.assertEqual(self.eg.scan_text('token = "flexfactor_policy_blocked"'), [])
+
+    def test_credential_like_assignment_detected(self):
+        f = self.eg.scan_text('db_password = "V7n3Kq9Xz2Lw"')
+        self.assertEqual([x["category"] for x in f], ["password_assignment"])
+
+    def test_env_reference_value_passes(self):
+        self.assertEqual(self.eg.scan_text("SECRET_TOKEN=${VAULT_SECRET}"), [])
+
+    def test_ssn_detected_phone_and_date_not(self):
+        self.assertEqual([x["category"] for x in self.eg.scan_text("ssn 219-09-9999")],
+                         ["pii"])
+        self.assertEqual(self.eg.scan_text("call 555-867-5309 on 2026-07-25"), [])
+
+    def test_preview_is_masked_never_the_secret(self):
+        token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        f = self.eg.scan_text(f"auth: {token}")
+        self.assertEqual(len(f), 1)
+        self.assertNotIn(token, f[0]["preview"])
+        self.assertLessEqual(len(f[0]["preview"]), 7)  # 4 chars + "***"
+
+    def test_redact_masks_all_findings_and_rescans_clean(self):
+        text = ("key = 'sk-ant-api03-R9t8Y7u6I5o4P3a2S1d0F9g8H7j6K5l4'\n"
+                "DATABASE_PASSWORD=tr5Bn8Mk2Wq7\n")
+        redacted, findings = self.eg.redact_text(text)
+        self.assertGreaterEqual(len(findings), 2)
+        self.assertIn("[EGRESS-REDACTED:", redacted)
+        self.assertNotIn("R9t8Y7u6I5o4P3a2S1d0", redacted)
+        self.assertNotIn("tr5Bn8Mk2Wq7", redacted)
+        self.assertEqual(self.eg.scan_text(redacted), [])  # nothing left to leak
+
+    def test_gate_modes(self):
+        secret = "AKIAJQ7WZ5X2K9V4M3TN"
+        clean_action, clean_out, _ = self.eg.gate_text("plain code", allow=set())
+        self.assertEqual((clean_action, clean_out), ("clean", "plain code"))
+        action, out, _ = self.eg.gate_text(secret, mode="block", allow=set())
+        self.assertEqual((action, out), ("blocked", ""))  # refused text NEVER egresses
+        action, out, _ = self.eg.gate_text(secret, mode="allow", allow=set())
+        self.assertEqual(action, "allowed")
+        self.assertEqual(out, secret)
+        action, out, _ = self.eg.gate_text(secret, mode="redact", allow=set())
+        self.assertEqual(action, "redacted")
+        self.assertNotIn(secret, out)
+        # Unknown mode must fail CLOSED, never pass through.
+        action, out, _ = self.eg.gate_text(secret, mode="banana", allow=set())
+        self.assertEqual((action, out), ("blocked", ""))
+
+    def test_policy_allow_category_permits(self):
+        action, out, _ = self.eg.gate_text("ssn 219-09-9999", mode="block",
+                                           allow={"pii"})
+        self.assertEqual(action, "allowed")
+        # ...but only for the ALLOWED categories: a mixed payload still blocks.
+        mixed = "ssn 219-09-9999 and AKIAJQ7WZ5X2K9V4M3TN"
+        action, out, _ = self.eg.gate_text(mixed, mode="block", allow={"pii"})
+        self.assertEqual(action, "blocked")
+
+    def test_env_policy_loading(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"FLEXFACTOR_ALLOW_EGRESS": "pii, cloud_token"}):
+            with mock.patch.object(self.eg.os.path, "expanduser",
+                                   return_value=os.path.join(_HERE, "no-such-dir")):
+                self.assertEqual(self.eg._load_policy_allow(),
+                                 {"pii", "cloud_token"})
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_ALLOW_EGRESS": "all"}):
+            with mock.patch.object(self.eg.os.path, "expanduser",
+                                   return_value=os.path.join(_HERE, "no-such-dir")):
+                self.assertEqual(self.eg._load_policy_allow(),
+                                 set(self.eg.ALL_CATEGORIES))
+
+
+class EgressEvalFixtureTests(unittest.TestCase):
+    """Reproducible eval on the labeled egress corpus:
+    - HARD invariant: zero false negatives (every 'secret' sample must produce
+      a finding in its expected category).
+    - HARD invariant: zero false positives (every 'clean' sample must scan
+      clean) - a noisy scanner would make audits of real repos unusable."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.eg = ff._egress
+        path = os.path.join(_HERE, "eval_fixtures", "egress_corpus.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            cls.corpus = json.load(fh)
+
+    def test_zero_secret_false_negatives(self):
+        missed = []
+        for sample in self.corpus["secret"]:
+            cats = {f["category"] for f in self.eg.scan_text(sample["text"])}
+            if sample["category"] not in cats:
+                missed.append(sample["id"])
+        self.assertEqual(missed, [], f"secrets NOT flagged: {missed}")
+
+    def test_zero_clean_false_positives(self):
+        flagged = []
+        for sample in self.corpus["clean"]:
+            findings = self.eg.scan_text(sample["text"])
+            if findings:
+                flagged.append((sample["id"],
+                                [f["category"] for f in findings]))
+        self.assertEqual(flagged, [], f"clean samples wrongly flagged: {flagged}")
+
+    def test_every_secret_sample_blocks_by_default(self):
+        for sample in self.corpus["secret"]:
+            action, out, _ = self.eg.gate_text(sample["text"], mode="block",
+                                               allow=set())
+            self.assertEqual((action, out), ("blocked", ""),
+                             f"{sample['id']} was not refused")
+
+
+class EgressGateWiringTests(unittest.TestCase):
+    """Pins that the providers ACTUALLY gate their payloads (the production
+    wiring, not just the module), same source-inspection style as the audit
+    report-only gate pin."""
+
+    SECRET = "creds: AKIAJQ7WZ5X2K9V4M3TN"
+
+    def test_all_six_provider_methods_gate_their_payload(self):
+        import inspect
+        for cls in (ff.AnthropicProvider, ff.OpenAIProvider):
+            for name in ("complete", "grade", "structured"):
+                src = inspect.getsource(getattr(cls, name))
+                self.assertIn("_egress_gate(", src,
+                              f"{cls.__name__}.{name} does not gate its payload")
+
+    def _with_mode(self, mode):
+        from unittest import mock
+        return mock.patch.object(ff, "EGRESS_MODE", mode)
+
+    def _no_policy(self):
+        from unittest import mock
+        return mock.patch.object(ff._egress, "_load_policy_allow",
+                                 return_value=set())
+
+    def test_default_mode_blocks_with_marker(self):
+        self.assertEqual(ff.EGRESS_MODE, "block")  # the shipped default
+        with self._no_policy():
+            with self.assertRaises(ff.EgressBlockedError) as ctx:
+                ff._egress_gate(self.SECRET)
+        msg = str(ctx.exception)
+        self.assertIn("flexfactor_egress_blocked", msg)
+        self.assertNotIn("AKIAJQ7WZ5X2K9V4M3TN", msg)  # error must not re-leak
+
+    def test_blocked_error_degrades_like_any_llm_failure(self):
+        # Every sweep handler catches broad exceptions; the gate must subclass
+        # RuntimeError so a blocked file becomes a skip, never an abort.
+        self.assertTrue(issubclass(ff.EgressBlockedError, RuntimeError))
+
+    def test_redact_mode_sends_masked_text(self):
+        with self._with_mode("redact"), self._no_policy():
+            out = ff._egress_gate(self.SECRET)
+        self.assertNotIn("AKIAJQ7WZ5X2K9V4M3TN", out)
+        self.assertIn("[EGRESS-REDACTED:cloud_token]", out)
+
+    def test_allow_mode_sends_unchanged(self):
+        with self._with_mode("allow"), self._no_policy():
+            self.assertEqual(ff._egress_gate(self.SECRET), self.SECRET)
+
+    def test_clean_text_passes_unchanged_in_block_mode(self):
+        code = "def f():\n    return 1\n"
+        with self._no_policy():
+            self.assertEqual(ff._egress_gate(code), code)
+
+    def test_cli_sets_mode_with_allow_winning(self):
+        import argparse
+        from unittest import mock
+        ns = argparse.Namespace(allow_sensitive=False, redact=True)
+        with mock.patch.object(ff, "EGRESS_MODE", "block"):
+            ff._set_egress_mode(ns)
+            self.assertEqual(ff.EGRESS_MODE, "redact")
+        ns = argparse.Namespace(allow_sensitive=True, redact=True)
+        with mock.patch.object(ff, "EGRESS_MODE", "block"):
+            ff._set_egress_mode(ns)
+            self.assertEqual(ff.EGRESS_MODE, "allow")
+        # No flags (or a mode with neither attr) -> the default stays block.
+        with mock.patch.object(ff, "EGRESS_MODE", "block"):
+            ff._set_egress_mode(argparse.Namespace())
+            self.assertEqual(ff.EGRESS_MODE, "block")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
