@@ -144,11 +144,8 @@ judge-tier system+instruction prefix past the threshold or drop the
 `cache_control` marks and the README claim. Either outcome removes a
 misleading cost assumption.
 
-### 4.3 Dependency pinning  [LOW effort]
-
-`pyproject.toml` exists but there is no requirements pin. Add
-`requirements.txt` with tested `anthropic`/`openai` pins (openai 2.x already
-pinned in CLI checks) so a fresh machine reproduces the tested envelope.
+### 4.3 Dependency pinning  [DONE 2026-07-25 — requirements.txt pins the
+tested pair anthropic==0.116.0 / openai==2.44.0; pyproject keeps the ranges]
 
 ## Phase 5 — Opportunistic hardening (backlog, do when touched)
 

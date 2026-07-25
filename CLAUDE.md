@@ -6,7 +6,7 @@ No app deployment — "prod" = the desktop shortcuts working.
 
 ## Run / test
 ```bash
-pip install anthropic openai                   # only deps; there is NO requirements.txt
+pip install -r requirements.txt                # exact tested pins (or: pip install anthropic openai)
 python flexfactor.py --file <f> --goal "..."   # refactor mode
 python flexfactor.py scout --program <p>
 python flexfactor.py audit --program <p>

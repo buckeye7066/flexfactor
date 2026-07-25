@@ -1,0 +1,10 @@
+# Tested envelope (2026-07-25): the exact SDK pair the suite and live runs
+# were exercised against on the dev machine. pyproject.toml carries the
+# compatible RANGES (anthropic>=0.40,<1.0 / openai>=2,<3); this file lets a
+# fresh machine reproduce the known-good pair:
+#   pip install -r requirements.txt
+# Both SDKs are imported lazily - one provider's key is enough to run.
+# Py3.12 SDK compat is fragile (see CLAUDE.md): re-run flexfactor_tests.py
+# after ANY bump before trusting a live audit with it.
+anthropic==0.116.0
+openai==2.44.0
