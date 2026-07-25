@@ -71,7 +71,9 @@ repo completes with zero network calls to Anthropic/OpenAI (spy on providers).
 
 ## Phase 2 — Finish the scout trust layer (roadmap 3-5)
 
-### 2.1 Evidence enrichment from a real temp-worktree clone  [roadmap #3]
+### 2.1 Evidence enrichment from a real temp-worktree clone  [DONE 2026-07-25
+— `enrich_evidence_from_clone` + `inspect_checkout` in the apply path;
+license-mismatch demotes fail-closed; `--no-clone-inspect` opt-out; +8 tests]
 
 Clone the candidate into a temp dir (never the user's repo), then fill the
 evidence fields currently recorded `unknown`: actual lifecycle scripts in

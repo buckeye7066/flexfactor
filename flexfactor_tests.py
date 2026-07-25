@@ -4396,8 +4396,10 @@ class ScoutEndToEndTests(unittest.TestCase):
             True, [[sys.executable, "-c", f"import sys; sys.exit({verify_rc})"]])
         ff._run = spy_run
         try:
+            # --no-clone-inspect keeps the scenario fully offline (the fixture
+            # urls aren't cloneable); enrichment has its own dedicated tests.
             rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
-                          "--top", "5"])
+                          "--top", "5", "--no-clone-inspect"])
         finally:
             for n, fn in saved.items():
                 setattr(ff, n, fn)
@@ -4737,6 +4739,155 @@ class EgressGateWiringTests(unittest.TestCase):
                 ff._set_egress_mode(argparse.Namespace(allow_sensitive=False,
                                                        redact=False))
                 self.assertEqual(ff.EGRESS_MODE, "block")
+
+
+class RealCloneEnrichmentTests(unittest.TestCase):
+    """ULTRAPLAN 2.1: evidence enrichment from a real (faked-clone) checkout.
+    The 'clone' is a runner that BUILDS a fixture checkout at the destination,
+    so everything runs offline through the real inspection code."""
+
+    def _evaluation(self, spdx="MIT"):
+        repo = {"fullName": "x/y", "htmlUrl": "https://example.com/x/y",
+                "primaryLanguage": "JavaScript", "stars": 100,
+                "licenseSpdx": spdx, "pushedAt": "2026-06-01",
+                "description": "lib"}
+        evaluation = {"need": "n", "repo": repo,
+                      "result": {"repo": repo, "safety": {"verdict": "allow"}},
+                      "benefit": {"benefit_score": 80}}
+        evaluation["evidence"] = ff.build_evidence_matrix(evaluation)
+        evaluation["verdicts"] = ff.candidate_verdicts(evaluation["evidence"])
+        return evaluation
+
+    def _fake_runner(self, builder, rc=0):
+        import subprocess
+
+        def runner(cmd, cwd, timeout=900):
+            self.assertEqual(cmd[:4], ["git", "clone", "--depth", "1"])
+            if rc == 0:
+                builder(cmd[-1])
+            return subprocess.CompletedProcess(cmd, rc, "", "")
+        return runner
+
+    MIT_TEXT = ("MIT License\n\nPermission is hereby granted, free of charge, "
+                "to any person obtaining a copy of this software...")
+    GPL_TEXT = ("GNU GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n...")
+
+    @staticmethod
+    def _write(dest, name, content):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, name), "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def test_clean_checkout_fills_evidence_and_keeps_integrate(self):
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "package.json", json.dumps(
+                {"scripts": {"build": "tsc"},
+                 "dependencies": {"a": "1", "b": "2"},
+                 "devDependencies": {"c": "3"}}))
+            self._write(dest, "LICENSE", self.MIT_TEXT)
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        ev = e["evidence"]
+        self.assertEqual(ev["install_scripts"], "none")
+        self.assertEqual(ev["dependency_burden"], "2 runtime + 1 dev deps")
+        self.assertEqual(ev["native_build"], "none detected")
+        self.assertEqual(ev["license_file_family"], "mit")
+        self.assertNotIn("license_mismatch", ev)
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)
+
+    def test_lifecycle_scripts_recorded_and_reasoned(self):
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "package.json", json.dumps(
+                {"scripts": {"postinstall": "node evil.js",
+                             "preinstall": "echo hi"}}))
+            self._write(dest, "LICENSE", self.MIT_TEXT)
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        self.assertEqual(e["evidence"]["install_scripts"],
+                         "present: preinstall, postinstall")
+        self.assertTrue(any("lifecycle install scripts" in r
+                            for r in e["verdicts"]["reasons"]))
+        # ...but integrate is unaffected (installs run --ignore-scripts) and
+        # execute stays never-auto-granted.
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)
+        self.assertIs(e["verdicts"]["safe_to_execute"], False)
+
+    def test_native_build_markers_recorded(self):
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "package.json", json.dumps(
+                {"scripts": {"install": "node-gyp rebuild"}}))
+            self._write(dest, "binding.gyp", "{}")
+            self._write(dest, "LICENSE", self.MIT_TEXT)
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        nb = e["evidence"]["native_build"]
+        self.assertIn("binding.gyp", nb)
+        self.assertIn("node-gyp in scripts", nb)
+
+    def test_license_mismatch_downgrades_and_blocks_integrate(self):
+        e = self._evaluation("MIT")  # metadata claims MIT...
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)  # pre-clone
+
+        def build(dest):
+            self._write(dest, "package.json", "{}")
+            self._write(dest, "LICENSE", self.GPL_TEXT)  # ...text is GPL
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        ev = e["evidence"]
+        self.assertIsNone(ev["license_compatible"])
+        self.assertIn("GPL", ev["license_mismatch"])
+        self.assertIs(e["verdicts"]["safe_to_integrate"], False)
+        self.assertTrue(any("LICENSE file reads as" in r
+                            for r in e["verdicts"]["reasons"]))
+
+    def test_uncheckable_spdx_never_reports_mismatch(self):
+        # zlib has no distinctive text phrase mapped -> absence of a family
+        # for the METADATA side must mean 'cannot verify', not 'mismatch'.
+        e = self._evaluation("Zlib")
+
+        def build(dest):
+            self._write(dest, "LICENSE", self.MIT_TEXT)  # detected family: mit
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        self.assertNotIn("license_mismatch", e["evidence"])
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)
+
+    def test_clone_failure_fails_closed_to_unknown(self):
+        e = self._evaluation("MIT")
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(None, rc=128))
+        ev = e["evidence"]
+        self.assertIn("clone failed (rc 128)", ev["clone_inspection"])
+        self.assertTrue(ev["install_scripts"].startswith("unknown"))
+        self.assertTrue(str(ev["native_build"]).startswith("unknown"))
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)  # metadata gate unchanged
+
+    def test_non_https_url_skips_without_running_git(self):
+        e = self._evaluation("MIT")
+        e["repo"]["htmlUrl"] = "file:///C:/evil"
+
+        def never(cmd, cwd, timeout=900):
+            raise AssertionError("git must not run for a non-https url")
+        ff.enrich_evidence_from_clone(e, run=never)
+        self.assertIn("skipped", e["evidence"]["clone_inspection"])
+
+    def test_symlinked_license_is_not_read(self):
+        # The LICENSE read goes through _read_contained, which refuses symlink
+        # leaves - a checkout can't trick the inspector into reading files
+        # outside itself.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "co")
+            os.makedirs(dest)
+            outside = os.path.join(tmp, "outside.txt")
+            with open(outside, "w", encoding="utf-8") as fh:
+                fh.write(self.MIT_TEXT)
+            try:
+                os.symlink(outside, os.path.join(dest, "LICENSE"))
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation not permitted on this host")
+            info = ff.inspect_checkout(dest)
+            self.assertIsNone(info["license_file_family"])
 
 
 class PolicyCommandTests(unittest.TestCase):

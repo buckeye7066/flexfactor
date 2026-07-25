@@ -68,6 +68,17 @@ exotic goal-irrelevant residuals; accept+document them instead).
 - Scout: `run_scout` → repo-rewards service (localhost:3000, auto-started from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1`) → `generate_integration` /
   `apply_integration` with `_rollback`
+- Real-clone enrichment (2026-07-25, ULTRAPLAN 2.1): in `_apply_phase`,
+  before per-candidate approval, `enrich_evidence_from_clone` shallow-clones
+  the candidate to a temp dir and `inspect_checkout` fills the evidence
+  fields that were `unknown` pre-clone (lifecycle scripts, native-build
+  markers, dependency burden, LICENSE-text family). Read-only via
+  `_read_contained` (symlink-safe); git clone runs no repo hooks; verdicts
+  RE-COMPUTED after enrichment. LICENSE-text-vs-SPDX mismatch downgrades
+  `license_compatible` to None -> integrate fails closed
+  (`skipped-demoted-by-inspection`). Clone failure leaves fields unknown
+  (never demotes on transport errors). `--no-clone-inspect` opts out; the
+  offline E2E passes it (fixture urls aren't cloneable).
 - Scout safety (2026-07-21): per-candidate `build_evidence_matrix` +
   `candidate_verdicts` — THREE deterministic verdicts (safe_to_inspect /
   safe_to_integrate / safe_to_execute), fail-closed on unknowns;

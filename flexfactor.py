@@ -2732,6 +2732,13 @@ def candidate_verdicts(evidence: dict) -> dict:
     if inj:
         integrate = False
 
+    if evidence.get("license_mismatch"):
+        reasons.append(str(evidence["license_mismatch"]))
+    scripts = str(evidence.get("install_scripts") or "")
+    if scripts.startswith("present"):
+        reasons.append(f"lifecycle install scripts {scripts} - blocked by "
+                       "--ignore-scripts unless --allow-scripts")
+
     # Execution is NEVER cleared automatically: lifecycle scripts and network
     # behavior are uninspected pre-clone, installs run --ignore-scripts, and
     # only the owner's explicit --allow-scripts grants execution.
@@ -2750,6 +2757,161 @@ def candidate_verdicts(evidence: dict) -> dict:
             "safe_to_integrate": integrate,
             "safe_to_execute": execute,
             "reasons": reasons}
+
+
+# --------------------------------------------------------------------------- #
+# Real-clone evidence enrichment (ULTRAPLAN 2.1): before a candidate reaches
+# per-candidate approval, shallow-clone it into a THROWAWAY temp dir (never
+# the user's repo) and fill the evidence fields that were 'unknown' pre-clone:
+# actual lifecycle scripts, native-build markers, true dependency burden, and
+# LICENSE-file-vs-SPDX-metadata agreement. Everything is READ-ONLY through
+# _read_contained (symlink-safe, size-capped); nothing in the checkout is
+# ever executed (git clone runs no repo-controlled hooks). safe_to_execute
+# stays owner-granted - this makes the approval card honest, it never
+# auto-grants anything. All failures leave evidence 'unknown' (fail closed).
+# --------------------------------------------------------------------------- #
+
+# Distinctive opening phrases of the common license texts. Order matters:
+# AGPL/LGPL contain the GPL phrase, so they are checked first.
+_LICENSE_TEXT_PHRASES = [
+    ("agpl", "GNU AFFERO GENERAL PUBLIC LICENSE"),
+    ("lgpl", "GNU LESSER GENERAL PUBLIC LICENSE"),
+    ("gpl", "GNU GENERAL PUBLIC LICENSE"),
+    ("apache", "Apache License"),
+    ("mpl", "Mozilla Public License"),
+    ("mit", "Permission is hereby granted, free of charge"),
+    ("bsd", "Redistribution and use in source and binary forms"),
+    ("isc", "Permission to use, copy, modify, and/or distribute"),
+    ("unlicense", "This is free and unencumbered software"),
+]
+
+# SPDX id -> the family its LICENSE text should read as. Ids not listed here
+# (zlib, cc0, ...) have no reliably distinctive text and are UNCHECKABLE -
+# absence from this map means "cannot verify", never "mismatch".
+_SPDX_FAMILY = {
+    "mit": "mit", "apache-2.0": "apache", "bsd-2-clause": "bsd",
+    "bsd-3-clause": "bsd", "0bsd": "bsd", "isc": "isc", "mpl-2.0": "mpl",
+    "unlicense": "unlicense", "gpl-2.0": "gpl", "gpl-3.0": "gpl",
+    "agpl-3.0": "agpl", "lgpl-2.1": "lgpl", "lgpl-3.0": "lgpl",
+}
+
+_LICENSE_FILE_NAMES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE-MIT",
+                       "COPYING", "COPYING.md")
+# npm hooks that run at INSTALL time (the arbitrary-code-execution vector).
+_NPM_LIFECYCLE_HOOKS = ("preinstall", "install", "postinstall", "prepare")
+_NATIVE_BUILD_FILES = ("binding.gyp", "CMakeLists.txt", "Cargo.toml")
+
+
+def _license_text_family(text: str | None) -> str | None:
+    if not text:
+        return None
+    low = text.lower()
+    for family, phrase in _LICENSE_TEXT_PHRASES:
+        if phrase.lower() in low:
+            return family
+    return None
+
+
+def inspect_checkout(checkout_dir: str) -> dict:
+    """Deterministic, read-only inspection of a real checkout. All reads go
+    through _read_contained (refuses symlink leaves/traversal, size-capped);
+    nothing is executed. Absent/unparseable inputs stay 'unknown'."""
+    info = {"install_scripts": "unknown (no readable package.json)",
+            "native_build": "none detected",
+            "dependency_burden": "unknown (no readable package.json)",
+            "license_file_family": None}
+    script_text = ""
+    pkg = None
+    raw = _read_contained(checkout_dir, "package.json", 400_000)
+    if raw:
+        try:
+            pkg = json.loads(raw)
+        except ValueError:
+            pkg = None  # malformed manifest -> fields stay unknown
+    if isinstance(pkg, dict):
+        scripts = pkg.get("scripts")
+        if isinstance(scripts, dict):
+            hooks = [k for k in _NPM_LIFECYCLE_HOOKS if k in scripts]
+            info["install_scripts"] = ("present: " + ", ".join(hooks)) if hooks else "none"
+            script_text = " ".join(str(v) for v in scripts.values())
+        else:
+            info["install_scripts"] = "none"
+        deps = pkg.get("dependencies")
+        dev = pkg.get("devDependencies")
+        n_deps = len(deps) if isinstance(deps, dict) else 0
+        n_dev = len(dev) if isinstance(dev, dict) else 0
+        info["dependency_burden"] = f"{n_deps} runtime + {n_dev} dev deps"
+    native = [n for n in _NATIVE_BUILD_FILES
+              if _read_contained(checkout_dir, n, 1000) is not None]
+    native += [f"{t} in scripts" for t in ("node-gyp", "prebuild-install")
+               if t in script_text]
+    if native:
+        info["native_build"] = "present: " + ", ".join(native)
+    for name in _LICENSE_FILE_NAMES:
+        fam = _license_text_family(_read_contained(checkout_dir, name, 200_000))
+        if fam:
+            info["license_file_family"] = fam
+            break
+    return info
+
+
+def _rmtree_force(path: str) -> None:
+    """rmtree that clears Windows read-only bits (git objects) on the way."""
+    def _onexc(func, p, exc):
+        with contextlib.suppress(OSError):
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+    try:
+        shutil.rmtree(path, onexc=_onexc)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)  # best effort; temp dir
+
+
+def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
+    """Shallow-clone the candidate into a temp dir, inspect it, update the
+    evidence matrix IN PLACE, and RE-COMPUTE the verdicts.
+
+    Fail-closed: clone/read failures leave every field 'unknown'. A LICENSE
+    file whose text family CONTRADICTS the SPDX metadata downgrades
+    license_compatible to None, which makes safe_to_integrate fail closed -
+    repo metadata alone can no longer vouch for the license. Verdicts are
+    recomputed even on failure paths (a no-op then), so callers can always
+    trust evaluation['verdicts'] to match the current evidence."""
+    ev = evaluation.get("evidence")
+    if not isinstance(ev, dict):
+        return
+    import tempfile
+    url = str((evaluation.get("repo") or {}).get("htmlUrl") or "").strip()
+    runner = _run if run is None else run
+    if not url.lower().startswith("https://"):
+        ev["clone_inspection"] = "skipped (no https clone url)"
+    else:
+        tmp = tempfile.mkdtemp(prefix="ffscout-inspect-")
+        dest = os.path.join(tmp, "checkout")
+        try:
+            cp = runner(["git", "clone", "--depth", "1", "--no-tags", url, dest],
+                        cwd=tmp, timeout=180)
+            if cp.returncode != 0:
+                ev["clone_inspection"] = (f"clone failed (rc {cp.returncode}); "
+                                          "evidence fields stay unknown")
+            else:
+                info = inspect_checkout(dest)
+                ev["install_scripts"] = info["install_scripts"]
+                ev["native_build"] = info["native_build"]
+                ev["dependency_burden"] = info["dependency_burden"]
+                ev["clone_inspection"] = "inspected a real shallow clone"
+                fam_file = info["license_file_family"]
+                if fam_file:
+                    ev["license_file_family"] = fam_file
+                fam_meta = _SPDX_FAMILY.get(str(ev.get("license") or "").strip().lower())
+                if fam_file and fam_meta and fam_file != fam_meta:
+                    ev["license_compatible"] = None  # unknown -> gate fails closed
+                    ev["license_mismatch"] = (
+                        f"LICENSE file reads as {fam_file.upper()} but metadata "
+                        f"claims {ev.get('license')}")
+        finally:
+            _rmtree_force(tmp)
+    evaluation["verdicts"] = candidate_verdicts(ev)
 
 
 def run_scout(args) -> int:
@@ -3082,6 +3244,19 @@ def _apply_phase(args, profile_name: str, profile: dict,
         repo = e["repo"]
         name = repo.get("fullName") or repo.get("htmlUrl") or e["need"]
         print(f"\n-> {name}  (for: {e['need']})")
+        if getattr(args, "clone_inspect", True):
+            # ULTRAPLAN 2.1: verify the metadata against a REAL shallow clone
+            # before asking the owner to approve. Enrichment can only DEMOTE
+            # (fail closed); a candidate that passed on metadata alone but
+            # whose LICENSE text disagrees is skipped here, never applied.
+            enrich_evidence_from_clone(e)
+            v = e.get("verdicts") or {}
+            if v.get("safe_to_integrate") is not True:
+                why = (e.get("evidence") or {}).get("license_mismatch") \
+                    or "; ".join(v.get("reasons") or [])[:300]
+                print(f"   skipped: real-clone inspection demoted this candidate ({why})")
+                results.append(ApplyResult(name, "skipped-demoted-by-inspection", str(why)))
+                continue
         if not _approve_candidate(args, e, project_dir):
             print("   skipped: not approved")
             results.append(ApplyResult(name, "skipped-unapproved",
@@ -6530,6 +6705,13 @@ def main(argv=None) -> int:
                             help="Prefix for the per-repo apply branch (default: flexfactor/adopt-).")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Apply even if the git working tree isn't clean.")
+        parser.add_argument("--no-clone-inspect", action="store_false", dest="clone_inspect",
+                            default=True,
+                            help="Skip the pre-approval shallow-clone inspection that fills "
+                                 "the evidence matrix from a REAL checkout (lifecycle "
+                                 "scripts, native build, dependency burden, LICENSE-vs-"
+                                 "metadata agreement). Inspection is read-only, runs no "
+                                 "repo code, and can only demote a candidate.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                             help="Show what would be installed/written without changing anything.")
         _add_egress_args(parser)
