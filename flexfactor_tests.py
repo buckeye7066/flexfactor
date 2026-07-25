@@ -1361,9 +1361,23 @@ class BudgetedHealthPingTests(unittest.TestCase):
         class _Msg:
             usage = _Usage()
 
+        # Production ping() now streams (messages.stream(...).get_final_message())
+        # because the FCC proxy renders non-streaming messages.create() as raw
+        # SSE text rather than a Message. Mirror that call shape here so the
+        # stub feeds the same _Msg (with .usage) to _meter.
+        class _Stream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *exc):
+                return False
+            def get_final_message(self_):
+                return _Msg()
+
         class _Messages:
             def create(self, **kw):
                 return _Msg()
+            def stream(self, **kw):
+                return _Stream()
 
         class _Anthropic:
             def __init__(self):

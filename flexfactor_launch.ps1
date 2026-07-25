@@ -2,6 +2,31 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# ---- Route through the local FCC proxy (Free Claude Code) instead of the ----
+# ---- real Anthropic/OpenAI APIs. The proxy on 127.0.0.1:8082 exposes only  ----
+# ---- the Anthropic Messages API and takes Bearer token 'freecc'. It maps   ----
+# ---- any Claude model id by tier (opus/sonnet/haiku) to a free upstream,   ----
+# ---- so FlexFactor's claude-* ids route fine. The OpenAI provider is left  ----
+# ---- unusable here because the proxy has no OpenAI inbound endpoint.       ----
+# To revert: copy flexfactor_launch.ps1.bak-preproxy over this file and your
+# real ANTHROPIC_API_KEY / OPENAI_API_KEY will be used again.
+$env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"
+$env:ANTHROPIC_AUTH_TOKEN = "freecc"      # Bearer auth the proxy expects
+$env:ANTHROPIC_API_KEY   = ""             # blank any real key so the SDK uses the Bearer token
+$env:OPENAI_API_KEY      = ""             # proxy is Anthropic-only -> single Anthropic provider
+$env:OPENAI_BASE_URL     = ""
+$proxyUp = $false
+$tcp = New-Object System.Net.Sockets.TcpClient
+try { $tcp.Connect("127.0.0.1", 8082); $proxyUp = $true } catch { $proxyUp = $false } finally { $tcp.Close() }
+if (-not $proxyUp) {
+    Write-Host "  NOTE: the local FCC proxy at 127.0.0.1:8082 is not reachable." -ForegroundColor Yellow
+    Write-Host "  FlexFactor is configured to route through it (that is what Claude Code uses)." -ForegroundColor Yellow
+    Write-Host "  Start the FCC proxy and retry, or restore flexfactor_launch.ps1.bak-preproxy" -ForegroundColor Yellow
+    Write-Host "  to use the real Anthropic/OpenAI API keys again." -ForegroundColor Yellow
+    Read-Host "Press Enter to close"; exit 1
+}
+Write-Host "  Routing through local FCC proxy at 127.0.0.1:8082 (Bearer freecc)." -ForegroundColor Green
+
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
 
 Write-Host ""
@@ -30,7 +55,7 @@ $mode = Read-Host "Choose [1/2/3] (Enter = 1)"
 # sanity check used by refactor/scout.
 if ($mode -eq "3") {
     # Key detection. Audit wants BOTH models when it can get them.
-    $haveAnthropic = -not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)
+    $haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
     $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
     $extraArgs = @()
 
@@ -112,16 +137,16 @@ if ($mode -eq "3") {
     exit 0
 }
 
-$provider = Read-Host "Provider [openai / anthropic] (Enter = openai)"
-if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "openai" }
+$provider = Read-Host "Provider [anthropic / openai] (Enter = anthropic)"
+if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "anthropic" }
 
 # Key sanity check (shared by refactor and scout modes).
 if ($provider -eq "openai" -and [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
     Write-Host "OPENAI_API_KEY is not set in this environment." -ForegroundColor Red
     Read-Host "Press Enter to close"; exit 1
 }
-if ($provider -eq "anthropic" -and [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) {
-    Write-Host "ANTHROPIC_API_KEY is not set. Set a valid sk-ant-... key and retry." -ForegroundColor Red
+if ($provider -eq "anthropic" -and [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY) -and [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN)) {
+    Write-Host "No Anthropic credential set (ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN) and proxy env is missing." -ForegroundColor Red
     Read-Host "Press Enter to close"; exit 1
 }
 
