@@ -2075,7 +2075,8 @@ def _winify(cmd: list[str]) -> list[str]:
     return [resolved, *cmd[1:]] if resolved else cmd
 
 
-def _run(cmd: list[str], cwd: str, timeout: int = 900) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: str, timeout: int = 900,
+         env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a subprocess robustly - NEVER raises. A missing executable, OS error, bad
     arguments, or timeout returns a NON-ZERO CompletedProcess instead of crashing the
     caller, so one bad gate/test/command can never abort a whole audit (which would
@@ -2103,7 +2104,8 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900) -> subprocess.CompletedPr
         cp.flexfactor_policy_blocked = True
         return cp
     try:
-        return subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True,
+                              timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
         return _fail(124, out, f"timed out after {timeout}s")
@@ -2895,34 +2897,69 @@ _SPDX_FAMILY = {
     "agpl-3.0": "agpl", "lgpl-2.1": "lgpl", "lgpl-3.0": "lgpl",
 }
 
-_LICENSE_FILE_NAMES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE-MIT",
-                       "COPYING", "COPYING.md")
+# License-like ROOT filenames, matched case-insensitively against the actual
+# tree listing (Sol finding 3: a fixed tuple missed COPYING.txt etc.).
+_LICENSE_FILE_RX = re.compile(r"^(license|licence|copying|unlicense)([._\-].*)?$",
+                              re.IGNORECASE)
 # npm hooks that run at INSTALL time (the arbitrary-code-execution vector).
 _NPM_LIFECYCLE_HOOKS = ("preinstall", "install", "postinstall", "prepare")
 _NATIVE_BUILD_FILES = ("binding.gyp", "CMakeLists.txt", "Cargo.toml")
 
 
-def _license_text_family(text: str | None) -> str | None:
+def _license_text_families(text: str | None) -> set[str]:
+    """ALL license families whose distinctive text appears (Sol finding 4:
+    returning only the first match wrongly demoted dual-licensed repos and
+    files with embedded third-party notices)."""
     if not text:
-        return None
+        return set()
     low = text.lower()
-    for family, phrase in _LICENSE_TEXT_PHRASES:
-        if phrase.lower() in low:
-            return family
-    return None
+    return {family for family, phrase in _LICENSE_TEXT_PHRASES
+            if phrase.lower() in low}
+
+
+def _tree_reader(checkout_dir: str):
+    """(list_root, read) accessors for a checkout.
+
+    For a real git clone the reads go to the OBJECT DATABASE (`git ls-tree` /
+    `git show HEAD:<path>`): raw blob contents, no smudge/clean filters, and
+    it works with --no-checkout so no repo-controlled filter process can ever
+    run (Sol finding 2). Plain fixture dirs (tests) fall back to contained
+    filesystem reads (_read_contained: symlink-safe, size-capped)."""
+    if os.path.isdir(os.path.join(checkout_dir, ".git")):
+        def list_root() -> list[str]:
+            cp = _run(["git", "-C", checkout_dir, "ls-tree", "--name-only", "HEAD"],
+                      cwd=checkout_dir, timeout=60)
+            return cp.stdout.splitlines() if cp.returncode == 0 else []
+
+        def read(rel: str, cap: int) -> str | None:
+            cp = _run(["git", "-C", checkout_dir, "show", f"HEAD:{rel}"],
+                      cwd=checkout_dir, timeout=60)
+            return cp.stdout[:cap] if cp.returncode == 0 else None
+    else:
+        def list_root() -> list[str]:
+            try:
+                return os.listdir(checkout_dir)
+            except OSError:
+                return []
+
+        def read(rel: str, cap: int) -> str | None:
+            return _read_contained(checkout_dir, rel, cap)
+    return list_root, read
 
 
 def inspect_checkout(checkout_dir: str) -> dict:
-    """Deterministic, read-only inspection of a real checkout. All reads go
-    through _read_contained (refuses symlink leaves/traversal, size-capped);
-    nothing is executed. Absent/unparseable inputs stay 'unknown'."""
+    """Deterministic, read-only inspection of a real checkout via _tree_reader
+    (git object-db reads for clones; contained filesystem reads for fixture
+    dirs). Nothing is executed. Absent/unparseable inputs stay 'unknown'."""
     info = {"install_scripts": "unknown (no readable package.json)",
             "native_build": "none detected",
             "dependency_burden": "unknown (no readable package.json)",
-            "license_file_family": None}
+            "license_families": set(),
+            "license_file_found": False}
+    list_root, read = _tree_reader(checkout_dir)
     script_text = ""
     pkg = None
-    raw = _read_contained(checkout_dir, "package.json", 400_000)
+    raw = read("package.json", 400_000)
     if raw:
         try:
             pkg = json.loads(raw)
@@ -2941,17 +2978,16 @@ def inspect_checkout(checkout_dir: str) -> dict:
         n_deps = len(deps) if isinstance(deps, dict) else 0
         n_dev = len(dev) if isinstance(dev, dict) else 0
         info["dependency_burden"] = f"{n_deps} runtime + {n_dev} dev deps"
-    native = [n for n in _NATIVE_BUILD_FILES
-              if _read_contained(checkout_dir, n, 1000) is not None]
+    native = [n for n in _NATIVE_BUILD_FILES if read(n, 1000) is not None]
     native += [f"{t} in scripts" for t in ("node-gyp", "prebuild-install")
                if t in script_text]
     if native:
         info["native_build"] = "present: " + ", ".join(native)
-    for name in _LICENSE_FILE_NAMES:
-        fam = _license_text_family(_read_contained(checkout_dir, name, 200_000))
-        if fam:
-            info["license_file_family"] = fam
-            break
+    for name in list_root():
+        if not _LICENSE_FILE_RX.match(str(name)):
+            continue
+        info["license_file_found"] = True
+        info["license_families"] |= _license_text_families(read(str(name), 200_000))
     return info
 
 
@@ -2967,48 +3003,85 @@ def _rmtree_force(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)  # best effort; temp dir
 
 
+def _hermetic_git_env() -> dict:
+    """Environment for the inspection clone: NO inherited git config (a user
+    or system `url.<x>.insteadOf` could rewrite the https url onto another
+    transport, and configured filters like git-lfs would execute during
+    checkout - Sol finding 2), no terminal prompts, no LFS smudge."""
+    env = dict(os.environ)
+    env.update({"GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_LFS_SKIP_SMUDGE": "1"})
+    return env
+
+
 def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     """Shallow-clone the candidate into a temp dir, inspect it, update the
     evidence matrix IN PLACE, and RE-COMPUTE the verdicts.
 
-    Fail-closed: clone/read failures leave every field 'unknown'. A LICENSE
-    file whose text family CONTRADICTS the SPDX metadata downgrades
-    license_compatible to None, which makes safe_to_integrate fail closed -
-    repo metadata alone can no longer vouch for the license. Verdicts are
-    recomputed even on failure paths (a no-op then), so callers can always
-    trust evaluation['verdicts'] to match the current evidence."""
+    FAIL-CLOSED CONTRACT (Sol finding 1): evidence['clone_inspection_ok'] is
+    True ONLY after a successful clone + inspection. The _apply_phase gate
+    requires it, so a candidate whose repo cannot be inspected (unclonable
+    url, timeout, non-https) can never proceed to apply on metadata alone -
+    an attacker can't dodge inspection by serving an unclonable url.
+
+    The clone itself is hermetic: --no-checkout (no worktree -> no smudge/
+    clean filter processes ever run), `--` before the url (no option
+    smuggling), and a config-isolated environment (_hermetic_git_env). All
+    subsequent reads come from the git object database (_tree_reader).
+
+    License verdicting: the LICENSE-like files' text families must INCLUDE
+    the metadata's family. A contradiction, an unrecognized text, or a
+    missing license file (when metadata claims a verifiable permissive id)
+    downgrades license_compatible to None -> integrate fails closed."""
     ev = evaluation.get("evidence")
     if not isinstance(ev, dict):
         return
     import tempfile
     url = str((evaluation.get("repo") or {}).get("htmlUrl") or "").strip()
     runner = _run if run is None else run
+    ev["clone_inspection_ok"] = False  # until proven otherwise (fail closed)
     if not url.lower().startswith("https://"):
         ev["clone_inspection"] = "skipped (no https clone url)"
     else:
         tmp = tempfile.mkdtemp(prefix="ffscout-inspect-")
         dest = os.path.join(tmp, "checkout")
         try:
-            cp = runner(["git", "clone", "--depth", "1", "--no-tags", url, dest],
-                        cwd=tmp, timeout=180)
+            cp = runner(["git", "clone", "--depth", "1", "--no-tags",
+                         "--no-checkout", "--", url, dest],
+                        cwd=tmp, timeout=180, env=_hermetic_git_env())
             if cp.returncode != 0:
                 ev["clone_inspection"] = (f"clone failed (rc {cp.returncode}); "
-                                          "evidence fields stay unknown")
+                                          "candidate cannot be verified")
             else:
                 info = inspect_checkout(dest)
                 ev["install_scripts"] = info["install_scripts"]
                 ev["native_build"] = info["native_build"]
                 ev["dependency_burden"] = info["dependency_burden"]
                 ev["clone_inspection"] = "inspected a real shallow clone"
-                fam_file = info["license_file_family"]
-                if fam_file:
-                    ev["license_file_family"] = fam_file
+                ev["clone_inspection_ok"] = True
+                fams = info["license_families"]
+                if fams:
+                    ev["license_file_family"] = "+".join(sorted(fams))
                 fam_meta = _SPDX_FAMILY.get(str(ev.get("license") or "").strip().lower())
-                if fam_file and fam_meta and fam_file != fam_meta:
-                    ev["license_compatible"] = None  # unknown -> gate fails closed
-                    ev["license_mismatch"] = (
-                        f"LICENSE file reads as {fam_file.upper()} but metadata "
-                        f"claims {ev.get('license')}")
+                if fam_meta:  # metadata claims a family we know how to verify
+                    if fams and fam_meta not in fams:
+                        ev["license_compatible"] = None  # -> gate fails closed
+                        ev["license_mismatch"] = (
+                            "license file text reads as "
+                            f"{'+'.join(sorted(fams)).upper()} but metadata "
+                            f"claims {ev.get('license')}")
+                    elif not info["license_file_found"]:
+                        ev["license_compatible"] = None
+                        ev["license_mismatch"] = (
+                            f"metadata claims {ev.get('license')} but the "
+                            "checkout contains no license file to verify it")
+                    elif not fams:
+                        ev["license_compatible"] = None
+                        ev["license_mismatch"] = (
+                            f"metadata claims {ev.get('license')} but the "
+                            "license file text is unrecognized (manual review)")
         finally:
             _rmtree_force(tmp)
     evaluation["verdicts"] = candidate_verdicts(ev)
@@ -3347,12 +3420,18 @@ def _apply_phase(args, profile_name: str, profile: dict,
         if getattr(args, "clone_inspect", True):
             # ULTRAPLAN 2.1: verify the metadata against a REAL shallow clone
             # before asking the owner to approve. Enrichment can only DEMOTE
-            # (fail closed); a candidate that passed on metadata alone but
-            # whose LICENSE text disagrees is skipped here, never applied.
+            # (fail closed), and inspection is REQUIRED: a candidate whose
+            # repo can't be cloned/inspected must not proceed on metadata
+            # alone (Sol finding 1 - an unclonable url would otherwise be a
+            # way to DODGE inspection). --no-clone-inspect is the explicit
+            # owner opt-out.
             enrich_evidence_from_clone(e)
             v = e.get("verdicts") or {}
-            if v.get("safe_to_integrate") is not True:
-                why = (e.get("evidence") or {}).get("license_mismatch") \
+            ev = e.get("evidence") or {}
+            if ev.get("clone_inspection_ok") is not True \
+                    or v.get("safe_to_integrate") is not True:
+                why = ev.get("license_mismatch") \
+                    or ev.get("clone_inspection") \
                     or "; ".join(v.get("reasons") or [])[:300]
                 print(f"   skipped: real-clone inspection demoted this candidate ({why})")
                 results.append(ApplyResult(name, "skipped-demoted-by-inspection", str(why)))

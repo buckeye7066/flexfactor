@@ -4761,8 +4761,9 @@ class RealCloneEnrichmentTests(unittest.TestCase):
     def _fake_runner(self, builder, rc=0):
         import subprocess
 
-        def runner(cmd, cwd, timeout=900):
+        def runner(cmd, cwd, timeout=900, env=None):
             self.assertEqual(cmd[:4], ["git", "clone", "--depth", "1"])
+            self.last_cmd, self.last_env = list(cmd), env
             if rc == 0:
                 builder(cmd[-1])
             return subprocess.CompletedProcess(cmd, rc, "", "")
@@ -4794,7 +4795,16 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertEqual(ev["native_build"], "none detected")
         self.assertEqual(ev["license_file_family"], "mit")
         self.assertNotIn("license_mismatch", ev)
+        self.assertIs(ev["clone_inspection_ok"], True)
         self.assertIs(e["verdicts"]["safe_to_integrate"], True)
+        # The clone is HERMETIC (Sol finding 2): no worktree checkout, no
+        # option smuggling, no inherited git config, no prompts, no LFS.
+        self.assertIn("--no-checkout", self.last_cmd)
+        self.assertIn("--", self.last_cmd)
+        self.assertEqual(self.last_env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(self.last_env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(self.last_env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(self.last_env["GIT_LFS_SKIP_SMUDGE"], "1")
 
     def test_lifecycle_scripts_recorded_and_reasoned(self):
         e = self._evaluation("MIT")
@@ -4839,8 +4849,54 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertIsNone(ev["license_compatible"])
         self.assertIn("GPL", ev["license_mismatch"])
         self.assertIs(e["verdicts"]["safe_to_integrate"], False)
-        self.assertTrue(any("LICENSE file reads as" in r
-                            for r in e["verdicts"]["reasons"]))
+        self.assertTrue(any("reads as" in r for r in e["verdicts"]["reasons"]))
+
+    def test_dual_license_containing_metadata_family_is_not_mismatch(self):
+        # Sol finding 4: Apache text FIRST, MIT text after; metadata says MIT.
+        # The metadata family is PRESENT in the file -> legitimate, no demote.
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "LICENSE",
+                        "Apache License\nVersion 2.0, January 2004\n\n"
+                        + self.MIT_TEXT)
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        ev = e["evidence"]
+        self.assertNotIn("license_mismatch", ev)
+        self.assertEqual(ev["license_file_family"], "apache+mit")
+        self.assertIs(e["verdicts"]["safe_to_integrate"], True)
+
+    def test_copying_txt_gpl_is_caught(self):
+        # Sol finding 3: COPYING.txt was not in the old fixed filename tuple.
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "COPYING.txt", self.GPL_TEXT)
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        self.assertIn("license_mismatch", e["evidence"])
+        self.assertIs(e["verdicts"]["safe_to_integrate"], False)
+
+    def test_missing_license_file_is_unverifiable_for_permissive_claim(self):
+        # Metadata claims MIT (verifiable family) but the checkout has NO
+        # license-like file at all -> cannot verify -> fail closed.
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "package.json", "{}")
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        self.assertIsNone(e["evidence"]["license_compatible"])
+        self.assertIn("no license file", e["evidence"]["license_mismatch"])
+        self.assertIs(e["verdicts"]["safe_to_integrate"], False)
+
+    def test_unrecognized_license_text_is_unverifiable(self):
+        e = self._evaluation("MIT")
+
+        def build(dest):
+            self._write(dest, "LICENSE", "You may use this software nicely.")
+        ff.enrich_evidence_from_clone(e, run=self._fake_runner(build))
+        self.assertIsNone(e["evidence"]["license_compatible"])
+        self.assertIn("unrecognized", e["evidence"]["license_mismatch"])
+        self.assertIs(e["verdicts"]["safe_to_integrate"], False)
 
     def test_uncheckable_spdx_never_reports_mismatch(self):
         # zlib has no distinctive text phrase mapped -> absence of a family
@@ -4860,16 +4916,19 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertIn("clone failed (rc 128)", ev["clone_inspection"])
         self.assertTrue(ev["install_scripts"].startswith("unknown"))
         self.assertTrue(str(ev["native_build"]).startswith("unknown"))
-        self.assertIs(e["verdicts"]["safe_to_integrate"], True)  # metadata gate unchanged
+        # Sol finding 1: an uninspectable candidate must NOT proceed on
+        # metadata alone - the apply gate keys on clone_inspection_ok.
+        self.assertIs(ev["clone_inspection_ok"], False)
 
     def test_non_https_url_skips_without_running_git(self):
         e = self._evaluation("MIT")
         e["repo"]["htmlUrl"] = "file:///C:/evil"
 
-        def never(cmd, cwd, timeout=900):
+        def never(cmd, cwd, timeout=900, env=None):
             raise AssertionError("git must not run for a non-https url")
         ff.enrich_evidence_from_clone(e, run=never)
         self.assertIn("skipped", e["evidence"]["clone_inspection"])
+        self.assertIs(e["evidence"]["clone_inspection_ok"], False)
 
     def test_symlinked_license_is_not_read(self):
         # The LICENSE read goes through _read_contained, which refuses symlink
@@ -4887,7 +4946,86 @@ class RealCloneEnrichmentTests(unittest.TestCase):
             except (OSError, NotImplementedError):
                 self.skipTest("symlink creation not permitted on this host")
             info = ff.inspect_checkout(dest)
-            self.assertIsNone(info["license_file_family"])
+            self.assertEqual(info["license_families"], set())  # refused, not read
+
+
+class ApplyPhaseInspectionGateTests(unittest.TestCase):
+    """Sol finding 5: prove _apply_phase actually STOPS a demoted or
+    uninspectable candidate BEFORE approval/generation - not just that the
+    enrichment internals compute the right values."""
+
+    def _target(self):
+        repo = {"fullName": "x/y", "htmlUrl": "https://example.com/x/y",
+                "primaryLanguage": "JavaScript", "stars": 10,
+                "licenseSpdx": "MIT", "pushedAt": "2026-06-01"}
+        e = {"need": "n", "repo": repo,
+             "result": {"repo": repo, "safety": {"verdict": "allow"}},
+             "benefit": {"benefit_score": 90}, "recommendation": "ADOPT"}
+        e["evidence"] = ff.build_evidence_matrix(e)
+        e["verdicts"] = ff.candidate_verdicts(e["evidence"])
+        return e
+
+    def _drive(self, enrich_effect):
+        import argparse
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        calls = {"approve": 0, "generate": 0}
+
+        def fake_enrich(e, run=None):
+            enrich_effect(e)
+
+        def fake_approve(args, e, project_dir):
+            calls["approve"] += 1
+            return False  # if reached, decline so the flow stops safely
+
+        def fake_generate(*a, **k):
+            calls["generate"] += 1
+            return None, "unreachable"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(apply_tier="adopt", clone_inspect=True,
+                                      dry_run=False, program=tmp)
+            with mock.patch.object(ff, "enrich_evidence_from_clone", fake_enrich), \
+                 mock.patch.object(ff, "_approve_candidate", fake_approve), \
+                 mock.patch.object(ff, "resolve_project_dir", lambda *a: tmp), \
+                 mock.patch.object(ff, "generate_integration", fake_generate):
+                with redirect_stdout(io.StringIO()):
+                    results = ff._apply_phase(args, "P", {"summary": "s"},
+                                              [self._target()], provider=None)
+        return results, calls
+
+    def test_demoted_candidate_never_reaches_approval(self):
+        def demote(e):
+            e["evidence"]["clone_inspection_ok"] = True
+            e["evidence"]["license_compatible"] = None
+            e["evidence"]["license_mismatch"] = \
+                "license file text reads as GPL but metadata claims MIT"
+            e["verdicts"] = ff.candidate_verdicts(e["evidence"])
+        results, calls = self._drive(demote)
+        self.assertEqual(results[0].status, "skipped-demoted-by-inspection")
+        self.assertEqual(calls, {"approve": 0, "generate": 0})
+
+    def test_uninspectable_candidate_never_reaches_approval(self):
+        def fail(e):
+            e["evidence"]["clone_inspection_ok"] = False
+            e["evidence"]["clone_inspection"] = \
+                "clone failed (rc 128); candidate cannot be verified"
+            # Verdicts from METADATA still say fine - the gate must not care.
+            e["verdicts"] = ff.candidate_verdicts(e["evidence"])
+        results, calls = self._drive(fail)
+        self.assertEqual(results[0].status, "skipped-demoted-by-inspection")
+        self.assertIn("cannot be verified", results[0].detail)
+        self.assertEqual(calls, {"approve": 0, "generate": 0})
+
+    def test_clean_inspection_reaches_approval(self):
+        def ok(e):
+            e["evidence"]["clone_inspection_ok"] = True
+            e["verdicts"] = ff.candidate_verdicts(e["evidence"])
+        results, calls = self._drive(ok)
+        self.assertEqual(results[0].status, "skipped-unapproved")
+        self.assertEqual(calls["approve"], 1)  # the gate let it through
 
 
 class OllamaProviderTests(unittest.TestCase):
