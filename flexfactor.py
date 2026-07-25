@@ -6437,12 +6437,16 @@ def _add_egress_args(parser) -> None:
 
 def _set_egress_mode(args) -> None:
     """--allow-sensitive wins over --redact if both are passed (the broader,
-    explicit consent). Default stays 'block' (fail closed)."""
+    explicit consent). ALWAYS assigns: a flag-less invocation resets to
+    'block', so a prior in-process run's allow/redact can never leak into a
+    later one (Sol finding 4)."""
     global EGRESS_MODE
     if getattr(args, "allow_sensitive", False):
         EGRESS_MODE = "allow"
     elif getattr(args, "redact", False):
         EGRESS_MODE = "redact"
+    else:
+        EGRESS_MODE = "block"
 
 
 def main(argv=None) -> int:

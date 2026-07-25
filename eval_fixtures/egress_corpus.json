@@ -34,7 +34,17 @@
     {"id": "env-password-line", "category": "env_secret",
      "text": "DATABASE_PASSWORD=tr5Bn8Mk2Wq7\n"},
     {"id": "ssn", "category": "pii",
-     "text": "patient = {'name': 'J. Doe', 'ssn': '219-09-9999'}"}
+     "text": "patient = {'name': 'J. Doe', 'ssn': '219-09-9999'}"},
+    {"id": "pem-truncated", "category": "private_key",
+     "text": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB9zTruncatedNoEndMarker"},
+    {"id": "env-bare-password-name", "category": "env_secret",
+     "text": "PASSWORD=tr5Bn8Mk2Wq7\n"},
+    {"id": "env-bare-token-name", "category": "env_secret",
+     "text": "TOKEN=Abcdef12\n"},
+    {"id": "google-key-trailing-dash", "category": "cloud_token",
+     "text": "maps_key = 'AIzaSyB9c8D7e6F5g4H3i2J1k0L9m8N7o6P5q4-'"},
+    {"id": "github-token-incidental-fake", "category": "cloud_token",
+     "text": "auth = ghp_A1b2C3d4fakeG7h8I9j0K1l2M3n4O5p6Q7r8"}
   ],
   "clean": [
     {"id": "plain-code",

@@ -68,6 +68,21 @@ def _is_placeholder(value: str) -> bool:
     return len(stripped) <= 1
 
 
+# Vendor-shaped tokens get a much STRICTER placeholder test (Sol finding 6):
+# a real random token can contain 'fake' or 'test' by chance, so only
+# structural signals - a 4+ repeated-char run (xxxx/0000) or long documentation
+# words vanishingly unlikely in real token material - may suppress a finding.
+_REPEAT_RUN = re.compile(r"(.)\1{3,}")
+_VENDOR_PLACEHOLDER_HINTS = ("example", "sample", "placeholder", "1234567890",
+                             "your")
+
+
+def _is_placeholder_token(token: str) -> bool:
+    low = token.lower()
+    return bool(_REPEAT_RUN.search(low)) or any(
+        h in low for h in _VENDOR_PLACEHOLDER_HINTS)
+
+
 def _value_looks_secret(value: str) -> bool:
     """Heuristic for GENERIC assignments only (the vendor-prefix patterns do
     not consult this): credential-like means >=8 chars, no whitespace, and a
@@ -84,33 +99,46 @@ def _value_looks_secret(value: str) -> bool:
 # value_group: if set, the placeholder/secret-likeness filters run on that
 # group; if None, the whole match is checked against the placeholder filter
 # only (vendor prefixes are already high-confidence).
+# End-of-token boundary for alphabets that include `-`: a trailing hyphen is a
+# non-word char, so \b can NEVER match after it (Sol finding 7) - use an
+# explicit negative lookahead over the token alphabet instead.
+_END = r"(?![A-Za-z0-9_\-])"
+
 _PATTERNS: list[tuple[str, re.Pattern, int | None]] = [
+    # The WHOLE block through the matching END line (redaction must mask the
+    # key BODY, not just the BEGIN marker - Sol finding 1); if the END marker
+    # is missing/truncated, fail closed by spanning to end-of-text.
     ("private_key",
-     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"), None),
-    # Vendor-distinctive token shapes. \b keeps `task-...`/`risk-...` safe.
+     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+                r"(?:[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----|[\s\S]*\Z)"),
+     None),
+    # Vendor-distinctive token shapes. Leading \b keeps `task-...`/`risk-...`
+    # safe; trailing boundary is _END wherever the alphabet contains `-`.
     ("cloud_token", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), None),
-    ("cloud_token", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), None),
+    ("cloud_token", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}" + _END), None),
     ("cloud_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"), None),
     ("cloud_token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), None),
-    ("cloud_token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"), None),
-    ("cloud_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"), None),
+    ("cloud_token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}" + _END), None),
+    ("cloud_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}" + _END), None),
     ("cloud_token", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{16,}\b"), None),
     ("cloud_token", re.compile(r"\bnpm_[A-Za-z0-9]{36,}\b"), None),
-    ("api_token", re.compile(r"\bsk-ant-[A-Za-z0-9\-]{20,}\b"), None),
-    ("api_token", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{32,}\b"), None),
+    ("api_token", re.compile(r"\bsk-ant-[A-Za-z0-9\-]{20,}" + _END), None),
+    ("api_token", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{32,}" + _END), None),
     # JWT: three dot-joined base64url segments starting with the {"..."} header.
     ("api_token",
-     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+                r"\.[A-Za-z0-9_\-]{10,}" + _END),
      None),
     # Quoted assignment to a secret-ish name; group(1) = the value. No leading
     # \b: `_` is a word char, so \b would miss `db_password = "..."` entirely.
     ("password_assignment",
      re.compile(r"(?i)(?:password|passwd|pwd|secret|api_?key|access_?key|"
                 r"auth_?token|token)\s*[:=]\s*[\"']([^\"']{8,})[\"']"), 1),
-    # .env-style line; group(1) = the value.
+    # .env-style line; group(1) = the value. The prefix is OPTIONAL so the
+    # bare names PASSWORD=/TOKEN=/... are caught too (Sol finding 5).
     ("env_secret",
-     re.compile(r"(?m)^\s*[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD)"
-                r"\s*=\s*[\"']?([^\s\"']{8,})[\"']?\s*$"), 1),
+     re.compile(r"(?m)^\s*(?:[A-Z][A-Z0-9_]*)?(?:KEY|SECRET|TOKEN|PASSWORD|"
+                r"PASSWD|PWD)\s*=\s*[\"']?([^\s\"']{8,})[\"']?\s*$"), 1),
     # SSN shape (3-2-4 with dashes; phone numbers are 3-3-4 and don't match).
     ("pii", re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), None),
 ]
@@ -131,7 +159,12 @@ def scan_text(text: str) -> list[dict]:
             if value_group is not None:
                 if not _value_looks_secret(token):
                     continue
-            elif _is_placeholder(token):
+            elif category in ("cloud_token", "api_token") \
+                    and _is_placeholder_token(token):
+                # Only vendor/API tokens get placeholder suppression. PEM
+                # blocks are never suppressed (the body can coincidentally
+                # contain any hint word) and neither is pii (an SSN ending in
+                # e.g. -9999 would trip the repeated-run rule).
                 continue
             findings.append({
                 "category": category,
@@ -145,22 +178,24 @@ def scan_text(text: str) -> list[dict]:
 
 
 def redact_text(text: str, findings: list[dict] | None = None) -> tuple[str, list[dict]]:
-    """Replace every finding's span with [EGRESS-REDACTED:<category>].
+    """Replace every finding's span with [EGRESS-REDACTED:<categories>].
 
-    Spans are replaced back-to-front so earlier offsets stay valid; overlapping
-    spans are merged into the earliest-starting replacement."""
+    Overlapping spans are merged into their UNION first (Sol finding 2: naive
+    clipping left the tail of a larger span unredacted when a smaller finding
+    sat inside it), then the merged spans are replaced back-to-front so earlier
+    offsets stay valid. Nothing inside any finding's span survives."""
     if findings is None:
         findings = scan_text(text)
+    merged: list[list] = []  # [start, end, {categories}]
+    for f in sorted(findings, key=lambda f: (f["start"], f["end"])):
+        if merged and f["start"] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], f["end"])
+            merged[-1][2].add(f["category"])
+        else:
+            merged.append([f["start"], f["end"], {f["category"]}])
     out = text
-    last_start = None
-    for f in sorted(findings, key=lambda f: (f["start"], f["end"]), reverse=True):
-        end = f["end"]
-        if last_start is not None and end > last_start:
-            end = last_start  # clip overlap with the finding to our right
-        if end <= f["start"]:
-            continue
-        out = out[:f["start"]] + f"[EGRESS-REDACTED:{f['category']}]" + out[end:]
-        last_start = f["start"]
+    for start, end, cats in reversed(merged):
+        out = out[:start] + "[EGRESS-REDACTED:" + "+".join(sorted(cats)) + "]" + out[end:]
     return out, findings
 
 
@@ -198,6 +233,11 @@ def gate_text(text: str, mode: str = "block",
     findings = scan_text(text)
     if not findings:
         return "clean", text, findings
+    if mode not in ("block", "redact", "allow"):
+        # Unknown mode fails closed BEFORE any allow logic (Sol finding 3:
+        # checking the category allowlist first let an unknown mode leak an
+        # allowed-category payload through).
+        return "blocked", "", findings
     if mode == "allow":
         return "allowed", text, findings
     effective_allow = _load_policy_allow() if allow is None else allow

@@ -4508,6 +4508,56 @@ class EgressScanTests(unittest.TestCase):
         self.assertNotIn("tr5Bn8Mk2Wq7", redacted)
         self.assertEqual(self.eg.scan_text(redacted), [])  # nothing left to leak
 
+    def test_pem_redaction_masks_the_whole_block(self):
+        # Sol finding 1: the key BODY and END marker must not survive redact
+        # mode (scan_text can't re-detect a bare base64 body, so the span
+        # itself has to cover the block).
+        text = ("cfg = load()\n-----BEGIN RSA PRIVATE KEY-----\n"
+                "MIIEowSECRETBODY9\n-----END RSA PRIVATE KEY-----\nrest = 1\n")
+        redacted, _ = self.eg.redact_text(text)
+        self.assertNotIn("MIIEowSECRETBODY9", redacted)
+        self.assertNotIn("END RSA PRIVATE KEY", redacted)
+        self.assertIn("rest = 1", redacted)  # ...but only the block is masked
+        # Truncated block (no END marker): fail closed to end-of-text.
+        trunc, _ = self.eg.redact_text(
+            "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB9zTrailing")
+        self.assertNotIn("MHcCAQEEIB9zTrailing", trunc)
+
+    def test_overlapping_spans_redact_their_union(self):
+        # Sol finding 2: a vendor token INSIDE a larger env-secret span must
+        # not leave the tail of the larger span unredacted.
+        text = "SECRET_TOKEN=abc12345-AKIAJQ7WZ5X2K9V4M3TN-tailSecret9\n"
+        redacted, findings = self.eg.redact_text(text)
+        self.assertGreaterEqual(len(findings), 2)  # env_secret + cloud_token
+        self.assertNotIn("AKIAJQ7WZ5X2K9V4M3TN", redacted)
+        self.assertNotIn("tailSecret9", redacted)
+        self.assertNotIn("abc12345", redacted)
+
+    def test_unknown_mode_blocks_even_with_allowed_categories(self):
+        # Sol finding 3: mode validation must precede the allow policy.
+        action, out, _ = self.eg.gate_text("AKIAJQ7WZ5X2K9V4M3TN",
+                                           mode="banana",
+                                           allow={"cloud_token"})
+        self.assertEqual((action, out), ("blocked", ""))
+
+    def test_bare_env_secret_names_detected(self):
+        # Sol finding 5: PASSWORD=/TOKEN= with no prefix must still match.
+        for line in ("PASSWORD=tr5Bn8Mk2Wq7", "TOKEN=Abcdef12"):
+            cats = [f["category"] for f in self.eg.scan_text(line)]
+            self.assertIn("env_secret", cats, f"missed: {line}")
+
+    def test_vendor_token_with_incidental_hint_word_detected(self):
+        # Sol finding 6: a real-shaped token containing 'fake' by chance is
+        # still a token - only structural placeholder signals may suppress.
+        f = self.eg.scan_text("ghp_A1b2C3d4fakeG7h8I9j0K1l2M3n4O5p6Q7r8")
+        self.assertEqual([x["category"] for x in f], ["cloud_token"])
+
+    def test_trailing_hyphen_token_detected(self):
+        # Sol finding 7: \b can't match after a trailing '-'; the explicit
+        # end-lookahead must.
+        f = self.eg.scan_text("k = 'AIzaSyB9c8D7e6F5g4H3i2J1k0L9m8N7o6P5q4-'")
+        self.assertEqual([x["category"] for x in f], ["cloud_token"])
+
     def test_gate_modes(self):
         secret = "AKIAJQ7WZ5X2K9V4M3TN"
         clean_action, clean_out, _ = self.eg.gate_text("plain code", allow=set())
@@ -4594,6 +4644,11 @@ class EgressGateWiringTests(unittest.TestCase):
 
     SECRET = "creds: AKIAJQ7WZ5X2K9V4M3TN"
 
+    class _SpyClient:
+        """Any attribute access = the provider touched the SDK client."""
+        def __getattr__(self, name):
+            raise AssertionError(f"SDK client touched ({name}) despite egress block")
+
     def test_all_six_provider_methods_gate_their_payload(self):
         import inspect
         for cls in (ff.AnthropicProvider, ff.OpenAIProvider):
@@ -4601,6 +4656,26 @@ class EgressGateWiringTests(unittest.TestCase):
                 src = inspect.getsource(getattr(cls, name))
                 self.assertIn("_egress_gate(", src,
                               f"{cls.__name__}.{name} does not gate its payload")
+
+    def test_gate_blocks_before_any_sdk_call(self):
+        # Sol finding 8: the source pin alone can't prove ORDER - drive the
+        # real provider methods with a spy client and assert the block fires
+        # before the SDK is ever touched.
+        secret = self.SECRET
+        for cls in (ff.AnthropicProvider, ff.OpenAIProvider):
+            p = object.__new__(cls)  # skip __init__: no SDK import, no key
+            p.model = p.judge_model = "test-model"
+            p.meter = None
+            p.client = self._SpyClient()
+            calls = (("complete", lambda: p.complete(secret)),
+                     ("grade", lambda: p.grade(secret)),
+                     ("structured", lambda: p.structured("sys", secret, {})))
+            for name, call in calls:
+                with self._no_policy():
+                    with self.assertRaises(
+                            ff.EgressBlockedError,
+                            msg=f"{cls.__name__}.{name} did not block"):
+                        call()
 
     def _with_mode(self, mode):
         from unittest import mock
@@ -4655,6 +4730,13 @@ class EgressGateWiringTests(unittest.TestCase):
         with mock.patch.object(ff, "EGRESS_MODE", "block"):
             ff._set_egress_mode(argparse.Namespace())
             self.assertEqual(ff.EGRESS_MODE, "block")
+        # Sol finding 4: a flag-less parse must RESET a stale allow/redact
+        # left by a prior in-process invocation, not inherit it.
+        for stale in ("allow", "redact"):
+            with mock.patch.object(ff, "EGRESS_MODE", stale):
+                ff._set_egress_mode(argparse.Namespace(allow_sensitive=False,
+                                                       redact=False))
+                self.assertEqual(ff.EGRESS_MODE, "block")
 
 
 class PolicyCommandTests(unittest.TestCase):
