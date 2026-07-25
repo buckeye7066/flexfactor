@@ -6349,7 +6349,7 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
 
 
 _TOP_LEVEL_USAGE = """\
-usage: flexfactor [-h] {refactor,scout,audit} ...
+usage: flexfactor [-h] {refactor,scout,audit,policy} ...
 
 FlexFactor - local, build-gated, budget-capped dual-provider code tool.
 
@@ -6361,9 +6361,62 @@ modes:
              benefit it (report-only by default; --apply to integrate).
   audit      Aggressive line-by-line defect hunt + auto-fix across a whole
              project (report-only by default; --apply to fix).
+  policy     Inspect (`show`) or initialize (`init`) the owner policy file
+             ~/.flexfactor/policy.json that unlocks high-risk command
+             classes and secret/PII egress categories (deny-by-default).
 
 Run `flexfactor <mode> --help` (e.g. `flexfactor scout --help`) for that
 mode's full options."""
+
+
+# Deny-by-default owner policy template (`flexfactor policy init`). JSON has
+# no comments, so guidance rides in "_"-prefixed keys both gate loaders ignore.
+_POLICY_TEMPLATE = {
+    "_comment": "FlexFactor owner policy (machine-local; never commit it). "
+                "DENY-BY-DEFAULT: with this file absent or its lists empty, "
+                "high-risk command classes are refused at the _run gate and "
+                "secret/PII findings block cloud egress. Add entries only "
+                "after deciding exactly what they unlock.",
+    "_allow_classes_help": "Command classes _run may execute beyond the always-"
+                           "allowed set. High-risk values: destructive, "
+                           "credentialed, deploy. Example: [\"deploy\"] lets "
+                           "audited projects run their deploy tooling.",
+    "allow_classes": [],
+    "_allow_egress_help": "Secret/PII finding categories permitted to reach "
+                          "cloud models without --redact/--allow-sensitive: "
+                          "private_key, cloud_token, api_token, "
+                          "password_assignment, env_secret, pii, or \"all\". "
+                          "Example: [\"pii\"].",
+    "allow_egress": [],
+}
+
+
+def run_policy(args) -> int:
+    path = os.path.join(os.path.expanduser("~"), ".flexfactor", "policy.json")
+    if args.action == "init":
+        if os.path.exists(path):
+            # Never overwrite: the existing file is the OWNER's reviewed policy.
+            print(f"policy file already exists, NOT overwriting: {path}")
+            return 1
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(_POLICY_TEMPLATE, fh, indent=2)
+            fh.write("\n")
+        print(f"wrote deny-by-default policy template: {path}")
+        print("Both lists are empty on purpose - edit the file to unlock "
+              "specific command classes / egress categories.")
+        return 0
+    # show: the EFFECTIVE state (file + env combined), for debugging gates.
+    print(f"policy file: {path} ({'present' if os.path.exists(path) else 'absent'})")
+    print(f"env FLEXFACTOR_ALLOW_CLASSES: {os.environ.get('FLEXFACTOR_ALLOW_CLASSES') or '(unset)'}")
+    print(f"env FLEXFACTOR_ALLOW_EGRESS:  {os.environ.get('FLEXFACTOR_ALLOW_EGRESS') or '(unset)'}")
+    cmd_allow = sorted(_cmd_policy._load_policy_allow() & _cmd_policy.HIGH_RISK)
+    egress_allow = sorted(_egress._load_policy_allow())
+    print("high-risk command classes unlocked: "
+          + (", ".join(cmd_allow) if cmd_allow else "(none - all high-risk refused)"))
+    print("egress categories allowed: "
+          + (", ".join(egress_allow) if egress_allow else "(none - all findings block)"))
+    return 0
 
 
 def _add_egress_args(parser) -> None:
@@ -6405,9 +6458,23 @@ def main(argv=None) -> int:
         return 0
     # Backward compatibility: the original CLI had no subcommand (just --file/--goal).
     # If the first token isn't a known mode, assume the classic "refactor" mode.
-    if not argv or argv[0] not in ("refactor", "scout", "audit"):
+    if not argv or argv[0] not in ("refactor", "scout", "audit", "policy"):
         argv = ["refactor", *argv]
     mode, rest = argv[0], argv[1:]
+
+    if mode == "policy":
+        parser = argparse.ArgumentParser(
+            prog="flexfactor policy",
+            description="Inspect or initialize ~/.flexfactor/policy.json - the owner "
+                        "policy that unlocks high-risk command classes (allow_classes) "
+                        "and secret/PII egress categories (allow_egress). "
+                        "Deny-by-default; `init` never overwrites an existing file.",
+        )
+        parser.add_argument("action", choices=["init", "show"],
+                            help="init: write the deny-by-default template (only if the "
+                                 "file is absent). show: print the effective policy "
+                                 "(file + env) both gates will enforce.")
+        return run_policy(parser.parse_args(rest))
 
     if mode == "scout":
         parser = argparse.ArgumentParser(

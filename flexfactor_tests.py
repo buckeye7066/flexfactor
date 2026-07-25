@@ -4657,5 +4657,93 @@ class EgressGateWiringTests(unittest.TestCase):
             self.assertEqual(ff.EGRESS_MODE, "block")
 
 
+class PolicyCommandTests(unittest.TestCase):
+    """`flexfactor policy init|show`: the owner-policy template must be
+    deny-by-default, never overwrite, and reflect what the gates enforce."""
+
+    def _home(self, tmp):
+        from unittest import mock
+        return mock.patch("os.path.expanduser",
+                          side_effect=lambda p: p.replace("~", tmp, 1))
+
+    def _no_env(self):
+        from unittest import mock
+        return mock.patch.dict(os.environ, {"FLEXFACTOR_ALLOW_CLASSES": "",
+                                            "FLEXFACTOR_ALLOW_EGRESS": ""})
+
+    def test_init_writes_deny_by_default_template(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._home(tmp), self._no_env():
+                rc = ff.main(["policy", "init"])
+                self.assertEqual(rc, 0)
+                path = os.path.join(tmp, ".flexfactor", "policy.json")
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self.assertEqual(data["allow_classes"], [])
+                self.assertEqual(data["allow_egress"], [])
+                # The template must actually be DENY-by-default through the
+                # REAL gate loaders, not just look empty.
+                self.assertEqual(ff._cmd_policy._load_policy_allow(), set())
+                self.assertEqual(ff._egress._load_policy_allow(), set())
+
+    def test_init_never_overwrites(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".flexfactor", "policy.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"allow_classes": ["deploy"]}')
+            with self._home(tmp), self._no_env():
+                rc = ff.main(["policy", "init"])
+            self.assertEqual(rc, 1)  # refused, and the owner's file survives
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), {"allow_classes": ["deploy"]})
+
+    def test_template_edits_flow_through_both_gates(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._home(tmp), self._no_env():
+                ff.main(["policy", "init"])
+                path = os.path.join(tmp, ".flexfactor", "policy.json")
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                data["allow_classes"] = ["deploy"]
+                data["allow_egress"] = ["pii"]
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh)
+                self.assertEqual(ff._cmd_policy._load_policy_allow(), {"deploy"})
+                self.assertEqual(ff._egress._load_policy_allow(), {"pii"})
+
+    def test_show_reports_effective_state(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._home(tmp), self._no_env():
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ff.main(["policy", "show"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("absent", out)
+        self.assertIn("all high-risk refused", out)
+        self.assertIn("all findings block", out)
+
+    def test_policy_mode_not_swallowed_by_implicit_refactor(self):
+        # `policy` must dispatch to its own parser, not become
+        # `refactor policy` (which would demand --file/--goal and exit 2).
+        import io
+        from contextlib import redirect_stdout
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._home(tmp), self._no_env():
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(ff.main(["policy", "show"]), 0)
+
+    def test_top_level_usage_lists_policy_mode(self):
+        self.assertIn("policy", ff._TOP_LEVEL_USAGE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

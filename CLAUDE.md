@@ -10,6 +10,7 @@ pip install anthropic openai                   # only deps; there is NO requirem
 python flexfactor.py --file <f> --goal "..."   # refactor mode
 python flexfactor.py scout --program <p>
 python flexfactor.py audit --program <p>
+python flexfactor.py policy init|show          # owner policy (~/.flexfactor/policy.json)
 python flexfactor_tests.py                     # unit tests, no API keys needed
 python flexfactor_dashboard.py --selftest
 ```

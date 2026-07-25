@@ -68,6 +68,8 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 python flexfactor.py --file <path> --goal "..."        # refactor
 python flexfactor.py scout --program <path|lnk|url>
 python flexfactor.py audit --program <path> [--program <path2> ...] [--parallel N]
+python flexfactor.py policy init                        # write deny-by-default owner policy
+python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)
 python flexfactor_dashboard.py --selftest               # dashboard self-check
 ```

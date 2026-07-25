@@ -83,13 +83,16 @@ Verify: fixture repos (safe / postinstall / native-build / license-mismatch)
 produce the expected evidence + verdicts; unknown-on-clone-failure fails
 closed.
 
-### 2.2 Eval-corpus extension  [roadmap #4]
+### 2.2 Eval-corpus extension  [DONE 2026-07-25 — 9 new candidates; typosquat/
+lockfile-tamper pinned via the safety-verdict allowlist until 2.1 lands]
 
 Add to `eval_fixtures/scout_candidates.json`: adversarial license spoofing
 (LICENSE text vs SPDX metadata mismatch), lockfile-tamper, and
 typosquat-name cases. Keep zero-unsafe-false-negatives as the hard invariant.
 
-### 2.3 Owner-reviewed `~/.flexfactor/policy.json` defaults  [roadmap #5]
+### 2.3 Owner-reviewed `~/.flexfactor/policy.json` defaults  [DONE 2026-07-25
+— `flexfactor policy init|show`, deny-by-default template covering
+allow_classes + allow_egress, never overwrites, +6 tests]
 
 Ship a commented template (deny high-risk everywhere, explicit allowlists
 empty) + a `flexfactor.py policy init` subcommand that writes it only if
