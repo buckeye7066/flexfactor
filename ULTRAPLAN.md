@@ -104,22 +104,17 @@ absent. Document in README.
 
 ## Phase 3 — Isolation infrastructure (roadmap #2 + audit Item 3)
 
-### 3.1 Research spike: no-network verification on Windows  [timeboxed]
+### 3.1 Research spike: no-network verification on Windows  [DONE 2026-07-25
+— see ISOLATION_SPIKE.md. Decision: env-level proxy-poisoning now (no admin,
+per-process, ~80%), AppContainer as the airtight follow-up; firewall/user/WFP
+rejected for blast radius.]
 
-Options to evaluate (1-2 days, decision doc not code): WFP filter via helper,
-per-user firewall rule + dedicated restricted user, Docker-when-available,
-`--offline` npm + severed proxy env vars as the cheap 80%. Outcome: pick one,
-record blast radius and failure modes.
-
-### 3.2 Implement chosen isolation for `apply_integration` verify + audit build gate
-
-`--ignore-scripts` already blocks install-time execution for adopted packages;
-this extends containment to the build/verify step itself. Opt-out flag with
-loud disclosure in the approval card (same honest-disclosure pattern as
-`_verify_disclosure`).
-
-Verify: E2E fixture whose build step attempts a network call — must fail the
-gate under isolation, succeed with the opt-out.
+### 3.2 Implement chosen isolation for `apply_integration` verify  [DONE
+2026-07-25 for the SCOUT verify path — `_no_network_env()` (proxy-poisoned +
+npm offline) on the verify `_run`, `--no-isolate-verify` opt-out, honest
+disclosure line ("raw sockets NOT blocked"), E2E pins the poisoned env.
+REMAINING: the audit build gate (`_full_gate`/fast verify) — same helper,
+separate slice; and the AppContainer airtight successor per the spike.]
 
 ## Phase 4 — Structure and cost hygiene
 

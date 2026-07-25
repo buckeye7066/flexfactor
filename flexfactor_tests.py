@@ -4370,16 +4370,20 @@ class ScoutEndToEndTests(unittest.TestCase):
                   "make_provider", "generate_integration", "_detect_verify",
                   "_run")}
         self.npm_calls: list[list[str]] = []
+        self.verify_envs: list[dict | None] = []
         real_run = ff._run
 
-        def spy_run(cmd, cwd, timeout=900):
+        def spy_run(cmd, cwd, timeout=900, env=None):
             # Intercept ONLY npm (no real installs in tests); everything else
             # (git, the python verify command) runs for real through the actual
-            # chokepoint incl. the command-policy gate.
+            # chokepoint incl. the command-policy gate. The verify command's
+            # env is captured to pin the network-isolation wiring.
             if cmd and str(cmd[0]).lower() == "npm":
                 self.npm_calls.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "", "")
-            return real_run(cmd, cwd, timeout=timeout)
+            if cmd and cmd[0] == sys.executable:
+                self.verify_envs.append(env)
+            return real_run(cmd, cwd, timeout=timeout, env=env)
 
         ff._server_is_up = lambda url, timeout=1.5: True
         ff.repo_rewards_search = lambda base, q, lens=None, attempts=3: \
@@ -4438,6 +4442,12 @@ class ScoutEndToEndTests(unittest.TestCase):
             npm = self.npm_calls[0]
             self.assertEqual(npm[:2], ["npm", "install"])
             self.assertIn("--ignore-scripts", npm)
+            # The verify step ran under the no-network env (ULTRAPLAN 3.2).
+            self.assertTrue(self.verify_envs, "verify command was not observed")
+            venv = self.verify_envs[0]
+            self.assertIsNotNone(venv)
+            self.assertEqual(venv["HTTPS_PROXY"], "http://127.0.0.1:9")
+            self.assertEqual(venv["npm_config_offline"], "true")
             self.assertIn("--", npm)
             self.assertIn("left-pad", npm)
             self.assertLess(npm.index("--ignore-scripts"), npm.index("--"))
@@ -4947,6 +4957,40 @@ class RealCloneEnrichmentTests(unittest.TestCase):
                 self.skipTest("symlink creation not permitted on this host")
             info = ff.inspect_checkout(dest)
             self.assertEqual(info["license_families"], set())  # refused, not read
+
+
+class NoNetworkVerifyEnvTests(unittest.TestCase):
+    """ULTRAPLAN 3.2: the verify step's best-effort no-network environment."""
+
+    def test_env_poisons_all_proxy_paths(self):
+        env = ff._no_network_env()
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                  "http_proxy", "https_proxy", "all_proxy"):
+            self.assertEqual(env[k], "http://127.0.0.1:9", k)
+        self.assertEqual(env["NO_PROXY"], "")  # nothing is exempt
+        self.assertEqual(env["no_proxy"], "")
+        self.assertEqual(env["npm_config_offline"], "true")
+        self.assertEqual(env["npm_config_registry"], "http://127.0.0.1:9")
+
+    def test_disclosure_states_isolation_level(self):
+        import tempfile
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name": "t", "scripts": {"build": "x"}}')
+            on = ff._verify_disclosure(
+                types.SimpleNamespace(verify=True, isolate_verify=True), tmp)
+            self.assertIn("network isolation", on)
+            self.assertIn("raw sockets NOT blocked", on)  # honest about limits
+            off = ff._verify_disclosure(
+                types.SimpleNamespace(verify=True, isolate_verify=False), tmp)
+            self.assertIn("WITHOUT network isolation", off)
+
+    def test_apply_verify_wiring_pins_isolation(self):
+        import inspect
+        src = inspect.getsource(ff.apply_integration)
+        self.assertIn("_no_network_env", src)
+        self.assertIn("isolate_verify", src)
 
 
 class ApplyPhaseInspectionGateTests(unittest.TestCase):

@@ -2476,10 +2476,16 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                 raise ApplyError("npm install failed:\n" + _tail(r.stderr))
 
         # Verify with the project's own build - the production-readiness gate.
+        # By default the verify subprocess runs under _no_network_env (the
+        # candidate's code executes here; env-level isolation stops the common
+        # HTTP exfil paths - ISOLATION_SPIKE.md). --no-isolate-verify opts out.
         if opts.verify and verify_cmds:
+            verify_env = (_no_network_env()
+                          if getattr(opts, "isolate_verify", True) else None)
             for cmd in verify_cmds:
-                print(f"    verifying: {' '.join(cmd)}")
-                r = _run(cmd, project_dir, timeout=1200)
+                print(f"    verifying: {' '.join(cmd)}"
+                      + ("  [network-isolated]" if verify_env else ""))
+                r = _run(cmd, project_dir, timeout=1200, env=verify_env)
                 if r.returncode != 0:
                     raise ApplyError(f"verify '{' '.join(cmd)}' failed:\n"
                                      + _tail(r.stdout + "\n" + r.stderr))
@@ -3016,6 +3022,25 @@ def _hermetic_git_env() -> dict:
     return env
 
 
+def _no_network_env() -> dict:
+    """Best-effort no-network environment for the build-VERIFY step
+    (ISOLATION_SPIKE.md option A): every standard proxy variable points at an
+    unroutable local port and npm is forced offline, so HTTP(S) through the
+    common clients (npm/yarn/node-fetch/undici/pip/curl) dies immediately.
+    NOT airtight - raw sockets bypass env-level isolation; the approval card
+    discloses exactly that. AppContainer isolation is the tracked successor."""
+    dead = "http://127.0.0.1:9"  # port 9 (discard) on loopback: nothing answers
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy"):
+        env[k] = dead
+    for k in ("NO_PROXY", "no_proxy"):
+        env[k] = ""  # nothing is exempt from the poisoned proxy
+    env.update({"npm_config_offline": "true", "npm_config_registry": dead,
+                "npm_config_fund": "false", "npm_config_audit": "false"})
+    return env
+
+
 def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     """Shallow-clone the candidate into a temp dir, inspect it, update the
     evidence matrix IN PLACE, and RE-COMPUTE the verdicts.
@@ -3330,9 +3355,13 @@ def _verify_disclosure(args, project_dir: str) -> str:
         return ("  Verify:    no build/lint script detected - the change is "
                 "committed WITHOUT executing the project's code")
     joined = "; ".join(" ".join(c) for c in cmds)
+    iso = ("under best-effort network isolation (proxy-poisoned env; raw "
+           "sockets NOT blocked)"
+           if getattr(args, "isolate_verify", True)
+           else "WITHOUT network isolation (--no-isolate-verify)")
     return (f"  Verify:    the project's own build ({joined}) runs WITH the "
-            "generated files applied - approving consents to that execution; "
-            "a failing build is rolled back")
+            f"generated files applied, {iso} - approving consents to that "
+            "execution; a failing build is rolled back")
 
 
 def _candidate_approval_summary(evaluation: dict, args, verify_note: str) -> str:
@@ -6868,6 +6897,14 @@ def main(argv=None) -> int:
                             help="Which recommendations to apply: 'adopt' (default) or also 'consider'.")
         parser.add_argument("--no-verify", action="store_false", dest="verify",
                             help="Skip the build-verify gate before committing (not recommended).")
+        parser.add_argument("--no-isolate-verify", action="store_false",
+                            dest="isolate_verify", default=True,
+                            help="Run the build-verify step WITHOUT the best-effort "
+                                 "no-network environment (proxy-poisoned env + npm "
+                                 "offline). Default: isolation ON - the verify step "
+                                 "executes candidate-influenced code, and the poisoned "
+                                 "env stops the common HTTP exfil paths (raw sockets "
+                                 "are not blocked; see ISOLATION_SPIKE.md).")
         parser.add_argument("--allow-scripts", action="store_true", dest="allow_scripts",
                             default=False,
                             help="Let npm lifecycle scripts (preinstall/postinstall) RUN during "
