@@ -49,6 +49,15 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 - Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
   minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
   prompts don't actually cache today (harmless - a miss bills normal price).
+- **Local-only provider (`--provider ollama`).** All three modes can run
+  against a local Ollama server (default `deepseek-coder:33b` author +
+  `llama3.2` judge; override with `--model`/`--judge-model` to match
+  `ollama list`). ZERO cloud egress: the provider refuses any non-loopback
+  `OLLAMA_BASE_URL`, audit never silently adds a cloud cross-checker to an
+  ollama run, and local tokens are metered at $0 (budgets unaffected). The
+  egress gate is deliberately not applied - payloads never leave the machine.
+  Quality vs frontier models is a real tradeoff; every safety net (build
+  gate, rollback, deterministic scout gates) is unchanged.
 - **Secret/PII egress gate (default ON).** Before ANY repo text reaches a cloud
   model, a deterministic pre-send scan (`flexfactor_egress.py`) checks for
   private keys, vendor API tokens, credential-like assignments, secret env

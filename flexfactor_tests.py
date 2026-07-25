@@ -4890,6 +4890,110 @@ class RealCloneEnrichmentTests(unittest.TestCase):
             self.assertIsNone(info["license_file_family"])
 
 
+class OllamaProviderTests(unittest.TestCase):
+    """ULTRAPLAN 1.2: the local-only provider. All HTTP is mocked; no server
+    or model needed."""
+
+    def _resp(self, body: dict):
+        import io
+
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _R(json.dumps(body).encode("utf-8"))
+
+    def _patch_urlopen(self, captured, body=None):
+        from unittest import mock
+        body = body or {"message": {"content": "hello"},
+                        "prompt_eval_count": 7, "eval_count": 3}
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return self._resp(body)
+        return mock.patch("urllib.request.urlopen", fake_urlopen)
+
+    def test_refuses_non_local_base_url(self):
+        # The zero-egress guarantee: a non-loopback OLLAMA_BASE_URL is refused
+        # at construction, fail closed.
+        for url in ("https://evil.example.com", "http://10.0.0.5:11434"):
+            with self.assertRaises(ValueError):
+                ff.OllamaProvider("m", base_url=url)
+
+    def test_complete_returns_content_and_bills_zero(self):
+        captured = []
+        p = ff.OllamaProvider("coder", base_url="http://localhost:11434")
+        p.meter = ff.CostMeter(limit_usd=1.0)
+        with self._patch_urlopen(captured):
+            out = p.complete("rewrite this")
+        self.assertEqual(out, "hello")
+        self.assertEqual(p.meter.usd, 0.0)  # local inference is FREE
+        self.assertEqual(p.meter.in_tok, 7)
+        self.assertEqual(p.meter.out_tok, 3)
+        self.assertTrue(captured[0].full_url.startswith(
+            "http://localhost:11434/api/chat"))
+
+    def test_structured_passes_schema_and_parses(self):
+        captured = []
+        body = {"message": {"content": "{\"a\": 1}"}}
+        p = ff.OllamaProvider("coder")
+        schema = {"type": "object"}
+        with self._patch_urlopen(captured, body):
+            out = p.structured("sys", "user", schema)
+        self.assertEqual(out, {"a": 1})
+        payload = json.loads(captured[0].data.decode("utf-8"))
+        self.assertEqual(payload["format"], schema)  # Ollama structured output
+        self.assertFalse(payload["stream"])
+
+    def test_grade_parses(self):
+        body = {"message": {"content": json.dumps(
+            {"grade": 88, "meets_goal": True, "rationale": "ok", "issues": []})}}
+        p = ff.OllamaProvider("coder")
+        with self._patch_urlopen([], body):
+            g = p.grade("grade this")
+        self.assertEqual(g.grade, 88)
+
+    def test_no_egress_gate_on_local_provider(self):
+        # A payload the CLOUD gate would refuse must still flow to the LOCAL
+        # server - zero cloud egress is the point of --provider ollama, and
+        # blocking secrets from a loopback call would defeat it.
+        from unittest import mock
+        secret = "creds: AKIAJQ7WZ5X2K9V4M3TN"
+        p = ff.OllamaProvider("coder")
+        with mock.patch.object(ff, "EGRESS_MODE", "block"), \
+             mock.patch.object(ff._egress, "_load_policy_allow",
+                               return_value=set()), \
+             self._patch_urlopen([]):
+            self.assertEqual(p.complete(secret), "hello")
+
+    def test_make_provider_wires_meter_and_judge_tier(self):
+        m = ff.CostMeter(limit_usd=1.0)
+        p = ff.make_provider("ollama", "coder", m)
+        self.assertIs(p.meter, m)
+        self.assertEqual(p.judge_model, ff.JUDGE_MODELS["ollama"])
+
+    def test_audit_provider_list_is_local_only(self):
+        # Even with BOTH cloud keys present and use_both on, an ollama primary
+        # must yield a single local provider - no silent cloud cross-checker.
+        import argparse
+        from unittest import mock
+        args = argparse.Namespace(provider="ollama", use_both=True, model=None,
+                                  secondary_model=None, judge_model=None,
+                                  economy=False, no_preflight=True)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k",
+                                          "OPENAI_API_KEY": "k"}):
+            provs = ff.build_audit_providers(args, meter=None)
+        self.assertEqual([n for n, _ in provs], ["ollama"])
+        self.assertIsInstance(provs[0][1], ff.OllamaProvider)
+
+    def test_ollama_billing_ids_price_at_zero(self):
+        self.assertEqual(ff._price_for("ollama:deepseek-coder:33b"), (0.0, 0.0))
+        # ...without weakening the fail-closed default for other unknowns.
+        self.assertEqual(ff._price_for("mystery-model"), ff._DEFAULT_PRICE)
+
+
 class PolicyCommandTests(unittest.TestCase):
     """`flexfactor policy init|show`: the owner-policy template must be
     deny-by-default, never overwrite, and reflect what the gates enforce."""

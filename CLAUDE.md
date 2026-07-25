@@ -28,7 +28,13 @@ exotic goal-irrelevant residuals; accept+document them instead).
   Opus 4.8's $5/$25, near-Opus code quality; launcher defaults economy ON),
   `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
   budget, default $50/program)
-- Providers: `AnthropicProvider` / `OpenAIProvider` (`complete`/`grade`/`structured`);
+- Providers: `AnthropicProvider` / `OpenAIProvider` / `OllamaProvider`
+  (`complete`/`grade`/`structured`/`ping`). Ollama (2026-07-25, ULTRAPLAN
+  1.2) = LOCAL-ONLY: refuses non-loopback `OLLAMA_BASE_URL` (fail closed),
+  no egress gate (nothing leaves the machine), bills `ollama:<model>` ids at
+  $0 via the `MODEL_PRICING["ollama"]` prefix entry, and
+  `build_audit_providers` never adds a cloud secondary when primary=ollama.
+  Defaults: author `deepseek-coder:33b`, judge `llama3.2:latest`;
   `_cached_system()` marks Anthropic system prompts cacheable; `_judge()` routes
   classification calls to the judge tier
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →

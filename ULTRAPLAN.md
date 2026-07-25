@@ -59,7 +59,9 @@ Verify: unit corpus of seeded-secret fixtures (zero false negatives on the
 labeled set — same hard-invariant style as `scout_candidates.json`); full
 suite stays green; a seeded-secret audit run refuses cleanly.
 
-### 1.2 Optional `--local-only` provider (Ollama)  [MED value, MED effort]
+### 1.2 Optional local-only provider (Ollama)  [DONE 2026-07-25 —
+`--provider ollama` on all modes; loopback-only fail closed; $0 metering;
+no silent cloud secondary; live-smoked against the local server; +8 tests]
 
 Escape hatch for sensitive repos: an `OllamaProvider` implementing the same
 `complete`/`grade`/`structured` surface against `localhost:11434` (the Ellie

@@ -82,6 +82,9 @@ except ImportError:
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "openai": "gpt-4o",
+    # LOCAL-ONLY tier (--provider ollama): strongest installed local coder.
+    # Override with --model to match what `ollama list` shows on this machine.
+    "ollama": "deepseek-coder:33b",
 }
 
 # JUDGE tier: a much cheaper model for the high-volume *classification* calls
@@ -93,6 +96,7 @@ DEFAULT_MODELS = {
 JUDGE_MODELS = {
     "anthropic": "claude-haiku-4-5",
     "openai": "gpt-4o-mini",
+    "ollama": "llama3.2:latest",  # small + fast local judge
 }
 
 # ECONOMY author tier (audit --economy): a cheaper code-writing model for
@@ -128,6 +132,10 @@ MODEL_PRICING = {
     "claude-haiku-4-5": (1.0, 5.0),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.0),
+    # Local inference is free. OllamaProvider bills under 'ollama:<model>' ids,
+    # which prefix-match this entry via the ':' separator rule in _price_for -
+    # NEVER the fail-closed default rate, so local runs don't eat --max-cost.
+    "ollama": (0.0, 0.0),
 }
 # Fail-closed default: the most expensive known model on each axis, so budget
 # enforcement over-counts (stops early) rather than under-counts an unknown id.
@@ -847,6 +855,88 @@ class OpenAIProvider:
             self._meter(resp, self.judge_model)
 
 
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
+
+class OllamaProvider:
+    """LOCAL-ONLY provider (ULTRAPLAN 1.2): same complete/grade/structured/ping
+    surface as the cloud adapters, served by an Ollama instance on localhost.
+
+    ZERO cloud egress is the point, so two deliberate differences from the
+    cloud providers:
+      * The secret/PII egress gate is NOT applied - payloads never leave this
+        machine. To keep that claim true the constructor REFUSES any
+        OLLAMA_BASE_URL whose host is not loopback (fail closed).
+      * Usage is metered under 'ollama:<model>' which prices at $0 (local
+        inference is free; --max-cost budgets are unaffected).
+    Quality vs the frontier cloud models is a real tradeoff; every safety net
+    (build gate, veto, rollback, deterministic scout gates) is unchanged."""
+
+    _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+    def __init__(self, model: str, judge_model: str | None = None,
+                 base_url: str | None = None):
+        import urllib.parse
+        self.model = model
+        self.judge_model = judge_model or model
+        self.meter = None  # set by make_provider
+        base = (base_url or OLLAMA_BASE_URL).rstrip("/")
+        host = urllib.parse.urlsplit(base).hostname or ""
+        if host not in self._LOCAL_HOSTS:
+            raise ValueError(
+                f"OllamaProvider refuses non-local base url '{base}': the "
+                "local-only provider must never send source off this machine.")
+        self.base_url = base
+
+    def _chat(self, model: str, system: str, user: str, max_tokens: int,
+              schema: dict | None = None) -> str:
+        import urllib.request
+        payload = {"model": model, "stream": False,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "options": {"num_predict": max_tokens}}
+        if schema is not None:
+            payload["format"] = schema  # Ollama structured outputs
+        # Billed under the $0 'ollama:' pricing prefix; the guard still runs so
+        # call accounting (calls/tokens) shows up in the meter like any provider.
+        with _budget_guard(self.meter, f"ollama:{model}",
+                           len(system) + len(user), max_tokens):
+            req = urllib.request.Request(
+                self.base_url + "/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if self.meter is not None:
+                self.meter.record(f"ollama:{model}",
+                                  input_tokens=int(data.get("prompt_eval_count") or 0),
+                                  output_tokens=int(data.get("eval_count") or 0))
+        return str((data.get("message") or {}).get("content") or "")
+
+    def complete(self, instruction: str) -> str:
+        return self._chat(self.model, REWRITE_SYSTEM, instruction, 16384).strip()
+
+    def grade(self, prompt: str) -> Grade:
+        text = self._chat(self.judge_model,
+                          GRADE_SYSTEM + " Keys: grade, meets_goal, rationale, issues.",
+                          prompt, 4000, schema=GRADE_SCHEMA)
+        return _parse_grade(text or "{}")
+
+    def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
+                   model: str | None = None) -> dict:
+        text = self._chat(model or self.model, system, prompt, max_tokens,
+                          schema=schema)
+        return json.loads(text or "{}")
+
+    def ping(self) -> None:
+        """Liveness = the local server answers /api/tags. Raises on failure so
+        preflight can drop an ollama that isn't running."""
+        import urllib.request
+        req = urllib.request.Request(self.base_url + "/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read(64)
+
+
 def _coerce_issue(item) -> str:
     """Normalize one issue to a string. Graders without schema enforcement (e.g.
     OpenAI json mode) sometimes return issues as dicts; flatten them so downstream
@@ -910,6 +1000,8 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
         prov = AnthropicProvider(model, judge_model=jm)
     elif name == "openai":
         prov = OpenAIProvider(model, judge_model=jm)
+    elif name == "ollama":
+        prov = OllamaProvider(model, judge_model=jm)
     else:
         raise ValueError(f"Unknown provider: {name}")
     prov.meter = meter  # share one meter so all calls bill into the same budget
@@ -931,6 +1023,8 @@ def _provider_key_present(name: str) -> bool:
         return bool(os.environ.get("ANTHROPIC_API_KEY"))
     if name == "openai":
         return bool(os.environ.get("OPENAI_API_KEY"))
+    if name == "ollama":
+        return True  # local server, no key; the preflight PING is the real check
     return False
 
 
@@ -1023,7 +1117,13 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     global _PROVIDER_DIAGNOSIS
     _PROVIDER_DIAGNOSIS = ""
     primary = args.provider
-    other = "openai" if primary == "anthropic" else "anthropic"
+    if primary == "ollama":
+        # LOCAL-ONLY: never silently add a CLOUD cross-checker to a run the
+        # owner pointed at the local provider - that would defeat the whole
+        # zero-egress point. (Dual-model rigor is a cloud-provider feature.)
+        other = None
+    else:
+        other = "openai" if primary == "anthropic" else "anthropic"
 
     # "Usable" = key present AND (unless --no-preflight) verified live. A present
     # but dead key (out of credits / revoked) must NOT be chosen as the author,
@@ -6662,7 +6762,7 @@ def main(argv=None) -> int:
         )
         parser.add_argument("--program", required=True,
                             help="The program to help: a project folder, file, .lnk shortcut, URL, or description.")
-        parser.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
+        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
         parser.add_argument("--judge-model", default=None, dest="judge_model",
@@ -6730,7 +6830,7 @@ def main(argv=None) -> int:
                                  "Repeatable: pass up to 5 to audit several programs in one run.")
         parser.add_argument("--parallel", type=int, default=1, dest="parallel",
                             help="How many programs to audit concurrently (default: 1).")
-        parser.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
+        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the AUTHOR model id (code generation).")
         parser.add_argument("--economy", action="store_true", dest="economy",
@@ -6851,7 +6951,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--file", required=True, help="Path to the source file to refactor.")
     parser.add_argument("--goal", required=True, help="Plain-English description of the desired change.")
-    parser.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
+    parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                         help="LLM backend (default: anthropic).")
     parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
     parser.add_argument("--judge-model", default=None, dest="judge_model",
