@@ -2,4 +2,17 @@ __pycache__/
 *.pyc
 *_repo_rewards_report.md
 *_audit_report.md
+*_readiness.md
+*_low_findings.md
 flexfactor_audit_batch_report.md
+
+# Run artifacts: audit logs and probe output are per-run evidence, not source.
+logs/
+*_audit_run*.log
+incognito_audit.log
+probe_tiers_out.json
+
+# Pre-proxy snapshots kept as the launcher's documented local revert path. The
+# same content is already in git history (the commit before the fcc-proxy
+# switch), so committing a second 380k copy would be pure duplication.
+*.bak-preproxy
