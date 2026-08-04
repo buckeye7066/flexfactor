@@ -5,6 +5,7 @@ Run:  python flexfactor_tests.py
 Uses the hermetic module-load pattern: register the module in sys.modules
 BEFORE exec_module, or @dataclass with future annotations dies at import.
 """
+import contextlib
 import importlib.util
 import json
 import os
@@ -5738,6 +5739,111 @@ class ProdreadyModeTests(unittest.TestCase):
             ff.main(["prodready", "--program", "."])
         self.assertTrue(captured["bootstrap"])
         self.assertFalse(captured["scripts"], "lifecycle scripts must be opt-in")
+
+
+class _StubProvider:
+    """Offline stand-in: reviews everything as clean. Records what it was asked."""
+    model = "stub-author"
+    judge_model = "stub-judge"
+
+    def __init__(self):
+        self.calls = []
+
+    def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+        self.calls.append(prompt[:80])
+        return {"findings": [], "summary": "clean"}
+
+    def complete(self, system, prompt, max_tokens=8000, model=None):
+        return ""
+
+    def grade(self, system, prompt, max_tokens=1000, model=None):
+        return {"score": 100, "notes": ""}
+
+    def ping(self):
+        return True
+
+
+class AuditPipelineIntegrationTests(unittest.TestCase):
+    """Exercise the NEW phases inside the real audit_one_program, offline.
+
+    The unit tests above cover each new function in isolation; this pins that
+    they are actually WIRED - that the names resolve in that 600-line function's
+    scope and that the results reach the report/result dicts."""
+
+    def _args(self, extra):
+        captured = {}
+
+        def fake_run_audit(a):
+            captured["args"] = a
+            return 0
+
+        with _patched(ff, "run_audit", fake_run_audit):
+            ff.main(extra)
+        return captured["args"]
+
+    @contextlib.contextmanager
+    def _run_one(self, files, argv_extra=()):
+        """Run one audit and keep the fixture ALIVE for the assertions.
+
+        (The first version returned after the fixture's __exit__ had already
+        deleted the tree, so every on-disk assertion failed against a path that
+        had genuinely existed a moment earlier.)"""
+        with _RepoFixture(files) as root:
+            args = self._args(["prodready", "--program", root, "--report-only",
+                               "--no-preflight", "--no-dashboard", "--no-tests",
+                               "--no-e2e", "--no-full-suite", *argv_extra])
+            stub = _StubProvider()
+            with _patched(ff, "build_audit_providers",
+                          lambda a, m=None: [("stub", stub)]):
+                res = ff.audit_one_program(root, args, 0, 1, None)
+            yield res, root
+
+    def test_readiness_runs_and_reaches_the_result(self):
+        with self._run_one({
+                "package.json": '{"name":"x","scripts":{"build":"tsc"}}',
+                "src/app.js": "console.log(1);\n"}) as (res, _root):
+            self.assertIsNone(res.get("error"), res.get("error"))
+            self.assertIn("readiness_ready", res)
+            self.assertIsNotNone(res["readiness_blockers"])
+            self.assertTrue(res.get("readiness_path"), "no scorecard was written")
+            self.assertTrue(os.path.isfile(res["readiness_path"]))
+
+    def test_scorecard_content_is_written_to_disk(self):
+        with self._run_one({"go.mod": "module x\n",
+                            "main.go": "package main\n"}) as (res, _root):
+            with open(res["readiness_path"], encoding="utf-8") as fh:
+                card = fh.read()
+        self.assertIn("Production readiness", card)
+        self.assertIn("Detected toolchains", card)
+        self.assertIn("go", card)
+
+    def test_readiness_blockers_become_findings(self):
+        # Blockers must flow into the audit's own findings, not live only in a
+        # side file the owner might never open.
+        with self._run_one({"package.json": "{}"}) as (res, _root):
+            self.assertGreater(res["defects"], 0,
+                               "readiness blockers never reached the findings list")
+
+    def test_readiness_can_be_switched_off(self):
+        with self._run_one({"package.json": "{}"}, ("--no-readiness",)) as (res, _r):
+            self.assertIsNone(res.get("readiness_ready"))
+            self.assertEqual(res["defects"], 0)
+
+    def test_project_with_no_manifest_is_honestly_unverifiable(self):
+        # A loose .py with no pyproject/requirements/setup.py is not a detectable
+        # component, so the tool must SAY it cannot verify rather than let
+        # _full_gate's empty-command True read as a green build.
+        with self._run_one({"notes.txt": "hi\n", "thing.py": "x = 1\n"}) as (res, root):
+            self.assertIsNone(res.get("error"), res.get("error"))
+            stack = ff._detect_stack(root)
+            self.assertFalse(stack["verification_is_real"])
+            self.assertIn("no build system", stack["verification_note"])
+
+    def test_report_only_skips_bootstrap(self):
+        # Report-only changes nothing, so it must not run installs either.
+        with self._run_one({"package.json":
+                            '{"dependencies":{"left-pad":"1.0.0"}}'}) as (res, _r):
+            self.assertEqual(res.get("bootstrap"), [])
 
 
 if __name__ == "__main__":
