@@ -12,6 +12,13 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   benefit, and (by default) APPLIES the ADOPT-tier integrations on a
   `flexfactor/adopt-<repo>` branch, verified by the project's own build, with hard
   rollback on failure. `--report-only` to just get the report.
+- **prodready** - point it at any program and walk away. Detects every toolchain
+  in the tree (13 ecosystems, monorepo-aware), installs the project's own
+  dependencies so the build gate measures the CODE rather than a missing
+  `node_modules`, runs the full audit fix loop down to medium severity, then
+  scores the result against a 12-gate production-readiness rubric and writes a
+  scorecard naming exactly what still blocks release. Asks nothing beyond the
+  program. `--report-only` / `--dry-run` still just look.
 - **audit** - aggressive line-by-line defect hunt and auto-fix across a whole
   codebase (up to 5 programs in parallel). Dual-model adversarial review, per-file
   build gate, cross-model veto, unit + e2e test generation, converges with
@@ -77,6 +84,7 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 python flexfactor.py --file <path> --goal "..."        # refactor
 python flexfactor.py scout --program <path|lnk|url>
 python flexfactor.py audit --program <path> [--program <path2> ...] [--parallel N]
+python flexfactor.py prodready --program <path>        # detect + install + fix + score
 python flexfactor.py policy init                        # write deny-by-default owner policy
 python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)
@@ -93,8 +101,34 @@ Desktop launchers (in `G:\One Drive\Desktop`): **FlexFactor.lnk** (menu),
 - Scout mode auto-starts the Repo Rewards service from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1` (expects it at `localhost:3000`).
 
+## What "production ready" is allowed to mean
+
+The verdict is a checklist with evidence, not a judgement call. 12 deterministic
+gates (no model involved) cover buildability, tests, committed secrets,
+dependency pinning, config externalisation, CI, docs, licence and a deployable
+artifact. A gate is `pass`, `fail`, `na`, or `unknown` — and `unknown` is
+deliberately not a synonym for `pass`: an unevaluated **critical** gate blocks
+the verdict, because a property nobody checked is not evidence of safety.
+
+Two claims the tool will refuse to make:
+
+- If no build system is detected, or a detected one has no usable build command,
+  it reports `Build verification: NOT AVAILABLE` and marks the run's fixes as
+  NOT build-verified. It will not report the old vacuous pass.
+- If a per-file syntax gate can't run (interpreter absent, blocked by policy,
+  timed out), that file is `unverified`, never "broken" — the difference matters
+  because "broken" causes a rollback that would discard a correct fix.
+
+Supported toolchains: Node (npm/pnpm/yarn/bun), Deno, Python (pip/poetry/uv/pdm/
+pipenv), Go, Rust, Java (maven/gradle), .NET, Ruby, PHP, Elixir, Dart/Flutter,
+Swift, C/C++ (cmake/meson/make).
+
 ## Gotchas
 
+- **Dependency lifecycle scripts are OFF during bootstrap.** Installing a tree
+  runs that tree's `postinstall` hooks — third-party code executing on your
+  machine because you pointed the tool at a repo. `--allow-scripts` opts in
+  (some native packages genuinely need it).
 - **Keep the `.ps1` launchers ASCII.** PowerShell 5.1 reads no-BOM files as CP1252;
   a UTF-8 em-dash can decode as a stray quote and break parsing.
 - **`_winify` is load-bearing.** Windows npm/npx/yarn are `.cmd` shims that

@@ -4055,14 +4055,22 @@ E2E_TEST_SYSTEM = (
     "file(s). Respond with JSON only."
 )
 
-# Files audit will actually read and reason about.
+# Files audit will actually read and reason about. Extended beyond the original
+# JS/Python/JVM set so the ecosystems the toolchain detector can now BUILD are
+# also ecosystems the auditor can READ - detecting how to compile Elixir or C++
+# while skipping every .ex and .cpp file would gate a review that never happened.
 _CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
-              ".svelte", ".go", ".rb", ".java", ".cs", ".php", ".rs", ".scala", ".kt"}
-# Per-file review ceiling. 400k (was 200k, then 300k) because real hand-written
-# modules do reach 300k+ (flexfactor.py itself is now ~310k) - the old caps
-# silently created audit blind spots for exactly the largest, most defect-dense
-# files. ~400k chars is ~100k tokens, well within a modern review model's window.
-MAX_REVIEW_BYTES = 400_000
+              ".svelte", ".go", ".rb", ".java", ".cs", ".php", ".rs", ".scala", ".kt",
+              ".ex", ".exs", ".swift", ".dart", ".c", ".cc", ".cpp", ".cxx",
+              ".h", ".hpp", ".m", ".mm", ".sh", ".bash", ".lua", ".pl", ".pm",
+              ".clj", ".cljs", ".hs", ".jl", ".r", ".sql", ".tf", ".gradle"}
+# Per-file review ceiling. 600k (was 200k, 300k, then 400k) because this file
+# itself keeps outgrowing the cap, and each time it did, the tool silently
+# stopped auditing its own largest, most defect-dense module. The prompt cost is
+# unaffected: review_file truncates the numbered source at 60k chars regardless,
+# so this governs only whether a file is ENUMERATED - and a skipped file is a
+# permanent blind spot, which is strictly worse than a truncated review.
+MAX_REVIEW_BYTES = 600_000
 # Requested output ceilings per model-call kind. Single source of truth so the
 # budget RESERVATION (before a concurrent call) matches what the call can spend.
 REVIEW_MAX_TOKENS = 16000       # review_file()
@@ -4839,7 +4847,57 @@ def _detect_stack(project_dir: str) -> dict:
         info["is_python"] = True
         if not info["test_cmd"]:
             info["test_cmd"] = ["python", "-m", "pytest", "-q"]
+    _enrich_stack_with_toolchains(project_dir, info)
     return info
+
+
+def _enrich_stack_with_toolchains(project_dir: str, info: dict) -> None:
+    """Fill the build/test gate from EVERY detected ecosystem, not just Node/Python.
+
+    Without this, `_full_gate` on a Go/Rust/Java/.NET/Ruby/PHP/Elixir repo has no
+    commands to run and returns True/"(no build/verify command available)". That
+    is indistinguishable at the call site from a build that genuinely passed, so
+    fixes to those projects were committed and reported as gated while nothing
+    had actually verified them. Populating verify_cmds/test_cmd here makes the
+    EXISTING gate real for all of them - no change to the gate itself.
+
+    Node/Python detection above wins where it already produced a command (it
+    reads the project's own scripts, which is more faithful than our defaults);
+    this only fills what is still empty."""
+    try:
+        import flexfactor_prodready as _pr
+    except Exception:
+        info.setdefault("toolchains", [])
+        return
+    try:
+        chains = _pr.detect_toolchains(project_dir)
+    except Exception:
+        chains = []
+    info["toolchains"] = chains
+    info["install_cmds"] = [(t.root, c) for t in chains for c in t.install]
+    for tc in chains:
+        # Commands must run in the COMPONENT's directory, not the project root
+        # (`go build ./...` from the repo root of a monorepo misses the module),
+        # so anything for a nested root is recorded but not hoisted into the
+        # root-relative gate lists that _full_gate/_run_unit_tests execute.
+        if tc.root not in (".", ""):
+            continue
+        for cmd in tc.build:
+            if cmd not in info["verify_cmds"]:
+                info["verify_cmds"].append(cmd)
+        if not info["test_cmd"] and tc.test:
+            info["test_cmd"] = list(tc.test[0])
+        if not info["fast_verify"]:
+            fast = (tc.typecheck or tc.lint or tc.build)
+            if fast:
+                info["fast_verify"] = list(fast[0])
+    if not info["full_suite_cmd"] and info["test_cmd"]:
+        info["full_suite_cmd"] = list(info["test_cmd"])
+    ecosystems = sorted({t.ecosystem for t in chains})
+    info["ecosystems"] = ecosystems
+    real, why = _pr.verification_is_real(chains) if chains else (False, "no build system detected")
+    info["verification_is_real"] = real
+    info["verification_note"] = why
 
 
 # --------------------------------------------------------------------------- #
@@ -5099,10 +5157,46 @@ def _gate_file(project_dir: str, rel_path: str, stack: dict, baseline_ok: bool) 
     node_ok = _node_syntax_ok(project_dir, rel_path)
     if node_ok is not None:
         return (node_ok, "node --check")
+    ext_ok, ext_log = _ext_syntax_gate(project_dir, rel_path)
+    if ext_ok is not None:
+        return (ext_ok, ext_log)
     # No cheap per-file check available. Rather than run the slow whole-project gate
     # after every fix, keep the file but flag it unverified; the cycle-end full gate
     # (and cross-model check) still guards it.
     return (None, "no fast per-file verification available for this file type")
+
+
+def _ext_syntax_gate(project_dir: str, rel_path: str) -> tuple[bool | None, str]:
+    """Parse-only gate for the non-JS/Python file types (go/rb/php/sh/json/toml).
+
+    The critical distinction: a MISSING interpreter must return None (unverified),
+    never False. `_run` reports a WinError-2 launch failure as a non-zero return
+    code, which is indistinguishable from a syntax error at the call site - and
+    False here means _fix_files ROLLS THE FILE BACK. On a machine without Ruby
+    installed that would silently discard every correct .rb fix and report the
+    file as broken. So the interpreter's presence is confirmed first, and its
+    absence is reported honestly as "not verified"."""
+    try:
+        import flexfactor_prodready as _pr
+    except Exception:
+        return None, ""
+    ok, log = _pr.inproc_syntax_ok(project_dir, rel_path)
+    if ok is not None:
+        return ok, log
+    cmd = _pr.syntax_gate_cmd(rel_path)
+    if not cmd:
+        return None, ""
+    if not shutil.which(cmd[0]):
+        return None, f"{cmd[0]} not installed - {rel_path} left unverified"
+    r = _run(cmd, project_dir, timeout=60)
+    # `flexfactor_launch_error` is _run's own marker for "this never reached a real
+    # exit" - it covers the policy refusal (126), timeout (124), executable-not-found
+    # (127) and OSError paths in one check. Every one of those must degrade to
+    # unverified rather than False, for the rollback reason in the docstring.
+    if getattr(r, "flexfactor_launch_error", False):
+        return None, f"{cmd[0]} did not run ({_tail(r.stderr, 2)}) - left unverified"
+    return (r.returncode == 0,
+            _tail(r.stderr or r.stdout) or f"{cmd[0]} syntax check")
 
 
 def _full_gate(project_dir: str, stack: dict) -> tuple[bool, str]:
@@ -5129,6 +5223,78 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     print(f"    running tests: {' '.join(stack['test_cmd'])}")
     r = _run(stack["test_cmd"], project_dir, timeout=1800)
     return (r.returncode == 0, _tail(r.stdout + "\n" + r.stderr, 40))
+
+
+def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
+                         allow_scripts: bool = False) -> list:
+    """Install every detected component's dependencies through the gated `_run`.
+
+    Deliberately never raises and never aborts the audit: a project whose install
+    fails is still worth reviewing (the review phase needs no toolchain at all).
+    The failure is recorded and surfaced so a subsequent red baseline build is
+    attributed to the missing dependencies rather than blamed on the code."""
+    try:
+        import flexfactor_prodready as _pr
+    except Exception:
+        return []
+    chains = stack.get("toolchains") or []
+    if not chains:
+        return []
+    plan = _pr.bootstrap_plan(chains, allow_scripts=allow_scripts)
+    if not plan:
+        print(f"{pfx}dependencies already present for all "
+              f"{len(chains)} component(s); skipping install.")
+        return []
+    print(f"{pfx}bootstrapping {len(plan)} install step(s) across "
+          f"{len(chains)} component(s)"
+          + ("" if allow_scripts else " (--ignore-scripts; --allow-scripts to permit)"))
+    return _pr.run_bootstrap(project_dir, chains, _run, allow_scripts=allow_scripts,
+                             log=lambda m: print(f"{pfx}{m}"))
+
+
+def _refresh_verification_status(stack: dict) -> None:
+    """Recompute whether the build gate is real, after bootstrap has run."""
+    try:
+        import flexfactor_prodready as _pr
+    except Exception:
+        return
+    chains = stack.get("toolchains") or []
+    if not chains:
+        return
+    real, why = _pr.verification_is_real(chains)
+    stack["verification_is_real"] = real
+    stack["verification_note"] = why
+
+
+def _assess_readiness_phase(project_dir: str, stack: dict, name: str,
+                            build_ok: bool | None, tests_ok: bool | None,
+                            bootstrap: list | None = None, pfx: str = "") -> dict | None:
+    """Score the project against the production-readiness rubric and write the card.
+
+    Returns a plain-dict summary (JSON-safe, so it can go into brain.json and the
+    audit report) or None when the module is unavailable."""
+    try:
+        import flexfactor_prodready as _pr
+    except Exception:
+        return None
+    chains = stack.get("toolchains") or []
+    try:
+        gates = _pr.assess_readiness(project_dir, chains, _run,
+                                     build_ok=build_ok, tests_ok=tests_ok)
+    except Exception as exc:                      # never let scoring kill the run
+        print(f"{pfx}readiness assessment failed: {type(exc).__name__}: {exc}")
+        return None
+    ready, blockers = _pr.readiness_verdict(gates)
+    passed, evaluated, total = _pr.readiness_score(gates)
+    card = _pr.render_scorecard(name, chains, gates, bootstrap)
+    path = _safe_report_write(project_dir,
+                              f"{_slugify(name) or 'program'}_readiness.md", card)
+    print(f"{pfx}readiness: {'PRODUCTION READY' if ready else 'NOT production ready'} "
+          f"({passed}/{evaluated} gates passed, {len(blockers)} blocker(s)) -> {path}")
+    return {"ready": ready, "passed": passed, "evaluated": evaluated, "total": total,
+            "report_path": path,
+            "gates": [g.to_dict() for g in gates],
+            "blockers": [g.to_dict() for g in blockers]}
 
 
 def _guess_dev_url(stack: dict) -> str:
@@ -6339,6 +6505,29 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # or a syntax-only fallback (a project already broken can't gate on its build).
         # In report/dry-run no fix is ever gated, so the (often slow + costly) project
         # build is pure waste there - skip it and report straight away.
+        # 2b. BOOTSTRAP: install the project's own dependencies so the baseline
+        #     build below measures the CODE, not a missing node_modules/venv. On an
+        #     un-bootstrapped checkout the baseline gate fails for a reason that has
+        #     nothing to do with the source, every subsequent fix is downgraded to
+        #     syntax-only and flagged 'unverified', and the run finishes having
+        #     verified nothing. Installing first is what makes the gate mean anything.
+        bootstrap_results = []
+        if not report_only and getattr(args, "bootstrap", True):
+            bootstrap_results = _run_bootstrap_phase(
+                project_dir, stack, pfx, allow_scripts=getattr(args, "allow_scripts", False))
+            failed = [s for s in bootstrap_results if not s.ok]
+            if failed:
+                print(f"{pfx}warning: {len(failed)} dependency install step(s) FAILED; "
+                      "the baseline build below may fail for that reason rather than "
+                      "for a code defect.")
+            # Installing changes the answer to "can we verify this?", and the
+            # detect-time value was computed before any of it ran. Recompute, or
+            # the run reports a stale UNVERIFIED warning for a repo it just
+            # successfully bootstrapped.
+            _refresh_verification_status(stack)
+        result["bootstrap"] = [
+            {"cmd": " ".join(s.cmd), "cwd": s.cwd, "ok": s.ok} for s in bootstrap_results]
+
         if report_only:
             baseline_ok = True
             print(f"{pfx}report-only/dry-run: skipping baseline build (no fixes will be gated).")
@@ -6347,6 +6536,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if not baseline_ok:
                 print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
                       "and flagged 'unverified'. The audit still runs.")
+            if not stack.get("verification_is_real", True):
+                # Say it out loud. _full_gate returns True when it has no commands,
+                # which reads as a pass; without this line the run would report a
+                # green build it never performed.
+                print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
 
         # The file LIST is enumerated once; each cycle RE-READS contents (which the
         # previous cycle's committed fixes have changed). max_files=0 covers the
@@ -6659,6 +6853,38 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "fix": "Investigate the failing suite output; the app is not verified clean.",
                 })
 
+        # 6b. PRODUCTION-READINESS SCORECARD. Deterministic, no model calls: it turns
+        #     "production ready" from a claim into a checklist with evidence. Run last
+        #     so it scores the code as the audit LEAVES it, using the same build/test
+        #     evidence the audit itself acted on rather than a second opinion.
+        readiness = None
+        if getattr(args, "readiness", False):
+            report(phase="readiness scorecard")
+            print(f"{pfx}Assessing production readiness ...")
+            final_build = None
+            if not report_only:
+                if stack.get("verify_cmds") or stack.get("fast_verify"):
+                    final_build, _ = _full_gate(project_dir, stack)
+                # A vacuous gate (no commands) must stay None = "not evaluated",
+                # never True. _full_gate cannot make that distinction; we can.
+                if not stack.get("verification_is_real", False):
+                    final_build = None
+            tests_ok = suite_status if suite_status is not None else test_status
+            readiness = _assess_readiness_phase(
+                project_dir, stack, display_name, build_ok=final_build,
+                tests_ok=tests_ok, bootstrap=bootstrap_results, pfx=pfx)
+            if readiness and readiness.get("blockers"):
+                # Surface each blocker as a real finding so it flows into the audit
+                # report and the exit status, instead of living only in a side file.
+                for b in readiness["blockers"]:
+                    all_findings.append({
+                        "file": "(readiness)", "line": 0,
+                        "severity": b.get("severity", "high"), "category": "production-readiness",
+                        "title": b.get("title", "readiness gate failed"),
+                        "problem": b.get("evidence", ""),
+                        "fix": b.get("remediation", ""),
+                    })
+
         # 7. Final git status. Per-cycle commits already landed the fixes; here we just
         #    report and clean up an empty branch if the whole run changed nothing.
         if not git:
@@ -6715,7 +6941,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
             "fix_severity": args.fix_severity, "manual_review": sorted(manual_review),
-            "low_findings": low_findings,
+            "low_findings": low_findings, "readiness": readiness,
+            "bootstrap": result.get("bootstrap") or [],
+            "ecosystems": stack.get("ecosystems") or [],
+            "verification_is_real": stack.get("verification_is_real"),
+            "verification_note": stack.get("verification_note", ""),
         }
         _print_audit_summary(audit)
         print(f"{pfx}Low/info issues catalogued (not auto-fixed): {len(low_findings)}")
@@ -6734,6 +6964,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             usd=round(meter.usd, 4), oversized_files=sorted(set(oversized)),
             converged=converged, stop_reason=stop_reason, suite_status=suite_status,
             clean_count=len(brain_clean),
+            readiness_ready=(readiness or {}).get("ready"),
+            readiness_blockers=len((readiness or {}).get("blockers") or []),
+            readiness_path=(readiness or {}).get("report_path"),
         )
         # Remember what we did this run so a future audit can recall it - including
         # the clean-file set so the NEXT run skips them and gets smaller.
@@ -6951,6 +7184,38 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          f"- **Providers:** {', '.join(a.get('providers') or []) or '(unknown)'}",
          f"- **Git:** {a['commit_status']}", ""]
 
+    if a.get("ecosystems"):
+        L.insert(4, f"- **Toolchains:** {', '.join(a['ecosystems'])}")
+    # State the verification status explicitly. _full_gate returns True when it
+    # has no commands to run, so a reader who sees "Baseline build: passed"
+    # without this line can reasonably believe a build happened when none did.
+    if a.get("verification_is_real") is False:
+        L.insert(5, f"- **Build verification:** NOT AVAILABLE — "
+                    f"{a.get('verification_note', 'no build system detected')}. "
+                    f"Fixes in this run were NOT build-verified.")
+    boot = a.get("bootstrap") or []
+    if boot:
+        failed = [b for b in boot if not b.get("ok")]
+        L.insert(6, f"- **Dependency bootstrap:** {len(boot) - len(failed)}/{len(boot)} "
+                    f"install step(s) succeeded"
+                    + (" — a failed install can make the build gate red for reasons "
+                       "unrelated to the code" if failed else ""))
+
+    rd = a.get("readiness")
+    if rd:
+        L += ["## Production readiness", "",
+              f"**{'PRODUCTION READY' if rd['ready'] else 'NOT PRODUCTION READY'}** — "
+              f"{rd['passed']}/{rd['evaluated']} evaluated gates passed, "
+              f"{len(rd['blockers'])} blocker(s).", "",
+              f"Full scorecard: `{rd.get('report_path', '')}`", ""]
+        if rd["blockers"]:
+            for b in rd["blockers"]:
+                L.append(f"- **{b.get('title')}** [{b.get('severity')}] — "
+                         f"{b.get('evidence', '')}")
+                if b.get("remediation"):
+                    L.append(f"  - Fix: {b['remediation']}")
+            L.append("")
+
     if a["e2e"].get("log"):
         L += ["## Button/UI test output", "", "```", a["e2e"]["log"][:4000], "```", ""]
 
@@ -6960,7 +7225,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     applied = set(a.get("applied_files") or [])
     remaining: dict[str, list[dict]] = {}
     for f in a["findings"]:
-        if f.get("file") in ("(e2e)", "(unit tests)", "(full suite)"):
+        if f.get("file") in ("(e2e)", "(unit tests)", "(full suite)", "(readiness)"):
             continue
         rank = SEVERITY_RANK.get(str(f.get("severity")).lower(), 0)
         below_floor = rank < floor
@@ -7038,7 +7303,7 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
 
 
 _TOP_LEVEL_USAGE = """\
-usage: flexfactor [-h] {refactor,scout,audit,policy} ...
+usage: flexfactor [-h] {refactor,scout,audit,prodready,policy} ...
 
 FlexFactor - local, build-gated, budget-capped dual-provider code tool.
 
@@ -7050,6 +7315,11 @@ modes:
              benefit it (report-only by default; --apply to integrate).
   audit      Aggressive line-by-line defect hunt + auto-fix across a whole
              project (report-only by default; --apply to fix).
+  prodready  Point it at any program and walk away: detect every toolchain,
+             install its dependencies, hunt and fix defects (down to medium),
+             then score it against a production-readiness rubric and write a
+             scorecard naming whatever still blocks release. Applies fixes by
+             default; --report-only or --dry-run to just look.
   policy     Inspect (`show`) or initialize (`init`) the owner policy file
              ~/.flexfactor/policy.json that unlocks high-risk command
              classes and secret/PII egress categories (deny-by-default).
@@ -7151,7 +7421,7 @@ def main(argv=None) -> int:
         return 0
     # Backward compatibility: the original CLI had no subcommand (just --file/--goal).
     # If the first token isn't a known mode, assume the classic "refactor" mode.
-    if not argv or argv[0] not in ("refactor", "scout", "audit", "policy"):
+    if not argv or argv[0] not in ("refactor", "scout", "audit", "prodready", "policy"):
         argv = ["refactor", *argv]
     mode, rest = argv[0], argv[1:]
 
@@ -7241,11 +7511,16 @@ def main(argv=None) -> int:
         _set_egress_mode(args)
         return run_scout(args)
 
-    if mode == "audit":
+    if mode in ("audit", "prodready"):
+        _prod = (mode == "prodready")
         parser = argparse.ArgumentParser(
-            prog="flexfactor audit",
-            description="Aggressively audit a whole program line by line, test every "
-                        "function and button in a live-like sandbox, and fix every defect.",
+            prog=f"flexfactor {mode}",
+            description=("Take a program all the way to production ready: detect its "
+                         "toolchains, install its dependencies, find and fix every "
+                         "defect, then score it against a production-readiness rubric.")
+            if _prod else
+            ("Aggressively audit a whole program line by line, test every "
+             "function and button in a live-like sandbox, and fix every defect."),
         )
         parser.add_argument("--program", required=True, action="append",
                             help="Program to audit: a project folder, file, .lnk, URL, or name. "
@@ -7305,6 +7580,25 @@ def main(argv=None) -> int:
                                  "(default: 50.0). Use 0 to disable the cap.")
         parser.add_argument("--no-full-suite", action="store_false", dest="full_suite",
                             help="Don't run the project's full test suite (test:all) at the end.")
+        parser.add_argument("--no-bootstrap", action="store_false", dest="bootstrap",
+                            help="Don't install the project's dependencies first. The build "
+                                 "gate then fails on a fresh checkout for reasons unrelated "
+                                 "to the code, and every fix is downgraded to 'unverified'.")
+        parser.add_argument("--allow-scripts", action="store_true", dest="allow_scripts",
+                            help="Permit dependency lifecycle scripts (npm postinstall etc.) "
+                                 "during bootstrap. Off by default: installing a tree runs "
+                                 "that tree's third-party code on your machine. Some native "
+                                 "packages genuinely need it.")
+        # Both default to None, not True/False: two flags sharing a dest means the
+        # LAST registered default wins, which would silently switch the scorecard on
+        # for plain `audit` too. None = "not specified" and the mode decides below.
+        parser.add_argument("--readiness", action="store_true", dest="readiness",
+                            default=None,
+                            help="Score the project against the production-readiness rubric "
+                                 "and write a scorecard (always on in prodready mode).")
+        parser.add_argument("--no-readiness", action="store_false", dest="readiness",
+                            default=None,
+                            help="Skip the production-readiness scorecard.")
         parser.add_argument("--recheck", action="store_true", dest="recheck",
                             help="Re-review files the brain marked clean in a prior run.")
         parser.add_argument("--no-dashboard", action="store_false", dest="dashboard",
@@ -7364,6 +7658,26 @@ def main(argv=None) -> int:
                             help="Review + report only; create no branch and change no files.")
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        if args.readiness is None:
+            args.readiness = _prod
+        if _prod:
+            # prodready = "make it production ready, don't ask me anything". The
+            # flags below are the ones an owner would otherwise have to know to
+            # set; each is still overridable because argparse already parsed any
+            # explicit value, and we only override the ones left at their audit
+            # default. Applying fixes is the POINT of the mode, so --apply is
+            # implied - but an explicit --report-only/--dry-run must still win.
+            # `--apply` and `--report-only` share a dest, so the PARSED value
+            # cannot distinguish "left at its default" from "explicitly turned
+            # off"; the raw argv can, so ask that instead.
+            if not ({"--report-only", "--dry-run", "--apply"} & set(rest)):
+                args.apply = True
+            if args.fix_severity == "high":
+                # Production readiness means medium defects get fixed too; the
+                # build gate + adversarial verify still guard every one of them.
+                args.fix_severity = "medium"
+            if args.branch_prefix == "flexfactor/audit-":
+                args.branch_prefix = "flexfactor/prodready-"
         _set_egress_mode(args)
         return run_audit(args)
 

@@ -45,10 +45,41 @@ Write-Host ""
 $dropped = if ($args.Count -ge 1) { $args[0] } else { $null }
 
 Write-Host "What do you want to do?" -ForegroundColor Yellow
-Write-Host "  1) refactor - improve a single source file until it's swole"
-Write-Host "  2) scout    - find Repo Rewards repos that would benefit a program"
-Write-Host "  3) audit    - aggressively find+fix every defect, test every function & button"
-$mode = Read-Host "Choose [1/2/3] (Enter = 1)"
+Write-Host "  1) refactor  - improve a single source file until it's swole"
+Write-Host "  2) scout     - find Repo Rewards repos that would benefit a program"
+Write-Host "  3) audit     - aggressively find+fix every defect, test every function & button"
+Write-Host "  4) prodready - hand it any program and walk away: detect the toolchains,"
+Write-Host "                 install the deps, fix the defects, score it production ready"
+$mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
+
+# prodready asks NOTHING beyond the program. That is the point of the mode: the
+# owner should not have to know which of ~40 audit flags make a run trustworthy.
+if ($mode -eq "4") {
+    $programs = @()
+    $droppedAll = @($args | Where-Object { $_ })
+    if ($droppedAll.Count -ge 1) {
+        $programs = @($droppedAll | Select-Object -First 5 | ForEach-Object { $_.Trim('"') })
+        Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
+    } else {
+        $p = (Read-Host "Program to make production ready (folder, file, .lnk, URL, or name)").Trim('"')
+        if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
+    }
+    if ($programs.Count -eq 0) {
+        Write-Host "No program given." -ForegroundColor Red
+        Read-Host "Press Enter to close"; exit 1
+    }
+    $programArgs = @()
+    foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
+    Write-Host ""
+    Write-Host "  Running: detect toolchains -> install dependencies -> review + fix" -ForegroundColor DarkGray
+    Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
+    Write-Host "  Fixes land on a flexfactor/prodready-* branch; nothing is pushed." -ForegroundColor DarkGray
+    Write-Host ""
+    python $script prodready @programArgs --provider anthropic --economy
+    Write-Host ""
+    Read-Host "Done. Press Enter to close"
+    exit 0
+}
 
 # Audit has its own provider handling: it auto-detects keys and (when both are
 # set) cross-checks with both models. Branch off before the single-provider

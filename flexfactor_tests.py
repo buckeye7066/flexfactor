@@ -5377,5 +5377,368 @@ class PolicyCommandTests(unittest.TestCase):
         self.assertIn("policy", ff._TOP_LEVEL_USAGE)
 
 
+# --------------------------------------------------------------------------- #
+# Production-readiness engine (flexfactor_prodready)
+# --------------------------------------------------------------------------- #
+import tempfile                                                    # noqa: E402
+import flexfactor_prodready as pr                                  # noqa: E402
+
+
+class _RepoFixture:
+    """Build a throwaway repo from a {relpath: contents} map."""
+
+    def __init__(self, files: dict):
+        self.files = files
+        self._tmp = None
+
+    def __enter__(self) -> str:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        for rel, body in self.files.items():
+            path = os.path.join(root, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        return root
+
+    def __exit__(self, *exc):
+        self._tmp.cleanup()
+        return False
+
+
+def _fake_run(results=None):
+    """A _run stand-in. `results` maps argv[0] -> returncode."""
+    results = results or {}
+
+    def run(cmd, cwd, timeout=None, **kw):
+        import subprocess
+        rc = results.get(cmd[0], 0)
+        cp = subprocess.CompletedProcess(cmd, rc, "", "")
+        return cp
+    return run
+
+
+class ToolchainDetectionTests(unittest.TestCase):
+    def test_node_manager_follows_the_lockfile(self):
+        # Running `npm install` in a pnpm workspace produces a broken tree, and
+        # the resulting build failure gets blamed on the audit's fixes.
+        for lock, expected in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"),
+                               ("package-lock.json", "npm")):
+            with _RepoFixture({"package.json": '{"scripts":{"build":"tsc"}}',
+                               lock: ""}) as root:
+                tc = pr.detect_toolchains(root)[0]
+                self.assertEqual(tc.manager, expected, f"for {lock}")
+
+    def test_every_supported_ecosystem_yields_a_build_command(self):
+        # The regression this whole module exists to prevent: an ecosystem that
+        # is detected but has no build command makes _full_gate vacuously True.
+        cases = {
+            "go": {"go.mod": "module x\n"},
+            "rust": {"Cargo.toml": "[package]\nname='x'\n"},
+            "java": {"pom.xml": "<project/>"},
+            "dotnet": {"app.csproj": "<Project/>"},
+            "elixir": {"mix.exs": "defmodule X do\nend\n"},
+            "dart": {"pubspec.yaml": "name: x\n"},
+            "deno": {"deno.json": "{}"},
+            "swift": {"Package.swift": "// swift-tools-version:5.5\n"},
+        }
+        for eco, files in cases.items():
+            with _RepoFixture(files) as root:
+                chains = pr.detect_toolchains(root)
+                self.assertTrue(chains, f"{eco} not detected")
+                tc = next(t for t in chains if t.ecosystem == eco)
+                self.assertTrue(tc.build, f"{eco} has no build command")
+                self.assertTrue(tc.install, f"{eco} has no install command")
+
+    def test_vendor_dirs_do_not_produce_phantom_toolchains(self):
+        with _RepoFixture({
+                "package.json": "{}",
+                "node_modules/left-pad/package.json": '{"name":"left-pad"}',
+                "vendor/thing/go.mod": "module vendored\n"}) as root:
+            chains = pr.detect_toolchains(root)
+            self.assertEqual([t.root for t in chains], ["."])
+
+    def test_monorepo_components_are_each_detected(self):
+        with _RepoFixture({"package.json": "{}",
+                           "services/api/go.mod": "module api\n",
+                           "services/web/package.json": "{}"}) as root:
+            found = {(t.ecosystem, t.root) for t in pr.detect_toolchains(root)}
+            self.assertIn(("node", "."), found)
+            self.assertIn(("go", "services/api"), found)
+            self.assertIn(("node", "services/web"), found)
+
+    def test_malformed_manifest_does_not_raise(self):
+        with _RepoFixture({"package.json": "{not json at all"}) as root:
+            chains = pr.detect_toolchains(root)
+            self.assertEqual(chains[0].ecosystem, "node")
+
+
+class VerificationHonestyTests(unittest.TestCase):
+    def test_no_build_system_is_not_verifiable(self):
+        ok, why = pr.verification_is_real([])
+        self.assertFalse(ok)
+        self.assertIn("no build system", why)
+
+    def test_detected_but_unbuildable_is_not_verifiable(self):
+        tc = pr.Toolchain(ecosystem="make", root=".", manager="make", marker="Makefile")
+        ok, why = pr.verification_is_real([tc])
+        self.assertFalse(ok)
+        self.assertIn("UNVERIFIED", why)
+
+    def test_missing_deps_blocks_verification_claim(self):
+        tc = pr.Toolchain(ecosystem="node", root=".", manager="npm",
+                          marker="package.json", install=[["npm", "install"]],
+                          build=[["npm", "run", "build"]], deps_installed=False)
+        self.assertFalse(pr.verification_is_real([tc])[0])
+        tc.deps_installed = True
+        self.assertTrue(pr.verification_is_real([tc])[0])
+
+    def test_build_not_needing_deps_stays_verifiable(self):
+        # python's compileall parses without importing, so a bare checkout is
+        # still build-verifiable. Conflating this with npm's case reported a
+        # working project as unverifiable purely for lacking a .venv.
+        with _RepoFixture({"requirements.txt": "requests==2.31.0\n"}) as root:
+            tc = pr.detect_toolchains(root)[0]
+            self.assertFalse(tc.deps_installed)
+            self.assertTrue(pr.verification_is_real([tc])[0])
+
+    def test_no_installer_component_is_not_called_missing_deps(self):
+        tc = pr.Toolchain(ecosystem="cpp", root=".", manager="meson",
+                          marker="meson.build", build=[["meson", "compile"]],
+                          install=[], deps_installed=False)
+        self.assertTrue(pr.verification_is_real([tc])[0])
+
+
+class BootstrapPlanTests(unittest.TestCase):
+    def _node(self, **kw):
+        return pr.Toolchain(ecosystem="node", root=".", manager="npm",
+                            marker="package.json", install=[["npm", "install"]], **kw)
+
+    def test_lifecycle_scripts_are_disabled_by_default(self):
+        plan = pr.bootstrap_plan([self._node()])
+        self.assertEqual(plan[0][1], ["npm", "install", "--ignore-scripts"])
+
+    def test_allow_scripts_opts_in(self):
+        plan = pr.bootstrap_plan([self._node()], allow_scripts=True)
+        self.assertEqual(plan[0][1], ["npm", "install"])
+
+    def test_installed_components_are_skipped_unless_forced(self):
+        tc = self._node(deps_installed=True)
+        self.assertEqual(pr.bootstrap_plan([tc]), [])
+        self.assertEqual(len(pr.bootstrap_plan([tc], force=True)), 1)
+
+    def test_failed_install_is_recorded_not_raised(self):
+        tc = self._node()
+        with _RepoFixture({"package.json": "{}"}) as root:
+            results = pr.run_bootstrap(root, [tc], _fake_run({"npm": 1}))
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertFalse(tc.deps_installed)
+
+    def test_successful_install_marks_deps_present(self):
+        tc = self._node()
+        with _RepoFixture({"package.json": "{}"}) as root:
+            results = pr.run_bootstrap(root, [tc], _fake_run())
+        self.assertTrue(results[0].ok)
+        self.assertTrue(tc.deps_installed)
+
+
+class ReadinessRubricTests(unittest.TestCase):
+    def _gates(self, files, **kw):
+        with _RepoFixture(files) as root:
+            chains = pr.detect_toolchains(root)
+            return {g.id: g for g in
+                    pr.assess_readiness(root, chains, _fake_run({"git": 1}), **kw)}
+
+    def test_committed_env_file_is_a_critical_failure(self):
+        g = self._gates({"package.json": "{}", ".env": "SECRET=abc123\n"})
+        self.assertEqual(g["no_committed_secrets"].status, "fail")
+        self.assertEqual(g["no_committed_secrets"].severity, "critical")
+
+    def test_env_example_is_not_mistaken_for_a_leaked_secret(self):
+        # The documented-config pattern is the OPPOSITE of a leak; flagging it
+        # would train the owner to ignore the gate that matters most.
+        g = self._gates({"package.json": "{}", ".env.example": "SECRET=\n"})
+        self.assertEqual(g["no_committed_secrets"].status, "pass")
+        self.assertEqual(g["config_documented"].status, "pass")
+
+    def test_unknown_is_distinct_from_fail(self):
+        g = self._gates({"package.json": "{}"})
+        self.assertEqual(g["build_passes"].status, "unknown")
+        g2 = self._gates({"package.json": "{}"}, build_ok=False)
+        self.assertEqual(g2["build_passes"].status, "fail")
+
+    def test_unknown_critical_gate_still_blocks(self):
+        # An unevaluated critical property is not evidence of safety. Treating
+        # it as a pass is the exact overclaim this module exists to prevent.
+        gate = pr.Gate(id="x", title="t", status="unknown", severity="critical")
+        self.assertTrue(pr.is_blocking(gate))
+
+    def test_na_gate_never_blocks(self):
+        gate = pr.Gate(id="x", title="t", status="na", severity="critical")
+        self.assertFalse(pr.is_blocking(gate))
+
+    def test_library_is_not_faulted_for_lacking_a_dockerfile(self):
+        g = self._gates({"go.mod": "module x\n"})
+        self.assertEqual(g["deployable_artifact"].status, "na")
+
+    def test_score_excludes_unevaluated_gates(self):
+        gates = [pr.Gate(id="a", title="a", status="pass", severity="low"),
+                 pr.Gate(id="b", title="b", status="fail", severity="low"),
+                 pr.Gate(id="c", title="c", status="unknown", severity="low"),
+                 pr.Gate(id="d", title="d", status="na", severity="low")]
+        self.assertEqual(pr.readiness_score(gates), (1, 2, 4))
+
+    def test_verdict_requires_zero_blockers(self):
+        gates = [pr.Gate(id="a", title="a", status="fail", severity="low")]
+        self.assertTrue(pr.readiness_verdict(gates)[0])      # low never blocks
+        gates.append(pr.Gate(id="b", title="b", status="fail", severity="critical"))
+        self.assertFalse(pr.readiness_verdict(gates)[0])
+
+    def test_scorecard_leads_with_the_verdict(self):
+        gates = [pr.Gate(id="a", title="Broken", status="fail", severity="critical",
+                         evidence="it is broken", remediation="unbreak it")]
+        card = pr.render_scorecard("demo", [], gates)
+        self.assertIn("NOT PRODUCTION READY", card)
+        self.assertLess(card.index("NOT PRODUCTION READY"), card.index("All gates"))
+        self.assertIn("unbreak it", card)
+
+
+class SyntaxGateTests(unittest.TestCase):
+    def test_json_and_toml_are_parsed_in_process(self):
+        with _RepoFixture({"a.json": '{"ok":true}', "b.json": "{broken",
+                           "c.toml": "k = 1\n"}) as root:
+            self.assertEqual(pr.inproc_syntax_ok(root, "a.json")[0], True)
+            self.assertEqual(pr.inproc_syntax_ok(root, "b.json")[0], False)
+            self.assertEqual(pr.inproc_syntax_ok(root, "c.toml")[0], True)
+
+    def test_unhandled_extension_returns_none(self):
+        with _RepoFixture({"a.py": "x = 1\n"}) as root:
+            self.assertIsNone(pr.inproc_syntax_ok(root, "a.py")[0])
+
+    def test_gate_cmd_substitutes_the_path(self):
+        self.assertEqual(pr.syntax_gate_cmd("lib/thing.rb"), ["ruby", "-c", "lib/thing.rb"])
+        self.assertIsNone(pr.syntax_gate_cmd("thing.unknownext"))
+
+    def test_missing_interpreter_is_unverified_not_broken(self):
+        # If a missing `ruby` returned False, _fix_files would ROLL BACK every
+        # correct .rb fix on a machine without Ruby and report the file broken.
+        with _RepoFixture({"a.rb": "puts 1\n"}) as root:
+            ok, log = ff._ext_syntax_gate(root, "a.rb")
+            if ok is None:
+                self.assertIn("unverified", log)
+            else:
+                self.assertTrue(ok, "real ruby present: valid file must pass")
+
+    def test_policy_blocked_gate_is_unverified_not_broken(self):
+        import subprocess as _sp
+        blocked = _sp.CompletedProcess(["ruby"], 126, "", "[flexfactor-policy] no")
+        blocked.flexfactor_launch_error = True
+        with _RepoFixture({"a.rb": "puts 1\n"}) as root:
+            with _patched(ff, "_run", lambda *a, **k: blocked), \
+                 _patched(ff.shutil, "which", lambda n: "/usr/bin/ruby"):
+                ok, log = ff._ext_syntax_gate(root, "a.rb")
+        self.assertIsNone(ok)
+        self.assertIn("unverified", log)
+
+
+class _patched:
+    """Minimal attribute patcher (the suite avoids unittest.mock elsewhere)."""
+
+    def __init__(self, obj, name, value):
+        self.obj, self.name, self.value = obj, name, value
+
+    def __enter__(self):
+        self.old = getattr(self.obj, self.name)
+        setattr(self.obj, self.name, self.value)
+        return self
+
+    def __exit__(self, *exc):
+        setattr(self.obj, self.name, self.old)
+        return False
+
+
+class StackEnrichmentTests(unittest.TestCase):
+    def test_go_repo_gets_a_real_full_gate(self):
+        # Before enrichment this stack had no verify_cmds, so _full_gate
+        # returned True without running anything and fixes shipped unverified.
+        with _RepoFixture({"go.mod": "module x\n"}) as root:
+            stack = ff._detect_stack(root)
+            self.assertTrue(stack["verify_cmds"], "go repo still has no build gate")
+            self.assertIn("go", stack["ecosystems"])
+            self.assertTrue(stack["test_cmd"])
+
+    def test_node_own_scripts_win_over_defaults(self):
+        with _RepoFixture({"package.json":
+                           '{"scripts":{"build":"vite build","test":"vitest"}}'}) as root:
+            stack = ff._detect_stack(root)
+            self.assertIn(["npm", "run", "build"], stack["verify_cmds"])
+            self.assertEqual(stack["test_cmd"], ["npm", "run", "test"])
+
+    def test_nested_component_commands_are_not_hoisted_to_root(self):
+        # `go build ./...` run from the repo root of a monorepo misses the
+        # module entirely, so a nested toolchain must not become the root gate.
+        with _RepoFixture({"services/api/go.mod": "module api\n"}) as root:
+            stack = ff._detect_stack(root)
+            self.assertEqual(stack["verify_cmds"], [])
+            self.assertTrue(stack["toolchains"])
+
+    def test_unknown_project_is_flagged_unverifiable(self):
+        with _RepoFixture({"notes.txt": "hello\n"}) as root:
+            stack = ff._detect_stack(root)
+            self.assertFalse(stack["verification_is_real"])
+
+
+class ProdreadyModeTests(unittest.TestCase):
+    def test_prodready_is_a_real_mode_not_rewritten_to_refactor(self):
+        self.assertIn("prodready", ff._TOP_LEVEL_USAGE)
+
+    def test_readiness_defaults_off_for_audit_on_for_prodready(self):
+        # Two flags sharing a dest means the LAST registered default wins; this
+        # pins that plain `audit` was not silently given the scorecard.
+        import io
+        from contextlib import redirect_stderr
+        captured = {}
+
+        def fake_run_audit(args):
+            captured.update(readiness=args.readiness, apply=args.apply,
+                            severity=args.fix_severity, prefix=args.branch_prefix)
+            return 0
+
+        with _patched(ff, "run_audit", fake_run_audit):
+            with redirect_stderr(io.StringIO()):
+                ff.main(["audit", "--program", "."])
+                self.assertFalse(captured["readiness"])
+                ff.main(["prodready", "--program", "."])
+                self.assertTrue(captured["readiness"])
+                self.assertTrue(captured["apply"])
+                self.assertEqual(captured["severity"], "medium")
+                self.assertIn("prodready", captured["prefix"])
+
+    def test_explicit_flags_still_win_in_prodready(self):
+        captured = {}
+
+        def fake_run_audit(args):
+            captured.update(readiness=args.readiness, apply=args.apply)
+            return 0
+
+        with _patched(ff, "run_audit", fake_run_audit):
+            ff.main(["prodready", "--program", ".", "--no-readiness", "--report-only"])
+        self.assertFalse(captured["readiness"])
+        self.assertFalse(captured["apply"])
+
+    def test_bootstrap_flags_exist_with_safe_defaults(self):
+        captured = {}
+
+        def fake_run_audit(args):
+            captured.update(bootstrap=args.bootstrap, scripts=args.allow_scripts)
+            return 0
+
+        with _patched(ff, "run_audit", fake_run_audit):
+            ff.main(["prodready", "--program", "."])
+        self.assertTrue(captured["bootstrap"])
+        self.assertFalse(captured["scripts"], "lifecycle scripts must be opt-in")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -10,6 +10,7 @@ pip install -r requirements.txt                # exact tested pins (or: pip inst
 python flexfactor.py --file <f> --goal "..."   # refactor mode
 python flexfactor.py scout --program <p>
 python flexfactor.py audit --program <p>
+python flexfactor.py prodready --program <p>   # detect+install+fix+score, zero questions
 python flexfactor.py policy init|show          # owner policy (~/.flexfactor/policy.json)
 python flexfactor_tests.py                     # unit tests, no API keys needed
 python flexfactor_dashboard.py --selftest
@@ -21,6 +22,46 @@ budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3
 ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2),
 `--adversarial-materiality {material,all}` (default material: don't burn rounds on
 exotic goal-irrelevant residuals; accept+document them instead).
+
+## Production-readiness engine (`flexfactor_prodready.py`, 2026-08-04)
+
+Stdlib-only, never imports flexfactor, and NEVER spawns a subprocess itself —
+the caller injects `_run`, so every command still passes cmdpolicy + `_winify`.
+Closes two silent-failure holes the audit had:
+
+1. **Nothing ever installed dependencies.** On a fresh checkout `npm run build`
+   failed for a reason unrelated to the code, the baseline gate went red, and
+   every fix was downgraded to syntax-only + `[unverified]`. `_run_bootstrap_phase`
+   now installs first (inserted just before the baseline `_full_gate`), so the
+   gate measures the code. `--no-bootstrap` opts out; lifecycle scripts are OFF
+   by default (`--allow-scripts` to permit) mirroring scout's policy.
+2. **`_full_gate` returned `True, "(no build/verify command available)"`** for
+   every non-Node/Python repo — indistinguishable from a real pass, so Go/Rust/
+   Java/.NET/Ruby/PHP/Elixir fixes shipped with zero verification. `_detect_stack`
+   now calls `_enrich_stack_with_toolchains`, which fills `verify_cmds`/`test_cmd`
+   from 13 ecosystems. `stack["verification_is_real"]` + `verification_note` carry
+   the honest answer and are printed and put in the report.
+
+- `detect_toolchains()` — 13 ecosystems, monorepo-aware to depth 3, skips
+  vendor dirs. Node manager follows the LOCKFILE (npm in a pnpm tree breaks it).
+- `assess_readiness()` — 12 deterministic gates (no model calls). Status is
+  FOUR-valued: `unknown` is NOT `fail`, and an `unknown` critical gate still
+  BLOCKS (an unevaluated property is not evidence of safety).
+- `verification_is_real()` — the honesty guard; `build_needs_deps` is why a
+  Python repo with no `.venv` is still verifiable (compileall parses without
+  importing) while a Node one is not.
+- `_ext_syntax_gate` extends the per-file gate to go/rb/php/sh/json/toml. A
+  MISSING interpreter must return `None`, never `False`: `False` makes
+  `_fix_files` roll the file back, so on a machine without Ruby every correct
+  `.rb` fix would be silently discarded. Guarded by `shutil.which` + `_run`'s
+  own `flexfactor_launch_error` marker (covers policy-block/timeout/not-found).
+- `prodready` mode = audit with `--apply`, `--fix-severity medium`, readiness ON,
+  branch prefix `flexfactor/prodready-`. Explicit `--report-only`/`--dry-run`
+  still win — checked against RAW argv because they share a dest with `--apply`.
+
+Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
+again; when it does, `flexfactor.py` silently drops out of its own audit
+(`test_flexfactor_can_review_itself` is the guard).
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
