@@ -706,10 +706,22 @@ class ScoutApplyDefaultTests(unittest.TestCase):
             branch_prefix = "flexfactor/adopt-"
             push = False
             merge = False
+            legacy_inline_apply = False
         a = A()
         for k, v in over.items():
             setattr(a, k, v)
         return a
+
+    def test_legacy_inline_apply_default_off(self):
+        real = ff.run_scout
+        captured = {}
+        ff.run_scout = lambda a: captured.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--apply", "--yes"])
+        finally:
+            ff.run_scout = real
+        self.assertTrue(captured["args"].apply)
+        self.assertFalse(captured["args"].legacy_inline_apply)
 
     def _adopt_eval(self):
         # Includes the deterministic safety verdicts _qualifies_for_apply now
@@ -4466,6 +4478,20 @@ class ScoutEndToEndTests(unittest.TestCase):
             True, [[sys.executable, "-c", f"import sys; sys.exit({verify_rc})"]])
         ff._run = spy_run
         try:
+            # Bridge 100: target mutation requires a separate FlexFactor apply
+            # approval file (not Scout --apply alone). Commit it so the dirty-
+            # tree gate does not block the apply phase.
+            import json as _json
+            with open(os.path.join(tmp, ".flexfactor-apply-approval.json"),
+                      "w", encoding="utf-8") as af:
+                _json.dump({"approved": True, "approver": "flexfactor-apply",
+                            "repo": "good/widget"}, af)
+            subprocess.run(["git", "-C", tmp, "add",
+                            ".flexfactor-apply-approval.json"],
+                           capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-q", "-m",
+                            "flexfactor apply approval"],
+                           capture_output=True)
             # --no-clone-inspect keeps the scenario fully offline (the fixture
             # urls aren't cloneable); enrichment has its own dedicated tests.
             rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
@@ -4528,9 +4554,13 @@ class ScoutEndToEndTests(unittest.TestCase):
             branches = self._git_out(tmp, "branch", "--list")
             self.assertNotIn("flexfactor/adopt-good-widget", branches)
             self.assertFalse(os.path.exists(os.path.join(tmp, "widget_integration.js")))
-            # Tree pristine apart from the report scout writes at the end.
+            # Tree pristine apart from scout report/proposal artifacts.
+            _artifact_names = ("repo_rewards_report", "_scout_report.json",
+                               ".flexfactor-scout-proposals.json",
+                               ".flexfactor-apply-approval.json")
             status = [ln for ln in self._git_out(tmp, "status", "--porcelain")
-                      .splitlines() if "repo_rewards_report" not in ln]
+                      .splitlines()
+                      if not any(a in ln for a in _artifact_names)]
             self.assertEqual(status, [], f"tree not pristine after rollback: {status}")
 
 
@@ -5139,8 +5169,9 @@ class ApplyPhaseInspectionGateTests(unittest.TestCase):
             return None, "unreachable"
 
         with tempfile.TemporaryDirectory() as tmp:
-            args = argparse.Namespace(apply_tier="adopt", clone_inspect=True,
-                                      dry_run=False, program=tmp)
+            args = argparse.Namespace(apply=True, apply_tier="adopt",
+                                      clone_inspect=True, dry_run=False,
+                                      program=tmp, legacy_inline_apply=False)
             with mock.patch.object(ff, "enrich_evidence_from_clone", fake_enrich), \
                  mock.patch.object(ff, "_approve_candidate", fake_approve), \
                  mock.patch.object(ff, "resolve_project_dir", lambda *a: tmp), \
@@ -5895,6 +5926,292 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
         with self._run_one({"package.json":
                             '{"dependencies":{"left-pad":"1.0.0"}}'}) as (res, _r):
             self.assertEqual(res.get("bootstrap"), [])
+
+
+class ScoutBridge94to100Tests(unittest.TestCase):
+    """Production exit criteria 98-100 (+ bridge 94-97 invariants)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import flexfactor_scout_contract as sc
+        cls.sc = sc
+
+    def test_94_separate_mode_risk_model_and_schema(self):
+        sc = self.sc
+        self.assertEqual(sc.SCOUT_MODE, "scout")
+        self.assertEqual(sc.SCOUT_REPORT_SCHEMA_VERSION, "scout-report-v1")
+        self.assertTrue(sc.METADATA_SCREENED_ONLY)
+        self.assertIn("safe_to_inspect", sc.SCOUT_RISK_MODEL["verdicts"])
+        self.assertIn("safe_to_integrate", sc.SCOUT_RISK_MODEL["verdicts"])
+        self.assertIn("safe_to_execute", sc.SCOUT_RISK_MODEL["verdicts"])
+        banner = sc.scout_config_banner()
+        self.assertIn("scout-three-verdict-v1", banner)
+        self.assertIn("metadata_screened_only=True", banner)
+
+    def test_95_metadata_never_safe_to_install_and_pin_fields(self):
+        sc = self.sc
+        evaluation = {
+            "recommendation": "ADOPT",
+            "result": {
+                "repo": {"fullName": "o/r", "htmlUrl": "https://example.com/o/r",
+                         "commitSha": "abc1234deadbeef"},
+                "safety": {"verdict": "allow"},
+            },
+            "benefit": {"benefit_score": 80, "integration_note": "drop-in"},
+            "evidence": {"license": "MIT", "license_compatible": True,
+                         "dependency_burden": "0 direct"},
+        }
+        ev = sc.pin_fields_from_evidence(evaluation)
+        self.assertTrue(ev["metadata_screened_only"])
+        self.assertIs(ev["safe_to_install"], False)
+        self.assertEqual(ev["commit_sha"], "abc1234deadbeef")
+        self.assertEqual(ev["commit_pin_source"], "metadata")
+        self.assertIn(ev["transitive_risk"],
+                      ("low", "moderate", "elevated",
+                       "unknown-until-sandbox-inspect"))
+        self.assertTrue(ev["compatibility"])
+
+    def test_96_credential_strip_and_disposable_teardown(self):
+        sc = self.sc
+        os.environ["OPENAI_API_KEY"] = "sk-test-probe"
+        try:
+            env = sc.strip_credential_env({"OPENAI_API_KEY": "sk-x",
+                                           "PATH": "/bin",
+                                           "MY_SECRET_TOKEN": "nope"})
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertNotIn("MY_SECRET_TOKEN", env)
+            self.assertIn("PATH", env)
+            self.assertEqual(env["HOME"], tempfile.gettempdir())
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+        with sc.disposable_sandbox(prefix="ffscout-ut-") as root:
+            marker = os.path.join(root, "x.txt")
+            open(marker, "w", encoding="utf-8").write("1")
+            self.assertTrue(os.path.isdir(root))
+        self.assertFalse(os.path.exists(root))
+
+    def test_97_proposal_has_delta_conflict_rollback(self):
+        sc = self.sc
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as f:
+                f.write('{"dependencies":{"left-pad":"1.0.0"}}')
+            open(os.path.join(tmp, "existing.js"), "w", encoding="utf-8").write("x")
+            evaluation = {
+                "recommendation": "ADOPT",
+                "need": "widgets",
+                "repo": {"fullName": "o/r", "htmlUrl": "https://x/o/r"},
+                "result": {"repo": {"fullName": "o/r", "htmlUrl": "https://x/o/r",
+                                    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+                "benefit": {"benefit_score": 90, "how_it_helps": "helps"},
+                "verdicts": {"safe_to_integrate": True},
+                "evidence": {"license": "MIT", "license_compatible": True,
+                             "commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                             "commit_pin_source": "clone", "clone_inspection_ok": True},
+            }
+            prop = sc.build_integration_proposal(
+                evaluation, project_dir=tmp,
+                packages=["left-pad", "new-pkg"],
+                files_planned=["existing.js", "fresh.js"])
+            self.assertEqual(prop["schema"], "scout-proposal-v1")
+            self.assertIn("dependency_delta", prop)
+            self.assertIn("new-pkg", prop["dependency_delta"]["deps_added_estimate"])
+            conflicts = prop.get("conflict_analysis") or {}
+            self.assertIn("conflict_likely", conflicts, conflicts)
+            self.assertTrue(conflicts["conflict_likely"], conflicts)
+            self.assertTrue(any(
+                o.get("path") == "existing.js" for o in conflicts.get("overlapping_files") or []))
+            self.assertTrue(prop["rollback_plan"])
+            self.assertTrue(prop["requires_flexfactor_apply_approval"])
+            self.assertIs(prop["target_mutation_allowed"], False)
+            self.assertIs(prop["safe_to_install"], False)
+
+    def test_98_malicious_fixture_cannot_see_credentials(self):
+        sc = self.sc
+        import subprocess
+
+        def run(cmd, cwd=None, timeout=30, env=None):
+            return subprocess.run(cmd, cwd=cwd, timeout=timeout, env=env,
+                                  capture_output=True, text=True)
+
+        result = sc.malicious_fixture_escape_probe(run)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["escaped"])
+        self.assertEqual(result["leaked_canaries"], [])
+        self.assertTrue(result["home_redirected"])
+        self.assertTrue(result["egress_poisoned"])
+        self.assertTrue(result["host_escaping_argv_refused"])
+
+    def test_99_recommendation_required_fields_commit_pinned(self):
+        sc = self.sc
+        evaluation = {
+            "recommendation": "CONSIDER",
+            "need": "n",
+            "repo": {"fullName": "a/b", "htmlUrl": "https://x/a/b"},
+            "result": {"repo": {"fullName": "a/b", "htmlUrl": "https://x/a/b"}},
+            "benefit": {"benefit_score": 70, "how_it_helps": "maybe"},
+            "verdicts": {"safe_to_integrate": True, "reasons": []},
+            "evidence": {
+                "license": "Apache-2.0", "license_compatible": True,
+                "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "commit_pin_source": "clone", "clone_inspection_ok": True,
+                "safety_verdict": "allow", "advisories": "none",
+                "last_activity": "2026-01-01", "stars": 10, "language": "JS",
+            },
+        }
+        report = sc.build_scout_structured_report(
+            "Prog", {"summary": "s", "stack": ["node"], "goals": ["g"]},
+            [evaluation])
+        self.assertEqual(report["schema"], "scout-report-v1")
+        self.assertEqual(report["mode"], "scout")
+        self.assertTrue(report["metadata_screened_only"])
+        self.assertFalse(report["safe_to_install_claims"])
+        rec = report["recommendations"][0]
+        for field in sc.SCOUT_RECOMMENDATION_REQUIRED_FIELDS:
+            self.assertIn(field, rec, f"missing {field}")
+        self.assertEqual(rec["commit_sha"],
+                         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        self.assertEqual(report["forbidden_label_hits"], [])
+
+    def test_100_scout_cannot_mutate_without_flexfactor_apply_approval(self):
+        sc = self.sc
+        import argparse
+        proposal = {"commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                    "repo": "o/r"}
+
+        class Args:
+            apply = True
+            legacy_inline_apply = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            may, why = sc.scout_may_mutate_target(Args(), tmp, proposal)
+            self.assertFalse(may)
+            self.assertIn("approval", why.lower())
+
+            # Wrong approver / unapproved -> still refuse
+            with open(os.path.join(tmp, sc.FLEXFACTOR_APPLY_APPROVAL_FILE),
+                      "w", encoding="utf-8") as f:
+                json.dump({"approved": False, "approver": "flexfactor-apply"}, f)
+            self.assertFalse(sc.flexfactor_apply_approved(tmp, proposal))
+
+            with open(os.path.join(tmp, sc.FLEXFACTOR_APPLY_APPROVAL_FILE),
+                      "w", encoding="utf-8") as f:
+                json.dump({"approved": True, "approver": "flexfactor-apply",
+                           "commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                           "repo": "o/r"}, f)
+            may2, why2 = sc.scout_may_mutate_target(Args(), tmp, proposal)
+            self.assertTrue(may2, why2)
+            self.assertIn("approval", why2)
+
+        # --apply alone (no legacy, no file) must not mutate even with merge flag
+        class MergeArgs:
+            apply = True
+            merge = True
+            legacy_inline_apply = False
+        may3, _ = sc.scout_may_mutate_target(MergeArgs(), None, proposal)
+        self.assertFalse(may3)
+
+    def test_100_apply_phase_proposal_only_without_approval(self):
+        """Wire-level: _apply_phase refuses mutation without approval file."""
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        repo = {"fullName": "x/y", "htmlUrl": "https://example.com/x/y",
+                "primaryLanguage": "JavaScript", "stars": 10,
+                "licenseSpdx": "MIT", "pushedAt": "2026-06-01"}
+        e = {"need": "n", "repo": repo,
+             "result": {"repo": repo, "safety": {"verdict": "allow"}},
+             "benefit": {"benefit_score": 90}, "recommendation": "ADOPT"}
+        e["evidence"] = ff.build_evidence_matrix(e)
+        e["evidence"]["clone_inspection_ok"] = True
+        e["evidence"]["commit_sha"] = "dddddddddddddddddddddddddddddddddddddddd"
+        e["evidence"]["commit_pin_source"] = "clone"
+        e["verdicts"] = ff.candidate_verdicts(e["evidence"])
+
+        gen_calls = {"n": 0}
+
+        def fake_generate(*a, **k):
+            gen_calls["n"] += 1
+            return None, "should-not-run"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                apply=True, apply_tier="adopt", clone_inspect=False,
+                dry_run=False, program=tmp, legacy_inline_apply=False,
+                assume_yes=True)
+            with mock.patch.object(ff, "_approve_candidate",
+                                   lambda *a, **k: True), \
+                 mock.patch.object(ff, "generate_integration", fake_generate), \
+                 mock.patch.object(ff, "resolve_project_dir", lambda *a: tmp):
+                with redirect_stdout(io.StringIO()):
+                    results = ff._apply_phase(args, "P", {"summary": "s"},
+                                              [e], provider=None)
+            self.assertEqual(results[0].status, "proposal-only")
+            self.assertEqual(gen_calls["n"], 0)
+
+    def test_e2e_apply_without_approval_does_not_mutate(self):
+        """Scout --apply --yes without approval file must not create branches."""
+        import subprocess
+        import types
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+            subprocess.run(["git", "-C", tmp, "config", "user.email", "t@t"],
+                           capture_output=True)
+            subprocess.run(["git", "-C", tmp, "config", "user.name", "t"],
+                           capture_output=True)
+            open(os.path.join(tmp, "src.js"), "w", encoding="utf-8").write("x\n")
+            subprocess.run(["git", "-C", tmp, "add", "-A"], capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-q", "-m", "init"],
+                           capture_output=True)
+
+            good = {
+                "repo": {"fullName": "good/widget",
+                         "htmlUrl": "https://x/good/widget",
+                         "primaryLanguage": "JavaScript", "stars": 500,
+                         "licenseSpdx": "MIT", "pushedAt": "2026-06-01",
+                         "description": "A widget library."},
+                "ai": {}, "finalScore": 85, "safety": {"verdict": "allow"},
+            }
+            saved = {n: getattr(ff, n) for n in
+                     ("_server_is_up", "repo_rewards_search", "_judge",
+                      "make_provider", "generate_integration")}
+            ff._server_is_up = lambda url, timeout=1.5: True
+            ff.repo_rewards_search = lambda *a, **k: [good]
+            ff._judge = lambda provider, system, prompt, schema, max_tokens=8000: (
+                {"name": "FixtureApp", "summary": "a fixture app",
+                 "stack": ["node"], "goals": ["test"],
+                 "opportunities": [{"need": "widgets",
+                                    "search_query": "widget"}]}
+                if schema is ff.PROGRAM_PROFILE_SCHEMA else
+                {"benefit_score": 90, "verdict": "adopt",
+                 "how_it_helps": "adds widgets", "integration_note": "",
+                 "risks": []})
+            ff.make_provider = lambda *a, **k: types.SimpleNamespace(
+                judge_model="stub")
+            ff.generate_integration = lambda *a, **k: (
+                {"files": [{"path": "widget_integration.js",
+                            "contents": "export const widget = 1;\n"}],
+                 "packages": [], "commit_message": "Integrate good/widget",
+                 "post_steps": []}, "plan")
+            try:
+                rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
+                              "--top", "3", "--no-clone-inspect"])
+            finally:
+                for n, fn in saved.items():
+                    setattr(ff, n, fn)
+            self.assertEqual(rc, 0)
+            branches = subprocess.run(
+                ["git", "-C", tmp, "branch", "--list"],
+                capture_output=True, text=True).stdout
+            self.assertNotIn("flexfactor/adopt-", branches)
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "widget_integration.js")))
+            # Structured proposal artifacts must still be written.
+            self.assertTrue(os.path.exists(
+                os.path.join(tmp, self.sc.SCOUT_PROPOSAL_FILE)))
+            self.assertTrue(os.path.exists(
+                os.path.join(tmp, self.sc.SCOUT_REPORT_JSON)))
 
 
 if __name__ == "__main__":
