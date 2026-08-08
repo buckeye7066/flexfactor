@@ -51,8 +51,9 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   reviewer returns a genuinely CLEAN verdict or `--adversarial-rounds` (default 2) is
   exhausted (then the fix is rejected and rolled back - never silently kept). Unlike
   the legacy check this path is fail-CLOSED: if the verifier itself is unreachable the
-  fix is accepted but marked `[unverified]`, so a downed reviewer is never reported as
-  a clean pass. Use `--no-adversarial` for the legacy single-shot, fail-open veto.
+  candidate is rolled back to the exact pre-change tree and rejected — never kept as
+  an UNVERIFIED success, never committed as a clean pass. Use `--no-adversarial` for
+  the legacy single-shot, fail-open veto.
 - Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
   minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
   prompts don't actually cache today (harmless - a miss bills normal price).

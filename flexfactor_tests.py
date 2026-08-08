@@ -3412,7 +3412,9 @@ class AdversarialFixLoopTests(unittest.TestCase):
                         f"residual not fed back; feedback seen: {fb}")
         self.assertEqual(self._read(tmp), "fixed\n")
 
-    def test_c_transport_failure_accepts_but_marks_unverified(self):
+    def test_c_transport_failure_rolls_back_fail_closed(self):
+        """Master Prompt 83/88: verifier outage restores the pre-change tree and
+        creates no success-shaped keep — never 'accepted UNVERIFIED'."""
         tmp, fb, fake_author, args, findings = self._harness()
         real = self._patch()
         calls = {"n": 0}
@@ -3428,11 +3430,13 @@ class AdversarialFixLoopTests(unittest.TestCase):
                 adversarial=True, adversarial_rounds=2)
         finally:
             self._restore(real)
-        self.assertIn("a.py", applied)          # not punished
-        self.assertIn("a.py", unver)            # but flagged UNVERIFIED, not clean
-        self.assertTrue(any("UNVERIFIED" in n for n in notes))
+        self.assertNotIn("a.py", applied)       # not kept as a success
+        self.assertNotIn("a.py", unver)         # no UNVERIFIED retention path
+        self.assertTrue(any("fail-closed" in n.lower() or "verifier unavailable" in n.lower()
+                            for n in notes), f"notes={notes}")
+        self.assertTrue(any("rejected by cross-model review" in n for n in notes))
         self.assertEqual(calls["n"], 2)         # 1 initial + 1 retry, then give up
-        self.assertEqual(self._read(tmp), "fixed\n")  # fix kept on disk
+        self.assertEqual(self._read(tmp), "orig\n")  # byte-for-byte pre-change restore
 
     def test_d_always_needs_work_rejects_and_rolls_back(self):
         tmp, fb, fake_author, args, findings = self._harness()
@@ -3858,6 +3862,53 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         self.assertTrue(self._branch_deletes(git_calls),
                         "a truly-empty run should clean up its empty branch")
         self.assertIn("no changes", (result.get("commit_status") or ""))
+
+    def test_verifier_outage_skips_success_commit(self):
+        """Master Prompt 88: forced verifier outage → no success commit."""
+        def outage_fix_files(*a, **k):
+            return ([], [], [
+                "a.py: REJECTED fail-closed (verifier unavailable): "
+                "adversarial verify unavailable: network down",
+            ])
+        commit_calls, git_calls, result = self._drive(outage_fix_files)
+        self.assertEqual(commit_calls, [],
+                         "verifier outage must not create a success commit")
+        self.assertIn("FAILED", (result.get("stop_reason") or ""))
+        self.assertIn("verifier", (result.get("stop_reason") or "").lower())
+        status = result.get("commit_status") or ""
+        self.assertIn("verifier-outage", status)
+        self.assertIn("no success commit", status)
+
+
+class RunManifestTests(unittest.TestCase):
+    """Master Prompt 86/90: every apply/audit run emits an immutable JSON manifest."""
+
+    def test_manifest_records_mode_budget_and_outcome(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        audit = {
+            "name": "Demo", "dir": tmp, "branch": "flexfactor/audit-demo",
+            "files_reviewed": 3, "applied_files": ["a.py"], "unverified_files": [],
+            "test_files": [], "commit_status": "committed", "stop_reason": "clean",
+            "converged": True, "baseline_ok": True, "usd": 1.25, "cycles": 1,
+            "providers": ["anthropic:m"], "fix_notes": [],
+            "verification_is_real": True, "verification_note": "",
+        }
+        path = ff._write_run_manifest(tmp, audit, report_only=False, max_cost=50.0)
+        self.assertTrue(path and os.path.isfile(path))
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["schema"], "flexfactor.run_manifest.v1")
+        self.assertEqual(data["mode"], "apply")
+        self.assertFalse(data["report_only"])
+        self.assertEqual(data["max_cost_usd"], 50.0)
+        self.assertEqual(data["applied_files"], ["a.py"])
+        self.assertEqual(data["commit_status"], "committed")
+        # Timestamped name: a second write must not overwrite the first.
+        path2 = ff._write_run_manifest(tmp, audit, report_only=True, max_cost=10.0)
+        self.assertNotEqual(path, path2)
+        self.assertTrue(os.path.isfile(path))
+        self.assertTrue(os.path.isfile(path2))
 
 
 class CmdPolicyTests(unittest.TestCase):
