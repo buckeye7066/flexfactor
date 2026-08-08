@@ -12,6 +12,13 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   benefit, and (by default) APPLIES the ADOPT-tier integrations on a
   `flexfactor/adopt-<repo>` branch, verified by the project's own build, with hard
   rollback on failure. `--report-only` to just get the report.
+- **prodready** - point it at any program and walk away. Detects every toolchain
+  in the tree (13 ecosystems, monorepo-aware), installs the project's own
+  dependencies so the build gate measures the CODE rather than a missing
+  `node_modules`, runs the full audit fix loop down to medium severity, then
+  scores the result against a 12-gate production-readiness rubric and writes a
+  scorecard naming exactly what still blocks release. Asks nothing beyond the
+  program. `--report-only` / `--dry-run` still just look.
 - **audit** - aggressive line-by-line defect hunt and auto-fix across a whole
   codebase (up to 5 programs in parallel). Dual-model adversarial review, per-file
   build gate, cross-model veto, unit + e2e test generation, converges with
@@ -49,6 +56,25 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 - Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
   minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
   prompts don't actually cache today (harmless - a miss bills normal price).
+- **Local-only provider (`--provider ollama`).** All three modes can run
+  against a local Ollama server (default `deepseek-coder:33b` author +
+  `llama3.2` judge; override with `--model`/`--judge-model` to match
+  `ollama list`). ZERO cloud egress: the provider refuses any non-loopback
+  `OLLAMA_BASE_URL`, audit never silently adds a cloud cross-checker to an
+  ollama run, and local tokens are metered at $0 (budgets unaffected). The
+  egress gate is deliberately not applied - payloads never leave the machine.
+  Quality vs frontier models is a real tradeoff; every safety net (build
+  gate, rollback, deterministic scout gates) is unchanged.
+- **Secret/PII egress gate (default ON).** Before ANY repo text reaches a cloud
+  model, a deterministic pre-send scan (`flexfactor_egress.py`) checks for
+  private keys, vendor API tokens, credential-like assignments, secret env
+  lines, and SSN-shaped PII. A finding REFUSES the call (fail closed, marked
+  `flexfactor_egress_blocked` — the file is skipped, never sent). Escape
+  hatches: `--redact` (mask the spans and send the rest), `--allow-sensitive`
+  (send anyway), or allow single categories via `FLEXFACTOR_ALLOW_EGRESS` /
+  `~/.flexfactor/policy.json {"allow_egress": [...]}`. The block tier is
+  high-confidence patterns only, so lockfile hashes and `token = "sentinel"`
+  test fixtures never block a legitimate audit.
 - Review sweep stops at 35% of the budget cap so there is always money left to fix.
 - The brain skips files marked clean in prior runs (`--recheck` to re-review).
 
@@ -58,6 +84,9 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 python flexfactor.py --file <path> --goal "..."        # refactor
 python flexfactor.py scout --program <path|lnk|url>
 python flexfactor.py audit --program <path> [--program <path2> ...] [--parallel N]
+python flexfactor.py prodready --program <path>        # detect + install + fix + score
+python flexfactor.py policy init                        # write deny-by-default owner policy
+python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)
 python flexfactor_dashboard.py --selftest               # dashboard self-check
 ```
@@ -72,8 +101,34 @@ Desktop launchers (in `G:\One Drive\Desktop`): **FlexFactor.lnk** (menu),
 - Scout mode auto-starts the Repo Rewards service from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1` (expects it at `localhost:3000`).
 
+## What "production ready" is allowed to mean
+
+The verdict is a checklist with evidence, not a judgement call. 12 deterministic
+gates (no model involved) cover buildability, tests, committed secrets,
+dependency pinning, config externalisation, CI, docs, licence and a deployable
+artifact. A gate is `pass`, `fail`, `na`, or `unknown` — and `unknown` is
+deliberately not a synonym for `pass`: an unevaluated **critical** gate blocks
+the verdict, because a property nobody checked is not evidence of safety.
+
+Two claims the tool will refuse to make:
+
+- If no build system is detected, or a detected one has no usable build command,
+  it reports `Build verification: NOT AVAILABLE` and marks the run's fixes as
+  NOT build-verified. It will not report the old vacuous pass.
+- If a per-file syntax gate can't run (interpreter absent, blocked by policy,
+  timed out), that file is `unverified`, never "broken" — the difference matters
+  because "broken" causes a rollback that would discard a correct fix.
+
+Supported toolchains: Node (npm/pnpm/yarn/bun), Deno, Python (pip/poetry/uv/pdm/
+pipenv), Go, Rust, Java (maven/gradle), .NET, Ruby, PHP, Elixir, Dart/Flutter,
+Swift, C/C++ (cmake/meson/make).
+
 ## Gotchas
 
+- **Dependency lifecycle scripts are OFF during bootstrap.** Installing a tree
+  runs that tree's `postinstall` hooks — third-party code executing on your
+  machine because you pointed the tool at a repo. `--allow-scripts` opts in
+  (some native packages genuinely need it).
 - **Keep the `.ps1` launchers ASCII.** PowerShell 5.1 reads no-BOM files as CP1252;
   a UTF-8 em-dash can decode as a stray quote and break parsing.
 - **`_winify` is load-bearing.** Windows npm/npx/yarn are `.cmd` shims that

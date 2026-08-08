@@ -27,7 +27,7 @@ dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 flexfactor = "flexfactor:main"
 
 [tool.setuptools]
-py-modules = ["flexfactor", "flexfactor_dashboard"]
+py-modules = ["flexfactor", "flexfactor_cmdpolicy", "flexfactor_egress", "flexfactor_dashboard"]
 
 # Test runner: the suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py

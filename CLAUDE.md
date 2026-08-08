@@ -6,10 +6,12 @@ No app deployment — "prod" = the desktop shortcuts working.
 
 ## Run / test
 ```bash
-pip install anthropic openai                   # only deps; there is NO requirements.txt
+pip install -r requirements.txt                # exact tested pins (or: pip install anthropic openai)
 python flexfactor.py --file <f> --goal "..."   # refactor mode
 python flexfactor.py scout --program <p>
 python flexfactor.py audit --program <p>
+python flexfactor.py prodready --program <p>   # detect+install+fix+score, zero questions
+python flexfactor.py policy init|show          # owner policy (~/.flexfactor/policy.json)
 python flexfactor_tests.py                     # unit tests, no API keys needed
 python flexfactor_dashboard.py --selftest
 ```
@@ -21,13 +23,59 @@ ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2),
 `--adversarial-materiality {material,all}` (default material: don't burn rounds on
 exotic goal-irrelevant residuals; accept+document them instead).
 
+## Production-readiness engine (`flexfactor_prodready.py`, 2026-08-04)
+
+Stdlib-only, never imports flexfactor, and NEVER spawns a subprocess itself —
+the caller injects `_run`, so every command still passes cmdpolicy + `_winify`.
+Closes two silent-failure holes the audit had:
+
+1. **Nothing ever installed dependencies.** On a fresh checkout `npm run build`
+   failed for a reason unrelated to the code, the baseline gate went red, and
+   every fix was downgraded to syntax-only + `[unverified]`. `_run_bootstrap_phase`
+   now installs first (inserted just before the baseline `_full_gate`), so the
+   gate measures the code. `--no-bootstrap` opts out; lifecycle scripts are OFF
+   by default (`--allow-scripts` to permit) mirroring scout's policy.
+2. **`_full_gate` returned `True, "(no build/verify command available)"`** for
+   every non-Node/Python repo — indistinguishable from a real pass, so Go/Rust/
+   Java/.NET/Ruby/PHP/Elixir fixes shipped with zero verification. `_detect_stack`
+   now calls `_enrich_stack_with_toolchains`, which fills `verify_cmds`/`test_cmd`
+   from 13 ecosystems. `stack["verification_is_real"]` + `verification_note` carry
+   the honest answer and are printed and put in the report.
+
+- `detect_toolchains()` — 13 ecosystems, monorepo-aware to depth 3, skips
+  vendor dirs. Node manager follows the LOCKFILE (npm in a pnpm tree breaks it).
+- `assess_readiness()` — 12 deterministic gates (no model calls). Status is
+  FOUR-valued: `unknown` is NOT `fail`, and an `unknown` critical gate still
+  BLOCKS (an unevaluated property is not evidence of safety).
+- `verification_is_real()` — the honesty guard; `build_needs_deps` is why a
+  Python repo with no `.venv` is still verifiable (compileall parses without
+  importing) while a Node one is not.
+- `_ext_syntax_gate` extends the per-file gate to go/rb/php/sh/json/toml. A
+  MISSING interpreter must return `None`, never `False`: `False` makes
+  `_fix_files` roll the file back, so on a machine without Ruby every correct
+  `.rb` fix would be silently discarded. Guarded by `shutil.which` + `_run`'s
+  own `flexfactor_launch_error` marker (covers policy-block/timeout/not-found).
+- `prodready` mode = audit with `--apply`, `--fix-severity medium`, readiness ON,
+  branch prefix `flexfactor/prodready-`. Explicit `--report-only`/`--dry-run`
+  still win — checked against RAW argv because they share a dest with `--apply`.
+
+Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
+again; when it does, `flexfactor.py` silently drops out of its own audit
+(`test_flexfactor_can_review_itself` is the guard).
+
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
   `ECONOMY_MODELS` (audit `--economy`: author = claude-sonnet-5 at $3/$15 vs
   Opus 4.8's $5/$25, near-Opus code quality; launcher defaults economy ON),
   `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
   budget, default $50/program)
-- Providers: `AnthropicProvider` / `OpenAIProvider` (`complete`/`grade`/`structured`);
+- Providers: `AnthropicProvider` / `OpenAIProvider` / `OllamaProvider`
+  (`complete`/`grade`/`structured`/`ping`). Ollama (2026-07-25, ULTRAPLAN
+  1.2) = LOCAL-ONLY: refuses non-loopback `OLLAMA_BASE_URL` (fail closed),
+  no egress gate (nothing leaves the machine), bills `ollama:<model>` ids at
+  $0 via the `MODEL_PRICING["ollama"]` prefix entry, and
+  `build_audit_providers` never adds a cloud secondary when primary=ollama.
+  Defaults: author `deepseek-coder:33b`, judge `llama3.2:latest`;
   `_cached_system()` marks Anthropic system prompts cacheable; `_judge()` routes
   classification calls to the judge tier
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →
@@ -67,8 +115,49 @@ exotic goal-irrelevant residuals; accept+document them instead).
 - Scout: `run_scout` → repo-rewards service (localhost:3000, auto-started from
   `C:\Users\firer\repo-rewards\scripts\launch.ps1`) → `generate_integration` /
   `apply_integration` with `_rollback`
+- Real-clone enrichment (2026-07-25, ULTRAPLAN 2.1): in `_apply_phase`,
+  before per-candidate approval, `enrich_evidence_from_clone` shallow-clones
+  the candidate to a temp dir and `inspect_checkout` fills the evidence
+  fields that were `unknown` pre-clone (lifecycle scripts, native-build
+  markers, dependency burden, LICENSE-text family). Read-only via
+  `_read_contained` (symlink-safe); git clone runs no repo hooks; verdicts
+  RE-COMPUTED after enrichment. LICENSE-text-vs-SPDX mismatch downgrades
+  `license_compatible` to None -> integrate fails closed
+  (`skipped-demoted-by-inspection`). Clone failure leaves fields unknown
+  (never demotes on transport errors). `--no-clone-inspect` opts out; the
+  offline E2E passes it (fixture urls aren't cloneable).
+- Scout safety (2026-07-21): per-candidate `build_evidence_matrix` +
+  `candidate_verdicts` — THREE deterministic verdicts (safe_to_inspect /
+  safe_to_integrate / safe_to_execute), fail-closed on unknowns;
+  `_qualifies_for_apply` hard-gates on safe_to_integrate (LLM/repo text can
+  never reach apply alone). `_injection_scan`/`_execution_risk_scan` feed the
+  gate; `_approve_candidate` = per-candidate approval (dry-run / --yes /
+  reviewed `.flexfactor-scout-policy.json` / TTY prompt; else skip).
+  npm installs run `--ignore-scripts` unless `--allow-scripts`;
+  `ApplyResult.manifest` records files/deps delta + script policy.
+  Eval corpus: `eval_fixtures/scout_candidates.json` (zero unsafe
+  false-negatives is a hard test invariant).
+- EGRESS GATE (2026-07-25): `flexfactor_egress.py` scans every repo-derived
+  provider payload (the `instruction`/`prompt` args of `complete`/`grade`/
+  `structured` in BOTH providers — system prompts are FlexFactor-authored
+  constants, not gated) for secrets/PII BEFORE any cloud call. Default
+  refuses (fail closed, `EgressBlockedError` subclasses RuntimeError so
+  sweeps degrade to a per-file skip, marker `flexfactor_egress_blocked`);
+  `--redact` masks-and-sends, `--allow-sensitive` sends anyway; category
+  allow via `FLEXFACTOR_ALLOW_EGRESS` env or policy.json `allow_egress`.
+  Block tier = high-confidence only (PEM, vendor-prefix tokens, JWT,
+  secret env lines, credential-like assignments, SSN) with placeholder +
+  letter-and-digit-value filters so `token = "sentinel"` fixtures never
+  block an audit. Eval corpus `eval_fixtures/egress_corpus.json`: zero
+  false negatives AND zero false positives are both hard test invariants.
+  `EGRESS_MODE` global is set once by `_set_egress_mode` at CLI parse
+  (allow > redact precedence), read-only afterward (thread-safe by design).
 - Subprocess chokepoint: `_run` + `_winify` (PATHEXT-aware; npm/npx are .cmd shims —
   removing _winify breaks every Node-repo audit with WinError 2). `_run` never raises.
+  COMMAND POLICY GATE: `flexfactor_cmdpolicy.py` classifies every command;
+  destructive/credentialed/deploy are refused (rc 126 +
+  `flexfactor_policy_blocked`) unless allowed via `FLEXFACTOR_ALLOW_CLASSES`
+  env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
 
