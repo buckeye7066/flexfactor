@@ -30,13 +30,17 @@ if ([string]::IsNullOrWhiteSpace($program)) {
 $provider = Read-Host "Provider [openai / anthropic] (Enter = openai)"
 if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "openai" }
 
-# Mode: report (SAFE DEFAULT) writes the report only; apply makes the code changes.
+# Mode: report (SAFE DEFAULT) writes the report only; apply emits proposals.
+# Target mutation still requires a separate FlexFactor apply approval file
+# (.flexfactor-apply-approval.json) unless --legacy-inline-apply is used.
 $mode = Read-Host "Mode [report / apply] (Enter = report)"
 if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "report" }
 $applyArgs = @()
 if ($mode -eq "apply") {
-    Write-Host "Apply mode: integrations that pass the build are committed LOCALLY to a" -ForegroundColor Yellow
-    Write-Host "flexfactor/adopt-* branch (no push). You will be asked to confirm." -ForegroundColor Yellow
+    Write-Host "Apply mode: writes integration PROPOSALS (dependency delta," -ForegroundColor Yellow
+    Write-Host "conflict analysis, rollback). Target mutation requires a" -ForegroundColor Yellow
+    Write-Host "separate FlexFactor apply approval (.flexfactor-apply-approval.json)." -ForegroundColor Yellow
+    Write-Host "You will be asked to confirm." -ForegroundColor Yellow
     $applyArgs = @("--apply")
 } else {
     Write-Host "Report mode: writes the report only; no code changes." -ForegroundColor DarkGray

@@ -76,6 +76,15 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_egress as _egress
 
+# Scout production bridge (94-100): separate risk model / report schema,
+# metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
+# Hard import - scout must not run without the bridge invariants.
+try:
+    import flexfactor_scout_contract as _scout_contract
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_scout_contract as _scout_contract
+
 # Model defaults per provider. Claude Opus 4.8 is the strongest current Claude
 # model; override either with --model. This is the AUTHOR tier - used only where
 # the model writes code (whole-file rewrite, defect fix, integration, test-gen).
@@ -2991,7 +3000,15 @@ def build_evidence_matrix(evaluation: dict) -> dict:
         "native_build": "unknown until inspected",
         "dependency_burden": "unknown until inspected",
         "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; "
-                         "hard rollback on any failure",
+                         "hard rollback on any failure; proposal-only until "
+                         "separate FlexFactor apply approval",
+        # Bridge 95: metadata is never install proof; SHA filled/confirmed later.
+        "metadata_screened_only": True,
+        "safe_to_install": False,
+        "commit_sha": "unpinned",
+        "commit_pin_source": "none",
+        "transitive_risk": "unknown-until-sandbox-inspect",
+        "compatibility": "unknown",
     }
     known = [
         ev["license_compatible"] is not None,
@@ -3002,7 +3019,10 @@ def build_evidence_matrix(evaluation: dict) -> dict:
         ev["safety_verdict"] != "unknown",
     ]
     ev["confidence"] = round(sum(known) / len(known), 2)
-    return ev
+    # Normalize bridge-95 fields (metadata SHA hint, transitive risk, compat).
+    evaluation["evidence"] = ev
+    _scout_contract.pin_fields_from_evidence(evaluation)
+    return evaluation["evidence"]
 
 
 # Safety verdicts from Repo Rewards that count as clean. "" is intentionally
@@ -3275,11 +3295,13 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
         try:
             # protocol.allow=never + https.allow=always: even if some config
             # layer survived, no transport other than https can ever be used.
+            # Bridge 96: hermetic git env + credential strip (no user tokens).
+            clone_env = _scout_contract.strip_credential_env(_hermetic_git_env())
             cp = runner(["git", "-c", "protocol.allow=never",
                          "-c", "protocol.https.allow=always",
                          "clone", "--depth", "1", "--no-tags",
                          "--no-checkout", "--", url, dest],
-                        cwd=tmp, timeout=180, env=_hermetic_git_env())
+                        cwd=tmp, timeout=180, env=clone_env)
             if cp.returncode != 0:
                 ev["clone_inspection"] = (f"clone failed (rc {cp.returncode}); "
                                           "candidate cannot be verified")
@@ -3290,6 +3312,8 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
                 ev["dependency_burden"] = info["dependency_burden"]
                 ev["clone_inspection"] = "inspected a real shallow clone"
                 ev["clone_inspection_ok"] = True
+                # Bridge 95: pin evaluation to immutable commit SHA from clone.
+                _scout_contract.confirm_pin_from_clone(dest, evaluation, run=runner)
                 fams = info["license_families"]
                 if fams:
                     ev["license_file_family"] = "+".join(sorted(fams))
@@ -3312,8 +3336,9 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
                             f"metadata claims {ev.get('license')} but the "
                             "license file text is unrecognized (manual review)")
         finally:
-            _rmtree_force(tmp)
-    evaluation["verdicts"] = candidate_verdicts(ev)
+            _rmtree_force(tmp)  # bridge 96: clean teardown of disposable clone
+    _scout_contract.pin_fields_from_evidence(evaluation)
+    evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
 def run_scout(args) -> int:
@@ -3334,8 +3359,11 @@ def run_scout(args) -> int:
 
     # 2. Characterize the entered program.
     display_name, context = resolve_program_input(args.program)
+    print(_scout_contract.scout_config_banner())
     print(f"FlexFactor scout | program='{display_name}' provider={args.provider} "
-          f"model={model} judge={provider.judge_model}\n")
+          f"model={model} judge={provider.judge_model}")
+    print("Repo Rewards results are METADATA-SCREENED CANDIDATES ONLY "
+          "(never safe-to-install).\n")
     print("Profiling the program...")
     # Profiling/summarizing is a judging task -> cheap tier.
     profile = _judge(
@@ -3415,6 +3443,9 @@ def run_scout(args) -> int:
         # influence it, and _qualifies_for_apply hard-gates on it.
         evaluation["evidence"] = build_evidence_matrix(evaluation)
         evaluation["verdicts"] = candidate_verdicts(evaluation["evidence"])
+        # Bridge 95/97: stamp pin fields + integration proposal (no mutation).
+        _scout_contract.pin_fields_from_evidence(evaluation)
+        _scout_contract.build_integration_proposal(evaluation)
         return evaluation
 
     n_workers = max(1, min(8, len(ranked)))
@@ -3427,20 +3458,35 @@ def run_scout(args) -> int:
                                     -(e["benefit"].get("benefit_score") or 0)))
     _print_scout_report(profile_name, profile, evaluations)
 
-    # 5. APPLY: turn qualifying recommendations into real code changes in the
-    #    program's repo. OFF by default (safe): scout describes, it does not mutate
-    #    unless the user passes --apply and confirms. This is the guard against a
-    #    scout run silently changing/committing a repo.
+    # 5. APPLY: production contract (bridge 97/100) always emits proposals;
+    #    target mutation requires separate FlexFactor apply approval (or
+    #    --legacy-inline-apply). SAFE DEFAULT remains report-only.
     applied: list[ApplyResult] = []
+    apply_dir = resolve_project_dir(args.program, profile_name)
+    proposals = []
+    for e in evaluations:
+        _scout_contract.pin_fields_from_evidence(e)
+        proposals.append(
+            _scout_contract.build_integration_proposal(e, project_dir=apply_dir))
+
     if getattr(args, "apply", False):
-        apply_dir = resolve_project_dir(args.program, profile_name)
         if _confirm_scout_apply(args, evaluations, apply_dir):
             applied = _apply_phase(args, profile_name, profile, evaluations, provider)
         else:
-            print("\nApply cancelled - report only. (Re-run with --apply --yes to skip this prompt.)")
+            print("\nApply cancelled - report + proposals only. "
+                  "(Re-run with --apply --yes to skip this prompt.)")
 
     report_path = _write_scout_report(args.program, profile_name, profile, evaluations, applied)
+    structured = _scout_contract.build_scout_structured_report(
+        profile_name, profile, evaluations, proposals=proposals)
+    base_dir = args.program if os.path.isdir(args.program) else (
+        _find_local_project(profile_name) or os.getcwd())
+    artifacts = _scout_contract.write_scout_artifacts(base_dir, structured, proposals)
     print(f"\nFull report written to {report_path}")
+    print(f"Structured scout report: {artifacts['report_json']}")
+    print(f"Integration proposals:   {artifacts['proposals_json']}")
+    print("Target mutation requires separate FlexFactor apply approval "
+          f"({_scout_contract.FLEXFACTOR_APPLY_APPROVAL_FILE}).")
     return 0
 
 
@@ -3494,11 +3540,20 @@ def _confirm_scout_apply(args, evaluations: list[dict],
                   "(per-candidate policy checks still apply).")
             return True
     print("\n" + "!" * 70)
-    print(f"  --apply will MODIFY the program's repository: generate and commit "
-          f"{n} integration(s)")
-    print(f"  onto a '{args.branch_prefix}*' branch"
-          + (", and PUSH to origin" if getattr(args, "push", False) else " (local commit only, no push)")
-          + (", then MERGE into the current branch" if getattr(args, "merge", False) else "") + ".")
+    if getattr(args, "legacy_inline_apply", False):
+        print(f"  --legacy-inline-apply will MODIFY the program's repository: "
+              f"generate and commit {n} integration(s)")
+        print(f"  onto a '{args.branch_prefix}*' branch"
+              + (", and PUSH to origin" if getattr(args, "push", False)
+                 else " (local commit only, no push)")
+              + (", then MERGE into the current branch"
+                 if getattr(args, "merge", False) else "") + ".")
+    else:
+        print(f"  --apply will emit {n} integration PROPOSAL(s) "
+              "(dependency delta, conflict analysis, rollback).")
+        print("  Target mutation requires a separate FlexFactor apply approval "
+              f"({_scout_contract.FLEXFACTOR_APPLY_APPROVAL_FILE}), unless "
+              "--legacy-inline-apply is set.")
     print("!" * 70)
     if not sys.stdin or not sys.stdin.isatty():
         # No interactive terminal and no --yes: fail safe (do NOT mutate).
@@ -3640,8 +3695,9 @@ def _apply_phase(args, profile_name: str, profile: dict,
         return []
 
     print("\n" + "=" * 70)
-    print(f"  Applying {len(targets)} change(s) to {project_dir}"
+    print(f"  Scout apply phase for {project_dir}"
           + ("  [dry run]" if args.dry_run else ""))
+    print("  Proposals always; mutation gated by FlexFactor apply approval.")
     print("=" * 70)
 
     blob = _profile_blob(profile_name, profile)
@@ -3669,10 +3725,21 @@ def _apply_phase(args, profile_name: str, profile: dict,
                 print(f"   skipped: real-clone inspection demoted this candidate ({why})")
                 results.append(ApplyResult(name, "skipped-demoted-by-inspection", str(why)))
                 continue
+        packages_hint = []
+        proposal = _scout_contract.build_integration_proposal(
+            e, project_dir=project_dir, packages=packages_hint)
+        print(f"   proposal: cost={proposal.get('integration_cost')} "
+              f"pin={proposal.get('commit_sha')} "
+              f"conflicts={proposal.get('conflict_analysis', {}).get('conflict_likely')}")
         if not _approve_candidate(args, e, project_dir):
             print("   skipped: not approved")
             results.append(ApplyResult(name, "skipped-unapproved",
                                        "per-candidate approval was not given"))
+            continue
+        may, why = _scout_contract.scout_may_mutate_target(args, project_dir, proposal)
+        if not may:
+            print(f"   proposal-only: {why}")
+            results.append(ApplyResult(name, "proposal-only", why))
             continue
         try:
             patch, plan = generate_integration(provider, project_dir, blob, e["need"], e["result"])
@@ -3684,6 +3751,12 @@ def _apply_phase(args, profile_name: str, profile: dict,
             print(f"   infeasible: {plan}")
             results.append(ApplyResult(name, "infeasible", plan))
             continue
+        # Refresh proposal with concrete packages/files from the generated patch.
+        _scout_contract.build_integration_proposal(
+            e, project_dir=project_dir,
+            packages=list(patch.get("packages") or []),
+            files_planned=[f.get("path") for f in (patch.get("files") or [])
+                           if isinstance(f, dict) and f.get("path")])
         res = apply_integration(project_dir, name, patch, args)
         print(f"   {res.status}: {res.detail}")
         if res.post_steps:
@@ -3691,7 +3764,9 @@ def _apply_phase(args, profile_name: str, profile: dict,
         results.append(res)
 
     ok = sum(1 for r in results if r.status.startswith("applied"))
-    print(f"\nApply summary: {ok}/{len(results)} change(s) landed.")
+    prop_only = sum(1 for r in results if r.status == "proposal-only")
+    print(f"\nApply summary: {ok}/{len(results)} change(s) landed; "
+          f"{prop_only} proposal-only.")
     return results
 
 
@@ -3790,12 +3865,27 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
         if ev:
             lines.append("- **Evidence:** "
                          f"license={ev.get('license')} (compatible={ev.get('license_compatible')}); "
+                         f"commit_sha={ev.get('commit_sha')}; "
+                         f"pin_source={ev.get('commit_pin_source')}; "
+                         f"metadata_screened_only={ev.get('metadata_screened_only')}; "
+                         f"safe_to_install={ev.get('safe_to_install')}; "
                          f"language={ev.get('language')}; stars={ev.get('stars')}; "
                          f"last_activity={ev.get('last_activity')}; "
                          f"safety={ev.get('safety_verdict')}; advisories={ev.get('advisories')}; "
+                         f"transitive_risk={ev.get('transitive_risk')}; "
+                         f"compatibility={ev.get('compatibility')}; "
                          f"injection_flags={ev.get('injection_flags') or '[]'}; "
                          f"execution_flags={ev.get('execution_flags') or '[]'}; "
                          f"confidence={ev.get('confidence')}")
+        prop = e.get("proposal") or {}
+        if prop:
+            lines.append(f"- **Integration cost:** {prop.get('integration_cost')}")
+            lines.append(f"- **Dependency delta:** {prop.get('dependency_delta')}")
+            lines.append(f"- **Conflict analysis:** {prop.get('conflict_analysis')}")
+            lines.append(f"- **Rollback plan:** {prop.get('rollback_plan')}")
+            lines.append(f"- **Rejection reason:** {prop.get('rejection_reason')}")
+            lines.append("- **Requires FlexFactor apply approval:** "
+                         f"{prop.get('requires_flexfactor_apply_approval')}")
         lines.append("")
     # Record what was evaluated and rejected, so the report is honest about
     # coverage rather than silently hiding the misses.
@@ -7548,14 +7638,21 @@ def main(argv=None) -> int:
                             help="How many top candidate repos to judge (default: 8).")
         parser.add_argument("--no-auto-start", action="store_false", dest="auto_start",
                             help="Don't try to auto-launch Repo Rewards if it's down.")
-        # SAFE DEFAULT: report-only. Mutating a third-party repo requires an
-        # EXPLICIT --apply (plus an interactive confirmation, unless --yes). This
-        # prevents scout from silently changing/committing code just by being run.
+        # SAFE DEFAULT: report-only. --apply emits proposals; target mutation
+        # requires a separate FlexFactor apply approval (bridge 97/100), unless
+        # --legacy-inline-apply is explicitly set (characterization / break-glass).
         parser.add_argument("--apply", action="store_true", dest="apply", default=False,
-                            help="Actually apply the qualifying integrations (default: OFF - "
-                                 "scout only writes a report). Prompts for confirmation unless --yes.")
+                            help="Emit integration proposals for qualifying candidates "
+                                 "(default: OFF - scout only writes a report). Target "
+                                 "mutation still requires FlexFactor apply approval unless "
+                                 "--legacy-inline-apply. Prompts unless --yes.")
         parser.add_argument("--report-only", action="store_false", dest="apply",
                             help="Explicit report-only (this is already the default).")
+        parser.add_argument("--legacy-inline-apply", action="store_true",
+                            dest="legacy_inline_apply", default=False,
+                            help="BREAK-GLASS: allow Scout to mutate the target inline "
+                                 "(old behavior). Production contract requires a separate "
+                                 "FlexFactor apply approval file instead.")
         parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
                             help="Skip the interactive confirmation for --apply (for automation).")
         parser.add_argument("--apply-tier", choices=["adopt", "consider"], default="adopt",
