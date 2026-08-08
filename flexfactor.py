@@ -2358,6 +2358,7 @@ def _is_flexfactor_artifact(rel: str) -> bool:
     return (r.endswith("_audit_report.md")
             or r.endswith("_low_findings.md")
             or r.endswith("_repo_rewards_report.md")
+            or "_run_manifest_" in base  # immutable run evidence (Master Prompt 86/90)
             or base == "playwright.flexfactor.config.cjs"
             or r.startswith("__flexfactor_e2e__/")
             or "/__flexfactor_e2e__/" in r)
