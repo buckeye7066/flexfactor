@@ -5460,8 +5460,9 @@ FIX_VERIFY_SYSTEM = (
 # --------------------------------------------------------------------------- #
 # Adversarial fix verification: the SECONDARY (sol) model is told to ASSUME the
 # author's (fable) fix is wrong and hunt for residual defects. Unlike the single,
-# fail-OPEN compliance check above, this path is fail-CLOSED (a transport failure
-# is "unverified", never a clean pass) and drives an iterate-to-clean loop.
+# fail-OPEN compliance check above, this path is fail-CLOSED: a transport failure
+# restores the pre-change tree and rejects the candidate (never keeps UNVERIFIED
+# changes, never a clean pass) and drives an iterate-to-clean loop.
 # --------------------------------------------------------------------------- #
 ADVERSARIAL_VERIFY_SCHEMA = {
     "type": "object",
@@ -5582,8 +5583,9 @@ def _adversarial_verify_fix(reviewer, rel_path: str, original: str, fixed: str,
       - clean=False, [<items>] : substantive 'needs_work' - each item names a
         concrete residual defect or regression; feed these back to the author.
       - clean=False, [] : FAIL CLOSED - the verifier itself was unavailable
-        (transport error persisting past `retries`). NOT clean, but also not the
-        author's fault (caller keeps the fix but marks it UNVERIFIED).
+        (transport error persisting past `retries`). Caller MUST restore the
+        pre-change tree and MUST NOT keep, commit, or score the candidate as a
+        success (Master Prompt 83/88).
 
     Judges the same capped unified diff as `_cross_verify_fix`. BudgetExceededError
     is NOT swallowed here (unlike the fail-open cross-check): it propagates so the
@@ -5989,8 +5991,9 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         # generation attempts and adversarial rounds are counted and bounded
         # INDEPENDENTLY: build-breaking attempts by MAX_FIX_TRIES, substantive
         # verifier needs_work rounds by adversarial_rounds. A build failure never
-        # consumes an adversarial round and vice-versa; a transport-fail/unverified
-        # consumes neither (it is accepted-unverified and terminates). The for-range
+        # consumes an adversarial round and vice-versa; a transport-fail/outage
+        # rolls the candidate back and rejects (fail-closed; never keeps
+        # UNVERIFIED). The for-range
         # is only a generous hard ceiling - the two counters always bind first.
         adv_active = adversarial and cross is not None
         adv_rounds = 0     # substantive adversarial needs_work rounds used
@@ -6119,12 +6122,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     break
                 if not clean:
                     if not residual:
-                        # Transport failure: the verifier itself was unavailable. Do NOT
-                        # punish the author's fix - keep it, but mark it UNVERIFIED so the
-                        # run never reports a blocked verifier AS a clean verdict.
-                        kept_patch, kept_ok = patch, None
-                        outcome = ("fixed", None)
-                        notes.append(f"{rel}: accepted UNVERIFIED ({reason})")
+                        # Transport failure: the verifier itself was unavailable.
+                        # Master Prompt 83/88: restore the exact pre-change tree, reject
+                        # the candidate, and prohibit any UNVERIFIED keep/commit/score.
+                        # A downed reviewer must never leave a success-shaped change.
+                        if _replace_contained(project_dir, rel, original) is None:
+                            dirty_files.append(rel)
+                            outcome = ("skip",
+                                       "contained rollback refused after verifier outage")
+                        else:
+                            outcome = ("reject",
+                                       f"verifier outage fail-closed: {reason}")
+                            notes.append(
+                                f"{rel}: REJECTED fail-closed (verifier unavailable): "
+                                f"{reason}")
                         break
                     # Substantive 'needs_work'. MATERIALITY GATE: only re-iterate when a
                     # residual actually matters (realistic input OR core behavior). If every
@@ -6709,6 +6720,26 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             applied_set |= set(applied_c)
             unverified_set |= set(unver_c)
             fix_notes += notes_c
+            # Master Prompt 83/88: a verifier outage must label the run failed and
+            # must not leave a success-shaped commit of unverified work. Per-file
+            # rollback already restored candidates; abort remaining cycles here.
+            if any("verifier unavailable" in n or "verifier outage fail-closed" in n
+                   for n in notes_c):
+                stop_reason = ("FAILED: adversarial verifier unavailable "
+                               "(fail-closed; pre-change tree restored, no UNVERIFIED keep)")
+                print(f"{pfx}{stop_reason}", file=sys.stderr)
+                # Still attempt a cycle commit ONLY if something verified landed;
+                # typically applied_c is empty after outage rollbacks.
+                if git and applied_c:
+                    status = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                              f"cycle {cycle}", stack)
+                    if "committed" in status:
+                        committed_any = True
+                    print(f"{pfx}git: {status}")
+                errors_total = sum(1 for n in fix_notes
+                                   if "rolled back" in n or "rejected by" in n) + len(set(oversized))
+                report(fixed=len(applied_set), errors=errors_total, cost=round(meter.usd, 4))
+                break
             # Recompute (don't increment) to avoid double-counting across cycles:
             # reverts + cross-model rejects so far, plus distinct oversized skips.
             errors_total = sum(1 for n in fix_notes
@@ -6900,6 +6931,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     if committed_any else "")
             commit_status = (f"DIRTY-ABORT on {branch}: refused rollback left an unverified "
                              f"candidate; branch PRESERVED{held} - inspect + clean up manually")
+        elif stop_reason.startswith("FAILED: adversarial verifier unavailable"):
+            # Master Prompt 83/88: verifier outage — no success claim. If nothing
+            # verified ever committed, drop the empty branch like a no-op run.
+            if created_branch and prev_branch and not committed_any:
+                _git(["checkout", "--force", prev_branch], project_dir)
+                _git(["branch", "-D", branch], project_dir)
+                commit_status = ("FAILED verifier-outage fail-closed: pre-change tree "
+                                 "restored; no success commit")
+            else:
+                commit_status = (f"FAILED verifier-outage fail-closed on {branch}: "
+                                 "candidates rolled back; no UNVERIFIED success commit"
+                                 + (" (earlier verified cycle commits retained)"
+                                    if committed_any else ""))
         elif applied_files or test_files or e2e.get("spec_files"):
             final_ok, _ = _full_gate(project_dir, stack)
             # Only claim 'committed' from a CONFIRMED clean tree. Per-cycle commits
@@ -6952,6 +6996,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         print(f"{pfx}Cost: {meter.summary()}")
         report_path = _write_audit_report(project_dir, audit)
         print(f"{pfx}Full audit report: {report_path}")
+        manifest_path = _write_run_manifest(
+            project_dir, audit,
+            report_only=report_only,
+            max_cost=float(getattr(args, "max_cost", 0) or 0))
+        if manifest_path:
+            print(f"{pfx}Run manifest: {manifest_path}")
+            result["manifest_path"] = manifest_path
         lows_path = _write_low_findings_report(project_dir, display_name, low_findings)
         if lows_path:
             print(f"{pfx}Low-severity list: {lows_path}")
@@ -7163,6 +7214,45 @@ def _print_audit_summary(a: dict) -> None:
     print(f"  cycles run:       {a.get('cycles', 1)}")
     print(f"  providers:        {', '.join(a.get('providers') or []) or '(unknown)'}")
     print(f"  git:              {a['commit_status']}")
+
+
+def _write_run_manifest(project_dir: str, a: dict, *,
+                        report_only: bool, max_cost: float) -> str | None:
+    """Immutable JSON evidence for one audit/apply run (Master Prompt 86/90).
+
+    Written once at end-of-run next to the markdown report. Captures mode,
+    budgets, applied/unverified sets, commit outcome, and stop reason so every
+    modification is auditable against a single manifest. Not rewritten in place:
+    each run uses a distinct timestamped filename."""
+    stamp = _now_iso().replace(":", "").replace("-", "")[:15]
+    name = f"{_slugify(a.get('name') or 'program') or 'program'}_run_manifest_{stamp}.json"
+    payload = {
+        "schema": "flexfactor.run_manifest.v1",
+        "when": _now_iso(),
+        "program": a.get("name"),
+        "project_dir": a.get("dir"),
+        "branch": a.get("branch"),
+        "mode": "report-only" if report_only else "apply",
+        "report_only": bool(report_only),
+        "max_cost_usd": float(max_cost),
+        "usd_spent": a.get("usd"),
+        "providers": list(a.get("providers") or []),
+        "cycles": a.get("cycles"),
+        "files_reviewed": a.get("files_reviewed"),
+        "applied_files": list(a.get("applied_files") or []),
+        "unverified_files": list(a.get("unverified_files") or []),
+        "test_files": list(a.get("test_files") or []),
+        "commit_status": a.get("commit_status"),
+        "stop_reason": a.get("stop_reason"),
+        "converged": a.get("converged"),
+        "baseline_ok": a.get("baseline_ok"),
+        "fix_notes": list(a.get("fix_notes") or [])[:200],
+        "verification_is_real": a.get("verification_is_real"),
+        "verification_note": a.get("verification_note"),
+    }
+    raw = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    written = _write_contained(project_dir, name, raw)
+    return written
 
 
 def _write_audit_report(project_dir: str, a: dict) -> str:
@@ -7550,7 +7640,8 @@ def main(argv=None) -> int:
                                  "ADVERSARIAL fable<->sol loop (default ON): the reviewer assumes "
                                  "the fix is wrong, hunts for residual defects, and the author "
                                  "re-fixes until the reviewer returns a genuinely CLEAN verdict "
-                                 "(fail-CLOSED: a downed verifier marks the fix UNVERIFIED).")
+                                 "(fail-CLOSED: a downed verifier restores the pre-change tree "
+                                 "and rejects the candidate — no UNVERIFIED keep/commit).")
         parser.add_argument("--no-adversarial", action="store_false", dest="adversarial",
                             help="Use the legacy single-shot, fail-OPEN cross-model veto instead "
                                  "of the adversarial iterate-to-clean loop.")
