@@ -7314,9 +7314,19 @@ def _write_run_manifest(project_dir: str, a: dict, *,
     Written once at end-of-run next to the markdown report. Captures mode,
     budgets, applied/unverified sets, commit outcome, and stop reason so every
     modification is auditable against a single manifest. Not rewritten in place:
-    each run uses a distinct timestamped filename."""
-    stamp = _now_iso().replace(":", "").replace("-", "")[:15]
-    name = f"{_slugify(a.get('name') or 'program') or 'program'}_run_manifest_{stamp}.json"
+    each write uses a distinct microsecond-timestamped filename (never overwrite)."""
+    import datetime as _dt
+    # Microseconds avoid same-second collisions when two manifests are written back-to-back
+    # (tests + rare double-call paths). If the path still exists, append a counter.
+    stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    slug = _slugify(a.get("name") or "program") or "program"
+    name = f"{slug}_run_manifest_{stamp}.json"
+    n = 0
+    while _contained_existence(project_dir, name) == "exists":
+        n += 1
+        name = f"{slug}_run_manifest_{stamp}_{n}.json"
+        if n > 99:
+            break
     payload = {
         "schema": "flexfactor.run_manifest.v1",
         "when": _now_iso(),
