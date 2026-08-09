@@ -7,7 +7,8 @@
 **Repo:** buckeye7066/flexfactor (mode, not a separate repo)  
 **Launcher:** `C:\Users\firer\flexfactor\flexfactor_scout_launch.ps1`  
 **Updated:** 2026-08-08  
-**Consumed FlexFactor core:** `main@5ed5f5f` (software merge `4ef4e8b`)
+**Consumed FlexFactor core:** `main@5ed5f5f` (software merge `4ef4e8b`)  
+**Scout wave merged main:** `0d72f75ec508b5a0eedad4e7e6665f9ec2bb07ce` (PR #8)
 
 ## Purpose contract
 
