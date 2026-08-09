@@ -1,0 +1,426 @@
+{
+  "schema": "scout-report-v1",
+  "mode": "scout",
+  "risk_model": {
+    "name": "scout-three-verdict-v1",
+    "verdicts": [
+      "safe_to_inspect",
+      "safe_to_integrate",
+      "safe_to_execute"
+    ],
+    "rules": [
+      "Repo Rewards results are metadata-screened candidates only.",
+      "Never label a candidate safe-to-install or safe-to-run from metadata.",
+      "safe_to_execute is never granted automatically.",
+      "Unknown license / missing safety / injection indicators fail closed.",
+      "Target mutation requires a separate FlexFactor apply approval."
+    ],
+    "false_substitutes": [
+      "safe-to-install labels",
+      "host credential access during candidate eval",
+      "auto-merge into target"
+    ]
+  },
+  "metadata_screened_only": true,
+  "safe_to_install_claims": false,
+  "program": {
+    "name": "opportunities",
+    "summary": "The provided program is a CLI tool for formatting markdown tables. We've identified potential gaps that can be addressed by adopting existing open-source libraries.",
+    "stack": [
+      "markdown-it-tables: A Markdown parser with support for tables, which can improve the program's table formatting capabilities.",
+      "cli-ui: A UI library for command-line interfaces, which can enhance the program's user interface and experience.",
+      "yargs-parser: A parser for yargs CLI options, which can improve the program's parsing and validation of user input.",
+      "inquirer.js: An interactive shell for creating powerful CLI tools, which can add more interactive features to the program.",
+      "commanderjs: A minimalistic command-line framework that makes it easy to write powerful commands, which can simplify the program's command structure.",
+      "fs-extra: A file system utility library that provides additional functionality beyond the built-in fs module, which can improve the program's file handling and manipulation."
+    ],
+    "goals": [
+      "Improve markdown table formatting capabilities",
+      "Enhance user interface and experience",
+      "Improve parsing and validation of user input",
+      "Add more interactive features to the program",
+      "Simplify command structure",
+      "Provide additional file system utility functions"
+    ]
+  },
+  "recommendations": [
+    {
+      "repo": "jpfleury/gedit-markdown",
+      "url": "https://github.com/jpfleury/gedit-markdown",
+      "need": "Improved markdown table formatting capabilities",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "license": "GPL-3.0",
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license GPL-3.0 is copyleft/incompatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-05-19T19:58:39.000Z",
+        "stars": 137,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "benefit": {
+        "score": 60,
+        "how_it_helps": "This repository provides live preview and export tools for Markdown documents, which could improve markdown table formatting capabilities by allowing users to visually inspect and refine their tables before exporting to HTML or PDF. This feature aligns with the program's goal of improving markdown table formatting capabilities.",
+        "integration_note": "The integration may require additional configuration to fit the needs of the opportunities program. However, the potential benefits outweigh the potential challenges.",
+        "risks": [
+          "Potential complexity in integrating live preview and export tools",
+          "Limited support for interactive features"
+        ]
+      },
+      "integration_cost": "low",
+      "rejection_reason": "license GPL-3.0 is copyleft/incompatible; safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "advisories": "unknown",
+      "last_activity": "2025-05-19T19:58:39.000Z",
+      "provenance": "https://github.com/jpfleury/gedit-markdown"
+    },
+    {
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Enhanced user interface and experience",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "license": "UNKNOWN",
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "benefit": {
+        "score": 0,
+        "how_it_helps": "No clear connection to enhancing user interface and experience, description is unavailable or unclear.",
+        "integration_note": "Requires manual review of source code and potential evaluation as a reference only.",
+        "risks": [
+          "Unverified purpose",
+          "Insufficient information"
+        ]
+      },
+      "integration_cost": "low",
+      "rejection_reason": "judged unnecessary",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "advisories": "unknown",
+      "last_activity": "unknown",
+      "provenance": "https://sourceforge.nethttps://sourceforge.net/p/commandline/"
+    }
+  ],
+  "proposals": [
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "jpfleury/gedit-markdown",
+      "url": "https://github.com/jpfleury/gedit-markdown",
+      "need": "Improved markdown table formatting capabilities",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "GPL-3.0",
+      "license_compatible": false,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license GPL-3.0 is copyleft/incompatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-05-19T19:58:39.000Z",
+        "stars": 137,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 60,
+        "how_it_helps": "This repository provides live preview and export tools for Markdown documents, which could improve markdown table formatting capabilities by allowing users to visually inspect and refine their tables before exporting to HTML or PDF. This feature aligns with the program's goal of improving markdown table formatting capabilities.",
+        "integration_note": "The integration may require additional configuration to fit the needs of the opportunities program. However, the potential benefits outweigh the potential challenges.",
+        "risks": [
+          "Potential complexity in integrating live preview and export tools",
+          "Limited support for interactive features"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "license GPL-3.0 is copyleft/incompatible; safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Enhanced user interface and experience",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "UNKNOWN",
+      "license_compatible": null,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 0,
+        "how_it_helps": "No clear connection to enhancing user interface and experience, description is unavailable or unclear.",
+        "integration_note": "Requires manual review of source code and potential evaluation as a reference only.",
+        "risks": [
+          "Unverified purpose",
+          "Insufficient information"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "jpfleury/gedit-markdown",
+      "url": "https://github.com/jpfleury/gedit-markdown",
+      "need": "Improved markdown table formatting capabilities",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "GPL-3.0",
+      "license_compatible": false,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license GPL-3.0 is copyleft/incompatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-05-19T19:58:39.000Z",
+        "stars": 137,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 60,
+        "how_it_helps": "This repository provides live preview and export tools for Markdown documents, which could improve markdown table formatting capabilities by allowing users to visually inspect and refine their tables before exporting to HTML or PDF. This feature aligns with the program's goal of improving markdown table formatting capabilities.",
+        "integration_note": "The integration may require additional configuration to fit the needs of the opportunities program. However, the potential benefits outweigh the potential challenges.",
+        "risks": [
+          "Potential complexity in integrating live preview and export tools",
+          "Limited support for interactive features"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "license GPL-3.0 is copyleft/incompatible; safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Enhanced user interface and experience",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "UNKNOWN",
+      "license_compatible": null,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 0,
+        "how_it_helps": "No clear connection to enhancing user interface and experience, description is unavailable or unclear.",
+        "integration_note": "Requires manual review of source code and potential evaluation as a reference only.",
+        "risks": [
+          "Unverified purpose",
+          "Insufficient information"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    }
+  ],
+  "sandbox": {
+    "candidate_execution": "disposable-temp-dir",
+    "credentials": "stripped",
+    "egress": "proxy-poisoned-best-effort",
+    "teardown": "required"
+  },
+  "apply_contract": {
+    "scout_mutates_target": false,
+    "requires_flexfactor_apply_approval": true,
+    "approval_file": ".flexfactor-apply-approval.json"
+  },
+  "forbidden_label_hits": []
+}

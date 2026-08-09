@@ -6261,6 +6261,58 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(tmp, self.sc.SCOUT_REPORT_JSON)))
 
+    def test_production_rr_fallback_when_local_down(self):
+        """When localhost RR is down, Scout falls back to production URL."""
+        import types
+        seen = {"urls": []}
+        saved = {
+            "up": ff._server_is_up,
+            "start": ff._try_start_repo_rewards,
+            "search": ff.repo_rewards_search,
+            "judge": ff._judge,
+            "prov": ff.make_provider,
+        }
+
+        def fake_up(url, timeout=1.5):
+            seen["urls"].append(url)
+            return str(url).startswith("https://web-production")
+
+        def fake_judge(provider, system, prompt, schema, max_tokens=8000):
+            if schema is ff.PROGRAM_PROFILE_SCHEMA:
+                return {"name": "FixtureApp", "summary": "fixture",
+                        "stack": ["node"], "goals": ["test"],
+                        "opportunities": [{"need": "widgets",
+                                           "search_query": "widget"}]}
+            return {"benefit_score": 10, "verdict": "skip",
+                    "how_it_helps": "", "integration_note": "", "risks": []}
+
+        ff._server_is_up = fake_up
+        ff._try_start_repo_rewards = lambda *a, **k: False
+        ff.repo_rewards_search = lambda url, query, **k: (
+            seen.__setitem__("search_url", url) or [])
+        ff._judge = fake_judge
+        ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
+                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                              "--repo-rewards-url", "http://localhost:3000",
+                              "--no-auto-start"])
+            # No candidates => rc 1 is OK; fallback must have been used.
+            self.assertIn(rc, (0, 1))
+            self.assertTrue(
+                any(str(u).startswith("https://web-production") for u in seen["urls"]),
+                f"expected production probe, saw {seen['urls']}")
+            self.assertTrue(
+                str(seen.get("search_url", "")).startswith("https://web-production"),
+                f"search must use production fallback, got {seen.get('search_url')}")
+        finally:
+            ff._server_is_up = saved["up"]
+            ff._try_start_repo_rewards = saved["start"]
+            ff.repo_rewards_search = saved["search"]
+            ff._judge = saved["judge"]
+            ff.make_provider = saved["prov"]
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

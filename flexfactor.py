@@ -1678,7 +1678,17 @@ import socket
 import urllib.error
 import urllib.request
 
-DEFAULT_REPO_REWARDS_URL = "http://localhost:3000"
+DEFAULT_REPO_REWARDS_URL = os.environ.get(
+    "FLEXFACTOR_REPO_REWARDS_URL", "http://localhost:3000"
+).rstrip("/")
+# Production Railway deployment (Repo Rewards PRODUCTION READY). Used as an
+# automatic fallback when the local default URL is down and auto-start fails,
+# so Scout can still consume a live metadata-screened search backend.
+PRODUCTION_REPO_REWARDS_URL = os.environ.get(
+    "FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL",
+    "https://web-production-d7db7.up.railway.app",
+).rstrip("/")
+LOCAL_REPO_REWARDS_URLS = frozenset({"http://localhost:3000", "http://127.0.0.1:3000"})
 
 # The LLM's characterization of the entered program. `opportunities` is the
 # bridge to Repo Rewards: each one carries a ready-to-run natural-language query.
@@ -1785,7 +1795,7 @@ def _try_start_repo_rewards(wait_seconds: int = 90) -> bool:
         print(f"  could not launch it automatically: {e}")
         return False
     for waited in range(wait_seconds):
-        if _server_is_up(DEFAULT_REPO_REWARDS_URL):
+        if _server_is_up("http://localhost:3000") or _server_is_up(DEFAULT_REPO_REWARDS_URL):
             print("  Repo Rewards is up.\n")
             return True
         if waited and waited % 10 == 0:
@@ -3346,15 +3356,30 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
 
 def run_scout(args) -> int:
     base_url = args.repo_rewards_url.rstrip("/")
+    requested_url = base_url
 
     # 1. Make sure Repo Rewards is reachable (the search backend).
     if not _server_is_up(base_url):
-        started = args.auto_start and base_url == DEFAULT_REPO_REWARDS_URL and _try_start_repo_rewards()
-        if not started:
-            print(f"error: Repo Rewards isn't reachable at {base_url}.", file=sys.stderr)
-            print("Start it first (double-click the 'Repo Rewards' desktop icon), then re-run.",
-                  file=sys.stderr)
-            return 2
+        started = False
+        if args.auto_start and base_url in LOCAL_REPO_REWARDS_URLS:
+            started = _try_start_repo_rewards()
+            if started:
+                base_url = DEFAULT_REPO_REWARDS_URL if _server_is_up(DEFAULT_REPO_REWARDS_URL) else base_url
+        if not _server_is_up(base_url):
+            # Local-first default: fall through to the verified production endpoint
+            # only when the operator did not pin a different explicit URL.
+            if (requested_url in LOCAL_REPO_REWARDS_URLS
+                    and PRODUCTION_REPO_REWARDS_URL
+                    and _server_is_up(PRODUCTION_REPO_REWARDS_URL)):
+                print(f"Repo Rewards not reachable at {requested_url}; "
+                      f"falling back to production {PRODUCTION_REPO_REWARDS_URL}")
+                base_url = PRODUCTION_REPO_REWARDS_URL
+            else:
+                print(f"error: Repo Rewards isn't reachable at {requested_url}.", file=sys.stderr)
+                print("Start it first (double-click the 'Repo Rewards' desktop icon), "
+                      "set FLEXFACTOR_REPO_REWARDS_URL, or pass --repo-rewards-url.",
+                      file=sys.stderr)
+                return 2
 
     model = args.model or DEFAULT_MODELS[args.provider]
     provider = make_provider(args.provider, model,
