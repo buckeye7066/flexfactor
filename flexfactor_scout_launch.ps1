@@ -7,7 +7,12 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
-$productionRr = "https://web-production-d7db7.up.railway.app"
+$productionRr = if (-not [string]::IsNullOrWhiteSpace($env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL)) {
+    $env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL.TrimEnd("/")
+} else {
+    "https://web-production-d7db7.up.railway.app"
+}
+$allowRemote = ($env:FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS -match '^(1|true|yes|on)$')
 
 Write-Host ""
 Write-Host "  ()  ()   FlexFactor Scout" -ForegroundColor Cyan
@@ -48,17 +53,61 @@ if ($provider -eq "anthropic" -and [string]::IsNullOrEmpty($env:ANTHROPIC_API_KE
     Write-Host "ANTHROPIC_API_KEY is not set." -ForegroundColor Red
     Read-Host "Press Enter to close"; exit 1
 }
-
-# Repo Rewards URL: explicit env wins; else prefer local :3000 when up, else production.
-$rrUrl = $env:FLEXFACTOR_REPO_REWARDS_URL
-if ([string]::IsNullOrWhiteSpace($rrUrl)) {
+if ($provider -eq "ollama") {
+    $ollamaOk = $false
     try {
-        $null = Invoke-WebRequest -Uri "http://localhost:3000/api/health" -UseBasicParsing -TimeoutSec 2
+        $tags = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 2
+        $names = @()
+        if ($null -ne $tags.models) {
+            $names = @($tags.models | ForEach-Object { $_.name })
+        }
+        $hasModel = $names | Where-Object {
+            $_ -eq "llama3.2:latest" -or $_ -like "llama3.2:*" -or $_ -eq "llama3.2"
+        }
+        if (-not $hasModel) {
+            Write-Host "Ollama is up but default model llama3.2 is not installed." -ForegroundColor Red
+            Write-Host "Run: ollama pull llama3.2" -ForegroundColor DarkGray
+            Write-Host "Or pass a different provider / install the model you will use." -ForegroundColor DarkGray
+            Read-Host "Press Enter to close"; exit 1
+        }
+        $ollamaOk = $true
+    } catch {
+        Write-Host "Ollama is not reachable at http://127.0.0.1:11434." -ForegroundColor Red
+        Write-Host "Start Ollama, or choose openai/anthropic instead." -ForegroundColor DarkGray
+        Read-Host "Press Enter to close"; exit 1
+    }
+    if (-not $ollamaOk) {
+        Read-Host "Press Enter to close"; exit 1
+    }
+}
+
+function Test-RepoRewardsLocal {
+    # Contract probe: /api/version (not /api/health — not required by RR).
+    try {
+        $null = Invoke-WebRequest -Uri "http://localhost:3000/api/version" -UseBasicParsing -TimeoutSec 2
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Repo Rewards URL: explicit env wins; else local when up; remote only with opt-in.
+$rrUrl = $env:FLEXFACTOR_REPO_REWARDS_URL
+$remoteArgs = @()
+if ([string]::IsNullOrWhiteSpace($rrUrl)) {
+    if (Test-RepoRewardsLocal) {
         $rrUrl = "http://localhost:3000"
         Write-Host "Repo Rewards: local http://localhost:3000" -ForegroundColor DarkGray
-    } catch {
+    } elseif ($allowRemote) {
         $rrUrl = $productionRr
-        Write-Host "Repo Rewards: production $productionRr" -ForegroundColor DarkGray
+        $remoteArgs = @("--allow-remote-repo-rewards")
+        Write-Host "Repo Rewards: opted-in remote $productionRr" -ForegroundColor DarkGray
+    } else {
+        Write-Host "Repo Rewards is not reachable at http://localhost:3000." -ForegroundColor Red
+        Write-Host "Start local Repo Rewards, set FLEXFACTOR_REPO_REWARDS_URL," -ForegroundColor DarkGray
+        Write-Host "or set FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 to opt into" -ForegroundColor DarkGray
+        Write-Host "remote $productionRr (sends search queries off-host)." -ForegroundColor DarkGray
+        Read-Host "Press Enter to close"; exit 1
     }
 }
 
@@ -69,7 +118,7 @@ $pyArgs = @(
     "--provider", $provider,
     "--repo-rewards-url", $rrUrl,
     "--no-auto-start"
-) + $applyArgs
+) + $remoteArgs + $applyArgs
 python @pyArgs
 Write-Host ""
 Read-Host "Done. Press Enter to close"
