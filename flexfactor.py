@@ -4188,11 +4188,14 @@ def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
 # NARROWS (does not fully close) the pathname-TOCTOU window; see PORTFOLIO_AUDIT.md
 # "Residual" for the honest Windows caveat.
 _HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
-# Require dir_fd support for EVERY op the openat-walk uses (open/replace/unlink/mkdir/
-# lstat); if any is missing we fall back to the Windows pathname path rather than risk a
-# NotImplementedError escaping mid-walk.
+# Require dir_fd for the openat walk primitives. Do NOT require os.replace here:
+# on some Linux/Python builds replace is missing from supports_dir_fd even though
+# src_dir_fd/dst_dir_fd work, and requiring it forced a false fail-closed on Linux CI.
+# Do NOT require os.lstat either: CPython <3.13 omits lstat from supports_dir_fd even
+# though os.lstat(..., dir_fd=) works via fstatat (gh-134993). Check os.stat instead.
 _HAS_DIR_FD = all(fn in getattr(os, "supports_dir_fd", set())
-                  for fn in (os.open, os.replace, os.unlink, os.mkdir, os.lstat))
+                  for fn in (os.open, os.unlink, os.mkdir, os.stat))
+_HAS_REPLACE_DIR_FD = os.replace in getattr(os, "supports_dir_fd", set())
 _POSIX_NOFOLLOW = _HAS_O_NOFOLLOW and _HAS_DIR_FD  # full openat component-walk available
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: don't translate CRLF on os.open
 # The pathname-based fallback (realpath + identity re-check) is the DOCUMENTED Windows
@@ -4381,7 +4384,14 @@ def _write_walk_posix(project_dir: str, comps: list[str], data: bytes,
                     written += n
             finally:
                 os.close(tfd)
-            os.replace(tmpname, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+            if _HAS_REPLACE_DIR_FD:
+                os.replace(tmpname, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+            else:
+                # Linux path that keeps the O_NOFOLLOW parent fd: resolve via /proc
+                # so we never re-walk a user-controlled pathname for the rename.
+                parent_path = f"/proc/self/fd/{parent}"
+                os.replace(os.path.join(parent_path, tmpname),
+                           os.path.join(parent_path, leaf))
         except OSError:
             try:
                 os.unlink(tmpname, dir_fd=parent)

@@ -1,0 +1,56 @@
+name: production-readiness
+
+on:
+  push:
+    branches: [main, "cursor/production-ready/**", "production-ready/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-tests:
+    name: windows-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run FlexFactor suite
+        shell: pwsh
+        run: |
+          python flexfactor_tests.py
+          if ($LASTEXITCODE -ne 0) { throw "flexfactor_tests failed" }
+
+  linux-containment:
+    name: linux-containment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Containment capability probe
+        run: |
+          python - <<'PY'
+          import os, flexfactor as ff
+          print("platform", os.name)
+          print("O_NOFOLLOW", ff._HAS_O_NOFOLLOW)
+          print("HAS_DIR_FD", ff._HAS_DIR_FD)
+          print("HAS_REPLACE_DIR_FD", ff._HAS_REPLACE_DIR_FD)
+          print("POSIX_NOFOLLOW", ff._POSIX_NOFOLLOW)
+          print("FALLBACK_OK", ff._CONTAINMENT_FALLBACK_OK)
+          s = getattr(os, "supports_dir_fd", set())
+          for name in ("open", "unlink", "mkdir", "stat", "lstat", "replace", "rename"):
+              fn = getattr(os, name, None)
+              print(f"  {name} in supports_dir_fd:", fn in s if fn else None)
+          PY
+      - name: Run FlexFactor suite (Linux containment evidence)
+        run: |
+          python flexfactor_tests.py
+      - name: Forced verifier-outage regression
+        run: |
+          python -m unittest \
+            flexfactor_tests.AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed \
+            flexfactor_tests.AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit \
+            -v
