@@ -5952,6 +5952,39 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         self.assertIn("scout-three-verdict-v1", banner)
         self.assertIn("metadata_screened_only=True", banner)
 
+    def test_94_scout_artifacts_do_not_poison_dirty_tree_gate(self):
+        """Prior Scout report/proposal files must not block a later apply run
+        (same contract FlexFactor core uses for run manifests)."""
+        import subprocess
+        import tempfile
+        self.assertTrue(ff._is_flexfactor_artifact("_scout_report.json"))
+        self.assertTrue(ff._is_flexfactor_artifact(".flexfactor-scout-proposals.json"))
+        self.assertTrue(ff._is_flexfactor_artifact("FixtureApp_repo_rewards_report.md"))
+        self.assertFalse(ff._is_flexfactor_artifact("src/app.js"))
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init"], cwd=tmp, capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp,
+                           capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=tmp,
+                           capture_output=True, check=True)
+            open(os.path.join(tmp, "keep.txt"), "w", encoding="utf-8").write("k")
+            subprocess.run(["git", "add", "keep.txt"], cwd=tmp, capture_output=True,
+                           check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp,
+                           capture_output=True, check=True)
+            open(os.path.join(tmp, "_scout_report.json"), "w",
+                 encoding="utf-8").write("{}")
+            open(os.path.join(tmp, ".flexfactor-scout-proposals.json"), "w",
+                 encoding="utf-8").write("[]")
+            open(os.path.join(tmp, "fixture_repo_rewards_report.md"), "w",
+                 encoding="utf-8").write("# r")
+            self.assertTrue(ff._git_tree_clean(tmp),
+                            "Scout artifacts alone must leave the tree clean")
+            open(os.path.join(tmp, "real_change.py"), "w",
+                 encoding="utf-8").write("x")
+            self.assertFalse(ff._git_tree_clean(tmp),
+                             "non-artifact changes must still dirty the tree")
+
     def test_95_metadata_never_safe_to_install_and_pin_fields(self):
         sc = self.sc
         evaluation = {
