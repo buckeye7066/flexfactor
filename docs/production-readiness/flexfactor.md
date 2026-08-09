@@ -17,8 +17,8 @@ Trustworthy local auditor/refactorer; verifier outage must fail closed. Scout is
 |------|----------|
 | GitHub | `buckeye7066/flexfactor` private; default `main` |
 | Baseline SHA at relaunch | `04dd785769bb20da3415f524e9b9346ef4e7c458` |
-| Merged main SHA (this wave) | `6db4811fde683c5322158d6009376b3d822fc695` |
-| PRs | [#3](https://github.com/buckeye7066/flexfactor/pull/3) fail-closed MERGED; [#5](https://github.com/buckeye7066/flexfactor/pull/5) run-manifest artifact MERGED |
+| Merged main SHA (this wave) | `4ef4e8b0d1550a88498141b4e211d55c6efb75b3` |
+| PRs | [#3](https://github.com/buckeye7066/flexfactor/pull/3) fail-closed; [#5](https://github.com/buckeye7066/flexfactor/pull/5) artifact gate; [#6](https://github.com/buckeye7066/flexfactor/pull/6) unique manifests — all MERGED |
 | Open PRs after merge | none for FlexFactor core |
 | Shared with Scout | yes — Scout-only surfaces not edited by this agent |
 
@@ -56,6 +56,7 @@ Trustworthy local auditor/refactorer; verifier outage must fail closed. Scout is
 |-----------------|---------------|--------------------|
 | Adversarial verifier transport failure kept the fix as `accepted UNVERIFIED` and allowed it into the applied set | Fail-closed meant “not a clean pass” rather than “restore and reject” | On empty residual (outage), `_replace_contained` restores original bytes, outcome is `reject`, audit aborts with no success commit |
 | New run manifests could poison the dirty-tree gate | `_is_flexfactor_artifact` did not recognize `*_run_manifest_*.json` | Artifact matcher includes `_run_manifest_`; unit test locks it |
+| Same-second manifest writes collided on filename | Stamp used second resolution only | Microsecond stamp + contained existence counter |
 
 ## Residual blockers (not PRODUCTION READY)
 
