@@ -1,0 +1,590 @@
+{
+  "schema": "scout-report-v1",
+  "mode": "scout",
+  "risk_model": {
+    "name": "scout-three-verdict-v1",
+    "verdicts": [
+      "safe_to_inspect",
+      "safe_to_integrate",
+      "safe_to_execute"
+    ],
+    "rules": [
+      "Repo Rewards results are metadata-screened candidates only.",
+      "Never label a candidate safe-to-install or safe-to-run from metadata.",
+      "safe_to_execute is never granted automatically.",
+      "Unknown license / missing safety / injection indicators fail closed.",
+      "Target mutation requires a separate FlexFactor apply approval."
+    ],
+    "false_substitutes": [
+      "safe-to-install labels",
+      "host credential access during candidate eval",
+      "auto-merge into target"
+    ]
+  },
+  "metadata_screened_only": true,
+  "safe_to_install_claims": false,
+  "program": {
+    "name": "Opportunity Analysis",
+    "summary": "Identify gaps in the program where open-source libraries or tools can help improve functionality, security, and efficiency.",
+    "stack": [
+      "Implement a markdown table formatter like `marked` with a CLI interface",
+      "Use a dependency management tool like `npm-workspaces` for package.json file management",
+      "Utilize a file system monitoring library like `fs-watch` to track changes in the program folder",
+      "Leverage a command-line argument parser like `commander` for parsing user input",
+      "Integrate a secrets manager like `dotenv` to secure sensitive data",
+      "Employ a code formatter like `prettier` to maintain consistent coding standards"
+    ],
+    "goals": [
+      "Security: Prevent unauthorized access and data exfiltration by using trusted libraries and tools",
+      "Efficiency: Optimize program performance by leveraging optimized dependencies",
+      "Functionality: Enhance user experience with a robust CLI interface and markdown table formatting capabilities"
+    ]
+  },
+  "recommendations": [
+    {
+      "repo": "kyoto7250/mdpd",
+      "url": "https://github.com/kyoto7250/mdpd",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "license": "MIT",
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-12-01T22:25:38.000Z",
+        "stars": 26,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "benefit": {
+        "score": 80,
+        "how_it_helps": "Improves functionality by providing a markdown table formatter with CLI interface, which is essential for enhancing user experience and supporting suggested uses.",
+        "integration_note": "Minimal integration cost and no significant security or efficiency risks associated with this adoption.",
+        "risks": []
+      },
+      "integration_cost": "low",
+      "rejection_reason": "safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "advisories": "unknown",
+      "last_activity": "2025-12-01T22:25:38.000Z",
+      "provenance": "https://github.com/kyoto7250/mdpd"
+    },
+    {
+      "repo": "susisu/mte-kernel",
+      "url": "https://github.com/susisu/mte-kernel",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "license": "MIT",
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2020-11-28T10:49:13.000Z",
+        "stars": 83,
+        "language": "JavaScript"
+      },
+      "compatibility": "unknown",
+      "benefit": {
+        "score": 50,
+        "how_it_helps": "The repository provides a text-editor-independent JavaScript library for editing and formatting Markdown tables, which can be used to enhance user experience with a robust CLI interface and markdown table formatting capabilities.",
+        "integration_note": "Integrating this repository may require some adjustments to the existing codebase due to differences in implementation details or design choices.",
+        "risks": [
+          "adjustments to the existing codebase",
+          "potential compatibility issues"
+        ]
+      },
+      "integration_cost": "low",
+      "rejection_reason": "judged unnecessary",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "advisories": "unknown",
+      "last_activity": "2020-11-28T10:49:13.000Z",
+      "provenance": "https://github.com/susisu/mte-kernel"
+    },
+    {
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Command-line argument parser for user input",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "license": "UNKNOWN",
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "benefit": {
+        "score": 5,
+        "how_it_helps": "This repository appears to be incomplete and lacks documentation, making it unclear how it could improve the program.",
+        "integration_note": "The absence of a clear README and description suggests that using this repository may not provide tangible benefits for our Opportunity Analysis program.",
+        "risks": [
+          "Lack of documentation and unclear functionality",
+          "Unstable and unmaintained"
+        ]
+      },
+      "integration_cost": "low",
+      "rejection_reason": "judged unnecessary",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "advisories": "unknown",
+      "last_activity": "unknown",
+      "provenance": "https://sourceforge.nethttps://sourceforge.net/p/commandline/"
+    }
+  ],
+  "proposals": [
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "kyoto7250/mdpd",
+      "url": "https://github.com/kyoto7250/mdpd",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "MIT",
+      "license_compatible": true,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-12-01T22:25:38.000Z",
+        "stars": 26,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 80,
+        "how_it_helps": "Improves functionality by providing a markdown table formatter with CLI interface, which is essential for enhancing user experience and supporting suggested uses.",
+        "integration_note": "Minimal integration cost and no significant security or efficiency risks associated with this adoption.",
+        "risks": []
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "susisu/mte-kernel",
+      "url": "https://github.com/susisu/mte-kernel",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "MIT",
+      "license_compatible": true,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2020-11-28T10:49:13.000Z",
+        "stars": 83,
+        "language": "JavaScript"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 50,
+        "how_it_helps": "The repository provides a text-editor-independent JavaScript library for editing and formatting Markdown tables, which can be used to enhance user experience with a robust CLI interface and markdown table formatting capabilities.",
+        "integration_note": "Integrating this repository may require some adjustments to the existing codebase due to differences in implementation details or design choices.",
+        "risks": [
+          "adjustments to the existing codebase",
+          "potential compatibility issues"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Command-line argument parser for user input",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "UNKNOWN",
+      "license_compatible": null,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 5,
+        "how_it_helps": "This repository appears to be incomplete and lacks documentation, making it unclear how it could improve the program.",
+        "integration_note": "The absence of a clear README and description suggests that using this repository may not provide tangible benefits for our Opportunity Analysis program.",
+        "risks": [
+          "Lack of documentation and unclear functionality",
+          "Unstable and unmaintained"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "kyoto7250/mdpd",
+      "url": "https://github.com/kyoto7250/mdpd",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "CONSIDER",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "MIT",
+      "license_compatible": true,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2025-12-01T22:25:38.000Z",
+        "stars": 26,
+        "language": "Python"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 80,
+        "how_it_helps": "Improves functionality by providing a markdown table formatter with CLI interface, which is essential for enhancing user experience and supporting suggested uses.",
+        "integration_note": "Minimal integration cost and no significant security or efficiency risks associated with this adoption.",
+        "risks": []
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "safety verdict 'pass' is not clean; execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default); NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "susisu/mte-kernel",
+      "url": "https://github.com/susisu/mte-kernel",
+      "need": "Implement markdown table formatter with CLI interface",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "MIT",
+      "license_compatible": true,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "2020-11-28T10:49:13.000Z",
+        "stars": 83,
+        "language": "JavaScript"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 50,
+        "how_it_helps": "The repository provides a text-editor-independent JavaScript library for editing and formatting Markdown tables, which can be used to enhance user experience with a robust CLI interface and markdown table formatting capabilities.",
+        "integration_note": "Integrating this repository may require some adjustments to the existing codebase due to differences in implementation details or design choices.",
+        "risks": [
+          "adjustments to the existing codebase",
+          "potential compatibility issues"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    },
+    {
+      "schema": "scout-proposal-v1",
+      "repo": "commandline",
+      "url": "https://sourceforge.nethttps://sourceforge.net/p/commandline/",
+      "need": "Command-line argument parser for user input",
+      "recommendation": "SKIP",
+      "commit_sha": "unpinned",
+      "commit_pin_source": "none",
+      "metadata_screened_only": true,
+      "safe_to_install": false,
+      "license": "UNKNOWN",
+      "license_compatible": null,
+      "security": {
+        "safety_verdict": "pass",
+        "advisories": "unknown",
+        "injection_flags": [],
+        "execution_flags": [],
+        "verdicts": {
+          "safe_to_inspect": "yes",
+          "safe_to_integrate": false,
+          "safe_to_execute": false,
+          "reasons": [
+            "license not verified compatible",
+            "safety verdict 'pass' is not clean",
+            "execution requires explicit --allow-scripts (lifecycle scripts stay blocked by default)",
+            "NOTE: if this candidate is APPROVED for apply and verification is enabled (the default), the build-verify gate runs the project's own build with the generated files applied - that execution is covered by the approval; the approval card states the exact verify state for the run"
+          ]
+        }
+      },
+      "maintenance": {
+        "last_activity": "unknown",
+        "stars": 0,
+        "language": "unknown"
+      },
+      "compatibility": "unknown",
+      "transitive_risk": "unknown-until-sandbox-inspect",
+      "benefit": {
+        "score": 5,
+        "how_it_helps": "This repository appears to be incomplete and lacks documentation, making it unclear how it could improve the program.",
+        "integration_note": "The absence of a clear README and description suggests that using this repository may not provide tangible benefits for our Opportunity Analysis program.",
+        "risks": [
+          "Lack of documentation and unclear functionality",
+          "Unstable and unmaintained"
+        ]
+      },
+      "integration_cost": "low",
+      "dependency_delta": {
+        "packages_requested": [],
+        "deps_before_count": 0,
+        "deps_added_estimate": [],
+        "deps_already_present": [],
+        "deps_after_estimate_count": 0
+      },
+      "conflict_analysis": {
+        "missing_project": false,
+        "overlapping_files": [],
+        "package_count": 0,
+        "conflict_likely": false,
+        "notes": [
+          "no file overlaps detected"
+        ]
+      },
+      "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; hard rollback on any failure; proposal-only until separate FlexFactor apply approval",
+      "rejection_reason": "judged unnecessary",
+      "requires_flexfactor_apply_approval": true,
+      "target_mutation_allowed": false
+    }
+  ],
+  "sandbox": {
+    "candidate_execution": "disposable-temp-dir",
+    "credentials": "stripped",
+    "egress": "proxy-poisoned-best-effort",
+    "teardown": "required"
+  },
+  "apply_contract": {
+    "scout_mutates_target": false,
+    "requires_flexfactor_apply_approval": true,
+    "approval_file": ".flexfactor-apply-approval.json"
+  },
+  "forbidden_label_hits": []
+}
