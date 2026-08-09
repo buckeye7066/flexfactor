@@ -2368,6 +2368,8 @@ def _is_flexfactor_artifact(rel: str) -> bool:
             or r.endswith("_low_findings.md")
             or r.endswith("_repo_rewards_report.md")
             or "_run_manifest_" in base  # immutable run evidence (Master Prompt 86/90)
+            or base == "_scout_report.json"  # Scout structured report (94/99)
+            or base == ".flexfactor-scout-proposals.json"  # Scout proposals (97)
             or base == "playwright.flexfactor.config.cjs"
             or r.startswith("__flexfactor_e2e__/")
             or "/__flexfactor_e2e__/" in r)
@@ -2375,7 +2377,7 @@ def _is_flexfactor_artifact(rel: str) -> bool:
 
 def _git_tree_clean(path: str) -> bool:
     """True if the tree has no changes EXCEPT FlexFactor's own generated artifacts
-    (audit report, e2e specs, playwright config) left by a prior run."""
+    (audit/scout reports, proposals, e2e specs, playwright config) left by a prior run."""
     r = _git(["status", "--porcelain"], path)
     if r.returncode != 0:
         return False
