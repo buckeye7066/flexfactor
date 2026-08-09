@@ -3921,6 +3921,10 @@ class RunManifestTests(unittest.TestCase):
         self.assertNotEqual(path, path2)
         self.assertTrue(os.path.isfile(path))
         self.assertTrue(os.path.isfile(path2))
+        # Manifests must not poison the dirty-tree gate on the next run.
+        base = os.path.basename(path)
+        self.assertTrue(ff._is_flexfactor_artifact(base),
+                        f"run manifest {base!r} must be a FlexFactor artifact")
 
 
 class CmdPolicyTests(unittest.TestCase):
