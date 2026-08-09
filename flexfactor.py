@@ -1681,14 +1681,25 @@ import urllib.request
 DEFAULT_REPO_REWARDS_URL = os.environ.get(
     "FLEXFACTOR_REPO_REWARDS_URL", "http://localhost:3000"
 ).rstrip("/")
-# Production Railway deployment (Repo Rewards PRODUCTION READY). Used as an
-# automatic fallback when the local default URL is down and auto-start fails,
-# so Scout can still consume a live metadata-screened search backend.
+# Production Railway deployment (Repo Rewards). Never used as a silent fallback:
+# remote search transmits program-derived queries off-host and requires an
+# explicit opt-in (--allow-remote-repo-rewards or FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1).
 PRODUCTION_REPO_REWARDS_URL = os.environ.get(
     "FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL",
     "https://web-production-d7db7.up.railway.app",
 ).rstrip("/")
 LOCAL_REPO_REWARDS_URLS = frozenset({"http://localhost:3000", "http://127.0.0.1:3000"})
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def allow_remote_repo_rewards(args=None) -> bool:
+    """Remote RR is a trust-boundary shift; require explicit operator opt-in."""
+    if args is not None and getattr(args, "allow_remote_repo_rewards", False):
+        return True
+    return _env_truthy("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS")
 
 # The LLM's characterization of the entered program. `opportunities` is the
 # bridge to Repo Rewards: each one carries a ready-to-run natural-language query.
@@ -1761,20 +1772,40 @@ BENEFIT_SYSTEM = (
 # --------------------------------------------------------------------------- #
 # Repo Rewards client + server lifecycle.
 # --------------------------------------------------------------------------- #
+def _host_port(base_url: str) -> tuple[str, int]:
+    """Return (host, port) using scheme-correct defaults (https→443, http→80)."""
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    host = parsed.hostname or "localhost"
+    if parsed.port is not None:
+        return host, int(parsed.port)
+    scheme = (parsed.scheme or "http").lower()
+    return host, 443 if scheme == "https" else 80
+
+
 def _server_is_up(base_url: str, timeout: float = 1.5) -> bool:
-    """Cheap TCP probe so we fail fast with guidance instead of a long HTTP hang."""
+    """Reachability via documented Repo Rewards contract (/api/version), then TCP.
+
+    Prefer an HTTP GET to `/api/version` so we do not treat an unrelated listener
+    on the port as "up". Fall back to a scheme-aware TCP probe when HTTP fails
+    for transient reasons (still uses https→443 / http→80 defaults).
+    """
+    url = base_url.rstrip("/") + "/api/version"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= int(getattr(resp, "status", 200)) < 500
+    except urllib.error.HTTPError as e:
+        # Received an HTTP response from the host — treat as reachable.
+        return e.code is not None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
     try:
         host, port = _host_port(base_url)
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
-
-
-def _host_port(base_url: str) -> tuple[str, int]:
-    rest = base_url.split("://", 1)[-1].split("/", 1)[0]
-    host, _, port = rest.partition(":")
-    return host or "localhost", int(port or "80")
 
 
 def _try_start_repo_rewards(wait_seconds: int = 90) -> bool:
@@ -3360,25 +3391,29 @@ def run_scout(args) -> int:
 
     # 1. Make sure Repo Rewards is reachable (the search backend).
     if not _server_is_up(base_url):
-        started = False
         if args.auto_start and base_url in LOCAL_REPO_REWARDS_URLS:
-            started = _try_start_repo_rewards()
-            if started:
-                base_url = DEFAULT_REPO_REWARDS_URL if _server_is_up(DEFAULT_REPO_REWARDS_URL) else base_url
+            # Keep the explicitly requested local URL after auto-start — never
+            # rewrite to DEFAULT_REPO_REWARDS_URL (env may point elsewhere).
+            _try_start_repo_rewards()
         if not _server_is_up(base_url):
-            # Local-first default: fall through to the verified production endpoint
-            # only when the operator did not pin a different explicit URL.
+            # Remote fallback is opt-in only (trust boundary: queries leave the host).
             if (requested_url in LOCAL_REPO_REWARDS_URLS
+                    and allow_remote_repo_rewards(args)
                     and PRODUCTION_REPO_REWARDS_URL
                     and _server_is_up(PRODUCTION_REPO_REWARDS_URL)):
                 print(f"Repo Rewards not reachable at {requested_url}; "
-                      f"falling back to production {PRODUCTION_REPO_REWARDS_URL}")
+                      f"using opted-in remote {PRODUCTION_REPO_REWARDS_URL}")
                 base_url = PRODUCTION_REPO_REWARDS_URL
             else:
                 print(f"error: Repo Rewards isn't reachable at {requested_url}.", file=sys.stderr)
                 print("Start it first (double-click the 'Repo Rewards' desktop icon), "
                       "set FLEXFACTOR_REPO_REWARDS_URL, or pass --repo-rewards-url.",
                       file=sys.stderr)
+                if requested_url in LOCAL_REPO_REWARDS_URLS and not allow_remote_repo_rewards(args):
+                    print("Remote production fallback is OFF by default (privacy). "
+                          "Pass --allow-remote-repo-rewards or set "
+                          "FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 to opt in.",
+                          file=sys.stderr)
                 return 2
 
     model = args.model or DEFAULT_MODELS[args.provider]
@@ -7686,6 +7721,13 @@ def main(argv=None) -> int:
                             help="How many top candidate repos to judge (default: 8).")
         parser.add_argument("--no-auto-start", action="store_false", dest="auto_start",
                             help="Don't try to auto-launch Repo Rewards if it's down.")
+        parser.add_argument("--allow-remote-repo-rewards", action="store_true",
+                            dest="allow_remote_repo_rewards", default=False,
+                            help="Opt in to using FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL "
+                                 "when the local Repo Rewards URL is unreachable. "
+                                 "OFF by default — remote search sends program-derived "
+                                 "queries off-host. Env FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 "
+                                 "also enables this.")
         # SAFE DEFAULT: report-only. --apply emits proposals; target mutation
         # requires a separate FlexFactor apply approval (bridge 97/100), unless
         # --legacy-inline-apply is explicitly set (characterization / break-glass).
