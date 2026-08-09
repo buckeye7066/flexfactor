@@ -2058,6 +2058,10 @@ class ReadIdentityRecheckTests(unittest.TestCase):
 
     def test_identity_mismatch_returns_empty(self):
         import tempfile
+        if ff._POSIX_NOFOLLOW:
+            self.skipTest(
+                "POSIX openat+O_NOFOLLOW leaf open does not use the Windows "
+                "lstat/fstat identity re-check this test exercises")
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
@@ -2097,23 +2101,21 @@ class WriteParentSwapRecheckTests(unittest.TestCase):
             full = os.path.join(tmp, "sub", "f.txt")
             os.makedirs(os.path.dirname(full))
             parent = os.path.dirname(full)
-            parent_key = os.path.normcase(os.path.abspath(parent))
-            real_stat = os.stat
+            real_same = ff._same_id
 
-            def changing_stat(path, *a, **k):
-                # Swap only AFTER the writer has created its exclusive .tmp (post-pre
-                # recheck). Counting os.stat calls is fragile: makedirs(exist_ok=True)
-                # may also stat the parent on some Windows runners.
-                if (os.path.normcase(os.path.abspath(path)) == parent_key
-                        and any(name.endswith(".tmp") for name in os.listdir(parent))):
-                    return real_stat(tmp, *a, **k)  # a DIFFERENT directory
-                return real_stat(path, *a, **k)
+            def swap_when_tmp_present(a, b):
+                # At the post-write recheck a .tmp exists. Force identity mismatch
+                # without relying on Windows (dev,size,mtime) fallback, which can
+                # conflate empty sibling directories on runners.
+                if any(name.endswith(".tmp") for name in os.listdir(parent)):
+                    return False
+                return real_same(a, b)
 
-            ff.os.stat = changing_stat
+            ff._same_id = swap_when_tmp_present
             try:
                 ok = ff._atomic_replace_nofollow(full, "DATA")
             finally:
-                ff.os.stat = real_stat
+                ff._same_id = real_same
             self.assertFalse(ok)  # parent identity changed since validation -> refused
             self.assertFalse(os.path.exists(full))  # nothing written
 
@@ -2121,6 +2123,7 @@ class WriteParentSwapRecheckTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             full = os.path.join(tmp, "sub", "f.txt")
+            os.makedirs(os.path.dirname(full), exist_ok=True)
             self.assertTrue(ff._atomic_replace_nofollow(full, "DATA"))
             with open(full, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "DATA")
@@ -2566,9 +2569,15 @@ class PosixShortWriteTests(unittest.TestCase):
     def test_short_write_does_not_commit(self):
         import tempfile
         real_write = os.write
+        calls = {"n": 0}
 
         def short_write(fd, data):
-            return real_write(fd, data[:1]) if len(data) > 1 else real_write(fd, data)
+            # Partial progress once, then STALL (return 0) -> must fail closed.
+            # Returning only data[:1] forever would still eventually complete the loop.
+            calls["n"] += 1
+            if calls["n"] == 1 and len(data) > 1:
+                return real_write(fd, data[:1])
+            return 0
 
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, "proj")
