@@ -1,0 +1,26 @@
+{
+  "applied_files": [],
+  "baseline_ok": true,
+  "branch": "flexfactor/audit-ff-journey-20260809070239",
+  "commit_status": "nothing-to-commit",
+  "converged": false,
+  "cycles": 1,
+  "files_reviewed": 1,
+  "fix_notes": [],
+  "max_cost_usd": 2.0,
+  "mode": "report-only",
+  "program": "ff-journey-20260809070239",
+  "project_dir": "C:\\Users\\firer\\AppData\\Local\\Temp\\ff-journey-20260809070239",
+  "providers": [
+    "ollama:phi3:latest"
+  ],
+  "report_only": true,
+  "schema": "flexfactor.run_manifest.v1",
+  "stop_reason": "report-only",
+  "test_files": [],
+  "unverified_files": [],
+  "usd_spent": 0.0,
+  "verification_is_real": false,
+  "verification_note": "detected node but no usable build command - changes are UNVERIFIED",
+  "when": "2026-08-09T07:05:13"
+}

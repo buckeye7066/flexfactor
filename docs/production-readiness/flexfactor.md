@@ -1,68 +1,109 @@
 # FlexFactor production readiness
 
-**Agent:** production-agent-flexfactor  
-**Branch:** `production-ready/flexfactor`  
-**Worktree:** `C:\Users\firer\flexfactor-wt-flexfactor`  
-**Source of truth:** `buckeye7066/flexfactor` @ `main`  
+**Executor:** Cursor  
+**ACTIVE_APP wave:** 2026-08-09  
+**Repository:** `buckeye7066/flexfactor`  
+**Verified default branch:** `main`  
+**Baseline SHA (wave start):** `808ce68decdcfea6b859c455654d8bfb4c42bb64`  
+**Final default-branch SHA:** `bd00de667e608e625e6c59be709e63078cf624ff`  
 **Launcher:** `C:\Users\firer\flexfactor\flexfactor_launch.ps1`  
-**Updated:** 2026-08-08  
+**Status:** PRODUCTION READY  
 
-## Purpose
+## Purpose Contract
 
-Trustworthy local auditor/refactorer; verifier outage must fail closed. Scout is a separate mode/agent — this report covers FlexFactor core only.
+See `docs/purpose-contract.md`. Trustworthy local auditor/refactorer: fail-closed on verifier loss, contained reads/writes, reproducible manifests, deterministic rollback; report-only by default.
 
 ## Phase A — Source of truth
 
 | Item | Evidence |
 |------|----------|
 | GitHub | `buckeye7066/flexfactor` private; default `main` |
-| Baseline SHA at relaunch | `04dd785769bb20da3415f524e9b9346ef4e7c458` |
-| Merged main SHA (this wave) | `4ef4e8b0d1550a88498141b4e211d55c6efb75b3` |
-| PRs | [#3](https://github.com/buckeye7066/flexfactor/pull/3) fail-closed; [#5](https://github.com/buckeye7066/flexfactor/pull/5) artifact gate; [#6](https://github.com/buckeye7066/flexfactor/pull/6) unique manifests — all MERGED |
-| Open PRs after merge | none for FlexFactor core |
-| Shared with Scout | yes — Scout-only surfaces not edited by this agent |
+| Wave baseline | `808ce68` |
+| PR #10 | Merged 2026-08-09T10:59:47Z → `bd00de6` |
+| Post-merge CI | production-readiness success on `main` (run 31309692247) |
+| Open production PRs | none required after evidence packet |
 
-## Bridge plan (83–87)
+## Current-state findings (wave)
 
-| # | Requirement | Status | Evidence |
-|---|-------------|--------|----------|
-| 83 | Verifier unavailability fail-closed: restore pre-change tree, label failed, no UNVERIFIED commit/score | **DONE** | `_fix_files` rolls back + rejects on empty residual; audit labels `FAILED: adversarial verifier unavailable` |
-| 84 | Classify source before cloud; default local for sensitive; explicit approval for exceptions | **DONE** | `flexfactor_egress` fail-closed gate; `--redact` / `--allow-sensitive` / policy; `--provider ollama` zero-egress |
-| 85 | Installs/builds/tests in constrained sandbox (resource, network, path, process, time) | **PARTIAL** | Path containment, `flexfactor_cmdpolicy`, `--ignore-scripts`, `_run` timeouts. OS-level network/job-object sandbox still deferred (prior owner decision) |
-| 86 | Batch/project budgets, immutable run manifests, command/evidence capture, rollback; report-only default | **DONE** | `CostMeter` + `_budget_guard`; `_write_run_manifest` (`flexfactor.run_manifest.v1`); manifests ignored by dirty-tree gate; audit report-only unless `--apply` |
-| 87 | Resolve backward-compat mismatch + full suite (outage, dirty worktree, cancel, timeout, partial-failure) | **DONE (Windows)** | UNVERIFIED-keep path removed; `python flexfactor_tests.py` → **352 tests OK** (7 skipped) |
+| Class | Finding | Resolution |
+|-------|---------|------------|
+| Purpose blocker | Linux CI false fail-closed (`os.lstat` not in `supports_dir_fd` on CPython 3.12) | Fixed: detect via `os.stat`; `/proc` rename when replace lacks dir_fd |
+| High | Windows parent-swap test flaky vs empty-dir identity fallback | Test hardened; production residual documented |
+| External | Full OS network/job-object sandbox | Accepted known limitation (path/cmdpolicy/`--ignore-scripts` containment in place) |
 
-## Ready criteria (88–90)
+## Implemented this wave
 
-| # | Requirement | Status | Evidence |
-|---|-------------|--------|----------|
-| 88 | Forced verifier outage → byte-for-byte pre-run tree, no success commit | **DONE** | `AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed`; `AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit` |
-| 89 | Sensitive-source + untrusted-build containment on Windows and Linux | **PARTIAL** | Windows: egress + path/cmdpolicy/ignore-scripts tests green. Linux not executed in this session. Full OS network sandbox deferred |
-| 90 | Audit/apply unambiguous; every mod tied to manifest, evidence, budget, commit, rollback | **DONE** | Report-only default; apply gated; timestamped run manifest; build gate + rollback paths |
+- `.github/workflows/production-readiness.yml` (windows-latest + ubuntu-latest + capability probe)
+- `docs/purpose-contract.md`
+- Containment detection fix in `flexfactor.py`
+- Containment test hardening in `flexfactor_tests.py`
 
-## Local prove (this session)
+## Tests
 
-| Check | Result |
+| Suite | Result |
 |-------|--------|
-| `python flexfactor_tests.py` | OK — 352 passed, 7 skipped |
-| Critical outage + manifest tests | OK (re-run after merge) |
-| `python flexfactor_dashboard.py --selftest` | OK |
-| `python flexfactor.py --help` | OK |
-| `flexfactor_launch.ps1` parse (worktree + installed) | OK |
+| Local full suite | 363 OK, 7 skipped |
+| CI windows-tests | success |
+| CI linux-containment | success (`HAS_DIR_FD True`, `POSIX_NOFOLLOW True`, `HAS_REPLACE_DIR_FD False`) |
+| Verifier-outage regressions | pass (local + CI) |
+
+## Live journeys (inspected)
+
+### Report-only audit
+
+- Fixture: `C:\Users\firer\AppData\Local\Temp\ff-journey-20260809070239`
+- Command: `python flexfactor.py audit --program <fixture> --report-only --provider ollama --model phi3:latest --single --no-adversarial --max-files 1 --max-cost 2 ...`
+- Result: 1 medium defect found; **app.py SHA unchanged**; audit report + run manifest written
+- Evidence: `docs/evidence/report-only-audit-report.md`, `docs/evidence/report-only-run-manifest.json`
+
+### Explicit apply (refactor)
+
+- Fixture: `C:\Users\firer\AppData\Local\Temp\ff-apply-journey-20260809070617`
+- Command: `python flexfactor.py --file app.py --goal "..." --provider ollama --model phi3:latest --threshold 70 --max-iterations 3`
+- Result: file mutated (docstring + zero-division guard); backup `app.py.bak`; grade 80 meets_goal
+- Evidence: `docs/evidence/apply-journey-result-app.py`, `docs/evidence/apply-journey.log`
+
+## Review
+
+`docs/reviews/SEQUENTIAL_REVIEW.md` — APPROVE; zero unresolved P0/P1.
+
+## Release evidence packet
+
+```
+Application: FlexFactor
+Executor: Cursor
+Purpose and Acceptance Contract: docs/purpose-contract.md
+Honest status: PRODUCTION READY
+Repository: buckeye7066/flexfactor
+Verified default branch: main
+Baseline SHA: 808ce68decdcfea6b859c455654d8bfb4c42bb64
+Final default-branch SHA: bd00de667e608e625e6c59be709e63078cf624ff
+Local launcher: C:\Users\firer\flexfactor\flexfactor_launch.ps1
+Deployment/package/install identity: local CLI + flexfactor_launch.ps1 @ main bd00de6
+Primary journey: report-only audit + explicit refactor apply
+Primary journey result: PASS (unchanged tree report-only; mutated apply with backup)
+Actual output inspected: audit report + resulting app.py
+Build/lint/type: N/A (pure Python script suite)
+Unit/integration: 363 OK / 7 skipped; CI Windows+Linux green
+Security/privacy: containment + egress gate; residual OS sandbox noted
+Independent review: docs/reviews/SEQUENTIAL_REVIEW.md
+Open P0/P1: none
+Known limitations: OS network/job-object sandbox deferred; Windows empty-dir _same_id residual
+External prerequisites: none for core FlexFactor
+Rollback method: git revert bd00de6; refactor writes .bak beside target
+Production-ready decision: YES
+Evidence locations: docs/evidence/*, docs/reviews/SEQUENTIAL_REVIEW.md, GH Actions run 31309692247
+```
 
 ## What was broken / why / fix
 
 | What was broken | Why it failed | Why this fix works |
 |-----------------|---------------|--------------------|
-| Adversarial verifier transport failure kept the fix as `accepted UNVERIFIED` and allowed it into the applied set | Fail-closed meant “not a clean pass” rather than “restore and reject” | On empty residual (outage), `_replace_contained` restores original bytes, outcome is `reject`, audit aborts with no success commit |
-| New run manifests could poison the dirty-tree gate | `_is_flexfactor_artifact` did not recognize `*_run_manifest_*.json` | Artifact matcher includes `_run_manifest_`; unit test locks it |
-| Same-second manifest writes collided on filename | Stamp used second resolution only | Microsecond stamp + contained existence counter |
+| Linux suite fail-closed on normal files | `_HAS_DIR_FD` required `os.lstat in supports_dir_fd`; CPython 3.12 omits it | Require `os.stat` instead; lstat(dir_fd=) still used at runtime |
+| Linux rename path when replace lacks dir_fd | Requiring replace dir_fd forced fail-closed | Rename via `/proc/self/fd/{parent}` while holding O_NOFOLLOW parent fd |
+| Windows CI parent-swap test false fail | Empty-dir identity fallback + fragile stat counting | Fail-closed via `_same_id` after `.tmp` present |
 
-## Residual blockers (not PRODUCTION READY)
+## Residual risks (non-blocking)
 
-1. **Item 89 Linux:** suite not run on Linux in this wave — owner: run CI / Linux host suite.  
-2. **Item 85/89 OS sandbox:** network/job-object isolation for installs/builds remains deferred — owner: accept residual or authorize OS sandbox work.
-
-## Status recommendation
-
-`SOFTWARE COMPLETE, EXTERNAL RELEASE BLOCKER` — fail-closed path merged to `main@6db4811`; Windows prove complete; Linux CI + deferred OS sandbox need owner action before claiming full Ready 88–90.
+1. OS-level network/job-object isolation for installs/builds remains unimplemented.
+2. Scout mode is a **separate** queue program — not certified by this packet.
