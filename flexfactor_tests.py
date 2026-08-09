@@ -2091,20 +2091,22 @@ class WriteParentSwapRecheckTests(unittest.TestCase):
 
     def test_parent_identity_change_fails_closed(self):
         import tempfile
-        if ff._HAS_DIR_FD and os.replace in os.supports_dir_fd:
+        if ff._POSIX_NOFOLLOW:
             self.skipTest("POSIX dir_fd path uses a handle, not the stat re-check")
         with tempfile.TemporaryDirectory() as tmp:
             full = os.path.join(tmp, "sub", "f.txt")
             os.makedirs(os.path.dirname(full))
             parent = os.path.dirname(full)
+            parent_key = os.path.normcase(os.path.abspath(parent))
             real_stat = os.stat
-            seen = {"n": 0}
 
             def changing_stat(path, *a, **k):
-                if os.path.abspath(path) == os.path.abspath(parent):
-                    seen["n"] += 1
-                    if seen["n"] >= 2:  # post-write stat differs -> simulate a swap
-                        return real_stat(tmp, *a, **k)  # a DIFFERENT directory
+                # Swap only AFTER the writer has created its exclusive .tmp (post-pre
+                # recheck). Counting os.stat calls is fragile: makedirs(exist_ok=True)
+                # may also stat the parent on some Windows runners.
+                if (os.path.normcase(os.path.abspath(path)) == parent_key
+                        and any(name.endswith(".tmp") for name in os.listdir(parent))):
+                    return real_stat(tmp, *a, **k)  # a DIFFERENT directory
                 return real_stat(path, *a, **k)
 
             ff.os.stat = changing_stat

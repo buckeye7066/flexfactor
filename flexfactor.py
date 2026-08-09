@@ -4191,8 +4191,10 @@ _HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
 # Require dir_fd for the openat walk primitives. Do NOT require os.replace here:
 # on some Linux/Python builds replace is missing from supports_dir_fd even though
 # src_dir_fd/dst_dir_fd work, and requiring it forced a false fail-closed on Linux CI.
+# Do NOT require os.lstat either: CPython <3.13 omits lstat from supports_dir_fd even
+# though os.lstat(..., dir_fd=) works via fstatat (gh-134993). Check os.stat instead.
 _HAS_DIR_FD = all(fn in getattr(os, "supports_dir_fd", set())
-                  for fn in (os.open, os.unlink, os.mkdir, os.lstat))
+                  for fn in (os.open, os.unlink, os.mkdir, os.stat))
 _HAS_REPLACE_DIR_FD = os.replace in getattr(os, "supports_dir_fd", set())
 _POSIX_NOFOLLOW = _HAS_O_NOFOLLOW and _HAS_DIR_FD  # full openat component-walk available
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: don't translate CRLF on os.open

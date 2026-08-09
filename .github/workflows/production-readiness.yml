@@ -30,6 +30,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Containment capability probe
+        run: |
+          python - <<'PY'
+          import os, flexfactor as ff
+          print("platform", os.name)
+          print("O_NOFOLLOW", ff._HAS_O_NOFOLLOW)
+          print("HAS_DIR_FD", ff._HAS_DIR_FD)
+          print("HAS_REPLACE_DIR_FD", ff._HAS_REPLACE_DIR_FD)
+          print("POSIX_NOFOLLOW", ff._POSIX_NOFOLLOW)
+          print("FALLBACK_OK", ff._CONTAINMENT_FALLBACK_OK)
+          s = getattr(os, "supports_dir_fd", set())
+          for name in ("open", "unlink", "mkdir", "stat", "lstat", "replace", "rename"):
+              fn = getattr(os, name, None)
+              print(f"  {name} in supports_dir_fd:", fn in s if fn else None)
+          PY
       - name: Run FlexFactor suite (Linux containment evidence)
         run: |
           python flexfactor_tests.py
