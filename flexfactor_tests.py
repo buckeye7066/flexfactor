@@ -3632,7 +3632,8 @@ class AdversarialFixLoopTests(unittest.TestCase):
     @staticmethod
     def _material(title="core bug", problem="realistic input breaks it"):
         return {"severity": "high", "line": 1, "title": title, "problem": problem,
-                "realistic_input": True, "affects_core": True}
+                "realistic_input": True, "affects_core": True,
+                "repro": "calling f(2) returns 5 instead of 4"}
 
     @staticmethod
     def _minor(title="exotic edge", problem="only a crafted payload hits it"):
@@ -6741,6 +6742,161 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         # Without opt-in the same truncated text must still fail loudly.
         with self.assertRaises(RuntimeError):
             prov.structured("sys", "prompt", {})
+
+
+class ResidualMaterialityBarTests(unittest.TestCase):
+    """2026-08-10 regression: the cheap cross-model judge rejected 100% of correct
+    fixes with style-preference 'residuals' ('returns None is not ideal', NaN
+    wishes) that named no failing case. The bar now: material requires a CONCRETE
+    repro (exact failing input + wrong result) in addition to realistic/core."""
+
+    def test_style_preference_without_repro_not_material(self):
+        # The live dirtydemo rejection, verbatim shape.
+        r = {"severity": "high", "line": 2, "title": "Division by zero still handled inadequately",
+             "problem": "returns None, which is not an ideal way to handle errors",
+             "realistic_input": True, "affects_core": True, "repro": ""}
+        self.assertFalse(ff._residual_is_material(r))
+
+    def test_placeholder_repro_not_material(self):
+        for placeholder in ("n/a", "None", "unknown", "hypothetical", "   "):
+            r = {"realistic_input": True, "affects_core": True, "repro": placeholder}
+            self.assertFalse(ff._residual_is_material(r), placeholder)
+
+    def test_concrete_repro_material(self):
+        r = {"realistic_input": True, "affects_core": False,
+             "repro": "divide(1, 0) prints a Python traceback instead of an error message"}
+        self.assertTrue(ff._residual_is_material(r))
+
+    def test_exotic_and_peripheral_never_material_even_with_repro(self):
+        r = {"realistic_input": False, "affects_core": False,
+             "repro": "crafted 2GB unicode payload crashes the pretty-printer"}
+        self.assertFalse(ff._residual_is_material(r))
+
+    def test_legacy_residual_missing_all_keys_stays_material(self):
+        # Fail-safe unchanged: a malformed/legacy residual with NO classification
+        # keys must iterate, never silently drop.
+        self.assertTrue(ff._residual_is_material({"title": "x", "problem": "y"}))
+
+    def test_suggestions_flow_through_as_non_blocking(self):
+        class _Rev:
+            judge_model = "cheap"
+
+            def structured(self, *a, **k):
+                return {"verdict": "needs_work", "residual": [], "regressions": [],
+                        "suggestions": ["consider raising instead of returning None"]}
+
+        ok, findings, reason = ff._adversarial_verify_fix(
+            _Rev(), "a.py", "x=1\n", "x=2\n", [{"severity": "high", "line": 1,
+                                                "title": "t", "problem": "p"}])
+        self.assertFalse(ok)  # needs_work verdict still reported to the loop...
+        # ...but every finding it produced is NON-material, so the materiality
+        # gate accepts + documents instead of burning a round.
+        self.assertTrue(findings)
+        self.assertFalse(any(ff._residual_is_material(f) for f in findings))
+
+    def test_clean_with_suggestions_still_clean(self):
+        class _Rev:
+            judge_model = "cheap"
+
+            def structured(self, *a, **k):
+                return {"verdict": "clean", "residual": [], "regressions": [],
+                        "suggestions": ["could add type hints"]}
+
+        ok, findings, reason = ff._adversarial_verify_fix(
+            _Rev(), "a.py", "x=1\n", "x=2\n", [{"severity": "high", "line": 1,
+                                                "title": "t", "problem": "p"}])
+        self.assertTrue(ok)
+        self.assertEqual(findings, [])
+        self.assertIn("suggestions documented", reason)
+
+    def test_regression_always_material(self):
+        class _Rev:
+            judge_model = "cheap"
+
+            def structured(self, *a, **k):
+                return {"verdict": "needs_work", "residual": [],
+                        "regressions": ["import removed, module now crashes on load"]}
+
+        ok, findings, reason = ff._adversarial_verify_fix(
+            _Rev(), "a.py", "x=1\n", "x=2\n", [{"severity": "high", "line": 1,
+                                                "title": "t", "problem": "p"}])
+        self.assertFalse(ok)
+        self.assertTrue(any(ff._residual_is_material(f) for f in findings))
+
+
+class ProdreadyShipDefaultsTests(unittest.TestCase):
+    """Owner directive 2026-08-10: prodready's job is not done until verified work
+    is back on the main branch. push+merge default ON in prodready (gated on
+    remote-present and green-final-build respectively); audit keeps them OFF."""
+
+    def _parse(self, mode, extra=()):
+        import types
+        argv = [mode, "--program", "X", *extra]
+        real_run_audit = ff.run_audit
+        captured = {}
+
+        def fake_run_audit(args):
+            captured["args"] = args
+            return 0
+
+        ff.run_audit = fake_run_audit
+        try:
+            ff.main(argv)
+        finally:
+            ff.run_audit = real_run_audit
+        return captured["args"]
+
+    def test_prodready_defaults_push_and_merge_on(self):
+        args = self._parse("prodready")
+        self.assertTrue(args.push)
+        self.assertTrue(args.merge)
+
+    def test_prodready_no_push_no_merge_win(self):
+        args = self._parse("prodready", ["--no-push", "--no-merge"])
+        self.assertFalse(args.push)
+        self.assertFalse(args.merge)
+
+    def test_audit_keeps_push_and_merge_off(self):
+        args = self._parse("audit")
+        self.assertFalse(args.push)
+        self.assertFalse(args.merge)
+
+    def test_merge_falls_back_to_pr_automerge_on_protected_main(self):
+        # Direct push of the merged base is rejected -> local merge undone
+        # (reset --hard to the pre-merge sha) -> gh PR with auto-merge.
+        import types
+        git_calls = []
+
+        def fake_git(cmd, cwd):
+            git_calls.append(cmd)
+            if cmd[:2] == ["push", "origin"] and "--force-with-lease" not in cmd:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="protected branch hook declined")
+            if cmd[:3] == ["diff", "--cached", "--quiet"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            out = "deadbeef123" if cmd[0] == "rev-parse" else ""
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+        pr_calls = []
+        orig = (ff._git, ff._git_has_remote, ff._full_gate, ff._gh_pr_automerge,
+                ff._git_current_branch)
+        ff._git = fake_git
+        ff._git_has_remote = lambda pd: True
+        ff._full_gate = lambda pd, st: (True, "")
+        ff._gh_pr_automerge = lambda pd, br, base: (pr_calls.append((br, base))
+                                                   or "PR opened with auto-merge")
+        ff._git_current_branch = lambda pd: "flexfactor/prodready-x"
+        args = types.SimpleNamespace(push=True, merge=True)
+        try:
+            status = ff._commit_and_sync("d", "flexfactor/prodready-x", "main",
+                                         args, "cycle 1", {})
+        finally:
+            (ff._git, ff._git_has_remote, ff._full_gate, ff._gh_pr_automerge,
+             ff._git_current_branch) = orig
+        self.assertIn(["reset", "--hard", "deadbeef123"], git_calls)
+        self.assertEqual(pr_calls, [("flexfactor/prodready-x", "main")])
+        self.assertIn("PR opened with auto-merge", status)
+        self.assertIn("local merge undone", status)
 
 
 class DirtyTreeSnapshotTests(unittest.TestCase):
