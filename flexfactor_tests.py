@@ -6685,8 +6685,27 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         self.assertIsNone(ff._salvage_truncated_json("no json here at all"))
         self.assertIsNone(ff._salvage_truncated_json(""))
         self.assertIsNone(ff._salvage_truncated_json(None))
-        # Balanced but invalid = a different failure, not truncation.
+        # Balanced but invalid with NO salvageable complete element.
         self.assertIsNone(ff._salvage_truncated_json('{"a": undefined_token}'))
+
+    def test_malformed_tail_mismatched_closer_salvages_prefix(self):
+        # Live AnyaChat.jsx skip (len=888, natural ending): the model closed the
+        # object without closing the findings array. The complete first finding
+        # must be rescued, not discarded.
+        bad = '{"findings":[{"line":1240,"severity":"medium","title":"t"},"summary":"junk"}'
+        data = ff._salvage_truncated_json(bad)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(len(data["findings"]), 1)
+        self.assertEqual(data["findings"][0]["line"], 1240)
+
+    def test_balanced_but_invalid_last_element_salvages_prefix(self):
+        # Balanced overall, but the LAST element contains an invalid token: trim
+        # to the last complete element instead of failing the whole review.
+        bad = '{"findings":[{"line":1,"title":"good"},{"line":2,"title": bad}]}'
+        data = ff._salvage_truncated_json(bad)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(len(data["findings"]), 1)
+        self.assertEqual(data["findings"][0]["title"], "good")
 
     def test_judge_opts_into_salvage(self):
         import types

@@ -1236,14 +1236,18 @@ def _salvage_truncated_json(text: str):
             closers.append("}" if ch == "{" else "]")
         elif ch in "}]":
             if not closers or ch != closers[-1]:
-                return None  # malformed, not merely truncated
+                break  # malformed from here on - try the candidates collected so far
             closers.pop()
-            if not closers:
-                return None  # fully balanced: not truncation, plain parse failed
             # A complete object/array ELEMENT just closed - a safe cut point.
             # (Only container closes qualify: cutting mid-string/number would
-            # salvage a fragment element with most of its keys missing.)
+            # salvage a fragment element with most of its keys missing.) When the
+            # TOP-LEVEL container closes the suffix is empty; that full-value
+            # candidate usually re-fails (it is why we are here), but earlier
+            # candidates still rescue a valid prefix from a malformed tail
+            # (e.g. a bad escape or stray key in the LAST element).
             candidates.append((i + 1, "".join(reversed(closers))))
+            if not closers:
+                break  # top-level closed: anything after is trailing junk
     for idx, suffix in reversed(candidates):
         frag = s[start:idx].rstrip().rstrip(",")
         try:
