@@ -2,19 +2,18 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# ---- Route through the local FCC proxy (Free Claude Code) instead of the ----
-# ---- real Anthropic/OpenAI APIs. The proxy on 127.0.0.1:8082 exposes only  ----
-# ---- the Anthropic Messages API and takes Bearer token 'freecc'. It maps   ----
-# ---- any Claude model id by tier (opus/sonnet/haiku) to a free upstream,   ----
-# ---- so FlexFactor's claude-* ids route fine. The OpenAI provider is left  ----
-# ---- unusable here because the proxy has no OpenAI inbound endpoint.       ----
-# To revert: copy flexfactor_launch.ps1.bak-preproxy over this file and your
-# real ANTHROPIC_API_KEY / OPENAI_API_KEY will be used again.
+# ---- Route the ANTHROPIC provider through the local FCC proxy (Free Claude ----
+# ---- Code). The proxy on 127.0.0.1:8082 exposes the Anthropic Messages API ----
+# ---- with Bearer token 'freecc' and maps any Claude model id by tier to a  ----
+# ---- free upstream, so FlexFactor's claude-* ids route fine.               ----
+# ---- The OPENAI key is deliberately LEFT ALONE: the OpenAI SDK talks to    ----
+# ---- api.openai.com directly, so a real OPENAI_API_KEY in the environment  ----
+# ---- gives audit/prodready their dual-model cross-check (billable spend).  ----
+# To run Anthropic on the real API too: copy flexfactor_launch.ps1.bak-preproxy
+# over this file and your real ANTHROPIC_API_KEY will be used again.
 $env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"
 $env:ANTHROPIC_AUTH_TOKEN = "freecc"      # Bearer auth the proxy expects
 $env:ANTHROPIC_API_KEY   = ""             # blank any real key so the SDK uses the Bearer token
-$env:OPENAI_API_KEY      = ""             # proxy is Anthropic-only -> single Anthropic provider
-$env:OPENAI_BASE_URL     = ""
 $proxyUp = $false
 $tcp = New-Object System.Net.Sockets.TcpClient
 try { $tcp.Connect("127.0.0.1", 8082); $proxyUp = $true } catch { $proxyUp = $false } finally { $tcp.Close() }
@@ -25,7 +24,12 @@ if (-not $proxyUp) {
     Write-Host "  to use the real Anthropic/OpenAI API keys again." -ForegroundColor Yellow
     Read-Host "Press Enter to close"; exit 1
 }
-Write-Host "  Routing through local FCC proxy at 127.0.0.1:8082 (Bearer freecc)." -ForegroundColor Green
+Write-Host "  Anthropic: routing through local FCC proxy at 127.0.0.1:8082 (Bearer freecc)." -ForegroundColor Green
+if (-not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
+    Write-Host "  OpenAI: real OPENAI_API_KEY detected - available as cross-check/second provider (billable)." -ForegroundColor Green
+} else {
+    Write-Host "  OpenAI: no OPENAI_API_KEY in this environment - single-provider run." -ForegroundColor DarkGray
+}
 
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
 
