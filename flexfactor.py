@@ -5326,22 +5326,53 @@ def _gap_to_finding(g: dict) -> dict:
     }
 
 
+PURPOSE_GAP_SOURCE_CAP = 48000       # total chars of source shown to the assessor
+PURPOSE_GAP_PER_FILE_CAP = 8000      # chars per file (head of file carries intent)
+
+
 def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
-                       findings: list[dict]) -> dict | None:
+                       findings: list[dict], project_dir: str | None = None) -> dict | None:
     """One cheap-tier call per program: infer the program's purpose from its own
     metadata and measure the gap to what the code delivers. Returns the normalized
     {purpose, fulfillment_pct, gaps} dict, or None when the response is unusable
-    (never raises for a malformed answer - the audit proceeds without it)."""
+    (never raises for a malformed answer - the audit proceeds without it).
+
+    When `project_dir` is given, actual source excerpts (contained reads, capped)
+    ride along - a file-name list alone makes every gap unverifiable ('source not
+    provided'), which a competent model correctly refuses to score as code_fixable."""
     sev = _severity_breakdown(findings)
     digest = ", ".join(f"{v} {k}" for k, v in sorted(sev.items())) or "none"
     tree = "\n".join(files[:400])
+    src_block = ""
+    if project_dir:
+        parts: list[str] = []
+        used = 0
+        shown = 0
+        for rel in files:
+            got = _read_text_and_sha(project_dir, rel)
+            if got is None:
+                continue
+            piece = got[0][:PURPOSE_GAP_PER_FILE_CAP]
+            block = f"--- {rel} ---\n{piece}"
+            if used + len(block) > PURPOSE_GAP_SOURCE_CAP:
+                break
+            parts.append(block)
+            used += len(block)
+            shown += 1
+        if parts:
+            note = (f" ({shown} of {len(files)} file(s) shown; the rest omitted "
+                    "for size - judge only what you can see and say so when "
+                    "something material is not shown)")
+            src_block = ("SOURCE CODE" + note + ":\n"
+                         + _fence_untrusted("source-files", "\n\n".join(parts)) + "\n\n")
     prompt = ("Infer this program's purpose and measure the gap between that "
               "purpose and what the code currently delivers.\n\n"
               "PROGRAM METADATA:\n"
               + _fence_untrusted("program-context", purpose_blob[:12000]) + "\n\n"
               "SOURCE FILES (repo-relative):\n"
               + _fence_untrusted("file-list", tree) + "\n\n"
-              f"AUDIT DEFECT COUNTS THIS RUN: {digest}\n\n"
+              + src_block
+              + f"AUDIT DEFECT COUNTS THIS RUN: {digest}\n\n"
               "Return the JSON object described in the system prompt.")
     data = _judge(provider, PURPOSE_GAP_SYSTEM, prompt, PURPOSE_GAP_SCHEMA,
                   max_tokens=8000)
@@ -7162,7 +7193,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Assessing purpose gap (metadata vs delivered behavior)...")
             try:
                 purpose_gap = assess_purpose_gap(
-                    reviewers[0], purpose_blob, all_files, all_findings)
+                    reviewers[0], purpose_blob, all_files, all_findings,
+                    project_dir=project_dir)
             except BudgetExceededError:
                 print(f"{pfx}purpose-gap skipped: cost cap reached")
             except Exception as ex:
