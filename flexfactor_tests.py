@@ -6670,6 +6670,17 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         data = ff._salvage_truncated_json('{"findings":[{"line":35,"sev')
         self.assertIsNone(data, "a cut mid-element with no complete element must not salvage")
 
+    def test_fence_inside_string_not_stripped(self):
+        # Findings routinely QUOTE ``` in problem strings; a fence matched
+        # mid-text must not garble the salvage input (only a LEADING fence is
+        # stripped).
+        truncated = ('{"findings":[{"line":1,"title":"a","problem":"use ```js fences"},'
+                     '{"line":2,"ti')
+        data = ff._salvage_truncated_json(truncated)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(len(data["findings"]), 1)
+        self.assertEqual(data["findings"][0]["problem"], "use ```js fences")
+
     def test_garbage_and_balanced_invalid_return_none(self):
         self.assertIsNone(ff._salvage_truncated_json("no json here at all"))
         self.assertIsNone(ff._salvage_truncated_json(""))

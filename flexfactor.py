@@ -792,7 +792,11 @@ class AnthropicProvider:
                 print("  [salvage] structured output was truncated mid-stream; "
                       "recovered the complete leading elements (partial tail dropped)")
         if data is None:
-            raise RuntimeError(f"Structured output was not JSON; head={text[:200]!r}")
+            # head AND tail: the tail shows WHERE a truncated stream was cut
+            # (mid-first-element cuts are unsalvageable by design; knowing the cut
+            # point separates those from salvage bugs when diagnosing skips).
+            raise RuntimeError(f"Structured output was not JSON; len={len(text)} "
+                               f"head={text[:200]!r} tail={text[-120:]!r}")
         return data
 
     def _stream_structured(self, *, model, max_tokens, system, messages, fmt) -> "Message":
@@ -1203,9 +1207,11 @@ def _salvage_truncated_json(text: str):
     if not text:
         return None
     s = text.strip()
-    # A truncated response may open a ```json fence and never close it.
-    fence = re.search(r"```(?:json|JSON)?\s*(.*)", s, re.S)
-    if fence and "```" not in fence.group(1):
+    # A truncated response may OPEN a ```json fence and never close it. Only strip
+    # a fence the response actually STARTS with - findings routinely quote ``` in
+    # their problem strings, and matching one mid-text would garble the input.
+    fence = re.match(r"```(?:json|JSON)?\s*(.*)", s, re.S)
+    if fence:
         s = fence.group(1).strip()
     starts = [i for i in (s.find("{"), s.find("[")) if i >= 0]
     if not starts:
