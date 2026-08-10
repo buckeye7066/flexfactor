@@ -6642,5 +6642,217 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertIn('$extraArgs += "--yes"', text)
 
 
+class DirtyTreeSnapshotTests(unittest.TestCase):
+    """Walk-away resilience (2026-08-10): prodready hit a real GrantFlow tree with
+    uncommitted changes and hard-errored - the one operational faceplant a
+    'hand it any program and walk away' mode must overcome itself. Contract:
+    snapshot the dirt verbatim as the sandbox branch's first commit (files on
+    disk untouched), keep fix commits separate, and on every cleanup path either
+    restore the WIP to the working tree or preserve the only ref holding it."""
+
+    # ---- real-git helper roundtrip -------------------------------------------
+
+    def _mkrepo(self, tmp):
+        import subprocess
+        run = lambda *a: subprocess.run(list(a), cwd=tmp, capture_output=True, check=True)
+        run("git", "init", "-b", "main")
+        run("git", "config", "user.email", "t@t")
+        run("git", "config", "user.name", "t")
+        with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
+            f.write("base\n")
+        run("git", "add", "-A")
+        run("git", "commit", "-q", "-m", "init")
+        return run
+
+    def _porcelain(self, tmp):
+        import subprocess
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=tmp,
+                           capture_output=True, text=True, check=True)
+        return sorted(l for l in r.stdout.splitlines() if l.strip())
+
+    def test_snapshot_and_restore_roundtrip_real_git(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._mkrepo(tmp)
+            # Dirty state: a tracked-file edit AND a new untracked file.
+            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
+                f.write("owner WIP\n")
+            with open(os.path.join(tmp, "new_wip.txt"), "w", encoding="utf-8") as f:
+                f.write("untracked WIP\n")
+            before = self._porcelain(tmp)
+            self.assertTrue(before, "test setup must be dirty")
+            run("git", "checkout", "-B", "flexfactor/prodready-x")
+            committed, sha = ff._snapshot_dirty_tree(tmp)
+            self.assertTrue(committed)
+            self.assertTrue(sha)
+            # Files on disk are untouched by the snapshot commit.
+            self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
+                             "owner WIP\n")
+            self.assertEqual(self._porcelain(tmp), [],
+                             "tree must be clean vs the snapshot commit")
+            # Restore path: back on main, WIP returns as plain uncommitted changes.
+            run("git", "checkout", "--force", "main")
+            self.assertTrue(ff._restore_dirty_snapshot(tmp, sha))
+            self.assertEqual(self._porcelain(tmp), before,
+                             "restored dirty state must match the pre-run state exactly")
+            self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
+                             "owner WIP\n")
+
+    def test_snapshot_message_labels_the_commit(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._mkrepo(tmp)
+            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
+                f.write("wip\n")
+            committed, sha = ff._snapshot_dirty_tree(tmp)
+            self.assertTrue(committed and sha)
+            log = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=tmp,
+                                 capture_output=True, text=True, check=True).stdout
+            self.assertIn("[FlexFactor] snapshot: pre-existing uncommitted changes", log)
+
+    # ---- audit_one_program gating (stubbed heavy surface) --------------------
+
+    def _drive(self, *, snapshot_dirty, tree_clean, fix_files_impl=None,
+               snapshot_ret=None):
+        import tempfile
+        import types
+        tmp = tempfile.mkdtemp()
+        git_calls = []
+        snap_calls = []
+        restore_calls = []
+
+        def git(*a, **k):
+            git_calls.append(list(a[0]) if a else [])
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_snapshot(pd):
+            snap_calls.append(pd)
+            return snapshot_ret if snapshot_ret is not None else (True, "cafe" * 10)
+
+        def fake_restore(pd, sha):
+            restore_calls.append(sha)
+            return True
+
+        class _P:
+            model = "m"
+
+        stack = {"is_node": False, "is_python": True, "framework": None, "scripts": {},
+                 "verify_cmds": [], "fast_verify": None, "test_cmd": None,
+                 "full_suite_cmd": None, "dev_script": None, "is_web": False,
+                 "esbuild": None, "config_refused": False}
+
+        class _Prog:
+            def update(self, *a, **k):
+                pass
+
+        args = types.SimpleNamespace(
+            max_cost=100.0, apply=True, dry_run=False, recheck=False, allow_dirty=False,
+            snapshot_dirty=snapshot_dirty, purpose_gap=False, bootstrap=False,
+            provider="anthropic", model=None, economy=False, judge_model=None,
+            secondary_model=None, use_both=True, no_preflight=True,
+            branch_prefix="flexfactor/prodready-", fix_severity="medium", max_files=0,
+            cycles=1, max_cycles=1, until_clean=False, include=[], exclude=[],
+            review_workers=2, adversarial=True, adversarial_rounds=2, fix_prefetch=0,
+            push=False, merge=False, tests=False, e2e=False, app_url=None,
+            full_suite=False, max_test_modules=4)
+
+        default_fix = fix_files_impl or (lambda *a, **k: ([], [], []))
+        stubs = {
+            "resolve_program_input": lambda arg: ("prog", ""),
+            "resolve_project_dir": lambda arg, name: tmp,
+            "_acquire_audit_lock": lambda pd: "lock",
+            "_release_audit_lock": lambda lp: None,
+            "_load_brain": lambda: {},
+            "_clean_map": lambda prior: {},
+            "_detect_stack": lambda pd: stack,
+            "_is_git_repo": lambda pd: True,
+            "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
+            "_git_tree_clean": lambda pd: tree_clean,
+            "_git_current_branch": lambda pd: "main",
+            "_git": git,
+            "_snapshot_dirty_tree": fake_snapshot,
+            "_restore_dirty_snapshot": fake_restore,
+            "_enumerate_source_files": lambda *a, **k: ["a.py"],
+            "_review_all": lambda *a, **k: ({}, [], set(), {}),
+            "_full_gate": lambda pd, st: (True, ""),
+            "_fix_files": default_fix,
+            "_commit_and_sync": lambda *a, **k: "cycle 1: nothing to commit",
+            "_brain_record_run": lambda *a, **k: None,
+            "_build_clean_map": lambda *a, **k: {},
+            "_write_audit_report": lambda *a, **k: os.path.join(tmp, "report.md"),
+            "_write_low_findings_report": lambda *a, **k: None,
+            "_print_audit_summary": lambda *a, **k: None,
+            "_PROGRESS": _Prog(),
+        }
+        orig = {}
+        for name, fn in stubs.items():
+            orig[name] = getattr(ff, name)
+            setattr(ff, name, fn)
+        try:
+            result = ff.audit_one_program("prog", args, 1, 1, 4100)
+        finally:
+            for name, o in orig.items():
+                setattr(ff, name, o)
+        return git_calls, snap_calls, restore_calls, result
+
+    def test_audit_mode_still_hard_stops_on_dirty_tree(self):
+        git_calls, snap_calls, _, result = self._drive(
+            snapshot_dirty=False, tree_clean=False)
+        self.assertEqual(result.get("error"), "working tree isn't clean")
+        self.assertEqual(snap_calls, [], "audit mode must never auto-snapshot")
+
+    def test_prodready_mode_overcomes_dirty_tree_via_snapshot(self):
+        git_calls, snap_calls, _, result = self._drive(
+            snapshot_dirty=True, tree_clean=False)
+        self.assertIsNone(result.get("error"),
+                          "prodready (walk-away) must not faceplant on a dirty tree")
+        self.assertEqual(len(snap_calls), 1, "exactly one preservation snapshot")
+        self.assertTrue((result.get("dirty_snapshot") or "").startswith("cafe"))
+        # Snapshot happens only AFTER the sandbox branch exists.
+        self.assertIn(["checkout", "-B", "flexfactor/prodready-prog"], git_calls)
+
+    def test_clean_tree_takes_no_snapshot(self):
+        _, snap_calls, _, result = self._drive(snapshot_dirty=True, tree_clean=True)
+        self.assertIsNone(result.get("error"))
+        self.assertEqual(snap_calls, [], "clean tree must not be snapshot-committed")
+
+    def test_empty_run_restores_wip_before_deleting_branch(self):
+        # No fixes found -> the empty sandbox branch is dropped, but the owner's
+        # WIP must be cherry-picked back into the working tree FIRST.
+        git_calls, snap_calls, restore_calls, result = self._drive(
+            snapshot_dirty=True, tree_clean=False)
+        self.assertEqual(len(restore_calls), 1, "WIP must be restored on the drop path")
+        drop_idx = git_calls.index(["branch", "-D", "flexfactor/prodready-prog"])
+        co_idx = git_calls.index(["checkout", "--force", "main"])
+        self.assertLess(co_idx, drop_idx)
+
+    def test_snapshot_failure_refuses_to_run_and_unwinds(self):
+        git_calls, snap_calls, restore_calls, result = self._drive(
+            snapshot_dirty=True, tree_clean=False, snapshot_ret=(False, None))
+        self.assertEqual(result.get("error"), "dirty tree; snapshot commit failed")
+        self.assertIn(["checkout", "main"], git_calls, "must unwind to the original branch")
+        self.assertIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls)
+
+    def test_unidentifiable_snapshot_preserves_branch(self):
+        git_calls, snap_calls, restore_calls, result = self._drive(
+            snapshot_dirty=True, tree_clean=False, snapshot_ret=(True, None))
+        self.assertEqual(result.get("error"),
+                         "dirty snapshot unidentifiable; branch preserved")
+        self.assertNotIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls,
+                         "the only ref holding owner WIP must never be deleted")
+
+    def test_prodready_cli_defaults_snapshot_on_audit_off(self):
+        # The parser wires --snapshot-dirty default by mode: prodready walks away,
+        # audit keeps the strict gate.
+        import inspect
+        src = inspect.getsource(ff.main) if hasattr(ff, "main") else ""
+        # Fall back to scanning the module source (main may be named differently).
+        if "snapshot_dirty = _prod" not in src:
+            src = open(ff.__file__, encoding="utf-8").read()
+        self.assertIn("args.snapshot_dirty = _prod", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

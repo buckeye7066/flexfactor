@@ -58,6 +58,18 @@ Closes two silent-failure holes the audit had:
 - `prodready` mode = audit with `--apply`, `--fix-severity medium`, readiness ON,
   branch prefix `flexfactor/prodready-`. Explicit `--report-only`/`--dry-run`
   still win — checked against RAW argv because they share a dest with `--apply`.
+- **Dirty-tree walk-away (2026-08-10).** Prodready no longer faceplants on a
+  dirty tree (the GrantFlow failure): `--snapshot-dirty` (default ON in prodready,
+  OFF in audit) commits the pre-existing changes verbatim as the sandbox branch's
+  FIRST commit (`_snapshot_dirty_tree`, `--no-verify`, files on disk untouched) so
+  the per-cycle `git add -A` commits contain only FlexFactor's changes. Every
+  cleanup path is fail-closed: the empty-branch drop paths call
+  `_drop_branch_restoring_wip` which cherry-picks the snapshot back onto the
+  original branch as plain uncommitted changes (conflict-free by construction —
+  same parent) BEFORE `branch -D`; if the restore fails the branch is PRESERVED
+  (never delete the only ref holding owner WIP). Snapshot-commit failure refuses
+  to run + unwinds. `--allow-dirty` keeps legacy sweep-it-in behavior and wins
+  over snapshot mode.
 
 Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
 again; when it does, `flexfactor.py` silently drops out of its own audit

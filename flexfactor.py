@@ -2433,6 +2433,51 @@ def _git_tree_clean(path: str) -> bool:
     return True
 
 
+DIRTY_SNAPSHOT_MSG = (
+    "[FlexFactor] snapshot: pre-existing uncommitted changes\n\n"
+    "These changes were already in the working tree when the run started. They are\n"
+    "preserved verbatim as this sandbox branch's FIRST commit so FlexFactor's own\n"
+    "fix commits stay separate from your work. Your files on disk were not touched.\n"
+    "To put them back on your original branch as uncommitted changes:\n"
+    "  git cherry-pick --no-commit <this-commit> && git reset")
+
+
+def _snapshot_dirty_tree(project_dir: str) -> tuple[bool, str | None]:
+    """Commit the tree's pre-existing changes verbatim as a labeled snapshot commit
+    on the CURRENT (sandbox) branch. Committing records the tree without modifying
+    any file on disk, and afterwards every `git add -A` cycle commit contains ONLY
+    FlexFactor's own changes. Returns (committed, sha). committed=False means the
+    tree is untouched except a possible staged->unstaged round trip; the caller
+    must then refuse to proceed (sweeping owner WIP into fix commits is never
+    acceptable). committed=True with sha=None means the commit landed but could
+    not be identified - the caller must PRESERVE the branch, never delete it."""
+    add = _git(["add", "-A"], project_dir)
+    if add.returncode != 0:
+        return False, None
+    # --no-verify: this is a verbatim preservation snapshot of the owner's own
+    # in-progress work; repo lint/pre-commit hooks must not be able to block it.
+    c = _git(["commit", "--no-verify", "-m", DIRTY_SNAPSHOT_MSG], project_dir)
+    if c.returncode != 0:
+        _git(["reset"], project_dir)  # unstage; leave the WIP exactly as found
+        return False, None
+    sha = _git(["rev-parse", "HEAD"], project_dir)
+    out = (sha.stdout or "").strip()
+    return True, (out if sha.returncode == 0 and out else None)
+
+
+def _restore_dirty_snapshot(project_dir: str, snapshot_sha: str) -> bool:
+    """Re-apply a pre-run dirty-tree snapshot as plain uncommitted working-tree
+    changes. Called after the ORIGINAL branch is checked back out; that branch tip
+    is the snapshot's parent (the sandbox branch was created from it), so the
+    apply is conflict-free by construction. True on success."""
+    cp = _git(["cherry-pick", "--no-commit", snapshot_sha], project_dir)
+    if cp.returncode != 0:
+        _git(["cherry-pick", "--abort"], project_dir)
+        return False
+    _git(["reset"], project_dir)  # unstage: exactly the pre-run dirty state
+    return True
+
+
 def _tail(text: str, lines: int = 25) -> str:
     return "\n".join((text or "").splitlines()[-lines:])
 
@@ -6881,9 +6926,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 2. Sandbox: clean-tree gated, dedicated reversible branch (created ONCE;
         #    every cycle commits onto it). The branch is slug-named from this program,
         #    giving per-program uniqueness with no cross-contamination.
-        if (git and not args.allow_dirty and not args.dry_run and not report_only
-                and not _git_tree_clean(project_dir)):
-            print(f"{pfx}error: working tree isn't clean. Commit/stash, or pass --allow-dirty.",
+        #    A dirty tree is handled three ways: --allow-dirty sweeps the dirt into
+        #    the cycle commits (legacy, explicit opt-in); --snapshot-dirty (prodready's
+        #    default - "walk away" must not faceplant on the most common real-world
+        #    state) preserves it verbatim as the branch's first commit; otherwise
+        #    hard-stop, because `git add -A` below would silently commit owner WIP
+        #    as FlexFactor's work.
+        tree_dirty = (git and not args.dry_run and not report_only
+                      and not _git_tree_clean(project_dir))
+        snapshot_mode = bool(getattr(args, "snapshot_dirty", False))
+        if tree_dirty and not args.allow_dirty and not snapshot_mode:
+            print(f"{pfx}error: working tree isn't clean. Commit/stash, pass --allow-dirty, "
+                  "or pass --snapshot-dirty to preserve the changes as the sandbox "
+                  "branch's first commit (prodready does this automatically).",
                   file=sys.stderr)
             result["error"] = "working tree isn't clean"
             return result
@@ -6900,6 +6955,38 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 return result
             created_branch = True
             print(f"{pfx}Sandbox branch: {branch} (from {prev_branch})")
+
+        # 2a. Dirty-tree preservation snapshot (walk-away mode). Runs AFTER the
+        #     sandbox branch exists so the snapshot commit lands on FlexFactor's
+        #     branch, never on the owner's. Every failure path here is fail-closed:
+        #     proceed only when the owner's WIP is provably separated.
+        dirty_snapshot = None
+        if created_branch and tree_dirty and not args.allow_dirty and snapshot_mode:
+            committed, dirty_snapshot = _snapshot_dirty_tree(project_dir)
+            if committed and dirty_snapshot:
+                print(f"{pfx}Dirty tree handled: pre-existing uncommitted changes preserved "
+                      f"verbatim as snapshot commit {dirty_snapshot[:9]} (first commit on "
+                      f"{branch}); files on disk untouched, fix commits stay separate.")
+                result["dirty_snapshot"] = dirty_snapshot
+            elif committed:
+                # Commit landed but is unidentifiable: this branch is now the only
+                # ref holding the owner's WIP - PRESERVE it, never proceed/delete.
+                print(f"{pfx}error: dirty-tree snapshot committed but could not be "
+                      f"identified; branch {branch} PRESERVED (holds your changes) - "
+                      "inspect manually.", file=sys.stderr)
+                result["error"] = "dirty snapshot unidentifiable; branch preserved"
+                return result
+            else:
+                # Could not snapshot -> refuse to run (the cycle commits would sweep
+                # owner WIP in). Unwind to the original branch; the WIP is still in
+                # the working tree (plain checkout carries it - same commit).
+                _git(["checkout", prev_branch], project_dir)
+                _git(["branch", "-D", branch], project_dir)
+                print(f"{pfx}error: working tree is dirty and the preservation snapshot "
+                      "could not be committed; original branch restored, files untouched. "
+                      "Commit/stash manually, or pass --allow-dirty.", file=sys.stderr)
+                result["error"] = "dirty tree; snapshot commit failed"
+                return result
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
@@ -7393,6 +7480,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         # 7. Final git status. Per-cycle commits already landed the fixes; here we just
         #    report and clean up an empty branch if the whole run changed nothing.
+        def _drop_branch_restoring_wip() -> str:
+            """Return to the original branch and delete the (fix-empty) sandbox
+            branch - but if a dirty-tree snapshot exists, FIRST re-apply it as plain
+            uncommitted changes; if that restore fails, the sandbox branch is the
+            only ref holding the owner's WIP, so keep it (never branch -D it away).
+            Returns a status suffix describing what happened to the WIP."""
+            _git(["checkout", "--force", prev_branch], project_dir)
+            if dirty_snapshot and not _restore_dirty_snapshot(project_dir, dirty_snapshot):
+                _git(["checkout", branch], project_dir)
+                return (f"; WARNING branch {branch} PRESERVED - it holds your pre-run "
+                        f"uncommitted changes (snapshot {dirty_snapshot[:9]}); "
+                        "automatic restore failed")
+            _git(["branch", "-D", branch], project_dir)
+            return ("; pre-run uncommitted changes restored to the working tree"
+                    if dirty_snapshot else "")
+
         if not git:
             commit_status = "no-git"
         elif args.dry_run:
@@ -7410,10 +7513,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # Master Prompt 83/88: verifier outage — no success claim. If nothing
             # verified ever committed, drop the empty branch like a no-op run.
             if created_branch and prev_branch and not committed_any:
-                _git(["checkout", "--force", prev_branch], project_dir)
-                _git(["branch", "-D", branch], project_dir)
                 commit_status = ("FAILED verifier-outage fail-closed: pre-change tree "
-                                 "restored; no success commit")
+                                 "restored; no success commit" + _drop_branch_restoring_wip())
             else:
                 commit_status = (f"FAILED verifier-outage fail-closed on {branch}: "
                                  "candidates rolled back; no UNVERIFIED success commit"
@@ -7434,11 +7535,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # No changes at all AND no commit ever landed - drop the empty branch and
             # restore the original. The `not committed_any` guard ensures a branch that
             # DID gain commits is never deleted here even if applied_files is empty.
-            _git(["checkout", "--force", prev_branch], project_dir)
-            _git(["branch", "-D", branch], project_dir)
-            commit_status = "no changes (audit found nothing to fix)"
+            # ("empty" = no FIX commits; a dirty-tree snapshot commit alone still
+            # counts as empty, and _drop_branch_restoring_wip puts the WIP back.)
+            commit_status = ("no changes (audit found nothing to fix)"
+                             + _drop_branch_restoring_wip())
         else:
             commit_status = "nothing-to-commit"
+
+        # On every path that KEEPS the branch, say where the owner's pre-run WIP is.
+        if dirty_snapshot and "pre-run uncommitted changes" not in commit_status:
+            commit_status += (f"; NOTE your pre-run uncommitted changes are preserved as "
+                              f"snapshot commit {dirty_snapshot[:9]} (first commit on {branch})")
 
         print(f"{pfx}Git: {commit_status}")
         suite_txt = ("GREEN" if suite_status else "RED" if suite_status is False else "not run")
@@ -7456,6 +7563,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "unverified_files": unverified_files, "test_files": test_files,
             "test_status": test_status, "e2e": e2e, "fix_notes": fix_notes,
             "commit_status": commit_status, "baseline_ok": baseline_ok,
+            "dirty_snapshot": dirty_snapshot,
             "cycles": cycles_run, "providers": [f"{n}:{p.model}" for n, p in providers],
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
@@ -8286,11 +8394,21 @@ def main(argv=None) -> int:
         parser.add_argument("--branch-prefix", default="flexfactor/audit-", dest="branch_prefix",
                             help="Prefix for the audit branch (default: flexfactor/audit-).")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
-                            help="Audit even if the git working tree isn't clean.")
+                            help="Audit even if the git working tree isn't clean "
+                                 "(pre-existing changes get swept into the cycle commits).")
+        parser.add_argument("--snapshot-dirty", action=argparse.BooleanOptionalAction,
+                            default=None, dest="snapshot_dirty",
+                            help="On a dirty tree, preserve the pre-existing uncommitted "
+                                 "changes verbatim as the sandbox branch's first commit "
+                                 "and continue, instead of refusing to run. Default: on "
+                                 "in prodready (walk-away must not stop for this), off "
+                                 "in audit.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                             help="Review + report only; create no branch and change no files.")
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        if args.snapshot_dirty is None:
+            args.snapshot_dirty = _prod
         if args.readiness is None:
             args.readiness = _prod
         if _prod:
