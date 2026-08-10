@@ -6632,6 +6632,15 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertIn('$env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"', text)
         self.assertIn('$env:ANTHROPIC_AUTH_TOKEN = "freecc"', text)
 
+    def test_launcher_audit_apply_branch_passes_apply_and_yes(self):
+        # The audit CLI defaults to report-only; a launcher apply branch that
+        # passes no flag silently runs report-only while claiming "Apply mode:
+        # verified fixes are committed each cycle" (found live 2026-08-10).
+        # --yes rides along because the launcher's own prompt IS the confirmation.
+        text = self._launcher_text()
+        self.assertIn('$extraArgs += "--apply"', text)
+        self.assertIn('$extraArgs += "--yes"', text)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

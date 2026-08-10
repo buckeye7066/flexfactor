@@ -136,12 +136,17 @@ if ($mode -eq "3") {
         Read-Host "Press Enter to close"; exit 1
     }
 
-    # Apply vs report-only. Default is to apply fixes.
+    # Apply vs report-only. Default is to apply fixes. The CLI's own default is
+    # report-only, so apply mode MUST pass --apply explicitly (plus --yes: this
+    # prompt already IS the confirmation, don't ask twice). Without these flags
+    # the launcher silently ran report-only while claiming apply mode.
     $apply = Read-Host "Apply fixes? [yes/report] (Enter = yes)"
     if ($apply -eq "report") {
         $extraArgs += "--report-only"
         Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
     } else {
+        $extraArgs += "--apply"
+        $extraArgs += "--yes"
         Write-Host "Apply mode: verified fixes are committed and pushed each cycle." -ForegroundColor DarkGray
     }
 

@@ -7706,6 +7706,9 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "fix_notes": list(a.get("fix_notes") or [])[:200],
         "verification_is_real": a.get("verification_is_real"),
         "verification_note": a.get("verification_note"),
+        "purpose_fulfillment_pct": (a.get("purpose_gap") or {}).get("fulfillment_pct"),
+        "purpose_gaps": len((a.get("purpose_gap") or {}).get("gaps") or []),
+        "purpose_bridged_files": list(a.get("bridged_files") or []),
     }
     raw = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     written = _write_contained(project_dir, name, raw)
