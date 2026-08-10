@@ -911,7 +911,7 @@ class ParallelReviewBudgetTests(unittest.TestCase):
             def __init__(self, meter):
                 self.meter = meter
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 use_model = model or self.model
                 with ff._budget_guard(self.meter, use_model, len(prompt) + len(system), max_tokens):
                     with clock:
@@ -1057,7 +1057,7 @@ class AuditSourceFencingTests(unittest.TestCase):
             model = "claude-opus-4-8"
             judge_model = "claude-haiku-4-5"
 
-            def structured(self, system, prompt, schema, max_tokens=8000):
+            def structured(self, system, prompt, schema, max_tokens=8000, **kw):
                 captured["prompt"] = prompt
                 return {"changed": False, "edits": [], "fixed_titles": [], "notes": ""}
 
@@ -1114,7 +1114,7 @@ class ProviderReservationChokepointTests(unittest.TestCase):
             def __init__(self, meter):
                 self.meter = meter
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 use = model or self.model
                 with ff._budget_guard(self.meter, use, len(prompt) + len(system), max_tokens):
                     self.meter.record(use, output_tokens=50)
@@ -1234,7 +1234,7 @@ class FeedbackFencingTests(unittest.TestCase):
             model = "claude-opus-4-8"
             judge_model = "claude-haiku-4-5"
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 captured["prompt"] = prompt
                 return {"changed": False, "edits": [], "fixed_titles": [], "notes": ""}
 
@@ -1428,7 +1428,7 @@ class ScoutIntegrationPromptFencingTests(unittest.TestCase):
                 self.calls = 0
                 self.captured = {}
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 self.calls += 1
                 if self.calls == 1:  # plan pass
                     return {"can_apply": True,
@@ -1566,7 +1566,7 @@ class WriteGeneratingPromptFencingTests(unittest.TestCase):
                 self.calls = 0
                 self.prompts = []
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 self.calls += 1
                 self.prompts.append(prompt)
                 if self.calls == 1:
@@ -1710,7 +1710,7 @@ class ModelNamedReadPathContainmentTests(unittest.TestCase):
                     self.calls = 0
                     self.prompts = []
 
-                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                     self.calls += 1
                     self.prompts.append(prompt)
                     if self.calls == 1:  # plan pass: name escaping + absolute paths
@@ -2005,7 +2005,7 @@ class ModifyFilesInRepoSymlinkReadTests(unittest.TestCase):
                     self.calls = 0
                     self.prompts = []
 
-                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                     self.calls += 1
                     self.prompts.append(prompt)
                     if self.calls == 1:
@@ -2847,7 +2847,7 @@ class IntegrationModifyEmptyMissingTests(unittest.TestCase):
                     self.calls = 0
                     self.prompts = []
 
-                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                     self.calls += 1
                     self.prompts.append(prompt)
                     if self.calls == 1:
@@ -2933,7 +2933,7 @@ class IntegrationModifyOutsideSymlinkTests(unittest.TestCase):
                     self.calls = 0
                     self.prompts = []
 
-                def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+                def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                     self.calls += 1
                     self.prompts.append(prompt)
                     if self.calls == 1:
@@ -3051,7 +3051,7 @@ class IntegrationRefusedExistenceFailsClosedTests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+            def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
                 self.calls += 1
                 if self.calls == 1:
                     return {"can_apply": True, "plan": "p", "packages": [],
@@ -5846,7 +5846,7 @@ class _StubProvider:
     def __init__(self):
         self.calls = []
 
-    def structured(self, system, prompt, schema, max_tokens=8000, model=None):
+    def structured(self, system, prompt, schema, max_tokens=8000, model=None, **kw):
         self.calls.append(prompt[:80])
         return {"findings": [], "summary": "clean"}
 
@@ -6640,6 +6640,77 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         text = self._launcher_text()
         self.assertIn('$extraArgs += "--apply"', text)
         self.assertIn('$extraArgs += "--yes"', text)
+
+
+class TruncatedJsonSalvageTests(unittest.TestCase):
+    """Live GrantFlow run 2026-08-10: on big files the FCC proxy's upstream cut
+    long review completions mid-stream; the head was a VALID findings list but
+    _extract_json_object needs balanced brackets, so three good partial reviews
+    were discarded per file. Salvage recovers the complete leading elements for
+    JUDGING calls only (generation still fails loudly)."""
+
+    TRUNCATED = ('{"findings":[{"line":35,"severity":"low","category":"dead-code",'
+                 '"title":"Unused import","problem":"unused"},'
+                 '{"line":61,"severity":"medium","category":"error-handling","tit')
+
+    def test_recovers_complete_leading_elements(self):
+        data = ff._salvage_truncated_json(self.TRUNCATED)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(len(data["findings"]), 1)
+        self.assertEqual(data["findings"][0]["line"], 35)
+        self.assertEqual(data["findings"][0]["title"], "Unused import")
+
+    def test_recovers_inside_unclosed_fence(self):
+        data = ff._salvage_truncated_json("```json\n" + self.TRUNCATED)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(len(data["findings"]), 1)
+
+    def test_no_fragment_elements_salvaged(self):
+        # The cut element (missing most keys) must be DROPPED, never half-kept.
+        data = ff._salvage_truncated_json('{"findings":[{"line":35,"sev')
+        self.assertIsNone(data, "a cut mid-element with no complete element must not salvage")
+
+    def test_garbage_and_balanced_invalid_return_none(self):
+        self.assertIsNone(ff._salvage_truncated_json("no json here at all"))
+        self.assertIsNone(ff._salvage_truncated_json(""))
+        self.assertIsNone(ff._salvage_truncated_json(None))
+        # Balanced but invalid = a different failure, not truncation.
+        self.assertIsNone(ff._salvage_truncated_json('{"a": undefined_token}'))
+
+    def test_judge_opts_into_salvage(self):
+        import types
+        seen = {}
+
+        class _Prov:
+            judge_model = "cheap"
+
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, salvage_truncated=False):
+                seen["salvage"] = salvage_truncated
+                seen["model"] = model
+                return {"ok": True}
+
+        out = ff._judge(_Prov(), "s", "p", {})
+        self.assertEqual(out, {"ok": True})
+        self.assertTrue(seen["salvage"], "_judge must opt into truncation salvage")
+        self.assertEqual(seen["model"], "cheap")
+
+    def test_anthropic_structured_salvages_truncated_stream(self):
+        import types
+        prov = object.__new__(ff.AnthropicProvider)  # skip __init__ (no client needed)
+        prov.model = "m"
+        prov.judge_model = "m"
+        prov.meter = None
+        msg = types.SimpleNamespace(
+            stop_reason="end_turn", stop_details=None,
+            content=[types.SimpleNamespace(type="text", text=self.TRUNCATED)],
+            usage=None)
+        prov._stream_structured = lambda **k: msg
+        data = prov.structured("sys", "prompt", {}, salvage_truncated=True)
+        self.assertEqual(len(data["findings"]), 1)
+        # Without opt-in the same truncated text must still fail loudly.
+        with self.assertRaises(RuntimeError):
+            prov.structured("sys", "prompt", {})
 
 
 class DirtyTreeSnapshotTests(unittest.TestCase):

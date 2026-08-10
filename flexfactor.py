@@ -751,7 +751,7 @@ class AnthropicProvider:
             raise RuntimeError(f"Grader returned unparseable output ({exc}); head={text[:200]!r}")
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
-                   model: str | None = None) -> dict:
+                   model: str | None = None, salvage_truncated: bool = False) -> dict:
         # Generic constrained-decoding call. Short by default (profile/benefit
         # judging, review findings), but whole-file outputs (fix + unit-test +
         # integration patch generation) need a much larger budget: a response that
@@ -781,6 +781,16 @@ class AnthropicProvider:
         if not text:
             raise RuntimeError("Model returned no text content to parse.")
         data, _ = _extract_json_object(text)
+        if data is None and salvage_truncated:
+            # Judging-only truncation repair (see _salvage_truncated_json): the FCC
+            # proxy's upstream sometimes cuts long completions mid-stream on big
+            # files; recovering the complete leading elements beats discarding an
+            # entire review. The file is NOT marked clean by a partial review, so
+            # the until-clean loop still re-reviews it.
+            data = _salvage_truncated_json(text)
+            if data is not None:
+                print("  [salvage] structured output was truncated mid-stream; "
+                      "recovered the complete leading elements (partial tail dropped)")
         if data is None:
             raise RuntimeError(f"Structured output was not JSON; head={text[:200]!r}")
         return data
@@ -921,7 +931,9 @@ class OpenAIProvider:
         return _parse_grade(resp.choices[0].message.content or "{}")
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
-                   model: str | None = None) -> dict:
+                   model: str | None = None, salvage_truncated: bool = False) -> dict:
+        # (salvage_truncated accepted for signature parity with AnthropicProvider;
+        # OpenAI json mode already fails loudly on truncation via finish_reason.)
         # OpenAI json mode isn't schema-constrained, so we inline the schema into
         # the system prompt and tolerantly parse — the caller's code defends
         # against missing keys with .get() defaults. Whole-file callers request a
@@ -1060,10 +1072,17 @@ class OllamaProvider:
         return _parse_grade(text or "{}")
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
-                   model: str | None = None) -> dict:
+                   model: str | None = None, salvage_truncated: bool = False) -> dict:
         text = self._chat(model or self.model, system, prompt, max_tokens,
                           schema=schema)
-        return json.loads(text or "{}")
+        try:
+            return json.loads(text or "{}")
+        except Exception:
+            if salvage_truncated:
+                data = _salvage_truncated_json(text)
+                if data is not None:
+                    return data
+            raise
 
     def ping(self) -> None:
         """Liveness = the local server answers /api/tags. Raises on failure so
@@ -1170,6 +1189,64 @@ def _extract_json_object(text: str):
     return None, s
 
 
+def _salvage_truncated_json(text: str):
+    """Best-effort repair of TRUNCATED structured output (stream cut mid-response,
+    e.g. the FCC proxy's upstream dropping a long completion partway): trim back
+    to the last position where a complete JSON value just closed, then append the
+    closers for every still-open container. Returns the parsed value or None.
+
+    The trailing incomplete element is DROPPED, so the result is PARTIAL - callers
+    must only use this where partial data is safe (judging/review calls, where the
+    until-clean cycle loop re-reviews the file anyway and fail-safe .get() defaults
+    treat missing keys conservatively). Never used for code generation: a partial
+    edit list must keep failing loudly rather than half-apply."""
+    if not text:
+        return None
+    s = text.strip()
+    # A truncated response may open a ```json fence and never close it.
+    fence = re.search(r"```(?:json|JSON)?\s*(.*)", s, re.S)
+    if fence and "```" not in fence.group(1):
+        s = fence.group(1).strip()
+    starts = [i for i in (s.find("{"), s.find("[")) if i >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    closers: list[str] = []      # stack of the closer each open container needs
+    in_str = esc = False
+    candidates: list[tuple[int, str]] = []  # (end index, closers suffix) after a complete value
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            closers.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not closers or ch != closers[-1]:
+                return None  # malformed, not merely truncated
+            closers.pop()
+            if not closers:
+                return None  # fully balanced: not truncation, plain parse failed
+            # A complete object/array ELEMENT just closed - a safe cut point.
+            # (Only container closes qualify: cutting mid-string/number would
+            # salvage a fragment element with most of its keys missing.)
+            candidates.append((i + 1, "".join(reversed(closers))))
+    for idx, suffix in reversed(candidates):
+        frag = s[start:idx].rstrip().rstrip(",")
+        try:
+            return json.loads(frag + suffix)
+        except Exception:
+            continue
+    return None
+
+
 def _feedback(grade: Grade) -> str:
     """Turn a grader verdict into a corrective instruction for the next rewrite.
 
@@ -1206,9 +1283,12 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     """Run a CLASSIFICATION/judging structured call on the provider's cheap judge
     model (review findings, fix verification, program profiling, benefit scoring).
     Code-GENERATION callers keep using provider.structured() directly, which stays
-    on the strong author model."""
+    on the strong author model. Judging calls opt into truncation salvage: a
+    partial findings/verdict list is safe here (fail-safe .get() defaults +
+    the until-clean loop re-reviews), whereas generation must fail loudly."""
     return provider.structured(system, prompt, schema, max_tokens=max_tokens,
-                               model=getattr(provider, "judge_model", None))
+                               model=getattr(provider, "judge_model", None),
+                               salvage_truncated=True)
 
 
 def _provider_key_present(name: str) -> bool:
