@@ -98,6 +98,20 @@ if ($merge -match '^(y|yes)$') {
     $extraArgs += "--merge"
 }
 
+# Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":
+# a batch of several programs used to faceplant on --program #2 or #3 just
+# because that repo had pre-existing uncommitted WIP). Audit defaults this
+# OFF (a hard stop is the safer default for a one-shot interactive run), but
+# this launcher exists to kick off a multi-program batch and walk away, so
+# offer the same snapshot as prodready and default it ON for that case.
+$snapshotDefault = if ($programs.Count -ge 2) { "yes" } else { "no" }
+$snap = Read-Host "On a dirty working tree, snapshot the pre-existing changes and continue instead of stopping? [Y/n] (Enter = $snapshotDefault)"
+if ([string]::IsNullOrWhiteSpace($snap)) { $snap = $snapshotDefault }
+if ($snap -match '^(y|yes)$') {
+    $extraArgs += "--snapshot-dirty"
+    Write-Host "Dirty trees: pre-existing changes are snapshotted as the sandbox branch's first commit and the audit continues." -ForegroundColor DarkGray
+}
+
 # When 2+ programs were given, offer to run them concurrently.
 if ($programs.Count -ge 2) {
     $par = Read-Host "Run them at the same time (parallel)? [y/N]"

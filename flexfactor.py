@@ -797,6 +797,7 @@ class AnthropicProvider:
             # point separates those from salvage bugs when diagnosing skips).
             raise RuntimeError(f"Structured output was not JSON; len={len(text)} "
                                f"head={text[:200]!r} tail={text[-120:]!r}")
+        _check_structured_type(data, schema, text)
         return data
 
     def _stream_structured(self, *, model, max_tokens, system, messages, fmt) -> "Message":
@@ -974,7 +975,10 @@ class OpenAIProvider:
             raise RuntimeError(
                 f"Model output hit the {min(max_tokens, 16384)}-token budget (file too "
                 "large to regenerate in one response); raise max_tokens for this call.")
-        return json.loads(choice.message.content or "{}")
+        text = choice.message.content or "{}"
+        data = json.loads(text)
+        _check_structured_type(data, schema, text)
+        return data
 
     def ping(self) -> None:
         """One-token liveness check on the JUDGE tier, ROUTED THROUGH the adapter so
@@ -1080,13 +1084,16 @@ class OllamaProvider:
         text = self._chat(model or self.model, system, prompt, max_tokens,
                           schema=schema)
         try:
-            return json.loads(text or "{}")
+            data = json.loads(text or "{}")
         except Exception:
             if salvage_truncated:
                 data = _salvage_truncated_json(text)
                 if data is not None:
+                    _check_structured_type(data, schema, text)
                     return data
             raise
+        _check_structured_type(data, schema, text)
+        return data
 
     def ping(self) -> None:
         """Liveness = the local server answers /api/tags. Raises on failure so
@@ -1191,6 +1198,31 @@ def _extract_json_object(text: str):
                     except Exception:
                         break  # unbalanced/invalid; try the other bracket type
     return None, s
+
+
+def _check_structured_type(data, schema: dict, text: str):
+    """Every provider's structured() promises the caller a value shaped like
+    `schema` (almost always a top-level JSON object with named keys the caller
+    reads via .get()). _extract_json_object tolerantly scans for EITHER a {...}
+    or a [...] span, so a model that wraps its object in an array (or a fenced
+    block that happens to parse as a bare list) silently hands the caller a
+    list instead of a dict. Every call site trusts the schema and calls
+    .get()/[key] unguarded (generate_file_fix's `patch.get("changed")` etc.),
+    so a mismatched type used to surface many frames away as an opaque
+    'list' object has no attribute 'get' AttributeError that aborted the
+    WHOLE program's audit (caught only by the outer per-program try/except).
+    Raising HERE - at the one chokepoint every provider's structured() output
+    passes through - turns that into a normal generation failure the existing
+    retry/edit-fallback/[skip] handling already copes with."""
+    expected = schema.get("type")
+    if expected == "object" and not isinstance(data, dict):
+        raise RuntimeError(
+            f"Structured output did not match schema (expected a JSON object, "
+            f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
+    if expected == "array" and not isinstance(data, list):
+        raise RuntimeError(
+            f"Structured output did not match schema (expected a JSON array, "
+            f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
 
 
 def _salvage_truncated_json(text: str):

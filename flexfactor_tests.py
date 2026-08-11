@@ -5289,6 +5289,21 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertEqual(payload["format"], schema)  # Ollama structured output
         self.assertFalse(payload["stream"])
 
+    def test_structured_rejects_list_for_object_schema(self):
+        # Regression: a model that wraps its object response in an array (or
+        # any array-shaped output where the caller declared an object schema)
+        # used to be handed back verbatim. Callers unconditionally do
+        # `patch.get("changed")` etc. on the assumption structured() honored
+        # the schema, so a silently-returned list crashed many frames away as
+        # an opaque 'list' object has no attribute 'get' that aborted the
+        # whole program's audit. structured() must fail LOUDLY, right here,
+        # so the caller's existing retry/fallback/[skip] handling applies.
+        body = {"message": {"content": "[{\"a\": 1}]"}}
+        p = ff.OllamaProvider("coder")
+        self._fake_opener(p, [], body)
+        with self.assertRaises(RuntimeError):
+            p.structured("sys", "user", {"type": "object"})
+
     def test_grade_parses(self):
         body = {"message": {"content": json.dumps(
             {"grade": 88, "meets_goal": True, "rationale": "ok", "issues": []})}}
