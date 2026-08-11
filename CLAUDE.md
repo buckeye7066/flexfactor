@@ -71,7 +71,14 @@ Closes two silent-failure holes the audit had:
   same parent) BEFORE `branch -D`; if the restore fails the branch is PRESERVED
   (never delete the only ref holding owner WIP). Snapshot-commit failure refuses
   to run + unwinds. `--allow-dirty` keeps legacy sweep-it-in behavior and wins
-  over snapshot mode.
+  over snapshot mode. TRI-STATE (2026-08-11, live SermonSmith abort):
+  `_snapshot_dirty_tree` returns ('committed'|'nothing'|'failed', sha) —
+  'nothing' = PHANTOM dirt (status reports modifications but `git add -A`
+  stages zero content; CRLF/stat-cache churn) and the audit PROCEEDS with no
+  snapshot instead of aborting the program. Related parking fixes: the run now
+  RETURNS to the owner's original branch at end-of-run (parked-on-sandbox
+  repos made the next run see prev_branch == the sandbox branch), and
+  `_commit_and_sync` skips the meaningless self-merge when prev == branch.
 
 Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
 again; when it does, `flexfactor.py` silently drops out of its own audit
@@ -89,7 +96,13 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   no egress gate (nothing leaves the machine), bills `ollama:<model>` ids at
   $0 via the `MODEL_PRICING["ollama"]` prefix entry, and
   `build_audit_providers` never adds a cloud secondary when primary=ollama.
-  Defaults: author `deepseek-coder:33b`, judge `llama3.2:latest`;
+  Defaults: author `deepseek-coder:33b`, judge `llama3.2:latest`.
+  FREE-FIRST PREFLIGHT FALLBACK (owner order 2026-08-11): when the chosen
+  cloud primary fails preflight, `build_audit_providers` falls back to FREE
+  local ollama BEFORE the other paid cloud key; a usable cloud provider is
+  kept as cross-check reviewer in that case (the zero-egress no-cloud-secondary
+  rule applies only when the owner POINTS at ollama). An owner-chosen usable
+  primary still wins;
   `_cached_system()` marks Anthropic system prompts cacheable; `_judge()` routes
   classification calls to the judge tier
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →

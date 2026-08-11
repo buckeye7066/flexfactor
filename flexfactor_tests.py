@@ -160,6 +160,62 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff.make_provider = real_make
             ff._provider_health = real_health
 
+    def test_preflight_prefers_free_ollama_over_paid_fallback(self):
+        # Owner order 2026-08-11: "the preflight should be the free ollama as
+        # well - openai and anthropic are fallbacks." Dead cloud primary + live
+        # local ollama -> ollama becomes the author, BEFORE the other paid key;
+        # the usable cloud provider is KEPT as the cross-check reviewer (the
+        # zero-egress local-only rule applies only when the owner POINTS at
+        # ollama, not when preflight falls back to it).
+        class Args:
+            provider = "openai"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: True  # ollama never needs a key
+        ff._provider_health = lambda name, meter=None: (
+            (False, "credit balance is too low") if name == "openai" else (True, "ok"))
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            out = ff.build_audit_providers(Args)
+            self.assertEqual([n for n, _ in out], ["ollama", "anthropic"])
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_preflight_owner_chosen_usable_primary_still_wins(self):
+        # A usable owner-chosen cloud primary is never displaced by ollama.
+        class Args:
+            provider = "anthropic"
+            model = None
+            economy = False
+            use_both = False
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: True
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            out = ff.build_audit_providers(Args)
+            self.assertEqual([n for n, _ in out], ["anthropic"])
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
     def test_preflight_all_keys_dead_returns_empty_with_diagnosis(self):
         # Every present key is rejected -> return [] AND set a credit-aware reason
         # so the caller can tell the user to top up (vs "no key set").
@@ -7055,7 +7111,7 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
 
         def fake_snapshot(pd):
             snap_calls.append(pd)
-            return snapshot_ret if snapshot_ret is not None else (True, "cafe" * 10)
+            return snapshot_ret if snapshot_ret is not None else ("committed", "cafe" * 10)
 
         def fake_restore(pd, sha):
             restore_calls.append(sha)
@@ -7156,18 +7212,79 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
 
     def test_snapshot_failure_refuses_to_run_and_unwinds(self):
         git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False, snapshot_ret=(False, None))
+            snapshot_dirty=True, tree_clean=False, snapshot_ret=("failed", None))
         self.assertEqual(result.get("error"), "dirty tree; snapshot commit failed")
         self.assertIn(["checkout", "main"], git_calls, "must unwind to the original branch")
         self.assertIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls)
 
     def test_unidentifiable_snapshot_preserves_branch(self):
         git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False, snapshot_ret=(True, None))
+            snapshot_dirty=True, tree_clean=False, snapshot_ret=("committed", None))
         self.assertEqual(result.get("error"),
                          "dirty snapshot unidentifiable; branch preserved")
         self.assertNotIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls,
                          "the only ref holding owner WIP must never be deleted")
+
+    def test_phantom_dirty_tree_proceeds_without_snapshot(self):
+        # Live SermonSmith abort 2026-08-11: git status reported modifications but
+        # `git add -A` staged zero content (CRLF/stat-cache churn). That must NOT
+        # abort the program - there is nothing of the owner's to preserve.
+        git_calls, snap_calls, restore_calls, result = self._drive(
+            snapshot_dirty=True, tree_clean=False, snapshot_ret=("nothing", None))
+        self.assertIsNone(result.get("error"),
+                          "phantom dirt must not abort the audit")
+        self.assertEqual(len(snap_calls), 1)
+        self.assertIsNone(result.get("dirty_snapshot"))
+        self.assertEqual(restore_calls, [], "nothing to restore for phantom dirt")
+
+    def test_snapshot_helper_reports_nothing_when_zero_content_staged(self):
+        # Unit-level: add ok, `diff --cached --quiet` rc 0 -> ('nothing', None),
+        # and NO commit is attempted.
+        import types
+        calls = []
+
+        def fake_git(cmd, cwd):
+            calls.append(cmd)
+            rc = 0  # add ok; diff --cached --quiet rc 0 = nothing staged
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+        orig = ff._git
+        ff._git = fake_git
+        try:
+            status, sha = ff._snapshot_dirty_tree("d")
+        finally:
+            ff._git = orig
+        self.assertEqual((status, sha), ("nothing", None))
+        self.assertFalse(any(c and c[0] == "commit" for c in calls),
+                         "no commit attempt when nothing is staged")
+
+    def test_commit_and_sync_skips_self_merge_when_parked(self):
+        # prev_branch == branch (repo left parked on the sandbox branch by an
+        # interrupted run) -> merging would be a meaningless self-merge; skip it.
+        import types
+        git_calls = []
+
+        def fake_git(cmd, cwd):
+            git_calls.append(cmd)
+            if cmd[:3] == ["diff", "--cached", "--quiet"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="x", stderr="")
+
+        orig = (ff._git, ff._git_has_remote, ff._full_gate, ff._git_current_branch)
+        ff._git = fake_git
+        ff._git_has_remote = lambda pd: False
+        ff._full_gate = lambda pd, st: (True, "")
+        ff._git_current_branch = lambda pd: "flexfactor/audit-x"
+        args = types.SimpleNamespace(push=False, merge=True)
+        try:
+            status = ff._commit_and_sync("d", "flexfactor/audit-x",
+                                         "flexfactor/audit-x", args, "cycle 1", {})
+        finally:
+            (ff._git, ff._git_has_remote, ff._full_gate,
+             ff._git_current_branch) = orig
+        self.assertNotIn("merged into", status)
+        self.assertFalse(any(c and c[0] == "merge" for c in git_calls),
+                         "self-merge must never be attempted")
 
     def test_prodready_cli_defaults_snapshot_on_audit_off(self):
         # The parser wires --snapshot-dirty default by mode: prodready walks away,

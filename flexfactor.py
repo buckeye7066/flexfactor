@@ -2083,11 +2083,24 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             print(f"  [preflight] {name} key is set but unusable: {reason}", file=sys.stderr)
         return ok
 
-    # Fall back to the provider that actually WORKS if the primary's is unusable.
-    if not _usable(primary) and _usable(other):
-        print(f"  [preflight] falling back: primary '{primary}' unusable, using '{other}'.",
-              file=sys.stderr)
-        primary, other = other, primary
+    # Fall back when the primary is unusable. Owner order 2026-08-11: "the
+    # preflight should be the free ollama as well - openai and anthropic are
+    # fallbacks", i.e. FREE-FIRST: the local ollama server is tried BEFORE the
+    # other (paid) cloud key. An owner-CHOSEN primary still wins when usable.
+    # NOTE on the LOCAL-ONLY rule: when the owner POINTS at ollama, no cloud
+    # secondary is ever added (zero-egress intent, handled above). Falling back
+    # to ollama from a cloud primary is different - the owner asked for a cloud
+    # run, so a usable cloud provider is KEPT as the cross-check reviewer.
+    if not _usable(primary):
+        if primary != "ollama" and _usable("ollama"):
+            print(f"  [preflight] falling back: primary '{primary}' unusable, using FREE "
+                  f"'ollama' (paid cloud keys stay as cross-check/fallback).",
+                  file=sys.stderr)
+            primary = "ollama"
+        elif _usable(other):
+            print(f"  [preflight] falling back: primary '{primary}' unusable, using '{other}'.",
+                  file=sys.stderr)
+            primary, other = other, primary
     if not _usable(primary):
         # Distinguish "no key at all" from "keys present but all dead" for the caller.
         any_key = _provider_key_present(primary) or _provider_key_present(other)
@@ -3179,27 +3192,44 @@ DIRTY_SNAPSHOT_MSG = (
     "  git cherry-pick --no-commit <this-commit> && git reset")
 
 
-def _snapshot_dirty_tree(project_dir: str) -> tuple[bool, str | None]:
+def _snapshot_dirty_tree(project_dir: str) -> tuple[str, str | None]:
     """Commit the tree's pre-existing changes verbatim as a labeled snapshot commit
     on the CURRENT (sandbox) branch. Committing records the tree without modifying
     any file on disk, and afterwards every `git add -A` cycle commit contains ONLY
-    FlexFactor's own changes. Returns (committed, sha). committed=False means the
-    tree is untouched except a possible staged->unstaged round trip; the caller
-    must then refuse to proceed (sweeping owner WIP into fix commits is never
-    acceptable). committed=True with sha=None means the commit landed but could
-    not be identified - the caller must PRESERVE the branch, never delete it."""
+    FlexFactor's own changes. Returns (status, sha):
+      ('committed', sha)  - snapshot landed. sha=None means it landed but could not
+                            be identified: the caller must PRESERVE the branch.
+      ('nothing', None)   - the tree was only PHANTOM-dirty: `git status` reported
+                            modifications but `git add -A` staged ZERO content
+                            (CRLF/eol normalization + stale stat-cache churn - the
+                            live SermonSmith abort of 2026-08-11). There is nothing
+                            to preserve; the caller may proceed with no snapshot.
+      ('failed', None)    - could not commit; the tree is untouched except a
+                            possible staged->unstaged round trip. The caller must
+                            refuse to proceed (sweeping owner WIP into fix commits
+                            is never acceptable)."""
     add = _git(["add", "-A"], project_dir)
     if add.returncode != 0:
-        return False, None
+        return "failed", None
+    # Phantom-dirt check: `git diff --cached --quiet` exit code is data
+    # (0 = nothing staged, 1 = staged changes, >1 = real error). A status-dirty
+    # tree that stages nothing has no content to preserve - committing would
+    # fail with 'nothing to commit' and previously aborted the whole program.
+    staged = _git(["diff", "--cached", "--quiet"], project_dir)
+    if staged.returncode == 0:
+        return "nothing", None
+    if staged.returncode != 1:
+        _git(["reset"], project_dir)
+        return "failed", None
     # --no-verify: this is a verbatim preservation snapshot of the owner's own
     # in-progress work; repo lint/pre-commit hooks must not be able to block it.
     c = _git(["commit", "--no-verify", "-m", DIRTY_SNAPSHOT_MSG], project_dir)
     if c.returncode != 0:
         _git(["reset"], project_dir)  # unstage; leave the WIP exactly as found
-        return False, None
+        return "failed", None
     sha = _git(["rev-parse", "HEAD"], project_dir)
     out = (sha.stdout or "").strip()
-    return True, (out if sha.returncode == 0 and out else None)
+    return "committed", (out if sha.returncode == 0 and out else None)
 
 
 def _restore_dirty_snapshot(project_dir: str, snapshot_sha: str) -> bool:
@@ -7508,7 +7538,11 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         # diverges. --force-with-lease keeps it safe (won't clobber others' work).
         pr = _git(["push", "--force-with-lease", "-u", "origin", branch], project_dir)
         status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
-    if args.merge and final_ok and prev_branch:
+    # prev_branch == branch happens when a repo was left PARKED on the sandbox
+    # branch by an earlier interrupted run (live SermonSmith 2026-08-11): a
+    # "merge" would be a meaningless self-merge, so it is skipped rather than
+    # faked. The end-of-run original-branch restore prevents new parking.
+    if args.merge and final_ok and prev_branch and prev_branch != branch:
         co = _git(["checkout", prev_branch], project_dir)
         if co.returncode != 0:
             # Could not leave the audit branch: do NOT merge (we'd be on the wrong
@@ -7786,8 +7820,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     proceed only when the owner's WIP is provably separated.
         dirty_snapshot = None
         if created_branch and tree_dirty and not args.allow_dirty and snapshot_mode:
-            committed, dirty_snapshot = _snapshot_dirty_tree(project_dir)
-            if committed and dirty_snapshot:
+            snap_status, dirty_snapshot = _snapshot_dirty_tree(project_dir)
+            committed = (snap_status == "committed")
+            if snap_status == "nothing":
+                # Phantom dirt (CRLF/stat-cache churn): status said dirty but zero
+                # content staged. Nothing of the owner's to preserve - proceed.
+                print(f"{pfx}Dirty tree was only line-ending/stat-cache churn "
+                      "(no stageable content); no preservation snapshot needed, continuing.")
+            elif committed and dirty_snapshot:
                 print(f"{pfx}Dirty tree handled: pre-existing uncommitted changes preserved "
                       f"verbatim as snapshot commit {dirty_snapshot[:9]} (first commit on "
                       f"{branch}); files on disk untouched, fix commits stay separate.")
@@ -8446,6 +8486,25 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                               "severity": f.get("severity"), "title": f.get("title")}
                              for f in low_findings[:500]],
         }, clean_map=clean_map)
+        # End-of-run branch restore: never leave the repo PARKED on the sandbox
+        # branch. Parking is what broke the live SermonSmith run of 2026-08-11 -
+        # the NEXT run then sees prev_branch == the sandbox branch, self-merges
+        # become meaningless, and "results back to main" never happens for that
+        # repo again. Restore the owner's original branch when it is safe:
+        # the branch still exists, we are actually on the sandbox branch, and
+        # the tree is clean (never carry uncommitted state across a checkout).
+        # dirty_abort keeps its parked state on purpose (owner must inspect).
+        if (git and created_branch and prev_branch and prev_branch != branch
+                and not args.dry_run and not dirty_abort
+                and _git_current_branch(project_dir) == branch
+                and _git_tree_clean(project_dir)):
+            back = _git(["checkout", prev_branch], project_dir)
+            if back.returncode == 0:
+                print(f"{pfx}Returned to your branch '{prev_branch}' "
+                      f"(fixes remain on {branch}).")
+            else:
+                print(f"{pfx}note: could not return to '{prev_branch}' "
+                      f"({_tail(back.stderr, 2)}); still on {branch}.")
         report(phase=("done - CLEAN" if converged else "done - partial"), done=True,
                fix_done=len(done_set), fix_total=total_to_review, fixed=len(done_set),
                defects=len(all_findings), errors=errors_total, cost=round(meter.usd, 4))
