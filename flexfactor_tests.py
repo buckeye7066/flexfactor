@@ -216,6 +216,96 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff.make_provider = real_make
             ff._provider_health = real_health
 
+    def test_preflight_env_mismatch_prefers_free_routed_cloud_over_ollama(self):
+        # 2026-08-11 live failure: a stale script passed `--provider openai`
+        # while the launch env BLANKED OPENAI_API_KEY and configured anthropic
+        # through the FREE local proxy (ANTHROPIC_BASE_URL=127.0.0.1:8082 +
+        # ANTHROPIC_AUTH_TOKEN). The free-first chain then demoted the run to
+        # local ollama while the intended free cloud proxy sat idle. A KEYLESS
+        # primary + a FREE-ROUTED usable other cloud provider must resolve to
+        # the free cloud route (env wins over the stale argument).
+        from unittest import mock
+
+        class Args:
+            provider = "openai"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name != "openai"  # openai keyless
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            with mock.patch.dict(os.environ, {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+                    "ANTHROPIC_AUTH_TOKEN": "freecc",
+                    "ANTHROPIC_API_KEY": ""}):
+                out = ff.build_audit_providers(Args)
+            # anthropic (free proxy) is primary; keyless openai never appears.
+            self.assertEqual([n for n, _ in out], ["anthropic"])
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_preflight_keyless_primary_without_free_route_still_falls_to_ollama(self):
+        # The env-mismatch guard fires ONLY for a free-routed other provider.
+        # With a real paid Anthropic key (no proxy signature), the owner's
+        # FREE-FIRST order still applies: keyless-openai primary -> ollama
+        # author, usable paid cloud kept as cross-check.
+        from unittest import mock
+
+        class Args:
+            provider = "openai"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name != "openai"
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            with mock.patch.dict(os.environ, {
+                    "ANTHROPIC_BASE_URL": "",
+                    "ANTHROPIC_AUTH_TOKEN": "",
+                    "ANTHROPIC_API_KEY": "sk-ant-realpaidkey"}):
+                out = ff.build_audit_providers(Args)
+            self.assertEqual([n for n, _ in out], ["ollama", "anthropic"])
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_provider_free_routed_signatures(self):
+        from unittest import mock
+        # Loopback base URL counts, auth-token-without-key counts, a real paid
+        # key with no proxy signature does not, and openai never does.
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+                                          "ANTHROPIC_AUTH_TOKEN": "",
+                                          "ANTHROPIC_API_KEY": "sk-ant-x"}):
+            self.assertTrue(ff._provider_free_routed("anthropic"))
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "",
+                                          "ANTHROPIC_AUTH_TOKEN": "freecc",
+                                          "ANTHROPIC_API_KEY": ""}):
+            self.assertTrue(ff._provider_free_routed("anthropic"))
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "",
+                                          "ANTHROPIC_AUTH_TOKEN": "",
+                                          "ANTHROPIC_API_KEY": "sk-ant-x"}):
+            self.assertFalse(ff._provider_free_routed("anthropic"))
+        self.assertFalse(ff._provider_free_routed("openai"))
+
     def test_preflight_all_keys_dead_returns_empty_with_diagnosis(self):
         # Every present key is rejected -> return [] AND set a credit-aware reason
         # so the caller can tell the user to top up (vs "no key set").
@@ -4667,6 +4757,28 @@ class EgressScanTests(unittest.TestCase):
         f = self.eg.scan_text('db_password = "V7n3Kq9Xz2Lw"')
         self.assertEqual([x["category"] for x in f], ["password_assignment"])
 
+    def test_readme_replace_with_instruction_values_pass(self):
+        # 2026-08-11 live false positive: FutureU's README documents example env
+        # lines whose values are "replace this" INSTRUCTIONS containing digits
+        # ('12'/'32'), which defeated the letters-AND-digits filter. The README
+        # excerpt rides into EVERY review payload via the PROGRAM CONTEXT
+        # preamble, so the whole program's cloud cross-check was egress-blocked
+        # (same payload lines [48, 49] across every file). Instructional
+        # replace-with values are documentation, not secrets.
+        for line in (
+            "FUTUREU_ADMIN_PASSWORD='replace-with-a-unique-12-plus-character-password' \\",
+            "FUTUREU_SESSION_SECRET='replace-with-at-least-32-random-characters' \\",
+            "SESSION_SECRET=replace-with-at-least-32-random-characters",
+            'password = "replace_me_before_deploy_2026"',
+        ):
+            self.assertEqual(self.eg.scan_text(line), [], f"false positive: {line}")
+        # ...but a REAL credential-like value still trips (no weakening).
+        # (This shape legitimately matches both the quoted-assignment and the
+        # env-line patterns - what matters is that it is CAUGHT.)
+        cats = {x["category"] for x in
+                self.eg.scan_text("FUTUREU_ADMIN_PASSWORD='V7n3Kq9Xz2Lw'")}
+        self.assertIn("password_assignment", cats)
+
     def test_env_reference_value_passes(self):
         self.assertEqual(self.eg.scan_text("SECRET_TOKEN=${VAULT_SECRET}"), [])
 
@@ -5411,6 +5523,128 @@ class OllamaProviderTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             redirectors[0].redirect_request(
                 req, None, 302, "Found", {}, "https://evil.example/collect")
+
+
+class OllamaThrottleTests(unittest.TestCase):
+    """2026-08-11 live failure: ~40 concurrent review calls (5 parallel programs
+    x 8 review workers) against ONE local ollama server queued past the 600s
+    HTTP timeout and every review died 'timed out' -> INCOMPLETE -> NOT clean.
+    The process-global gate bounds IN-FLIGHT requests (callers wait at the gate,
+    where no HTTP timeout ticks). Sized from measurement: one llama3.2 judge
+    review call = 49s on this machine (CPU-only), so 2 lanes stay far under the
+    per-call deadline."""
+
+    def setUp(self):
+        self._saved_gate = ff._OLLAMA_GATE
+        ff._OLLAMA_GATE = None
+
+    def tearDown(self):
+        ff._OLLAMA_GATE = self._saved_gate
+
+    def test_gate_default_is_two_lanes(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLEXFACTOR_OLLAMA_CONCURRENCY", None)
+            g = ff._ollama_gate()
+        self.assertTrue(g.acquire(blocking=False))
+        self.assertTrue(g.acquire(blocking=False))
+        self.assertFalse(g.acquire(blocking=False))  # third in-flight call waits
+        g.release(); g.release()
+
+    def test_gate_sized_from_env_and_bad_values_fall_back(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_OLLAMA_CONCURRENCY": "1"}):
+            g = ff._ollama_gate()
+        self.assertTrue(g.acquire(blocking=False))
+        self.assertFalse(g.acquire(blocking=False))
+        g.release()
+        ff._OLLAMA_GATE = None
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_OLLAMA_CONCURRENCY": "junk"}):
+            g = ff._ollama_gate()
+        self.assertTrue(g.acquire(blocking=False))
+        self.assertTrue(g.acquire(blocking=False))  # default 2
+        g.release(); g.release()
+
+    def test_chat_goes_through_the_gate(self):
+        # The wiring pin: OllamaProvider._chat must hold the gate for the HTTP
+        # call, so parallel sweeps physically cannot exceed the lane count.
+        entered = []
+
+        class _RecGate:
+            def __enter__(self):
+                entered.append(True)
+                return self
+
+            def __exit__(self, *a):
+                return False
+        ff._OLLAMA_GATE = _RecGate()  # _ollama_gate() returns it as-is
+
+        import io
+
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                # the gate must already be held when the request goes out
+                assert entered, "HTTP call issued without holding the ollama gate"
+                return _R(json.dumps({"message": {"content": "ok"}}).encode())
+        p = ff.OllamaProvider("coder")
+        p._opener = _Opener()
+        self.assertEqual(p.complete("x"), "ok")
+        self.assertEqual(len(entered), 1)
+
+    def test_http_timeout_env_override(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLEXFACTOR_OLLAMA_TIMEOUT", None)
+            self.assertEqual(ff._ollama_http_timeout(), 600.0)
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_OLLAMA_TIMEOUT": "1200"}):
+            self.assertEqual(ff._ollama_http_timeout(), 1200.0)
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_OLLAMA_TIMEOUT": "5"}):
+            self.assertEqual(ff._ollama_http_timeout(), 30.0)  # floor
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_OLLAMA_TIMEOUT": "junk"}):
+            self.assertEqual(ff._ollama_http_timeout(), 600.0)
+
+
+class PaidRescueStampedeTests(unittest.TestCase):
+    """The paid-rescue tier must drain through a bounded pipe: a timeout storm
+    on the free path (dozens of concurrent workers) must not become dozens of
+    simultaneous paid API calls. Extends the 041ac07 hold-window circuit."""
+
+    def setUp(self):
+        self._saved = ff._PAID_RESCUE_GATE
+        ff._PAID_RESCUE_GATE = None
+
+    def tearDown(self):
+        ff._PAID_RESCUE_GATE = self._saved
+
+    def test_gate_default_three_and_env_sizing(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLEXFACTOR_PAID_RESCUE_CONCURRENCY", None)
+            g = ff._paid_rescue_gate()
+        for _ in range(3):
+            self.assertTrue(g.acquire(blocking=False))
+        self.assertFalse(g.acquire(blocking=False))
+        for _ in range(3):
+            g.release()
+        ff._PAID_RESCUE_GATE = None
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_PAID_RESCUE_CONCURRENCY": "1"}):
+            g = ff._paid_rescue_gate()
+        self.assertTrue(g.acquire(blocking=False))
+        self.assertFalse(g.acquire(blocking=False))
+        g.release()
+
+    def test_paid_message_holds_the_gate(self):
+        # Source pin: the paid Anthropic replay path must run under the gate.
+        import inspect
+        src = inspect.getsource(ff.AnthropicProvider._paid_message)
+        self.assertIn("_paid_rescue_gate()", src)
 
     def test_default_preflight_pings_local_server_and_fails_closed(self):
         # Sol finding 3: default preflight must PING ollama (not reject it as

@@ -50,6 +50,12 @@ _PLACEHOLDER_HINTS = (
     "changeme", "change-me", "change_me", "dummy", "fake", "redacted",
     "insert", "<key>", "<token>", "<secret>", "todo", "1234567890",
     "abcdef123", "deadbeef",
+    # "replace this" instructions (2026-08-11 live false positive: FutureU's
+    # README documents FUTUREU_ADMIN_PASSWORD='replace-with-a-unique-12-plus-
+    # character-password' - the digits in "12"/"32" defeated the letters-AND-
+    # digits filter, and every review payload carries the README excerpt, so
+    # the whole program's cloud cross-check was egress-blocked).
+    "replace-with", "replace_with", "replaceme", "replace-me", "replace_me",
 )
 # Values that are clearly code/config REFERENCES to a secret, not the secret.
 _CODE_VALUE_HINTS = (

@@ -40,8 +40,10 @@ if ($programs.Count -eq 0) {
 }
 
 # Key detection. Audit wants BOTH models when it can get them. Figure out what
-# keys are available and pick the primary provider accordingly.
-$haveAnthropic = -not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)
+# keys are available and pick the primary provider accordingly. Anthropic also
+# counts a Bearer credential (ANTHROPIC_AUTH_TOKEN, e.g. the free FCC proxy) -
+# same rule as flexfactor.py's _provider_key_present (2026-08-11).
+$haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
 $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
 
 # extraArgs collects every optional flag we add below (report-only, merge, etc).
@@ -68,6 +70,21 @@ if ($haveAnthropic -and $haveOpenai) {
 # Let the user override the primary provider, but default to what we detected.
 $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
 if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+# GUARD (2026-08-11 live failure): never pass a provider whose credential this
+# environment does not carry - a keyless '--provider openai' demoted a whole
+# 5-program run to local ollama at preflight. The env wins over the answer.
+if ($provider -ne "openai" -and $provider -ne "anthropic") {
+    Write-Host "Unknown provider '$provider' - using $defaultProvider." -ForegroundColor Yellow
+    $provider = $defaultProvider
+}
+if ($provider -eq "openai" -and -not $haveOpenai) {
+    Write-Host "OPENAI_API_KEY is not set in this environment - using anthropic instead." -ForegroundColor Yellow
+    $provider = "anthropic"
+}
+if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
+    Write-Host "No Anthropic credential in this environment - using openai instead." -ForegroundColor Yellow
+    $provider = "openai"
+}
 $primary = $provider
 
 # Apply vs report-only. SAFE DEFAULT is report-only; type "apply" to opt in to

@@ -168,6 +168,10 @@ if ($mode -eq "4") {
     Write-Host "  Verified fixes land on a flexfactor/prodready-* branch, then merge into" -ForegroundColor DarkGray
     Write-Host "  the current branch and push to origin automatically (green-build gated)." -ForegroundColor DarkGray
     Write-Host ""
+    # '--provider anthropic' matches the free-proxy env this launcher itself sets
+    # above (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) - the argument and the env
+    # can never disagree here. Do NOT change this to openai: OPENAI_API_KEY is
+    # blanked in this environment (2026-08-11 guard).
     $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
@@ -201,6 +205,22 @@ if ($mode -eq "3") {
 
     $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
     if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+    # GUARD (2026-08-11 live failure): this launcher BLANKS OPENAI_API_KEY for the
+    # free-proxy env, so '--provider openai' is guaranteed unusable here and used
+    # to demote the whole run to local ollama at preflight. Never pass a provider
+    # whose credential this environment does not carry - the env wins.
+    if ($provider -ne "openai" -and $provider -ne "anthropic") {
+        Write-Host "Unknown provider '$provider' - using $defaultProvider." -ForegroundColor Yellow
+        $provider = $defaultProvider
+    }
+    if ($provider -eq "openai" -and -not $haveOpenai) {
+        Write-Host "OPENAI_API_KEY is blank in this environment (free-proxy mode) - using anthropic (free proxy) instead." -ForegroundColor Yellow
+        $provider = "anthropic"
+    }
+    if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
+        Write-Host "No Anthropic credential in this environment - using openai instead." -ForegroundColor Yellow
+        $provider = "openai"
+    }
     $primary = $provider
 
     # Programs: audit can take UP TO FIVE in one run. Each can be a folder, file,

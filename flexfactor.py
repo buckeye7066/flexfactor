@@ -1106,6 +1106,30 @@ def _fallback_hold_active() -> bool:
         return time.monotonic() < _FALLBACK_HOLD_UNTIL
 
 
+# STAMPEDE BOUND (2026-08-11, extends the hold-window circuit): when the free
+# path degrades under a parallel sweep, MANY worker threads can hit the rescue
+# path at once - each one a real paid API call. The hold window already stops
+# them re-probing the wedged free path; this gate additionally bounds how many
+# paid calls are IN FLIGHT at once, so a timeout storm drains through a narrow
+# paid pipe instead of stampeding the whole sweep onto the paid tier
+# simultaneously. Tune with FLEXFACTOR_PAID_RESCUE_CONCURRENCY (default 3).
+_PAID_RESCUE_GATE_LOCK = threading.Lock()
+_PAID_RESCUE_GATE: "threading.BoundedSemaphore | None" = None
+
+
+def _paid_rescue_gate() -> "threading.BoundedSemaphore":
+    global _PAID_RESCUE_GATE
+    with _PAID_RESCUE_GATE_LOCK:
+        if _PAID_RESCUE_GATE is None:
+            raw = (os.environ.get("FLEXFACTOR_PAID_RESCUE_CONCURRENCY") or "").strip()
+            try:
+                n = max(1, int(raw)) if raw else 3
+            except ValueError:
+                n = 3
+            _PAID_RESCUE_GATE = threading.BoundedSemaphore(n)
+        return _PAID_RESCUE_GATE
+
+
 class PaidRescueNeeded(RuntimeError):
     """Internal signal: the free path AND the paid-Anthropic rescue both failed
     (or no Anthropic rescue key is set) while an OpenAI rescue key exists. The
@@ -1177,7 +1201,10 @@ class AnthropicProvider:
         client = self._paid_client()
         if client is not None:
             try:
-                msg = _stream_with_deadline(client, deadline_s=0.0, **kwargs)
+                # Bounded paid pipe: a degraded free path under a parallel sweep
+                # must not stampede every worker onto the paid tier at once.
+                with _paid_rescue_gate():
+                    msg = _stream_with_deadline(client, deadline_s=0.0, **kwargs)
                 print("  [fallback] free path failed for this call - served by the "
                       "paid Anthropic API (free proxy stays primary)")
                 return msg
@@ -1608,6 +1635,46 @@ class OpenAIProvider:
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# ---- Global ollama concurrency gate (2026-08-11 live failure) --------------- #
+# One local server serves EVERY OllamaProvider call in this process - including
+# all programs of a --parallel run and all REVIEW_WORKERS threads per program.
+# The 2026-08-11 5-program audit put ~40 concurrent review calls against it;
+# ollama serves them (near-)serially, so queued requests blew the 600s HTTP
+# timeout and every review died with "timed out" -> INCOMPLETE -> NOT clean.
+# MEASURED on this machine (2026-08-11, CPU-only inference - /api/ps reports
+# size_vram=0): one llama3.2 judge-tier review call = 49s; deepseek-coder:33b
+# could not produce 5 tokens in 280s (model load alone exceeds minutes).
+# The gate bounds IN-FLIGHT HTTP requests; excess callers wait HERE, where no
+# HTTP timeout is ticking, instead of inside ollama's queue where it is. At the
+# default of 2, per-call wall time stays far under the 600s deadline (2 lanes x
+# ~49s judge calls) while still overlapping request setup. Tune with
+# FLEXFACTOR_OLLAMA_CONCURRENCY; the per-call HTTP timeout itself can be tuned
+# with FLEXFACTOR_OLLAMA_TIMEOUT (default 600s) for slower models/machines.
+_OLLAMA_GATE_LOCK = threading.Lock()
+_OLLAMA_GATE: "threading.BoundedSemaphore | None" = None
+
+
+def _ollama_gate() -> "threading.BoundedSemaphore":
+    """The process-wide in-flight ollama call limiter (lazily sized from env)."""
+    global _OLLAMA_GATE
+    with _OLLAMA_GATE_LOCK:
+        if _OLLAMA_GATE is None:
+            raw = (os.environ.get("FLEXFACTOR_OLLAMA_CONCURRENCY") or "").strip()
+            try:
+                n = max(1, int(raw)) if raw else 2
+            except ValueError:
+                n = 2
+            _OLLAMA_GATE = threading.BoundedSemaphore(n)
+        return _OLLAMA_GATE
+
+
+def _ollama_http_timeout() -> float:
+    raw = (os.environ.get("FLEXFACTOR_OLLAMA_TIMEOUT") or "").strip()
+    try:
+        return max(30.0, float(raw)) if raw else 600.0
+    except ValueError:
+        return 600.0
+
 
 def _local_only_opener():
     """urllib opener for the local-only provider (Sol findings 1+2): NO proxy
@@ -1677,8 +1744,12 @@ class OllamaProvider:
                 self.base_url + "/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}, method="POST")
-            with self._opener.open(req, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            # The gate bounds concurrent in-flight requests to what one local
+            # server can actually serve; waiting here does NOT tick the HTTP
+            # timeout (that starts only once the request is sent).
+            with _ollama_gate():
+                with self._opener.open(req, timeout=_ollama_http_timeout()) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
             if self.meter is not None:
                 self.meter.record(f"ollama:{model}",
                                   input_tokens=int(data.get("prompt_eval_count") or 0),
@@ -1962,6 +2033,28 @@ def _provider_key_present(name: str) -> bool:
     return False
 
 
+def _provider_free_routed(name: str) -> bool:
+    """True when this CLOUD provider's traffic is routed through the free local
+    proxy rather than the paid API. Signature (set by the launchers): anthropic
+    credentialed by ANTHROPIC_AUTH_TOKEN with no ANTHROPIC_API_KEY, or an
+    ANTHROPIC_BASE_URL pointing at loopback. Used by build_audit_providers to
+    recognize that falling back to this provider costs nothing - so it may win
+    over local ollama without violating the FREE-FIRST owner order."""
+    if name != "anthropic":
+        return False
+    base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    host = ""
+    try:
+        import urllib.parse
+        host = urllib.parse.urlsplit(base).hostname or ""
+    except ValueError:
+        pass
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return True
+    return (not os.environ.get("ANTHROPIC_API_KEY")
+            and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")))
+
+
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
 # _provider_health() so a batch / --parallel run pings each provider at most once.
 # Lock-guarded AND single-flight: the first caller pings while the rest wait on an
@@ -2092,7 +2185,25 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # to ollama from a cloud primary is different - the owner asked for a cloud
     # run, so a usable cloud provider is KEPT as the cross-check reviewer.
     if not _usable(primary):
-        if primary != "ollama" and _usable("ollama"):
+        # ENV-MISMATCH GUARD (2026-08-11 live failure): a stale script passed
+        # `--provider openai` while the launch environment deliberately BLANKED
+        # OPENAI_API_KEY and configured anthropic through the FREE local proxy
+        # (ANTHROPIC_BASE_URL=127.0.0.1:8082 + ANTHROPIC_AUTH_TOKEN). The old
+        # free-first chain then picked local ollama - which could not sustain
+        # the run - while the intended free cloud proxy sat idle. When the
+        # chosen primary has NO credential at all (never configured, as opposed
+        # to a present-but-dead key) and the OTHER cloud provider is FREE-routed
+        # and usable, the environment - not the argument - is authoritative:
+        # prefer the configured free route. This does not violate FREE-FIRST
+        # (both candidates are free; the proxy is the stronger one).
+        if (other and not _provider_key_present(primary)
+                and _provider_free_routed(other) and _usable(other)):
+            print(f"  [preflight] '--provider {primary}' has no credential in this "
+                  f"environment, but '{other}' is configured via the free local "
+                  f"proxy - using '{other}' as primary (env wins over a stale "
+                  f"--provider argument).", file=sys.stderr)
+            primary, other = other, primary
+        elif primary != "ollama" and _usable("ollama"):
             print(f"  [preflight] falling back: primary '{primary}' unusable, using FREE "
                   f"'ollama' (paid cloud keys stay as cross-check/fallback).",
                   file=sys.stderr)
