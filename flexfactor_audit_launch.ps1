@@ -71,12 +71,14 @@ if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
 $primary = $provider
 
 # Apply vs report-only. SAFE DEFAULT is report-only; type "apply" to opt in to
-# committing verified fixes LOCALLY on the audit branch (no push).
+# committing verified fixes. Merge+push to the current branch/origin are the CLI
+# defaults now (owner order 2026-08-11), green-build gated.
 $apply = Read-Host "Apply fixes? [report / apply] (Enter = report)"
 if ($apply -match '^(a|apply|y|yes)$') {
     $extraArgs += "--apply"
     $extraArgs += "--yes"
-    Write-Host "Apply mode: verified fixes are committed LOCALLY on the audit branch (no push)." -ForegroundColor Yellow
+    Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow
+    Write-Host "branch, and pushed to origin automatically (green-build gated)." -ForegroundColor Yellow
 } else {
     Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
 }
@@ -92,11 +94,8 @@ if ($econ -match '^(n|no)$') {
     Write-Host "Economy mode: Sonnet 5 authors fixes; review stays on the cheap judge tier." -ForegroundColor DarkGray
 }
 
-# Optionally merge verified fixes into the current branch.
-$merge = Read-Host "Merge verified fixes into the current branch? [y/N]"
-if ($merge -match '^(y|yes)$') {
-    $extraArgs += "--merge"
-}
+# Merge+push into the current branch are automatic now (CLI defaults ON,
+# owner order 2026-08-11); pass --no-merge/--no-push at the CLI to opt out.
 
 # Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":
 # a run used to hard-stop just because that repo had pre-existing uncommitted

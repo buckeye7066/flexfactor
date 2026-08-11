@@ -788,7 +788,9 @@ class AuditApplyDefaultTests(unittest.TestCase):
         finally:
             ff.run_audit = real
         self.assertFalse(cap["args"].apply)   # <-- would be True on the pre-fix parser
-        self.assertFalse(cap["args"].push)    # never auto-push
+        # Owner directive 2026-08-11: push defaults ON (ship results to main).
+        # Inert here because report-only never commits; --no-push still wins.
+        self.assertTrue(cap["args"].push)
 
     def test_apply_flag_enables_mutation(self):
         real = ff.run_audit
@@ -6885,9 +6887,10 @@ class ResidualMaterialityBarTests(unittest.TestCase):
 
 
 class ProdreadyShipDefaultsTests(unittest.TestCase):
-    """Owner directive 2026-08-10: prodready's job is not done until verified work
-    is back on the main branch. push+merge default ON in prodready (gated on
-    remote-present and green-final-build respectively); audit keeps them OFF."""
+    """Owner directive 2026-08-10 (extended to audit 2026-08-11): FlexFactor's job
+    is not done until verified work is back on the main branch. push+merge
+    default ON in BOTH audit and prodready (gated on remote-present and
+    green-final-build respectively); --no-push/--no-merge still win."""
 
     def _parse(self, mode, extra=()):
         import types
@@ -6916,8 +6919,14 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
         self.assertFalse(args.push)
         self.assertFalse(args.merge)
 
-    def test_audit_keeps_push_and_merge_off(self):
+    def test_audit_defaults_push_and_merge_on(self):
+        # Owner directive 2026-08-11: audit results also ship to main by default.
         args = self._parse("audit")
+        self.assertTrue(args.push)
+        self.assertTrue(args.merge)
+
+    def test_audit_no_push_no_merge_win(self):
+        args = self._parse("audit", ["--no-push", "--no-merge"])
         self.assertFalse(args.push)
         self.assertFalse(args.merge)
 
@@ -7707,6 +7716,132 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertEqual(client.api_key, "sk-ant-test")
         self.assertIn("api.anthropic.com", str(client.base_url),
                       "the rescue client must target the REAL API, not the proxy")
+
+
+class ConsoleMeterTests(unittest.TestCase):
+    """Live console progress meter (owner report 2026-08-11: 'no progress meter
+    in option 4'). Pure logic (formatting/render/field-merge) plus the two I/O
+    modes: in-place \\r line on a TTY, heartbeat lines when redirected."""
+
+    def test_fmt_elapsed(self):
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(0), "0s")
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(37), "37s")
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(65), "1m05s")
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(252.9), "4m12s")
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(3725), "1h02m")
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(-5), "0s")       # clamps
+        self.assertEqual(ff.ConsoleMeter.fmt_elapsed(None), "0s")     # never raises
+
+    def test_render_line_full_fields(self):
+        line = ff.ConsoleMeter.render_line(
+            {"name": "MyApp", "phase": "reviewing (cycle 2/12)", "reviewed": 3,
+             "files_total": 42, "fix_done": 1, "fix_total": 42, "defects": 7,
+             "current_file": "src/deep/thing.py", "cost": 0.325, "cap": 50.0},
+            elapsed_secs=252, spin="|")
+        self.assertIn("| MyApp reviewing (cycle 2/12)", line)
+        self.assertIn("reviewed 3/42", line)
+        self.assertIn("resolved 1/42", line)
+        self.assertIn("defects 7", line)
+        self.assertIn("thing.py", line)
+        self.assertIn("$0.33/$50", line)
+        self.assertIn("4m12s", line)
+
+    def test_render_line_sparse_fields_and_defaults(self):
+        # Early phases have no counts yet: only phase + elapsed appear, no
+        # 'reviewed 0/None' garbage and no crash on missing keys.
+        line = ff.ConsoleMeter.render_line({}, 5)
+        self.assertIn("working", line)
+        self.assertIn("5s", line)
+        self.assertNotIn("reviewed", line)
+        self.assertNotIn("resolved", line)
+        self.assertNotIn("$", line)
+
+    def test_render_line_truncates_to_width(self):
+        line = ff.ConsoleMeter.render_line(
+            {"name": "X" * 50, "phase": "p" * 100}, 1, spin="|", width=40)
+        self.assertLessEqual(len(line), 40)
+        self.assertTrue(line.endswith("..."))
+
+    def test_render_line_bad_cost_never_raises(self):
+        line = ff.ConsoleMeter.render_line({"cost": "garbage", "cap": None}, 1)
+        self.assertIn("working", line)  # cost segment silently dropped
+
+    def test_update_merges_and_ignores_none(self):
+        m = ff.ConsoleMeter(stream=None, tty=False)
+        m.update(phase="reviewing", reviewed=3)
+        m.update(reviewed=None, defects=2)  # None must not clobber
+        self.assertEqual(m.fields["reviewed"], 3)
+        self.assertEqual(m.fields["phase"], "reviewing")
+        self.assertEqual(m.fields["defects"], 2)
+
+    def test_heartbeat_mode_emits_plain_lines(self):
+        import io
+        buf = io.StringIO()
+        m = ff.ConsoleMeter(stream=buf, tty=False, heartbeat_secs=0.05)
+        m.update(phase="baseline build gate", cost=0.1)
+        m.start()
+        try:
+            time.sleep(0.18)
+        finally:
+            m.stop()
+        out = buf.getvalue()
+        self.assertIn("[progress]", out)
+        self.assertIn("baseline build gate", out)
+        self.assertNotIn("\r", out)  # no control junk in redirected logs
+        self.assertGreaterEqual(out.count("[progress]"), 2)
+
+    def test_tty_mode_draws_in_place_and_restores_print(self):
+        import builtins
+        import io
+        orig_print = builtins.print
+        buf = io.StringIO()
+        m = ff.ConsoleMeter(stream=buf, tty=True, tick_secs=0.03)
+        m.update(name="App", phase="reviewing", reviewed=1, files_total=4)
+        m.start()
+        try:
+            time.sleep(0.12)
+            self.assertIsNot(builtins.print, orig_print,
+                             "TTY mode must interpose print for clean interleaving")
+        finally:
+            m.stop()
+        self.assertIs(builtins.print, orig_print, "print restored after stop()")
+        out = buf.getvalue()
+        self.assertIn("\r", out)
+        self.assertIn("reviewing", out)
+        self.assertIn("reviewed 1/4", out)
+        # stop() must leave the line erased (ends with a bare \r after padding)
+        self.assertTrue(out.endswith("\r"))
+
+    def test_second_concurrent_meter_is_a_noop(self):
+        import io
+        b1, b2 = io.StringIO(), io.StringIO()
+        m1 = ff.ConsoleMeter(stream=b1, tty=False, heartbeat_secs=0.04)
+        m2 = ff.ConsoleMeter(stream=b2, tty=False, heartbeat_secs=0.04)
+        m1.update(phase="one")
+        m2.update(phase="two")
+        m1.start()
+        try:
+            m2.start()  # active slot taken -> must not draw
+            time.sleep(0.1)
+        finally:
+            m2.stop()
+            m1.stop()
+        self.assertIn("one", b1.getvalue())
+        self.assertEqual(b2.getvalue(), "", "second meter must stay silent")
+        # After both stopped, the slot is free again for a fresh meter.
+        b3 = io.StringIO()
+        m3 = ff.ConsoleMeter(stream=b3, tty=False, heartbeat_secs=0.04)
+        m3.update(phase="three")
+        m3.start()
+        try:
+            time.sleep(0.1)
+        finally:
+            m3.stop()
+        self.assertIn("three", b3.getvalue())
+
+    def test_stop_without_start_is_safe(self):
+        m = ff.ConsoleMeter(stream=None, tty=False)
+        m.stop()  # must not raise
 
 
 if __name__ == "__main__":

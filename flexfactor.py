@@ -551,6 +551,222 @@ class ProgressBus:
 # Module-level bus shared across concurrently-audited programs.
 _PROGRESS = ProgressBus()
 
+
+class ConsoleMeter:
+    """Live CONSOLE progress meter for an audit/prodready run.
+
+    The Tk dashboard already gets per-state updates via ProgressBus, but the
+    console itself only printed discrete log lines - a slow model call or a
+    long `npm install`/build left the launcher window frozen for minutes with
+    no sign of life (the owner's "no progress meter in option 4" report). This
+    draws ONE status line fed from the same report(**fields) stream the
+    dashboard uses, and a background tick keeps the spinner/elapsed moving
+    even while a single long call is in flight.
+
+    TTY-aware:
+      - stdout is a TTY  -> an in-place line (\\r + pad-erase; deliberately no
+        ANSI escapes so plain conhost works). While active, builtins.print is
+        wrapped so normal log lines first erase the meter line, print cleanly,
+        and the meter repaints on the next tick.
+      - stdout redirected -> plain heartbeat lines every `heartbeat_secs`
+        (default 30s), so log files show liveness with no \\r control junk.
+
+    Best-effort by design (same contract as ProgressBus): every draw is
+    exception-guarded so a broken console can never break an audit. Only ONE
+    meter draws per process; a second concurrent start() (parallel program
+    runs) is a no-op so interleaved [i/N] prefixed output stays readable.
+    ASCII-only output (launcher consoles may be CP1252)."""
+
+    SPIN = "|/-\\"
+    _active_lock = threading.Lock()
+    _active = None  # the one ConsoleMeter currently drawing, or None
+
+    def __init__(self, stream=None, tty: bool | None = None,
+                 heartbeat_secs: float = 30.0, tick_secs: float = 0.5):
+        self.stream = stream if stream is not None else sys.stdout
+        if tty is None:
+            try:
+                tty = bool(self.stream.isatty())
+            except Exception:
+                tty = False
+        self.tty = bool(tty)
+        self.heartbeat_secs = heartbeat_secs
+        self.tick_secs = tick_secs
+        self.fields: dict = {}
+        self._lock = threading.RLock()
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at = 0.0
+        self._spin_i = 0
+        self._last_len = 0
+        self._orig_print = None
+
+    # ---- pure helpers (unit-tested; no I/O) ---------------------------------
+    @staticmethod
+    def fmt_elapsed(secs: float) -> str:
+        """37 -> '37s', 252 -> '4m12s', 3725 -> '1h02m'."""
+        try:
+            secs = max(0, int(secs))
+        except (TypeError, ValueError):
+            secs = 0
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h{m:02d}m"
+        if m:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    @staticmethod
+    def render_line(fields: dict, elapsed_secs: float, spin: str = "",
+                    width: int = 0) -> str:
+        """Build the status line from a report(**fields) snapshot.
+
+        Shows only what is known so far (early phases have no counts yet).
+        `width` > 0 truncates with an ellipsis so an in-place draw never wraps
+        (a wrapped line can't be erased with \\r)."""
+        parts = []
+        name = str(fields.get("name") or "")[:24]
+        phase = str(fields.get("phase") or "working")
+        head = " ".join(x for x in (spin, name, phase) if x)
+        parts.append(head)
+        files_total = fields.get("files_total")
+        if fields.get("reviewed") is not None and files_total:
+            parts.append(f"reviewed {fields['reviewed']}/{files_total}")
+        if fields.get("fix_total"):
+            parts.append(f"resolved {fields.get('fix_done', 0)}/{fields['fix_total']}")
+        if fields.get("defects") is not None:
+            parts.append(f"defects {fields['defects']}")
+        cur = fields.get("current_file")
+        if cur:
+            parts.append(os.path.basename(str(cur))[:32])
+        cost = fields.get("cost")
+        if cost is not None:
+            cap = fields.get("cap")
+            try:
+                tag = f"${float(cost):.2f}" + (f"/${float(cap):.0f}" if cap else "")
+                parts.append(tag)
+            except (TypeError, ValueError):
+                pass
+        parts.append(ConsoleMeter.fmt_elapsed(elapsed_secs))
+        line = " | ".join(p for p in parts if p)
+        if width and len(line) > width:
+            line = line[: max(0, width - 3)] + "..."
+        return line
+
+    # ---- lifecycle ----------------------------------------------------------
+    def update(self, **fields) -> None:
+        """Merge a report() snapshot (None values are ignored). Thread-safe."""
+        with self._lock:
+            for k, v in fields.items():
+                if v is not None:
+                    self.fields[k] = v
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        with ConsoleMeter._active_lock:
+            if ConsoleMeter._active is not None:
+                return  # another program's meter is drawing (parallel run)
+            ConsoleMeter._active = self
+        self._started_at = time.time()
+        self._stop_evt.clear()
+        if self.tty:
+            self._install_print_wrapper()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="flexfactor-console-meter")
+        self._thread.start()
+
+    def stop(self) -> None:
+        with ConsoleMeter._active_lock:
+            if ConsoleMeter._active is self and self._thread is None:
+                ConsoleMeter._active = None  # start() claimed but thread never ran
+        if self._thread is None:
+            return
+        self._stop_evt.set()
+        self._thread.join(timeout=5)
+        self._thread = None
+        with self._lock:
+            self._erase_line_locked()
+        self._restore_print_wrapper()
+        with ConsoleMeter._active_lock:
+            if ConsoleMeter._active is self:
+                ConsoleMeter._active = None
+
+    # ---- drawing ------------------------------------------------------------
+    def _loop(self) -> None:
+        interval = self.tick_secs if self.tty else self.heartbeat_secs
+        if self.tty:
+            self._draw()  # show life immediately; heartbeats wait one interval
+        while not self._stop_evt.wait(interval):
+            self._draw()
+
+    def _draw(self) -> None:
+        try:
+            with self._lock:
+                elapsed = time.time() - self._started_at
+                if self.tty:
+                    self._spin_i = (self._spin_i + 1) % len(self.SPIN)
+                    spin = self.SPIN[self._spin_i]
+                    try:
+                        width = shutil.get_terminal_size((100, 25)).columns - 1
+                    except (OSError, ValueError):
+                        width = 99
+                    line = self.render_line(self.fields, elapsed, spin,
+                                            max(20, width))
+                    pad = " " * max(0, self._last_len - len(line))
+                    self.stream.write("\r" + line + pad)
+                    self.stream.flush()
+                    self._last_len = len(line)
+                else:
+                    if self.fields.get("done"):
+                        return
+                    line = self.render_line(self.fields, elapsed)
+                    self.stream.write(f"[progress] {line}\n")
+                    self.stream.flush()
+        except Exception:
+            pass  # progress is best-effort; never break the audit
+
+    def _erase_line_locked(self) -> None:
+        if not self.tty or self._last_len <= 0:
+            return
+        try:
+            self.stream.write("\r" + " " * self._last_len + "\r")
+            self.stream.flush()
+        except Exception:
+            pass
+        self._last_len = 0
+
+    # ---- print coordination (TTY mode only) ---------------------------------
+    def _install_print_wrapper(self) -> None:
+        """Wrap builtins.print so log lines never land on top of the meter line.
+
+        Without this, print() output would append to the un-terminated meter
+        line and garble the console. The wrapper erases the meter line first;
+        the meter repaints on its next tick. Restored on stop()."""
+        import builtins
+        if self._orig_print is not None:
+            return
+        orig = builtins.print
+        this = self
+
+        def _meter_print(*a, **kw):
+            try:
+                with this._lock:
+                    this._erase_line_locked()
+            except Exception:
+                pass
+            return orig(*a, **kw)
+
+        self._orig_print = orig
+        builtins.print = _meter_print
+
+    def _restore_print_wrapper(self) -> None:
+        import builtins
+        if self._orig_print is not None:
+            builtins.print = self._orig_print
+            self._orig_print = None
+
 # The schema the grader must return. Structured outputs don't support numeric
 # range constraints, so we validate/clamp `grade` to 0..100 in Python.
 GRADE_SCHEMA = {
@@ -7420,6 +7636,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
               "fixed": 0, "unverified": 0, "test_status": None, "e2e_status": "skipped",
               "commit_status": "n/a", "report_path": None, "cycles": 0, "error": None}
     lock_path: str | None = None
+    # Live console meter (spinner/heartbeat). Created up front so `finally` can
+    # always stop it; started once the program is resolved and reporting begins.
+    console_meter = ConsoleMeter()
     try:
         # 1. Resolve the program to a local source folder.
         display_name, _ctx = resolve_program_input(program_arg)
@@ -7447,7 +7666,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # persistent "brain" so we can recall what we did to this program before.
         meter = CostMeter(args.max_cost if getattr(args, "max_cost", 0) else None)
         oversized: list[str] = []
-        report = lambda **kw: _PROGRESS.update(index, **kw)  # dashboard feed
+        def report(**kw):  # dashboard feed + live console meter (same stream)
+            _PROGRESS.update(index, **kw)
+            console_meter.update(**kw)
         prior = _load_brain().get(project_dir) or {}
         # Files the brain already drove clean - skipped this run (unless --recheck)
         # so repeated capped runs continue where the last stopped and the whole
@@ -7477,6 +7698,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                      if prior.get("oversized_files") else ""))
         report(name=display_name, dir=project_dir, phase="starting",
                cost=0.0, cap=meter.limit_usd, done=False, errors=0, fixed=0, defects=0)
+        console_meter.start()  # in-place spinner on a TTY, heartbeat lines otherwise
 
         stack = _detect_stack(project_dir)
         if stack.get("config_refused"):
@@ -7602,6 +7824,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     verified nothing. Installing first is what makes the gate mean anything.
         bootstrap_results = []
         if not report_only and getattr(args, "bootstrap", True):
+            report(phase="installing dependencies (bootstrap)")
             bootstrap_results = _run_bootstrap_phase(
                 project_dir, stack, pfx, allow_scripts=getattr(args, "allow_scripts", False))
             failed = [s for s in bootstrap_results if not s.ok]
@@ -7621,6 +7844,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             baseline_ok = True
             print(f"{pfx}report-only/dry-run: skipping baseline build (no fixes will be gated).")
         else:
+            report(phase="baseline build gate")
             baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (True, "")
             if not baseline_ok:
                 print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
@@ -8235,6 +8459,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             pass
         return result
     finally:
+        console_meter.stop()  # erase the meter line + restore builtins.print
         _release_audit_lock(lock_path)
 
 
@@ -8987,16 +9212,20 @@ def main(argv=None) -> int:
         parser.add_argument("--app-url", default=None, dest="app_url",
                             help="Base URL the dev server serves on (default: guessed from framework).")
         parser.add_argument("--push", action="store_true", dest="push", default=False,
-                            help="Push the audit branch to origin (default: OFF - commit locally "
-                                 "only, never auto-push).")
+                            help="Push the audit branch (and the merged base) to origin. "
+                                 "Default: ON in both audit --apply and prodready (owner "
+                                 "directive 2026-08-11: verified results go to main "
+                                 "automatically); --no-push turns it off.")
         parser.add_argument("--no-push", action="store_false", dest="push",
-                            help="Keep commits local (audit default is already off; prodready "
-                                 "defaults push ON, this turns it back off).")
+                            help="Keep commits local (audit and prodready both default "
+                                 "push ON; this turns it back off).")
         parser.add_argument("--merge", action="store_true", dest="merge",
-                            help="If the final build passes, merge the audit branch into the current branch.")
+                            help="If the final build passes, merge the audit branch into the "
+                                 "current branch (default: ON; --no-merge turns it off).")
         parser.add_argument("--no-merge", action="store_false", dest="merge",
-                            help="Do not merge into the current branch (prodready defaults "
-                                 "merge ON, gated on a green final build; this turns it off).")
+                            help="Do not merge into the current branch (audit and prodready "
+                                 "both default merge ON, gated on a green final build; "
+                                 "this turns it off).")
         parser.add_argument("--branch-prefix", default="flexfactor/audit-", dest="branch_prefix",
                             help="Prefix for the audit branch (default: flexfactor/audit-).")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
@@ -9035,17 +9264,20 @@ def main(argv=None) -> int:
                 args.fix_severity = "medium"
             if args.branch_prefix == "flexfactor/audit-":
                 args.branch_prefix = "flexfactor/prodready-"
-            # Owner directive (2026-08-10): prodready's job is not done until the
-            # verified work is BACK on the main branch headed for production.
-            # Default push+merge ON. Both stay gated: push needs a remote (and
-            # never force-pushes over others' work - --force-with-lease), merge
-            # happens ONLY when the final build gate is green, and a merge
-            # conflict aborts cleanly rather than forcing. Explicit --no-push /
-            # --no-merge (raw argv, same pattern as --apply above) win.
-            if "--no-push" not in rest:
-                args.push = True
-            if "--no-merge" not in rest:
-                args.merge = True
+        # Owner directive (2026-08-10, extended to audit 2026-08-11): FlexFactor's
+        # job is not done until the verified work is BACK on the main branch
+        # headed for production - "automatically push results to main". Default
+        # push+merge ON for BOTH audit and prodready. Both stay gated: push
+        # needs a remote (and never force-pushes over others' work -
+        # --force-with-lease), merge happens ONLY when the final build gate is
+        # green, a merge conflict aborts cleanly rather than forcing, and a
+        # protected main falls back to a PR with auto-merge. Report-only runs
+        # never commit, so the defaults are inert there. Explicit --no-push /
+        # --no-merge (raw argv, same pattern as --apply above) win.
+        if "--no-push" not in rest:
+            args.push = True
+        if "--no-merge" not in rest:
+            args.merge = True
         _set_egress_mode(args)
         return run_audit(args)
 

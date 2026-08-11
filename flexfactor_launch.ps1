@@ -165,7 +165,8 @@ if ($mode -eq "4") {
     Write-Host ""
     Write-Host "  Running: detect toolchains -> install dependencies -> review + fix" -ForegroundColor DarkGray
     Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
-    Write-Host "  Fixes land on a flexfactor/prodready-* branch; nothing is pushed." -ForegroundColor DarkGray
+    Write-Host "  Verified fixes land on a flexfactor/prodready-* branch, then merge into" -ForegroundColor DarkGray
+    Write-Host "  the current branch and push to origin automatically (green-build gated)." -ForegroundColor DarkGray
     Write-Host ""
     $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy'))
     Write-Host ""
@@ -235,13 +236,9 @@ if ($mode -eq "3") {
     } else {
         $extraArgs += "--apply"
         $extraArgs += "--yes"
-        Write-Host "Apply mode: verified fixes are committed and pushed each cycle." -ForegroundColor DarkGray
-    }
-
-    # Optionally merge verified fixes into the current branch.
-    $merge = Read-Host "Merge verified fixes into the current branch? [y/N]"
-    if ($merge -match '^(y|yes)$') {
-        $extraArgs += "--merge"
+        Write-Host "Apply mode: verified fixes are committed each cycle, merged into the" -ForegroundColor DarkGray
+        Write-Host "current branch, and pushed to origin/main automatically (green-build" -ForegroundColor DarkGray
+        Write-Host "gated; owner order 2026-08-11). CLI --no-push/--no-merge opt out." -ForegroundColor DarkGray
     }
 
     # Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":

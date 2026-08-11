@@ -174,6 +174,20 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
+- Console progress: `ConsoleMeter` (2026-08-11, "no progress meter in option 4")
+  draws ONE live status line fed from the same `report(**fields)` stream the
+  dashboard uses, with a background tick so spinner/elapsed move during long
+  silent LLM/build calls. TTY -> in-place `\r` line (no ANSI; wraps
+  builtins.print while active so log lines interleave cleanly, restored on
+  stop); redirected -> `[progress]` heartbeat lines every 30s. Best-effort
+  (never breaks an audit), ASCII-only, one drawing meter per process
+  (parallel runs: extras are no-ops). Started/stopped in `audit_one_program`.
+- SHIP TO MAIN (owner order 2026-08-10, extended to audit 2026-08-11): push+
+  merge default ON for BOTH audit --apply and prodready — verified results go
+  back to main automatically. Still gated: merge only on a green final build,
+  push `--force-with-lease` for the sandbox branch, protected mains fall back
+  to a PR with auto-merge, conflicts abort cleanly. `--no-push`/`--no-merge`
+  (raw-argv checked) opt out; report-only runs never commit so it's inert there.
 
 ## Gotchas
 - **Launchers must stay ASCII** (PS 5.1 + no-BOM = CP1252; em-dashes break strings).
