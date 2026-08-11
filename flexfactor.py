@@ -2716,7 +2716,13 @@ def run(args) -> int:
     # From here on, operate on the resolved path (a .lnk becomes its real target).
     args.file = resolved_path
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    # Same resolution rule as build_audit_providers: explicit --model wins,
+    # --economy routes authoring to the cheaper tier, else the default tier.
+    # One flag, one meaning, every mode - the owner should never have to
+    # remember which mode a cost switch belongs to.
+    model = (args.model
+             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
+             or DEFAULT_MODELS[args.provider])
     provider = make_provider(args.provider, model,
                              judge_model=getattr(args, "judge_model", None))
     print(f"FlexFactor | provider={args.provider} model={model} "
@@ -4625,7 +4631,9 @@ def run_scout(args) -> int:
                           file=sys.stderr)
                 return 2
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    model = (args.model
+             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
+             or DEFAULT_MODELS[args.provider])
     provider = make_provider(args.provider, model,
                              judge_model=getattr(args, "judge_model", None))
 
@@ -9912,6 +9920,10 @@ def main(argv=None) -> int:
         parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+        parser.add_argument("--economy", action="store_true", dest="economy",
+                            help="Cheapest-credits mode, same switch as audit/prodready: author "
+                                 "integrations with claude-sonnet-5 instead of the Opus tier. "
+                                 "--model overrides this; no-op on providers with no economy tier.")
         parser.add_argument("--judge-model", default=None, dest="judge_model",
                             help="Cheap model for judging calls (profile/benefit). "
                                  "Default: the provider's small tier. Pass the author model id to disable tiering.")
@@ -10208,6 +10220,10 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                         help="LLM backend (default: anthropic).")
     parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+    parser.add_argument("--economy", action="store_true", dest="economy",
+                        help="Cheapest-credits mode, same switch as audit/prodready: author the "
+                             "rewrite with claude-sonnet-5 instead of the Opus tier. --model "
+                             "overrides this; no-op on providers with no economy tier.")
     parser.add_argument("--judge-model", default=None, dest="judge_model",
                         help="Cheap model used for grading reps. Default: the provider's small tier. "
                              "Pass the author model id to grade with the same model that rewrites.")

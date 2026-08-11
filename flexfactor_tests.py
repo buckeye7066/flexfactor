@@ -9332,5 +9332,44 @@ class ResumeCheckpointTests(unittest.TestCase):
                              "a recovered review must not be re-billed")
 
 
+class EconomyFlagUniformityTests(unittest.TestCase):
+    """Owner feedback 2026-08-11: a cost switch that works in audit but errors
+    in refactor is a trap, not a design - one flag, one meaning, every mode."""
+
+    def test_refactor_accepts_economy_and_picks_the_economy_tier(self):
+        cap = {}
+        real = ff.run
+        ff.run = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["--file", "x.py", "--goal", "g", "--economy"])
+        finally:
+            ff.run = real
+        a = cap["args"]
+        self.assertTrue(a.economy)
+        # The resolution rule mirrors build_audit_providers: --model wins,
+        # else economy tier, else default.
+        resolved = (a.model
+                    or (ff.ECONOMY_MODELS.get(a.provider) if a.economy else None)
+                    or ff.DEFAULT_MODELS[a.provider])
+        self.assertEqual(resolved, ff.ECONOMY_MODELS["anthropic"])
+
+    def test_run_model_resolution_is_pinned_in_source(self):
+        import inspect
+        self.assertIn('ECONOMY_MODELS.get(args.provider)',
+                      inspect.getsource(ff.run))
+        self.assertIn('ECONOMY_MODELS.get(args.provider)',
+                      inspect.getsource(ff.run_scout))
+
+    def test_scout_accepts_economy(self):
+        cap = {}
+        real = ff.run_scout
+        ff.run_scout = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--economy"])
+        finally:
+            ff.run_scout = real
+        self.assertTrue(cap["args"].economy)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

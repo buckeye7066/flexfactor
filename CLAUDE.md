@@ -211,8 +211,10 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
-  `ECONOMY_MODELS` (audit `--economy`: author = claude-sonnet-5 at $3/$15 vs
-  Opus 4.8's $5/$25, near-Opus code quality; launcher defaults economy ON),
+  `ECONOMY_MODELS` (`--economy`, accepted by EVERY mode - refactor, scout,
+  audit, prodready (owner feedback 2026-08-11: one flag, one meaning, every
+  mode): author = claude-sonnet-5 at $3/$15 vs Opus 4.8's $5/$25, near-Opus
+  code quality; launcher defaults economy ON),
   `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
   budget, default $50/program)
 - Providers: `AnthropicProvider` / `OpenAIProvider` / `OllamaProvider`
