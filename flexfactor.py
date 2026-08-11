@@ -6633,12 +6633,16 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
         out["contract_source"] = getattr(contract, "source", None)
         if fp is not None:
             out["acceptance_coverage"] = fp.acceptance_coverage(contract, norm_gaps)
-            met = sum(1 for r in out["acceptance_coverage"] if r["met"])
+            # Only met-is-True counts: met=None means UNKNOWN (an unattributed
+            # whole-purpose gap is open), and unknown is never evidence of met.
+            met = sum(1 for r in out["acceptance_coverage"] if r["met"] is True)
+            unknown = sum(1 for r in out["acceptance_coverage"] if r["met"] is None)
             total = len(out["acceptance_coverage"])
             if total:
                 # Measured against the owner's criteria, not the model's mood.
                 out["fulfillment_pct"] = round(100.0 * met / total)
                 out["criteria_met"] = met
+                out["criteria_unknown"] = unknown
                 out["criteria_total"] = total
     else:
         out["authored"] = False
@@ -7523,7 +7527,7 @@ def _review_all(reviewers: list, project_dir: str,
     if incomplete:
         print(f"  [warn] {len(incomplete)} file(s) had an INCOMPLETE review "
               "(budget/error) - NOT marked clean, will be re-reviewed")
-    return file_findings, flat, unreadable, reviewed_clean
+    return file_findings, flat, unreadable, reviewed_clean, incomplete
 
 
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
@@ -8411,6 +8415,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         total_to_review = len(files)
         cycles_run = 0
         errors_total = 0
+        review_incomplete: set[str] = set()  # last sweep's failed-review files
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
@@ -8430,7 +8435,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
-            file_findings, flat, unreadable, reviewed_clean = _review_all(
+            file_findings, flat, unreadable, reviewed_clean, review_incomplete = _review_all(
                 reviewers, project_dir, files, report=report, meter=meter, soft_cap_usd=soft,
                 workers=getattr(args, "review_workers", REVIEW_WORKERS),
                 context=purpose_blob)
@@ -8475,7 +8480,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             done_set |= run_clean  # clean files count as resolved (cumulative)
             report(fix_done=len(done_set), fix_total=total_to_review)
             if not fixable_files:
-                if manual_review:
+                if review_incomplete:
+                    # "Nothing to fix" is UNPROVEN: files whose review errored
+                    # out (provider outage / budget) were never inspected, so a
+                    # sweep of failed reviews must not read as a clean converge.
+                    # This is the 3,464-defects-fixed-0-exit-0 invisibility all
+                    # over again, one layer down - kill it here.
+                    print(f"{pfx}NOT converged: {len(review_incomplete)} file(s) "
+                          "never got a completed review (provider error/budget); "
+                          "'nothing to fix' is unproven. Re-run to retry them.")
+                    stop_reason = (f"review incomplete: {len(review_incomplete)} "
+                                   "file(s) never got a completed review "
+                                   "(provider error/budget) - NOT clean")
+                    converged = False
+                elif manual_review:
                     print(f"{pfx}STOP: {len(manual_review)} file(s) still flag critical/high after "
                           f"{MAX_FIX_ATTEMPTS} attempts - set aside for manual review (no infinite loop)")
                     stop_reason = (f"converged except {len(manual_review)} file(s) needing manual "
@@ -8629,9 +8647,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             pct = purpose_gap.get("fulfillment_pct")
             gaps_before = [dict(g) for g in gaps]
             if purpose_gap.get("criteria_total"):
+                unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
                       f"{purpose_gap['criteria_total']} of the owner's acceptance "
-                      f"criteria met ({pct}%) - {len(gaps)} gap(s) to close")
+                      f"criteria met ({pct}%)"
+                      + (f", {unk} UNKNOWN (whole-purpose gaps open)" if unk else "")
+                      + f" - {len(gaps)} gap(s) to close")
             else:
                 print(f"{pfx}Purpose fulfillment (INFERRED purpose, not the owner's "
                       f"contract): {pct if pct is not None else '?'}% - {len(gaps)} gap(s)")
@@ -8711,8 +8732,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # movement against the contract, computed from what actually landed.
             _fp = _purpose_module()
             if _fp is not None:
+                # A gap is only "closed" when the fix for its file APPLIED and
+                # was VERIFIED - an [unverified] apply (verifier down / build
+                # not runnable) is not evidence the gap is gone.
+                verified_bridged = set(bridged_files) - set(unverified_set)
                 closed = [g.get("title") for rel, g in bridgeable
-                          if rel in set(bridged_files)]
+                          if rel in verified_bridged]
                 purpose_gap["progress"] = _fp.gap_progress(gaps_before, closed)
                 prog = purpose_gap["progress"]
                 print(f"{pfx}Purpose progress: closed {prog['gaps_closed']}/"
@@ -8943,6 +8968,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "verification_note": stack.get("verification_note", ""),
             "purpose_gap": purpose_gap, "bridged_files": bridged_files,
             "purpose_contract": result.get("purpose_contract"),
+            "review_incomplete": len(review_incomplete),
         }
         _print_audit_summary(audit)
         print(f"{pfx}Low/info issues catalogued (not auto-fixed): {len(low_findings)}")
@@ -8973,7 +8999,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_fulfillment_pct=(purpose_gap or {}).get("fulfillment_pct"),
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
+            review_incomplete=len(review_incomplete),
         )
+        # EVERY review failed and nothing was fixed: the run proved nothing at
+        # all. That is an ERROR (exit 1, supervisors may retry a transient
+        # provider outage), never a quiet success.
+        if (review_incomplete and not applied_files
+                and len(review_incomplete) >= total_to_review > 0):
+            result["error"] = (f"review never completed for any of the "
+                               f"{total_to_review} file(s) (provider errors/"
+                               "budget); nothing was reviewed, proven, or fixed")
         # Remember what we did this run so a future audit can recall it - including
         # the clean-file set so the NEXT run skips them and gets smaller.
         _brain_record_run(project_dir, {
@@ -9163,7 +9198,9 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     # "Applied nothing" means no file fixed AND no defects were found to fix.
     # A genuinely clean repo (0 defects) legitimately applies nothing.
     barren = [r for r in results
-              if not r.get("fixed") and (r.get("defects") or 0) > 0]
+              if not r.get("fixed")
+              and ((r.get("defects") or 0) > 0
+                   or (r.get("review_incomplete") or 0) > 0)]
     if barren:
         names = ", ".join(str(r.get("name")) for r in barren)
         print(f"\nFAILED: apply mode fixed NOTHING in {len(barren)} program(s) "
@@ -9253,7 +9290,8 @@ def _release_status(a: dict) -> tuple[str | None, list[str]]:
                                 else "fail" if e2e.get("ran") else "unknown"),
         "defects_resolved": ("fail" if (sev & {"critical", "high"}) else
                              "pass" if a.get("findings") is not None
-                             and not (sev & {"critical", "high"}) else "unknown"),
+                             and not (sev & {"critical", "high"})
+                             and not a.get("review_incomplete") else "unknown"),
         "tests_pass": ("pass" if (suite is True or (suite is None and tests is True))
                        else "fail" if (suite is False or tests is False) else "unknown"),
         "merged": "pass" if merged else "unknown",
@@ -9469,8 +9507,17 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
             L += ["### Acceptance criteria (the owner's, verbatim)", "",
                   "| # | Met | Criterion | Blocked by |", "|---|---|---|---|"]
             for row in cov:
-                blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
-                L.append(f"| {row['index']} | {'yes' if row['met'] else 'NO'} | "
+                met = row.get("met")
+                if met is None:
+                    # No gap names this criterion, but whole-purpose gaps are
+                    # open - "met" would be an overclaim.
+                    label = "UNKNOWN"
+                    blockers = (f"— ({row.get('unattributed_gaps', 0)} "
+                                "whole-purpose gap(s) open)")
+                else:
+                    label = "yes" if met else "NO"
+                    blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
+                L.append(f"| {row['index']} | {label} | "
                          f"{row['criterion']} | {blockers} |")
             L.append("")
             L += ["### Gaps", ""]

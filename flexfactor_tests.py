@@ -2750,7 +2750,7 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2762,7 +2762,7 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("", "emptysha")
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2852,7 +2852,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         # files are dropped and NONE end up in the clean allowlist.
         m = ff.CostMeter(limit_usd=0.01)
         m.record("claude-opus-4-8", input_tokens=1_000_000)  # push well over the cap
-        ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+        ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
             [], "/proj", ["a.py", "b.py", "c.py"], meter=m, workers=2)
         self.assertEqual(reviewed_clean, {})  # nothing reviewed -> nothing clean
         self.assertEqual(unreadable, set())
@@ -2863,7 +2863,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         real_rf = ff.review_file
         ff.review_file = lambda reviewer, rel, text, context="": ([], "")  # no findings, COMPLETES
         try:
-            _, _, unreadable, reviewed_clean = ff._review_all(
+            _, _, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py", "b.py"], workers=2)
         finally:
             ff._read_text_and_sha = real
@@ -2882,7 +2882,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
 
         ff.review_file = boom
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2900,7 +2900,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
 
         ff.review_file = budget
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["a.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["a.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -3138,7 +3138,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         real_rf = ff.review_file
         ff.review_file = lambda reviewer, rel, text, context="": (ran.append(rel) or ([], ""))
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -3155,7 +3155,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
 
         ff.review_file = boom
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -4038,8 +4038,8 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         def review_all(*a, **k):
             review_once["n"] += 1
             if review_once["n"] == 1:
-                return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {})
-            return ({}, [], set(), {})  # converge on later cycles
+                return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {}, set())
+            return ({}, [], set(), {}, set())  # converge on later cycles
 
         class _Prog:
             def update(self, *a, **k):
@@ -7500,7 +7500,7 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
             "_snapshot_dirty_tree": fake_snapshot,
             "_restore_dirty_snapshot": fake_restore,
             "_enumerate_source_files": lambda *a, **k: ["a.py"],
-            "_review_all": lambda *a, **k: ({}, [], set(), {}),
+            "_review_all": lambda *a, **k: ({}, [], set(), {}, set()),
             "_full_gate": lambda pd, st: (True, ""),
             "_fix_files": default_fix,
             "_commit_and_sync": lambda *a, **k: "cycle 1: nothing to commit",
@@ -9113,6 +9113,117 @@ class StatusVocabularyTests(unittest.TestCase):
              "suite_status": True, "test_status": True, "baseline_ok": True}
         status, _ = ff._release_status(a)
         self.assertNotEqual(status, "PRODUCTION READY")
+
+
+# =========================================================================== #
+# 2026-08-11 defect-hunt regressions: three truth inversions on uncovered paths.
+# =========================================================================== #
+
+class UnattributedGapHonestyTests(unittest.TestCase):
+    """Defect: the gap schema tells the model to emit acceptance_ref=0 for a
+    whole-purpose gap; normalize_gap maps 0 to None; acceptance_coverage only
+    counted ATTRIBUTED gaps as blocking - so six critical unattributed gaps
+    scored as '4/4 criteria met (100%)'. Unknown is not met."""
+
+    def _contract(self):
+        return fp.PurposeContract(
+            name="Demo", slug="demo", purpose="do the thing", authored=True,
+            acceptance_criteria=["c1", "c2", "c3", "c4"])
+
+    def test_unattributed_gaps_make_unblocked_criteria_unknown_not_met(self):
+        gaps = [fp.normalize_gap({"title": f"g{i}", "severity": "critical",
+                                  "acceptance_ref": 0}, 4) for i in range(6)]
+        rows = fp.acceptance_coverage(self._contract(), gaps)
+        self.assertTrue(all(r["met"] is None for r in rows),
+                        "criteria cannot be 'met' while whole-purpose gaps are open")
+        self.assertTrue(all(r["unattributed_gaps"] == 6 for r in rows))
+
+    def test_attributed_gap_still_blocks_and_clean_contract_is_met(self):
+        gaps = [fp.normalize_gap({"title": "g", "severity": "high",
+                                  "acceptance_ref": 2}, 4)]
+        rows = fp.acceptance_coverage(self._contract(), gaps)
+        self.assertIs(rows[1]["met"], False)
+        # No unattributed gaps: the other criteria are provably unblocked.
+        self.assertTrue(all(r["met"] is True for i, r in enumerate(rows) if i != 1))
+        self.assertTrue(all(r["met"] is True
+                            for r in fp.acceptance_coverage(self._contract(), [])))
+
+    def test_fulfillment_pct_counts_only_proven_met(self):
+        # assess_purpose_gap overwrites the model pct with met/total; unknown
+        # criteria must not count as met, so all-unattributed -> 0%, never 100%.
+        data = {"purpose": "p", "fulfillment_pct": 100,
+                "gaps": [{"title": f"g{i}", "severity": "critical",
+                          "acceptance_ref": 0, "code_fixable": False,
+                          "file": "", "fix_instructions": ""} for i in range(6)]}
+
+        class _P:
+            model = "m"
+            def structured(self, *a, **k):
+                return data
+
+        out = ff.assess_purpose_gap(_P(), "blob", [], [], contract=self._contract())
+        self.assertEqual(out["fulfillment_pct"], 0)
+        self.assertEqual(out["criteria_met"], 0)
+        self.assertEqual(out["criteria_unknown"], 4)
+        self.assertEqual(len(out["gaps"]), 6)
+
+
+class ReviewIncompleteHonestyTests(unittest.TestCase):
+    """Defect: _review_all tracked files whose review ERRORED but never
+    returned them, so a sweep where every review failed converged as CLEAN and
+    exited 0 - the 3,464-found-0-fixed invisibility one layer down."""
+
+    def test_review_all_returns_the_incomplete_set(self):
+        class _Boom:
+            model = "m"
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: ("x = 1\n", "sha1")
+        ff.review_file = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+        try:
+            ffs, flat, unreadable, clean, incomplete = ff._review_all(
+                [_Boom()], "/proj", ["a.py", "b.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(incomplete, {"a.py", "b.py"})
+        self.assertEqual(clean, {})
+        self.assertEqual(ffs, {})
+
+    def test_exit_code_treats_unreviewed_nothing_fixed_as_failure(self):
+        results = [{"name": "A", "error": None, "defects": 0, "fixed": 0,
+                    "review_incomplete": 12}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True),
+                         ff.EXIT_APPLIED_NOTHING)
+        # A genuinely clean, fully reviewed repo still exits 0.
+        results = [{"name": "A", "error": None, "defects": 0, "fixed": 0,
+                    "review_incomplete": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
+
+    def test_incomplete_sweep_cannot_converge(self):
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("if review_incomplete:", src)
+        self.assertIn("review incomplete:", src)
+
+    def test_release_status_defects_resolved_needs_complete_review(self):
+        # "defects_resolved: pass" may only be claimed when every file's review
+        # actually completed - unreviewed files are not evidence of resolution.
+        import inspect
+        self.assertIn('and not a.get("review_incomplete")',
+                      inspect.getsource(ff._release_status))
+
+
+class GapClosureVerifiedOnlyTests(unittest.TestCase):
+    """Defect: gap closure counted every gap on an APPLIED file, including
+    [unverified] applies (verifier down). Only a verified fix closes a gap."""
+
+    def test_closed_titles_exclude_unverified_files(self):
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("verified_bridged = set(bridged_files) - set(unverified_set)",
+                      src)
+        self.assertIn("if rel in verified_bridged", src)
 
 
 if __name__ == "__main__":
