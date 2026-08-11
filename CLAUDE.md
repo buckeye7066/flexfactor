@@ -44,7 +44,9 @@ Closes two silent-failure holes the audit had:
 
 - `detect_toolchains()` — 13 ecosystems, monorepo-aware to depth 3, skips
   vendor dirs. Node manager follows the LOCKFILE (npm in a pnpm tree breaks it).
-- `assess_readiness()` — 12 deterministic gates (no model calls). Status is
+- `assess_readiness()` — 13 deterministic gates (no model calls; incl.
+  `structured_data_valid`, an offline JSON-LD check — "na" when no JSON-LD,
+  severity low so it reports but never blocks). Status is
   FOUR-valued: `unknown` is NOT `fail`, and an `unknown` critical gate still
   BLOCKS (an unevaluated property is not evidence of safety).
 - `verification_is_real()` — the honesty guard; `build_needs_deps` is why a
