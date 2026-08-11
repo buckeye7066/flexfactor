@@ -1,0 +1,811 @@
+{
+ "schema": "flexfactor.purpose_contracts.v1",
+ "installed": "2026-08-11",
+ "authority": "The owner's Axiom Portfolio master prompts. Purpose and acceptance text is VERBATIM from those documents - never rewrite it downward to make a run look finished. See memory/doctrine/PROVENANCE.md.",
+ "governing_sentence": "The goal is not to make every program resemble the same generic application. The goal is to make every program successfully perform the particular job it was created to perform.",
+ "programs": {
+  "ai-time": {
+   "name": "AI Time",
+   "slug": "ai-time",
+   "aliases": [
+    "aitime",
+    "ai-time"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Baseline local source from the supplied shortcut: C:\\Users\\firer\\AITime; launcher AI Time.vbs through wscript.exe.",
+   "local_path": "C:\\Users\\firer\\AITime",
+   "purpose": "accurately show Dr. White when usage credits or quotas reset and how many credits, requests, tokens, or time-window allowances remain across every AI provider, account, model, CLI, desktop application, and local AI endpoint actually available on the machine.",
+   "acceptance_criteria": [
+    "accurate live reconciliation for every available provider that exposes usage",
+    "truthful unavailable for providers that do not",
+    "mocked adapter suite",
+    "stale-data tests",
+    "reset-boundary tests",
+    "multiple-account tests",
+    "secure launcher",
+    "no false precision"
+   ],
+   "required_design": [
+    "dynamically discover providers rather than hardcoding only a few",
+    "separate provider, account, plan, model, quota type, and reset window",
+    "show limit, used, remaining, reset timestamp, countdown, local time, UTC, source, last refresh, freshness, and confidence",
+    "use official usage/quota APIs, official CLIs, or authenticated official dashboards where permitted",
+    "never invent values when a provider does not expose exact quota",
+    "label exact, provider-reported, locally calculated, estimated, stale, unavailable, and unlimited-local states distinctly",
+    "treat local Ollama models as no provider-credit limit while showing hardware/resource limits separately",
+    "handle multiple rolling windows, monthly limits, daily limits, model-specific caps, and plan changes",
+    "store secrets in OS-protected storage or environment configuration; never log tokens or passwords",
+    "handle clock skew, daylight saving changes, provider timezone differences, offline mode, session expiry, 2FA handoff, and selector/API changes",
+    "provide a readable dashboard and tray/desktop status without popup storms"
+   ],
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "app-store-publisher": {
+   "name": "App Store Publisher",
+   "slug": "app-store-publisher",
+   "aliases": [
+    "app-store-publisher",
+    "app store publisher"
+   ],
+   "repo": "buckeye7066/app-store-publisher",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/app-store-publisher, default main; launcher launch.vbs.",
+   "local_path": "C:\\Users\\firer\\app-store-publisher",
+   "purpose": "a safe release orchestrator for Google Play, Samsung, and Apple workflows that validates artifacts and metadata, prefers supported APIs, uses browser automation only as a bounded fallback, requires fresh approval for each irreversible action, and preserves receipts and reconciliation.",
+   "acceptance_criteria": [
+    "complete release-state model",
+    "artifact/signature/version/hash validation",
+    "dry-run zero mutation",
+    "isolated browser profile",
+    "allowlisted domains/actions",
+    "redacted logs",
+    "resumable checkpoints",
+    "2FA handoff",
+    "duplicate/replay prevention",
+    "internal/test-track submission with exact store receipt",
+    "no promotion or rollout without fresh specific approval"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "are-we-mice-or-are-we-men": {
+   "name": "Are We Mice Or Are We Men",
+   "slug": "are-we-mice-or-are-we-men",
+   "aliases": [
+    "are-we-mice-or-are-we-men",
+    "awmoawm",
+    "are we mice"
+   ],
+   "repo": "buckeye7066/are-we-mice-or-are-we-men",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/are-we-mice-or-are-we-men, default main; Vercel frontend and Railway backend must be reverified.",
+   "local_path": "C:\\Users\\firer\\are-we-mice-or-are-we-men",
+   "purpose": "an invite-only, supervised AEMT and paramedic education platform, not mouse/human research software and not real-time clinical decision support.",
+   "acceptance_criteria": [
+    "correct product identity everywhere",
+    "authoritative dated curriculum provenance",
+    "qualified educator/clinician review status",
+    "AEMT and paramedic blueprint coverage",
+    "realistic cases, vitals, labs, quizzes, and exams",
+    "no unsafe field-care framing",
+    "secure accounts",
+    "privacy/export/delete",
+    "representative supervised learner journeys on exact deployed SHA"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "axiom-genemap-discovery": {
+   "name": "Axiom GeneMap Discovery",
+   "slug": "axiom-genemap-discovery",
+   "aliases": [
+    "genemap-discovery",
+    "genemap",
+    "gene map"
+   ],
+   "repo": "buckeye7066/genemap-discovery",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/genemap-discovery, default main; deployed app https://genemap-discovery.vercel.app.",
+   "local_path": "C:\\Users\\firer\\genemap-discovery",
+   "purpose": "an approachable genetics education and early-research platform that separates AI candidate leads from verified evidence, displays source/species/version provenance, supports lessons and research navigation, and cannot be mistaken for diagnosis or clinical decision support.",
+   "acceptance_criteria": [
+    "lessons-to-research path works",
+    "human/model-organism evidence separated",
+    "claim-level provenance",
+    "deterministic benchmarks",
+    "AI leads visibly unverified until supported",
+    "no diagnosis, personal risk, PGx, dosing, drug avoidance, screening urgency, or trial matching",
+    "exact deployed SHA and real research journey"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "clean-slate": {
+   "name": "Clean Slate",
+   "slug": "clean-slate",
+   "aliases": [
+    "clean-slate",
+    "cleanslate"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Repo/local source must be reverified; launcher Run-CleanSlate.ps1.",
+   "local_path": null,
+   "purpose": "a narrowly scoped AI-data reset tool with transparent discovery, dry run, explicit target selection, backups/exports where possible, multiple confirmations, receipts, cancellation, and tested recovery.",
+   "acceptance_criteria": [
+    "disposable Windows VM",
+    "dry-run zero mutation",
+    "representative local apply",
+    "cloud deletion only with separate provider-specific confirmation",
+    "root/profile/Windows/OneDrive/tool-state refusal",
+    "interrupted deletion recovery",
+    "idempotency",
+    "receipts",
+    "restore proof"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "crispr-compass": {
+   "name": "CRISPR Compass",
+   "slug": "crispr-compass",
+   "aliases": [
+    "crispr-compass",
+    "crispr"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Local source C:\\Users\\firer\\crispr-compass; observed local target http://localhost:8501; private repo only after source/scientific review.",
+   "local_path": "C:\\Users\\firer\\crispr-compass",
+   "purpose": "a clearly bounded research/education tool whose actual sequence/evidence functions are verified from source, reproducible, secure, and non-clinical.",
+   "acceptance_criteria": [
+    "deterministic startup",
+    "visible research-only boundary",
+    "actual modules and workflows inventoried",
+    "genome build, nuclease/PAM, transcript/isoform, scoring version, data sources, assumptions, uncertainty, and off-target limits recorded where relevant",
+    "sequence/privacy controls",
+    "reproducible fixtures",
+    "no inferred capabilities from the product name"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "directshift-health": {
+   "name": "DirectShift Health",
+   "slug": "directshift-health",
+   "aliases": [
+    "directshift-health",
+    "directshift"
+   ],
+   "repo": "buckeye7066/directshift-health",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/directshift-health, default main; launcher start-directshift.cmd.",
+   "local_path": "C:\\Users\\firer\\directshift-health",
+   "purpose": "a trustworthy healthcare staffing marketplace for 13-week assignments and Uber-like individual shifts across supported professions, with credentialing, availability, pay/stipend transparency, facility requirements, negotiation/fixed offers, scheduling, cancellation, timekeeping, and payment evidence.",
+   "acceptance_criteria": [
+    "worker/facility onboarding",
+    "credential expiration and verification",
+    "role/state scope",
+    "matching",
+    "shift/contract lifecycle",
+    "pay and stipend calculations",
+    "cancellation/no-show",
+    "time approval",
+    "dispute and audit",
+    "privacy/security",
+    "no placement or licensure claim without evidence",
+    "complete representative booking journey"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "ellie": {
+   "name": "Ellie",
+   "slug": "ellie",
+   "aliases": [
+    "ellie"
+   ],
+   "repo": "buckeye7066/Ellie",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/Ellie, default main; local launcher Start-Ellie.bat.",
+   "local_path": "C:\\Users\\firer\\Ellie",
+   "purpose": "a private, always-available local assistant with local sensitive processing, recoverable memory, optional voice/vision, secure device enrollment, least-privilege capabilities, one-time action approval, tamper-evident receipts, and safe upgrade/rollback/uninstall.",
+   "acceptance_criteria": [
+    "clean Windows install",
+    "offline conversation",
+    "model-unavailable behavior",
+    "exact device identity, revocation, capability, nonce, and approval enforcement",
+    "no unrelated Electron/process termination",
+    "rollback stamps work in Windows PowerShell",
+    "phone/watch journey when hardware is available",
+    "signing remains a blocker until genuinely completed"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "factory-deck": {
+   "name": "Factory Deck",
+   "slug": "factory-deck",
+   "aliases": [
+    "local-ai-factory",
+    "factory-deck",
+    "factorydeck"
+   ],
+   "repo": "buckeye7066/local-ai-factory",
+   "default_branch": "branch",
+   "locator": "Repo buckeye7066/local-ai-factory, default branch to be reverified; launcher scripts\\start-factory.cmd.",
+   "local_path": "C:\\Users\\firer\\local-ai-factory",
+   "purpose": "a provider-agnostic local software factory that can plan, implement, test, repair, review, and deliver a usable application with durable job state, budgets, approvals, worktrees, logs, retries, rollback, and offline/mock operation.",
+   "acceptance_criteria": [
+    "both deterministic mock journey and at least one real configured-provider journey",
+    "generated application opened and inspected",
+    "crash/cancel/restart/timeout/budget tests",
+    "sandbox and credential isolation",
+    "attribution from job through commit and rollback",
+    "clean Windows launch"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "family-castle-clash": {
+   "name": "Family Castle Clash",
+   "slug": "family-castle-clash",
+   "aliases": [
+    "family-castle-clash",
+    "castle clash"
+   ],
+   "repo": "buckeye7066/family-castle-clash",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/family-castle-clash, default main; local launcher must be discovered.",
+   "local_path": "C:\\Users\\firer\\family-castle-clash",
+   "purpose": "a private family-themed real-time lane battler with family-admin enrollment, server-authoritative and restart-safe play, privacy-preserving media import, understandable cards/powers, and no unintended public exposure.",
+   "acceptance_criteria": [
+    "invite-only registration",
+    "role/session revocation",
+    "private-LAN default",
+    "TLS if exposed",
+    "actual EXIF removal",
+    "transactional state",
+    "simultaneous-write, crash, restart, reconnect, and match-resume proof",
+    "deterministic simulation",
+    "hidden-hand and anti-cheat guarantees",
+    "polished gameplay and character explanations"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "family-stewardship-navigator": {
+   "name": "Family Stewardship Navigator",
+   "slug": "family-stewardship-navigator",
+   "aliases": [
+    "family-stewardship-navigator",
+    "fsn",
+    "stewardship"
+   ],
+   "repo": "buckeye7066/family-stewardship-navigator",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/family-stewardship-navigator, default main; launcher Start-Family-Stewardship.cmd.",
+   "local_path": "G:\\family-stewardship-navigator",
+   "purpose": "a dependable family finance, estate, fiduciary, document, tax-year, and stewardship workspace with strong encryption, permissions, backups, provenance, recovery, and understandable workflows.",
+   "acceptance_criteria": [
+    "secure first run",
+    "correct household/role boundaries",
+    "encrypted backups and tested restore",
+    "no plaintext secrets",
+    "correct tax-year/version handling",
+    "concurrency and stale-write protection",
+    "export/delete",
+    "disaster recovery",
+    "clean launcher"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "fcc-ollama": {
+   "name": "FCC Ollama / Claude Code - FREE (Ollama)",
+   "slug": "fcc-ollama",
+   "aliases": [
+    "fcc-ollama",
+    "fcc",
+    "claude-code-free"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Baseline locations: private repo buckeye7066/fcc-ollama; local runtime/config under %USERPROFILE%\\.fcc.",
+   "local_path": "C:\\Users\\firer\\fcc-ollama",
+   "purpose": "a reliable free local Claude Code workflow backed by Ollama or another explicitly free local endpoint, with clean enable/use/disable/restore behavior, no paid Anthropic-key dependency, safe ports/proxies/environment restoration, verified MCP inventory, and no tokens, model blobs, caches, logs, or private conversations committed.",
+   "acceptance_criteria": [
+    "clean Windows setup",
+    "startup and shutdown",
+    "actual local inference",
+    "model selection",
+    "health checks",
+    "safe failure",
+    "configuration restoration",
+    "no empty or documentation-only repository",
+    "no hidden paid-provider fallback"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "flexfactor": {
+   "name": "FlexFactor",
+   "slug": "flexfactor",
+   "aliases": [
+    "flexfactor",
+    "flex-factor"
+   ],
+   "repo": "buckeye7066/flexfactor",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/flexfactor, default main; launcher flexfactor_launch.ps1.",
+   "local_path": "C:\\Users\\firer\\FlexFactor",
+   "purpose": "a trustworthy local code auditor/refactorer that never retains unverified changes, never leaks sensitive source, fails closed on verifier loss, contains untrusted installs/builds, produces reproducible evidence, and offers deterministic rollback.",
+   "acceptance_criteria": [
+    "forced verifier outage leaves the target byte-for-byte unchanged and creates no success commit",
+    "full Windows and Linux containment evidence",
+    "artifact files never enter integration commits",
+    "one real report-only audit and one explicitly approved apply journey",
+    "exact manifests, budgets, commands, tests, commits, and rollback"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "forgepress": {
+   "name": "ForgePress",
+   "slug": "forgepress",
+   "aliases": [
+    "forgepress",
+    "forge-press"
+   ],
+   "repo": "buckeye7066/ForgePress",
+   "default_branch": "master",
+   "locator": "Repo buckeye7066/ForgePress, default master; installed EXE is behavioral reference only until reproducible source build is proven.",
+   "local_path": "C:\\Users\\firer\\ForgePress",
+   "purpose": "a safe, reproducible publishing workstation for manuscript creation, export, ISBN/Bowker, repository publishing, detector integrations, versioning, and release receipts.",
+   "acceptance_criteria": [
+    "clean source build/package",
+    "previews and print/PDF work",
+    "credentials in OS storage",
+    "allowlisted IPC/network",
+    "publication receipts bound to action, target, freshness, and one-time use",
+    "Bowker cannot bypass confirmation",
+    "saves await persistence",
+    "supported detectors work",
+    "signed installer remains a blocker until completed"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "free-and-clean": {
+   "name": "Free and Clean",
+   "slug": "free-and-clean",
+   "aliases": [
+    "free-and-clean",
+    "freeandclean"
+   ],
+   "repo": "buckeye7066/free-and-clean",
+   "default_branch": null,
+   "locator": "Repo buckeye7066/free-and-clean; local launcher and source must be reverified.",
+   "local_path": "C:\\Users\\firer\\FreeAndClean",
+   "purpose": "a safe Windows cleanup, relocation, and migration utility with preview-first operation, reversible changes, transactional copy verification, filesystem-aware switching, ACL preservation, repair, and rollback.",
+   "acceptance_criteria": [
+    "destination-inside-source refusal",
+    "hard-refused-root containment",
+    "reparse handling",
+    "locked files",
+    "insufficient space",
+    "partial-copy manifest and cleanup",
+    "source quiescence/revalidation",
+    "ACL copy and verification",
+    "broken-junction repair",
+    "NTFS/exFAT behavior checked before copy",
+    "disposable-volume apply and rollback",
+    "no broad user-profile or system-tree migration"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "futureu": {
+   "name": "FutureU",
+   "slug": "futureu",
+   "aliases": [
+    "futureu",
+    "future-u"
+   ],
+   "repo": "buckeye7066/FutureU",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/FutureU, default main; local launcher and eventual production host must be reverified.",
+   "local_path": "C:\\Users\\firer\\FutureU",
+   "purpose": "a complete trustworthy K-12 homeschool and classroom platform with 120 review-approved courses, secure student records, parent/admin/teacher workflows, full-year and substitute-day teacher tools, separate teacher pricing, and 51 versioned state/DC configurations.",
+   "acceptance_criteria": [
+    "120/120 complete courses with scope/sequence, lessons, media, assignments, quizzes, tests, keys, rubrics, accommodations, remediation/enrichment, rights, accessibility, and qualified review",
+    "51/51 authoritative jurisdiction configurations with review dates and legal-review status",
+    "secure uploads/malware scanning",
+    "child privacy",
+    "payments",
+    "backup/restore",
+    "monitoring",
+    "accessibility",
+    "no AI draft treated as approved content",
+    "no official-compliance claim without qualified evidence"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "grantflow": {
+   "name": "GrantFlow",
+   "slug": "grantflow",
+   "aliases": [
+    "grantflow",
+    "grant-flow"
+   ],
+   "repo": "buckeye7066/GrantFlow",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/GrantFlow, default main; current Vercel/Railway production identities must be reverified.",
+   "local_path": "C:\\Users\\firer\\GrantFlow",
+   "purpose": "a production-grade whole-profile funding discovery and application workflow that finds real current profile-specific official sources, explains fit, preserves provenance, distinguishes direct opportunities from directories/referrals, handles portals/2FA/signatures honestly, and proves outcomes without overstating qualification or awards.",
+   "acceptance_criteria": [
+    "one authoritative matching/scoring contract",
+    "current-source validation",
+    "broken-link lifecycle",
+    "duplicate handling",
+    "representative profile cohort",
+    "Hamilton and other portal handoffs",
+    "Amy recovery",
+    "authenticated end-to-end journey",
+    "exact frontend/backend SHA",
+    "real output comparison against manual search"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "incognito": {
+   "name": "Incognito",
+   "slug": "incognito",
+   "aliases": [
+    "incognito"
+   ],
+   "repo": "buckeye7066/incognito",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/incognito, default main; launcher launch.bat; optional private sync must be reverified.",
+   "local_path": "C:\\Users\\firer\\incognito",
+   "purpose": "a one-household, local-first encrypted identity/privacy vault that remains useful offline, makes sync optional and zero-knowledge, minimizes metadata, and supports safe recovery and transactional rekey.",
+   "acceptance_criteria": [
+    "truthful local/backup/sync modes",
+    "memory-only keys where intended",
+    "encrypted backups",
+    "interrupted-rekey recovery",
+    "old-key invalidation",
+    "multi-device conflict handling",
+    "metadata minimization",
+    "offline use",
+    "real multi-device proof if sync is released"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "iplay": {
+   "name": "IPlay",
+   "slug": "iplay",
+   "aliases": [
+    "iplay"
+   ],
+   "repo": "buckeye7066/Iplay",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/Iplay, default main; current local launcher/source must be reverified.",
+   "local_path": "C:\\Users\\firer\\Iplay",
+   "purpose": "produce a lifelike, full-length video of the chosen avatar genuinely performing the selected music, with correct instrument-specific fingering, keys, bowing, strokes, strums, picks, timing, continuity, scene direction, and original master audio, with no source performer leakage.",
+   "acceptance_criteria": [
+    "piano, guitar, and violin reference journeys",
+    "actual generated video inspected",
+    "master sample-rate timeline correctness",
+    "right/left-hand semantics",
+    "checkpoint identity binding",
+    "deterministic resume",
+    "incremental checkpoints",
+    "cancellation",
+    "mandatory provenance sidecars before publish",
+    "audio hash authority",
+    "no generic beat motion or source-body fallback",
+    "clean Windows import/analyze/preview/render/resume/export",
+    "GPU or provider requirement remains a blocker until real render proof passes"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "kidney-antigen-discovery": {
+   "name": "Kidney Antigen Discovery",
+   "slug": "kidney-antigen-discovery",
+   "aliases": [
+    "kidney-antigen-discovery",
+    "kidney antigen"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Local source C:\\Users\\firer\\kidney-antigen-discovery; private repo only after source, secret, license, and data review.",
+   "local_path": "C:\\Users\\firer\\kidney-antigen-discovery",
+   "purpose": "a research-only reproducible antigen-prioritization workbench using versioned human tissue/cell evidence, surface accessibility, disease/graft context, off-target expression, immunobiology, and explicit uncertainty, never clinical validation.",
+   "acceptance_criteria": [
+    "deterministic startup",
+    "full dataset/model/equation inventory",
+    "source/species/isoform/release provenance",
+    "missingness not converted to zero",
+    "reproducible fixtures",
+    "threshold sensitivity",
+    "alternative explanations",
+    "benchmark candidates",
+    "no clinical efficacy or transplant-treatment claim",
+    "scientific review record"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-claude-code.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "livehealth": {
+   "name": "LiveHealth",
+   "slug": "livehealth",
+   "aliases": [
+    "livehealth",
+    "live-health"
+   ],
+   "repo": "buckeye7066/livehealth",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/livehealth, default main; current launcher/deployment must be reverified.",
+   "local_path": null,
+   "purpose": "a modular healthcare record and operations platform capable of serving appropriately scoped hospitals, clinics, EMS, home health, rehab, behavioral health, group homes, labs, pharmacies, radiology, and social-service workflows without pretending unfinished modules are certified clinical systems.",
+   "acceptance_criteria": [
+    "define supported release scope",
+    "role/tenant separation",
+    "audit",
+    "consent",
+    "data provenance",
+    "interoperability boundaries",
+    "medication/lab/order safety",
+    "downtime/recovery",
+    "privacy/export/delete",
+    "no unsupported clinical claims",
+    "representative end-to-end workflow for every enabled module",
+    "security and regulatory evidence proportional to release scope"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "mind-over-math": {
+   "name": "Mind Over Math",
+   "slug": "mind-over-math",
+   "aliases": [
+    "mind-over-math",
+    "mindovermath"
+   ],
+   "repo": "buckeye7066/mind-over-math",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/mind-over-math, default main; Vercel frontend/Railway backend must be reverified.",
+   "local_path": "C:\\Users\\firer\\mind-over-math",
+   "purpose": "an invite-controlled precalculus/calculus learning platform with authoritative deterministic verification, honest unverifiable states, secure accounts, meaningful mastery analytics, and accessible student/teacher workflows.",
+   "acceptance_criteria": [
+    "full typecheck",
+    "rendered accessibility labels",
+    "secure admin recovery/bootstrap",
+    "invited learner journey",
+    "deterministic verifier adversarial suite",
+    "unverified items never silently graded",
+    "incomplete/unscored work never stored as a real zero or full percentage",
+    "concurrency safety",
+    "privacy/export/delete",
+    "exact deployed SHA"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "promopilot": {
+   "name": "PromoPilot",
+   "slug": "promopilot",
+   "aliases": [
+    "promopilot",
+    "promo-pilot"
+   ],
+   "repo": "buckeye7066/promopilot",
+   "default_branch": "master",
+   "locator": "Repo buckeye7066/promopilot, default master; Railway production target must be reverified.",
+   "local_path": "C:\\Users\\firer\\promopilot",
+   "purpose": "an approval-first, brand-isolated marketing control plane producing varied MBA-level campaigns with evidence-backed claims, channel-specific creative, exact-draft approval, publishing, analytics, attribution, keyword and creative performance measurement, watch-time/click/conversion data where available, and data-driven optimization.",
+   "acceptance_criteria": [
+    "brand and destination isolation",
+    "real connectors",
+    "draft/edit/evidence/approve/schedule/publish/fail/retry/audit journey",
+    "exact revision resolver used by health and send paths",
+    "media/attribution secrets",
+    "idempotency",
+    "official nullable analytics",
+    "no fabricated metrics",
+    "real channel result and optimization recommendation"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "repo-rewards": {
+   "name": "Repo Rewards",
+   "slug": "repo-rewards",
+   "aliases": [
+    "repo-rewards",
+    "reporewards"
+   ],
+   "repo": "buckeye7066/repo-rewards",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/repo-rewards, default main; Railway production target must be reverified.",
+   "local_path": "C:\\Users\\firer\\repo-rewards",
+   "purpose": "metadata-screened multi-forge repository discovery that explains relevance and observable trust signals without claiming code is safe to run or install.",
+   "acceptance_criteria": [
+    "commit-bound evidence",
+    "correct immutable history",
+    "SSRF defense including DNS rebinding and streaming size limits",
+    "atomic leases",
+    "crash recovery",
+    "backoff/DLQ",
+    "accurate queue metrics",
+    "authenticated admin",
+    "consistent Scout schema",
+    "meaningful sorted relevance benchmark",
+    "exact live SHA",
+    "truthful UI"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "scout-a-program": {
+   "name": "Scout a Program (FlexFactor Scout)",
+   "slug": "scout-a-program",
+   "aliases": [
+    "flexfactor-scout",
+    "scout"
+   ],
+   "repo": null,
+   "default_branch": null,
+   "locator": "Same repo as FlexFactor; launcher flexfactor_scout_launch.ps1; consumes Repo Rewards.",
+   "local_path": "C:\\Users\\firer\\FlexFactor",
+   "purpose": "propose commit-pinned components with licensing, maintenance, security, compatibility, benefit, cost, and rejection evidence; evaluate only in a disposable credential-free sandbox; never auto-merge.",
+   "acceptance_criteria": [
+    "malicious candidate cannot access host files, credentials, or unrestricted network",
+    "every recommendation and rejection is explained",
+    "proposal-only default",
+    "separate explicit FlexFactor apply approval",
+    "deterministic cleanup",
+    "no Scout artifacts staged accidentally"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-cursor.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  },
+  "sermonsmith-ai-by-axiom-biolabs": {
+   "name": "SermonSmith AI by Axiom BioLabs",
+   "slug": "sermonsmith-ai-by-axiom-biolabs",
+   "aliases": [
+    "sermonsmith",
+    "sermon smith"
+   ],
+   "repo": "buckeye7066/sermonsmith",
+   "default_branch": "main",
+   "locator": "Repo buckeye7066/sermonsmith, default main; deployed app and Railway API must be reverified.",
+   "local_path": "C:\\Users\\firer\\sermonsmith",
+   "purpose": "a pastor-led sermon workspace from passage to review-ready outline while preserving prayer, exegesis, pastoral judgment, denominational context, exact provider-sourced Scripture text, and explicit human review across supported surfaces.",
+   "acceptance_criteria": [
+    "public routes",
+    "account/recovery",
+    "sermon creation",
+    "provider wording verification actually available in the user flow",
+    "PDF opened and inspected",
+    "truthful claims",
+    "billing/cancellation/deletion-safe behavior",
+    "hash-router-safe desktop navigation",
+    "mobile/desktop release journeys",
+    "exact deployed SHA",
+    "no active subscription stranded by deletion"
+   ],
+   "required_design": null,
+   "source": {
+    "doc": "memory/doctrine/axiom-master-prompt-chatgpt.md",
+    "section": "Assigned Applications",
+    "authored_by": "owner"
+   }
+  }
+ }
+}
