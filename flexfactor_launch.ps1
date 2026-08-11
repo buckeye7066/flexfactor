@@ -174,19 +174,21 @@ if ($mode -eq "4") {
     Write-Host ""
     Write-Host "  Running: detect toolchains -> install dependencies -> review + fix" -ForegroundColor DarkGray
     Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
-    Write-Host "  Verified fixes land on a flexfactor/prodready-* branch, then merge into" -ForegroundColor DarkGray
-    Write-Host "  the current branch and push to origin automatically (green-build gated)." -ForegroundColor DarkGray
+    Write-Host "  Verified fixes commit straight to your CURRENT branch and push to" -ForegroundColor DarkGray
+    Write-Host "  origin (green-build gated). No sandbox branch, no merge step." -ForegroundColor DarkGray
     Write-Host ""
-    # '--provider anthropic' matches the free-proxy env this launcher itself sets
-    # above (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) - the argument and the env
-    # can never disagree here. Do NOT change this to openai: OPENAI_API_KEY is
-    # blanked in this environment (2026-08-11 guard).
+    # NO '--provider' (owner order 2026-08-11). Passing one marks the choice as
+    # EXPLICIT, which suppresses FREE-FIRST and sends the whole run to a paid cloud
+    # key - measured that day at ~$2.85/hr while a loaded local qwen3-coder idled.
+    # Omitting it lets preflight pick the free local model as author and keep a
+    # usable cloud key as the cross-check reviewer. The free-proxy env this launcher
+    # sets above still applies to whichever cloud provider is chosen.
     # '--yes': prodready implies --apply, and the CLI still asks for apply
     # confirmation; without a TTY (schtask / piped answers) that gate refuses
     # and the whole run silently degrades to report-only (2026-08-11: 6h /
     # $17.75 GrantFlow review, 3464 defects found, 0 fixed). This menu already
     # IS the owner's confirmation - same reasoning as audit mode above.
-    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy', '--yes'))
+    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--economy', '--yes'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0

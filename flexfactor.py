@@ -91,9 +91,13 @@ except ImportError:
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "openai": "gpt-4o",
-    # LOCAL-ONLY tier (--provider ollama): strongest installed local coder.
-    # Override with --model to match what `ollama list` shows on this machine.
-    "ollama": "deepseek-coder:33b",
+    # LOCAL tier: strongest installed local coder. qwen3-coder:30b is a Mixture-of-
+    # Experts model, so it activates far fewer parameters per token than the dense
+    # deepseek-coder:33b it replaced - materially faster on the same hardware, and a
+    # newer code-specialised checkpoint. Both are installed on this machine (verified
+    # via `ollama list` 2026-08-11); relative QUALITY on these repos is NOT yet
+    # benchmarked. Override with --model.
+    "ollama": "qwen3-coder:30b",
 }
 
 # JUDGE tier: a much cheaper model for the high-volume *classification* calls
@@ -2435,6 +2439,12 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # but dead key (out of credits / revoked) must NOT be chosen as the author,
     # or the audit crashes on the first fix call. Preflight defaults ON.
     preflight = not getattr(args, "no_preflight", False)
+    # Default TRUE = "assume the owner chose this provider". Only `main` knows
+    # whether --provider was actually typed, and it says so explicitly. Every other
+    # caller (tests, embedders) keeps the pre-existing obey-the-argument contract,
+    # so free-first can never silently displace a deliberate provider choice.
+    _free_first_applies = (primary != "ollama"
+                           and not getattr(args, "explicit_provider", True))
 
     def _usable(name: str) -> bool:
         if not _provider_key_present(name):
@@ -2454,6 +2464,26 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # secondary is ever added (zero-egress intent, handled above). Falling back
     # to ollama from a cloud primary is different - the owner asked for a cloud
     # run, so a usable cloud provider is KEPT as the cross-check reviewer.
+    # FREE-FIRST PREFERENCE (owner order 2026-08-11: "the preflight should be the
+    # free ollama as well - openai and anthropic are fallbacks"). Free-first used to
+    # live ONLY inside the `if not _usable(primary)` crash-handler below, which meant
+    # a HEALTHY paid key caused ollama to never even be considered - the precise
+    # condition under which free-first is supposed to engage. Measured 2026-08-11:
+    # a prodready run with a healthy Anthropic key billed real money at ~$2.85/hr
+    # while a loaded local qwen3-coder sat idle. So: when the owner did not NAME a
+    # provider, the local (free) model AUTHORS and the cloud provider stays on as the
+    # cross-check reviewer that keeps it on target. An EXPLICIT `--provider ollama`
+    # still means LOCAL-ONLY / zero-egress and adds no cloud secondary (set above).
+    if _free_first_applies and _usable("ollama"):
+        # Keep the STRONGEST USABLE cloud provider as cross-checker - preferring the
+        # one that would have been primary, falling back to the other. Never promote a
+        # dead key to cross-checker just because it was named first.
+        cloud_cross = (primary if _usable(primary)
+                       else (other if other and _usable(other) else None))
+        primary, other = "ollama", cloud_cross
+        print(f"  [preflight] FREE-FIRST: authoring locally with 'ollama'; cross-check "
+              f"reviewer: {cloud_cross or 'NONE (no usable cloud key)'}.", file=sys.stderr)
+
     if not _usable(primary):
         # ENV-MISMATCH GUARD (2026-08-11 live failure): a stale script passed
         # `--provider openai` while the launch environment deliberately BLANKED
@@ -9883,6 +9913,9 @@ def main(argv=None) -> int:
             return False
 
         args.explicit_report_only = _asked("--report-only", "--dry-run")
+        # Did the owner NAME a provider, or is "anthropic" just the argparse default?
+        # Free-first only overrides the DEFAULT; an explicit choice is always obeyed.
+        args.explicit_provider = _asked("--provider")
         if args.readiness is None:
             args.readiness = _prod
         if _prod:

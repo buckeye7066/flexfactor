@@ -238,6 +238,39 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff.make_provider = real_make
             ff._provider_health = real_health
 
+    def test_free_first_engages_even_when_the_paid_key_is_HEALTHY(self):
+        # THE 2026-08-11 MONEY BUG. Free-first used to live only inside the
+        # `if not _usable(primary)` crash-handler, so a HEALTHY paid key meant
+        # ollama was never considered and the run billed real money (~$2.85/hr
+        # measured) while a loaded local model idled. When the owner did NOT type
+        # --provider, the local model must author and the cloud must cross-check.
+        class Args:
+            provider = "anthropic"       # argparse DEFAULT, not an owner choice
+            explicit_provider = False    # main sets this when --provider is absent
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: True
+        ff._provider_health = lambda name, meter=None: (True, "ok")  # ALL healthy
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(names[0], "ollama",
+                             "a healthy paid key must NOT suppress free-first")
+            self.assertIn("anthropic", names,
+                          "the cloud provider stays on as cross-check reviewer")
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
     def test_preflight_owner_chosen_usable_primary_still_wins(self):
         # A usable owner-chosen cloud primary is never displaced by ollama.
         class Args:
