@@ -729,6 +729,62 @@ def _current_lockfile(project_dir: str, tc: Toolchain) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# JSON-LD structured-data validation (the local, offline equivalent of the
+# machine-checkable part of Google's Rich Results Test - which has no free API).
+# Google silently IGNORES an invalid application/ld+json block, so broken
+# structured data is a silent-failure class: the page ships, the rich result
+# never appears, and nothing ever errors.
+# --------------------------------------------------------------------------- #
+_JSONLD_PAT = re.compile(
+    r"<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.I | re.S)
+
+
+def _validate_jsonld(project_dir: str, files: list[str]) -> "tuple[int, list[str]]":
+    """Parse every application/ld+json block in tracked .html/.htm files.
+
+    Returns (total_blocks, problems). A block is valid when it parses as JSON
+    and every node object carries @context (top level) and @type (per node,
+    with @graph items checked individually; a bare @id reference node is
+    legal without @type). Bounded: first 200 HTML files, MAX_CONFIG_BYTES per
+    read via _read_text - a hostile repo cannot balloon the walk."""
+    problems: list[str] = []
+    total = 0
+    html_files = [f for f in files if f.lower().endswith((".html", ".htm"))]
+    for rel in html_files[:200]:
+        text = _read_text(os.path.join(project_dir, rel))
+        if not text or "ld+json" not in text.lower():
+            continue
+        for i, m in enumerate(_JSONLD_PAT.finditer(text), 1):
+            total += 1
+            where = f"{rel}#block{i}"
+            raw = m.group(1).strip()
+            if not raw:
+                problems.append(f"{where}: empty block")
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception as exc:
+                problems.append(f"{where}: invalid JSON ({exc})")
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    problems.append(
+                        f"{where}: top-level {type(node).__name__}, expected object")
+                    continue
+                if "@context" not in node:
+                    problems.append(f"{where}: missing @context")
+                graph = node.get("@graph")
+                items = graph if isinstance(graph, list) else [node]
+                for item in items:
+                    if isinstance(item, dict) and "@type" not in item \
+                            and "@id" not in item:
+                        problems.append(f"{where}: node missing @type")
+    return total, problems
+
+
 def _has_tests(files: list[str]) -> bool:
     for f in files:
         parts = f.lower().split("/")
@@ -876,6 +932,25 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         evidence="Dockerfile/Procfile present" if has_container
         else ("service with no container/Procfile" if is_service else "not a service"),
         remediation="Add a Dockerfile or Procfile that starts the service.",
+        auto_fixable=True)
+
+    # --- Structured data (SEO markup) --------------------------------------- #
+    # "na" when the project ships no JSON-LD at all: most apps legitimately
+    # don't, and absence of SEO markup is not a readiness defect. Severity low:
+    # reported, never blocks a release - but Google silently ignores an invalid
+    # block, so when JSON-LD IS present it must at least be machine-valid.
+    jsonld_total, jsonld_problems = _validate_jsonld(project_dir, files)
+    add(id="structured_data_valid", title="JSON-LD structured data is valid",
+        status="na" if jsonld_total == 0
+        else ("pass" if not jsonld_problems else "fail"),
+        severity="low",
+        evidence=(f"{jsonld_total} JSON-LD block(s), all parse with @context/@type"
+                  if jsonld_total and not jsonld_problems
+                  else ("; ".join(jsonld_problems[:5])
+                        if jsonld_problems else "no JSON-LD blocks found")),
+        remediation="Fix the application/ld+json blocks: must parse as JSON and "
+                    "carry @context plus @type per node - Google silently "
+                    "ignores invalid blocks, so they fail without any error.",
         auto_fixable=True)
 
     return gates

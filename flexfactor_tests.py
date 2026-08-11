@@ -7146,6 +7146,75 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
         self.assertIn("args.snapshot_dirty = _prod", src)
 
 
+class JsonLdGateTests(unittest.TestCase):
+    """structured_data_valid gate (2026-08-10): the local, offline equivalent of
+    the machine-checkable part of Google's Rich Results Test. Google silently
+    ignores an invalid application/ld+json block, so broken markup ships with
+    zero errors - the gate makes it visible. Severity low (never blocks), and
+    "na" (not "fail") when the project simply has no JSON-LD."""
+
+    _GOOD = ('<html><head><script type="application/ld+json">'
+             '{"@context": "https://schema.org", "@type": "Article", '
+             '"headline": "X"}</script></head><body></body></html>')
+    _BAD_JSON = ('<html><head><script type="application/ld+json">'
+                 '{"@context": "https://schema.org", "@type": "Article",'
+                 '</script></head></html>')
+    _NO_TYPE = ('<html><head><script type="application/ld+json">'
+                '{"@context": "https://schema.org", "headline": "X"}'
+                '</script></head></html>')
+    _GRAPH = ('<html><head><script type="application/ld+json">'
+              '{"@context": "https://schema.org", "@graph": ['
+              '{"@type": "WebSite", "name": "S"},'
+              '{"@id": "#org"}]}</script></head></html>')
+
+    def _gate(self, files):
+        with _RepoFixture(files) as root:
+            chains = pr.detect_toolchains(root)
+            gates = {g.id: g for g in
+                     pr.assess_readiness(root, chains, _fake_run({"git": 1}))}
+        return gates["structured_data_valid"]
+
+    def test_na_when_no_jsonld(self):
+        g = self._gate({"index.html": "<html><body>hi</body></html>",
+                        "app.py": "print(1)\n"})
+        self.assertEqual(g.status, "na")
+
+    def test_pass_on_valid_block(self):
+        g = self._gate({"index.html": self._GOOD})
+        self.assertEqual(g.status, "pass")
+        self.assertIn("1 JSON-LD block(s)", g.evidence)
+
+    def test_fail_on_malformed_json(self):
+        g = self._gate({"index.html": self._BAD_JSON})
+        self.assertEqual(g.status, "fail")
+        self.assertIn("invalid JSON", g.evidence)
+
+    def test_fail_on_missing_type(self):
+        g = self._gate({"page.html": self._NO_TYPE})
+        self.assertEqual(g.status, "fail")
+        self.assertIn("missing @type", g.evidence)
+
+    def test_graph_items_checked_and_id_refs_legal(self):
+        g = self._gate({"index.html": self._GRAPH})
+        self.assertEqual(g.status, "pass",
+                         "@graph items with @type (or bare @id refs) are valid")
+
+    def test_gate_never_blocks_release(self):
+        g = self._gate({"index.html": self._BAD_JSON})
+        self.assertEqual(g.severity, "low")
+        self.assertFalse(pr.is_blocking(g),
+                         "SEO markup must report, never veto a release")
+
+    def test_helper_counts_multiple_blocks_and_files(self):
+        with _RepoFixture({"a.html": self._GOOD + self._GOOD,
+                           "b.htm": self._NO_TYPE}) as root:
+            total, problems = pr._validate_jsonld(
+                root, ["a.html", "b.htm"])
+        self.assertEqual(total, 3)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("b.htm#block1", problems[0])
+
+
 class StreamDeadlineTests(unittest.TestCase):
     """FCC resilience (2026-08-10): the keep-alive hang mode must be BOUNDED by a
     wall-clock deadline (abandon-the-thread, never interrupt-the-socket - the
