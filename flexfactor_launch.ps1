@@ -172,7 +172,12 @@ if ($mode -eq "4") {
     # above (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) - the argument and the env
     # can never disagree here. Do NOT change this to openai: OPENAI_API_KEY is
     # blanked in this environment (2026-08-11 guard).
-    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy'))
+    # '--yes': prodready implies --apply, and the CLI still asks for apply
+    # confirmation; without a TTY (schtask / piped answers) that gate refuses
+    # and the whole run silently degrades to report-only (2026-08-11: 6h /
+    # $17.75 GrantFlow review, 3464 defects found, 0 fixed). This menu already
+    # IS the owner's confirmation - same reasoning as audit mode above.
+    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy', '--yes'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
