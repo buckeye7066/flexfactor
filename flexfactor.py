@@ -183,9 +183,14 @@ class CostMeter:
     concurrently. `over_limit()` is checked before each expensive LLM call so a
     run stops cleanly at the budget instead of blowing past it."""
 
-    def __init__(self, limit_usd: float | None = None):
+    def __init__(self, limit_usd: float | None = None, carried_usd: float = 0.0):
+        # `carried_usd` is spend from an EARLIER, interrupted run of the same
+        # program that this process is resuming. It counts against --max-cost
+        # from the first call: without it, resume would be a budget bypass
+        # (kill at $49.99, resume, spend $50 more, repeat).
         self.limit_usd = limit_usd
-        self.usd = 0.0
+        self.carried_usd = max(0.0, float(carried_usd or 0.0))
+        self.usd = self.carried_usd
         self.calls = 0
         self.in_tok = 0
         self.out_tok = 0
@@ -236,8 +241,10 @@ class CostMeter:
 
     def summary(self) -> str:
         cap = f" / ${self.limit_usd:.2f} cap" if self.limit_usd is not None else ""
+        carried = (f", incl. ${self.carried_usd:.2f} carried from the resumed run"
+                   if self.carried_usd else "")
         return (f"${self.usd:.2f}{cap} ({self.calls} calls, "
-                f"{self.in_tok:,} in / {self.out_tok:,} out tokens)")
+                f"{self.in_tok:,} in / {self.out_tok:,} out tokens{carried})")
 
 
 def _estimate_call_cost(model: str, source_chars: int, max_out_tokens: int) -> float:
@@ -331,6 +338,33 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-07-18"
 TOOL_VERSION = "0.2.0"
+
+# --------------------------------------------------------------------------- #
+# RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
+#
+# brain.json is capped at MAX_BRAIN_PROJECTS (40) with LRU pruning, and on
+# 2026-08-11 a test run with an unredirected BRAIN_PATH evicted every real
+# project - GrantFlow, GeneMap, SermonSmith, IPlay, FutureU all lost their
+# clean_files skip sets permanently. Resume state that lived there would inherit
+# that single point of failure, so it lives here instead: ~/.flexfactor/runs/
+# <run-id>/checkpoint.json, pruned only by run count, written atomically after
+# every few reviewed files so a killed process can be picked up where it stopped.
+#
+# TESTS MUST REDIRECT THIS, exactly like BRAIN_PATH/STATUS_PATH
+# (flexfactor_tests.py does it at import; TestSessionIsolationTests proves it).
+# --------------------------------------------------------------------------- #
+RUNS_PATH = os.path.join(os.path.expanduser("~"), ".flexfactor", "runs")
+
+
+def _runstate_module():
+    """Lazy import of flexfactor_runstate (same pattern as flexfactor_purpose:
+    the core must still run if the module is missing - resume simply goes away)."""
+    try:
+        import flexfactor_runstate as _rs
+        return _rs
+    except Exception:
+        return None
+
 
 # In-process lock: audit runs several programs on threads, all writing brain.json.
 _BRAIN_LOCK = threading.Lock()
@@ -3539,46 +3573,6 @@ DIRTY_SNAPSHOT_MSG = (
     "  git cherry-pick --no-commit <this-commit> && git reset")
 
 
-def _snapshot_dirty_tree(project_dir: str) -> tuple[str, str | None]:
-    """Commit the tree's pre-existing changes verbatim as a labeled snapshot commit
-    on the CURRENT (sandbox) branch. Committing records the tree without modifying
-    any file on disk, and afterwards every `git add -A` cycle commit contains ONLY
-    FlexFactor's own changes. Returns (status, sha):
-      ('committed', sha)  - snapshot landed. sha=None means it landed but could not
-                            be identified: the caller must PRESERVE the branch.
-      ('nothing', None)   - the tree was only PHANTOM-dirty: `git status` reported
-                            modifications but `git add -A` staged ZERO content
-                            (CRLF/eol normalization + stale stat-cache churn - the
-                            live SermonSmith abort of 2026-08-11). There is nothing
-                            to preserve; the caller may proceed with no snapshot.
-      ('failed', None)    - could not commit; the tree is untouched except a
-                            possible staged->unstaged round trip. The caller must
-                            refuse to proceed (sweeping owner WIP into fix commits
-                            is never acceptable)."""
-    add = _git(["add", "-A"], project_dir)
-    if add.returncode != 0:
-        return "failed", None
-    # Phantom-dirt check: `git diff --cached --quiet` exit code is data
-    # (0 = nothing staged, 1 = staged changes, >1 = real error). A status-dirty
-    # tree that stages nothing has no content to preserve - committing would
-    # fail with 'nothing to commit' and previously aborted the whole program.
-    staged = _git(["diff", "--cached", "--quiet"], project_dir)
-    if staged.returncode == 0:
-        return "nothing", None
-    if staged.returncode != 1:
-        _git(["reset"], project_dir)
-        return "failed", None
-    # --no-verify: this is a verbatim preservation snapshot of the owner's own
-    # in-progress work; repo lint/pre-commit hooks must not be able to block it.
-    c = _git(["commit", "--no-verify", "-m", DIRTY_SNAPSHOT_MSG], project_dir)
-    if c.returncode != 0:
-        _git(["reset"], project_dir)  # unstage; leave the WIP exactly as found
-        return "failed", None
-    sha = _git(["rev-parse", "HEAD"], project_dir)
-    out = (sha.stdout or "").strip()
-    return "committed", (out if sha.returncode == 0 and out else None)
-
-
 def _restore_dirty_snapshot(project_dir: str, snapshot_sha: str) -> bool:
     """Re-apply a pre-run dirty-tree snapshot as plain uncommitted working-tree
     changes. Called after the ORIGINAL branch is checked back out; that branch tip
@@ -3804,7 +3798,7 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                            "Working tree is not clean - commit/stash changes or pass --allow-dirty.")
 
     prev_branch = _git_current_branch(project_dir) if git else None
-    branch = (opts.branch_prefix + _slugify(repo_name)) if git else None
+    branch = prev_branch  # no sandbox branch: apply onto the current branch
     # Backups are keyed by REPO-RELATIVE path and read/written through the contained
     # no-follow helpers, so an ancestor swapped after validation can never redirect a
     # snapshot READ or a rollback DELETE/RESTORE outside the repo.
@@ -3835,10 +3829,10 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
 
     try:
         if git:
-            r = _git(["checkout", "-B", branch], project_dir)
-            if r.returncode != 0:
-                raise ApplyError(f"could not create branch {branch}: {_tail(r.stderr, 5)}")
-            created_branch = True
+            # NO SANDBOX BRANCH (owner order 2026-08-11): adopt applies onto the
+            # branch the repo is already on. Rollback below is snapshot/restore
+            # based, not branch based, so it is unaffected.
+            pass
 
         # Snapshot package manifests too: npm install rewrites them and we must be
         # able to restore them on rollback in the non-git path.
@@ -6944,125 +6938,6 @@ def _guess_dev_url(stack: dict) -> str:
     return "http://localhost:5173"  # vite/react default
 
 
-def _e2e_dev_cmd(stack: dict, port: int | None) -> str:
-    """Build the dev-server command, pinned to `port` when one is supplied so
-    concurrently-audited programs never collide on the same port."""
-    base = f"npm run {stack['dev_script']}"
-    if not port:
-        return base
-    fw = stack.get("framework")
-    if fw in ("vite", "react"):
-        return f"{base} -- --port {port}"
-    if fw in ("next", "react-scripts"):
-        return f"{base} -- -p {port}"
-    # Unknown framework: we can't force the port via a flag, so we only point the
-    # baseURL at {port} and rely on reuseExistingServer — if the dev server picks a
-    # different port this run won't connect. Pin --app-url or use --parallel 1 then.
-    return base
-
-
-def _setup_and_run_e2e(provider, project_dir: str, stack: dict, app_url: str,
-                       findings_sink: list[dict], port: int | None = None,
-                       lock=None) -> dict:
-    """Install Playwright, generate specs that click every control, and run them
-    against the app's own dev server (Playwright boots it via webServer). Best
-    effort: any environment failure degrades to a recorded note, never aborts.
-
-    `port` pins the dev server + baseURL so parallel programs don't collide;
-    `lock` (a threading.Lock) serializes the install+run block across programs to
-    avoid npm-cache races and overlapping Playwright servers."""
-    out = {"ran": False, "ok": None, "log": "", "spec_files": []}
-    if not (stack.get("is_node") and stack.get("is_web") and stack.get("dev_script")):
-        out["log"] = "not a runnable web app (no dev script) — skipped"
-        return out
-
-    # An explicit --app-url wins; otherwise pin to the per-program port if given.
-    if app_url:
-        base_url = app_url
-    elif port:
-        base_url = f"http://localhost:{port}"
-    else:
-        base_url = _guess_dev_url(stack)
-    dev_cmd = f"npm run {stack['dev_script']}" if app_url else _e2e_dev_cmd(stack, port)
-
-    def _drive() -> dict:
-        print(f"    e2e: installing Playwright; app will run at {base_url} via '{dev_cmd}'")
-        inst = _run(["npm", "install", "-D", "@playwright/test"], project_dir, timeout=900)
-        if inst.returncode != 0:
-            out["log"] = "npm install @playwright/test failed:\n" + _tail(inst.stderr)
-            return out
-        # Browsers are cached globally after first download; --with-deps is a no-op on Windows.
-        br = _run(["npx", "playwright", "install", "chromium"], project_dir, timeout=900)
-        if br.returncode != 0:
-            out["log"] = "playwright install chromium failed:\n" + _tail(br.stderr)
-            return out
-
-        spec_dir = "__flexfactor_e2e__"
-        gen = provider.structured(
-            E2E_TEST_SYSTEM,
-            (f"App base URL: {base_url}\nFramework: {stack.get('framework')}\n\n"
-             f"Write Playwright spec file(s) under '{spec_dir}/' that visit the app and "
-             "click/exercise every interactive control, asserting no crash and no console "
-             "errors. Use CommonJS require()."),
-            TEST_GEN_SCHEMA,
-        )
-        spec_files = []
-        for f in gen.get("files") or []:
-            rel = f.get("path") or ""
-            if not rel:
-                continue
-            # Force every generated spec into the e2e dir under a safe basename, then
-            # re-validate through the containment chokepoint (a spec path already
-            # 'inside' spec_dir could still carry a '..' escape).
-            rel = f"{spec_dir}/{os.path.basename(rel.replace(chr(92), '/'))}"
-            written = _write_contained(project_dir, rel, f.get("contents") or "")
-            if written is None:
-                print(f"    [skip] generated e2e spec path escapes/symlinked, refused: {f.get('path')!r}")
-                continue
-            spec_files.append(os.path.relpath(written, project_dir))
-        if not spec_files:
-            out["log"] = "model produced no e2e specs"
-            return out
-
-        cfg_name = "playwright.flexfactor.config.cjs"
-        cfg = (
-            "const { defineConfig } = require('@playwright/test');\n"
-            "module.exports = defineConfig({\n"
-            f"  testDir: './{spec_dir}',\n"
-            "  timeout: 60000,\n"
-            "  fullyParallel: false,\n"
-            "  retries: 0,\n"
-            "  reporter: [['list']],\n"
-            f"  use: {{ baseURL: '{base_url}', headless: true, ignoreHTTPSErrors: true }},\n"
-            f"  webServer: {{ command: '{dev_cmd}', url: '{base_url}', "
-            "reuseExistingServer: true, timeout: 180000 },\n"
-            "});\n"
-        )
-        if _write_contained(project_dir, cfg_name, cfg) is None:
-            out["log"] = f"playwright config path refused (symlink/escape): {cfg_name}; e2e skipped"
-            return out
-
-        print("    e2e: driving the app (clicking buttons)...")
-        r = _run(["npx", "playwright", "test", "-c", cfg_name], project_dir, timeout=1800)
-        out.update(ran=True, ok=(r.returncode == 0),
-                   log=_tail(r.stdout + "\n" + r.stderr, 50),
-                   spec_files=spec_files + [cfg_name])
-        if r.returncode != 0:
-            findings_sink.append({
-                "file": "(e2e)", "line": 0, "severity": "high", "category": "bug",
-                "title": "Playwright button/UI test failures",
-                "problem": "Driving the live app surfaced failing interactions:\n" + out["log"],
-                "fix": "Inspect the failing spec output and repair the implicated UI handlers.",
-            })
-        return out
-
-    # Only one program drives Playwright at a time when a lock is supplied.
-    if lock is not None:
-        with lock:
-            return _drive()
-    return _drive()
-
-
 # --------------------------------------------------------------------------- #
 # Cross-model fix verification: a SECOND model independently re-checks the first
 # model's rewrite. Two-model agreement is what makes the audit maximally rigorous
@@ -7407,7 +7282,8 @@ def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
                 workers: int = REVIEW_WORKERS,
-                context: str = "") -> tuple[dict, list, set, dict]:
+                context: str = "", precomputed: dict | None = None,
+                on_reviewed=None) -> tuple[dict, list, set, dict]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
@@ -7416,7 +7292,18 @@ def _review_all(reviewers: list, project_dir: str,
         'clean' is an ALLOWLIST of these: a file SKIPPED by the budget/stop cutoff, or one
         whose review ABORTED (BudgetExceededError / any reviewer exception), is NEVER clean.
     `report` (if given) is called with live counts. Stops submitting new work once the
-    cost cap (or the review reserve) is reached."""
+    cost cap (or the review reserve) is reached.
+
+    RESUME (2026-08-11):
+      - `precomputed` {rel: (sha, findings)} carries reviews an INTERRUPTED run of
+        this same program already paid for. An entry is replayed ONLY when the
+        file's CURRENT hash still equals the recorded one - a changed file falls
+        through to a real, paid review. That re-hash is what keeps resume from
+        reporting findings about bytes that no longer exist. Replay is free, so
+        it proceeds even after the budget cutoff has stopped new model calls.
+      - `on_reviewed(rel, sha, findings)` is called for every COMPLETED review so
+        the caller can checkpoint incrementally; a killed process then resumes
+        from the last flush instead of re-reviewing the whole repository."""
     file_findings: dict[str, list[dict]] = {}
     flat: list[dict] = []
     unreadable: set[str] = set()          # contained read REFUSED (never mark clean)
@@ -7987,10 +7874,11 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     status = (f"{label}: committed on {branch} "
               f"(build {'ok' if final_ok is True else 'NOT VERIFIED' if final_ok is None else 'FAILED'})")
     if args.push and _git_has_remote(project_dir):
-        # Force-push: the audit branch is FlexFactor's own sandbox, recreated with
-        # `checkout -B` each run, so its remote copy from a prior run legitimately
-        # diverges. --force-with-lease keeps it safe (won't clobber others' work).
-        pr = _git(["push", "--force-with-lease", "-u", "origin", branch], project_dir)
+        # NEVER force-push (owner order 2026-08-11 removed sandbox branches). This is
+        # now the owner's REAL branch, not a disposable sandbox that legitimately
+        # diverges - a --force-with-lease here could discard commits pushed from
+        # another machine. A fast-forward push or an honest rejection, nothing else.
+        pr = _git(["push", "-u", "origin", branch], project_dir)
         status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
     # prev_branch == branch happens when a repo was left PARKED on the sandbox
     # branch by an earlier interrupted run (live SermonSmith 2026-08-11): a
@@ -8052,7 +7940,6 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
 
 # One program drives Playwright at a time (npm-cache + port-collision safety) when
 # auditing programs concurrently.
-_E2E_LOCK = threading.Lock()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -8274,70 +8161,27 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    as FlexFactor's work.
         tree_dirty = (git and not args.dry_run and not report_only
                       and not _git_tree_clean(project_dir))
-        snapshot_mode = bool(getattr(args, "snapshot_dirty", False))
-        if tree_dirty and not args.allow_dirty and not snapshot_mode:
-            print(f"{pfx}error: working tree isn't clean. Commit/stash, pass --allow-dirty, "
-                  "or pass --snapshot-dirty to preserve the changes as the sandbox "
-                  "branch's first commit (prodready does this automatically).",
+        if tree_dirty and not args.allow_dirty:
+            print(f"{pfx}error: working tree isn't clean. Commit or stash first, or pass "
+                  "--allow-dirty to sweep the changes into FlexFactor's commits. "
+                  "(Sandbox branches were REMOVED by owner order 2026-08-11, so there is "
+                  "no separate branch to quarantine your WIP onto.)",
                   file=sys.stderr)
             result["error"] = "working tree isn't clean"
             return result
         prev_branch = _git_current_branch(project_dir) if git else None
-        branch = (args.branch_prefix + _slugify(display_name)) if git else None
+        # NO SANDBOX BRANCH (owner order 2026-08-11). Work lands on the branch the
+        # repo is already on, so a verified fix IS in the repo the moment it commits -
+        # never stranded on a flexfactor/* branch waiting on a merge gate that may
+        # never open. `created_branch` stays False forever: nothing to create, nothing
+        # to restore, nothing to force-push.
+        branch = prev_branch
         result["branch"] = branch
         created_branch = False
         if git and not args.dry_run and not report_only:
-            r = _git(["checkout", "-B", branch], project_dir)
-            if r.returncode != 0:
-                print(f"{pfx}error: could not create audit branch {branch}: {_tail(r.stderr, 5)}",
-                      file=sys.stderr)
-                result["error"] = f"could not create audit branch {branch}"
-                return result
-            created_branch = True
-            print(f"{pfx}Sandbox branch: {branch} (from {prev_branch})")
+            print(f"{pfx}Working directly on your branch: {branch} (no sandbox branch)")
 
-        # 2a. Dirty-tree preservation snapshot (walk-away mode). Runs AFTER the
-        #     sandbox branch exists so the snapshot commit lands on FlexFactor's
-        #     branch, never on the owner's. Every failure path here is fail-closed:
-        #     proceed only when the owner's WIP is provably separated.
-        dirty_snapshot = None
-        if created_branch and tree_dirty and not args.allow_dirty and snapshot_mode:
-            snap_status, dirty_snapshot = _snapshot_dirty_tree(project_dir)
-            committed = (snap_status == "committed")
-            if snap_status == "nothing":
-                # Phantom dirt (CRLF/stat-cache churn): status said dirty but zero
-                # content staged. Nothing of the owner's to preserve - proceed.
-                print(f"{pfx}Dirty tree was only line-ending/stat-cache churn "
-                      "(no stageable content); no preservation snapshot needed, continuing.")
-            elif committed and dirty_snapshot:
-                print(f"{pfx}Dirty tree handled: pre-existing uncommitted changes preserved "
-                      f"verbatim as snapshot commit {dirty_snapshot[:9]} (first commit on "
-                      f"{branch}); files on disk untouched, fix commits stay separate.")
-                result["dirty_snapshot"] = dirty_snapshot
-            elif committed:
-                # Commit landed but is unidentifiable: this branch is now the only
-                # ref holding the owner's WIP - PRESERVE it, never proceed/delete.
-                print(f"{pfx}error: dirty-tree snapshot committed but could not be "
-                      f"identified; branch {branch} PRESERVED (holds your changes) - "
-                      "inspect manually.", file=sys.stderr)
-                result["error"] = "dirty snapshot unidentifiable; branch preserved"
-                return result
-            else:
-                # Could not snapshot -> refuse to run (the cycle commits would sweep
-                # owner WIP in). Unwind to the original branch; the WIP is still in
-                # the working tree (plain checkout carries it - same commit).
-                _git(["checkout", prev_branch], project_dir)
-                _git(["branch", "-D", branch], project_dir)
-                print(f"{pfx}error: working tree is dirty and the preservation snapshot "
-                      "could not be committed; original branch restored, files untouched. "
-                      "Commit/stash manually, or pass --allow-dirty.", file=sys.stderr)
-                result["error"] = "dirty tree; snapshot commit failed"
-                return result
-
-        # Baseline build status decides whether the per-file gate is the real build
-        # or a syntax-only fallback (a project already broken can't gate on its build).
-        # In report/dry-run no fix is ever gated, so the (often slow + costly) project
-        # build is pure waste there - skip it and report straight away.
+        dirty_snapshot = None  # snapshot-to-sandbox-branch REMOVED (owner order)
         # 2b. BOOTSTRAP: install the project's own dependencies so the baseline
         #     build below measures the CODE, not a missing node_modules/venv. On an
         #     un-bootstrapped checkout the baseline gate fails for a reason that has
@@ -8788,22 +8632,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 if git:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
 
-        # 6. Drive every button (Playwright) in the live-like sandbox. The lock keeps
-        #    one program driving Playwright at a time; the port keeps dev servers apart.
+        # Button/UI (Playwright) sandbox REMOVED (owner order 2026-08-11):
+        # the live-like sandbox is not part of this app. e2e never runs.
         e2e = {"ran": False, "ok": None, "log": "", "spec_files": []}
-        if args.e2e and not report_only and not dirty_abort:
-            print(f"{pfx}Button/UI testing (Playwright)...")
-            lock = _E2E_LOCK if total > 1 else None
-            try:
-                e2e = _setup_and_run_e2e(author, project_dir, stack, args.app_url,
-                                         all_findings, port=e2e_port, lock=lock)
-                print(f"{pfx}e2e: {'ran, PASS' if e2e['ok'] else 'ran, FAIL' if e2e['ran'] else 'skipped'}"
-                      + (f" — {e2e['log']}" if e2e["log"] and not e2e["ran"] else ""))
-            except Exception as ex:
-                print(f"{pfx}e2e error (non-fatal): {ex}")
-                e2e["log"] = str(ex)
-            if git and e2e.get("spec_files"):
-                print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'e2e tests', stack)}")
 
         # 6.5 Final full-suite gate: run the project's OWN suite (test:all / ci /
         #     verify) so "done" means the whole suite is green, not just that fixes
@@ -10005,8 +9836,11 @@ def main(argv=None) -> int:
                             help="Skip the interactive confirmation for --apply (for automation).")
         parser.add_argument("--no-tests", action="store_false", dest="tests",
                             help="Skip generating/running unit tests.")
-        parser.add_argument("--no-e2e", action="store_false", dest="e2e",
-                            help="Skip Playwright button/UI testing.")
+        # DEPRECATED no-op. The Playwright "live-like sandbox" was REMOVED by owner
+        # order 2026-08-11. Accepted-and-ignored so existing launchers/scheduled
+        # tasks that still pass it keep running instead of dying in argparse.
+        parser.add_argument("--no-e2e", action="store_true", dest="_e2e_removed",
+                            help=argparse.SUPPRESS)
         parser.add_argument("--app-url", default=None, dest="app_url",
                             help="Base URL the dev server serves on (default: guessed from framework).")
         parser.add_argument("--push", action="store_true", dest="push", default=False,
@@ -10029,13 +9863,6 @@ def main(argv=None) -> int:
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Audit even if the git working tree isn't clean "
                                  "(pre-existing changes get swept into the cycle commits).")
-        parser.add_argument("--snapshot-dirty", action=argparse.BooleanOptionalAction,
-                            default=None, dest="snapshot_dirty",
-                            help="On a dirty tree, preserve the pre-existing uncommitted "
-                                 "changes verbatim as the sandbox branch's first commit "
-                                 "and continue, instead of refusing to run. Default: on "
-                                 "in prodready (walk-away must not stop for this), off "
-                                 "in audit.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                             help="Review + report only; create no branch and change no files.")
         _add_egress_args(parser)
@@ -10056,8 +9883,6 @@ def main(argv=None) -> int:
             return False
 
         args.explicit_report_only = _asked("--report-only", "--dry-run")
-        if args.snapshot_dirty is None:
-            args.snapshot_dirty = _prod
         if args.readiness is None:
             args.readiness = _prod
         if _prod:

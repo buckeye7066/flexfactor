@@ -4107,15 +4107,19 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         self.assertIn("DIRTY-ABORT", status)
         self.assertIn("PRESERVED", status)
 
-    def test_empty_run_still_cleans_up_branch(self):
-        # A genuinely empty run (nothing applied, no checkpoint) still drops its
-        # empty branch - the committed_any guard doesn't block legitimate cleanup.
+    def test_empty_run_creates_and_deletes_no_branch(self):
+        # Sandbox branches were REMOVED (owner order 2026-08-11). A genuinely empty
+        # run must therefore create NO branch and delete NO branch - there is nothing
+        # to clean up, and deleting anything here would be deleting the owner's branch.
         def empty_fix_files(*a, **k):
             return ([], [], [])
         commit_calls, git_calls, result = self._drive(empty_fix_files)
-        self.assertTrue(self._branch_deletes(git_calls),
-                        "a truly-empty run should clean up its empty branch")
-        self.assertIn("no changes", (result.get("commit_status") or ""))
+        self.assertFalse(self._branch_deletes(git_calls),
+                         "no sandbox branch exists, so nothing may be deleted")
+        self.assertFalse([g for g in git_calls if g[:2] == ["checkout", "-B"]],
+                         "no sandbox branch may ever be created")
+        # An empty run must say so plainly - never imply work landed.
+        self.assertIn("nothing-to-commit", (result.get("commit_status") or ""))
 
     def test_verifier_outage_skips_success_commit(self):
         """Master Prompt 88: forced verifier outage → no success commit."""
@@ -4131,7 +4135,10 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         self.assertIn("verifier", (result.get("stop_reason") or "").lower())
         status = result.get("commit_status") or ""
         self.assertIn("verifier-outage", status)
-        self.assertIn("no success commit", status)
+        # Wording-agnostic: with no sandbox branch the status reads "no UNVERIFIED
+        # success commit". What must hold is that NO success commit was claimed.
+        self.assertIn("success commit", status)
+        self.assertRegex(status, r"no (UNVERIFIED )?success commit")
 
 
 class RunManifestTests(unittest.TestCase):
@@ -4759,7 +4766,9 @@ class ScoutEndToEndTests(unittest.TestCase):
             rc = self._run_scenario(tmp, verify_rc=0)
             self.assertEqual(rc, 0)
             branches = self._git_out(tmp, "branch", "--list")
-            self.assertIn("flexfactor/adopt-good-widget", branches)
+            # No sandbox branch: adopt applies onto whatever branch the repo is on.
+            self.assertNotIn("flexfactor/adopt-", branches)
+            self.assertIn("master", branches)
             # The hostile candidate (higher finalScore, LLM said ADOPT) must
             # have NO branch and NO applied change.
             self.assertNotIn("injector", branches)
@@ -7338,277 +7347,32 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
         self.assertIn("local merge undone", status)
 
 
-class DirtyTreeSnapshotTests(unittest.TestCase):
-    """Walk-away resilience (2026-08-10): prodready hit a real GrantFlow tree with
-    uncommitted changes and hard-errored - the one operational faceplant a
-    'hand it any program and walk away' mode must overcome itself. Contract:
-    snapshot the dirt verbatim as the sandbox branch's first commit (files on
-    disk untouched), keep fix commits separate, and on every cleanup path either
-    restore the WIP to the working tree or preserve the only ref holding it."""
+class NoSandboxBranchContractTests(unittest.TestCase):
+    """Owner order 2026-08-11: sandbox branches are REMOVED. The dirty-tree
+    snapshot machinery they existed to serve is gone with them. Contract now:
+    a dirty tree HARD-STOPS (FlexFactor must never sweep the owner's WIP into
+    its own commits and claim that work as its own), and no flexfactor/* branch
+    is ever created."""
 
-    # ---- real-git helper roundtrip -------------------------------------------
+    def test_snapshot_dirty_machinery_is_gone(self):
+        # The function AND the flag must both be absent - a leftover no-op flag
+        # that silently does nothing is exactly the "fake" behaviour to avoid.
+        self.assertFalse(hasattr(ff, "_snapshot_dirty_tree"),
+                         "_snapshot_dirty_tree is sandbox machinery and must be removed")
+        src = open(ff.__file__, encoding="utf-8").read()
+        self.assertNotIn('"--snapshot-dirty"', src)
 
-    def _mkrepo(self, tmp):
-        import subprocess
-        run = lambda *a: subprocess.run(list(a), cwd=tmp, capture_output=True, check=True)
-        run("git", "init", "-b", "main")
-        run("git", "config", "user.email", "t@t")
-        run("git", "config", "user.name", "t")
-        with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
-            f.write("base\n")
-        run("git", "add", "-A")
-        run("git", "commit", "-q", "-m", "init")
-        return run
+    def test_no_sandbox_branch_is_ever_created(self):
+        src = open(ff.__file__, encoding="utf-8").read()
+        self.assertNotIn('_git(["checkout", "-B"', src,
+                         "no code path may create a sandbox branch")
 
-    def _porcelain(self, tmp):
-        import subprocess
-        r = subprocess.run(["git", "status", "--porcelain"], cwd=tmp,
-                           capture_output=True, text=True, check=True)
-        return sorted(l for l in r.stdout.splitlines() if l.strip())
-
-    def test_snapshot_and_restore_roundtrip_real_git(self):
-        import subprocess
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            run = self._mkrepo(tmp)
-            # Dirty state: a tracked-file edit AND a new untracked file.
-            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
-                f.write("owner WIP\n")
-            with open(os.path.join(tmp, "new_wip.txt"), "w", encoding="utf-8") as f:
-                f.write("untracked WIP\n")
-            before = self._porcelain(tmp)
-            self.assertTrue(before, "test setup must be dirty")
-            run("git", "checkout", "-B", "flexfactor/prodready-x")
-            committed, sha = ff._snapshot_dirty_tree(tmp)
-            self.assertTrue(committed)
-            self.assertTrue(sha)
-            # Files on disk are untouched by the snapshot commit.
-            self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
-                             "owner WIP\n")
-            self.assertEqual(self._porcelain(tmp), [],
-                             "tree must be clean vs the snapshot commit")
-            # Restore path: back on main, WIP returns as plain uncommitted changes.
-            run("git", "checkout", "--force", "main")
-            self.assertTrue(ff._restore_dirty_snapshot(tmp, sha))
-            self.assertEqual(self._porcelain(tmp), before,
-                             "restored dirty state must match the pre-run state exactly")
-            self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
-                             "owner WIP\n")
-
-    def test_snapshot_message_labels_the_commit(self):
-        import subprocess
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            self._mkrepo(tmp)
-            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
-                f.write("wip\n")
-            committed, sha = ff._snapshot_dirty_tree(tmp)
-            self.assertTrue(committed and sha)
-            log = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=tmp,
-                                 capture_output=True, text=True, check=True).stdout
-            self.assertIn("[FlexFactor] snapshot: pre-existing uncommitted changes", log)
-
-    # ---- audit_one_program gating (stubbed heavy surface) --------------------
-
-    def _drive(self, *, snapshot_dirty, tree_clean, fix_files_impl=None,
-               snapshot_ret=None):
-        import tempfile
-        import types
-        tmp = tempfile.mkdtemp()
-        git_calls = []
-        snap_calls = []
-        restore_calls = []
-
-        def git(*a, **k):
-            git_calls.append(list(a[0]) if a else [])
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        def fake_snapshot(pd):
-            snap_calls.append(pd)
-            return snapshot_ret if snapshot_ret is not None else ("committed", "cafe" * 10)
-
-        def fake_restore(pd, sha):
-            restore_calls.append(sha)
-            return True
-
-        class _P:
-            model = "m"
-
-        stack = {"is_node": False, "is_python": True, "framework": None, "scripts": {},
-                 "verify_cmds": [], "fast_verify": None, "test_cmd": None,
-                 "full_suite_cmd": None, "dev_script": None, "is_web": False,
-                 "esbuild": None, "config_refused": False}
-
-        class _Prog:
-            def update(self, *a, **k):
-                pass
-
-        args = types.SimpleNamespace(
-            max_cost=100.0, apply=True, dry_run=False, recheck=False, allow_dirty=False,
-            snapshot_dirty=snapshot_dirty, purpose_gap=False, bootstrap=False,
-            provider="anthropic", model=None, economy=False, judge_model=None,
-            secondary_model=None, use_both=True, no_preflight=True,
-            branch_prefix="flexfactor/prodready-", fix_severity="medium", max_files=0,
-            cycles=1, max_cycles=1, until_clean=False, include=[], exclude=[],
-            review_workers=2, adversarial=True, adversarial_rounds=2, fix_prefetch=0,
-            push=False, merge=False, tests=False, e2e=False, app_url=None,
-            full_suite=False, max_test_modules=4)
-
-        default_fix = fix_files_impl or (lambda *a, **k: ([], [], []))
-        stubs = {
-            "resolve_program_input": lambda arg: ("prog", ""),
-            "resolve_project_dir": lambda arg, name: tmp,
-            "_acquire_audit_lock": lambda pd: "lock",
-            "_release_audit_lock": lambda lp: None,
-            "_load_brain": lambda: {},
-            "_clean_map": lambda prior: {},
-            "_detect_stack": lambda pd: stack,
-            "_is_git_repo": lambda pd: True,
-            "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
-            "_git_tree_clean": lambda pd: tree_clean,
-            "_git_current_branch": lambda pd: "main",
-            "_git": git,
-            "_snapshot_dirty_tree": fake_snapshot,
-            "_restore_dirty_snapshot": fake_restore,
-            "_enumerate_source_files": lambda *a, **k: ["a.py"],
-            "_review_all": lambda *a, **k: ({}, [], set(), {}),
-            "_full_gate": lambda pd, st: (True, ""),
-            "_fix_files": default_fix,
-            "_commit_and_sync": lambda *a, **k: "cycle 1: nothing to commit",
-            "_brain_record_run": lambda *a, **k: None,
-            "_build_clean_map": lambda *a, **k: {},
-            "_write_audit_report": lambda *a, **k: os.path.join(tmp, "report.md"),
-            "_write_low_findings_report": lambda *a, **k: None,
-            "_print_audit_summary": lambda *a, **k: None,
-            "_PROGRESS": _Prog(),
-        }
-        orig = {}
-        for name, fn in stubs.items():
-            orig[name] = getattr(ff, name)
-            setattr(ff, name, fn)
-        try:
-            result = ff.audit_one_program("prog", args, 1, 1, 4100)
-        finally:
-            for name, o in orig.items():
-                setattr(ff, name, o)
-        return git_calls, snap_calls, restore_calls, result
-
-    def test_audit_mode_still_hard_stops_on_dirty_tree(self):
-        git_calls, snap_calls, _, result = self._drive(
-            snapshot_dirty=False, tree_clean=False)
-        self.assertEqual(result.get("error"), "working tree isn't clean")
-        self.assertEqual(snap_calls, [], "audit mode must never auto-snapshot")
-
-    def test_prodready_mode_overcomes_dirty_tree_via_snapshot(self):
-        git_calls, snap_calls, _, result = self._drive(
-            snapshot_dirty=True, tree_clean=False)
-        self.assertIsNone(result.get("error"),
-                          "prodready (walk-away) must not faceplant on a dirty tree")
-        self.assertEqual(len(snap_calls), 1, "exactly one preservation snapshot")
-        self.assertTrue((result.get("dirty_snapshot") or "").startswith("cafe"))
-        # Snapshot happens only AFTER the sandbox branch exists.
-        self.assertIn(["checkout", "-B", "flexfactor/prodready-prog"], git_calls)
-
-    def test_clean_tree_takes_no_snapshot(self):
-        _, snap_calls, _, result = self._drive(snapshot_dirty=True, tree_clean=True)
-        self.assertIsNone(result.get("error"))
-        self.assertEqual(snap_calls, [], "clean tree must not be snapshot-committed")
-
-    def test_empty_run_restores_wip_before_deleting_branch(self):
-        # No fixes found -> the empty sandbox branch is dropped, but the owner's
-        # WIP must be cherry-picked back into the working tree FIRST.
-        git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False)
-        self.assertEqual(len(restore_calls), 1, "WIP must be restored on the drop path")
-        drop_idx = git_calls.index(["branch", "-D", "flexfactor/prodready-prog"])
-        co_idx = git_calls.index(["checkout", "--force", "main"])
-        self.assertLess(co_idx, drop_idx)
-
-    def test_snapshot_failure_refuses_to_run_and_unwinds(self):
-        git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False, snapshot_ret=("failed", None))
-        self.assertEqual(result.get("error"), "dirty tree; snapshot commit failed")
-        self.assertIn(["checkout", "main"], git_calls, "must unwind to the original branch")
-        self.assertIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls)
-
-    def test_unidentifiable_snapshot_preserves_branch(self):
-        git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False, snapshot_ret=("committed", None))
-        self.assertEqual(result.get("error"),
-                         "dirty snapshot unidentifiable; branch preserved")
-        self.assertNotIn(["branch", "-D", "flexfactor/prodready-prog"], git_calls,
-                         "the only ref holding owner WIP must never be deleted")
-
-    def test_phantom_dirty_tree_proceeds_without_snapshot(self):
-        # Live SermonSmith abort 2026-08-11: git status reported modifications but
-        # `git add -A` staged zero content (CRLF/stat-cache churn). That must NOT
-        # abort the program - there is nothing of the owner's to preserve.
-        git_calls, snap_calls, restore_calls, result = self._drive(
-            snapshot_dirty=True, tree_clean=False, snapshot_ret=("nothing", None))
-        self.assertIsNone(result.get("error"),
-                          "phantom dirt must not abort the audit")
-        self.assertEqual(len(snap_calls), 1)
-        self.assertIsNone(result.get("dirty_snapshot"))
-        self.assertEqual(restore_calls, [], "nothing to restore for phantom dirt")
-
-    def test_snapshot_helper_reports_nothing_when_zero_content_staged(self):
-        # Unit-level: add ok, `diff --cached --quiet` rc 0 -> ('nothing', None),
-        # and NO commit is attempted.
-        import types
-        calls = []
-
-        def fake_git(cmd, cwd):
-            calls.append(cmd)
-            rc = 0  # add ok; diff --cached --quiet rc 0 = nothing staged
-            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
-
-        orig = ff._git
-        ff._git = fake_git
-        try:
-            status, sha = ff._snapshot_dirty_tree("d")
-        finally:
-            ff._git = orig
-        self.assertEqual((status, sha), ("nothing", None))
-        self.assertFalse(any(c and c[0] == "commit" for c in calls),
-                         "no commit attempt when nothing is staged")
-
-    def test_commit_and_sync_skips_self_merge_when_parked(self):
-        # prev_branch == branch (repo left parked on the sandbox branch by an
-        # interrupted run) -> merging would be a meaningless self-merge; skip it.
-        import types
-        git_calls = []
-
-        def fake_git(cmd, cwd):
-            git_calls.append(cmd)
-            if cmd[:3] == ["diff", "--cached", "--quiet"]:
-                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
-            return types.SimpleNamespace(returncode=0, stdout="x", stderr="")
-
-        orig = (ff._git, ff._git_has_remote, ff._full_gate, ff._git_current_branch)
-        ff._git = fake_git
-        ff._git_has_remote = lambda pd: False
-        ff._full_gate = lambda pd, st: (True, "")
-        ff._git_current_branch = lambda pd: "flexfactor/audit-x"
-        args = types.SimpleNamespace(push=False, merge=True)
-        try:
-            status = ff._commit_and_sync("d", "flexfactor/audit-x",
-                                         "flexfactor/audit-x", args, "cycle 1", {})
-        finally:
-            (ff._git, ff._git_has_remote, ff._full_gate,
-             ff._git_current_branch) = orig
-        self.assertNotIn("merged into", status)
-        self.assertFalse(any(c and c[0] == "merge" for c in git_calls),
-                         "self-merge must never be attempted")
-
-    def test_prodready_cli_defaults_snapshot_on_audit_off(self):
-        # The parser wires --snapshot-dirty default by mode: prodready walks away,
-        # audit keeps the strict gate.
-        import inspect
-        src = inspect.getsource(ff.main) if hasattr(ff, "main") else ""
-        # Fall back to scanning the module source (main may be named differently).
-        if "snapshot_dirty = _prod" not in src:
-            src = open(ff.__file__, encoding="utf-8").read()
-        self.assertIn("args.snapshot_dirty = _prod", src)
+    def test_push_is_never_forced(self):
+        # Force-push was safe only while the branch was disposable. On the owner's
+        # real branch it could discard commits pushed from another machine.
+        src = open(ff.__file__, encoding="utf-8").read()
+        self.assertNotIn('"--force-with-lease", "-u"', src,
+                         "must never force-push the owner's real branch")
 
 
 class JsonLdGateTests(unittest.TestCase):
