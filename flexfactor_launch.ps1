@@ -8,14 +8,19 @@ $ErrorActionPreference = "Stop"
 # ---- API with Bearer token 'freecc' and maps any Claude model id by tier  ----
 # ---- to a free upstream (free cloud or local Ollama, per fcc-toggle       ----
 # ---- routing), so FlexFactor's claude-* ids route fine.                   ----
-# ---- The OPENAI key is BLANKED as well: zero billable spend. FlexFactor   ----
-# ---- runs single-provider through the free proxy (no OpenAI cross-check). ----
+# ---- The paid keys are BLANKED for the SDKs but CAPTURED first as RESCUE  ----
+# ---- fallbacks (owner order 2026-08-10 evening): the free proxy stays     ----
+# ---- PRIMARY for every call; the paid keys' only job is to keep a run     ----
+# ---- going when the free backend is overwhelmed, stale, or down. Paid     ----
+# ---- rescue spend stays inside FlexFactor's --max-cost budget.            ----
 # To run on the real paid APIs again: copy flexfactor_launch.ps1.bak-preproxy
 # over this file and your real ANTHROPIC_API_KEY/OPENAI_API_KEY will be used.
+$env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = $env:ANTHROPIC_API_KEY
+$env:FLEXFACTOR_FALLBACK_OPENAI_KEY    = $env:OPENAI_API_KEY
 $env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"
 $env:ANTHROPIC_AUTH_TOKEN = "freecc"      # Bearer auth the proxy expects
 $env:ANTHROPIC_API_KEY   = ""             # blank any real key so the SDK uses the Bearer token
-$env:OPENAI_API_KEY      = ""             # blank: no billable OpenAI calls in free mode
+$env:OPENAI_API_KEY      = ""             # blank: no billable OpenAI calls on the free path
 $env:OPENAI_BASE_URL     = ""
 
 function Test-FccProxyUp {
@@ -96,7 +101,15 @@ function Invoke-FlexFactorJob {
 if (-not (Ensure-FccProxy)) {
     Read-Host "Press Enter to close"; exit 1
 }
-Write-Host "  All model calls: FREE via the local FCC proxy at 127.0.0.1:8082 (no paid API keys)." -ForegroundColor Green
+Write-Host "  All model calls: FREE via the local FCC proxy at 127.0.0.1:8082." -ForegroundColor Green
+$fbA = -not [string]::IsNullOrEmpty($env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY)
+$fbO = -not [string]::IsNullOrEmpty($env:FLEXFACTOR_FALLBACK_OPENAI_KEY)
+if ($fbA -or $fbO) {
+    $tiers = @(); if ($fbA) { $tiers += 'Anthropic' }; if ($fbO) { $tiers += 'OpenAI' }
+    Write-Host "  Rescue fallbacks armed: $($tiers -join ' + ') (paid, used ONLY when the free path hangs/stalls)." -ForegroundColor DarkGray
+} else {
+    Write-Host "  No rescue fallback keys found in the environment - free-only (a stalled backend can stall runs)." -ForegroundColor DarkGray
+}
 
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
 
@@ -126,14 +139,22 @@ $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
 # prodready asks NOTHING beyond the program. That is the point of the mode: the
 # owner should not have to know which of ~40 audit flags make a run trustworthy.
 if ($mode -eq "4") {
+    # Programs: prodready takes UP TO FIVE in one run, same as audit. Each can
+    # be a folder, file, .lnk, URL, or name. Dropped paths are used as-is.
     $programs = @()
     $droppedAll = @($args | Where-Object { $_ })
     if ($droppedAll.Count -ge 1) {
         $programs = @($droppedAll | Select-Object -First 5 | ForEach-Object { $_.Trim('"') })
         Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
     } else {
-        $p = (Read-Host "Program to make production ready (folder, file, .lnk, URL, or name)").Trim('"')
-        if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
+        $countRaw = Read-Host "How many programs to make production ready? (1-5, Enter = 1)"
+        $count = 1
+        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 5) { $count = 1 }
+        for ($i = 1; $i -le $count; $i++) {
+            $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
+            if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
+        }
+        $programs = @($programs | Select-Object -First 5)
     }
     if ($programs.Count -eq 0) {
         Write-Host "No program given." -ForegroundColor Red

@@ -830,6 +830,78 @@ def _stream_with_deadline(client, *, deadline_s: float | None = None,
     return box["msg"]
 
 
+# ---- Paid-key RESCUE fallbacks (owner order 2026-08-10 evening) ------------- #
+# The free FCC proxy stays PRIMARY for every call. When the launcher hands the
+# real paid keys over as FLEXFACTOR_FALLBACK_ANTHROPIC_KEY / _OPENAI_KEY, their
+# ONLY job is to keep a run alive when the free path is overwhelmed (keep-alive
+# hang), stale (repeated empty/garbage responses), or down (proxy unrecoverable).
+# Escalation order per call:
+#   free attempts (with proxy restart)  ->  paid Anthropic (same protocol)
+#   ->  paid OpenAI (delegated to OpenAIProvider)  ->  the original error.
+# A HANG additionally arms a hold window (default 300s; FLEXFACTOR_FALLBACK_HOLD
+# overrides): while it is active, calls go straight to the paid tier instead of
+# each paying the 600s deadline probe against a backend already known to be
+# wedged; when it expires the next call probes the free path again - so the paid
+# keys never silently become the primary. Paid spend flows through the same
+# CostMeter/--max-cost budget as every other call. Budget-cap and egress-block
+# errors fire BEFORE any call and are never rescued; refusals are never rescued.
+
+def _fallback_anthropic_key() -> str:
+    return (os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY") or "").strip()
+
+
+def _fallback_openai_key() -> str:
+    return (os.environ.get("FLEXFACTOR_FALLBACK_OPENAI_KEY") or "").strip()
+
+
+def _fallback_available() -> bool:
+    return bool(_fallback_anthropic_key() or _fallback_openai_key())
+
+
+_FALLBACK_HOLD_LOCK = threading.Lock()
+_FALLBACK_HOLD_UNTIL = 0.0  # monotonic; while now < this, skip the free probe
+
+
+def _fallback_hold_seconds() -> float:
+    raw = (os.environ.get("FLEXFACTOR_FALLBACK_HOLD") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 300.0
+
+
+def _note_free_path_hang() -> None:
+    """The free path just burned a full stream deadline (hang mode). Arm the
+    paid-hold window so the NEXT calls rescue immediately instead of each
+    spending another 600s discovering the same wedged backend."""
+    global _FALLBACK_HOLD_UNTIL
+    if not _fallback_available():
+        return
+    with _FALLBACK_HOLD_LOCK:
+        _FALLBACK_HOLD_UNTIL = time.monotonic() + _fallback_hold_seconds()
+
+
+def _fallback_hold_active() -> bool:
+    if not _fallback_available():
+        return False
+    with _FALLBACK_HOLD_LOCK:
+        return time.monotonic() < _FALLBACK_HOLD_UNTIL
+
+
+class PaidRescueNeeded(RuntimeError):
+    """Internal signal: the free path AND the paid-Anthropic rescue both failed
+    (or no Anthropic rescue key is set) while an OpenAI rescue key exists. The
+    method-level handler delegates to the OpenAI rescue provider OUTSIDE the
+    Anthropic call's _budget_guard, carrying the original failure for honest
+    re-raise when OpenAI cannot serve the call either."""
+
+    def __init__(self, original: BaseException):
+        super().__init__(str(original))
+        self.original = original
+
+
 class AnthropicProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import anthropic  # imported lazily so OpenAI-only users need not install it
@@ -840,6 +912,64 @@ class AnthropicProvider:
         # Anthropic() resolves ANTHROPIC_API_KEY (or an `ant auth login` profile)
         # from the environment - never hardcode the key.
         self.client = anthropic.Anthropic()
+        self._paid_client_obj = None   # lazy real-API rescue client (paid key)
+        self._oai_rescue = None        # lazy OpenAIProvider rescue delegate
+
+    def _paid_client(self):
+        """Real-API Anthropic client built from the rescue key, or None. Explicit
+        api_key/base_url kwargs make the SDK ignore ALL credential env vars, so
+        the proxy's ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN cannot leak into a
+        paid call (verified against SDK 0.116.0 credential-resolution order)."""
+        key = _fallback_anthropic_key()
+        if not key:
+            return None
+        if self._paid_client_obj is None:
+            import anthropic
+            self._paid_client_obj = anthropic.Anthropic(
+                api_key=key, base_url="https://api.anthropic.com")
+        return self._paid_client_obj
+
+    def _openai_rescue_provider(self):
+        """Lazy OpenAIProvider armed with the rescue key (the env var is blanked
+        in free mode, so the client gets the key explicitly), or None."""
+        key = _fallback_openai_key()
+        if not key:
+            return None
+        if self._oai_rescue is None:
+            import openai
+            # NOT OpenAIProvider(...): its __init__ builds openai.OpenAI() from
+            # the env var, which is BLANKED in free mode - and the SDK raises on
+            # a missing/empty env key at construction (verified live 2026-08-10).
+            # Bypass __init__ and inject the rescue-key client directly.
+            prov = object.__new__(OpenAIProvider)
+            prov.model = DEFAULT_MODELS["openai"]
+            prov.judge_model = JUDGE_MODELS["openai"]
+            prov.meter = self.meter
+            # Explicit base_url too: free mode leaves OPENAI_BASE_URL="" in the
+            # env, and the SDK honors an empty-but-present env value as a literal
+            # base URL -> APIConnectionError (verified live 2026-08-10).
+            prov.client = openai.OpenAI(api_key=key,
+                                        base_url="https://api.openai.com/v1")
+            self._oai_rescue = prov
+        return self._oai_rescue
+
+    def _paid_message(self, kwargs: dict, original: BaseException):
+        """Free path failed for this call: replay the SAME Messages call against
+        the real Anthropic API (deadline off - the SDK's own HTTP timeouts work
+        there). Raises PaidRescueNeeded when that tier is unavailable or fails
+        while an OpenAI rescue key exists; re-raises the failure otherwise."""
+        client = self._paid_client()
+        if client is not None:
+            try:
+                msg = _stream_with_deadline(client, deadline_s=0.0, **kwargs)
+                print("  [fallback] free path failed for this call - served by the "
+                      "paid Anthropic API (free proxy stays primary)")
+                return msg
+            except Exception as exc:  # noqa: BLE001 - escalate to the next tier
+                original = exc
+        if _fallback_openai_key():
+            raise PaidRescueNeeded(original)
+        raise original
 
     def _recover_transport(self) -> None:
         """After a hang (StreamDeadlineError) or connection failure through the
@@ -882,22 +1012,45 @@ class AnthropicProvider:
         # cannot block a rewrite forever; one recover-and-retry on failure
         # (proxy restart + fresh client) before giving up.
         instruction = _egress_gate(instruction)
-        with _budget_guard(self.meter, self.model, len(instruction), 64000):
-            kwargs = dict(
-                model=self.model,
-                max_tokens=64000,
-                system=_cached_system(REWRITE_SYSTEM),
-                thinking={"type": "adaptive"},
-                messages=[{"role": "user", "content": instruction}],
-            )
-            try:
-                message = _stream_with_deadline(self.client, **kwargs)
-            except Exception:
-                if not _FCC_PROXY_ACTIVE:
-                    raise
-                self._recover_transport()
-                message = _stream_with_deadline(self.client, **kwargs)
-            self._meter(message, self.model)
+        try:
+            with _budget_guard(self.meter, self.model, len(instruction), 64000):
+                kwargs = dict(
+                    model=self.model,
+                    max_tokens=64000,
+                    system=_cached_system(REWRITE_SYSTEM),
+                    thinking={"type": "adaptive"},
+                    messages=[{"role": "user", "content": instruction}],
+                )
+                if _fallback_hold_active():
+                    # A recent hang already proved the free path is wedged; don't
+                    # spend another full deadline re-proving it for this call.
+                    message = self._paid_message(kwargs, RuntimeError(
+                        "free path on fallback hold after a recent hang"))
+                else:
+                    try:
+                        message = _stream_with_deadline(self.client, **kwargs)
+                    except Exception as exc:
+                        if not _FCC_PROXY_ACTIVE and not _fallback_available():
+                            raise
+                        if isinstance(exc, StreamDeadlineError):
+                            _note_free_path_hang()
+                        self._recover_transport()
+                        try:
+                            message = _stream_with_deadline(self.client, **kwargs)
+                        except Exception as exc2:
+                            if not _fallback_available():
+                                raise
+                            if isinstance(exc2, StreamDeadlineError):
+                                _note_free_path_hang()
+                            message = self._paid_message(kwargs, exc2)
+                self._meter(message, self.model)
+        except PaidRescueNeeded as pr:
+            oai = self._openai_rescue_provider()
+            if oai is None:
+                raise pr.original
+            print("  [fallback] free + paid-Anthropic paths failed; rewriting via "
+                  "paid OpenAI (free proxy stays primary)")
+            return oai.complete(instruction)
         if message.stop_reason == "refusal":
             raise RuntimeError(f"Model refused the rewrite (stop_details={message.stop_details}).")
         return "".join(b.text for b in message.content if b.type == "text").strip()
@@ -910,13 +1063,21 @@ class AnthropicProvider:
         sys_blocks = _cached_system(GRADE_SYSTEM)
         fmt = {"format": {"type": "json_schema", "schema": GRADE_SCHEMA}}
         last_text: str | None = None
-        with _budget_guard(self.meter, self.judge_model, len(prompt), 4000):
-            message = self._stream_structured(
-                model=self.judge_model, max_tokens=4000, system=sys_blocks,
-                messages=[{"role": "user", "content": prompt}], fmt=fmt)
-            self._meter(message, self.judge_model)
-            text = next((b.text for b in message.content if b.type == "text"), None)
-            last_text = text
+        try:
+            with _budget_guard(self.meter, self.judge_model, len(prompt), 4000):
+                message = self._stream_structured(
+                    model=self.judge_model, max_tokens=4000, system=sys_blocks,
+                    messages=[{"role": "user", "content": prompt}], fmt=fmt)
+                self._meter(message, self.judge_model)
+                text = next((b.text for b in message.content if b.type == "text"), None)
+                last_text = text
+        except PaidRescueNeeded as pr:
+            oai = self._openai_rescue_provider()
+            if oai is None:
+                raise pr.original
+            print("  [fallback] free + paid-Anthropic paths failed; grading via "
+                  "paid OpenAI (free proxy stays primary)")
+            return oai.grade(prompt)
         if message.stop_reason == "refusal":
             raise RuntimeError(f"Model refused to grade (stop_details={message.stop_details}).")
         if not text:
@@ -942,11 +1103,22 @@ class AnthropicProvider:
         prompt = _egress_gate(prompt)
         fmt = {"format": {"type": "json_schema", "schema": schema}}
         sys_blocks = _cached_system(system)
-        with _budget_guard(self.meter, use_model, len(prompt) + len(system), max_tokens):
-            message = self._stream_structured(
-                model=use_model, max_tokens=max_tokens, system=sys_blocks,
-                messages=[{"role": "user", "content": prompt}], fmt=fmt)
-            self._meter(message, use_model)
+        try:
+            with _budget_guard(self.meter, use_model, len(prompt) + len(system), max_tokens):
+                message = self._stream_structured(
+                    model=use_model, max_tokens=max_tokens, system=sys_blocks,
+                    messages=[{"role": "user", "content": prompt}], fmt=fmt)
+                self._meter(message, use_model)
+        except PaidRescueNeeded as pr:
+            oai = self._openai_rescue_provider()
+            if oai is None:
+                raise pr.original
+            oai_model = (JUDGE_MODELS["openai"] if use_model == self.judge_model
+                         else DEFAULT_MODELS["openai"])
+            print("  [fallback] free + paid-Anthropic paths failed; structured call "
+                  f"via paid OpenAI {oai_model} (free proxy stays primary)")
+            return oai.structured(system, prompt, schema, max_tokens=max_tokens,
+                                  model=oai_model, salvage_truncated=salvage_truncated)
         if message.stop_reason == "refusal":
             raise RuntimeError(f"Model refused (stop_details={message.stop_details}).")
         if message.stop_reason == "max_tokens":
@@ -996,15 +1168,20 @@ class AnthropicProvider:
         (spaced 6s); between attempts `_recover_transport` restarts a dead
         proxy and swaps in a fresh HTTP client so a wedged pooled connection
         or a crashed fcc-server no longer strands the job."""
+        call_kwargs = dict(model=model, max_tokens=max_tokens, system=system,
+                           output_config=fmt, messages=messages)
+        if _fallback_hold_active():
+            # A recent hang already proved the free path is wedged; go straight
+            # to the paid tier for this call instead of re-proving it at 600s a
+            # probe. When the hold expires the next call tries free again.
+            return self._paid_message(call_kwargs, RuntimeError(
+                "free path on fallback hold after a recent hang"))
         last_text = None
         message = None
         for attempt in range(3):
             try:
-                message = _stream_with_deadline(
-                    self.client, model=model, max_tokens=max_tokens, system=system,
-                    output_config=fmt, messages=messages,
-                )
-            except Exception:
+                message = _stream_with_deadline(self.client, **call_kwargs)
+            except Exception as exc:
                 # Transport error, NIM zero-token drop, or a StreamDeadlineError
                 # from the abandoned-hang path: treat uniformly - recover the
                 # transport (proxy restart + fresh client, FCC-only), retry
@@ -1012,6 +1189,15 @@ class AnthropicProvider:
                 # transient stall doesn't kill the file.
                 message = None
                 last_text = None
+                if isinstance(exc, StreamDeadlineError):
+                    _note_free_path_hang()
+                    if _fallback_available():
+                        # A hang costs a full deadline (600s); with a rescue key
+                        # available, burning two MORE deadlines on retries would
+                        # stall the run for half an hour per call. Rescue now;
+                        # the hold window keeps later calls from re-probing.
+                        self._recover_transport()
+                        return self._paid_message(call_kwargs, exc)
                 if attempt < 2:
                     self._recover_transport()
                     time.sleep(6.0)
@@ -1039,6 +1225,14 @@ class AnthropicProvider:
         # exceptioned (deadline / transport / empty), in which case there is no
         # Message to inspect and we raise explicitly so review_file marks the file
         # INCOMPLETE (review failed) instead of crashing on a None content array.
+        # With a rescue key present, a STALE free path (three empty/garbage
+        # responses in a row) is exactly what the paid keys exist for - replay
+        # the call on the paid tier before giving up on the file.
+        if _fallback_available() and (message is None or last_text is not None):
+            reason = ("repeated empty/transport failure" if message is None
+                      else "unparseable output after retries")
+            return self._paid_message(call_kwargs, RuntimeError(
+                f"free path failed: {reason}"))
         if message is None:
             raise RuntimeError("structured streaming call failed after retries "
                                "(stream deadline exceeded or repeated empty/transport error)")
@@ -1051,21 +1245,36 @@ class AnthropicProvider:
         retry through the FCC proxy: a preflight ping that merely hit a dead proxy
         or a queued/hung slot must not condemn the whole provider (measured: a
         healthy ping took 307s queued behind two big review calls)."""
-        with _budget_guard(self.meter, self.judge_model, len("ping"), 1):
-            try:
-                message = _stream_with_deadline(
-                    self.client, model=self.judge_model, max_tokens=8,
-                    messages=[{"role": "user", "content": "ping"}],
-                )
-            except Exception:
-                if not _FCC_PROXY_ACTIVE:
-                    raise
-                self._recover_transport()
-                message = _stream_with_deadline(
-                    self.client, model=self.judge_model, max_tokens=8,
-                    messages=[{"role": "user", "content": "ping"}],
-                )
-            self._meter(message, self.judge_model)
+        kwargs = dict(model=self.judge_model, max_tokens=8,
+                      messages=[{"role": "user", "content": "ping"}])
+        try:
+            with _budget_guard(self.meter, self.judge_model, len("ping"), 1):
+                if _fallback_hold_active():
+                    message = self._paid_message(kwargs, RuntimeError(
+                        "free path on fallback hold after a recent hang"))
+                else:
+                    try:
+                        message = _stream_with_deadline(self.client, **kwargs)
+                    except Exception as exc:
+                        if not _FCC_PROXY_ACTIVE and not _fallback_available():
+                            raise
+                        if isinstance(exc, StreamDeadlineError):
+                            _note_free_path_hang()
+                        self._recover_transport()
+                        try:
+                            message = _stream_with_deadline(self.client, **kwargs)
+                        except Exception as exc2:
+                            if not _fallback_available():
+                                raise
+                            if isinstance(exc2, StreamDeadlineError):
+                                _note_free_path_hang()
+                            message = self._paid_message(kwargs, exc2)
+                self._meter(message, self.judge_model)
+        except PaidRescueNeeded as pr:
+            oai = self._openai_rescue_provider()
+            if oai is None:
+                raise pr.original
+            oai.ping()
 
 
 class OpenAIProvider:

@@ -6628,11 +6628,13 @@ class PurposeGapTests(unittest.TestCase):
 
 
 class LauncherOpenAIKeyTests(unittest.TestCase):
-    """FREE-ONLY contract (owner order 2026-08-10, superseding the morning's
-    keep-OpenAI fix): the desktop launcher must blank BOTH paid credentials
-    (ANTHROPIC_API_KEY and OPENAI_API_KEY) so every model call routes through
-    the free FCC proxy and nothing can bill. The dual-model cross-check is
-    deliberately given up; restoring paid mode = flexfactor_launch.ps1.bak-preproxy."""
+    """FREE-PRIMARY contract (owner orders 2026-08-10, evening superseding the
+    afternoon's free-ONLY): the desktop launcher must still blank BOTH paid
+    credentials (ANTHROPIC_API_KEY and OPENAI_API_KEY) so every SDK-resolved
+    call routes through the free FCC proxy - but it must first CAPTURE the real
+    keys into FLEXFACTOR_FALLBACK_* so the paid tiers can rescue a call when
+    the free path hangs/stalls. Their job is to keep the free run going, never
+    to become primary. Restoring full paid mode = flexfactor_launch.ps1.bak-preproxy."""
 
     def _launcher_text(self):
         here = os.path.dirname(os.path.abspath(__file__))
@@ -6676,6 +6678,29 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         text = self._launcher_text()
         self.assertIn('$extraArgs += "--apply"', text)
         self.assertIn('$extraArgs += "--yes"', text)
+
+    def test_launcher_captures_rescue_keys_BEFORE_blanking(self):
+        # Order matters: capturing after blanking hands the fallback an empty
+        # string and the rescue tier silently never exists.
+        import re as _re
+        text = self._launcher_text()
+        cap_a = text.find('$env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = $env:ANTHROPIC_API_KEY')
+        cap_o = text.find('$env:FLEXFACTOR_FALLBACK_OPENAI_KEY    = $env:OPENAI_API_KEY')
+        blank_a = _re.search(r'^\s*\$env:ANTHROPIC_API_KEY\s*=\s*""', text, _re.M)
+        blank_o = _re.search(r'^\s*\$env:OPENAI_API_KEY\s*=\s*""', text, _re.M)
+        self.assertGreaterEqual(cap_a, 0, "launcher no longer captures the Anthropic rescue key")
+        self.assertGreaterEqual(cap_o, 0, "launcher no longer captures the OpenAI rescue key")
+        self.assertIsNotNone(blank_a)
+        self.assertIsNotNone(blank_o)
+        self.assertLess(cap_a, blank_a.start(), "Anthropic rescue capture must precede blanking")
+        self.assertLess(cap_o, blank_o.start(), "OpenAI rescue capture must precede blanking")
+
+    def test_launcher_prodready_prompts_up_to_five_programs(self):
+        # Owner order 2026-08-10: option 4 (prodready) takes up to five programs
+        # interactively, same as option 3 (audit) - not just via drag-and-drop.
+        text = self._launcher_text()
+        self.assertIn("How many programs to make production ready? (1-5", text)
+        self.assertIn("How many programs to audit? (1-5", text)
 
 
 class TruncatedJsonSalvageTests(unittest.TestCase):
@@ -7450,6 +7475,238 @@ class TransportRecoveryTests(unittest.TestCase):
         finally:
             ff._fcc_proxy_health = saved_health
             ff.subprocess.Popen = saved_popen
+
+
+class _FakeMsgBlock:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class _FakeMsg:
+    def __init__(self, text='{"ok": 1}', stop_reason="end_turn"):
+        self.content = [_FakeMsgBlock(text)]
+        self.stop_reason = stop_reason
+        self.usage = None
+
+
+class PaidFallbackRescueTests(unittest.TestCase):
+    """Owner order 2026-08-10 evening: the free FCC proxy stays PRIMARY; the
+    real Anthropic/OpenAI keys (handed over as FLEXFACTOR_FALLBACK_*) exist
+    ONLY to keep a run going when the free path hangs, stalls, or emits
+    garbage. Escalation: free -> paid Anthropic -> paid OpenAI -> original
+    error. A hang arms a hold window so later calls skip the 600s re-probe."""
+
+    _ENV = ("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY", "FLEXFACTOR_FALLBACK_OPENAI_KEY",
+            "FLEXFACTOR_FALLBACK_HOLD")
+
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in self._ENV}
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        self._hold = ff._FALLBACK_HOLD_UNTIL
+        ff._FALLBACK_HOLD_UNTIL = 0.0
+        self._swd = ff._stream_with_deadline
+        self._sleep = ff.time.sleep
+        ff.time.sleep = lambda s: None  # the 6s retry spacing is pointless in stubs
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        ff._FALLBACK_HOLD_UNTIL = self._hold
+        ff._stream_with_deadline = self._swd
+        ff.time.sleep = self._sleep
+
+    def _provider(self):
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.model = "claude-opus-4-8"
+        prov.judge_model = "claude-haiku-4-5"
+        prov.meter = None
+        prov.client = object()  # sentinel free client (never a real SDK client)
+        prov._paid_client_obj = None
+        prov._oai_rescue = None
+        return prov
+
+    # ---- env plumbing ----
+    def test_no_keys_means_no_fallback(self):
+        self.assertFalse(ff._fallback_available())
+        ff._note_free_path_hang()  # must be a no-op without keys
+        self.assertFalse(ff._fallback_hold_active())
+
+    def test_keys_arm_fallback_and_hold(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        self.assertTrue(ff._fallback_available())
+        ff._note_free_path_hang()
+        self.assertTrue(ff._fallback_hold_active())
+
+    def test_hold_expires(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        os.environ["FLEXFACTOR_FALLBACK_HOLD"] = "0.01"
+        ff._note_free_path_hang()
+        deadline = time.monotonic() + 2.0
+        while ff._fallback_hold_active() and time.monotonic() < deadline:
+            self._sleep(0.02)  # the REAL sleep saved in setUp
+        self.assertFalse(ff._fallback_hold_active(), "hold must expire so free is re-probed")
+
+    # ---- escalation ----
+    def test_deadline_hang_rescues_via_paid_anthropic_and_arms_hold(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        prov = self._provider()
+        paid_msg = _FakeMsg()
+        calls = []
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            calls.append(client)
+            if client is prov.client:
+                raise ff.StreamDeadlineError("keep-alive hang")
+            return paid_msg
+
+        ff._stream_with_deadline = fake_swd
+        out = prov._stream_structured(
+            model="claude-haiku-4-5", max_tokens=100, system=[],
+            messages=[{"role": "user", "content": "x"}], fmt={})
+        self.assertIs(out, paid_msg)
+        self.assertIs(calls[0], prov.client, "free path must be tried FIRST")
+        self.assertIsNot(calls[-1], prov.client, "rescue must use the paid client")
+        self.assertTrue(ff._fallback_hold_active(), "a hang must arm the hold window")
+        # And while the hold is active, the free client is skipped entirely.
+        calls.clear()
+        out2 = prov._stream_structured(
+            model="claude-haiku-4-5", max_tokens=100, system=[],
+            messages=[{"role": "user", "content": "x"}], fmt={})
+        self.assertIs(out2, paid_msg)
+        self.assertTrue(all(c is not prov.client for c in calls),
+                        "during the hold window the wedged free path must not be probed")
+
+    def test_exhausted_retries_rescue_via_paid_anthropic(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        prov = self._provider()
+        paid_msg = _FakeMsg()
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            if client is prov.client:
+                raise ConnectionError("transport drop")
+            return paid_msg
+
+        ff._stream_with_deadline = fake_swd
+        out = prov._stream_structured(
+            model="claude-haiku-4-5", max_tokens=100, system=[],
+            messages=[{"role": "user", "content": "x"}], fmt={})
+        self.assertIs(out, paid_msg)
+        self.assertFalse(ff._fallback_hold_active(),
+                         "fast transport failures must NOT arm the hang hold")
+
+    def test_no_keys_preserves_original_failure(self):
+        prov = self._provider()
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            raise ConnectionError("transport drop")
+
+        ff._stream_with_deadline = fake_swd
+        with self.assertRaises(RuntimeError):
+            prov._stream_structured(
+                model="claude-haiku-4-5", max_tokens=100, system=[],
+                messages=[{"role": "user", "content": "x"}], fmt={})
+
+    def test_structured_delegates_to_openai_when_anthropic_tier_fails(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
+        prov = self._provider()
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            raise ConnectionError("everything anthropic-shaped is down")
+
+        ff._stream_with_deadline = fake_swd
+
+        seen = {}
+
+        class _StubOai:
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, salvage_truncated=False):
+                seen["model"] = model
+                return {"ok": True}
+
+        prov._oai_rescue = _StubOai()  # preseed the lazy delegate
+        out = prov.structured("sys", "prompt", {"type": "object"},
+                              model=prov.judge_model)
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(seen["model"], ff.JUDGE_MODELS["openai"],
+                         "a judge-tier call must map to the OpenAI judge tier")
+
+    def test_openai_rescue_maps_author_tier(self):
+        os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
+        prov = self._provider()
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            raise ConnectionError("free path down, no anthropic rescue key")
+
+        ff._stream_with_deadline = fake_swd
+
+        seen = {}
+
+        class _StubOai:
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, salvage_truncated=False):
+                seen["model"] = model
+                return {"ok": True}
+
+        prov._oai_rescue = _StubOai()
+        out = prov.structured("sys", "prompt", {"type": "object"})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(seen["model"], ff.DEFAULT_MODELS["openai"],
+                         "an author-tier call must map to the OpenAI author tier")
+
+    def test_garbage_output_rescues_when_keys_present(self):
+        # A STALE free backend returning prose instead of JSON is exactly the
+        # "stales" case the owner named: the paid tier must take the call.
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        prov = self._provider()
+        paid_msg = _FakeMsg()
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            if client is prov.client:
+                return _FakeMsg(text="sorry, here is prose not json")
+            return paid_msg
+
+        ff._stream_with_deadline = fake_swd
+        out = prov._stream_structured(
+            model="claude-haiku-4-5", max_tokens=100, system=[],
+            messages=[{"role": "user", "content": "x"}], fmt={})
+        self.assertIs(out, paid_msg)
+
+    def test_openai_rescue_builds_with_blanked_env_key(self):
+        # Live-caught 2026-08-10: OpenAIProvider.__init__ constructs the client
+        # from the env var, which free mode BLANKS - and the SDK raises on a
+        # missing env key at construction. The rescue must inject its own key,
+        # never read the (deliberately empty) environment.
+        os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
+        saved = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = ""
+        try:
+            prov = self._provider()
+            oai = prov._openai_rescue_provider()  # must not raise
+            self.assertIsNotNone(oai)
+            self.assertEqual(oai.api_key if hasattr(oai, "api_key") else oai.client.api_key,
+                             "sk-test")
+            self.assertEqual(oai.model, ff.DEFAULT_MODELS["openai"])
+            self.assertEqual(oai.judge_model, ff.JUDGE_MODELS["openai"])
+        finally:
+            if saved is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = saved
+
+    def test_paid_client_ignores_proxy_env(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
+        prov = self._provider()
+        client = prov._paid_client()
+        self.assertIsNotNone(client)
+        self.assertEqual(client.api_key, "sk-ant-test")
+        self.assertIn("api.anthropic.com", str(client.base_url),
+                      "the rescue client must target the REAL API, not the proxy")
 
 
 if __name__ == "__main__":
