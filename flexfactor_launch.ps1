@@ -2,34 +2,101 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# ---- Route the ANTHROPIC provider through the local FCC proxy (Free Claude ----
-# ---- Code). The proxy on 127.0.0.1:8082 exposes the Anthropic Messages API ----
-# ---- with Bearer token 'freecc' and maps any Claude model id by tier to a  ----
-# ---- free upstream, so FlexFactor's claude-* ids route fine.               ----
-# ---- The OPENAI key is deliberately LEFT ALONE: the OpenAI SDK talks to    ----
-# ---- api.openai.com directly, so a real OPENAI_API_KEY in the environment  ----
-# ---- gives audit/prodready their dual-model cross-check (billable spend).  ----
-# To run Anthropic on the real API too: copy flexfactor_launch.ps1.bak-preproxy
-# over this file and your real ANTHROPIC_API_KEY will be used again.
+# ---- Route ALL model calls through the local FCC proxy (Free Claude Code, ----
+# ---- the same backend the "Claude Code - FREE (Ollama)" desktop shortcut  ----
+# ---- uses). The proxy on 127.0.0.1:8082 exposes the Anthropic Messages    ----
+# ---- API with Bearer token 'freecc' and maps any Claude model id by tier  ----
+# ---- to a free upstream (free cloud or local Ollama, per fcc-toggle       ----
+# ---- routing), so FlexFactor's claude-* ids route fine.                   ----
+# ---- The OPENAI key is BLANKED as well: zero billable spend. FlexFactor   ----
+# ---- runs single-provider through the free proxy (no OpenAI cross-check). ----
+# To run on the real paid APIs again: copy flexfactor_launch.ps1.bak-preproxy
+# over this file and your real ANTHROPIC_API_KEY/OPENAI_API_KEY will be used.
 $env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"
 $env:ANTHROPIC_AUTH_TOKEN = "freecc"      # Bearer auth the proxy expects
 $env:ANTHROPIC_API_KEY   = ""             # blank any real key so the SDK uses the Bearer token
-$proxyUp = $false
-$tcp = New-Object System.Net.Sockets.TcpClient
-try { $tcp.Connect("127.0.0.1", 8082); $proxyUp = $true } catch { $proxyUp = $false } finally { $tcp.Close() }
-if (-not $proxyUp) {
-    Write-Host "  NOTE: the local FCC proxy at 127.0.0.1:8082 is not reachable." -ForegroundColor Yellow
-    Write-Host "  FlexFactor is configured to route through it (that is what Claude Code uses)." -ForegroundColor Yellow
-    Write-Host "  Start the FCC proxy and retry, or restore flexfactor_launch.ps1.bak-preproxy" -ForegroundColor Yellow
-    Write-Host "  to use the real Anthropic/OpenAI API keys again." -ForegroundColor Yellow
+$env:OPENAI_API_KEY      = ""             # blank: no billable OpenAI calls in free mode
+$env:OPENAI_BASE_URL     = ""
+
+function Test-FccProxyUp {
+    try { return ((Invoke-WebRequest "http://127.0.0.1:8082/health" -TimeoutSec 2 -UseBasicParsing).StatusCode -eq 200) } catch { return $false }
+}
+
+function Ensure-FccProxy {
+    # Make sure the free FCC proxy is serving; start it if not, the same way
+    # fcc-toggle.ps1's Start-Server does (hidden, logs under ~/.fcc/logs,
+    # messaging off, bound to 127.0.0.1:8082). Returns $true when healthy.
+    if (Test-FccProxyUp) { return $true }
+    Write-Host "  FCC proxy not running - starting it (same free backend as the desktop shortcut) ..." -ForegroundColor Yellow
+    $fccServer = $null
+    try { $fccServer = (Get-Command -Name 'fcc-server' -CommandType Application -ErrorAction Stop).Path } catch {}
+    if (-not $fccServer) {
+        Write-Host "  fcc-server not found on PATH. Run the 'Claude Code - FREE (Ollama)' desktop" -ForegroundColor Red
+        Write-Host "  shortcut once (it starts the proxy), then retry FlexFactor." -ForegroundColor Red
+        return $false
+    }
+    $fccHome = Join-Path $HOME '.fcc'
+    $fccLogs = Join-Path $fccHome 'logs'
+    if (-not (Test-Path $fccLogs)) { New-Item -ItemType Directory -Path $fccLogs -Force | Out-Null }
+    $prevMessaging = $env:MESSAGING_PLATFORM; $prevHost = $env:HOST; $prevPort = $env:PORT
+    try {
+        if ($env:FCC_ENABLE_MESSAGING -ne '1') { $env:MESSAGING_PLATFORM = 'none' }
+        $env:HOST = '127.0.0.1'; $env:PORT = '8082'
+        Start-Process -FilePath $fccServer -WorkingDirectory $fccHome `
+            -RedirectStandardOutput (Join-Path $fccLogs 'server.stdout.log') `
+            -RedirectStandardError (Join-Path $fccLogs 'server.stderr.log') `
+            -WindowStyle Hidden
+    } finally {
+        if ($null -eq $prevMessaging) { Remove-Item Env:\MESSAGING_PLATFORM -ErrorAction SilentlyContinue } else { $env:MESSAGING_PLATFORM = $prevMessaging }
+        if ($null -eq $prevHost) { Remove-Item Env:\HOST -ErrorAction SilentlyContinue } else { $env:HOST = $prevHost }
+        if ($null -eq $prevPort) { Remove-Item Env:\PORT -ErrorAction SilentlyContinue } else { $env:PORT = $prevPort }
+    }
+    $deadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $deadline -and -not (Test-FccProxyUp)) { Start-Sleep -Milliseconds 500 }
+    if (Test-FccProxyUp) { return $true }
+    Write-Host "  The FCC proxy did not come up within 90s." -ForegroundColor Red
+    Write-Host "  See $HOME\.fcc\logs\server.stderr.log, or run the desktop shortcut" -ForegroundColor Red
+    Write-Host "  'Claude Code - FREE (Ollama)' to diagnose, then retry." -ForegroundColor Red
+    return $false
+}
+
+function Invoke-FlexFactorJob {
+    # Supervisor: the free backend drops connections / hangs under load, so a
+    # FlexFactor job that dies is RELAUNCHED (up to 5 attempts) after re-ensuring
+    # the proxy is up. Safe by design: the audit sandbox branch is recreated with
+    # `git checkout -B` on every run, brain.json's clean_files skip makes a rerun
+    # converge instead of starting over, and in-process retries mean a restart
+    # only happens when the process genuinely died. Exit 2 (argparse usage
+    # error) never retries - rerunning a doomed command 5x helps nobody.
+    param([string[]]$JobArgs)
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        if (-not (Ensure-FccProxy)) {
+            Write-Host "  Proxy unavailable - cannot run this attempt." -ForegroundColor Red
+            return 1
+        }
+        if ($attempt -gt 1) {
+            Write-Host ""
+            Write-Host "  RESTART $attempt/$maxAttempts - relaunching the job (free backend dropped it) ..." -ForegroundColor Yellow
+        }
+        python $script @JobArgs
+        $code = $LASTEXITCODE
+        if ($code -eq 0) { return 0 }
+        if ($code -eq 2) {
+            Write-Host "  Exit code 2 (usage error) - not retrying." -ForegroundColor Red
+            return $code
+        }
+        Write-Host "  FlexFactor exited with code $code." -ForegroundColor Yellow
+        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 15 }
+    }
+    Write-Host "  Gave up after $maxAttempts attempts - see output above." -ForegroundColor Red
+    return 1
+}
+
+if (-not (Ensure-FccProxy)) {
     Read-Host "Press Enter to close"; exit 1
 }
-Write-Host "  Anthropic: routing through local FCC proxy at 127.0.0.1:8082 (Bearer freecc)." -ForegroundColor Green
-if (-not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
-    Write-Host "  OpenAI: real OPENAI_API_KEY detected - available as cross-check/second provider (billable)." -ForegroundColor Green
-} else {
-    Write-Host "  OpenAI: no OPENAI_API_KEY in this environment - single-provider run." -ForegroundColor DarkGray
-}
+Write-Host "  All model calls: FREE via the local FCC proxy at 127.0.0.1:8082 (no paid API keys)." -ForegroundColor Green
 
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
 
@@ -79,7 +146,7 @@ if ($mode -eq "4") {
     Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
     Write-Host "  Fixes land on a flexfactor/prodready-* branch; nothing is pushed." -ForegroundColor DarkGray
     Write-Host ""
-    python $script prodready @programArgs --provider anthropic --economy
+    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--provider', 'anthropic', '--economy'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
@@ -184,7 +251,7 @@ if ($mode -eq "3") {
     $providerArgs = @('--provider', $primary)
 
     Write-Host ""
-    python $script audit @providerArgs @programArgs @extraArgs
+    $null = Invoke-FlexFactorJob (@('audit') + $providerArgs + $programArgs + $extraArgs)
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
@@ -212,7 +279,7 @@ if ($mode -eq "2") {
         $program = (Read-Host "Program to help (folder, .lnk, URL, or description)").Trim('"')
     }
     Write-Host ""
-    python $script scout --program $program --provider $provider
+    $null = Invoke-FlexFactorJob @('scout', '--program', $program, '--provider', $provider)
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
@@ -236,6 +303,6 @@ $threshold = Read-Host "Accept threshold 0-100 (Enter = 90)"
 if ([string]::IsNullOrWhiteSpace($threshold)) { $threshold = "90" }
 
 Write-Host ""
-python $script refactor --file $file --goal $goal --provider $provider --threshold $threshold
+$null = Invoke-FlexFactorJob @('refactor', '--file', $file, '--goal', $goal, '--provider', $provider, '--threshold', $threshold)
 Write-Host ""
 Read-Host "Done. Press Enter to close"

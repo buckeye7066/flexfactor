@@ -657,28 +657,177 @@ def _cached_system(system: str) -> list[dict]:
 # get_final_message() never raises and the audit stays hung. It also risked a
 # REGRESSION: a legitimately-slow review still streaming tokens at the deadline
 # would be force-closed and retried to death -> file lost. So the watcher is
-# REMOVED. The reliable mitigations now are (a) the spaced retry/sleep in
-# _stream_structured below for the EMPTY-DROP cascade (NIM's other failure
-# mode), and (b) an EXTERNAL log-stall detector: poll the run log's highest
-# (N/375) line - if it freezes for many minutes while the audit python shows
-# ~0 CPU, that's a re-hang; kill the audit python and restart it. (Do NOT use
-# ~/.flexfactor/status.json mtime as the signal - the ProgressBus does not write
-# it per-file in proxied runs, so a status.json-mtime monitor is a false
-# positive; it fired twice on a normally-advancing run-5.) The subprocess-per-call approach (kill the child
-# on timeout -> OS tears down sockets reliably) is the only known Windows-safe
-# wall-clock cap and is deferred as out of scope for this report-only pass.
+# REMOVED. (Do NOT use ~/.flexfactor/status.json mtime as an external stall
+# signal - the ProgressBus does not write it per-file in proxied runs, so a
+# status.json-mtime monitor is a false positive; it fired twice on a
+# normally-advancing run-5.)
+#
+# CURRENT approach (2026-08-10, "auto-restart on lost connection"): the hang is
+# bounded by ABANDONMENT, not interruption. The stream call runs in a daemon
+# worker thread; the caller waits `deadline_s` wall-clock on join() and, on
+# timeout, walks away (StreamDeadlineError) leaving the blocked recv to rot in
+# its abandoned thread. That sidesteps the Windows closesocket() limitation
+# entirely: nothing tries to unblock the recv - the retry path simply drops the
+# old httpx client (whose pool owns the wedged connection) and continues on a
+# fresh one. The deadline is generous (default 600s, matching the proxy's own
+# HTTP_READ_TIMEOUT=600 read budget) so a legitimately-slow-but-streaming
+# review is never false-killed: a healthy glm-5.2 turn measures 44-67s, and
+# anything still silent at 10 minutes is the keep-alive hang, full stop.
+# Additionally, when the PROXY ITSELF dies (connection refused), the recovery
+# path restarts fcc-server the same way fcc-toggle.ps1's Start-Server does and
+# waits for /health before retrying - so a lost connection no longer strands
+# the job. Both behaviors only arm when routing through the local proxy
+# (_FCC_PROXY_ACTIVE); against the real Anthropic API the deadline is off and
+# this stays the thin passthrough it was.
 _FCC_PROXY_ACTIVE = "127.0.0.1:8082" in os.environ.get("ANTHROPIC_BASE_URL", "")
+
+
+class StreamDeadlineError(RuntimeError):
+    """A proxied stream produced no final message within the wall-clock deadline
+    (the NIM keep-alive hang mode). The blocked call was ABANDONED in its daemon
+    thread - the socket cannot be interrupted on Windows - so the retry path must
+    use a fresh client (see AnthropicProvider._recover_transport)."""
+
+
+def _stream_deadline_seconds() -> float:
+    """Per-call wall-clock budget. FLEXFACTOR_STREAM_TIMEOUT (seconds) overrides;
+    0 disables. Defaults: 600s through the FCC proxy, disabled on the real API
+    (the SDK's own HTTP timeout machinery works there)."""
+    raw = os.environ.get("FLEXFACTOR_STREAM_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 600.0 if _FCC_PROXY_ACTIVE else 0.0
+
+
+def _fcc_proxy_health(timeout: float = 3.0) -> bool:
+    """True when the local FCC proxy answers /health with 200. Only meaningful
+    when _FCC_PROXY_ACTIVE."""
+    import urllib.request
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    if not base:
+        return False
+    try:
+        with urllib.request.urlopen(base + "/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+_FCC_RESTART_LOCK = threading.Lock()
+_FCC_RESTART_LAST = 0.0  # monotonic stamp of the last restart attempt (cooldown)
+
+
+def _ensure_fcc_proxy(wait_s: float = 90.0) -> bool:
+    """Make sure the FCC proxy is serving; restart fcc-server if it is not.
+
+    Mirrors fcc-toggle.ps1 Start-Server: hidden window, cwd ~/.fcc, messaging
+    disabled unless FCC_ENABLE_MESSAGING=1, HOST/PORT pinned to 127.0.0.1:8082,
+    stdout/stderr appended to ~/.fcc/logs/. Lock-guarded single-flight with a
+    30s cooldown so parallel review workers hitting a dead proxy do not spawn a
+    server stampede - late arrivals re-check health and return. Never raises;
+    returns the final health verdict so callers can decide to retry or give up."""
+    global _FCC_RESTART_LAST
+    if not _FCC_PROXY_ACTIVE:
+        return True
+    if _fcc_proxy_health():
+        return True
+    with _FCC_RESTART_LOCK:
+        if _fcc_proxy_health():
+            return True  # another worker already restarted it
+        now = time.monotonic()
+        if now - _FCC_RESTART_LAST < 30.0:
+            # A restart attempt just happened and health is still down - do not
+            # thrash; wait out the remainder of that attempt's window instead.
+            deadline = _FCC_RESTART_LAST + wait_s
+            while time.monotonic() < min(deadline, now + wait_s):
+                if _fcc_proxy_health():
+                    return True
+                time.sleep(2.0)
+            return _fcc_proxy_health()
+        _FCC_RESTART_LAST = now
+        exe = shutil.which("fcc-server")
+        if not exe:
+            print("  [fcc] proxy is down and fcc-server is not on PATH - cannot restart it")
+            return False
+        fcc_home = os.path.join(os.path.expanduser("~"), ".fcc")
+        log_dir = os.path.join(fcc_home, "logs")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            log_dir = None
+        env = dict(os.environ)
+        if env.get("FCC_ENABLE_MESSAGING") != "1":
+            env["MESSAGING_PLATFORM"] = "none"
+        env["HOST"] = "127.0.0.1"
+        env["PORT"] = "8082"
+        print("  [fcc] proxy connection lost - restarting fcc-server ...")
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                # DETACHED_PROCESS | CREATE_NO_WINDOW: survive this python's exit,
+                # never flash a console.
+                creationflags = 0x00000008 | 0x08000000
+            if log_dir:
+                out = open(os.path.join(log_dir, "server.stdout.log"), "ab")
+                err = open(os.path.join(log_dir, "server.stderr.log"), "ab")
+            else:
+                out = err = subprocess.DEVNULL
+            subprocess.Popen(
+                [exe], cwd=fcc_home if os.path.isdir(fcc_home) else None, env=env,
+                stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                creationflags=creationflags)
+        except Exception as exc:
+            print(f"  [fcc] failed to spawn fcc-server: {exc}")
+            return False
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if _fcc_proxy_health():
+                print("  [fcc] proxy is back up")
+                return True
+            time.sleep(1.0)
+        print(f"  [fcc] proxy did not come back within {wait_s:.0f}s")
+        return False
 
 
 def _stream_with_deadline(client, *, deadline_s: float | None = None,
                           **stream_kwargs) -> object:
-    """messages.stream(...).get_final_message(). The deadline/watcher was removed
-    (see the note above): a thread-close cannot interrupt a Windows blocking recv,
-    so it both failed to break the keep-alive hang and risked false-killing slow
-    legit reviews. This is now a thin passthrough kept so callers stay stable; the
-    empty-drop retry/sleep lives in _stream_structured."""
-    with client.messages.stream(**stream_kwargs) as stream:
-        return stream.get_final_message()
+    """messages.stream(...).get_final_message() bounded by a wall-clock deadline.
+
+    The call runs in a daemon worker thread; on timeout the thread is ABANDONED
+    (Windows cannot interrupt its blocking recv - see the note above) and
+    StreamDeadlineError is raised so the caller can retry on a fresh client.
+    deadline_s=None -> _stream_deadline_seconds() (600s via FCC proxy, off on
+    the real API); deadline_s<=0 -> plain passthrough."""
+    if deadline_s is None:
+        deadline_s = _stream_deadline_seconds()
+    if not deadline_s or deadline_s <= 0:
+        with client.messages.stream(**stream_kwargs) as stream:
+            return stream.get_final_message()
+    box: dict[str, object] = {}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            with client.messages.stream(**stream_kwargs) as stream:
+                box["msg"] = stream.get_final_message()
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller thread
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, daemon=True,
+                         name="flexfactor-stream-deadline")
+    t.start()
+    if not done.wait(deadline_s):
+        raise StreamDeadlineError(
+            f"stream produced no final message within {deadline_s:.0f}s wall clock "
+            "(FCC keep-alive hang mode); call abandoned - retry on a fresh client")
+    if "exc" in box:
+        raise box["exc"]  # type: ignore[misc]
+    return box["msg"]
 
 
 class AnthropicProvider:
@@ -691,6 +840,24 @@ class AnthropicProvider:
         # Anthropic() resolves ANTHROPIC_API_KEY (or an `ant auth login` profile)
         # from the environment - never hardcode the key.
         self.client = anthropic.Anthropic()
+
+    def _recover_transport(self) -> None:
+        """After a hang (StreamDeadlineError) or connection failure through the
+        FCC proxy: make sure the proxy is serving (restarting fcc-server if it
+        died) and DROP the old HTTP client - its connection pool may still own
+        the wedged keep-alive socket an abandoned call left behind. No-op when
+        talking to the real Anthropic API."""
+        if not _FCC_PROXY_ACTIVE:
+            return
+        try:
+            _ensure_fcc_proxy()
+        except Exception:
+            pass  # best-effort; the retry's own failure will surface the truth
+        try:
+            import anthropic
+            self.client = anthropic.Anthropic()
+        except Exception:
+            pass
 
     def _meter(self, message, model: str) -> None:
         # Bill against the model ACTUALLY used for this call (author vs judge),
@@ -711,16 +878,25 @@ class AnthropicProvider:
     def complete(self, instruction: str) -> str:
         # Long output (a whole file) -> stream so we don't hit the SDK's HTTP
         # timeout guard, and let the model think adaptively. AUTHOR tier.
+        # Routed through _stream_with_deadline so the FCC keep-alive hang mode
+        # cannot block a rewrite forever; one recover-and-retry on failure
+        # (proxy restart + fresh client) before giving up.
         instruction = _egress_gate(instruction)
         with _budget_guard(self.meter, self.model, len(instruction), 64000):
-            with self.client.messages.stream(
+            kwargs = dict(
                 model=self.model,
                 max_tokens=64000,
                 system=_cached_system(REWRITE_SYSTEM),
                 thinking={"type": "adaptive"},
                 messages=[{"role": "user", "content": instruction}],
-            ) as stream:
-                message = stream.get_final_message()
+            )
+            try:
+                message = _stream_with_deadline(self.client, **kwargs)
+            except Exception:
+                if not _FCC_PROXY_ACTIVE:
+                    raise
+                self._recover_transport()
+                message = _stream_with_deadline(self.client, **kwargs)
             self._meter(message, self.model)
         if message.stop_reason == "refusal":
             raise RuntimeError(f"Model refused the rewrite (stop_details={message.stop_details}).")
@@ -813,13 +989,13 @@ class AnthropicProvider:
         the real API the first try succeeds (json_schema enforced), so retries cost
         nothing there.
 
-        Each attempt goes through `_stream_with_deadline` (a thin passthrough —
-        see the note above that helper: a thread-force-close watcher was tried and
-        could NOT interrupt a blocking recv on Windows, so it was retired). The
-        retry loop below catches transport errors and NIM zero-token drops (spaced
-        6s); it does NOT bound the keep-alive hang mode — that one blocks forever
-        and is left to an external log-stall monitor + manual restart, since no
-        in-process wall-clock cap works on Windows."""
+        Each attempt goes through `_stream_with_deadline`, which bounds the
+        keep-alive hang mode with a wall-clock deadline (abandon + retry on a
+        fresh client - see the note above that helper). The retry loop below
+        catches transport errors, NIM zero-token drops, and deadline hits
+        (spaced 6s); between attempts `_recover_transport` restarts a dead
+        proxy and swaps in a fresh HTTP client so a wedged pooled connection
+        or a crashed fcc-server no longer strands the job."""
         last_text = None
         message = None
         for attempt in range(3):
@@ -829,13 +1005,15 @@ class AnthropicProvider:
                     output_config=fmt, messages=messages,
                 )
             except Exception:
-                # Transport error or NIM zero-token drop (a forced close from the
-                # retired watcher would also land here, but no longer occurs):
-                # treat uniformly - retry once spaced, never propagate yet so the
-                # cascade stays local and a transient stall doesn't kill the file.
+                # Transport error, NIM zero-token drop, or a StreamDeadlineError
+                # from the abandoned-hang path: treat uniformly - recover the
+                # transport (proxy restart + fresh client, FCC-only), retry
+                # spaced, never propagate yet so the cascade stays local and a
+                # transient stall doesn't kill the file.
                 message = None
                 last_text = None
                 if attempt < 2:
+                    self._recover_transport()
                     time.sleep(6.0)
                 continue
             text = next((b.text for b in message.content if b.type == "text"), None)
@@ -869,12 +1047,24 @@ class AnthropicProvider:
     def ping(self) -> None:
         """One-token liveness check on the JUDGE tier, ROUTED THROUGH the adapter so
         it goes through _budget_guard + _meter like any other call. Raises on failure
-        (the caller classifies auth/credit errors vs transient)."""
+        (the caller classifies auth/credit errors vs transient). One recover-and-
+        retry through the FCC proxy: a preflight ping that merely hit a dead proxy
+        or a queued/hung slot must not condemn the whole provider (measured: a
+        healthy ping took 307s queued behind two big review calls)."""
         with _budget_guard(self.meter, self.judge_model, len("ping"), 1):
-            message = _stream_with_deadline(
-                self.client, model=self.judge_model, max_tokens=8,
-                messages=[{"role": "user", "content": "ping"}],
-            )
+            try:
+                message = _stream_with_deadline(
+                    self.client, model=self.judge_model, max_tokens=8,
+                    messages=[{"role": "user", "content": "ping"}],
+                )
+            except Exception:
+                if not _FCC_PROXY_ACTIVE:
+                    raise
+                self._recover_transport()
+                message = _stream_with_deadline(
+                    self.client, model=self.judge_model, max_tokens=8,
+                    messages=[{"role": "user", "content": "ping"}],
+                )
             self._meter(message, self.judge_model)
 
 

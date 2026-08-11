@@ -10,6 +10,8 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -6626,22 +6628,40 @@ class PurposeGapTests(unittest.TestCase):
 
 
 class LauncherOpenAIKeyTests(unittest.TestCase):
-    """The desktop launcher must NEVER blank OPENAI_API_KEY: the FCC proxy only
-    replaces the Anthropic side, and blanking the OpenAI key silently killed the
-    dual-model cross-check (the owner's key was present but 'not found')."""
+    """FREE-ONLY contract (owner order 2026-08-10, superseding the morning's
+    keep-OpenAI fix): the desktop launcher must blank BOTH paid credentials
+    (ANTHROPIC_API_KEY and OPENAI_API_KEY) so every model call routes through
+    the free FCC proxy and nothing can bill. The dual-model cross-check is
+    deliberately given up; restoring paid mode = flexfactor_launch.ps1.bak-preproxy."""
 
     def _launcher_text(self):
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(here, "flexfactor_launch.ps1"), encoding="ascii") as fh:
             return fh.read()  # encoding=ascii doubles as the ASCII-only launcher gate
 
-    def test_launcher_does_not_blank_openai_key(self):
+    def test_launcher_blanks_both_paid_keys(self):
         import re as _re
         text = self._launcher_text()
-        self.assertIsNone(
+        self.assertIsNotNone(
             _re.search(r'^\s*\$env:OPENAI_API_KEY\s*=\s*""', text, _re.M),
-            "flexfactor_launch.ps1 blanks OPENAI_API_KEY again - this silently "
-            "disables the dual-model cross-check even when the owner's key is set")
+            "flexfactor_launch.ps1 no longer blanks OPENAI_API_KEY - a real key "
+            "in the environment would silently bill paid OpenAI during audits")
+        self.assertIsNotNone(
+            _re.search(r'^\s*\$env:ANTHROPIC_API_KEY\s*=\s*""', text, _re.M),
+            "flexfactor_launch.ps1 no longer blanks ANTHROPIC_API_KEY - a real "
+            "key would silently bill paid Anthropic instead of the free proxy")
+
+    def test_launcher_has_job_supervisor(self):
+        # The free backend drops connections/hangs under load; jobs must be
+        # relaunched automatically or long audits never finish (owner order
+        # 2026-08-10). The supervisor must retry, re-ensure the proxy, and
+        # never retry an argparse usage error (exit 2).
+        text = self._launcher_text()
+        self.assertIn("function Invoke-FlexFactorJob", text)
+        self.assertIn("function Ensure-FccProxy", text)
+        self.assertIn("Invoke-FlexFactorJob (@('audit')", text)
+        self.assertIn("Invoke-FlexFactorJob (@('prodready')", text)
+        self.assertIn("$code -eq 2", text)
 
     def test_launcher_still_pins_anthropic_to_proxy(self):
         text = self._launcher_text()
@@ -7124,6 +7144,243 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
         if "snapshot_dirty = _prod" not in src:
             src = open(ff.__file__, encoding="utf-8").read()
         self.assertIn("args.snapshot_dirty = _prod", src)
+
+
+class StreamDeadlineTests(unittest.TestCase):
+    """FCC resilience (2026-08-10): the keep-alive hang mode must be BOUNDED by a
+    wall-clock deadline (abandon-the-thread, never interrupt-the-socket - the
+    interrupt approach provably cannot work on Windows), and a lost proxy
+    connection must trigger recovery instead of stranding the job."""
+
+    def setUp(self):
+        self._release = threading.Event()  # lets tearDown free abandoned workers
+
+    def tearDown(self):
+        self._release.set()
+
+    def _hanging_client(self):
+        release = self._release
+
+        class _Stream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *exc):
+                return False
+            def get_final_message(self_):
+                release.wait(30)  # simulates the NIM keep-alive hang
+                raise RuntimeError("released")
+
+        class _Messages:
+            def stream(self_, **kw):
+                return _Stream()
+
+        class _Client:
+            def __init__(self_):
+                self_.messages = _Messages()
+
+        return _Client()
+
+    def _good_client(self, payload='{"ok": true}'):
+        class _Block:
+            type = "text"
+            text = payload
+
+        class _Msg:
+            content = [_Block()]
+            stop_reason = "end_turn"
+            usage = None
+
+        class _Stream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *exc):
+                return False
+            def get_final_message(self_):
+                return _Msg()
+
+        class _Messages:
+            def stream(self_, **kw):
+                return _Stream()
+
+        class _Client:
+            def __init__(self_):
+                self_.messages = _Messages()
+
+        return _Client()
+
+    def test_deadline_abandons_hung_stream(self):
+        t0 = time.time()
+        with self.assertRaises(ff.StreamDeadlineError):
+            ff._stream_with_deadline(self._hanging_client(), deadline_s=0.2,
+                                     model="m", max_tokens=8, messages=[])
+        self.assertLess(time.time() - t0, 5.0,
+                        "the deadline must fire promptly, not wait out the hang")
+
+    def test_zero_deadline_is_plain_passthrough(self):
+        msg = ff._stream_with_deadline(self._good_client(), deadline_s=0,
+                                       model="m", max_tokens=8, messages=[])
+        self.assertEqual(msg.content[0].text, '{"ok": true}')
+
+    def test_worker_exception_is_relayed(self):
+        class _Messages:
+            def stream(self_, **kw):
+                raise ValueError("boom")
+
+        class _Client:
+            def __init__(self_):
+                self_.messages = _Messages()
+
+        with self.assertRaises(ValueError):
+            ff._stream_with_deadline(_Client(), deadline_s=5,
+                                     model="m", max_tokens=8, messages=[])
+
+    def test_env_overrides_default_deadline(self):
+        saved = os.environ.get("FLEXFACTOR_STREAM_TIMEOUT")
+        try:
+            os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "0.25"
+            self.assertEqual(ff._stream_deadline_seconds(), 0.25)
+            os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "0"
+            self.assertEqual(ff._stream_deadline_seconds(), 0.0)
+        finally:
+            if saved is None:
+                os.environ.pop("FLEXFACTOR_STREAM_TIMEOUT", None)
+            else:
+                os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = saved
+
+    def test_default_deadline_armed_only_through_proxy(self):
+        saved_env = os.environ.pop("FLEXFACTOR_STREAM_TIMEOUT", None)
+        saved_active = ff._FCC_PROXY_ACTIVE
+        try:
+            ff._FCC_PROXY_ACTIVE = True
+            self.assertEqual(ff._stream_deadline_seconds(), 600.0)
+            ff._FCC_PROXY_ACTIVE = False
+            self.assertEqual(ff._stream_deadline_seconds(), 0.0)
+        finally:
+            ff._FCC_PROXY_ACTIVE = saved_active
+            if saved_env is not None:
+                os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = saved_env
+
+
+class TransportRecoveryTests(unittest.TestCase):
+    """_stream_structured must recover (ensure proxy + fresh client) between
+    attempts, so a hang or a dead proxy costs one attempt, not the whole file;
+    _ensure_fcc_proxy must be a no-op when health is fine."""
+
+    def setUp(self):
+        self._release = threading.Event()
+        self._saved_active = ff._FCC_PROXY_ACTIVE
+        self._saved_ensure = ff._ensure_fcc_proxy
+        self._saved_env = os.environ.get("FLEXFACTOR_STREAM_TIMEOUT")
+        self._saved_mod = sys.modules.get("anthropic")
+
+    def tearDown(self):
+        self._release.set()
+        ff._FCC_PROXY_ACTIVE = self._saved_active
+        ff._ensure_fcc_proxy = self._saved_ensure
+        if self._saved_env is None:
+            os.environ.pop("FLEXFACTOR_STREAM_TIMEOUT", None)
+        else:
+            os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = self._saved_env
+        if self._saved_mod is not None:
+            sys.modules["anthropic"] = self._saved_mod
+        else:
+            sys.modules.pop("anthropic", None)
+
+    def test_stream_structured_recovers_after_hang(self):
+        import types as _types
+        release = self._release
+
+        class _Block:
+            type = "text"
+            text = '{"ok": true}'
+
+        class _Msg:
+            content = [_Block()]
+            stop_reason = "end_turn"
+            usage = None
+
+        class _GoodStream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *exc):
+                return False
+            def get_final_message(self_):
+                return _Msg()
+
+        class _HangStream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *exc):
+                return False
+            def get_final_message(self_):
+                release.wait(30)
+                raise RuntimeError("released")
+
+        class _HangMessages:
+            def stream(self_, **kw):
+                return _HangStream()
+
+        class _GoodMessages:
+            def stream(self_, **kw):
+                return _GoodStream()
+
+        class _FreshAnthropic:  # what _recover_transport swaps in
+            def __init__(self_):
+                self_.messages = _GoodMessages()
+
+        fake_mod = _types.ModuleType("anthropic")
+        fake_mod.Anthropic = _FreshAnthropic
+        sys.modules["anthropic"] = fake_mod
+
+        ensure_calls = []
+        ff._FCC_PROXY_ACTIVE = True
+        ff._ensure_fcc_proxy = lambda *a, **k: (ensure_calls.append(1), True)[1]
+        os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "0.2"
+
+        prov = ff.AnthropicProvider.__new__(ff.AnthropicProvider)  # skip __init__
+        prov.meter = None
+        prov.model = "m"
+        prov.judge_model = "j"
+
+        class _HangClient:
+            def __init__(self_):
+                self_.messages = _HangMessages()
+
+        prov.client = _HangClient()
+
+        t0 = time.time()
+        msg = prov._stream_structured(
+            model="m", max_tokens=64, system=[{"type": "text", "text": "s"}],
+            messages=[{"role": "user", "content": "p"}], fmt={})
+        self.assertEqual(msg.content[0].text, '{"ok": true}')
+        self.assertGreaterEqual(len(ensure_calls), 1,
+                                "recovery must re-ensure the proxy")
+        self.assertIsInstance(prov.client, _FreshAnthropic,
+                              "recovery must swap in a fresh client")
+        self.assertLess(time.time() - t0, 30.0)
+
+    def test_recover_transport_noop_off_proxy(self):
+        ff._FCC_PROXY_ACTIVE = False
+        prov = ff.AnthropicProvider.__new__(ff.AnthropicProvider)
+        sentinel = object()
+        prov.client = sentinel
+        prov._recover_transport()
+        self.assertIs(prov.client, sentinel,
+                      "off-proxy the client must not be touched")
+
+    def test_ensure_fcc_proxy_no_spawn_when_healthy(self):
+        saved_health = ff._fcc_proxy_health
+        saved_popen = ff.subprocess.Popen
+        spawned = []
+        try:
+            ff._fcc_proxy_health = lambda *a, **k: True
+            ff.subprocess.Popen = lambda *a, **k: spawned.append(a)
+            ff._FCC_PROXY_ACTIVE = True
+            self.assertTrue(ff._ensure_fcc_proxy())
+            self.assertEqual(spawned, [], "healthy proxy must never be respawned")
+        finally:
+            ff._fcc_proxy_health = saved_health
+            ff.subprocess.Popen = saved_popen
 
 
 if __name__ == "__main__":
