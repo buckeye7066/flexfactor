@@ -4,6 +4,123 @@ Local dual-provider code tool: refactor / scout / audit. Single-file core
 (`flexfactor.py`, ~4.3k lines) + Tkinter dashboard + PowerShell launchers.
 No app deployment — "prod" = the desktop shortcuts working.
 
+## APPLY IS THE DEFAULT (owner order 2026-08-11) — read this first
+
+> "I will NEVER just 'review' with this program either."
+
+`audit` and `prodready` now default to `--apply`. A review must be asked for with
+`--report-only`/`--dry-run`, and a run that would review **without** having been
+asked **aborts before spending a cent** (`_assert_review_only_was_asked_for`).
+The rules this enforces, and the defect each one killed:
+
+- **No TTY → APPLY, never review.** `_confirm_audit_apply` used to return False
+  without a TTY, and `run_audit` turned that into a silent report-only run: the
+  2026-08-11 GrantFlow prodready spent **6 hours and $17.75**, found 3,464
+  defects, fixed **0**, and exited **0**. `isatty()` alone is not enough —
+  measured on this machine, `python ... < /dev/null` under Git Bash reports
+  `isatty() == True`, and the piped-answers launcher EOFs after its last answer,
+  so **EOFError also means "automation" and applies**. Only Ctrl-C or a human
+  typing something other than `apply` cancels, and cancelling **aborts (exit 2)**
+  rather than degrading into a paid review.
+- **Exit codes carry the truth.** `EXIT_APPLIED_NOTHING = 3`: an apply run that
+  found defects and fixed none is no longer exit 0. Both retry supervisors read
+  exit 0 as success, which is how a 6-hour no-op looked like a good night. The
+  launcher does **not** retry on 3 (a retry re-spends the budget for the same
+  nothing).
+- **`_full_gate` is TRI-STATE.** `None` = no build/verify command existed, so
+  nothing was verified. It used to return `True` there, and `_commit_and_sync`
+  merged+pushed to the default branch on the strength of it — every repo whose
+  toolchain FlexFactor cannot drive shipped unverified. The merge gate is now
+  `final_ok is True`; `None` prints `merge+push REFUSED`. Report-only likewise
+  sets `baseline_ok = None`, not `True` (the report used to say "Baseline build:
+  passed" for a build that never ran).
+- **Scout is deliberately exempt.** `scout --apply` stays opt-in: the owner's own
+  contract for Scout requires "proposal-only default; separate explicit
+  FlexFactor apply approval". Never flip it to match audit.
+
+## Purpose awareness (`flexfactor_purpose.py` + `memory/`, 2026-08-11)
+
+> "The goal is not to make every program resemble the same generic application.
+> The goal is to make every program successfully perform the particular job it
+> was created to perform." — the owner's portfolio directive
+
+FlexFactor reads **why the program exists** before it reads any code.
+
+- `memory/doctrine/` — the owner's four Axiom master prompts, verbatim, with
+  `PROVENANCE.md` recording the `.docx` originals and drawing the line between
+  what is ingested (purpose, acceptance, status vocabulary, definition of
+  production ready) and what is **not** (the ACTIVE_APP lock, no-fan-out and
+  one-agent-per-program mechanics — those were instructions to that effort's
+  executors, not properties of the programs).
+- `memory/purpose_contracts.json` — 26 programs seeded **verbatim** from the
+  master prompts' "Assigned Applications" sections. Schema is the owner's
+  section 5. Never rewrite a purpose downward to make a run look finished.
+- Resolution order (`find_contract`): the audited repo's own
+  `.flexfactor-purpose.json` / `docs/purpose-contract.md` / `PURPOSE.md` **wins**,
+  then the registry by slug → alias → `local_path`. Nothing authored → the
+  purpose is INFERRED and every report says so.
+- The contract rides in `purpose_blob`, so **every per-file review** judges
+  defects against this program's job. `assess_purpose_gap` then scores each
+  numbered acceptance criterion; each gap must cite `acceptance_ref`, so
+  `acceptance_coverage()` can render the criteria table a generic linter cannot.
+- `fulfillment_pct` with a contract is **measured** (criteria met / total), not
+  the model's impression. The owner's purpose text always overrides the model's
+  paraphrase.
+- Gap-driven fixing: an owner-authored gap is an unmet requirement, so it
+  **bypasses `--fix-severity`** and gets `MAX_PURPOSE_GAP_FIXES_AUTHORED` (12)
+  instead of 3, worst-severity first. Inferred gaps still respect the fix floor
+  (a guess must not drive a rewrite spree). The headline is
+  `gap_progress()` — "closed N of M gaps toward the purpose, unblocked K
+  acceptance criteria" — not a score.
+- **Status vocabulary is enforced.** `production_ready_status()` only returns
+  PRODUCTION READY when every applicable condition has passing evidence; a
+  critical condition that is `unknown` blocks. `DONE` raises. `forbidden_claims()`
+  is the tripwire for "build passes"/"tests pass"/"deployed"/"works locally"/
+  "health endpoint returns 200" being used as readiness.
+
+## Free-vs-paid failover: the numbers, and why they are those numbers
+
+A stall threshold **below the free route's healthy latency** silently converts a
+free-primary setup into a metered one. The governing measurement on this machine:
+the FCC proxy runs `PROVIDER_MAX_CONCURRENCY=2`, and a **healthy** judge ping
+measured **307.8s**, nearly all of it queued. So:
+
+- `MEASURED_HEALTHY_QUEUE_S = 307.8`, `STREAM_FIRST_EVENT_FLOOR_S = 461.7`
+  (1.5x), `STREAM_FIRST_EVENT_DEADLINE_S = 600.0`, `STREAM_IDLE_DEADLINE_S = 120.0`.
+- `FLEXFACTOR_STREAM_TIMEOUT` below the floor is **clamped up and logged**;
+  `FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT=1` overrides (tests use it). "Make the timeout
+  snappier" is the well-meant tweak that bills the owner for free work.
+- `_stream_with_deadline` is **two-phase, never total-elapsed**: the first-event
+  budget absorbs queueing; after the first event a 120s **idle** timer (reset on
+  every event) applies. A long-but-progressing generation is never killed.
+- `_is_backpressure` — 429/overloaded/503/model-loading/cold-start means *alive,
+  be patient*: back off and retry FREE, never rescue. **Trap:** markers must be
+  specific phrases. A bare `"queue"` marker made `StreamDeadlineError`
+  (whose text quotes the queued-call measurement) classify itself as
+  backpressure, so real stalls never rescued. `StreamDeadlineError` is
+  hard-excluded by type.
+- `_note_free_path_hang` **probes `/health` first**. A deadline hit on a proxy
+  that still answers 200 is queueing or one wedged socket — the paid hold is NOT
+  armed. Return to free is guaranteed: the hold is a 300s window
+  (`FLEXFACTOR_FALLBACK_HOLD`), never sticky.
+- Damage bounds: `--max-cost` caps dollars per program; `_paid_rescue_admit`
+  caps the **rate** at 40 rescues/hour (`FLEXFACTOR_PAID_RESCUE_PER_HOUR`);
+  `_paid_rescue_gate` caps concurrency at 3. Every rescue logs the trigger,
+  model, duration and running count to stderr, and `paid_rescue_stats()` lands
+  in the run manifest.
+
+## TEST HYGIENE TRAP — tests must never touch `~/.flexfactor`
+
+`flexfactor_tests.py` redirects `ff.BRAIN_PATH` and `ff.STATUS_PATH` to a temp
+dir **at import**, and `TestSessionIsolationTests` proves it. Do not remove this.
+Measured harm 2026-08-11: only one test class patched `BRAIN_PATH`, so test runs
+wrote tempdir projects into the REAL `~/.flexfactor/brain.json`; with
+`MAX_BRAIN_PROJECTS = 40` and LRU pruning, a couple of full runs **evicted every
+real project** (GrantFlow, GeneMap, SermonSmith, IPlay, FutureU lost their
+`clean_files` skip sets and run history — the next audit re-reviews and re-pays
+for files it had already driven clean). Tests also stomped `status.json`,
+clobbering the live dashboard of a run in flight.
+
 ## Run / test
 ```bash
 pip install -r requirements.txt                # exact tested pins (or: pip install anthropic openai)

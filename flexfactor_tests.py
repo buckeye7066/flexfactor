@@ -20,6 +20,53 @@ ff = importlib.util.module_from_spec(_SPEC)
 sys.modules["flexfactor"] = ff
 _SPEC.loader.exec_module(ff)
 
+# --------------------------------------------------------------------------- #
+# NEVER touch the owner's real FlexFactor state from a test run.
+#
+# Measured harm, 2026-08-11: only ONE test class patched BRAIN_PATH, so every
+# other test that reached _brain_record_run wrote a tempdir project into the REAL
+# ~/.flexfactor/brain.json. MAX_BRAIN_PROJECTS is 40 with LRU pruning, so a
+# couple of full test runs evicted EVERY real project - GrantFlow, GeneMap,
+# SermonSmith, IPlay and FutureU lost their clean_files skip sets and run
+# history, which means the next audit of each re-reviews (and re-pays for) files
+# it had already driven clean. Test runs also stomped ~/.flexfactor/status.json,
+# clobbering the live dashboard of a run in flight.
+#
+# Both paths are module-level constants, so redirecting them ONCE here covers
+# every test unconditionally. TestSessionIsolationTests below proves it holds.
+# --------------------------------------------------------------------------- #
+import tempfile as _tempfile  # noqa: E402
+
+_TEST_STATE_DIR = _tempfile.mkdtemp(prefix="flexfactor-tests-state-")
+ff.BRAIN_PATH = os.path.join(_TEST_STATE_DIR, "brain.json")
+ff.STATUS_PATH = os.path.join(_TEST_STATE_DIR, "status.json")
+if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
+    ff._PROGRESS.path = ff.STATUS_PATH
+
+
+class TestSessionIsolationTests(unittest.TestCase):
+    """A guard that can actually fail: if the redirection above is removed or a
+    test re-points these at $HOME, this test says so before the next run eats
+    the owner's project memory again."""
+
+    def test_brain_and_status_paths_are_not_the_real_ones(self):
+        home_flex = os.path.join(os.path.expanduser("~"), ".flexfactor")
+        for name, path in (("BRAIN_PATH", ff.BRAIN_PATH),
+                           ("STATUS_PATH", ff.STATUS_PATH)):
+            self.assertFalse(
+                os.path.abspath(path).lower().startswith(os.path.abspath(home_flex).lower()),
+                f"{name} points at the owner's real state ({path}); a test run "
+                "would evict real projects from brain.json")
+
+    def test_the_real_brain_is_untouched_by_a_write(self):
+        real = os.path.join(os.path.expanduser("~"), ".flexfactor", "brain.json")
+        before = os.path.getmtime(real) if os.path.exists(real) else None
+        ff._brain_record_run(os.path.join(_TEST_STATE_DIR, "proj"),
+                             {"defects": 0, "fixed": 0, "errors": 0, "usd": 0.0})
+        after = os.path.getmtime(real) if os.path.exists(real) else None
+        self.assertEqual(before, after, "a test wrote to the REAL brain.json")
+        self.assertTrue(os.path.exists(ff.BRAIN_PATH))
+
 
 class ApplyEditsTests(unittest.TestCase):
     TEXT = "line one\nline two\nline three\nline four\n"
@@ -922,10 +969,14 @@ class ScoutApplyDefaultTests(unittest.TestCase):
 
 
 class AuditApplyDefaultTests(unittest.TestCase):
-    """Follow-up defect 1: bare `audit` must be REPORT-ONLY (no branch/write/commit);
-    mutation requires explicit --apply."""
+    """OWNER REVERSAL 2026-08-11: "I will NEVER just 'review' with this program."
 
-    def test_bare_audit_parses_to_report_only(self):
+    Bare `audit` used to be report-only, and that default is what let a launcher,
+    a schtask, or a missing --yes turn a 6-hour run into a $17.75 no-op. APPLY is
+    now the default; a review must be asked for explicitly.
+    """
+
+    def test_bare_audit_parses_to_apply(self):
         real = ff.run_audit
         cap = {}
         ff.run_audit = lambda a: cap.setdefault("args", a) or 0
@@ -933,10 +984,39 @@ class AuditApplyDefaultTests(unittest.TestCase):
             ff.main(["audit", "--program", "x"])
         finally:
             ff.run_audit = real
-        self.assertFalse(cap["args"].apply)   # <-- would be True on the pre-fix parser
+        self.assertTrue(cap["args"].apply,
+                        "bare `audit` must APPLY - review-only is opt-in now")
+        self.assertFalse(cap["args"].explicit_report_only)
         # Owner directive 2026-08-11: push defaults ON (ship results to main).
-        # Inert here because report-only never commits; --no-push still wins.
         self.assertTrue(cap["args"].push)
+
+    def test_report_only_flag_is_honored_and_recorded_as_explicit(self):
+        for argv in (["audit", "--program", "x", "--report-only"],
+                     ["audit", "--program", "x", "--dry-run"],
+                     # argparse prefix matching: an abbreviation is still explicit
+                     # and must NOT be overridden back to apply.
+                     ["prodready", "--program", "x", "--report"]):
+            real = ff.run_audit
+            cap = {}
+            ff.run_audit = lambda a: cap.setdefault("args", a) or 0
+            try:
+                ff.main(list(argv))
+            finally:
+                ff.run_audit = real
+            self.assertTrue(cap["args"].explicit_report_only, argv)
+            if "--dry-run" not in argv:
+                self.assertFalse(cap["args"].apply, argv)
+
+    def test_prodready_bare_applies(self):
+        real = ff.run_audit
+        cap = {}
+        ff.run_audit = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["prodready", "--program", "x"])
+        finally:
+            ff.run_audit = real
+        self.assertTrue(cap["args"].apply)
+        self.assertEqual(cap["args"].branch_prefix, "flexfactor/prodready-")
 
     def test_apply_flag_enables_mutation(self):
         real = ff.run_audit
@@ -7789,7 +7869,19 @@ class TransportRecoveryTests(unittest.TestCase):
         ensure_calls = []
         ff._FCC_PROXY_ACTIVE = True
         ff._ensure_fcc_proxy = lambda *a, **k: (ensure_calls.append(1), True)[1]
+        # A 0.2s deadline is far below the 461.7s safety floor (1.5x the measured
+        # 307.8s healthy queued call), so it MUST be opted into explicitly - that
+        # clamp is the money-leak guard, and a test is the one legitimate reason
+        # to bypass it.
         os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "0.2"
+        os.environ["FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT"] = "1"
+        self.addCleanup(os.environ.pop, "FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT", None)
+        # The hang must be classified as a genuinely dead backend, so /health has
+        # to say so - otherwise the new liveness probe correctly declines to arm
+        # the paid hold and this exercises the wrong path.
+        _saved_health = ff._fcc_proxy_health
+        ff._fcc_proxy_health = lambda *a, **k: False
+        self.addCleanup(lambda: setattr(ff, "_fcc_proxy_health", _saved_health))
 
         prov = ff.AnthropicProvider.__new__(ff.AnthropicProvider)  # skip __init__
         prov.meter = None
@@ -8193,6 +8285,786 @@ class ConsoleMeterTests(unittest.TestCase):
     def test_stop_without_start_is_safe(self):
         m = ff.ConsoleMeter(stream=None, tty=False)
         m.stop()  # must not raise
+
+
+# =========================================================================== #
+# Owner order 2026-08-11: the free route must not be billed as a paid one.
+# =========================================================================== #
+
+class _FakeStream:
+    """Test double for anthropic's MessageStream.
+
+    `events` is a list of per-event sleep durations; iterating yields one event
+    per entry after sleeping. That lets a test model "slow but alive" (many
+    events, long total) separately from "wedged" (no events, forever).
+    """
+
+    def __init__(self, events, final, pre_delay=0.0):
+        self._events = list(events)
+        self._final = final
+        self._pre = pre_delay
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        if self._pre:
+            time.sleep(self._pre)
+        for d in self._events:
+            time.sleep(d)
+            yield object()
+
+    def get_final_message(self):
+        return self._final
+
+
+class _FakeClient:
+    def __init__(self, stream_factory):
+        outer = self
+
+        class _Messages:
+            def stream(self_, **kw):
+                return outer._factory(**kw)
+
+        self._factory = stream_factory
+        self.messages = _Messages()
+
+
+class _Blk:
+    type = "text"
+    text = '{"ok": true}'
+
+
+class _FinalMsg:
+    content = [_Blk()]
+    stop_reason = "end_turn"
+    usage = None
+
+
+class StallClassifierTests(unittest.TestCase):
+    """BOTH SIDES. A test that only proves failover FIRES is the test that lets
+    the money leak through: it never notices when failover fires on healthy
+    traffic. Each stall case here is paired with an alive case."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("FLEXFACTOR_STREAM_TIMEOUT", "FLEXFACTOR_STREAM_IDLE_TIMEOUT",
+                        "FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT")}
+        self._proxy = ff._FCC_PROXY_ACTIVE
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        ff._FCC_PROXY_ACTIVE = self._proxy
+
+    # ---- the floor -------------------------------------------------------- #
+
+    def test_floor_exceeds_the_measured_healthy_queue(self):
+        # The whole point. The healthy queued call measured 307.8s on this
+        # machine; a first-event budget at or below that bills every healthy
+        # call to a paid key.
+        self.assertGreater(ff.STREAM_FIRST_EVENT_FLOOR_S, ff.MEASURED_HEALTHY_QUEUE_S)
+        self.assertGreaterEqual(ff.STREAM_FIRST_EVENT_DEADLINE_S,
+                                ff.STREAM_FIRST_EVENT_FLOOR_S)
+
+    def test_default_budget_would_not_failover_on_the_measured_healthy_call(self):
+        ff._FCC_PROXY_ACTIVE = True
+        os.environ.pop("FLEXFACTOR_STREAM_TIMEOUT", None)
+        self.assertGreater(ff._stream_deadline_seconds(), ff.MEASURED_HEALTHY_QUEUE_S,
+                           "the default first-event budget must survive a healthy "
+                           "307.8s queued call")
+
+    def test_unsafe_low_timeout_is_clamped_up(self):
+        ff._FCC_PROXY_ACTIVE = True
+        os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "60"
+        os.environ.pop("FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT", None)
+        self.assertEqual(ff._stream_deadline_seconds(), ff.STREAM_FIRST_EVENT_FLOOR_S)
+
+    def test_unsafe_low_timeout_honored_only_with_explicit_optin(self):
+        ff._FCC_PROXY_ACTIVE = True
+        os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "60"
+        os.environ["FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT"] = "1"
+        self.assertEqual(ff._stream_deadline_seconds(), 60.0)
+
+    def test_zero_disables_and_offproxy_is_unbounded(self):
+        ff._FCC_PROXY_ACTIVE = True
+        os.environ["FLEXFACTOR_STREAM_TIMEOUT"] = "0"
+        self.assertEqual(ff._stream_deadline_seconds(), 0.0)
+        os.environ.pop("FLEXFACTOR_STREAM_TIMEOUT", None)
+        ff._FCC_PROXY_ACTIVE = False
+        self.assertEqual(ff._stream_deadline_seconds(), 0.0)
+
+    # ---- ALIVE: must NOT fail over ---------------------------------------- #
+
+    def test_slow_but_streaming_call_never_fails_over(self):
+        """8 events x 0.1s = 0.8s total, well past a 0.3s FIRST-EVENT budget.
+        Under the old total-elapsed deadline this raised; a progressing stream
+        must now run to completion however long it takes."""
+        os.environ["FLEXFACTOR_ALLOW_UNSAFE_TIMEOUT"] = "1"
+        msg = ff._stream_with_deadline(
+            _FakeClient(lambda **kw: _FakeStream([0.1] * 8, _FinalMsg())),
+            deadline_s=0.3, idle_s=1.0, model="m", messages=[])
+        self.assertIs(msg.__class__, _FinalMsg)
+
+    def test_long_queue_then_stream_is_fine_when_within_first_event_budget(self):
+        msg = ff._stream_with_deadline(
+            _FakeClient(lambda **kw: _FakeStream([0.02] * 3, _FinalMsg(), pre_delay=0.4)),
+            deadline_s=2.0, idle_s=1.0, model="m", messages=[])
+        self.assertIs(msg.__class__, _FinalMsg)
+
+    # ---- WEDGED: must fail over ------------------------------------------- #
+
+    def test_no_first_event_ever_raises_deadline(self):
+        with self.assertRaises(ff.StreamDeadlineError) as cm:
+            ff._stream_with_deadline(
+                _FakeClient(lambda **kw: _FakeStream([30.0], _FinalMsg())),
+                deadline_s=0.3, idle_s=5.0, model="m", messages=[])
+        self.assertIn("no first event", str(cm.exception))
+
+    def test_goes_quiet_after_first_event_raises_idle_stall(self):
+        with self.assertRaises(ff.StreamDeadlineError) as cm:
+            ff._stream_with_deadline(
+                _FakeClient(lambda **kw: _FakeStream([0.02, 0.02, 30.0], _FinalMsg())),
+                deadline_s=5.0, idle_s=0.3, model="m", messages=[])
+        self.assertIn("stalled", str(cm.exception))
+
+
+class BackpressureClassifierTests(unittest.TestCase):
+    """429 / overloaded / model-loading is the backend saying 'alive, wait' -
+    paying a metered key to skip a free queue is the money leak, not a rescue."""
+
+    def test_backpressure_markers_classify_as_alive(self):
+        class _Http(Exception):
+            status_code = 429
+        for exc in (_Http("slow down"),
+                    RuntimeError("Error code: 429 - too many requests"),
+                    RuntimeError("overloaded_error: upstream is overloaded"),
+                    RuntimeError("model is loading, please retry"),
+                    RuntimeError("503 Service Unavailable")):
+            self.assertTrue(ff._is_backpressure(exc), exc)
+
+    def test_a_stall_is_never_backpressure(self):
+        # Regression: the marker list once contained the bare word "queue", and
+        # StreamDeadlineError's own text mentions the queued-call measurement,
+        # so a genuine stall classified itself as "alive" and never rescued.
+        exc = ff.StreamDeadlineError(
+            "stream produced no first event within 600s wall clock "
+            "(healthy queued call measures ~308s here)")
+        self.assertFalse(ff._is_backpressure(exc))
+
+    def test_real_transport_failure_is_not_backpressure(self):
+        self.assertFalse(ff._is_backpressure(ConnectionRefusedError("refused")))
+
+    def test_backpressure_retries_free_and_never_bills_paid(self):
+        paid = []
+        prov = ff.AnthropicProvider.__new__(ff.AnthropicProvider)
+        prov.meter = None
+        prov.model = "m"
+        prov.judge_model = "j"
+        prov._paid_message = lambda *a, **k: paid.append(1)
+
+        class _BusyStream:
+            def __enter__(self_):
+                return self_
+            def __exit__(self_, *e):
+                return False
+            def __iter__(self_):
+                raise RuntimeError("Error code: 429 - too many requests")
+            def get_final_message(self_):
+                raise RuntimeError("Error code: 429 - too many requests")
+
+        prov.client = _FakeClient(lambda **kw: _BusyStream())
+        saved_sleep = ff.time.sleep
+        ff.time.sleep = lambda *_a: None
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                prov._stream_structured(model="m", max_tokens=8, system=[],
+                                        messages=[], fmt={})
+        finally:
+            ff.time.sleep = saved_sleep
+        self.assertIn("backpressure", str(cm.exception))
+        self.assertEqual(paid, [], "a busy free backend must never bill a paid key")
+
+
+class PaidRescueGovernorTests(unittest.TestCase):
+    """Bound the damage when classification is wrong anyway."""
+
+    def setUp(self):
+        ff._reset_paid_rescue_ledger()
+        self._cap = os.environ.get("FLEXFACTOR_PAID_RESCUE_PER_HOUR")
+        self._proxy = ff._FCC_PROXY_ACTIVE
+        self._health = ff._fcc_proxy_health
+        self._keys = {k: os.environ.get(k) for k in
+                      ("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY", "FLEXFACTOR_FALLBACK_OPENAI_KEY")}
+
+    def tearDown(self):
+        ff._reset_paid_rescue_ledger()
+        ff._FCC_PROXY_ACTIVE = self._proxy
+        ff._fcc_proxy_health = self._health
+        if self._cap is None:
+            os.environ.pop("FLEXFACTOR_PAID_RESCUE_PER_HOUR", None)
+        else:
+            os.environ["FLEXFACTOR_PAID_RESCUE_PER_HOUR"] = self._cap
+        for k, v in self._keys.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        ff._FALLBACK_HOLD_UNTIL = 0.0
+
+    def test_hourly_cap_refuses_further_paid_rescues(self):
+        os.environ["FLEXFACTOR_PAID_RESCUE_PER_HOUR"] = "2"
+        ff._paid_rescue_admit("first")
+        ff._paid_rescue_admit("second")
+        with self.assertRaises(RuntimeError) as cm:
+            ff._paid_rescue_admit("third")
+        self.assertIn("rate cap", str(cm.exception))
+        self.assertEqual(ff.paid_rescue_stats()["paid_rescues_last_hour"], 2)
+
+    def test_stats_are_auditable(self):
+        os.environ["FLEXFACTOR_PAID_RESCUE_PER_HOUR"] = "9"
+        ff._paid_rescue_admit("x")
+        s = ff.paid_rescue_stats()
+        self.assertEqual(s["paid_rescues_total"], 1)
+        self.assertEqual(s["paid_rescue_hourly_cap"], 9)
+
+    def test_healthy_proxy_blocks_the_paid_hold(self):
+        """A deadline hit on a backend whose /health still answers 200 is
+        queueing or one wedged socket - NOT a dead backend. Arming the hold
+        there pins the whole run to a paid key over one slow call."""
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-test"
+        ff._FCC_PROXY_ACTIVE = True
+        ff._fcc_proxy_health = lambda *a, **k: True
+        ff._FALLBACK_HOLD_UNTIL = 0.0
+        ff._note_free_path_hang("deadline")
+        self.assertFalse(ff._fallback_hold_active(),
+                         "a healthy /health must veto the paid hold")
+
+    def test_dead_proxy_arms_the_hold_and_free_returns_when_it_expires(self):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-test"
+        ff._FCC_PROXY_ACTIVE = True
+        ff._fcc_proxy_health = lambda *a, **k: False
+        ff._FALLBACK_HOLD_UNTIL = 0.0
+        ff._note_free_path_hang("deadline")
+        self.assertTrue(ff._fallback_hold_active())
+        # One stall must never PERMANENTLY pin FlexFactor to paid: the hold is a
+        # window, and free is tried again the moment it lapses.
+        ff._FALLBACK_HOLD_UNTIL = time.monotonic() - 1.0
+        self.assertFalse(ff._fallback_hold_active())
+
+
+# =========================================================================== #
+# Owner order 2026-08-11: never review-only; never a pass with no evidence.
+# =========================================================================== #
+
+class NeverReviewOnlyTests(unittest.TestCase):
+
+    def _args(self, **kw):
+        import argparse
+        a = argparse.Namespace(apply=True, dry_run=False, assume_yes=False,
+                               explicit_report_only=False, branch_prefix="flexfactor/audit-",
+                               push=True, merge=True)
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a
+
+    def test_no_tty_applies_instead_of_degrading(self):
+        """THE $17.75 BUG. A schtask/piped launcher has no TTY; that used to
+        return False and silently become a paid review."""
+        class _NoTTY:
+            def isatty(self_):
+                return False
+        saved = sys.stdin
+        sys.stdin = _NoTTY()
+        try:
+            self.assertTrue(ff._confirm_audit_apply(self._args(), ["p"]))
+        finally:
+            sys.stdin = saved
+
+    def test_eof_on_stdin_applies_rather_than_cancelling(self):
+        """Found by a LIVE run, 2026-08-11. isatty() is not enough: under Git
+        Bash `python ... < /dev/null` reports isatty()==True, and the owner's
+        piped-answers launcher EOFs here after its last answer. Both are
+        automation; both used to be read as 'the human said no'."""
+        import builtins
+        class _TTY:
+            def isatty(self_):
+                return True
+        saved_in, saved_input = sys.stdin, builtins.input
+        sys.stdin = _TTY()
+        def _eof(*a):
+            raise EOFError
+        builtins.input = _eof
+        try:
+            self.assertTrue(ff._confirm_audit_apply(self._args(), ["p"]))
+        finally:
+            sys.stdin = saved_in
+            builtins.input = saved_input
+
+    def test_ctrl_c_still_cancels(self):
+        import builtins
+        class _TTY:
+            def isatty(self_):
+                return True
+        saved_in, saved_input = sys.stdin, builtins.input
+        sys.stdin = _TTY()
+        def _int(*a):
+            raise KeyboardInterrupt
+        builtins.input = _int
+        try:
+            self.assertFalse(ff._confirm_audit_apply(self._args(), ["p"]))
+        finally:
+            sys.stdin = saved_in
+            builtins.input = saved_input
+
+    def test_tty_decline_returns_false(self):
+        class _TTY:
+            def isatty(self_):
+                return True
+        saved_in, saved_input = sys.stdin, __builtins__["input"] if isinstance(
+            __builtins__, dict) else __builtins__.input
+        import builtins
+        sys.stdin = _TTY()
+        builtins.input = lambda *a: "no"
+        try:
+            self.assertFalse(ff._confirm_audit_apply(self._args(), ["p"]))
+        finally:
+            sys.stdin = saved_in
+            builtins.input = saved_input
+
+    def test_declining_aborts_the_run_and_does_not_downgrade(self):
+        """Cancel means cancel. It used to mean 'spend hours reviewing instead'."""
+        import inspect
+        # Strip comments: the CODE must not downgrade, but the comment explaining
+        # why is allowed to name the thing it removed.
+        src = "\n".join(l.split("#", 1)[0] for l in
+                        inspect.getsource(ff.run_audit).splitlines())
+        self.assertNotIn("args.apply = False", src,
+                         "declining must never downgrade to report-only")
+        self.assertIn("return 2", src)
+
+    def test_review_only_must_be_asked_for_explicitly(self):
+        with self.assertRaises(SystemExit) as cm:
+            ff._assert_review_only_was_asked_for(
+                self._args(apply=False, explicit_report_only=False))
+        self.assertIn("refuses to start", str(cm.exception))
+        # ... but an explicit request is honored.
+        ff._assert_review_only_was_asked_for(
+            self._args(apply=False, explicit_report_only=True))
+        ff._assert_review_only_was_asked_for(self._args(apply=True))
+
+
+class VacuousGateTests(unittest.TestCase):
+    """A gate that runs no command proved nothing. It must not read as green,
+    and it must not be allowed to ship code to the default branch."""
+
+    def test_full_gate_returns_none_when_there_is_nothing_to_run(self):
+        ok, log = ff._full_gate("/nope", {})
+        self.assertIsNone(ok, "no commands must be None (unverified), never True")
+        self.assertIn("NOTHING WAS VERIFIED", log)
+
+    def test_merge_and_push_refused_on_an_unverified_gate(self):
+        import inspect
+        src = inspect.getsource(ff._commit_and_sync)
+        self.assertIn("if args.merge and final_ok is True", src,
+                      "the merge gate must require True, not truthiness - None "
+                      "(no build command) auto-merged unverified work to main")
+        self.assertIn("merge+push REFUSED", src)
+
+    def test_report_only_baseline_is_not_claimed_as_passed(self):
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("baseline_ok = None", src)
+        self.assertNotIn("baseline_ok = True", src,
+                         "a skipped build is unverified, not a pass")
+
+    def test_report_renders_unverified_baseline_honestly(self):
+        import tempfile
+        base = {"name": "demo", "branch": None, "files_reviewed": 0, "findings": [],
+                "file_findings": {}, "applied_files": [], "unverified_files": [],
+                "test_files": [], "test_status": None, "e2e": {}, "fix_notes": [],
+                "commit_status": "n/a", "cycles": 1, "providers": [], "converged": True,
+                "stop_reason": "done", "suite_status": None, "clean_files": [],
+                "usd": 0.0, "fix_severity": "high", "manual_review": [],
+                "low_findings": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            for value, expect in ((None, "NOT RUN (unverified)"),
+                                  (True, "passed"), (False, "FAILED")):
+                a = dict(base, dir=tmp, baseline_ok=value)
+                with open(ff._write_audit_report(tmp, a), encoding="utf-8") as fh:
+                    body = fh.read()
+                self.assertIn(f"**Baseline build:** {expect}", body)
+
+
+class ApplyExitCodeTests(unittest.TestCase):
+    """A run that fixed nothing must not exit 0 - both retry supervisors read
+    exit 0 as success, which is how a 6-hour no-op looked like a good night."""
+
+    def test_apply_that_fixed_nothing_exits_nonzero(self):
+        results = [{"name": "A", "error": None, "defects": 3464, "fixed": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True),
+                         ff.EXIT_APPLIED_NOTHING)
+
+    def test_apply_that_fixed_something_exits_zero(self):
+        results = [{"name": "A", "error": None, "defects": 10, "fixed": 4}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
+
+    def test_genuinely_clean_repo_exits_zero(self):
+        results = [{"name": "A", "error": None, "defects": 0, "fixed": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
+
+    def test_report_only_run_is_not_penalised(self):
+        results = [{"name": "A", "error": None, "defects": 99, "fixed": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=False), 0)
+
+    def test_hard_error_still_wins(self):
+        results = [{"name": "A", "error": "boom", "defects": 0, "fixed": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 1)
+
+
+# =========================================================================== #
+# Owner order 2026-08-11 (PART B): "FlexFactor needs to make sure it understands
+# the purpose each app or program I place in it was created for, and must bridge
+# the gap between where it is and that purpose."
+# =========================================================================== #
+
+import flexfactor_purpose as fp  # noqa: E402  (after the hermetic ff load)
+
+
+class PurposeRegistryTests(unittest.TestCase):
+    """The seeded registry IS the owner's master prompts. If it drifts from them
+    the whole feature is guessing again."""
+
+    def setUp(self):
+        self.reg = fp.load_registry()
+
+    def test_registry_has_the_owner_portfolio(self):
+        # 9 (Claude Code lane) + 8 (ChatGPT) + 9 (Cursor) = 26 assigned apps.
+        self.assertEqual(len(self.reg), 26)
+
+    def test_every_contract_has_a_purpose_and_acceptance_criteria(self):
+        for slug, entry in self.reg.items():
+            self.assertTrue(entry.get("purpose"), slug)
+            self.assertTrue(entry.get("acceptance_criteria"), slug)
+            self.assertTrue((entry.get("source") or {}).get("doc"), slug)
+
+    def test_the_five_programs_the_launcher_offers_all_resolve(self):
+        # These are exactly what the owner types into launcher option 4.
+        for typed, expect in (("GrantFlow", "GrantFlow"),
+                              ("GeneMap", "Axiom GeneMap Discovery"),
+                              ("SermonSmith", "SermonSmith AI by Axiom BioLabs"),
+                              ("IPlay", "IPlay"),
+                              ("FutureU", "FutureU")):
+            c = fp.find_contract(typed, None, self.reg)
+            self.assertIsNotNone(c, typed)
+            self.assertEqual(c.name, expect)
+            self.assertTrue(c.authored)
+
+    def test_grantflow_contract_carries_the_owners_real_bar(self):
+        c = fp.find_contract("GrantFlow", None, self.reg)
+        joined = " ".join(c.acceptance_criteria).lower()
+        # The owner's stated north-star: beat free manual search end to end.
+        self.assertIn("real output comparison against manual search", joined)
+        self.assertIn("provenance", c.purpose.lower())
+
+    def test_unknown_program_yields_no_contract(self):
+        self.assertIsNone(fp.find_contract("not-a-real-program", None, self.reg))
+
+    def test_doctrine_documents_are_installed(self):
+        base = os.path.join(_HERE, "memory", "doctrine")
+        for name in ("PROVENANCE.md",
+                     "portfolio-parallel-orchestration-directive.md",
+                     "axiom-master-prompt-claude-code.md",
+                     "axiom-master-prompt-chatgpt.md",
+                     "axiom-master-prompt-cursor.md"):
+            self.assertTrue(os.path.isfile(os.path.join(base, name)), name)
+
+
+class PurposeContractTests(unittest.TestCase):
+
+    def test_inferred_contract_is_never_labelled_as_the_owners(self):
+        c = fp.inferred_contract("X", "does a thing")
+        self.assertFalse(c.authored)
+        self.assertIn("INFERRED", c.prompt_block())
+        self.assertNotIn("AUTHORED BY THE OWNER", c.prompt_block())
+
+    def test_authored_contract_numbers_its_criteria_for_citation(self):
+        c = fp.PurposeContract(name="X", purpose="p",
+                               acceptance_criteria=["a", "b", "c"], authored=True)
+        block = c.prompt_block()
+        self.assertIn("AUTHORED BY THE OWNER", block)
+        self.assertIn("  1. a", block)
+        self.assertIn("  3. c", block)
+
+    def test_in_repo_json_contract_wins_over_the_registry(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".flexfactor-purpose.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"name": "Local", "purpose": "local purpose",
+                           "acceptance_criteria": ["one"]}, fh)
+            c = fp.find_contract("GrantFlow", tmp)
+        self.assertEqual(c.purpose, "local purpose")
+        self.assertTrue(c.authored)
+
+    def test_markdown_contract_is_parsed(self):
+        # This is the shape the repo's own docs/purpose-contract.md already uses.
+        parsed = fp.parse_markdown_contract(
+            "# Purpose & Acceptance Contract - FlexFactor\n"
+            "## Purpose\n\nDo the job well.\n\n"
+            "## Acceptance (master prompt)\n\n1. first thing\n2. second thing\n\n"
+            "## Forbidden substitutes\n\nFake success, docs-only claims\n")
+        self.assertEqual(parsed["name"], "FlexFactor")
+        self.assertEqual(parsed["purpose"], "Do the job well.")
+        self.assertEqual(parsed["acceptance_criteria"], ["first thing", "second thing"])
+        self.assertIn("Fake success", parsed["false_substitutes"])
+
+    def test_repos_own_contract_file_is_readable_end_to_end(self):
+        c = fp.contract_from_repo(_HERE, "FlexFactor")
+        self.assertIsNotNone(c, "FlexFactor's own docs/purpose-contract.md must load")
+        self.assertTrue(c.authored)
+        self.assertTrue(c.acceptance_criteria)
+
+
+class GapAnalysisTests(unittest.TestCase):
+    """The output must be PURPOSE-derived: every gap traceable to a criterion,
+    and the headline a count of gaps closed rather than a score."""
+
+    def _contract(self):
+        return fp.PurposeContract(
+            name="GrantFlow", purpose="find real funding sources",
+            acceptance_criteria=["current-source validation",
+                                 "broken-link lifecycle",
+                                 "real output comparison against manual search"],
+            authored=True)
+
+    def test_gap_out_of_range_ref_is_dropped_not_misattributed(self):
+        g = fp.normalize_gap({"acceptance_ref": 99, "severity": "nope"}, 3)
+        self.assertIsNone(g["acceptance_ref"])
+        self.assertEqual(g["severity"], "medium")
+        g2 = fp.normalize_gap({"acceptance_ref": "2"}, 3)
+        self.assertEqual(g2["acceptance_ref"], 2)
+        g3 = fp.normalize_gap({"acceptance_ref": 0}, 3)
+        self.assertIsNone(g3["acceptance_ref"])
+
+    def test_coverage_maps_gaps_onto_the_owners_criteria(self):
+        c = self._contract()
+        gaps = [{"title": "no link checker", "acceptance_ref": 2, "severity": "high"},
+                {"title": "no search benchmark", "acceptance_ref": 3, "severity": "critical"}]
+        cov = fp.acceptance_coverage(c, gaps)
+        self.assertEqual([r["met"] for r in cov], [True, False, False])
+        self.assertEqual(cov[2]["worst_severity"], "critical")
+        self.assertEqual(cov[1]["gap_titles"], ["no link checker"])
+
+    def test_progress_counts_gaps_closed_and_criteria_unblocked(self):
+        before = [{"title": "a", "acceptance_ref": 2},
+                  {"title": "b", "acceptance_ref": 3},
+                  {"title": "c", "acceptance_ref": 3}]
+        prog = fp.gap_progress(before, ["a"])
+        self.assertEqual(prog["gaps_closed"], 1)
+        self.assertEqual(prog["gaps_remaining"], 2)
+        self.assertEqual(prog["criteria_unblocked"], 1)   # #2 freed
+        self.assertEqual(prog["criteria_blocked_after"], 1)  # #3 still has "c"
+
+    def test_partially_closed_criterion_stays_blocked(self):
+        before = [{"title": "b", "acceptance_ref": 3}, {"title": "c", "acceptance_ref": 3}]
+        prog = fp.gap_progress(before, ["b"])
+        self.assertEqual(prog["criteria_unblocked"], 0)
+
+    def test_assessor_uses_the_contract_and_measures_against_it(self):
+        c = self._contract()
+        seen = {}
+
+        def fake_judge(prov, system, prompt, schema, max_tokens=8000):
+            seen["prompt"] = prompt
+            seen["system"] = system
+            return {"purpose": "a weaker paraphrase",
+                    "fulfillment_pct": 95,
+                    "gaps": [{"title": "no benchmark", "severity": "critical",
+                              "description": "d", "evidence": "e", "next_step": "n",
+                              "code_fixable": True, "file": "src/a.js",
+                              "acceptance_ref": 3}]}
+
+        real = ff._judge
+        ff._judge = fake_judge
+        try:
+            out = ff.assess_purpose_gap(object(), "META", ["src/a.js"], [], contract=c)
+        finally:
+            ff._judge = real
+        self.assertIn("PURPOSE AND ACCEPTANCE CONTRACT", seen["prompt"])
+        self.assertIn("real output comparison against manual search", seen["prompt"])
+        # The OWNER's purpose survives; the model's weaker paraphrase does not.
+        self.assertEqual(out["purpose"], c.purpose)
+        self.assertTrue(out["authored"])
+        # ...and the percentage is MEASURED (2 of 3 criteria met), not the 95
+        # the model felt like reporting.
+        self.assertEqual(out["criteria_met"], 2)
+        self.assertEqual(out["criteria_total"], 3)
+        self.assertEqual(out["fulfillment_pct"], 67)
+
+    def test_without_a_contract_the_result_is_marked_inferred(self):
+        def fake_judge(prov, system, prompt, schema, max_tokens=8000):
+            return {"purpose": "guessed", "fulfillment_pct": 50, "gaps": []}
+        real = ff._judge
+        ff._judge = fake_judge
+        try:
+            out = ff.assess_purpose_gap(object(), "META", [], [])
+        finally:
+            ff._judge = real
+        self.assertFalse(out["authored"])
+        self.assertNotIn("acceptance_coverage", out)
+
+    def test_report_leads_with_gaps_closed_and_the_criteria_table(self):
+        import tempfile
+        audit = {"name": "demo", "branch": None, "files_reviewed": 1, "findings": [],
+                 "file_findings": {}, "applied_files": [], "unverified_files": [],
+                 "test_files": [], "test_status": None, "e2e": {}, "fix_notes": [],
+                 "commit_status": "n/a", "baseline_ok": True, "cycles": 1,
+                 "providers": [], "converged": True, "stop_reason": "done",
+                 "suite_status": None, "clean_files": [], "usd": 0.0,
+                 "fix_severity": "high", "manual_review": [], "low_findings": [],
+                 "bridged_files": ["src/a.js"],
+                 "purpose_gap": {
+                     "purpose": "find real funding sources",
+                     "authored": True,
+                     "contract_source": {"doc": "memory/purpose_contracts.json"},
+                     "fulfillment_pct": 67, "criteria_met": 2, "criteria_total": 3,
+                     "acceptance_coverage": [
+                         {"index": 1, "criterion": "current-source validation",
+                          "met": True, "blocking_gaps": 0, "worst_severity": None,
+                          "gap_titles": []},
+                         {"index": 2, "criterion": "broken-link lifecycle",
+                          "met": False, "blocking_gaps": 1, "worst_severity": "high",
+                          "gap_titles": ["no link checker"]},
+                         {"index": 3, "criterion": "real output comparison against manual search",
+                          "met": False, "blocking_gaps": 1, "worst_severity": "critical",
+                          "gap_titles": ["no benchmark"]}],
+                     "progress": {"gaps_before": 3, "gaps_closed": 1, "gaps_remaining": 2,
+                                  "criteria_blocked_before": 3, "criteria_unblocked": 1,
+                                  "criteria_blocked_after": 2},
+                     "gaps": [{"title": "no benchmark", "severity": "critical",
+                               "description": "d", "evidence": "e", "next_step": "n",
+                               "code_fixable": True, "file": "src/a.js",
+                               "acceptance_ref": 3}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            audit["dir"] = tmp
+            with open(ff._write_audit_report(tmp, audit), encoding="utf-8") as fh:
+                body = fh.read()
+        self.assertIn("closed 1 of 3 gap(s) toward that purpose", body)
+        self.assertIn("owner-authored contract", body)
+        self.assertIn("### Acceptance criteria (the owner's, verbatim)", body)
+        self.assertIn("real output comparison against manual search", body)
+        self.assertIn("[acceptance #3]", body)
+        # A generic lint list cannot produce a criterion table - that is the
+        # whole point of purpose-derived output.
+        self.assertIn("| 2 | NO | broken-link lifecycle | no link checker |", body)
+
+    def test_inferred_purpose_is_flagged_in_the_report(self):
+        import tempfile
+        audit = {"name": "demo", "branch": None, "files_reviewed": 1, "findings": [],
+                 "file_findings": {}, "applied_files": [], "unverified_files": [],
+                 "test_files": [], "test_status": None, "e2e": {}, "fix_notes": [],
+                 "commit_status": "n/a", "baseline_ok": True, "cycles": 1,
+                 "providers": [], "converged": True, "stop_reason": "done",
+                 "suite_status": None, "clean_files": [], "usd": 0.0,
+                 "fix_severity": "high", "manual_review": [], "low_findings": [],
+                 "purpose_gap": {"purpose": "guessed", "authored": False,
+                                 "fulfillment_pct": 50, "gaps": []}}
+        with tempfile.TemporaryDirectory() as tmp:
+            audit["dir"] = tmp
+            with open(ff._write_audit_report(tmp, audit), encoding="utf-8") as fh:
+                body = fh.read()
+        self.assertIn("INFERRED by FlexFactor", body)
+
+
+class StatusVocabularyTests(unittest.TestCase):
+    """The owner's section 4 vocabulary, as enforcement. This is the direct fix
+    for the silent-overclaim class: no status without evidence."""
+
+    def test_no_evidence_is_never_production_ready(self):
+        status, unmet = fp.production_ready_status({})
+        self.assertEqual(status, "IN PROGRESS")
+        self.assertTrue(unmet)
+
+    def test_full_evidence_is_production_ready(self):
+        ev = {cid: "pass" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        self.assertEqual(fp.production_ready_status(ev), ("PRODUCTION READY", []))
+
+    def test_a_critical_unknown_blocks_even_when_everything_else_passes(self):
+        ev = {cid: "pass" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        ev["purpose_fulfilled"] = "unknown"
+        status, unmet = fp.production_ready_status(ev)
+        self.assertEqual(status, "IN PROGRESS")
+        self.assertIn("purpose_fulfilled", unmet)
+
+    def test_open_purpose_gaps_block_regardless_of_green_gates(self):
+        ev = {cid: "pass" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        status, _ = fp.production_ready_status(ev, has_open_gaps=True)
+        self.assertEqual(status, "IN PROGRESS")
+
+    def test_only_release_side_unknowns_yield_release_candidate(self):
+        ev = {cid: "pass" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        for cid in ("merged", "ci_on_sha", "sha_deployed", "release_identity"):
+            ev[cid] = "unknown"
+        status, unmet = fp.production_ready_status(ev)
+        self.assertEqual(status, "RELEASE CANDIDATE")
+        self.assertEqual(sorted(unmet),
+                         ["ci_on_sha", "merged", "release_identity", "sha_deployed"])
+
+    def test_any_failure_blocks(self):
+        ev = {cid: "pass" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        ev["tests_pass"] = "fail"
+        self.assertEqual(fp.production_ready_status(ev)[0], "BLOCKED")
+
+    def test_na_conditions_do_not_block(self):
+        ev = {cid: "na" for cid, _p, _c in fp.PRODUCTION_READY_CONDITIONS}
+        self.assertEqual(fp.production_ready_status(ev), ("PRODUCTION READY", []))
+
+    def test_banned_equivalences_are_detected(self):
+        for claim in ("the build passes so it is ready", "tests pass",
+                      "it works locally", "health endpoint returns 200",
+                      "merged and deployed"):
+            self.assertTrue(fp.forbidden_claims(claim), claim)
+
+    def test_done_is_not_a_release_status(self):
+        with self.assertRaises(ValueError):
+            fp.assert_status_vocabulary("DONE")
+        self.assertEqual(fp.assert_status_vocabulary("production ready"),
+                         "PRODUCTION READY")
+
+    def test_release_status_wired_into_the_audit_report(self):
+        import tempfile
+        audit = {"name": "demo", "branch": None, "files_reviewed": 1,
+                 "findings": [{"severity": "critical"}], "file_findings": {},
+                 "applied_files": [], "unverified_files": [], "test_files": [],
+                 "test_status": None, "e2e": {}, "fix_notes": [],
+                 "commit_status": "n/a", "baseline_ok": True, "cycles": 1,
+                 "providers": [], "converged": False, "stop_reason": "x",
+                 "suite_status": None, "clean_files": [], "usd": 0.0,
+                 "fix_severity": "high", "manual_review": [], "low_findings": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            audit["dir"] = tmp
+            with open(ff._write_audit_report(tmp, audit), encoding="utf-8") as fh:
+                body = fh.read()
+        self.assertIn("## Release status", body)
+        self.assertIn("**BLOCKED**", body)   # an open critical defect
+        self.assertIn("not equivalent to PRODUCTION READY", body.replace(
+            "none of these are equivalent to PRODUCTION READY",
+            "not equivalent to PRODUCTION READY"))
+
+    def test_audit_never_reports_production_ready_with_open_gaps(self):
+        a = {"purpose_gap": {"gaps": [{"title": "g"}], "authored": True},
+             "findings": [], "e2e": {}, "providers": ["a", "b"],
+             "commit_status": "committed; merged into main",
+             "suite_status": True, "test_status": True, "baseline_ok": True}
+        status, _ = ff._release_status(a)
+        self.assertNotEqual(status, "PRODUCTION READY")
 
 
 if __name__ == "__main__":

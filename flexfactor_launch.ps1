@@ -88,7 +88,16 @@ function Invoke-FlexFactorJob {
         $code = $LASTEXITCODE
         if ($code -eq 0) { return 0 }
         if ($code -eq 2) {
-            Write-Host "  Exit code 2 (usage error) - not retrying." -ForegroundColor Red
+            Write-Host "  Exit code 2 (usage error / cancelled) - not retrying." -ForegroundColor Red
+            return $code
+        }
+        if ($code -eq 3) {
+            # Exit 3 = the run completed but APPLIED NOTHING despite finding
+            # defects (2026-08-11). Relaunching that 4 more times just spends the
+            # same money again for the same nothing. Surface it and stop.
+            Write-Host "  Exit code 3: the run FIXED NOTHING despite finding defects." -ForegroundColor Red
+            Write-Host "  Not retrying - a repeat would re-spend the same budget for the" -ForegroundColor Red
+            Write-Host "  same result. See the audit report for why nothing could be applied." -ForegroundColor Red
             return $code
         }
         Write-Host "  FlexFactor exited with code $code." -ForegroundColor Yellow
@@ -250,14 +259,16 @@ if ($mode -eq "3") {
         Read-Host "Press Enter to close"; exit 1
     }
 
-    # Apply vs report-only. Default is to apply fixes. The CLI's own default is
-    # report-only, so apply mode MUST pass --apply explicitly (plus --yes: this
-    # prompt already IS the confirmation, don't ask twice). Without these flags
-    # the launcher silently ran report-only while claiming apply mode.
+    # Apply vs report-only. APPLY is the default in the CLI too now (owner order
+    # 2026-08-11: "I will NEVER just 'review' with this program"), and a bare run
+    # that would review without applying ABORTS rather than quietly spending. We
+    # still pass --apply --yes explicitly so this menu's answer is unambiguous.
+    Write-Host "  NOTE: 'report' only REVIEWS. On a large repo that costs real money" -ForegroundColor DarkGray
+    Write-Host "  and changes nothing (2026-08-11: 6h, 17.75 USD, 3464 defects, 0 fixed)." -ForegroundColor DarkGray
     $apply = Read-Host "Apply fixes? [yes/report] (Enter = yes)"
     if ($apply -eq "report") {
         $extraArgs += "--report-only"
-        Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
+        Write-Host "Report mode: findings only, no code changes. You asked for this explicitly." -ForegroundColor Yellow
     } else {
         $extraArgs += "--apply"
         $extraArgs += "--yes"

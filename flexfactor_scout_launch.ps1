@@ -82,7 +82,7 @@ if ($provider -eq "ollama") {
 }
 
 function Test-RepoRewardsLocal {
-    # Contract probe: /api/version (not /api/health — not required by RR).
+    # Contract probe: /api/version (not /api/health - not required by RR).
     try {
         $null = Invoke-WebRequest -Uri "http://localhost:3000/api/version" -UseBasicParsing -TimeoutSec 2
         return $true

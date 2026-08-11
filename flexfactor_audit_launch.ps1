@@ -87,17 +87,22 @@ if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
 }
 $primary = $provider
 
-# Apply vs report-only. SAFE DEFAULT is report-only; type "apply" to opt in to
-# committing verified fixes. Merge+push to the current branch/origin are the CLI
-# defaults now (owner order 2026-08-11), green-build gated.
-$apply = Read-Host "Apply fixes? [report / apply] (Enter = report)"
-if ($apply -match '^(a|apply|y|yes)$') {
+# Apply vs report-only. DEFAULT IS APPLY (owner order 2026-08-11: "I will NEVER
+# just 'review' with this program"). This prompt used to default to REPORT while
+# the other launcher's equivalent prompt defaulted to APPLY - two entry points
+# disagreeing about the most expensive decision in the tool was itself the trap.
+# Merge+push to the current branch/origin are CLI defaults, green-build gated.
+Write-Host "  NOTE: 'report' only REVIEWS. On a large repo that costs real money and" -ForegroundColor DarkGray
+Write-Host "  changes nothing (2026-08-11: 6h, 17.75 USD, 3464 defects found, 0 fixed)." -ForegroundColor DarkGray
+$apply = Read-Host "Apply fixes? [apply / report] (Enter = apply)"
+if ($apply -match '^(r|report)$') {
+    $extraArgs += "--report-only"
+    Write-Host "Report mode: findings only, no code changes. You asked for this explicitly." -ForegroundColor Yellow
+} else {
     $extraArgs += "--apply"
     $extraArgs += "--yes"
     Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow
     Write-Host "branch, and pushed to origin automatically (green-build gated)." -ForegroundColor Yellow
-} else {
-    Write-Host "Report mode: findings only, no code changes." -ForegroundColor DarkGray
 }
 
 # Economy mode: author fixes/tests with Claude Sonnet 5 (about 40% cheaper than
