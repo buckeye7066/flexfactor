@@ -7942,6 +7942,18 @@ class _FakeMsg:
         self.usage = None
 
 
+# The provider SDKs are OPTIONAL extras (imported lazily; one key is enough to
+# run), so tests that reach the real `import anthropic` / `import openai` in
+# _paid_client() / _openai_rescue_provider() must SKIP - not error - on a
+# machine without them. CI installs requirements.txt, so these still run there.
+_HAS_ANTHROPIC_SDK = importlib.util.find_spec("anthropic") is not None
+_HAS_OPENAI_SDK = importlib.util.find_spec("openai") is not None
+_needs_anthropic_sdk = unittest.skipUnless(
+    _HAS_ANTHROPIC_SDK, "anthropic SDK not installed (optional extra)")
+_needs_openai_sdk = unittest.skipUnless(
+    _HAS_OPENAI_SDK, "openai SDK not installed (optional extra)")
+
+
 class PaidFallbackRescueTests(unittest.TestCase):
     """Owner order 2026-08-10 evening: the free FCC proxy stays PRIMARY; the
     real Anthropic/OpenAI keys (handed over as FLEXFACTOR_FALLBACK_*) exist
@@ -8004,6 +8016,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertFalse(ff._fallback_hold_active(), "hold must expire so free is re-probed")
 
     # ---- escalation ----
+    @_needs_anthropic_sdk
     def test_deadline_hang_rescues_via_paid_anthropic_and_arms_hold(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()
@@ -8033,6 +8046,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertTrue(all(c is not prov.client for c in calls),
                         "during the hold window the wedged free path must not be probed")
 
+    @_needs_anthropic_sdk
     def test_exhausted_retries_rescue_via_paid_anthropic(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()
@@ -8063,6 +8077,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
                 model="claude-haiku-4-5", max_tokens=100, system=[],
                 messages=[{"role": "user", "content": "x"}], fmt={})
 
+    @_needs_anthropic_sdk
     def test_structured_delegates_to_openai_when_anthropic_tier_fails(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
@@ -8111,6 +8126,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertEqual(seen["model"], ff.DEFAULT_MODELS["openai"],
                          "an author-tier call must map to the OpenAI author tier")
 
+    @_needs_anthropic_sdk
     def test_garbage_output_rescues_when_keys_present(self):
         # A STALE free backend returning prose instead of JSON is exactly the
         # "stales" case the owner named: the paid tier must take the call.
@@ -8129,6 +8145,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
             messages=[{"role": "user", "content": "x"}], fmt={})
         self.assertIs(out, paid_msg)
 
+    @_needs_openai_sdk
     def test_openai_rescue_builds_with_blanked_env_key(self):
         # Live-caught 2026-08-10: OpenAIProvider.__init__ constructs the client
         # from the env var, which free mode BLANKS - and the SDK raises on a
@@ -8151,6 +8168,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
             else:
                 os.environ["OPENAI_API_KEY"] = saved
 
+    @_needs_anthropic_sdk
     def test_paid_client_ignores_proxy_env(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()

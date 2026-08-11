@@ -4424,7 +4424,11 @@ def _rmtree_force(path: str) -> None:
             os.chmod(p, stat.S_IWRITE)
             func(p)
     try:
-        shutil.rmtree(path, onexc=_onexc)
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_onexc)
+        else:
+            # onexc is 3.12+; onerror passes (func, path, exc_info) instead.
+            shutil.rmtree(path, onerror=lambda f, p, ei: _onexc(f, p, ei[1]))
     except OSError:
         shutil.rmtree(path, ignore_errors=True)  # best effort; temp dir
 
