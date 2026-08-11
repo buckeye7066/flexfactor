@@ -317,6 +317,15 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
+- RESUME (owner order 2026-08-11, "there needs to be a resume"): `_review_all`
+  checkpoints every completed per-file review (sha-keyed) into the brain's
+  per-project `resume` record every 10 files + at sweep end
+  (`_save_resume_state`); `audit_one_program` recovers sha-matching entries at
+  start (`_load_resume_state`) - recovered clean files join the skip set,
+  recovered findings skip cycle-1 review and go straight to fixing. Cleared
+  only when a run CONVERGES (`_brain_record_run`); a cost-capped or crashed
+  run keeps it. `--recheck` ignores it. Policy-versioned like clean_files -
+  never trusted across a content or policy change.
 - Console progress: `ConsoleMeter` (2026-08-11, "no progress meter in option 4")
   draws ONE live status line fed from the same `report(**fields)` stream the
   dashboard uses, with a background tick so spinner/elapsed move during long

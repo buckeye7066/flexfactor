@@ -495,6 +495,11 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
             rec["clean_files"] = {"policy": POLICY_VERSION,
                                   "tool": TOOL_VERSION,
                                   "files": dict(clean_map)}
+        # A CONVERGED run has nothing left to resume; anything else (cost cap,
+        # interruption recorded later, incomplete review) keeps its checkpoint
+        # so the next run picks up where this one left off.
+        if summary.get("converged"):
+            rec.pop("resume", None)
         brain[project_dir] = rec
         # The top-level dict is keyed by project dir and would otherwise grow (and be
         # re-serialized) forever; keep the most recently audited projects only.
@@ -505,6 +510,47 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
             for stale in sorted(brain, key=_last_when)[: len(brain) - MAX_BRAIN_PROJECTS]:
                 del brain[stale]
         _save_brain(brain)
+
+
+def _load_resume_state(prior: dict) -> dict:
+    """Recover the mid-run review checkpoint left by an interrupted run.
+
+    Owner order 2026-08-11: "there needs to be a resume" - a run that dies
+    mid-flow (crash, Ctrl-C, power loss, credits) must not make the next run
+    re-pay for reviews that already completed. The checkpoint is sha-keyed per
+    file and policy-versioned, so nothing is ever trusted across a content
+    change or a review-policy change."""
+    rs = (prior or {}).get("resume")
+    if isinstance(rs, dict) and rs.get("policy") == POLICY_VERSION:
+        f = rs.get("findings")
+        c = rs.get("clean")
+        return {"findings": dict(f) if isinstance(f, dict) else {},
+                "clean": dict(c) if isinstance(c, dict) else {}}
+    return {"findings": {}, "clean": {}}
+
+
+def _save_resume_state(project_dir: str, findings_cache: dict, clean: dict) -> None:
+    """Persist the in-flight review state (atomic, best-effort - a failed
+    checkpoint must never break the run it is trying to protect).
+
+    `findings_cache` is {rel: {"sha": <reviewed sha>, "findings": [...]}} for
+    completed reviews that FOUND something; `clean` is {rel: sha} for completed
+    reviews that found nothing. Overwritten on every checkpoint so it always
+    reflects the latest completed work; cleared by _brain_record_run once a run
+    CONVERGES (a finished-clean program has nothing to resume)."""
+    try:
+        with _BRAIN_LOCK, _brain_file_lock():
+            brain = _load_brain()
+            rec = brain.get(project_dir) or {"history": [], "cumulative": {}}
+            rec["resume"] = {"policy": POLICY_VERSION, "tool": TOOL_VERSION,
+                             "when": _now_iso(),
+                             "findings": dict(findings_cache),
+                             "clean": dict(clean)}
+            brain[project_dir] = rec
+            _save_brain(brain)
+    except Exception:
+        pass  # checkpointing is protection, never a new failure mode
+
 
 
 # --------------------------------------------------------------------------- #
@@ -7415,7 +7461,8 @@ def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
                 workers: int = REVIEW_WORKERS,
-                context: str = "") -> tuple[dict, list, set, dict]:
+                context: str = "",
+                checkpoint_cb=None) -> tuple[dict, list, set, dict, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
@@ -7430,6 +7477,7 @@ def _review_all(reviewers: list, project_dir: str,
     unreadable: set[str] = set()          # contained read REFUSED (never mark clean)
     reviewed_clean: dict[str, str] = {}   # rel -> reviewed_sha (fully reviewed, empty)
     incomplete: set[str] = set()          # review aborted (budget/error) -> NOT clean
+    reviewed_sha: dict[str, str] = {}     # rel -> sha for completed reviews WITH findings
     total = len(files)
     lock = threading.Lock()
     done = {"n": 0}
@@ -7498,13 +7546,21 @@ def _review_all(reviewers: list, project_dir: str,
                     incomplete.add(rel)
                     print(f"  ({i}/{total}) {rel}: review INCOMPLETE (budget/error) - NOT clean")
                     continue
-                merged = payload            # 3-tuple: (rel, findings, reviewed_sha)
-                reviewed_sha = res[2]
+                merged = payload            # 3-tuple: (rel, findings, sha-as-reviewed)
                 if merged:
                     file_findings[rel] = merged
                     flat.extend(merged)
+                    reviewed_sha[rel] = res[2]
                 else:
-                    reviewed_clean[rel] = reviewed_sha  # fully reviewed, empty -> clean allowlist
+                    reviewed_clean[rel] = res[2]  # fully reviewed, empty -> clean allowlist
+                # RESUME checkpoint: persist completed reviews every 10 files so
+                # a crash mid-sweep loses at most the last few paid calls.
+                if checkpoint_cb is not None and done["n"] % 10 == 0:
+                    try:
+                        checkpoint_cb(dict(file_findings), dict(reviewed_clean),
+                                      dict(reviewed_sha))
+                    except Exception:
+                        pass  # checkpointing must never break the sweep
                 sev_counts: dict[str, int] = {}
                 for f in merged:
                     sev_counts[f.get("severity", "?")] = sev_counts.get(f.get("severity", "?"), 0) + 1
@@ -7527,6 +7583,11 @@ def _review_all(reviewers: list, project_dir: str,
     if incomplete:
         print(f"  [warn] {len(incomplete)} file(s) had an INCOMPLETE review "
               "(budget/error) - NOT marked clean, will be re-reviewed")
+    if checkpoint_cb is not None:
+        try:
+            checkpoint_cb(dict(file_findings), dict(reviewed_clean), dict(reviewed_sha))
+        except Exception:
+            pass
     return file_findings, flat, unreadable, reviewed_clean, incomplete
 
 
@@ -8189,6 +8250,44 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 if cur is not None and cur == sha:
                     prior_clean[rel] = sha
                     clean_files.add(rel.replace("\\", "/"))
+        # RESUME (owner order 2026-08-11: "there needs to be a resume"). An
+        # interrupted run checkpoints every completed per-file review into the
+        # brain; recover them here so re-running the same command picks up
+        # where the run died instead of re-paying for finished reviews. Every
+        # entry is sha-verified against the file's CURRENT contained read -
+        # anything changed since it was reviewed is dropped and re-reviewed.
+        # --recheck opts out (same switch as the clean-file memory).
+        resume_findings: dict[str, list[dict]] = {}
+        resume_cache: dict[str, dict] = {}   # rel -> {"sha","findings"} carried forward
+        if not getattr(args, "recheck", False):
+            _rs = _load_resume_state(prior)
+            stale = 0
+            for rel, sha in (_rs.get("clean") or {}).items():
+                key = str(rel).replace("\\", "/")
+                if key in clean_files:
+                    continue
+                cur = _file_sha_contained(project_dir, rel)
+                if cur is not None and cur == sha:
+                    prior_clean[key] = sha
+                    clean_files.add(key)
+                else:
+                    stale += 1
+            for rel, entry in (_rs.get("findings") or {}).items():
+                sha = (entry or {}).get("sha")
+                found = (entry or {}).get("findings")
+                cur = _file_sha_contained(project_dir, rel)
+                if sha and isinstance(found, list) and found and cur == sha:
+                    key = str(rel).replace("\\", "/")
+                    resume_findings[key] = found
+                    resume_cache[key] = {"sha": sha, "findings": found}
+                else:
+                    stale += 1
+            if resume_findings or stale:
+                print(f"{pfx}Resume: recovered {len(resume_findings)} completed "
+                      "review(s) with findings from the interrupted run "
+                      "(sha-verified, not re-billed)"
+                      + (f"; {stale} stale entr{'y' if stale == 1 else 'ies'} "
+                         "dropped for re-review" if stale else "") + ".")
         if prior.get("last_run"):
             lr = prior["last_run"]
             cum = prior.get("cumulative") or {}
@@ -8435,10 +8534,35 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
+            def _resume_checkpoint(ffs: dict, sweep_clean: dict, shas: dict,
+                                   _cycle=cycle):
+                # Persist completed reviews mid-flight so a crash resumes
+                # instead of re-paying. Carries forward the still-valid
+                # recovered entries plus everything this run proved clean.
+                cache = dict(resume_cache)
+                for rel, fl in ffs.items():
+                    if rel in shas:
+                        cache[rel] = {"sha": shas[rel], "findings": fl}
+                clean_now = dict(prior_clean)
+                clean_now.update(run_clean_sha)
+                clean_now.update(sweep_clean)
+                _save_resume_state(project_dir, cache, clean_now)
+
+            sweep_files = files
+            if cycle == 1 and resume_findings:
+                skip = set(resume_findings)
+                sweep_files = [f for f in files if f not in skip]
             file_findings, flat, unreadable, reviewed_clean, review_incomplete = _review_all(
-                reviewers, project_dir, files, report=report, meter=meter, soft_cap_usd=soft,
+                reviewers, project_dir, sweep_files, report=report, meter=meter, soft_cap_usd=soft,
                 workers=getattr(args, "review_workers", REVIEW_WORKERS),
-                context=purpose_blob)
+                context=purpose_blob, checkpoint_cb=_resume_checkpoint)
+            if cycle == 1 and resume_findings:
+                # Recovered reviews join the sweep's results exactly as if they
+                # had been reviewed this cycle (they were - by the interrupted
+                # run, against the same bytes).
+                for rel, fl in resume_findings.items():
+                    file_findings.setdefault(rel, fl)
+                    flat.extend(fl)
             # A file the contained read REFUSED is never clean and never auto-fixed:
             # set it aside for manual review (a swapped symlink / fail-closed platform).
             for rel in unreadable:

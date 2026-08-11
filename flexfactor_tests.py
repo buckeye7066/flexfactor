@@ -9226,5 +9226,111 @@ class GapClosureVerifiedOnlyTests(unittest.TestCase):
         self.assertIn("if rel in verified_bridged", src)
 
 
+class ResumeCheckpointTests(unittest.TestCase):
+    """Owner order 2026-08-11: "Is there a 'resume' button...? If not, there
+    needs to be." An interrupted run checkpoints every completed per-file
+    review (sha-keyed) into the brain; re-running the same command recovers
+    them instead of re-paying. Fix commits already survive via per-cycle
+    commits - this covers the REVIEW side, which used to be lost entirely."""
+
+    def setUp(self):
+        # BRAIN_PATH is already redirected to a temp dir at import; make each
+        # test start from an empty brain anyway.
+        with contextlib.suppress(OSError):
+            os.remove(ff.BRAIN_PATH)
+
+    def test_save_load_roundtrip_and_policy_guard(self):
+        ff._save_resume_state("/proj", {"a.py": {"sha": "s1", "findings": [{"t": 1}]}},
+                              {"b.py": "s2"})
+        prior = ff._load_brain().get("/proj") or {}
+        rs = ff._load_resume_state(prior)
+        self.assertEqual(rs["findings"]["a.py"]["sha"], "s1")
+        self.assertEqual(rs["clean"], {"b.py": "s2"})
+        # A checkpoint written under a DIFFERENT policy version is never
+        # trusted (the review rules changed; the cached verdicts may not hold).
+        prior2 = json.loads(json.dumps(prior))
+        prior2["resume"]["policy"] = "some-older-policy"
+        rs2 = ff._load_resume_state(prior2)
+        self.assertEqual(rs2, {"findings": {}, "clean": {}})
+
+    def test_review_all_fires_checkpoint_with_full_snapshot(self):
+        finding = {"file": "bad.py", "line": 1, "severity": "high",
+                   "category": "bug", "title": "t", "problem": "p", "fix": "f"}
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
+        ff.review_file = (lambda rv, rel, text, context="":
+                          (([finding], "s") if rel == "bad.py" else ([], "s")))
+        seen = {}
+
+        def cb(ffs, clean, shas):
+            seen["ffs"], seen["clean"], seen["shas"] = ffs, clean, shas
+
+        class _R:
+            model = "m"
+        try:
+            ff._review_all([_R()], "/proj", ["bad.py", "ok.py"], workers=1,
+                           checkpoint_cb=cb)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(list(seen["ffs"]), ["bad.py"])
+        self.assertEqual(seen["shas"], {"bad.py": "sha-bad.py"})
+        self.assertEqual(seen["clean"], {"ok.py": "sha-ok.py"})
+
+    def test_converged_run_clears_resume_but_interrupted_keeps_it(self):
+        ff._save_resume_state("/proj", {"a.py": {"sha": "s", "findings": [{}]}}, {})
+        ff._brain_record_run("/proj", {"when": "now", "converged": False,
+                                       "defects": 1, "fixed": 0, "usd": 0.0})
+        self.assertIn("resume", ff._load_brain()["/proj"],
+                      "a non-converged run must keep its checkpoint")
+        ff._brain_record_run("/proj", {"when": "now", "converged": True,
+                                       "defects": 0, "fixed": 1, "usd": 0.0})
+        self.assertNotIn("resume", ff._load_brain()["/proj"],
+                         "a converged run has nothing to resume")
+
+    def test_interrupted_run_resumes_without_rebilling_review(self):
+        # End to end: run 1 completes clean; simulate an interruption checkpoint
+        # holding a completed review-with-findings for the (unchanged) file;
+        # run 2 must recover it - reporting the defect WITHOUT a single
+        # provider call - and still run as a real apply run.
+        helper = AuditPipelineIntegrationTests()
+        with helper._run_one({"app.py": "x = 1\n"},
+                             ("--no-purpose-gap", "--no-readiness")) as (res, root):
+            self.assertIsNone(res.get("error"))
+            key = res.get("dir") or root
+            sha = ff._file_sha_contained(key, "app.py")
+            self.assertTrue(sha)
+            finding = {"file": "app.py", "line": 1, "severity": "low",
+                       "category": "bug", "title": "resume-recovered finding",
+                       "problem": "p", "fix": "f"}
+            with ff._BRAIN_LOCK, ff._brain_file_lock():
+                brain = ff._load_brain()
+                rec = brain.get(key) or {}
+                rec.pop("clean_files", None)  # force re-enumeration of app.py
+                rec["resume"] = {"policy": ff.POLICY_VERSION, "tool": ff.TOOL_VERSION,
+                                 "when": "t",
+                                 "findings": {"app.py": {"sha": sha,
+                                                         "findings": [finding]}},
+                                 "clean": {}}
+                brain[key] = rec
+                ff._save_brain(brain)
+            args = helper._args(["prodready", "--program", root, "--no-bootstrap",
+                                 "--no-preflight", "--no-dashboard", "--no-tests",
+                                 "--no-e2e", "--no-full-suite", "--no-purpose-gap",
+                                 "--no-readiness"])
+            stub = _StubProvider()
+            with _patched(ff, "build_audit_providers",
+                          lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_full_gate",
+                          lambda d, s: (None, "(build stubbed offline in tests)")):
+                res2 = ff.audit_one_program(root, args, 0, 1, None)
+            self.assertIsNone(res2.get("error"), res2.get("error"))
+            self.assertEqual(res2.get("defects"), 1,
+                             "the recovered finding must reach the results")
+            self.assertEqual(stub.calls, [],
+                             "a recovered review must not be re-billed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

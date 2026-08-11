@@ -27,6 +27,11 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   build gate, cross-model veto, unit + e2e test generation, converges with
   `--until-clean`, hard `--max-cost` budget (default $50/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
+  **Resume is automatic**: every completed per-file review is checkpointed
+  (sha-keyed) as the sweep runs, and fixes commit per cycle - if a run dies
+  mid-flow (crash, Ctrl-C, credits), re-running the same command picks up
+  where it left off instead of re-paying for finished work. `--recheck`
+  discards the memory and starts fresh.
 
 ## Token economics (how cost is kept down)
 
