@@ -1,17 +1,24 @@
 # CLAUDE.md — FlexFactor
 
 Local dual-provider code tool: refactor / scout / audit. Single-file core
-(`flexfactor.py`, ~4.3k lines) + Tkinter dashboard + PowerShell launchers.
+(`flexfactor.py`, ~10k lines) + Tkinter dashboard + PowerShell launchers.
 No app deployment — "prod" = the desktop shortcuts working.
 
-## APPLY IS THE DEFAULT (owner order 2026-08-11) — read this first
+## EVERY RUN IS REAL (owner order 2026-08-11, stronger form) — read this first
 
 > "I will NEVER just 'review' with this program either."
+> "I do not want test runs as part of the app's functions. Each run must be for real."
 
-`audit` and `prodready` now default to `--apply`. A review must be asked for with
-`--report-only`/`--dry-run`, and a run that would review **without** having been
-asked **aborts before spending a cent** (`_assert_review_only_was_asked_for`).
-The rules this enforces, and the defect each one killed:
+The second order (later the same day) superseded the escape hatch the first one
+left open: `audit` and `prodready` no longer HAVE a review-only mode at all.
+`--report-only`/`--dry-run` were **removed from the audit/prodready CLI** (an
+invocation naming them fails argparse, exit 2, before anything runs or spends),
+`_assert_review_only_was_asked_for` was deleted (nothing left to assert — a
+resurrected copy would mean the mode crept back; `test_review_only_escape_hatch_no_longer_exists`
+guards this), and `audit_one_program` contains no `report_only` branch
+(`test_review_only_mode_is_gone_from_the_audit_pipeline` pins the absence).
+The offline pipeline tests now stub `_full_gate`/pass `--no-bootstrap` instead
+of riding a review mode. The surviving rules, and the defect each one killed:
 
 - **No TTY → APPLY, never review.** `_confirm_audit_apply` used to return False
   without a TTY, and `run_audit` turned that into a silent report-only run: the
@@ -21,7 +28,8 @@ The rules this enforces, and the defect each one killed:
   `isatty() == True`, and the piped-answers launcher EOFs after its last answer,
   so **EOFError also means "automation" and applies**. Only Ctrl-C or a human
   typing something other than `apply` cancels, and cancelling **aborts (exit 2)**
-  rather than degrading into a paid review.
+  rather than degrading into a paid review (there is nothing to degrade into —
+  the review mode no longer exists).
 - **Exit codes carry the truth.** `EXIT_APPLIED_NOTHING = 3`: an apply run that
   found defects and fixed none is no longer exit 0. Both retry supervisors read
   exit 0 as success, which is how a 6-hour no-op looked like a good night. The
@@ -31,9 +39,9 @@ The rules this enforces, and the defect each one killed:
   nothing was verified. It used to return `True` there, and `_commit_and_sync`
   merged+pushed to the default branch on the strength of it — every repo whose
   toolchain FlexFactor cannot drive shipped unverified. The merge gate is now
-  `final_ok is True`; `None` prints `merge+push REFUSED`. Report-only likewise
-  sets `baseline_ok = None`, not `True` (the report used to say "Baseline build:
-  passed" for a build that never ran).
+  `final_ok is True`; `None` prints `merge+push REFUSED`. A baseline with no
+  runnable build command is likewise `None`, not `True` (the report used to say
+  "Baseline build: passed" for a build that never ran).
 - **Scout is deliberately exempt.** `scout --apply` stays opt-in: the owner's own
   contract for Scout requires "proposal-only default; separate explicit
   FlexFactor apply approval". Never flip it to match audit.
@@ -175,8 +183,8 @@ Closes two silent-failure holes the audit had:
   `.rb` fix would be silently discarded. Guarded by `shutil.which` + `_run`'s
   own `flexfactor_launch_error` marker (covers policy-block/timeout/not-found).
 - `prodready` mode = audit with `--apply`, `--fix-severity medium`, readiness ON,
-  branch prefix `flexfactor/prodready-`. Explicit `--report-only`/`--dry-run`
-  still win — checked against RAW argv because they share a dest with `--apply`.
+  branch prefix `flexfactor/prodready-`. There is no review-only override:
+  `--report-only`/`--dry-run` were removed from audit/prodready outright.
 - **Dirty-tree walk-away (2026-08-10).** Prodready no longer faceplants on a
   dirty tree (the GrantFlow failure): `--snapshot-dirty` (default ON in prodready,
   OFF in audit) commits the pre-existing changes verbatim as the sandbox branch's
@@ -203,15 +211,19 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),
-  `ECONOMY_MODELS` (audit `--economy`: author = claude-sonnet-5 at $3/$15 vs
-  Opus 4.8's $5/$25, near-Opus code quality; launcher defaults economy ON),
+  `ECONOMY_MODELS` (`--economy`, accepted by EVERY mode - refactor, scout,
+  audit, prodready (owner feedback 2026-08-11: one flag, one meaning, every
+  mode): author = claude-sonnet-5 at $3/$15 vs Opus 4.8's $5/$25, near-Opus
+  code quality; launcher defaults economy ON),
   `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
   budget, default $50/program)
 - Providers: `AnthropicProvider` / `OpenAIProvider` / `OllamaProvider`
   (`complete`/`grade`/`structured`/`ping`). Ollama (2026-07-25, ULTRAPLAN
   1.2) = LOCAL-ONLY: refuses non-loopback `OLLAMA_BASE_URL` (fail closed),
   no egress gate (nothing leaves the machine), bills `ollama:<model>` ids at
-  $0 via the `MODEL_PRICING["ollama"]` prefix entry, and
+  $0 via the hardcoded `ollama:` prefix branch in `_price_for` (deliberately
+  NOT a `MODEL_PRICING` table entry — the generic separator rules must not
+  apply to it), and
   `build_audit_providers` never adds a cloud secondary when primary=ollama.
   Defaults: author `deepseek-coder:33b`, judge `llama3.2:latest`.
   FREE-FIRST PREFLIGHT FALLBACK (owner order 2026-08-11): when the chosen
@@ -231,7 +243,9 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   hunts residual/new/uncovered defects, and each `needs_work` verdict feeds the
   residual list back so the author re-fixes; loops until a genuinely CLEAN verdict
   or `--adversarial-rounds` (default 2) is hit (then reject+rollback). Fail-CLOSED:
-  a downed verifier accepts the fix but marks it `[unverified]` (never a clean pass).
+  a downed verifier means the candidate is ROLLED BACK to the exact pre-change
+  tree and rejected — never kept as an `[unverified]` success (Master Prompt
+  83/88; the CLI help and README state the same contract).
   If a candidate is WRITTEN but its rollback is REFUSED (any of the build-gate / veto /
   adversarial / budget paths), `_fix_files` raises `DirtyTreeError`; `audit_one_program`
   catches it, git-restores the file, and ABORTS the cycle WITHOUT committing (so an
@@ -244,7 +258,8 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   rejects only with a material residual still open. `--adversarial-materiality all`
   restores iterate-on-everything (default `material`). `_residual_is_material()` fail-safe:
   missing keys => material (never silently drop). All fail-closed invariants unchanged.
-  `MAX_REVIEW_BYTES` raised 300k->400k so flexfactor.py (now ~310k) stays reviewable.
+  `MAX_REVIEW_BYTES` is 600k (300k -> 400k -> 600k as flexfactor.py grew; it is
+  ~540k now — see the trap note above; `test_flexfactor_can_review_itself` guards).
 - `_fix_files` pipelines generation: `--fix-prefetch N` (default 3, 0=serial)
   first-attempt generations run in background threads while the current file is
   applied/gated/verified; retries + all tree writes/commits stay serial. Scout
@@ -304,6 +319,15 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
+- RESUME (owner order 2026-08-11, "there needs to be a resume"): `_review_all`
+  checkpoints every completed per-file review (sha-keyed) into the brain's
+  per-project `resume` record every 10 files + at sweep end
+  (`_save_resume_state`); `audit_one_program` recovers sha-matching entries at
+  start (`_load_resume_state`) - recovered clean files join the skip set,
+  recovered findings skip cycle-1 review and go straight to fixing. Cleared
+  only when a run CONVERGES (`_brain_record_run`); a cost-capped or crashed
+  run keeps it. `--recheck` ignores it. Policy-versioned like clean_files -
+  never trusted across a content or policy change.
 - Console progress: `ConsoleMeter` (2026-08-11, "no progress meter in option 4")
   draws ONE live status line fed from the same `report(**fields)` stream the
   dashboard uses, with a background tick so spinner/elapsed move during long
@@ -317,7 +341,8 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   back to main automatically. Still gated: merge only on a green final build,
   push `--force-with-lease` for the sandbox branch, protected mains fall back
   to a PR with auto-merge, conflicts abort cleanly. `--no-push`/`--no-merge`
-  (raw-argv checked) opt out; report-only runs never commit so it's inert there.
+  (raw-argv checked) opt out. Every audit/prodready run applies (review-only
+  removed 2026-08-11), so push+merge defaults are live on every run.
 
 ## Gotchas
 - **Launchers must stay ASCII** (PS 5.1 + no-BOM = CP1252; em-dashes break strings).

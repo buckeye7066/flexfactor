@@ -1,9 +1,9 @@
 # FlexFactor Audit launcher - double-click the icon, or drag a project folder /
 # .lnk / file / URL onto it. Goes straight into audit mode: a line-by-line
-# review that tests every function and every button. The SAFE DEFAULT is
-# report-only; choose "apply" to aggressively fix every defect it finds
-# (committing each verified cycle LOCALLY on the audit branch, no push). When
-# both API keys are present it runs TWO models (primary + cross-check).
+# review that fixes every defect it finds, committing each verified cycle on
+# the audit branch and merging+pushing green results automatically. EVERY RUN
+# IS REAL (owner order 2026-08-11): there is no report-only mode. When both
+# API keys are present it runs TWO models (primary + cross-check).
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -46,7 +46,7 @@ if ($programs.Count -eq 0) {
 $haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
 $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
 
-# extraArgs collects every optional flag we add below (report-only, merge, etc).
+# extraArgs collects every optional flag we add below (apply, economy, etc).
 $extraArgs = @()
 
 if ($haveAnthropic -and $haveOpenai) {
@@ -87,23 +87,14 @@ if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
 }
 $primary = $provider
 
-# Apply vs report-only. DEFAULT IS APPLY (owner order 2026-08-11: "I will NEVER
-# just 'review' with this program"). This prompt used to default to REPORT while
-# the other launcher's equivalent prompt defaulted to APPLY - two entry points
-# disagreeing about the most expensive decision in the tool was itself the trap.
-# Merge+push to the current branch/origin are CLI defaults, green-build gated.
-Write-Host "  NOTE: 'report' only REVIEWS. On a large repo that costs real money and" -ForegroundColor DarkGray
-Write-Host "  changes nothing (2026-08-11: 6h, 17.75 USD, 3464 defects found, 0 fixed)." -ForegroundColor DarkGray
-$apply = Read-Host "Apply fixes? [apply / report] (Enter = apply)"
-if ($apply -match '^(r|report)$') {
-    $extraArgs += "--report-only"
-    Write-Host "Report mode: findings only, no code changes. You asked for this explicitly." -ForegroundColor Yellow
-} else {
-    $extraArgs += "--apply"
-    $extraArgs += "--yes"
-    Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow
-    Write-Host "branch, and pushed to origin automatically (green-build gated)." -ForegroundColor Yellow
-}
+# Every run is REAL (owner order 2026-08-11, stronger form: "I do not want test
+# runs as part of the app's functions. Each run must be for real."). The CLI no
+# longer has --report-only/--dry-run for audit/prodready, so the old
+# apply-vs-report prompt is gone. Merge+push are CLI defaults, green-build gated.
+$extraArgs += "--apply"
+$extraArgs += "--yes"
+Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow
+Write-Host "branch, and pushed to origin automatically (green-build gated)." -ForegroundColor Yellow
 
 # Economy mode: author fixes/tests with Claude Sonnet 5 (about 40% cheaper than
 # Opus, near-Opus code quality; the build gate + cross-model veto still protect

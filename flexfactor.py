@@ -495,6 +495,11 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
             rec["clean_files"] = {"policy": POLICY_VERSION,
                                   "tool": TOOL_VERSION,
                                   "files": dict(clean_map)}
+        # A CONVERGED run has nothing left to resume; anything else (cost cap,
+        # interruption recorded later, incomplete review) keeps its checkpoint
+        # so the next run picks up where this one left off.
+        if summary.get("converged"):
+            rec.pop("resume", None)
         brain[project_dir] = rec
         # The top-level dict is keyed by project dir and would otherwise grow (and be
         # re-serialized) forever; keep the most recently audited projects only.
@@ -505,6 +510,47 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
             for stale in sorted(brain, key=_last_when)[: len(brain) - MAX_BRAIN_PROJECTS]:
                 del brain[stale]
         _save_brain(brain)
+
+
+def _load_resume_state(prior: dict) -> dict:
+    """Recover the mid-run review checkpoint left by an interrupted run.
+
+    Owner order 2026-08-11: "there needs to be a resume" - a run that dies
+    mid-flow (crash, Ctrl-C, power loss, credits) must not make the next run
+    re-pay for reviews that already completed. The checkpoint is sha-keyed per
+    file and policy-versioned, so nothing is ever trusted across a content
+    change or a review-policy change."""
+    rs = (prior or {}).get("resume")
+    if isinstance(rs, dict) and rs.get("policy") == POLICY_VERSION:
+        f = rs.get("findings")
+        c = rs.get("clean")
+        return {"findings": dict(f) if isinstance(f, dict) else {},
+                "clean": dict(c) if isinstance(c, dict) else {}}
+    return {"findings": {}, "clean": {}}
+
+
+def _save_resume_state(project_dir: str, findings_cache: dict, clean: dict) -> None:
+    """Persist the in-flight review state (atomic, best-effort - a failed
+    checkpoint must never break the run it is trying to protect).
+
+    `findings_cache` is {rel: {"sha": <reviewed sha>, "findings": [...]}} for
+    completed reviews that FOUND something; `clean` is {rel: sha} for completed
+    reviews that found nothing. Overwritten on every checkpoint so it always
+    reflects the latest completed work; cleared by _brain_record_run once a run
+    CONVERGES (a finished-clean program has nothing to resume)."""
+    try:
+        with _BRAIN_LOCK, _brain_file_lock():
+            brain = _load_brain()
+            rec = brain.get(project_dir) or {"history": [], "cumulative": {}}
+            rec["resume"] = {"policy": POLICY_VERSION, "tool": TOOL_VERSION,
+                             "when": _now_iso(),
+                             "findings": dict(findings_cache),
+                             "clean": dict(clean)}
+            brain[project_dir] = rec
+            _save_brain(brain)
+    except Exception:
+        pass  # checkpointing is protection, never a new failure mode
+
 
 
 # --------------------------------------------------------------------------- #
@@ -2670,7 +2716,13 @@ def run(args) -> int:
     # From here on, operate on the resolved path (a .lnk becomes its real target).
     args.file = resolved_path
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    # Same resolution rule as build_audit_providers: explicit --model wins,
+    # --economy routes authoring to the cheaper tier, else the default tier.
+    # One flag, one meaning, every mode - the owner should never have to
+    # remember which mode a cost switch belongs to.
+    model = (args.model
+             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
+             or DEFAULT_MODELS[args.provider])
     provider = make_provider(args.provider, model,
                              judge_model=getattr(args, "judge_model", None))
     print(f"FlexFactor | provider={args.provider} model={model} "
@@ -4424,7 +4476,11 @@ def _rmtree_force(path: str) -> None:
             os.chmod(p, stat.S_IWRITE)
             func(p)
     try:
-        shutil.rmtree(path, onexc=_onexc)
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_onexc)
+        else:
+            # onexc is 3.12+; onerror passes (func, path, exc_info) instead.
+            shutil.rmtree(path, onerror=lambda f, p, ei: _onexc(f, p, ei[1]))
     except OSError:
         shutil.rmtree(path, ignore_errors=True)  # best effort; temp dir
 
@@ -4575,7 +4631,9 @@ def run_scout(args) -> int:
                           file=sys.stderr)
                 return 2
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    model = (args.model
+             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
+             or DEFAULT_MODELS[args.provider])
     provider = make_provider(args.provider, model,
                              judge_model=getattr(args, "judge_model", None))
 
@@ -6629,12 +6687,16 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
         out["contract_source"] = getattr(contract, "source", None)
         if fp is not None:
             out["acceptance_coverage"] = fp.acceptance_coverage(contract, norm_gaps)
-            met = sum(1 for r in out["acceptance_coverage"] if r["met"])
+            # Only met-is-True counts: met=None means UNKNOWN (an unattributed
+            # whole-purpose gap is open), and unknown is never evidence of met.
+            met = sum(1 for r in out["acceptance_coverage"] if r["met"] is True)
+            unknown = sum(1 for r in out["acceptance_coverage"] if r["met"] is None)
             total = len(out["acceptance_coverage"])
             if total:
                 # Measured against the owner's criteria, not the model's mood.
                 out["fulfillment_pct"] = round(100.0 * met / total)
                 out["criteria_met"] = met
+                out["criteria_unknown"] = unknown
                 out["criteria_total"] = total
     else:
         out["authored"] = False
@@ -7407,7 +7469,8 @@ def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
                 workers: int = REVIEW_WORKERS,
-                context: str = "") -> tuple[dict, list, set, dict]:
+                context: str = "",
+                checkpoint_cb=None) -> tuple[dict, list, set, dict, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
@@ -7422,6 +7485,7 @@ def _review_all(reviewers: list, project_dir: str,
     unreadable: set[str] = set()          # contained read REFUSED (never mark clean)
     reviewed_clean: dict[str, str] = {}   # rel -> reviewed_sha (fully reviewed, empty)
     incomplete: set[str] = set()          # review aborted (budget/error) -> NOT clean
+    reviewed_sha: dict[str, str] = {}     # rel -> sha for completed reviews WITH findings
     total = len(files)
     lock = threading.Lock()
     done = {"n": 0}
@@ -7490,13 +7554,21 @@ def _review_all(reviewers: list, project_dir: str,
                     incomplete.add(rel)
                     print(f"  ({i}/{total}) {rel}: review INCOMPLETE (budget/error) - NOT clean")
                     continue
-                merged = payload            # 3-tuple: (rel, findings, reviewed_sha)
-                reviewed_sha = res[2]
+                merged = payload            # 3-tuple: (rel, findings, sha-as-reviewed)
                 if merged:
                     file_findings[rel] = merged
                     flat.extend(merged)
+                    reviewed_sha[rel] = res[2]
                 else:
-                    reviewed_clean[rel] = reviewed_sha  # fully reviewed, empty -> clean allowlist
+                    reviewed_clean[rel] = res[2]  # fully reviewed, empty -> clean allowlist
+                # RESUME checkpoint: persist completed reviews every 10 files so
+                # a crash mid-sweep loses at most the last few paid calls.
+                if checkpoint_cb is not None and done["n"] % 10 == 0:
+                    try:
+                        checkpoint_cb(dict(file_findings), dict(reviewed_clean),
+                                      dict(reviewed_sha))
+                    except Exception:
+                        pass  # checkpointing must never break the sweep
                 sev_counts: dict[str, int] = {}
                 for f in merged:
                     sev_counts[f.get("severity", "?")] = sev_counts.get(f.get("severity", "?"), 0) + 1
@@ -7519,7 +7591,12 @@ def _review_all(reviewers: list, project_dir: str,
     if incomplete:
         print(f"  [warn] {len(incomplete)} file(s) had an INCOMPLETE review "
               "(budget/error) - NOT marked clean, will be re-reviewed")
-    return file_findings, flat, unreadable, reviewed_clean
+    if checkpoint_cb is not None:
+        try:
+            checkpoint_cb(dict(file_findings), dict(reviewed_clean), dict(reviewed_sha))
+        except Exception:
+            pass
+    return file_findings, flat, unreadable, reviewed_clean, incomplete
 
 
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
@@ -8181,6 +8258,44 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 if cur is not None and cur == sha:
                     prior_clean[rel] = sha
                     clean_files.add(rel.replace("\\", "/"))
+        # RESUME (owner order 2026-08-11: "there needs to be a resume"). An
+        # interrupted run checkpoints every completed per-file review into the
+        # brain; recover them here so re-running the same command picks up
+        # where the run died instead of re-paying for finished reviews. Every
+        # entry is sha-verified against the file's CURRENT contained read -
+        # anything changed since it was reviewed is dropped and re-reviewed.
+        # --recheck opts out (same switch as the clean-file memory).
+        resume_findings: dict[str, list[dict]] = {}
+        resume_cache: dict[str, dict] = {}   # rel -> {"sha","findings"} carried forward
+        if not getattr(args, "recheck", False):
+            _rs = _load_resume_state(prior)
+            stale = 0
+            for rel, sha in (_rs.get("clean") or {}).items():
+                key = str(rel).replace("\\", "/")
+                if key in clean_files:
+                    continue
+                cur = _file_sha_contained(project_dir, rel)
+                if cur is not None and cur == sha:
+                    prior_clean[key] = sha
+                    clean_files.add(key)
+                else:
+                    stale += 1
+            for rel, entry in (_rs.get("findings") or {}).items():
+                sha = (entry or {}).get("sha")
+                found = (entry or {}).get("findings")
+                cur = _file_sha_contained(project_dir, rel)
+                if sha and isinstance(found, list) and found and cur == sha:
+                    key = str(rel).replace("\\", "/")
+                    resume_findings[key] = found
+                    resume_cache[key] = {"sha": sha, "findings": found}
+                else:
+                    stale += 1
+            if resume_findings or stale:
+                print(f"{pfx}Resume: recovered {len(resume_findings)} completed "
+                      "review(s) with findings from the interrupted run "
+                      "(sha-verified, not re-billed)"
+                      + (f"; {stale} stale entr{'y' if stale == 1 else 'ies'} "
+                         "dropped for re-review" if stale else "") + ".")
         if prior.get("last_run"):
             lr = prior["last_run"]
             cum = prior.get("cumulative") or {}
@@ -8205,9 +8320,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = "package.json unreadable (containment) - refused to audit"
             return result
         git = _is_git_repo(project_dir)
-        # report-only / dry-run review the code and report, but never modify, branch,
-        # or commit. Decided up front so the sandbox setup below stays non-mutating.
-        report_only = not args.apply or args.dry_run
 
         # Purpose context: the program's own metadata (README, package metadata,
         # file tree) travels with every per-file review so defects are judged
@@ -8272,8 +8384,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    state) preserves it verbatim as the branch's first commit; otherwise
         #    hard-stop, because `git add -A` below would silently commit owner WIP
         #    as FlexFactor's work.
-        tree_dirty = (git and not args.dry_run and not report_only
-                      and not _git_tree_clean(project_dir))
+        tree_dirty = git and not _git_tree_clean(project_dir)
         snapshot_mode = bool(getattr(args, "snapshot_dirty", False))
         if tree_dirty and not args.allow_dirty and not snapshot_mode:
             print(f"{pfx}error: working tree isn't clean. Commit/stash, pass --allow-dirty, "
@@ -8286,7 +8397,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         branch = (args.branch_prefix + _slugify(display_name)) if git else None
         result["branch"] = branch
         created_branch = False
-        if git and not args.dry_run and not report_only:
+        if git:
             r = _git(["checkout", "-B", branch], project_dir)
             if r.returncode != 0:
                 print(f"{pfx}error: could not create audit branch {branch}: {_tail(r.stderr, 5)}",
@@ -8336,8 +8447,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
-        # In report/dry-run no fix is ever gated, so the (often slow + costly) project
-        # build is pure waste there - skip it and report straight away.
         # 2b. BOOTSTRAP: install the project's own dependencies so the baseline
         #     build below measures the CODE, not a missing node_modules/venv. On an
         #     un-bootstrapped checkout the baseline gate fails for a reason that has
@@ -8345,7 +8454,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     syntax-only and flagged 'unverified', and the run finishes having
         #     verified nothing. Installing first is what makes the gate mean anything.
         bootstrap_results = []
-        if not report_only and getattr(args, "bootstrap", True):
+        if getattr(args, "bootstrap", True):
             report(phase="installing dependencies (bootstrap)")
             bootstrap_results = _run_bootstrap_phase(
                 project_dir, stack, pfx, allow_scripts=getattr(args, "allow_scripts", False))
@@ -8362,24 +8471,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         result["bootstrap"] = [
             {"cmd": " ".join(s.cmd), "cwd": s.cwd, "ok": s.ok} for s in bootstrap_results]
 
-        if report_only:
-            # None, not True. A skipped build is UNVERIFIED, and saying "passed"
-            # for a command that never ran is the overclaim this run is supposed
-            # to be free of - the markdown report read "Baseline build: passed"
-            # for every report-only audit ever produced.
-            baseline_ok = None
-            print(f"{pfx}report-only/dry-run: baseline build NOT RUN (nothing to gate).")
-        else:
-            report(phase="baseline build gate")
-            baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (None, "")
-            if baseline_ok is False:
-                print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
-                      "and flagged 'unverified'. The audit still runs.")
-            if not stack.get("verification_is_real", True):
-                # Say it out loud. _full_gate returns True when it has no commands,
-                # which reads as a pass; without this line the run would report a
-                # green build it never performed.
-                print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
+        report(phase="baseline build gate")
+        baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (None, "")
+        if baseline_ok is False:
+            print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
+                  "and flagged 'unverified'. The audit still runs.")
+        if not stack.get("verification_is_real", True):
+            # Say it out loud. _full_gate returns True when it has no commands,
+            # which reads as a pass; without this line the run would report a
+            # green build it never performed.
+            print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
 
         # The file LIST is enumerated once; each cycle RE-READS contents (which the
         # previous cycle's committed fixes have changed). max_files=0 covers the
@@ -8421,6 +8522,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         total_to_review = len(files)
         cycles_run = 0
         errors_total = 0
+        review_incomplete: set[str] = set()  # last sweep's failed-review files
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
@@ -8440,10 +8542,35 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
-            file_findings, flat, unreadable, reviewed_clean = _review_all(
-                reviewers, project_dir, files, report=report, meter=meter, soft_cap_usd=soft,
+            def _resume_checkpoint(ffs: dict, sweep_clean: dict, shas: dict,
+                                   _cycle=cycle):
+                # Persist completed reviews mid-flight so a crash resumes
+                # instead of re-paying. Carries forward the still-valid
+                # recovered entries plus everything this run proved clean.
+                cache = dict(resume_cache)
+                for rel, fl in ffs.items():
+                    if rel in shas:
+                        cache[rel] = {"sha": shas[rel], "findings": fl}
+                clean_now = dict(prior_clean)
+                clean_now.update(run_clean_sha)
+                clean_now.update(sweep_clean)
+                _save_resume_state(project_dir, cache, clean_now)
+
+            sweep_files = files
+            if cycle == 1 and resume_findings:
+                skip = set(resume_findings)
+                sweep_files = [f for f in files if f not in skip]
+            file_findings, flat, unreadable, reviewed_clean, review_incomplete = _review_all(
+                reviewers, project_dir, sweep_files, report=report, meter=meter, soft_cap_usd=soft,
                 workers=getattr(args, "review_workers", REVIEW_WORKERS),
-                context=purpose_blob)
+                context=purpose_blob, checkpoint_cb=_resume_checkpoint)
+            if cycle == 1 and resume_findings:
+                # Recovered reviews join the sweep's results exactly as if they
+                # had been reviewed this cycle (they were - by the interrupted
+                # run, against the same bytes).
+                for rel, fl in resume_findings.items():
+                    file_findings.setdefault(rel, fl)
+                    flat.extend(fl)
             # A file the contained read REFUSED is never clean and never auto-fixed:
             # set it aside for manual review (a swapped symlink / fail-closed platform).
             for rel in unreadable:
@@ -8454,10 +8581,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Found {len(flat)} defect(s) across {len(file_findings)} file(s).")
             report(defects=len(flat), severity=_severity_breakdown(flat),
                    phase=f"fixing (cycle {cycle}/{cycle_cap})")
-
-            if report_only:
-                stop_reason = "report-only"
-                break  # report-only / dry-run: review once, change nothing
 
             # Hard cost cap: if we're already over budget, don't start fixing.
             if meter.over_limit():
@@ -8489,7 +8612,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             done_set |= run_clean  # clean files count as resolved (cumulative)
             report(fix_done=len(done_set), fix_total=total_to_review)
             if not fixable_files:
-                if manual_review:
+                if review_incomplete:
+                    # "Nothing to fix" is UNPROVEN: files whose review errored
+                    # out (provider outage / budget) were never inspected, so a
+                    # sweep of failed reviews must not read as a clean converge.
+                    # This is the 3,464-defects-fixed-0-exit-0 invisibility all
+                    # over again, one layer down - kill it here.
+                    print(f"{pfx}NOT converged: {len(review_incomplete)} file(s) "
+                          "never got a completed review (provider error/budget); "
+                          "'nothing to fix' is unproven. Re-run to retry them.")
+                    stop_reason = (f"review incomplete: {len(review_incomplete)} "
+                                   "file(s) never got a completed review "
+                                   "(provider error/budget) - NOT clean")
+                    converged = False
+                elif manual_review:
                     print(f"{pfx}STOP: {len(manual_review)} file(s) still flag critical/high after "
                           f"{MAX_FIX_ATTEMPTS} attempts - set aside for manual review (no infinite loop)")
                     stop_reason = (f"converged except {len(manual_review)} file(s) needing manual "
@@ -8511,7 +8647,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # Commit+push+merge progress mid-cycle so an interruption (e.g.
                 # credits running out) can't lose this cycle's accumulated fixes.
                 nonlocal committed_any
-                if git and not args.dry_run:
+                if git:
                     s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                          f"cycle {_c} checkpoint", stack)
                     if "committed" in s:  # a real commit landed on the branch
@@ -8523,7 +8659,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     author, cross, project_dir, cycle_findings, stack, baseline_ok, args,
                     meter=meter, oversized=oversized, report=report, err_base=errors_total,
                     done_set=done_set, total_overall=total_to_review,
-                    commit_cb=(_checkpoint if (git and not args.dry_run) else None),
+                    commit_cb=(_checkpoint if git else None),
                     adversarial=getattr(args, "adversarial", True),
                     adversarial_rounds=getattr(args, "adversarial_rounds", 2),
                     materiality=getattr(args, "adversarial_materiality", "material"))
@@ -8536,7 +8672,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # `dirty_abort` skips the post-loop test/e2e commits).
                 dirty_abort = True
                 for df in dte.files:
-                    if git and not args.dry_run:
+                    if git:
                         _git(["checkout", "--", df], project_dir)
                 msg = ("dirty-abort: a refused rollback left an unverified candidate on "
                        f"disk ({', '.join(dte.files)}); NOT committing this cycle")
@@ -8643,9 +8779,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             pct = purpose_gap.get("fulfillment_pct")
             gaps_before = [dict(g) for g in gaps]
             if purpose_gap.get("criteria_total"):
+                unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
                       f"{purpose_gap['criteria_total']} of the owner's acceptance "
-                      f"criteria met ({pct}%) - {len(gaps)} gap(s) to close")
+                      f"criteria met ({pct}%)"
+                      + (f", {unk} UNKNOWN (whole-purpose gaps open)" if unk else "")
+                      + f" - {len(gaps)} gap(s) to close")
             else:
                 print(f"{pfx}Purpose fulfillment (INFERRED purpose, not the owner's "
                       f"contract): {pct if pct is not None else '?'}% - {len(gaps)} gap(s)")
@@ -8659,7 +8798,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # purpose is a guess and a guess should not drive a low-severity
             # rewrite spree.
             bridgeable: list[tuple[str, dict]] = []
-            if not report_only and not meter.over_limit():
+            if not meter.over_limit():
                 for g in gaps:
                     rel = str(g.get("file") or "").replace("\\", "/")
                     if not (g.get("code_fixable") and rel):
@@ -8698,7 +8837,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     bridged_files = sorted(set(applied_g))
                     applied_files = sorted(applied_set)
                     unverified_files = sorted(unverified_set)
-                    if git and not args.dry_run and applied_g:
+                    if git and applied_g:
                         status = _commit_and_sync(project_dir, branch, prev_branch, args,
                                                   "purpose-gap bridge", stack)
                         if "committed" in status:
@@ -8710,7 +8849,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # and NEVER commit it.
                     dirty_abort = True
                     for df in dte.files:
-                        if git and not args.dry_run:
+                        if git:
                             _git(["checkout", "--", df], project_dir)
                     msg = ("dirty-abort during purpose-gap bridge: refused rollback left "
                            f"an unverified candidate on disk ({', '.join(dte.files)}); "
@@ -8725,8 +8864,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # movement against the contract, computed from what actually landed.
             _fp = _purpose_module()
             if _fp is not None:
+                # A gap is only "closed" when the fix for its file APPLIED and
+                # was VERIFIED - an [unverified] apply (verifier down / build
+                # not runnable) is not evidence the gap is gone.
+                verified_bridged = set(bridged_files) - set(unverified_set)
                 closed = [g.get("title") for rel, g in bridgeable
-                          if rel in set(bridged_files)]
+                          if rel in verified_bridged]
                 purpose_gap["progress"] = _fp.gap_progress(gaps_before, closed)
                 prog = purpose_gap["progress"]
                 print(f"{pfx}Purpose progress: closed {prog['gaps_closed']}/"
@@ -8737,7 +8880,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 5. Generate + run unit tests (test each function). Failures are real defects.
         test_files: list[str] = []
         test_status = None
-        if args.tests and stack.get("test_cmd") and not report_only and not dirty_abort:
+        if args.tests and stack.get("test_cmd") and not dirty_abort:
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
                 text, read_status = _classify_source_read(project_dir, rel)
@@ -8791,7 +8934,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 6. Drive every button (Playwright) in the live-like sandbox. The lock keeps
         #    one program driving Playwright at a time; the port keeps dev servers apart.
         e2e = {"ran": False, "ok": None, "log": "", "spec_files": []}
-        if args.e2e and not report_only and not dirty_abort:
+        if args.e2e and not dirty_abort:
             print(f"{pfx}Button/UI testing (Playwright)...")
             lock = _E2E_LOCK if total > 1 else None
             try:
@@ -8811,7 +8954,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         suite_status = None
         suite_log = ""
         suite_cmd = stack.get("full_suite_cmd")
-        if getattr(args, "full_suite", True) and suite_cmd and not report_only:
+        if getattr(args, "full_suite", True) and suite_cmd:
             if suite_cmd == stack.get("test_cmd") and test_status is not None:
                 suite_status = test_status  # already ran it as the unit-test step
                 print(f"{pfx}full suite ({' '.join(suite_cmd)}): reusing unit-test result "
@@ -8840,13 +8983,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             report(phase="readiness scorecard")
             print(f"{pfx}Assessing production readiness ...")
             final_build = None
-            if not report_only:
-                if stack.get("verify_cmds") or stack.get("fast_verify"):
-                    final_build, _ = _full_gate(project_dir, stack)
-                # A vacuous gate (no commands) must stay None = "not evaluated",
-                # never True. _full_gate cannot make that distinction; we can.
-                if not stack.get("verification_is_real", False):
-                    final_build = None
+            if stack.get("verify_cmds") or stack.get("fast_verify"):
+                final_build, _ = _full_gate(project_dir, stack)
+            # A vacuous gate (no commands) must stay None = "not evaluated",
+            # never True. _full_gate cannot make that distinction; we can.
+            if not stack.get("verification_is_real", False):
+                final_build = None
             tests_ok = suite_status if suite_status is not None else test_status
             readiness = _assess_readiness_phase(
                 project_dir, stack, display_name, build_ok=final_build,
@@ -8883,8 +9025,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         if not git:
             commit_status = "no-git"
-        elif args.dry_run:
-            commit_status = "dry-run"
         elif dirty_abort:
             # A refused rollback aborted the run mid-cycle. The audit branch may hold
             # VERIFIED checkpoint (or prior-cycle) commits, so it must NEVER be treated
@@ -8960,6 +9100,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "verification_note": stack.get("verification_note", ""),
             "purpose_gap": purpose_gap, "bridged_files": bridged_files,
             "purpose_contract": result.get("purpose_contract"),
+            "review_incomplete": len(review_incomplete),
         }
         _print_audit_summary(audit)
         print(f"{pfx}Low/info issues catalogued (not auto-fixed): {len(low_findings)}")
@@ -8968,7 +9109,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         print(f"{pfx}Full audit report: {report_path}")
         manifest_path = _write_run_manifest(
             project_dir, audit,
-            report_only=report_only,
             max_cost=float(getattr(args, "max_cost", 0) or 0))
         if manifest_path:
             print(f"{pfx}Run manifest: {manifest_path}")
@@ -8991,7 +9131,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_fulfillment_pct=(purpose_gap or {}).get("fulfillment_pct"),
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
+            review_incomplete=len(review_incomplete),
         )
+        # EVERY review failed and nothing was fixed: the run proved nothing at
+        # all. That is an ERROR (exit 1, supervisors may retry a transient
+        # provider outage), never a quiet success.
+        if (review_incomplete and not applied_files
+                and len(review_incomplete) >= total_to_review > 0):
+            result["error"] = (f"review never completed for any of the "
+                               f"{total_to_review} file(s) (provider errors/"
+                               "budget); nothing was reviewed, proven, or fixed")
         # Remember what we did this run so a future audit can recall it - including
         # the clean-file set so the NEXT run skips them and gets smaller.
         _brain_record_run(project_dir, {
@@ -9015,7 +9164,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # the tree is clean (never carry uncommitted state across a checkout).
         # dirty_abort keeps its parked state on purpose (owner must inspect).
         if (git and created_branch and prev_branch and prev_branch != branch
-                and not args.dry_run and not dirty_abort
+                and not dirty_abort
                 and _git_current_branch(project_dir) == branch
                 and _git_tree_clean(project_dir)):
             back = _git(["checkout", prev_branch], project_dir)
@@ -9086,8 +9235,7 @@ def _confirm_audit_apply(args, programs) -> bool:
     print("!" * 70)
     if not sys.stdin or not sys.stdin.isatty():
         print("Non-interactive session (no TTY): proceeding with APPLY. FlexFactor "
-              "never silently degrades to review-only - pass --report-only if a "
-              "review is genuinely what you want.")
+              "has no review-only mode - every run is a real apply run.")
         return True
     try:
         resp = input("Type 'apply' to proceed, anything else to CANCEL the run: ").strip().lower()
@@ -9106,31 +9254,6 @@ def _confirm_audit_apply(args, programs) -> bool:
     return resp == "apply"
 
 
-def _assert_review_only_was_asked_for(args) -> None:
-    """A run that will not apply anything must have been ASKED for, in writing.
-
-    Owner order 2026-08-11: "no run may spend real money on review-only output -
-    if it would, it aborts." Reviewing a large repo costs real dollars ($17.75 on
-    GrantFlow) and produces nothing but a markdown file, so arriving in
-    report-only mode by accident is now fatal rather than merely expensive.
-
-    `args.explicit_report_only` is set at parse time from the RAW argv, because
-    `--apply` and `--report-only` share a dest and the parsed value cannot tell
-    "left at its default" from "explicitly turned off".
-    """
-    if getattr(args, "apply", False) or getattr(args, "dry_run", False):
-        return
-    if getattr(args, "explicit_report_only", False):
-        return
-    raise SystemExit(
-        "FlexFactor refuses to start: this run would REVIEW without applying "
-        "anything, and nobody asked it to.\n"
-        "Reviewing a large repository costs real money and produces no fix "
-        "(2026-08-11: 6 hours, $17.75, 3,464 defects found, 0 fixed).\n"
-        "Apply is the default. Pass --report-only (or --dry-run) if a review is "
-        "genuinely what you want.")
-
-
 def run_audit(args) -> int:
     # 1. Validate the program list (1..5).
     programs = list(args.program or [])
@@ -9144,16 +9267,13 @@ def run_audit(args) -> int:
     # Declining ABORTS. It used to set args.apply = False, i.e. quietly spend
     # hours and real money producing a review the owner did not ask for - the
     # exact defect behind the $17.75 GrantFlow run. Cancel means cancel.
-    if getattr(args, "apply", False) and not getattr(args, "dry_run", False):
-        if not _confirm_audit_apply(args, programs):
-            print("Apply cancelled by the operator - nothing was reviewed, changed, "
-                  "or spent. (Pass --report-only if you actually want a review.)",
-                  file=sys.stderr)
-            return 2
-
-    # A review costs real money. If this run is NOT going to apply anything, the
-    # operator must have said so explicitly, and must have accepted the spend.
-    _assert_review_only_was_asked_for(args)
+    # Owner order 2026-08-11 (stronger form): there IS no review-only mode any
+    # more - every audit/prodready run is a real apply run, so the confirmation
+    # below is the only gate between "invoked" and "mutating".
+    if not _confirm_audit_apply(args, programs):
+        print("Apply cancelled by the operator - nothing was reviewed, changed, "
+              "or spent.", file=sys.stderr)
+        return 2
 
     # Start fresh dashboard state and (optionally) launch the live graph window.
     _PROGRESS.reset()
@@ -9185,8 +9305,9 @@ def run_audit(args) -> int:
         batch_path = _write_batch_report(results)
         print(f"\nCombined batch report: {batch_path}")
 
-    return _audit_exit_code(results, apply_requested=bool(getattr(args, "apply", False))
-                            and not getattr(args, "dry_run", False))
+    # Every run is an apply run now (review-only was removed outright), so the
+    # applied-nothing exit-code contract applies unconditionally.
+    return _audit_exit_code(results, apply_requested=True)
 
 
 #: Exit code for "the run completed, applied nothing, and was supposed to apply".
@@ -9209,7 +9330,9 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     # "Applied nothing" means no file fixed AND no defects were found to fix.
     # A genuinely clean repo (0 defects) legitimately applies nothing.
     barren = [r for r in results
-              if not r.get("fixed") and (r.get("defects") or 0) > 0]
+              if not r.get("fixed")
+              and ((r.get("defects") or 0) > 0
+                   or (r.get("review_incomplete") or 0) > 0)]
     if barren:
         names = ", ".join(str(r.get("name")) for r in barren)
         print(f"\nFAILED: apply mode fixed NOTHING in {len(barren)} program(s) "
@@ -9299,7 +9422,8 @@ def _release_status(a: dict) -> tuple[str | None, list[str]]:
                                 else "fail" if e2e.get("ran") else "unknown"),
         "defects_resolved": ("fail" if (sev & {"critical", "high"}) else
                              "pass" if a.get("findings") is not None
-                             and not (sev & {"critical", "high"}) else "unknown"),
+                             and not (sev & {"critical", "high"})
+                             and not a.get("review_incomplete") else "unknown"),
         "tests_pass": ("pass" if (suite is True or (suite is None and tests is True))
                        else "fail" if (suite is False or tests is False) else "unknown"),
         "merged": "pass" if merged else "unknown",
@@ -9364,7 +9488,7 @@ def _print_audit_summary(a: dict) -> None:
 
 
 def _write_run_manifest(project_dir: str, a: dict, *,
-                        report_only: bool, max_cost: float) -> str | None:
+                        max_cost: float) -> str | None:
     """Immutable JSON evidence for one audit/apply run (Master Prompt 86/90).
 
     Written once at end-of-run next to the markdown report. Captures mode,
@@ -9389,8 +9513,11 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "program": a.get("name"),
         "project_dir": a.get("dir"),
         "branch": a.get("branch"),
-        "mode": "report-only" if report_only else "apply",
-        "report_only": bool(report_only),
+        # Review-only was removed outright (owner order 2026-08-11: "each run
+        # must be for real"), so every manifest records a real apply run. The
+        # key is kept so older manifest consumers keep parsing.
+        "mode": "apply",
+        "report_only": False,
         "max_cost_usd": float(max_cost),
         "usd_spent": a.get("usd"),
         "providers": list(a.get("providers") or []),
@@ -9433,8 +9560,8 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          f"- **Files fixed:** {len(a['applied_files'])}"
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
             if a['unverified_files'] else ""),
-         # Tri-state. None = the build never ran (report-only, or no build
-         # command exists), which is NOT a pass and must never read like one.
+         # Tri-state. None = the build never ran (no build command exists),
+         # which is NOT a pass and must never read like one.
          f"- **Baseline build:** {'passed' if a['baseline_ok'] is True else 'NOT RUN (unverified)' if a['baseline_ok'] is None else 'FAILED'}",
          f"- **Unit tests added:** {len(a['test_files'])} "
          f"(suite {'passed' if a['test_status'] else 'FAILED' if a['test_status'] is False else 'not run'})",
@@ -9512,8 +9639,17 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
             L += ["### Acceptance criteria (the owner's, verbatim)", "",
                   "| # | Met | Criterion | Blocked by |", "|---|---|---|---|"]
             for row in cov:
-                blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
-                L.append(f"| {row['index']} | {'yes' if row['met'] else 'NO'} | "
+                met = row.get("met")
+                if met is None:
+                    # No gap names this criterion, but whole-purpose gaps are
+                    # open - "met" would be an overclaim.
+                    label = "UNKNOWN"
+                    blockers = (f"— ({row.get('unattributed_gaps', 0)} "
+                                "whole-purpose gap(s) open)")
+                else:
+                    label = "yes" if met else "NO"
+                    blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
+                L.append(f"| {row['index']} | {label} | "
                          f"{row['criterion']} | {blockers} |")
             L.append("")
             L += ["### Gaps", ""]
@@ -9784,6 +9920,10 @@ def main(argv=None) -> int:
         parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+        parser.add_argument("--economy", action="store_true", dest="economy",
+                            help="Cheapest-credits mode, same switch as audit/prodready: author "
+                                 "integrations with claude-sonnet-5 instead of the Opus tier. "
+                                 "--model overrides this; no-op on providers with no economy tier.")
         parser.add_argument("--judge-model", default=None, dest="judge_model",
                             help="Cheap model for judging calls (profile/benefit). "
                                  "Default: the provider's small tier. Pass the author model id to disable tiering.")
@@ -9987,20 +10127,18 @@ def main(argv=None) -> int:
                             help="Only review paths containing this substring (repeatable).")
         parser.add_argument("--exclude", action="append", default=[],
                             help="Skip paths containing this substring (repeatable).")
-        # DEFAULT: APPLY. Owner order 2026-08-11 - "I will NEVER just 'review'
-        # with this program". Fixing the code is the whole product; a review is
-        # a special request that costs money and delivers nothing, so it now
-        # takes an explicit flag. The old report-only default is what let a
-        # launcher, a schtask, or a missing --yes turn a 6-hour run into an
-        # expensive no-op.
+        # EVERY RUN IS REAL. Owner order 2026-08-11 (second, stronger form):
+        # "I do not want test runs as part of the app's functions. Each run
+        # must be for real." Audit and prodready no longer HAVE a review-only
+        # mode - --report-only/--dry-run were removed outright, so a run that
+        # would review without applying cannot even be requested. (Scout keeps
+        # its separate proposal-only contract; that is a different mode with
+        # its own owner-approved apply gate.)
         parser.add_argument("--apply", action="store_true", dest="apply", default=True,
-                            help="Create the branch and commit fixes (default: ON). "
-                                 "Prompts for confirmation on a TTY unless --yes; "
-                                 "non-interactive sessions apply without prompting.")
-        parser.add_argument("--report-only", action="store_false", dest="apply",
-                            help="Review and report, change nothing. NOT the default - "
-                                 "a review costs money and fixes nothing, so it must be "
-                                 "asked for explicitly.")
+                            help="Create the branch and commit fixes (always ON; kept for "
+                                 "launcher compatibility). Prompts for confirmation on a "
+                                 "TTY unless --yes; non-interactive sessions apply "
+                                 "without prompting.")
         parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
                             help="Skip the interactive confirmation for --apply (for automation).")
         parser.add_argument("--no-tests", action="store_false", dest="tests",
@@ -10036,26 +10174,8 @@ def main(argv=None) -> int:
                                  "and continue, instead of refusing to run. Default: on "
                                  "in prodready (walk-away must not stop for this), off "
                                  "in audit.")
-        parser.add_argument("--dry-run", action="store_true", dest="dry_run",
-                            help="Review + report only; create no branch and change no files.")
         _add_egress_args(parser)
         args = parser.parse_args(rest)
-        # Did the operator ASK for a review? `--apply`/`--report-only` share a
-        # dest, so only the raw argv can distinguish "left at the default" from
-        # "explicitly turned off". Prefix matching is honored too (argparse
-        # accepts `--report`, `--dry`), because an abbreviation is still an
-        # explicit request and must not be overridden back to apply.
-        def _asked(*full: str) -> bool:
-            for tok in rest:
-                head = tok.split("=", 1)[0]
-                if not head.startswith("--") or len(head) < 4:
-                    continue
-                for f in full:
-                    if f.startswith(head):
-                        return True
-            return False
-
-        args.explicit_report_only = _asked("--report-only", "--dry-run")
         if args.snapshot_dirty is None:
             args.snapshot_dirty = _prod
         if args.readiness is None:
@@ -10065,15 +10185,9 @@ def main(argv=None) -> int:
             # flags below are the ones an owner would otherwise have to know to
             # set; each is still overridable because argparse already parsed any
             # explicit value, and we only override the ones left at their audit
-            # default. Applying fixes is the POINT of the mode, so --apply is
-            # implied - but an explicit --report-only/--dry-run must still win.
-            # `--apply` and `--report-only` share a dest, so the PARSED value
-            # cannot distinguish "left at its default" from "explicitly turned
-            # off"; the raw argv can, so ask that instead. `_asked` also honors
-            # argparse's prefix matching - `--report` used to set apply=False in
-            # argparse and then get silently overridden back to True here.
-            if not args.explicit_report_only:
-                args.apply = True
+            # default. Applying fixes is the POINT of the mode (and of audit
+            # too, since review-only was removed outright).
+            args.apply = True
             if args.fix_severity == "high":
                 # Production readiness means medium defects get fixed too; the
                 # build gate + adversarial verify still guard every one of them.
@@ -10106,6 +10220,10 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                         help="LLM backend (default: anthropic).")
     parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+    parser.add_argument("--economy", action="store_true", dest="economy",
+                        help="Cheapest-credits mode, same switch as audit/prodready: author the "
+                             "rewrite with claude-sonnet-5 instead of the Opus tier. --model "
+                             "overrides this; no-op on providers with no economy tier.")
     parser.add_argument("--judge-model", default=None, dest="judge_model",
                         help="Cheap model used for grading reps. Default: the provider's small tier. "
                              "Pass the author model id to grade with the same model that rewrites.")

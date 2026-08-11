@@ -452,6 +452,14 @@ def acceptance_coverage(contract: PurposeContract, gaps: list[dict]) -> list[dic
     This is the thing that makes the output purpose-derived. A generic linter
     cannot produce this table because it has no idea what the criteria are.
     """
+    # UNATTRIBUTED gaps (acceptance_ref None - the model was told to emit 0
+    # when a gap blocks the purpose but no single numbered criterion, and
+    # normalize_gap maps 0/out-of-range to None) block the PURPOSE as a whole.
+    # A criterion with no attributed gap is therefore only provably met when
+    # there are also no unattributed gaps in play; otherwise it is UNKNOWN
+    # (met=None). "Unevaluated is not evidence of safety" - without this, six
+    # critical whole-purpose gaps used to score as 100% of criteria met.
+    unattributed = [g for g in gaps if g.get("acceptance_ref") is None]
     rows = []
     for i, crit in enumerate(contract.acceptance_criteria, 1):
         blocking = [g for g in gaps if g.get("acceptance_ref") == i]
@@ -464,8 +472,9 @@ def acceptance_coverage(contract: PurposeContract, gaps: list[dict]) -> list[dic
         rows.append({
             "index": i,
             "criterion": crit,
-            "met": not blocking,
+            "met": (False if blocking else (None if unattributed else True)),
             "blocking_gaps": len(blocking),
+            "unattributed_gaps": len(unattributed),
             "worst_severity": worst[1] if worst else None,
             "gap_titles": [g.get("title") for g in blocking],
         })

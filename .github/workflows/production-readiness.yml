@@ -16,6 +16,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install pinned provider SDKs (PaidFallbackRescueTests import them)
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
       - name: Run FlexFactor suite
         shell: pwsh
         run: |
@@ -30,6 +35,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install pinned provider SDKs (PaidFallbackRescueTests import them)
+        run: |
+          python -m pip install -r requirements.txt
       - name: Containment capability probe
         run: |
           python - <<'PY'

@@ -985,27 +985,48 @@ class AuditApplyDefaultTests(unittest.TestCase):
         finally:
             ff.run_audit = real
         self.assertTrue(cap["args"].apply,
-                        "bare `audit` must APPLY - review-only is opt-in now")
-        self.assertFalse(cap["args"].explicit_report_only)
+                        "bare `audit` must APPLY - there is no review-only mode")
         # Owner directive 2026-08-11: push defaults ON (ship results to main).
         self.assertTrue(cap["args"].push)
 
-    def test_report_only_flag_is_honored_and_recorded_as_explicit(self):
+    def test_review_only_flags_are_rejected_outright(self):
+        # Owner order 2026-08-11 (stronger form): "I do not want test runs as
+        # part of the app's functions. Each run must be for real." Audit and
+        # prodready no longer HAVE the flags, so argparse must refuse the whole
+        # invocation (exit 2) before anything runs or spends.
+        import contextlib
+        import io
         for argv in (["audit", "--program", "x", "--report-only"],
                      ["audit", "--program", "x", "--dry-run"],
-                     # argparse prefix matching: an abbreviation is still explicit
-                     # and must NOT be overridden back to apply.
-                     ["prodready", "--program", "x", "--report"]):
+                     ["prodready", "--program", "x", "--report-only"],
+                     ["prodready", "--program", "x", "--dry-run"]):
             real = ff.run_audit
-            cap = {}
-            ff.run_audit = lambda a: cap.setdefault("args", a) or 0
+            called = {}
+            ff.run_audit = lambda a: called.setdefault("ran", True) or 0
             try:
-                ff.main(list(argv))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit, msg=argv) as cm:
+                        ff.main(list(argv))
+                self.assertEqual(cm.exception.code, 2, argv)
+                self.assertNotIn("ran", called, argv)
             finally:
                 ff.run_audit = real
-            self.assertTrue(cap["args"].explicit_report_only, argv)
-            if "--dry-run" not in argv:
-                self.assertFalse(cap["args"].apply, argv)
+
+    def test_scout_keeps_its_proposal_only_flags(self):
+        # Scout is governed by the owner's OTHER standing order: proposal-only
+        # default with a separate explicit apply approval. Removing audit's
+        # review-only mode must not touch scout's flags.
+        real = ff.run_scout
+        cap = {}
+        ff.run_scout = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--report-only"])
+            self.assertFalse(cap["args"].apply)
+            cap.clear()
+            ff.main(["scout", "--program", "x", "--dry-run"])
+            self.assertTrue(cap["args"].dry_run)
+        finally:
+            ff.run_scout = real
 
     def test_prodready_bare_applies(self):
         real = ff.run_audit
@@ -1029,17 +1050,18 @@ class AuditApplyDefaultTests(unittest.TestCase):
         self.assertTrue(cap["args"].apply)
         self.assertTrue(cap["args"].assume_yes)
 
-    def test_report_only_gate_pinned_in_production_code(self):
-        # Pin the PRODUCTION gate, not a locally recreated boolean: the exact
-        # report-only expression must exist in audit_one_program and must guard
-        # the mutating steps (branch creation / commit / tests / e2e). If the
-        # gate is renamed or removed, this fails.
+    def test_review_only_mode_is_gone_from_the_audit_pipeline(self):
+        # Pin the REMOVAL: audit_one_program must contain no report-only gate
+        # at all (every run is a real apply run), and run_audit must hardwire
+        # apply_requested=True into the exit-code contract.
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("report_only = not args.apply or args.dry_run", src)
-        self.assertGreaterEqual(src.count("not report_only"), 3,
-                                "report_only must guard multiple mutating steps")
-        self.assertIn("if report_only", src)
+        self.assertNotIn("report_only", src,
+                         "review-only mode must stay removed from the pipeline")
+        self.assertNotIn("args.dry_run", src)
+        run_src = inspect.getsource(ff.run_audit)
+        self.assertIn("apply_requested=True", run_src)
+        self.assertNotIn("_assert_review_only_was_asked_for", run_src)
 
 
 class TopLevelHelpTests(unittest.TestCase):
@@ -2728,7 +2750,7 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: None
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2740,7 +2762,7 @@ class ReviewUnreadableNotCleanTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("", "emptysha")
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [], "/proj", ["x.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2830,7 +2852,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         # files are dropped and NONE end up in the clean allowlist.
         m = ff.CostMeter(limit_usd=0.01)
         m.record("claude-opus-4-8", input_tokens=1_000_000)  # push well over the cap
-        ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+        ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
             [], "/proj", ["a.py", "b.py", "c.py"], meter=m, workers=2)
         self.assertEqual(reviewed_clean, {})  # nothing reviewed -> nothing clean
         self.assertEqual(unreadable, set())
@@ -2841,7 +2863,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         real_rf = ff.review_file
         ff.review_file = lambda reviewer, rel, text, context="": ([], "")  # no findings, COMPLETES
         try:
-            _, _, unreadable, reviewed_clean = ff._review_all(
+            _, _, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py", "b.py"], workers=2)
         finally:
             ff._read_text_and_sha = real
@@ -2860,7 +2882,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
 
         ff.review_file = boom
         try:
-            ffindings, flat, unreadable, reviewed_clean = ff._review_all(
+            ffindings, flat, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
@@ -2878,7 +2900,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
 
         ff.review_file = budget
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["a.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["a.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -3116,7 +3138,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         real_rf = ff.review_file
         ff.review_file = lambda reviewer, rel, text, context="": (ran.append(rel) or ([], ""))
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -3133,7 +3155,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
 
         ff.review_file = boom
         try:
-            _, _, _, reviewed_clean = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
+            _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
             ff._read_text_and_sha = real
             ff.review_file = real_rf
@@ -4016,8 +4038,8 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         def review_all(*a, **k):
             review_once["n"] += 1
             if review_once["n"] == 1:
-                return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {})
-            return ({}, [], set(), {})  # converge on later cycles
+                return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {}, set())
+            return ({}, [], set(), {}, set())  # converge on later cycles
 
         class _Prog:
             def update(self, *a, **k):
@@ -4148,7 +4170,7 @@ class RunManifestTests(unittest.TestCase):
             "providers": ["anthropic:m"], "fix_notes": [],
             "verification_is_real": True, "verification_note": "",
         }
-        path = ff._write_run_manifest(tmp, audit, report_only=False, max_cost=50.0)
+        path = ff._write_run_manifest(tmp, audit, max_cost=50.0)
         self.assertTrue(path and os.path.isfile(path))
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -4159,7 +4181,7 @@ class RunManifestTests(unittest.TestCase):
         self.assertEqual(data["applied_files"], ["a.py"])
         self.assertEqual(data["commit_status"], "committed")
         # Timestamped name: a second write must not overwrite the first.
-        path2 = ff._write_run_manifest(tmp, audit, report_only=True, max_cost=10.0)
+        path2 = ff._write_run_manifest(tmp, audit, max_cost=10.0)
         self.assertNotEqual(path, path2)
         self.assertTrue(os.path.isfile(path))
         self.assertTrue(os.path.isfile(path2))
@@ -6211,9 +6233,10 @@ class ProdreadyModeTests(unittest.TestCase):
             return 0
 
         with _patched(ff, "run_audit", fake_run_audit):
-            ff.main(["prodready", "--program", ".", "--no-readiness", "--report-only"])
+            ff.main(["prodready", "--program", ".", "--no-readiness"])
         self.assertFalse(captured["readiness"])
-        self.assertFalse(captured["apply"])
+        self.assertTrue(captured["apply"],
+                        "apply cannot be turned off any more - every run is real")
 
     def test_bootstrap_flags_exist_with_safe_defaults(self):
         captured = {}
@@ -6276,12 +6299,18 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
         deleted the tree, so every on-disk assertion failed against a path that
         had genuinely existed a moment earlier.)"""
         with _RepoFixture(files) as root:
-            args = self._args(["prodready", "--program", root, "--report-only",
+            args = self._args(["prodready", "--program", root, "--no-bootstrap",
                                "--no-preflight", "--no-dashboard", "--no-tests",
                                "--no-e2e", "--no-full-suite", *argv_extra])
             stub = _StubProvider()
+            # Review-only is gone, so keep these pipeline tests offline the
+            # honest way: skip dependency installs (--no-bootstrap) and stub
+            # the build gate to "never ran" (None) - exactly what a machine
+            # with no toolchain would report.
             with _patched(ff, "build_audit_providers",
-                          lambda a, m=None: [("stub", stub)]):
+                          lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_full_gate",
+                          lambda d, s: (None, "(build stubbed offline in tests)")):
                 res = ff.audit_one_program(root, args, 0, 1, None)
             yield res, root
 
@@ -6326,8 +6355,8 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertFalse(stack["verification_is_real"])
             self.assertIn("no build system", stack["verification_note"])
 
-    def test_report_only_skips_bootstrap(self):
-        # Report-only changes nothing, so it must not run installs either.
+    def test_no_bootstrap_flag_skips_installs(self):
+        # --no-bootstrap must keep the run from installing anything.
         with self._run_one({"package.json":
                             '{"dependencies":{"left-pad":"1.0.0"}}'}) as (res, _r):
             self.assertEqual(res.get("bootstrap"), [])
@@ -7471,7 +7500,7 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
             "_snapshot_dirty_tree": fake_snapshot,
             "_restore_dirty_snapshot": fake_restore,
             "_enumerate_source_files": lambda *a, **k: ["a.py"],
-            "_review_all": lambda *a, **k: ({}, [], set(), {}),
+            "_review_all": lambda *a, **k: ({}, [], set(), {}, set()),
             "_full_gate": lambda pd, st: (True, ""),
             "_fix_files": default_fix,
             "_commit_and_sync": lambda *a, **k: "cycle 1: nothing to commit",
@@ -7942,6 +7971,18 @@ class _FakeMsg:
         self.usage = None
 
 
+# The provider SDKs are OPTIONAL extras (imported lazily; one key is enough to
+# run), so tests that reach the real `import anthropic` / `import openai` in
+# _paid_client() / _openai_rescue_provider() must SKIP - not error - on a
+# machine without them. CI installs requirements.txt, so these still run there.
+_HAS_ANTHROPIC_SDK = importlib.util.find_spec("anthropic") is not None
+_HAS_OPENAI_SDK = importlib.util.find_spec("openai") is not None
+_needs_anthropic_sdk = unittest.skipUnless(
+    _HAS_ANTHROPIC_SDK, "anthropic SDK not installed (optional extra)")
+_needs_openai_sdk = unittest.skipUnless(
+    _HAS_OPENAI_SDK, "openai SDK not installed (optional extra)")
+
+
 class PaidFallbackRescueTests(unittest.TestCase):
     """Owner order 2026-08-10 evening: the free FCC proxy stays PRIMARY; the
     real Anthropic/OpenAI keys (handed over as FLEXFACTOR_FALLBACK_*) exist
@@ -8004,6 +8045,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertFalse(ff._fallback_hold_active(), "hold must expire so free is re-probed")
 
     # ---- escalation ----
+    @_needs_anthropic_sdk
     def test_deadline_hang_rescues_via_paid_anthropic_and_arms_hold(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()
@@ -8033,6 +8075,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertTrue(all(c is not prov.client for c in calls),
                         "during the hold window the wedged free path must not be probed")
 
+    @_needs_anthropic_sdk
     def test_exhausted_retries_rescue_via_paid_anthropic(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()
@@ -8063,6 +8106,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
                 model="claude-haiku-4-5", max_tokens=100, system=[],
                 messages=[{"role": "user", "content": "x"}], fmt={})
 
+    @_needs_anthropic_sdk
     def test_structured_delegates_to_openai_when_anthropic_tier_fails(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
@@ -8111,6 +8155,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertEqual(seen["model"], ff.DEFAULT_MODELS["openai"],
                          "an author-tier call must map to the OpenAI author tier")
 
+    @_needs_anthropic_sdk
     def test_garbage_output_rescues_when_keys_present(self):
         # A STALE free backend returning prose instead of JSON is exactly the
         # "stales" case the owner named: the paid tier must take the call.
@@ -8129,6 +8174,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
             messages=[{"role": "user", "content": "x"}], fmt={})
         self.assertIs(out, paid_msg)
 
+    @_needs_openai_sdk
     def test_openai_rescue_builds_with_blanked_env_key(self):
         # Live-caught 2026-08-10: OpenAIProvider.__init__ constructs the client
         # from the env var, which free mode BLANKS - and the SDK raises on a
@@ -8151,6 +8197,7 @@ class PaidFallbackRescueTests(unittest.TestCase):
             else:
                 os.environ["OPENAI_API_KEY"] = saved
 
+    @_needs_anthropic_sdk
     def test_paid_client_ignores_proxy_env(self):
         os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = "sk-ant-test"
         prov = self._provider()
@@ -8567,8 +8614,8 @@ class NeverReviewOnlyTests(unittest.TestCase):
 
     def _args(self, **kw):
         import argparse
-        a = argparse.Namespace(apply=True, dry_run=False, assume_yes=False,
-                               explicit_report_only=False, branch_prefix="flexfactor/audit-",
+        a = argparse.Namespace(apply=True, assume_yes=False,
+                               branch_prefix="flexfactor/audit-",
                                push=True, merge=True)
         for k, v in kw.items():
             setattr(a, k, v)
@@ -8649,15 +8696,12 @@ class NeverReviewOnlyTests(unittest.TestCase):
                          "declining must never downgrade to report-only")
         self.assertIn("return 2", src)
 
-    def test_review_only_must_be_asked_for_explicitly(self):
-        with self.assertRaises(SystemExit) as cm:
-            ff._assert_review_only_was_asked_for(
-                self._args(apply=False, explicit_report_only=False))
-        self.assertIn("refuses to start", str(cm.exception))
-        # ... but an explicit request is honored.
-        ff._assert_review_only_was_asked_for(
-            self._args(apply=False, explicit_report_only=True))
-        ff._assert_review_only_was_asked_for(self._args(apply=True))
+    def test_review_only_escape_hatch_no_longer_exists(self):
+        # The 2026-08-11 stronger order removed review-only outright, so the
+        # "was a review asked for?" assertion has nothing left to assert and
+        # must be GONE - a resurrected copy would mean the mode crept back.
+        self.assertFalse(hasattr(ff, "_assert_review_only_was_asked_for"),
+                         "review-only was removed; the gate must not return")
 
 
 class VacuousGateTests(unittest.TestCase):
@@ -8677,12 +8721,13 @@ class VacuousGateTests(unittest.TestCase):
                       "(no build command) auto-merged unverified work to main")
         self.assertIn("merge+push REFUSED", src)
 
-    def test_report_only_baseline_is_not_claimed_as_passed(self):
+    def test_unrunnable_baseline_is_not_claimed_as_passed(self):
+        # No build command -> tri-state None (unverified), never a pass.
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("baseline_ok = None", src)
+        self.assertIn('else (None, "")', src)
         self.assertNotIn("baseline_ok = True", src,
-                         "a skipped build is unverified, not a pass")
+                         "a build that never ran is unverified, not a pass")
 
     def test_report_renders_unverified_baseline_honestly(self):
         import tempfile
@@ -8719,9 +8764,12 @@ class ApplyExitCodeTests(unittest.TestCase):
         results = [{"name": "A", "error": None, "defects": 0, "fixed": 0}]
         self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
 
-    def test_report_only_run_is_not_penalised(self):
-        results = [{"name": "A", "error": None, "defects": 99, "fixed": 0}]
-        self.assertEqual(ff._audit_exit_code(results, apply_requested=False), 0)
+    def test_run_audit_always_requests_apply(self):
+        # Review-only is gone, so the applied-nothing exit contract applies to
+        # every run; run_audit must hardwire apply_requested=True.
+        import inspect
+        self.assertIn("apply_requested=True",
+                      inspect.getsource(ff.run_audit))
 
     def test_hard_error_still_wins(self):
         results = [{"name": "A", "error": "boom", "defects": 0, "fixed": 0}]
@@ -9065,6 +9113,262 @@ class StatusVocabularyTests(unittest.TestCase):
              "suite_status": True, "test_status": True, "baseline_ok": True}
         status, _ = ff._release_status(a)
         self.assertNotEqual(status, "PRODUCTION READY")
+
+
+# =========================================================================== #
+# 2026-08-11 defect-hunt regressions: three truth inversions on uncovered paths.
+# =========================================================================== #
+
+class UnattributedGapHonestyTests(unittest.TestCase):
+    """Defect: the gap schema tells the model to emit acceptance_ref=0 for a
+    whole-purpose gap; normalize_gap maps 0 to None; acceptance_coverage only
+    counted ATTRIBUTED gaps as blocking - so six critical unattributed gaps
+    scored as '4/4 criteria met (100%)'. Unknown is not met."""
+
+    def _contract(self):
+        return fp.PurposeContract(
+            name="Demo", slug="demo", purpose="do the thing", authored=True,
+            acceptance_criteria=["c1", "c2", "c3", "c4"])
+
+    def test_unattributed_gaps_make_unblocked_criteria_unknown_not_met(self):
+        gaps = [fp.normalize_gap({"title": f"g{i}", "severity": "critical",
+                                  "acceptance_ref": 0}, 4) for i in range(6)]
+        rows = fp.acceptance_coverage(self._contract(), gaps)
+        self.assertTrue(all(r["met"] is None for r in rows),
+                        "criteria cannot be 'met' while whole-purpose gaps are open")
+        self.assertTrue(all(r["unattributed_gaps"] == 6 for r in rows))
+
+    def test_attributed_gap_still_blocks_and_clean_contract_is_met(self):
+        gaps = [fp.normalize_gap({"title": "g", "severity": "high",
+                                  "acceptance_ref": 2}, 4)]
+        rows = fp.acceptance_coverage(self._contract(), gaps)
+        self.assertIs(rows[1]["met"], False)
+        # No unattributed gaps: the other criteria are provably unblocked.
+        self.assertTrue(all(r["met"] is True for i, r in enumerate(rows) if i != 1))
+        self.assertTrue(all(r["met"] is True
+                            for r in fp.acceptance_coverage(self._contract(), [])))
+
+    def test_fulfillment_pct_counts_only_proven_met(self):
+        # assess_purpose_gap overwrites the model pct with met/total; unknown
+        # criteria must not count as met, so all-unattributed -> 0%, never 100%.
+        data = {"purpose": "p", "fulfillment_pct": 100,
+                "gaps": [{"title": f"g{i}", "severity": "critical",
+                          "acceptance_ref": 0, "code_fixable": False,
+                          "file": "", "fix_instructions": ""} for i in range(6)]}
+
+        class _P:
+            model = "m"
+            def structured(self, *a, **k):
+                return data
+
+        out = ff.assess_purpose_gap(_P(), "blob", [], [], contract=self._contract())
+        self.assertEqual(out["fulfillment_pct"], 0)
+        self.assertEqual(out["criteria_met"], 0)
+        self.assertEqual(out["criteria_unknown"], 4)
+        self.assertEqual(len(out["gaps"]), 6)
+
+
+class ReviewIncompleteHonestyTests(unittest.TestCase):
+    """Defect: _review_all tracked files whose review ERRORED but never
+    returned them, so a sweep where every review failed converged as CLEAN and
+    exited 0 - the 3,464-found-0-fixed invisibility one layer down."""
+
+    def test_review_all_returns_the_incomplete_set(self):
+        class _Boom:
+            model = "m"
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: ("x = 1\n", "sha1")
+        ff.review_file = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+        try:
+            ffs, flat, unreadable, clean, incomplete = ff._review_all(
+                [_Boom()], "/proj", ["a.py", "b.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(incomplete, {"a.py", "b.py"})
+        self.assertEqual(clean, {})
+        self.assertEqual(ffs, {})
+
+    def test_exit_code_treats_unreviewed_nothing_fixed_as_failure(self):
+        results = [{"name": "A", "error": None, "defects": 0, "fixed": 0,
+                    "review_incomplete": 12}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True),
+                         ff.EXIT_APPLIED_NOTHING)
+        # A genuinely clean, fully reviewed repo still exits 0.
+        results = [{"name": "A", "error": None, "defects": 0, "fixed": 0,
+                    "review_incomplete": 0}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
+
+    def test_incomplete_sweep_cannot_converge(self):
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("if review_incomplete:", src)
+        self.assertIn("review incomplete:", src)
+
+    def test_release_status_defects_resolved_needs_complete_review(self):
+        # "defects_resolved: pass" may only be claimed when every file's review
+        # actually completed - unreviewed files are not evidence of resolution.
+        import inspect
+        self.assertIn('and not a.get("review_incomplete")',
+                      inspect.getsource(ff._release_status))
+
+
+class GapClosureVerifiedOnlyTests(unittest.TestCase):
+    """Defect: gap closure counted every gap on an APPLIED file, including
+    [unverified] applies (verifier down). Only a verified fix closes a gap."""
+
+    def test_closed_titles_exclude_unverified_files(self):
+        import inspect
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("verified_bridged = set(bridged_files) - set(unverified_set)",
+                      src)
+        self.assertIn("if rel in verified_bridged", src)
+
+
+class ResumeCheckpointTests(unittest.TestCase):
+    """Owner order 2026-08-11: "Is there a 'resume' button...? If not, there
+    needs to be." An interrupted run checkpoints every completed per-file
+    review (sha-keyed) into the brain; re-running the same command recovers
+    them instead of re-paying. Fix commits already survive via per-cycle
+    commits - this covers the REVIEW side, which used to be lost entirely."""
+
+    def setUp(self):
+        # BRAIN_PATH is already redirected to a temp dir at import; make each
+        # test start from an empty brain anyway.
+        with contextlib.suppress(OSError):
+            os.remove(ff.BRAIN_PATH)
+
+    def test_save_load_roundtrip_and_policy_guard(self):
+        ff._save_resume_state("/proj", {"a.py": {"sha": "s1", "findings": [{"t": 1}]}},
+                              {"b.py": "s2"})
+        prior = ff._load_brain().get("/proj") or {}
+        rs = ff._load_resume_state(prior)
+        self.assertEqual(rs["findings"]["a.py"]["sha"], "s1")
+        self.assertEqual(rs["clean"], {"b.py": "s2"})
+        # A checkpoint written under a DIFFERENT policy version is never
+        # trusted (the review rules changed; the cached verdicts may not hold).
+        prior2 = json.loads(json.dumps(prior))
+        prior2["resume"]["policy"] = "some-older-policy"
+        rs2 = ff._load_resume_state(prior2)
+        self.assertEqual(rs2, {"findings": {}, "clean": {}})
+
+    def test_review_all_fires_checkpoint_with_full_snapshot(self):
+        finding = {"file": "bad.py", "line": 1, "severity": "high",
+                   "category": "bug", "title": "t", "problem": "p", "fix": "f"}
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
+        ff.review_file = (lambda rv, rel, text, context="":
+                          (([finding], "s") if rel == "bad.py" else ([], "s")))
+        seen = {}
+
+        def cb(ffs, clean, shas):
+            seen["ffs"], seen["clean"], seen["shas"] = ffs, clean, shas
+
+        class _R:
+            model = "m"
+        try:
+            ff._review_all([_R()], "/proj", ["bad.py", "ok.py"], workers=1,
+                           checkpoint_cb=cb)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(list(seen["ffs"]), ["bad.py"])
+        self.assertEqual(seen["shas"], {"bad.py": "sha-bad.py"})
+        self.assertEqual(seen["clean"], {"ok.py": "sha-ok.py"})
+
+    def test_converged_run_clears_resume_but_interrupted_keeps_it(self):
+        ff._save_resume_state("/proj", {"a.py": {"sha": "s", "findings": [{}]}}, {})
+        ff._brain_record_run("/proj", {"when": "now", "converged": False,
+                                       "defects": 1, "fixed": 0, "usd": 0.0})
+        self.assertIn("resume", ff._load_brain()["/proj"],
+                      "a non-converged run must keep its checkpoint")
+        ff._brain_record_run("/proj", {"when": "now", "converged": True,
+                                       "defects": 0, "fixed": 1, "usd": 0.0})
+        self.assertNotIn("resume", ff._load_brain()["/proj"],
+                         "a converged run has nothing to resume")
+
+    def test_interrupted_run_resumes_without_rebilling_review(self):
+        # End to end: run 1 completes clean; simulate an interruption checkpoint
+        # holding a completed review-with-findings for the (unchanged) file;
+        # run 2 must recover it - reporting the defect WITHOUT a single
+        # provider call - and still run as a real apply run.
+        helper = AuditPipelineIntegrationTests()
+        with helper._run_one({"app.py": "x = 1\n"},
+                             ("--no-purpose-gap", "--no-readiness")) as (res, root):
+            self.assertIsNone(res.get("error"))
+            key = res.get("dir") or root
+            sha = ff._file_sha_contained(key, "app.py")
+            self.assertTrue(sha)
+            finding = {"file": "app.py", "line": 1, "severity": "low",
+                       "category": "bug", "title": "resume-recovered finding",
+                       "problem": "p", "fix": "f"}
+            with ff._BRAIN_LOCK, ff._brain_file_lock():
+                brain = ff._load_brain()
+                rec = brain.get(key) or {}
+                rec.pop("clean_files", None)  # force re-enumeration of app.py
+                rec["resume"] = {"policy": ff.POLICY_VERSION, "tool": ff.TOOL_VERSION,
+                                 "when": "t",
+                                 "findings": {"app.py": {"sha": sha,
+                                                         "findings": [finding]}},
+                                 "clean": {}}
+                brain[key] = rec
+                ff._save_brain(brain)
+            args = helper._args(["prodready", "--program", root, "--no-bootstrap",
+                                 "--no-preflight", "--no-dashboard", "--no-tests",
+                                 "--no-e2e", "--no-full-suite", "--no-purpose-gap",
+                                 "--no-readiness"])
+            stub = _StubProvider()
+            with _patched(ff, "build_audit_providers",
+                          lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_full_gate",
+                          lambda d, s: (None, "(build stubbed offline in tests)")):
+                res2 = ff.audit_one_program(root, args, 0, 1, None)
+            self.assertIsNone(res2.get("error"), res2.get("error"))
+            self.assertEqual(res2.get("defects"), 1,
+                             "the recovered finding must reach the results")
+            self.assertEqual(stub.calls, [],
+                             "a recovered review must not be re-billed")
+
+
+class EconomyFlagUniformityTests(unittest.TestCase):
+    """Owner feedback 2026-08-11: a cost switch that works in audit but errors
+    in refactor is a trap, not a design - one flag, one meaning, every mode."""
+
+    def test_refactor_accepts_economy_and_picks_the_economy_tier(self):
+        cap = {}
+        real = ff.run
+        ff.run = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["--file", "x.py", "--goal", "g", "--economy"])
+        finally:
+            ff.run = real
+        a = cap["args"]
+        self.assertTrue(a.economy)
+        # The resolution rule mirrors build_audit_providers: --model wins,
+        # else economy tier, else default.
+        resolved = (a.model
+                    or (ff.ECONOMY_MODELS.get(a.provider) if a.economy else None)
+                    or ff.DEFAULT_MODELS[a.provider])
+        self.assertEqual(resolved, ff.ECONOMY_MODELS["anthropic"])
+
+    def test_run_model_resolution_is_pinned_in_source(self):
+        import inspect
+        self.assertIn('ECONOMY_MODELS.get(args.provider)',
+                      inspect.getsource(ff.run))
+        self.assertIn('ECONOMY_MODELS.get(args.provider)',
+                      inspect.getsource(ff.run_scout))
+
+    def test_scout_accepts_economy(self):
+        cap = {}
+        real = ff.run_scout
+        ff.run_scout = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--economy"])
+        finally:
+            ff.run_scout = real
+        self.assertTrue(cap["args"].economy)
 
 
 if __name__ == "__main__":
