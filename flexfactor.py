@@ -8209,9 +8209,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = "package.json unreadable (containment) - refused to audit"
             return result
         git = _is_git_repo(project_dir)
-        # report-only / dry-run review the code and report, but never modify, branch,
-        # or commit. Decided up front so the sandbox setup below stays non-mutating.
-        report_only = not args.apply or args.dry_run
 
         # Purpose context: the program's own metadata (README, package metadata,
         # file tree) travels with every per-file review so defects are judged
@@ -8276,8 +8273,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    state) preserves it verbatim as the branch's first commit; otherwise
         #    hard-stop, because `git add -A` below would silently commit owner WIP
         #    as FlexFactor's work.
-        tree_dirty = (git and not args.dry_run and not report_only
-                      and not _git_tree_clean(project_dir))
+        tree_dirty = git and not _git_tree_clean(project_dir)
         snapshot_mode = bool(getattr(args, "snapshot_dirty", False))
         if tree_dirty and not args.allow_dirty and not snapshot_mode:
             print(f"{pfx}error: working tree isn't clean. Commit/stash, pass --allow-dirty, "
@@ -8290,7 +8286,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         branch = (args.branch_prefix + _slugify(display_name)) if git else None
         result["branch"] = branch
         created_branch = False
-        if git and not args.dry_run and not report_only:
+        if git:
             r = _git(["checkout", "-B", branch], project_dir)
             if r.returncode != 0:
                 print(f"{pfx}error: could not create audit branch {branch}: {_tail(r.stderr, 5)}",
@@ -8340,8 +8336,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
-        # In report/dry-run no fix is ever gated, so the (often slow + costly) project
-        # build is pure waste there - skip it and report straight away.
         # 2b. BOOTSTRAP: install the project's own dependencies so the baseline
         #     build below measures the CODE, not a missing node_modules/venv. On an
         #     un-bootstrapped checkout the baseline gate fails for a reason that has
@@ -8349,7 +8343,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     syntax-only and flagged 'unverified', and the run finishes having
         #     verified nothing. Installing first is what makes the gate mean anything.
         bootstrap_results = []
-        if not report_only and getattr(args, "bootstrap", True):
+        if getattr(args, "bootstrap", True):
             report(phase="installing dependencies (bootstrap)")
             bootstrap_results = _run_bootstrap_phase(
                 project_dir, stack, pfx, allow_scripts=getattr(args, "allow_scripts", False))
@@ -8366,24 +8360,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         result["bootstrap"] = [
             {"cmd": " ".join(s.cmd), "cwd": s.cwd, "ok": s.ok} for s in bootstrap_results]
 
-        if report_only:
-            # None, not True. A skipped build is UNVERIFIED, and saying "passed"
-            # for a command that never ran is the overclaim this run is supposed
-            # to be free of - the markdown report read "Baseline build: passed"
-            # for every report-only audit ever produced.
-            baseline_ok = None
-            print(f"{pfx}report-only/dry-run: baseline build NOT RUN (nothing to gate).")
-        else:
-            report(phase="baseline build gate")
-            baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (None, "")
-            if baseline_ok is False:
-                print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
-                      "and flagged 'unverified'. The audit still runs.")
-            if not stack.get("verification_is_real", True):
-                # Say it out loud. _full_gate returns True when it has no commands,
-                # which reads as a pass; without this line the run would report a
-                # green build it never performed.
-                print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
+        report(phase="baseline build gate")
+        baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (None, "")
+        if baseline_ok is False:
+            print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
+                  "and flagged 'unverified'. The audit still runs.")
+        if not stack.get("verification_is_real", True):
+            # Say it out loud. _full_gate returns True when it has no commands,
+            # which reads as a pass; without this line the run would report a
+            # green build it never performed.
+            print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
 
         # The file LIST is enumerated once; each cycle RE-READS contents (which the
         # previous cycle's committed fixes have changed). max_files=0 covers the
@@ -8459,10 +8445,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             report(defects=len(flat), severity=_severity_breakdown(flat),
                    phase=f"fixing (cycle {cycle}/{cycle_cap})")
 
-            if report_only:
-                stop_reason = "report-only"
-                break  # report-only / dry-run: review once, change nothing
-
             # Hard cost cap: if we're already over budget, don't start fixing.
             if meter.over_limit():
                 print(f"{pfx}cost cap reached before fixing ({meter.summary()}); stopping.")
@@ -8515,7 +8497,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # Commit+push+merge progress mid-cycle so an interruption (e.g.
                 # credits running out) can't lose this cycle's accumulated fixes.
                 nonlocal committed_any
-                if git and not args.dry_run:
+                if git:
                     s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                          f"cycle {_c} checkpoint", stack)
                     if "committed" in s:  # a real commit landed on the branch
@@ -8527,7 +8509,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     author, cross, project_dir, cycle_findings, stack, baseline_ok, args,
                     meter=meter, oversized=oversized, report=report, err_base=errors_total,
                     done_set=done_set, total_overall=total_to_review,
-                    commit_cb=(_checkpoint if (git and not args.dry_run) else None),
+                    commit_cb=(_checkpoint if git else None),
                     adversarial=getattr(args, "adversarial", True),
                     adversarial_rounds=getattr(args, "adversarial_rounds", 2),
                     materiality=getattr(args, "adversarial_materiality", "material"))
@@ -8540,7 +8522,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # `dirty_abort` skips the post-loop test/e2e commits).
                 dirty_abort = True
                 for df in dte.files:
-                    if git and not args.dry_run:
+                    if git:
                         _git(["checkout", "--", df], project_dir)
                 msg = ("dirty-abort: a refused rollback left an unverified candidate on "
                        f"disk ({', '.join(dte.files)}); NOT committing this cycle")
@@ -8663,7 +8645,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # purpose is a guess and a guess should not drive a low-severity
             # rewrite spree.
             bridgeable: list[tuple[str, dict]] = []
-            if not report_only and not meter.over_limit():
+            if not meter.over_limit():
                 for g in gaps:
                     rel = str(g.get("file") or "").replace("\\", "/")
                     if not (g.get("code_fixable") and rel):
@@ -8702,7 +8684,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     bridged_files = sorted(set(applied_g))
                     applied_files = sorted(applied_set)
                     unverified_files = sorted(unverified_set)
-                    if git and not args.dry_run and applied_g:
+                    if git and applied_g:
                         status = _commit_and_sync(project_dir, branch, prev_branch, args,
                                                   "purpose-gap bridge", stack)
                         if "committed" in status:
@@ -8714,7 +8696,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # and NEVER commit it.
                     dirty_abort = True
                     for df in dte.files:
-                        if git and not args.dry_run:
+                        if git:
                             _git(["checkout", "--", df], project_dir)
                     msg = ("dirty-abort during purpose-gap bridge: refused rollback left "
                            f"an unverified candidate on disk ({', '.join(dte.files)}); "
@@ -8741,7 +8723,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 5. Generate + run unit tests (test each function). Failures are real defects.
         test_files: list[str] = []
         test_status = None
-        if args.tests and stack.get("test_cmd") and not report_only and not dirty_abort:
+        if args.tests and stack.get("test_cmd") and not dirty_abort:
             print(f"{pfx}Generating + running unit tests...")
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
                 text, read_status = _classify_source_read(project_dir, rel)
@@ -8795,7 +8777,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 6. Drive every button (Playwright) in the live-like sandbox. The lock keeps
         #    one program driving Playwright at a time; the port keeps dev servers apart.
         e2e = {"ran": False, "ok": None, "log": "", "spec_files": []}
-        if args.e2e and not report_only and not dirty_abort:
+        if args.e2e and not dirty_abort:
             print(f"{pfx}Button/UI testing (Playwright)...")
             lock = _E2E_LOCK if total > 1 else None
             try:
@@ -8815,7 +8797,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         suite_status = None
         suite_log = ""
         suite_cmd = stack.get("full_suite_cmd")
-        if getattr(args, "full_suite", True) and suite_cmd and not report_only:
+        if getattr(args, "full_suite", True) and suite_cmd:
             if suite_cmd == stack.get("test_cmd") and test_status is not None:
                 suite_status = test_status  # already ran it as the unit-test step
                 print(f"{pfx}full suite ({' '.join(suite_cmd)}): reusing unit-test result "
@@ -8844,13 +8826,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             report(phase="readiness scorecard")
             print(f"{pfx}Assessing production readiness ...")
             final_build = None
-            if not report_only:
-                if stack.get("verify_cmds") or stack.get("fast_verify"):
-                    final_build, _ = _full_gate(project_dir, stack)
-                # A vacuous gate (no commands) must stay None = "not evaluated",
-                # never True. _full_gate cannot make that distinction; we can.
-                if not stack.get("verification_is_real", False):
-                    final_build = None
+            if stack.get("verify_cmds") or stack.get("fast_verify"):
+                final_build, _ = _full_gate(project_dir, stack)
+            # A vacuous gate (no commands) must stay None = "not evaluated",
+            # never True. _full_gate cannot make that distinction; we can.
+            if not stack.get("verification_is_real", False):
+                final_build = None
             tests_ok = suite_status if suite_status is not None else test_status
             readiness = _assess_readiness_phase(
                 project_dir, stack, display_name, build_ok=final_build,
@@ -8887,8 +8868,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         if not git:
             commit_status = "no-git"
-        elif args.dry_run:
-            commit_status = "dry-run"
         elif dirty_abort:
             # A refused rollback aborted the run mid-cycle. The audit branch may hold
             # VERIFIED checkpoint (or prior-cycle) commits, so it must NEVER be treated
@@ -8972,7 +8951,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         print(f"{pfx}Full audit report: {report_path}")
         manifest_path = _write_run_manifest(
             project_dir, audit,
-            report_only=report_only,
             max_cost=float(getattr(args, "max_cost", 0) or 0))
         if manifest_path:
             print(f"{pfx}Run manifest: {manifest_path}")
@@ -9019,7 +8997,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # the tree is clean (never carry uncommitted state across a checkout).
         # dirty_abort keeps its parked state on purpose (owner must inspect).
         if (git and created_branch and prev_branch and prev_branch != branch
-                and not args.dry_run and not dirty_abort
+                and not dirty_abort
                 and _git_current_branch(project_dir) == branch
                 and _git_tree_clean(project_dir)):
             back = _git(["checkout", prev_branch], project_dir)
@@ -9090,8 +9068,7 @@ def _confirm_audit_apply(args, programs) -> bool:
     print("!" * 70)
     if not sys.stdin or not sys.stdin.isatty():
         print("Non-interactive session (no TTY): proceeding with APPLY. FlexFactor "
-              "never silently degrades to review-only - pass --report-only if a "
-              "review is genuinely what you want.")
+              "has no review-only mode - every run is a real apply run.")
         return True
     try:
         resp = input("Type 'apply' to proceed, anything else to CANCEL the run: ").strip().lower()
@@ -9110,31 +9087,6 @@ def _confirm_audit_apply(args, programs) -> bool:
     return resp == "apply"
 
 
-def _assert_review_only_was_asked_for(args) -> None:
-    """A run that will not apply anything must have been ASKED for, in writing.
-
-    Owner order 2026-08-11: "no run may spend real money on review-only output -
-    if it would, it aborts." Reviewing a large repo costs real dollars ($17.75 on
-    GrantFlow) and produces nothing but a markdown file, so arriving in
-    report-only mode by accident is now fatal rather than merely expensive.
-
-    `args.explicit_report_only` is set at parse time from the RAW argv, because
-    `--apply` and `--report-only` share a dest and the parsed value cannot tell
-    "left at its default" from "explicitly turned off".
-    """
-    if getattr(args, "apply", False) or getattr(args, "dry_run", False):
-        return
-    if getattr(args, "explicit_report_only", False):
-        return
-    raise SystemExit(
-        "FlexFactor refuses to start: this run would REVIEW without applying "
-        "anything, and nobody asked it to.\n"
-        "Reviewing a large repository costs real money and produces no fix "
-        "(2026-08-11: 6 hours, $17.75, 3,464 defects found, 0 fixed).\n"
-        "Apply is the default. Pass --report-only (or --dry-run) if a review is "
-        "genuinely what you want.")
-
-
 def run_audit(args) -> int:
     # 1. Validate the program list (1..5).
     programs = list(args.program or [])
@@ -9148,16 +9100,13 @@ def run_audit(args) -> int:
     # Declining ABORTS. It used to set args.apply = False, i.e. quietly spend
     # hours and real money producing a review the owner did not ask for - the
     # exact defect behind the $17.75 GrantFlow run. Cancel means cancel.
-    if getattr(args, "apply", False) and not getattr(args, "dry_run", False):
-        if not _confirm_audit_apply(args, programs):
-            print("Apply cancelled by the operator - nothing was reviewed, changed, "
-                  "or spent. (Pass --report-only if you actually want a review.)",
-                  file=sys.stderr)
-            return 2
-
-    # A review costs real money. If this run is NOT going to apply anything, the
-    # operator must have said so explicitly, and must have accepted the spend.
-    _assert_review_only_was_asked_for(args)
+    # Owner order 2026-08-11 (stronger form): there IS no review-only mode any
+    # more - every audit/prodready run is a real apply run, so the confirmation
+    # below is the only gate between "invoked" and "mutating".
+    if not _confirm_audit_apply(args, programs):
+        print("Apply cancelled by the operator - nothing was reviewed, changed, "
+              "or spent.", file=sys.stderr)
+        return 2
 
     # Start fresh dashboard state and (optionally) launch the live graph window.
     _PROGRESS.reset()
@@ -9189,8 +9138,9 @@ def run_audit(args) -> int:
         batch_path = _write_batch_report(results)
         print(f"\nCombined batch report: {batch_path}")
 
-    return _audit_exit_code(results, apply_requested=bool(getattr(args, "apply", False))
-                            and not getattr(args, "dry_run", False))
+    # Every run is an apply run now (review-only was removed outright), so the
+    # applied-nothing exit-code contract applies unconditionally.
+    return _audit_exit_code(results, apply_requested=True)
 
 
 #: Exit code for "the run completed, applied nothing, and was supposed to apply".
@@ -9368,7 +9318,7 @@ def _print_audit_summary(a: dict) -> None:
 
 
 def _write_run_manifest(project_dir: str, a: dict, *,
-                        report_only: bool, max_cost: float) -> str | None:
+                        max_cost: float) -> str | None:
     """Immutable JSON evidence for one audit/apply run (Master Prompt 86/90).
 
     Written once at end-of-run next to the markdown report. Captures mode,
@@ -9393,8 +9343,11 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "program": a.get("name"),
         "project_dir": a.get("dir"),
         "branch": a.get("branch"),
-        "mode": "report-only" if report_only else "apply",
-        "report_only": bool(report_only),
+        # Review-only was removed outright (owner order 2026-08-11: "each run
+        # must be for real"), so every manifest records a real apply run. The
+        # key is kept so older manifest consumers keep parsing.
+        "mode": "apply",
+        "report_only": False,
         "max_cost_usd": float(max_cost),
         "usd_spent": a.get("usd"),
         "providers": list(a.get("providers") or []),
@@ -9437,8 +9390,8 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          f"- **Files fixed:** {len(a['applied_files'])}"
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
             if a['unverified_files'] else ""),
-         # Tri-state. None = the build never ran (report-only, or no build
-         # command exists), which is NOT a pass and must never read like one.
+         # Tri-state. None = the build never ran (no build command exists),
+         # which is NOT a pass and must never read like one.
          f"- **Baseline build:** {'passed' if a['baseline_ok'] is True else 'NOT RUN (unverified)' if a['baseline_ok'] is None else 'FAILED'}",
          f"- **Unit tests added:** {len(a['test_files'])} "
          f"(suite {'passed' if a['test_status'] else 'FAILED' if a['test_status'] is False else 'not run'})",
@@ -9991,20 +9944,18 @@ def main(argv=None) -> int:
                             help="Only review paths containing this substring (repeatable).")
         parser.add_argument("--exclude", action="append", default=[],
                             help="Skip paths containing this substring (repeatable).")
-        # DEFAULT: APPLY. Owner order 2026-08-11 - "I will NEVER just 'review'
-        # with this program". Fixing the code is the whole product; a review is
-        # a special request that costs money and delivers nothing, so it now
-        # takes an explicit flag. The old report-only default is what let a
-        # launcher, a schtask, or a missing --yes turn a 6-hour run into an
-        # expensive no-op.
+        # EVERY RUN IS REAL. Owner order 2026-08-11 (second, stronger form):
+        # "I do not want test runs as part of the app's functions. Each run
+        # must be for real." Audit and prodready no longer HAVE a review-only
+        # mode - --report-only/--dry-run were removed outright, so a run that
+        # would review without applying cannot even be requested. (Scout keeps
+        # its separate proposal-only contract; that is a different mode with
+        # its own owner-approved apply gate.)
         parser.add_argument("--apply", action="store_true", dest="apply", default=True,
-                            help="Create the branch and commit fixes (default: ON). "
-                                 "Prompts for confirmation on a TTY unless --yes; "
-                                 "non-interactive sessions apply without prompting.")
-        parser.add_argument("--report-only", action="store_false", dest="apply",
-                            help="Review and report, change nothing. NOT the default - "
-                                 "a review costs money and fixes nothing, so it must be "
-                                 "asked for explicitly.")
+                            help="Create the branch and commit fixes (always ON; kept for "
+                                 "launcher compatibility). Prompts for confirmation on a "
+                                 "TTY unless --yes; non-interactive sessions apply "
+                                 "without prompting.")
         parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
                             help="Skip the interactive confirmation for --apply (for automation).")
         parser.add_argument("--no-tests", action="store_false", dest="tests",
@@ -10040,26 +9991,8 @@ def main(argv=None) -> int:
                                  "and continue, instead of refusing to run. Default: on "
                                  "in prodready (walk-away must not stop for this), off "
                                  "in audit.")
-        parser.add_argument("--dry-run", action="store_true", dest="dry_run",
-                            help="Review + report only; create no branch and change no files.")
         _add_egress_args(parser)
         args = parser.parse_args(rest)
-        # Did the operator ASK for a review? `--apply`/`--report-only` share a
-        # dest, so only the raw argv can distinguish "left at the default" from
-        # "explicitly turned off". Prefix matching is honored too (argparse
-        # accepts `--report`, `--dry`), because an abbreviation is still an
-        # explicit request and must not be overridden back to apply.
-        def _asked(*full: str) -> bool:
-            for tok in rest:
-                head = tok.split("=", 1)[0]
-                if not head.startswith("--") or len(head) < 4:
-                    continue
-                for f in full:
-                    if f.startswith(head):
-                        return True
-            return False
-
-        args.explicit_report_only = _asked("--report-only", "--dry-run")
         if args.snapshot_dirty is None:
             args.snapshot_dirty = _prod
         if args.readiness is None:
@@ -10069,15 +10002,9 @@ def main(argv=None) -> int:
             # flags below are the ones an owner would otherwise have to know to
             # set; each is still overridable because argparse already parsed any
             # explicit value, and we only override the ones left at their audit
-            # default. Applying fixes is the POINT of the mode, so --apply is
-            # implied - but an explicit --report-only/--dry-run must still win.
-            # `--apply` and `--report-only` share a dest, so the PARSED value
-            # cannot distinguish "left at its default" from "explicitly turned
-            # off"; the raw argv can, so ask that instead. `_asked` also honors
-            # argparse's prefix matching - `--report` used to set apply=False in
-            # argparse and then get silently overridden back to True here.
-            if not args.explicit_report_only:
-                args.apply = True
+            # default. Applying fixes is the POINT of the mode (and of audit
+            # too, since review-only was removed outright).
+            args.apply = True
             if args.fix_severity == "high":
                 # Production readiness means medium defects get fixed too; the
                 # build gate + adversarial verify still guard every one of them.

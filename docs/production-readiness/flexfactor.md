@@ -11,7 +11,7 @@
 
 ## Purpose Contract
 
-See `docs/purpose-contract.md`. Trustworthy local auditor/refactorer: fail-closed on verifier loss, contained reads/writes, reproducible manifests, deterministic rollback; report-only by default.
+See `docs/purpose-contract.md`. Trustworthy local auditor/refactorer: fail-closed on verifier loss, contained reads/writes, reproducible manifests, deterministic rollback; every audit/prodready run applies for real (review-only removed 2026-08-11; scout remains proposal-only by contract).
 
 ## Phase A — Source of truth
 

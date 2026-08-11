@@ -985,27 +985,48 @@ class AuditApplyDefaultTests(unittest.TestCase):
         finally:
             ff.run_audit = real
         self.assertTrue(cap["args"].apply,
-                        "bare `audit` must APPLY - review-only is opt-in now")
-        self.assertFalse(cap["args"].explicit_report_only)
+                        "bare `audit` must APPLY - there is no review-only mode")
         # Owner directive 2026-08-11: push defaults ON (ship results to main).
         self.assertTrue(cap["args"].push)
 
-    def test_report_only_flag_is_honored_and_recorded_as_explicit(self):
+    def test_review_only_flags_are_rejected_outright(self):
+        # Owner order 2026-08-11 (stronger form): "I do not want test runs as
+        # part of the app's functions. Each run must be for real." Audit and
+        # prodready no longer HAVE the flags, so argparse must refuse the whole
+        # invocation (exit 2) before anything runs or spends.
+        import contextlib
+        import io
         for argv in (["audit", "--program", "x", "--report-only"],
                      ["audit", "--program", "x", "--dry-run"],
-                     # argparse prefix matching: an abbreviation is still explicit
-                     # and must NOT be overridden back to apply.
-                     ["prodready", "--program", "x", "--report"]):
+                     ["prodready", "--program", "x", "--report-only"],
+                     ["prodready", "--program", "x", "--dry-run"]):
             real = ff.run_audit
-            cap = {}
-            ff.run_audit = lambda a: cap.setdefault("args", a) or 0
+            called = {}
+            ff.run_audit = lambda a: called.setdefault("ran", True) or 0
             try:
-                ff.main(list(argv))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit, msg=argv) as cm:
+                        ff.main(list(argv))
+                self.assertEqual(cm.exception.code, 2, argv)
+                self.assertNotIn("ran", called, argv)
             finally:
                 ff.run_audit = real
-            self.assertTrue(cap["args"].explicit_report_only, argv)
-            if "--dry-run" not in argv:
-                self.assertFalse(cap["args"].apply, argv)
+
+    def test_scout_keeps_its_proposal_only_flags(self):
+        # Scout is governed by the owner's OTHER standing order: proposal-only
+        # default with a separate explicit apply approval. Removing audit's
+        # review-only mode must not touch scout's flags.
+        real = ff.run_scout
+        cap = {}
+        ff.run_scout = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--report-only"])
+            self.assertFalse(cap["args"].apply)
+            cap.clear()
+            ff.main(["scout", "--program", "x", "--dry-run"])
+            self.assertTrue(cap["args"].dry_run)
+        finally:
+            ff.run_scout = real
 
     def test_prodready_bare_applies(self):
         real = ff.run_audit
@@ -1029,17 +1050,18 @@ class AuditApplyDefaultTests(unittest.TestCase):
         self.assertTrue(cap["args"].apply)
         self.assertTrue(cap["args"].assume_yes)
 
-    def test_report_only_gate_pinned_in_production_code(self):
-        # Pin the PRODUCTION gate, not a locally recreated boolean: the exact
-        # report-only expression must exist in audit_one_program and must guard
-        # the mutating steps (branch creation / commit / tests / e2e). If the
-        # gate is renamed or removed, this fails.
+    def test_review_only_mode_is_gone_from_the_audit_pipeline(self):
+        # Pin the REMOVAL: audit_one_program must contain no report-only gate
+        # at all (every run is a real apply run), and run_audit must hardwire
+        # apply_requested=True into the exit-code contract.
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("report_only = not args.apply or args.dry_run", src)
-        self.assertGreaterEqual(src.count("not report_only"), 3,
-                                "report_only must guard multiple mutating steps")
-        self.assertIn("if report_only", src)
+        self.assertNotIn("report_only", src,
+                         "review-only mode must stay removed from the pipeline")
+        self.assertNotIn("args.dry_run", src)
+        run_src = inspect.getsource(ff.run_audit)
+        self.assertIn("apply_requested=True", run_src)
+        self.assertNotIn("_assert_review_only_was_asked_for", run_src)
 
 
 class TopLevelHelpTests(unittest.TestCase):
@@ -4148,7 +4170,7 @@ class RunManifestTests(unittest.TestCase):
             "providers": ["anthropic:m"], "fix_notes": [],
             "verification_is_real": True, "verification_note": "",
         }
-        path = ff._write_run_manifest(tmp, audit, report_only=False, max_cost=50.0)
+        path = ff._write_run_manifest(tmp, audit, max_cost=50.0)
         self.assertTrue(path and os.path.isfile(path))
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -4159,7 +4181,7 @@ class RunManifestTests(unittest.TestCase):
         self.assertEqual(data["applied_files"], ["a.py"])
         self.assertEqual(data["commit_status"], "committed")
         # Timestamped name: a second write must not overwrite the first.
-        path2 = ff._write_run_manifest(tmp, audit, report_only=True, max_cost=10.0)
+        path2 = ff._write_run_manifest(tmp, audit, max_cost=10.0)
         self.assertNotEqual(path, path2)
         self.assertTrue(os.path.isfile(path))
         self.assertTrue(os.path.isfile(path2))
@@ -6211,9 +6233,10 @@ class ProdreadyModeTests(unittest.TestCase):
             return 0
 
         with _patched(ff, "run_audit", fake_run_audit):
-            ff.main(["prodready", "--program", ".", "--no-readiness", "--report-only"])
+            ff.main(["prodready", "--program", ".", "--no-readiness"])
         self.assertFalse(captured["readiness"])
-        self.assertFalse(captured["apply"])
+        self.assertTrue(captured["apply"],
+                        "apply cannot be turned off any more - every run is real")
 
     def test_bootstrap_flags_exist_with_safe_defaults(self):
         captured = {}
@@ -6276,12 +6299,18 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
         deleted the tree, so every on-disk assertion failed against a path that
         had genuinely existed a moment earlier.)"""
         with _RepoFixture(files) as root:
-            args = self._args(["prodready", "--program", root, "--report-only",
+            args = self._args(["prodready", "--program", root, "--no-bootstrap",
                                "--no-preflight", "--no-dashboard", "--no-tests",
                                "--no-e2e", "--no-full-suite", *argv_extra])
             stub = _StubProvider()
+            # Review-only is gone, so keep these pipeline tests offline the
+            # honest way: skip dependency installs (--no-bootstrap) and stub
+            # the build gate to "never ran" (None) - exactly what a machine
+            # with no toolchain would report.
             with _patched(ff, "build_audit_providers",
-                          lambda a, m=None: [("stub", stub)]):
+                          lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_full_gate",
+                          lambda d, s: (None, "(build stubbed offline in tests)")):
                 res = ff.audit_one_program(root, args, 0, 1, None)
             yield res, root
 
@@ -6326,8 +6355,8 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertFalse(stack["verification_is_real"])
             self.assertIn("no build system", stack["verification_note"])
 
-    def test_report_only_skips_bootstrap(self):
-        # Report-only changes nothing, so it must not run installs either.
+    def test_no_bootstrap_flag_skips_installs(self):
+        # --no-bootstrap must keep the run from installing anything.
         with self._run_one({"package.json":
                             '{"dependencies":{"left-pad":"1.0.0"}}'}) as (res, _r):
             self.assertEqual(res.get("bootstrap"), [])
@@ -8585,8 +8614,8 @@ class NeverReviewOnlyTests(unittest.TestCase):
 
     def _args(self, **kw):
         import argparse
-        a = argparse.Namespace(apply=True, dry_run=False, assume_yes=False,
-                               explicit_report_only=False, branch_prefix="flexfactor/audit-",
+        a = argparse.Namespace(apply=True, assume_yes=False,
+                               branch_prefix="flexfactor/audit-",
                                push=True, merge=True)
         for k, v in kw.items():
             setattr(a, k, v)
@@ -8667,15 +8696,12 @@ class NeverReviewOnlyTests(unittest.TestCase):
                          "declining must never downgrade to report-only")
         self.assertIn("return 2", src)
 
-    def test_review_only_must_be_asked_for_explicitly(self):
-        with self.assertRaises(SystemExit) as cm:
-            ff._assert_review_only_was_asked_for(
-                self._args(apply=False, explicit_report_only=False))
-        self.assertIn("refuses to start", str(cm.exception))
-        # ... but an explicit request is honored.
-        ff._assert_review_only_was_asked_for(
-            self._args(apply=False, explicit_report_only=True))
-        ff._assert_review_only_was_asked_for(self._args(apply=True))
+    def test_review_only_escape_hatch_no_longer_exists(self):
+        # The 2026-08-11 stronger order removed review-only outright, so the
+        # "was a review asked for?" assertion has nothing left to assert and
+        # must be GONE - a resurrected copy would mean the mode crept back.
+        self.assertFalse(hasattr(ff, "_assert_review_only_was_asked_for"),
+                         "review-only was removed; the gate must not return")
 
 
 class VacuousGateTests(unittest.TestCase):
@@ -8695,12 +8721,13 @@ class VacuousGateTests(unittest.TestCase):
                       "(no build command) auto-merged unverified work to main")
         self.assertIn("merge+push REFUSED", src)
 
-    def test_report_only_baseline_is_not_claimed_as_passed(self):
+    def test_unrunnable_baseline_is_not_claimed_as_passed(self):
+        # No build command -> tri-state None (unverified), never a pass.
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("baseline_ok = None", src)
+        self.assertIn('else (None, "")', src)
         self.assertNotIn("baseline_ok = True", src,
-                         "a skipped build is unverified, not a pass")
+                         "a build that never ran is unverified, not a pass")
 
     def test_report_renders_unverified_baseline_honestly(self):
         import tempfile
@@ -8737,9 +8764,12 @@ class ApplyExitCodeTests(unittest.TestCase):
         results = [{"name": "A", "error": None, "defects": 0, "fixed": 0}]
         self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
 
-    def test_report_only_run_is_not_penalised(self):
-        results = [{"name": "A", "error": None, "defects": 99, "fixed": 0}]
-        self.assertEqual(ff._audit_exit_code(results, apply_requested=False), 0)
+    def test_run_audit_always_requests_apply(self):
+        # Review-only is gone, so the applied-nothing exit contract applies to
+        # every run; run_audit must hardwire apply_requested=True.
+        import inspect
+        self.assertIn("apply_requested=True",
+                      inspect.getsource(ff.run_audit))
 
     def test_hard_error_still_wins(self):
         results = [{"name": "A", "error": "boom", "defects": 0, "fixed": 0}]

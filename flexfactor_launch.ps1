@@ -259,17 +259,12 @@ if ($mode -eq "3") {
         Read-Host "Press Enter to close"; exit 1
     }
 
-    # Apply vs report-only. APPLY is the default in the CLI too now (owner order
-    # 2026-08-11: "I will NEVER just 'review' with this program"), and a bare run
-    # that would review without applying ABORTS rather than quietly spending. We
-    # still pass --apply --yes explicitly so this menu's answer is unambiguous.
-    Write-Host "  NOTE: 'report' only REVIEWS. On a large repo that costs real money" -ForegroundColor DarkGray
-    Write-Host "  and changes nothing (2026-08-11: 6h, 17.75 USD, 3464 defects, 0 fixed)." -ForegroundColor DarkGray
-    $apply = Read-Host "Apply fixes? [yes/report] (Enter = yes)"
-    if ($apply -eq "report") {
-        $extraArgs += "--report-only"
-        Write-Host "Report mode: findings only, no code changes. You asked for this explicitly." -ForegroundColor Yellow
-    } else {
+    # Every run is REAL (owner order 2026-08-11, stronger form: "I do not want
+    # test runs as part of the app's functions. Each run must be for real.").
+    # The CLI no longer has --report-only/--dry-run for audit/prodready, so this
+    # launcher no longer offers a report choice either. --apply --yes keeps the
+    # invocation unambiguous for the non-TTY confirmation path.
+    if ($true) {
         $extraArgs += "--apply"
         $extraArgs += "--yes"
         Write-Host "Apply mode: verified fixes are committed each cycle, merged into the" -ForegroundColor DarkGray
