@@ -99,12 +99,12 @@ if ($merge -match '^(y|yes)$') {
 }
 
 # Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":
-# a batch of several programs used to faceplant on --program #2 or #3 just
-# because that repo had pre-existing uncommitted WIP). Audit defaults this
-# OFF (a hard stop is the safer default for a one-shot interactive run), but
-# this launcher exists to kick off a multi-program batch and walk away, so
-# offer the same snapshot as prodready and default it ON for that case.
-$snapshotDefault = if ($programs.Count -ge 2) { "yes" } else { "no" }
+# a run used to hard-stop just because that repo had pre-existing uncommitted
+# WIP). Audit's CLI default is OFF, but --snapshot-dirty is safe by
+# construction (verbatim preserve as a labeled first commit + fail-closed
+# restore, not a silent sweep-in like --allow-dirty), so this launcher
+# defaults the prompt to yes regardless of program count.
+$snapshotDefault = "yes"
 $snap = Read-Host "On a dirty working tree, snapshot the pre-existing changes and continue instead of stopping? [Y/n] (Enter = $snapshotDefault)"
 if ([string]::IsNullOrWhiteSpace($snap)) { $snap = $snapshotDefault }
 if ($snap -match '^(y|yes)$') {

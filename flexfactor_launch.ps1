@@ -156,6 +156,19 @@ if ($mode -eq "3") {
         $extraArgs += "--merge"
     }
 
+    # Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":
+    # a hard stop on a repo with pre-existing uncommitted WIP). audit's
+    # --snapshot-dirty default is OFF (a hard stop is the safer default when
+    # nothing else asked), so offer it here rather than force an owner back
+    # to a terminal to pass the flag by hand.
+    $snapshotDefault = "yes"
+    $snap = Read-Host "On a dirty working tree, snapshot the pre-existing changes and continue instead of stopping? [Y/n] (Enter = $snapshotDefault)"
+    if ([string]::IsNullOrWhiteSpace($snap)) { $snap = $snapshotDefault }
+    if ($snap -match '^(y|yes)$') {
+        $extraArgs += "--snapshot-dirty"
+        Write-Host "Dirty trees: pre-existing changes are snapshotted as the sandbox branch's first commit and the audit continues." -ForegroundColor DarkGray
+    }
+
     # When 2+ programs were given, offer to run them concurrently.
     if ($programs.Count -ge 2) {
         $par = Read-Host "Run them at the same time (parallel)? [y/N]"
