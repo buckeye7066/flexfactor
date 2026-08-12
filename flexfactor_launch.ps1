@@ -208,7 +208,9 @@ if ($mode -eq "3") {
         Write-Host "Both keys detected - audit will use both models (primary + cross-check)." -ForegroundColor Green
         $defaultProvider = "anthropic"
     } elseif ($haveAnthropic) {
-        Write-Host "Only ANTHROPIC_API_KEY detected - using anthropic." -ForegroundColor Yellow
+        # In this launcher the real key was blanked above; what's detected is
+        # the free-proxy Bearer token. Say so instead of claiming a paid key.
+        Write-Host "Anthropic route detected (free-proxy token) - using anthropic." -ForegroundColor Yellow
         $defaultProvider = "anthropic"
     } elseif ($haveOpenai) {
         Write-Host "Only OPENAI_API_KEY detected - using openai." -ForegroundColor Yellow
@@ -219,8 +221,17 @@ if ($mode -eq "3") {
         Read-Host "Press Enter to close"; exit 1
     }
 
-    $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
-    if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+    # Only ask when there is a REAL choice (both providers usable). With one
+    # usable provider the guards below force every answer back to the default,
+    # so the question was pure noise (owner feedback 2026-08-11 evening). In
+    # this free-proxy launcher OPENAI_API_KEY is always blanked above, so the
+    # prompt never fires here at all.
+    if ($haveAnthropic -and $haveOpenai) {
+        $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
+        if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+    } else {
+        $provider = $defaultProvider
+    }
     # GUARD (2026-08-11 live failure): this launcher BLANKS OPENAI_API_KEY for the
     # free-proxy env, so '--provider openai' is guaranteed unusable here and used
     # to demote the whole run to local ollama at preflight. Never pass a provider

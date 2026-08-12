@@ -67,9 +67,15 @@ if ($haveAnthropic -and $haveOpenai) {
     Read-Host "Press Enter to close"; exit 1
 }
 
-# Let the user override the primary provider, but default to what we detected.
-$provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
-if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+# Let the user pick the primary ONLY when both providers are usable. With a
+# single usable provider the guards below force every answer back to the
+# default, so asking was pure noise (owner feedback 2026-08-11 evening).
+if ($haveAnthropic -and $haveOpenai) {
+    $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
+    if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
+} else {
+    $provider = $defaultProvider
+}
 # GUARD (2026-08-11 live failure): never pass a provider whose credential this
 # environment does not carry - a keyless '--provider openai' demoted a whole
 # 5-program run to local ollama at preflight. The env wins over the answer.
