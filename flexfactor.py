@@ -7517,6 +7517,25 @@ def _review_all(reviewers: list, project_dir: str,
     return file_findings, flat, unreadable, reviewed_clean, incomplete
 
 
+def _fixtrace(event: str, rel: str = "", **kw) -> None:
+    """Append one JSON line per fix-phase event to ~/.flexfactor/fixtrace.jsonl.
+    Owner order 2026-08-11 (Gap 1): 'log each provider call before and after' -
+    when a fix run produces nothing, this file says exactly which call it was
+    inside, with what model, and how each attempt ended. Append-only, flushed
+    per line, and never allowed to break the fix itself."""
+    try:
+        d = os.path.join(os.path.expanduser("~"), ".flexfactor")
+        os.makedirs(d, exist_ok=True)
+        rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+               "pid": os.getpid(), "event": event, "file": rel}
+        rec.update({k: (str(v)[:300] if isinstance(v, Exception) else v)
+                    for k, v in kw.items()})
+        with open(os.path.join(d, "fixtrace.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
                baseline_ok: bool, args, meter=None, oversized=None, report=None,
                err_base: int = 0, done_set=None, total_overall: int = 0,
@@ -7674,6 +7693,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         build_tries = 0    # build-breaking attempts used (adversarial path only)
         max_tries = (MAX_FIX_TRIES + adversarial_rounds + 2) if adv_active else MAX_FIX_TRIES
         for attempt in range(1, max_tries + 1):
+            _fixtrace("attempt.start", rel, attempt=attempt, mode=("edits" if edit_mode else "whole"),
+                      author=getattr(author, "model", "?"))
             patch = None
             if edit_mode:
                 try:
@@ -7874,6 +7895,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             break
 
         kind = outcome[0]
+        _fixtrace("attempt.outcome", rel, outcome=kind, detail=str(outcome[1])[:300],
+                  attempts=attempt)
         if kind == "fixed":
             titles = kept_patch.get("fixed_titles") or []
             defects_fixed += len(titles) or len(targets)
@@ -7896,7 +7919,15 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             errors += 1
             print(f"  [skip] {rel}: fix generation failed ({outcome[1]})")
         elif kind == "noop":
+            # NEVER silent (owner rule): a model declining to change a file that
+            # HAS findings is a skipped defect, not a success. Without this note,
+            # a run of all-noops reported empty fix_notes and 0 errors - reading
+            # exactly like a clean converge (observed live 2026-08-11: 3 defects,
+            # 0 fixed, no notes, 'not auto-fixable').
+            errors += 1
             print(f"  [no-op] {rel}: model returned no change ({outcome[1]})")
+            notes.append(f"{rel}: NO-OP - author model returned no change for "
+                         f"{len(targets)} finding(s): {outcome[1] or 'no reason given'}")
         elif kind == "revert":
             errors += 1
             print(f"  [revert] {rel}: fix broke verification after {MAX_FIX_TRIES} tries - rolled back")
