@@ -81,8 +81,15 @@ def main() -> int:
           f"{sum(len(v) for v in captured_findings.values())} total.")
 
     import json
-    out_path = os.path.join(HERE, "docs", "evidence", "self-audit-findings.json")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Written OUTSIDE the repo deliberately: audit_one_program refuses to run
+    # against a dirty working tree (a real safety guard -- "Commit or stash
+    # first"), so writing evidence inside the repo would make every SUBSEQUENT
+    # self-audit run refuse to start because of this script's own prior output.
+    out_dir = os.environ.get("FF_SELF_AUDIT_OUT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".flexfactor", "self-audit-reports"
+    )
+    out_path = os.path.join(out_dir, "self-audit-findings.json")
+    os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(
             {
