@@ -2548,14 +2548,10 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # cross-check reviewer that keeps it on target. An EXPLICIT `--provider ollama`
     # still means LOCAL-ONLY / zero-egress and adds no cloud secondary (set above).
     if _free_first_applies and _usable("ollama"):
-        # Keep the STRONGEST USABLE cloud provider as cross-checker - preferring the
-        # one that would have been primary, falling back to the other. Never promote a
-        # dead key to cross-checker just because it was named first.
-        cloud_cross = (primary if _usable(primary)
-                       else (other if other and _usable(other) else None))
-        primary, other = "ollama", cloud_cross
-        print(f"  [preflight] FREE-FIRST: authoring locally with 'ollama'; cross-check "
-              f"reviewer: {cloud_cross or 'NONE (no usable cloud key)'}.", file=sys.stderr)
+        primary, other = "ollama", None
+        print("  [preflight] FREE-FIRST: authoring locally with 'ollama'; "
+              "cloud cross-check disabled to preserve local-only source handling.",
+              file=sys.stderr)
 
     if not _usable(primary):
         # ENV-MISMATCH GUARD (2026-08-11 live failure): a stale script passed
@@ -2578,9 +2574,9 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             primary, other = other, primary
         elif primary != "ollama" and _usable("ollama"):
             print(f"  [preflight] falling back: primary '{primary}' unusable, using FREE "
-                  f"'ollama' (paid cloud keys stay as cross-check/fallback).",
+                  "'ollama' without a cloud secondary.",
                   file=sys.stderr)
-            primary = "ollama"
+            primary, other = "ollama", None
         elif _usable(other):
             print(f"  [preflight] falling back: primary '{primary}' unusable, using '{other}'.",
                   file=sys.stderr)
@@ -2604,7 +2600,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                      or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
-    if args.use_both and _usable(other):
+    if args.use_both and other and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
         # defaults to the cheap model, not a second frontier model. This keeps the
@@ -2940,6 +2936,13 @@ def allow_remote_repo_rewards(args=None) -> bool:
     if args is not None and getattr(args, "allow_remote_repo_rewards", False):
         return True
     return _env_truthy("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS")
+
+
+def allow_remote_program_context(args=None) -> bool:
+    """Cloud profiling sends target source/README/tree off-host; require opt-in."""
+    if args is not None and getattr(args, "allow_remote_program_context", False):
+        return True
+    return _env_truthy("FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT")
 
 # The LLM's characterization of the entered program. `opportunities` is the
 # bridge to Repo Rewards: each one carries a ready-to-run natural-language query.
@@ -4682,14 +4685,24 @@ def run_scout(args) -> int:
                           file=sys.stderr)
                 return 2
 
+    # 2. Characterize the entered program locally, then enforce the separate
+    # cloud-context boundary before constructing or calling a remote provider.
+    display_name, context = resolve_program_input(args.program)
+    if (args.provider != "ollama"
+            and not allow_remote_program_context(args)):
+        print("error: Scout profiling would send this program's source/README/file tree "
+              "to a cloud LLM, but remote program-context sharing is not enabled.",
+              file=sys.stderr)
+        print("Re-run with --allow-remote-program-context or set "
+              "FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1. "
+              "Use --provider ollama to keep profiling local.", file=sys.stderr)
+        return 2
+
     model = (args.model
              or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
              or DEFAULT_MODELS[args.provider])
     provider = make_provider(args.provider, model,
                              judge_model=getattr(args, "judge_model", None))
-
-    # 2. Characterize the entered program.
-    display_name, context = resolve_program_input(args.program)
     print(_scout_contract.scout_config_banner())
     print(f"FlexFactor scout | program='{display_name}' provider={args.provider} "
           f"model={model} judge={provider.judge_model}")
@@ -10080,6 +10093,12 @@ def main(argv=None) -> int:
                                  "OFF by default — remote search sends program-derived "
                                  "queries off-host. Env FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 "
                                  "also enables this.")
+        parser.add_argument("--allow-remote-program-context", action="store_true",
+                            dest="allow_remote_program_context", default=False,
+                            help="Opt in to sending the target program's source, README, and "
+                                 "file tree to the selected cloud LLM for Scout profiling. "
+                                 "OFF by default for anthropic/openai; Ollama stays local. "
+                                 "Env FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1 also enables this.")
         # SAFE DEFAULT: report-only. --apply emits proposals; target mutation
         # requires a separate FlexFactor apply approval (bridge 97/100), unless
         # --legacy-inline-apply is explicitly set (characterization / break-glass).

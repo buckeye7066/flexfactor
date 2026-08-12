@@ -46,12 +46,19 @@ if ([string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
     }
 }
 
+$allowProgramContext = ($env:FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT -match '^(1|true|yes|on)$')
+if (-not $allowProgramContext) {
+    Log "BLOCKED: weekly Scout would send GrantFlow source/README/file tree to $provider. Set FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1 only after owner approval."
+    exit 2
+}
+
 Set-Location $flexDir
 # --report-only: advisory output only. --no-auto-start: use the cloud service,
 # never boot the local repo-rewards stack at 2 AM.
 python "$flexDir\flexfactor.py" scout `
     --program $program `
     --provider $provider `
+    --allow-remote-program-context `
     --report-only `
     --repo-rewards-url $rrUrl `
     --no-auto-start 2>&1 | Tee-Object -FilePath $logFile -Append

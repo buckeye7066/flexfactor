@@ -239,7 +239,7 @@ class PricingAndEconomyTests(unittest.TestCase):
         ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
         try:
             out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["ollama", "anthropic"])
+            self.assertEqual([n for n, _ in out], ["ollama"])
         finally:
             ff._provider_key_present = real_key
             ff.make_provider = real_make
@@ -271,8 +271,7 @@ class PricingAndEconomyTests(unittest.TestCase):
             names = [n for n, _ in ff.build_audit_providers(Args)]
             self.assertEqual(names[0], "ollama",
                              "a healthy paid key must NOT suppress free-first")
-            self.assertIn("anthropic", names,
-                          "the cloud provider stays on as cross-check reviewer")
+            self.assertEqual(names, ["ollama"])
         finally:
             ff._provider_key_present = real_key
             ff.make_provider = real_make
@@ -369,7 +368,7 @@ class PricingAndEconomyTests(unittest.TestCase):
                     "ANTHROPIC_AUTH_TOKEN": "",
                     "ANTHROPIC_API_KEY": "sk-ant-realpaidkey"}):
                 out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["ollama", "anthropic"])
+            self.assertEqual([n for n, _ in out], ["ollama"])
         finally:
             ff._provider_key_present = real_key
             ff.make_provider = real_make
@@ -952,7 +951,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: captured.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args"].apply)
@@ -974,7 +973,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: captured.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x"])
         finally:
             ff.run_scout = real
         self.assertFalse(captured["args"].apply)
@@ -982,7 +981,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         # --apply flips it on.
         ff.run_scout = lambda a: captured.__setitem__("args2", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args2"].apply)
@@ -1060,10 +1059,10 @@ class AuditApplyDefaultTests(unittest.TestCase):
         cap = {}
         ff.run_scout = lambda a: cap.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--report-only"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--report-only"])
             self.assertFalse(cap["args"].apply)
             cap.clear()
-            ff.main(["scout", "--program", "x", "--dry-run"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--dry-run"])
             self.assertTrue(cap["args"].dry_run)
         finally:
             ff.run_scout = real
@@ -4809,7 +4808,7 @@ class ScoutEndToEndTests(unittest.TestCase):
                            capture_output=True)
             # --no-clone-inspect keeps the scenario fully offline (the fixture
             # urls aren't cloneable); enrichment has its own dedicated tests.
-            rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
+            rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
                           "--top", "5", "--no-clone-inspect"])
         finally:
             for n, fn in saved.items():
@@ -6711,7 +6710,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                  "packages": [], "commit_message": "Integrate good/widget",
                  "post_steps": []}, "plan")
             try:
-                rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
                               "--top", "3", "--no-clone-inspect"])
             finally:
                 for n, fn in saved.items():
@@ -6761,7 +6760,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--no-auto-start"])
             self.assertEqual(rc, 2)
@@ -6807,7 +6806,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--allow-remote-repo-rewards",
                               "--no-auto-start"])
@@ -6870,7 +6869,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://127.0.0.1:3000"])
             self.assertIn(rc, (0, 1))
             self.assertTrue(seen["started"])
@@ -9253,10 +9252,108 @@ class EconomyFlagUniformityTests(unittest.TestCase):
         real = ff.run_scout
         ff.run_scout = lambda a: cap.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--economy"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--economy"])
         finally:
             ff.run_scout = real
         self.assertTrue(cap["args"].economy)
+
+
+class ScoutCloudContextConsentTests(unittest.TestCase):
+    """The real Scout entry path must stop before any cloud provider call."""
+
+    def test_cloud_profile_is_blocked_without_explicit_opt_in(self):
+        import types
+        args = types.SimpleNamespace(
+            repo_rewards_url="http://localhost:3000",
+            auto_start=False,
+            provider="anthropic",
+            program="C:/private/project",
+            allow_remote_program_context=False,
+        )
+        called = {"provider": False}
+        with _patched(ff, "_server_is_up", lambda _url: True), \
+             _patched(ff, "resolve_program_input",
+                      lambda _program: ("private-project", "SECRET SOURCE TREE")), \
+             _patched(ff, "make_provider",
+                      lambda *a, **k: called.__setitem__("provider", True)):
+            with _patched(os, "environ", {}):
+                rc = ff.run_scout(args)
+        self.assertEqual(rc, 2)
+        self.assertFalse(called["provider"],
+                         "cloud provider must not be constructed before consent")
+
+    def test_parser_exposes_separate_context_consent_switch(self):
+        captured = {}
+        real = ff.run_scout
+        ff.run_scout = lambda a: captured.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--allow-remote-program-context"])
+        finally:
+            ff.run_scout = real
+        self.assertTrue(captured["args"].allow_remote_program_context)
+
+
+    def test_real_main_path_blocks_cloud_provider_without_consent(self):
+        called = {"provider": False}
+        with _patched(ff, "_server_is_up", lambda _url: True), \
+             _patched(ff, "resolve_program_input",
+                      lambda _program: ("private-project", "SECRET SOURCE TREE")), \
+             _patched(ff, "make_provider",
+                      lambda *a, **k: called.__setitem__("provider", True)):
+            with _patched(os, "environ", {}):
+                rc = ff.main(["scout", "--program", "C:/private/project"])
+        self.assertEqual(rc, 2)
+        self.assertFalse(called["provider"])
+
+    def test_environment_opt_in_reaches_cloud_judge(self):
+        import types
+        args = types.SimpleNamespace(
+            repo_rewards_url="http://localhost:3000",
+            auto_start=False,
+            provider="anthropic",
+            program="C:/private/project",
+            allow_remote_program_context=False,
+            model=None,
+            economy=False,
+            judge_model=None,
+        )
+        reached = {"judge": False}
+
+        def stop_at_judge(*_args, **_kwargs):
+            reached["judge"] = True
+            raise RuntimeError("stop after consent boundary")
+
+        with _patched(ff, "_server_is_up", lambda _url: True), \
+             _patched(ff, "resolve_program_input",
+                      lambda _program: ("private-project", "SECRET SOURCE TREE")), \
+             _patched(ff, "make_provider",
+                      lambda *a, **k: types.SimpleNamespace(judge_model=None)), \
+             _patched(ff, "_judge", stop_at_judge):
+            with _patched(os, "environ",
+                          {"FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT": "1"}):
+                with self.assertRaisesRegex(RuntimeError, "consent boundary"):
+                    ff.run_scout(args)
+        self.assertTrue(reached["judge"])
+
+    def test_ollama_primary_never_retains_cloud_secondary(self):
+        class Args:
+            provider = "ollama"
+            explicit_provider = True
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+
+        with _patched(ff, "_provider_key_present", lambda _name: True), \
+             _patched(ff, "make_provider", lambda *a, **k: object()):
+            names = [name for name, _provider in ff.build_audit_providers(Args)]
+        self.assertEqual(names, ["ollama"])
+
+    def test_ollama_rejects_non_loopback_base_url(self):
+        with self.assertRaisesRegex(ValueError, "non-local"):
+            ff.OllamaProvider("test", base_url="https://ollama.example")
 
 
 if __name__ == "__main__":
