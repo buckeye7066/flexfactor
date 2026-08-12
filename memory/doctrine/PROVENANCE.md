@@ -14,10 +14,26 @@ these in Flex Factor's memory so it has an idea of what I mean."*
 | `axiom-master-prompt-claude-code.md` | `G:\One Drive\Desktop\claude1p.docx` |
 | `axiom-master-prompt-chatgpt.md` | `G:\One Drive\Desktop\chatgptp1.docx` |
 | `axiom-master-prompt-cursor.md` | `G:\One Drive\Desktop\cursorp1.docx` |
+| `flexfactor-governing-purpose-and-completion-contract.md` | Owner-supplied text, chat session 2026-08-12 (no `.docx` original) |
 
 The `.md` copies are plain-text extractions of the `.docx` originals. If fidelity
 is ever in doubt, re-extract from the `.docx`. Do not edit these files to make a
 program look finished — they are the yardstick, not the report.
+
+## The governing contract (installed 2026-08-12)
+
+`flexfactor-governing-purpose-and-completion-contract.md` is the owner's
+definitive statement of **what FlexFactor itself shall do to a target program**:
+complete discovery, purpose determination, exhaustive analysis, adversarial
+execution, correction and purpose bridging, iterative (round 1–4) verification,
+fourth-round escalation, and the completion standard / meaning of "flawless".
+It supersedes earlier scattered statements of FlexFactor's operating obligations.
+
+**The ownership/scope rule is deliberately absent.** The master prompts' §3
+("Ownership and Collision Prevention" — lane ownership, one-agent-per-program,
+ACTIVE_APP-style locks) was **deleted entirely from this contract by the owner
+on 2026-08-12, with no replacement**. Do not reintroduce it from the master
+prompts; its absence here is a decision, not an omission.
 
 ## What FlexFactor actually consumes
 
