@@ -952,7 +952,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: captured.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args"].apply)
@@ -974,7 +974,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: captured.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x"])
         finally:
             ff.run_scout = real
         self.assertFalse(captured["args"].apply)
@@ -982,7 +982,7 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         # --apply flips it on.
         ff.run_scout = lambda a: captured.__setitem__("args2", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args2"].apply)
@@ -1060,10 +1060,10 @@ class AuditApplyDefaultTests(unittest.TestCase):
         cap = {}
         ff.run_scout = lambda a: cap.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--report-only"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--report-only"])
             self.assertFalse(cap["args"].apply)
             cap.clear()
-            ff.main(["scout", "--program", "x", "--dry-run"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--dry-run"])
             self.assertTrue(cap["args"].dry_run)
         finally:
             ff.run_scout = real
@@ -4809,7 +4809,7 @@ class ScoutEndToEndTests(unittest.TestCase):
                            capture_output=True)
             # --no-clone-inspect keeps the scenario fully offline (the fixture
             # urls aren't cloneable); enrichment has its own dedicated tests.
-            rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
+            rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
                           "--top", "5", "--no-clone-inspect"])
         finally:
             for n, fn in saved.items():
@@ -6711,7 +6711,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                  "packages": [], "commit_message": "Integrate good/widget",
                  "post_steps": []}, "plan")
             try:
-                rc = ff.main(["scout", "--program", tmp, "--apply", "--yes",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
                               "--top", "3", "--no-clone-inspect"])
             finally:
                 for n, fn in saved.items():
@@ -6761,7 +6761,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--no-auto-start"])
             self.assertEqual(rc, 2)
@@ -6807,7 +6807,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--allow-remote-repo-rewards",
                               "--no-auto-start"])
@@ -6870,7 +6870,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--program", tmp, "--top", "1",
+                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://127.0.0.1:3000"])
             self.assertIn(rc, (0, 1))
             self.assertTrue(seen["started"])
@@ -9253,7 +9253,7 @@ class EconomyFlagUniformityTests(unittest.TestCase):
         real = ff.run_scout
         ff.run_scout = lambda a: cap.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x", "--economy"])
+            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--economy"])
         finally:
             ff.run_scout = real
         self.assertTrue(cap["args"].economy)
@@ -9288,8 +9288,7 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
         real = ff.run_scout
         ff.run_scout = lambda a: captured.setdefault("args", a) or 0
         try:
-            ff.main(["scout", "--program", "x",
-                     "--allow-remote-program-context"])
+            ff.main(["scout", "--program", "x", "--allow-remote-program-context"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args"].allow_remote_program_context)
