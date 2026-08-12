@@ -116,18 +116,23 @@ if ($econ -match '^(n|no)$') {
 # Merge+push into the current branch are automatic now (CLI defaults ON,
 # owner order 2026-08-11); pass --no-merge/--no-push at the CLI to opt out.
 
-# Dirty tree walk-away (same fix prodready got for "the GrantFlow failure":
-# a run used to hard-stop just because that repo had pre-existing uncommitted
-# WIP). Audit's CLI default is OFF, but --snapshot-dirty is safe by
-# construction (verbatim preserve as a labeled first commit + fail-closed
-# restore, not a silent sweep-in like --allow-dirty), so this launcher
-# defaults the prompt to yes regardless of program count.
-$snapshotDefault = "yes"
-$snap = Read-Host "On a dirty working tree, snapshot the pre-existing changes and continue instead of stopping? [Y/n] (Enter = $snapshotDefault)"
-if ([string]::IsNullOrWhiteSpace($snap)) { $snap = $snapshotDefault }
-if ($snap -match '^(y|yes)$') {
-    $extraArgs += "--snapshot-dirty"
-    Write-Host "Dirty trees: pre-existing changes are snapshotted as the sandbox branch's first commit and the audit continues." -ForegroundColor DarkGray
+# Dirty tree handling. Sandbox branches AND the snapshot commit were REMOVED
+# from the CLI (owner order 2026-08-11 evening) - audit works directly on the
+# repo's current branch, and passing the deleted --snapshot-dirty flag killed
+# a whole 5-program run at argparse (exit 2, 2026-08-11 22:26). The only
+# continue-anyway option left is --allow-dirty: pre-existing uncommitted
+# changes get committed on the current branch together with FlexFactor's
+# fixes (visible in history, pushed with the rest - nothing is silently
+# lost). Default yes: a walk-away run must not faceplant on the most common
+# real-world repo state.
+$dirtyDefault = "yes"
+$dirty = Read-Host "On a dirty working tree, commit the pre-existing changes along with the fixes and continue instead of stopping? [Y/n] (Enter = $dirtyDefault)"
+if ([string]::IsNullOrWhiteSpace($dirty)) { $dirty = $dirtyDefault }
+if ($dirty -match '^(y|yes)$') {
+    $extraArgs += "--allow-dirty"
+    Write-Host "Dirty trees: pre-existing changes are committed on your current branch together with FlexFactor's fixes; the audit continues." -ForegroundColor DarkGray
+} else {
+    Write-Host "Dirty trees: a program with uncommitted changes will hard-stop (commit or stash it, then rerun)." -ForegroundColor DarkGray
 }
 
 # When 2+ programs were given, offer to run them concurrently.
