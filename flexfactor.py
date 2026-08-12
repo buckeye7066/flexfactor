@@ -9930,9 +9930,14 @@ def main(argv=None) -> int:
                             help="Stop after --cycles instead of looping until found==fixed.")
         parser.add_argument("--max-cycles", type=int, default=12, dest="max_cycles",
                             help="Hard cycle ceiling for --until-clean (default: 12).")
-        parser.add_argument("--max-cost", type=float, default=50.0, dest="max_cost",
+        parser.add_argument("--max-cost", type=float, default=150.0, dest="max_cost",
                             help="Hard USD budget per program; stop spending once reached "
-                                 "(default: 50.0). Use 0 to disable the cap.")
+                                 "(default: 150.0). Use 0 to disable the cap. HEADROOM, not a "
+                                 "target: with FREE-FIRST the local model does the reviewing "
+                                 "at $0 and only the cloud cross-check bills, so a correct run "
+                                 "should land far below even the old $50. The cap exists so a "
+                                 "misroute cannot run away, not because a run is expected to "
+                                 "approach it.")
         parser.add_argument("--no-full-suite", action="store_false", dest="full_suite",
                             help="Don't run the project's full test suite (test:all) at the end.")
         parser.add_argument("--no-bootstrap", action="store_false", dest="bootstrap",
