@@ -33,6 +33,19 @@ if ([string]::IsNullOrWhiteSpace($program)) {
 $provider = Read-Host "Provider [openai / anthropic / ollama] (Enter = ollama)"
 if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "ollama" }
 
+$contextArgs = @()
+if ($provider -ne "ollama") {
+    Write-Host ""
+    Write-Host "Cloud profiling sends the selected program's source, README, and file tree" -ForegroundColor Yellow
+    Write-Host "to $provider. This is separate from Repo Rewards query sharing." -ForegroundColor Yellow
+    $shareContext = (Read-Host "Share this program context with $provider? Type YES to continue").Trim()
+    if ($shareContext -cne "YES") {
+        Write-Host "Cloud program-context sharing was not approved. Nothing sent." -ForegroundColor Red
+        Read-Host "Press Enter to close"; exit 1
+    }
+    $contextArgs = @("--allow-remote-program-context")
+}
+
 $mode = Read-Host "Mode [report / apply] (Enter = report)"
 if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "report" }
 $applyArgs = @()
@@ -118,7 +131,7 @@ $pyArgs = @(
     "--provider", $provider,
     "--repo-rewards-url", $rrUrl,
     "--no-auto-start"
-) + $remoteArgs + $applyArgs
+) + $remoteArgs + $contextArgs + $applyArgs
 python @pyArgs
 Write-Host ""
 Read-Host "Done. Press Enter to close"
