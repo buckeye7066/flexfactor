@@ -9259,5 +9259,41 @@ class EconomyFlagUniformityTests(unittest.TestCase):
         self.assertTrue(cap["args"].economy)
 
 
+class ScoutCloudContextConsentTests(unittest.TestCase):
+    """The real Scout entry path must stop before any cloud provider call."""
+
+    def test_cloud_profile_is_blocked_without_explicit_opt_in(self):
+        import types
+        args = types.SimpleNamespace(
+            repo_rewards_url="http://localhost:3000",
+            auto_start=False,
+            provider="anthropic",
+            program="C:/private/project",
+            allow_remote_program_context=False,
+        )
+        called = {"provider": False}
+        with _patched(ff, "_server_is_up", lambda _url: True), \
+             _patched(ff, "resolve_program_input",
+                      lambda _program: ("private-project", "SECRET SOURCE TREE")), \
+             _patched(ff, "make_provider",
+                      lambda *a, **k: called.__setitem__("provider", True)):
+            with _patched(os, "environ", {}):
+                rc = ff.run_scout(args)
+        self.assertEqual(rc, 2)
+        self.assertFalse(called["provider"],
+                         "cloud provider must not be constructed before consent")
+
+    def test_parser_exposes_separate_context_consent_switch(self):
+        captured = {}
+        real = ff.run_scout
+        ff.run_scout = lambda a: captured.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x",
+                     "--allow-remote-program-context"])
+        finally:
+            ff.run_scout = real
+        self.assertTrue(captured["args"].allow_remote_program_context)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
