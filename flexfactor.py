@@ -43,8 +43,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import contextlib
+import datetime
 import difflib
 import errno
 import hashlib
@@ -8406,6 +8408,101 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
 
+        # ================= PHASE 1: PURPOSE FIRST (owner order 2026-08-11) ====
+        # "FlexFactor needs to look at the purpose of whichever program is loaded
+        # into it ... and help bridge the gap between where the app is and the
+        # ultimate purpose of its creation." The gap assessment used to run at
+        # the END of the pipeline, behind the full generic sweep and all fix
+        # cycles - so the criteria that define the program's actual job were only
+        # reached if everything upstream survived, and it never had. Inverted:
+        # the purpose gap is measured FIRST, its code-fixable gaps are bridged
+        # and committed FIRST, and the generic sweep then starts with the files
+        # implicated in the purpose gap. A run that dies early has still closed
+        # criteria; a run that finishes has closed the gap, not tidied the code.
+        purpose_before = None      # baseline measurement (criteria met at start)
+        bridged_early: list[str] = []
+        if getattr(args, "purpose_gap", True) and purpose_blob:
+            report(phase="purpose gap (baseline)")
+            print(f"{pfx}PHASE 1 - purpose: measuring the gap between this program "
+                  "and the job it was created to do...")
+            try:
+                purpose_before = assess_purpose_gap(
+                    reviewers[-1], purpose_blob, all_files, [],
+                    project_dir=project_dir, contract=purpose_contract)
+            except BudgetExceededError:
+                print(f"{pfx}purpose baseline skipped: cost cap reached")
+            except Exception as ex:
+                print(f"{pfx}purpose baseline failed (non-fatal): {ex}")
+        purpose_files: list[str] = []
+        if purpose_before:
+            b_gaps = purpose_before.get("gaps") or []
+            if purpose_before.get("criteria_total"):
+                print(f"{pfx}Baseline: {purpose_before['criteria_met']}/"
+                      f"{purpose_before['criteria_total']} acceptance criteria met; "
+                      f"{len(b_gaps)} gap(s) stand between this program and its purpose.")
+            authored_b = bool(purpose_before.get("authored"))
+            floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
+            bridgeable_b: list[tuple[str, dict]] = []
+            for g in b_gaps:
+                rel = str(g.get("file") or "").replace("\\", "/")
+                if rel:
+                    purpose_files.append(rel)  # purpose-critical: swept first below
+                if not (g.get("code_fixable") and rel):
+                    continue
+                if (not authored_b and
+                        SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0) < floor_rank):
+                    continue
+                if _read_text_and_sha(project_dir, rel) is None:
+                    continue
+                bridgeable_b.append((rel, g))
+            bridgeable_b.sort(key=lambda rg: -SEVERITY_RANK.get(
+                str(rg[1].get("severity", "")).lower(), 0))
+            cap_b = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored_b else MAX_PURPOSE_GAP_FIXES
+            bridgeable_b = bridgeable_b[:cap_b]
+            if bridgeable_b and not meter.over_limit():
+                print(f"{pfx}PHASE 1 - bridging {len(bridgeable_b)} code-fixable purpose "
+                      "gap(s) BEFORE any generic sweep (build-gated"
+                      + (" + cross-checked" if cross is not None else "") + ")...")
+                gap_ff: dict[str, list[dict]] = {}
+                for rel, g in bridgeable_b:
+                    gap_ff.setdefault(rel, []).append(_gap_to_finding(g))
+                try:
+                    applied_p, unver_p, notes_p = _fix_files(
+                        author, cross, project_dir, gap_ff, stack, baseline_ok, args,
+                        meter=meter, oversized=oversized, report=report,
+                        err_base=errors_total, done_set=done_set,
+                        total_overall=total_to_review, commit_cb=None,
+                        adversarial=getattr(args, "adversarial", True),
+                        adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                        materiality=getattr(args, "adversarial_materiality", "material"))
+                    applied_set |= set(applied_p)
+                    unverified_set |= set(unver_p)
+                    fix_notes += notes_p
+                    bridged_early = sorted(set(applied_p))
+                    if git and applied_p:
+                        s = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                             "purpose-gap bridge (phase 1)", stack)
+                        if "committed" in s:
+                            committed_any = True
+                        print(f"{pfx}git (purpose phase 1): {s}")
+                except DirtyTreeError as dte:
+                    dirty_abort = True
+                    for df in dte.files:
+                        if git:
+                            _git(["checkout", "--", df], project_dir)
+                    stop_reason = ("aborted in purpose phase: refused rollback left an "
+                                   "unverified candidate")
+                    fix_notes.append(stop_reason)
+                except BudgetExceededError:
+                    fix_notes.append("purpose bridging stopped at cost cap")
+        if purpose_files and not dirty_abort:
+            # Purpose-critical files lead the sweep, so even a run that stops at
+            # the cost cap has reviewed the files that decide the program's job first.
+            pf = [f for f in purpose_files if f in set(files)]
+            rest_f = [f for f in files if f not in set(pf)]
+            files = pf + rest_f
+        # ================== END PHASE 1 =======================================
+
         for cycle in range(1, cycle_cap + 1):
             print(f"{pfx}--- cycle {cycle}/{cycle_cap} ---")
             cycles_run = cycle
@@ -8965,8 +9062,34 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "verification_note": stack.get("verification_note", ""),
             "purpose_gap": purpose_gap, "bridged_files": bridged_files,
             "purpose_contract": result.get("purpose_contract"),
+            "purpose_before": purpose_before,
+            "bridged_early": bridged_early,
             "review_incomplete": len(review_incomplete),
         }
+        # THE SCOREBOARD (owner order 2026-08-11): the run is scored on CRITERIA
+        # CLOSED, not defects fixed. "A run that fixes 498 files and closes zero
+        # criteria did not do the job." Both measurements come from the same
+        # assessor against the same owner-authored criteria, before vs after.
+        met_before = (purpose_before or {}).get("criteria_met")
+        met_after = (purpose_gap or {}).get("criteria_met")
+        total_crit = ((purpose_gap or {}).get("criteria_total")
+                      or (purpose_before or {}).get("criteria_total"))
+        if met_before is not None and met_after is not None and total_crit:
+            closed = met_after - met_before
+            audit["criteria_closed"] = closed
+            print(f"{pfx}{'='*54}")
+            print(f"{pfx}PURPOSE SCORE: {closed:+d} criteria closed this run "
+                  f"({met_before} -> {met_after} of {total_crit} met).")
+            if closed <= 0 and (len(applied_set) or 0) > 0:
+                print(f"{pfx}  NOTE: {len(applied_set)} file(s) were fixed but NO "
+                      "criteria closed - this run tidied code without moving the "
+                      "program toward its purpose. The remaining gaps are the job.")
+            print(f"{pfx}{'='*54}")
+        elif total_crit:
+            audit["criteria_closed"] = None
+            print(f"{pfx}PURPOSE SCORE: unknown (baseline or final assessment "
+                  "missing) - criteria met now: "
+                  f"{met_after if met_after is not None else '?'}/{total_crit}.")
         _print_audit_summary(audit)
         print(f"{pfx}Low/info issues catalogued (not auto-fixed): {len(low_findings)}")
         print(f"{pfx}Cost: {meter.summary()}")
@@ -9744,6 +9867,83 @@ def _set_egress_mode(args) -> None:
         EGRESS_MODE = "block"
 
 
+def _arm_death_instrumentation() -> None:
+    """LOUD, CLEAN DEATH (owner order 2026-08-11). Runs died leaving NOTHING:
+    no traceback, no summary, a frozen status.json, and a stale audit lock -
+    six weeks of dead runs looked identical to 'still working'. Three layers,
+    each covering a different way to die:
+      1. faulthandler -> ~/.flexfactor/crash-<pid>.log: native crashes and
+         deadlocks dump every thread's stack (a plain traceback can't).
+      2. atexit obituary: whatever ends the interpreter, stamp status.json
+         phase='DIED ...' so the dashboard shows death instead of eternal
+         'fixing', and release every audit lock this pid still holds.
+      3. The obituary self-cancels on a clean finish (_mark_run_finished).
+    A hard kill (job object / power loss) beats all three - but then the NEXT
+    run's stale-lock takeover (dead pid) reclaims the lock, and status.json's
+    timestamp goes stale, which is itself the death signal."""
+    state_dir = os.path.join(os.path.expanduser("~"), ".flexfactor")
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        import faulthandler
+        global _CRASH_LOG_FH
+        _CRASH_LOG_FH = open(os.path.join(state_dir, f"crash-{os.getpid()}.log"),
+                             "w", encoding="utf-8")
+        _CRASH_LOG_FH.write(f"pid={os.getpid()} argv={sys.argv!r} "
+                            f"started={datetime.datetime.now().isoformat()}\n")
+        _CRASH_LOG_FH.flush()
+        faulthandler.enable(file=_CRASH_LOG_FH, all_threads=True)
+    except Exception:
+        pass  # instrumentation must never block the run itself
+
+    def _obituary():
+        if _RUN_FINISHED_CLEANLY.is_set():
+            # Clean finish: remove an empty crash log so healthy runs leave no litter.
+            try:
+                if _CRASH_LOG_FH:
+                    _CRASH_LOG_FH.close()
+                    p = os.path.join(state_dir, f"crash-{os.getpid()}.log")
+                    if os.path.getsize(p) < 200:  # header only - no crash dump
+                        os.remove(p)
+            except Exception:
+                pass
+            return
+        # Unclean end: stamp the status file so 'fixing' can never be the last word.
+        try:
+            sp = os.path.join(state_dir, "status.json")
+            st = json.loads(_read_text_safe(sp, 1 << 20) or "{}")
+            for prog in st.get("programs", []):
+                if not prog.get("done"):
+                    prog["phase"] = (f"DIED (pid {os.getpid()} exited during "
+                                     f"'{prog.get('phase', '?')}')")
+                    prog["done"] = True
+                    prog["errors"] = int(prog.get("errors") or 0) + 1
+            st["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            with open(sp, "w", encoding="utf-8") as fh:
+                json.dump(st, fh)
+        except Exception:
+            pass
+        # Release every audit lock THIS pid owns (never another live run's).
+        try:
+            me = str(os.getpid())
+            for f in os.listdir(state_dir):
+                if f.startswith("audit-") and f.endswith(".lock"):
+                    p = os.path.join(state_dir, f)
+                    if _read_text_safe(p, 100).strip() == me:
+                        os.remove(p)
+        except Exception:
+            pass
+    atexit.register(_obituary)
+
+
+_CRASH_LOG_FH = None
+_RUN_FINISHED_CLEANLY = threading.Event()
+
+
+def _mark_run_finished() -> None:
+    """Call on every intentional exit path; silences the death obituary."""
+    _RUN_FINISHED_CLEANLY.set()
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
@@ -10125,4 +10325,15 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Armed ONLY for the real CLI process: embedders/tests calling main() must
+    # not have a crash-log filehandle pinned open in their working dirs
+    # (Windows rmtree fails on open files).
+    _arm_death_instrumentation()
+    try:
+        rc = main()
+        _mark_run_finished()  # intentional exit (any code) - not a silent death
+        raise SystemExit(rc)
+    except SystemExit:
+        _mark_run_finished()  # argparse exit-2 etc. are intentional too
+        raise
+
