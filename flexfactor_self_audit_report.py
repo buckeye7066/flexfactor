@@ -74,6 +74,16 @@ def main() -> int:
         "--no-push", "--no-merge", "--yes", "--no-dashboard",
         "--max-cost", str(ns.max_cost),
     ]
+    # FlexFactor's FREE-FIRST policy (owner order 2026-08-11) prefers local
+    # ollama over any cloud provider whenever --provider isn't explicitly
+    # named -- correct default for real programs, but on this CPU-only
+    # machine local inference makes a genuine per-file review take 15-20+
+    # minutes, impractical for a report a human is waiting on. Naming
+    # --provider explicitly routes through ANTHROPIC_BASE_URL (the free FCC
+    # proxy, set by the caller) instead, without touching that default policy
+    # for any other program audited through the normal CLI.
+    if os.environ.get("FF_SELF_AUDIT_PROVIDER"):
+        argv += ["--provider", os.environ["FF_SELF_AUDIT_PROVIDER"]]
     print(f"Running real flexfactor audit engine (report-only self-audit): {argv}")
     rc = ff.main(argv)
     print(f"\nflexfactor.main() returned {rc}")
