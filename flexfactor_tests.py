@@ -48,6 +48,27 @@ ff.RUNS_PATH = os.path.join(_TEST_STATE_DIR, "runs")
 if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
     ff._PROGRESS.path = ff.STATUS_PATH
 
+# --------------------------------------------------------------------------- #
+# NEVER let a test reach out to a real FCC proxy / mutate real env vars.
+#
+# _auto_activate_fcc_proxy (2026-08-12, the FREE-FIRST concurrent-pool feature)
+# probes http://127.0.0.1:8082/health and, if it answers, mutates THIS
+# process's os.environ (ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/
+# ANTHROPIC_API_KEY/FLEXFACTOR_FALLBACK_ANTHROPIC_KEY) and flips the global
+# _FCC_PROXY_ACTIVE flag - by design, so a real run needs no manual env setup.
+# But this dev machine genuinely runs an fcc-server on that port most of the
+# time, and flexfactor_tests.py runs every test in ONE process: the first test
+# that calls build_audit_providers() with a free-first Args would silently
+# activate real proxy routing and poison every test that runs after it in the
+# same process (proven 2026-08-12: it flipped _FCC_PROXY_ACTIVE True mid-suite,
+# which broke an unrelated deadline test and a transport-recovery test whose
+# expectations predate this feature). Same TEST HYGIENE principle as the
+# BRAIN_PATH/RUNS_PATH/STATUS_PATH redirects above - neutralize it here,
+# unconditionally, before any test runs; a test that specifically wants to
+# exercise the real function installs its own fake and restores this no-op in
+# `finally` (see FreeReviewPoolTests).
+ff._auto_activate_fcc_proxy = lambda *a, **k: False
+
 
 class TestSessionIsolationTests(unittest.TestCase):
     """A guard that can actually fail: if the redirection above is removed or a
@@ -415,6 +436,171 @@ class PricingAndEconomyTests(unittest.TestCase):
         finally:
             ff._provider_key_present = real_key
             ff._provider_health = real_health
+
+
+class FreeReviewPoolTests(unittest.TestCase):
+    """2026-08-12 owner correction: the FCC proxy and local Ollama are both
+    genuinely free but not equally fast on this machine (Ollama is CPU-only -
+    a large-file review measured 20+ minutes locally vs under a minute
+    through the proxy). The old free-first check only ever tried
+    `_usable('ollama')` and picked a single winner, leaving a second usable
+    free backend completely idle. "make sure these different models are not
+    working independently... orchestrated... optimized" (owner) - these
+    tests prove build_audit_providers now builds a POOL when both are
+    usable, and that _review_all's dispatch genuinely self-balances by real
+    throughput rather than splitting work evenly or picking one and idling
+    the rest."""
+
+    def setUp(self):
+        # The module-level test guard neutralizes real network activation
+        # (see the top-of-file comment); remember it so each test can install
+        # its own fake and this always restores the neutral no-op after.
+        self._neutral_activate = ff._auto_activate_fcc_proxy
+
+    def tearDown(self):
+        ff._auto_activate_fcc_proxy = self._neutral_activate
+
+    def test_build_audit_providers_pools_fcc_and_ollama_when_both_usable(self):
+        from unittest import mock
+
+        class Args:
+            provider = "anthropic"       # argparse default, not an owner choice
+            explicit_provider = False    # free-first applies
+            model = None
+            economy = False
+            use_both = False
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        def fake_activate(timeout=3.0):
+            # Simulate a healthy proxy WITHOUT any real network call - mirrors
+            # what the real function does once its probe succeeds.
+            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8082"
+            os.environ["ANTHROPIC_AUTH_TOKEN"] = "freecc"
+            return True
+
+        real_key_present = ff._provider_key_present
+        real_health = ff._provider_health
+        real_make = ff.make_provider
+        ff._auto_activate_fcc_proxy = fake_activate
+        ff._provider_key_present = lambda name: name in ("anthropic", "ollama")
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (name, object())
+        try:
+            with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "ANTHROPIC_AUTH_TOKEN": "",
+                                              "ANTHROPIC_API_KEY": ""}):
+                providers = ff.build_audit_providers(Args)
+                pool = ff._LAST_FREE_REVIEW_POOL
+        finally:
+            ff._provider_key_present = real_key_present
+            ff._provider_health = real_health
+            ff.make_provider = real_make
+            os.environ.pop("ANTHROPIC_BASE_URL", None)
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        pool_names = [n for n, _, _ in pool]
+        self.assertEqual(pool_names, ["anthropic", "ollama"],
+                         "both free backends must be pooled, fcc first (fastest)")
+        self.assertEqual([n for n, _ in providers], ["anthropic"],
+                         "the AUTHOR/FIX phase stays single-provider - the fastest "
+                         "pool member - per the owner's 'don't overcomplicate the "
+                         "more-serial fix phase' instruction")
+
+    def test_only_ollama_usable_falls_back_to_single_entry_pool(self):
+        # The FCC proxy being down/unreachable must not break the existing
+        # single-free-backend path - same outcome as before this feature.
+        class Args:
+            provider = "anthropic"
+            explicit_provider = False
+            model = None
+            economy = False
+            use_both = False
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key_present = ff._provider_key_present
+        real_health = ff._provider_health
+        real_make = ff.make_provider
+        ff._auto_activate_fcc_proxy = lambda timeout=3.0: False  # proxy unreachable
+        ff._provider_key_present = lambda name: name == "ollama"
+        ff._provider_health = lambda name, meter=None: (name == "ollama", "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (name, object())
+        try:
+            providers = ff.build_audit_providers(Args)
+            pool = ff._LAST_FREE_REVIEW_POOL
+        finally:
+            ff._provider_key_present = real_key_present
+            ff._provider_health = real_health
+            ff.make_provider = real_make
+        self.assertEqual([n for n, _, _ in pool], ["ollama"])
+        self.assertEqual([n for n, _ in providers], ["ollama"])
+
+    def test_reviewer_pool_self_balances_toward_the_faster_backend(self):
+        # Direct proof of the dispatch mechanism: a "fast" backend and a
+        # "slow" backend pulling from the SAME shared file queue must have
+        # the fast one complete MORE files - no hardcoded ratio, just
+        # whichever backend's semaphore frees up first wins the next file.
+        calls = {"fast": 0, "slow": 0}
+        lock = threading.Lock()
+
+        class _FastProvider:
+            model = "fast-model"
+
+        class _SlowProvider:
+            model = "slow-model"
+
+        def fake_review(provider, rel, text, context=""):
+            name = "fast" if provider.model == "fast-model" else "slow"
+            with lock:
+                calls[name] += 1
+            time.sleep(0.002 if name == "fast" else 0.05)  # slow is 25x slower
+            return [], "ok"
+
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
+        ff.review_file = fake_review
+        pool = ff._ReviewerPool([
+            ("fast", _FastProvider(), 2),
+            ("slow", _SlowProvider(), 2),
+        ])
+        files = [f"f{i}.py" for i in range(60)]
+        try:
+            ff._review_all([], "/proj", files, workers=pool.total_concurrency(),
+                           reviewer_pool=pool)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(calls["fast"] + calls["slow"], len(files))
+        self.assertGreater(calls["fast"], calls["slow"],
+                           f"fast backend only got {calls['fast']} of {len(files)} files "
+                           f"(slow got {calls['slow']}) - pool is not self-balancing "
+                           "toward real throughput")
+
+    def test_legacy_single_reviewer_path_unaffected_when_no_pool_given(self):
+        # reviewer_pool defaults to None - every pre-existing _review_all
+        # caller/test must see EXACTLY the old behavior (every entry in
+        # `reviewers` reviews every file).
+        seen = []
+
+        class _R:
+            model = "m"
+
+        def fake_review(provider, rel, text, context=""):
+            seen.append(rel)
+            return [], "ok"
+
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
+        ff.review_file = fake_review
+        try:
+            ff._review_all([_R()], "/proj", ["a.py", "b.py"], workers=1)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        self.assertEqual(sorted(seen), ["a.py", "b.py"])
 
 
 class CrossVerifyPromptTests(unittest.TestCase):
@@ -9124,7 +9310,13 @@ class ResumeCheckpointTests(unittest.TestCase):
         self.assertEqual(cp.data.get("reviewed"), {})
         self.assertEqual(cp.data.get("mode"), "prodready")
 
-    def test_review_all_fires_checkpoint_with_full_snapshot(self):
+    def test_review_all_fires_checkpoint_per_file_immediately(self):
+        # 2026-08-12 fix: checkpoint_cb used to be a full-dict-SNAPSHOT callback
+        # invoked only every 10 completed files (batched). It is now a per-file
+        # DELTA callback - (rel, sha, findings) - invoked immediately after
+        # EACH review completes, matching what _review_all's own docstring
+        # always promised. See test_killed_mid_sweep_recovers_far_more_than_
+        # the_old_batched_checkpoint below for the durability payoff.
         finding = {"file": "bad.py", "line": 1, "severity": "high",
                    "category": "bug", "title": "t", "problem": "p", "fix": "f"}
         real_read = ff._read_text_and_sha
@@ -9134,8 +9326,8 @@ class ResumeCheckpointTests(unittest.TestCase):
                           (([finding], "s") if rel == "bad.py" else ([], "s")))
         seen = {}
 
-        def cb(ffs, clean, shas):
-            seen["ffs"], seen["clean"], seen["shas"] = ffs, clean, shas
+        def cb(rel, sha, findings):
+            seen[rel] = (sha, findings)
 
         class _R:
             model = "m"
@@ -9145,9 +9337,62 @@ class ResumeCheckpointTests(unittest.TestCase):
         finally:
             ff._read_text_and_sha = real_read
             ff.review_file = real_review
-        self.assertEqual(list(seen["ffs"]), ["bad.py"])
-        self.assertEqual(seen["shas"], {"bad.py": "sha-bad.py"})
-        self.assertEqual(seen["clean"], {"ok.py": "sha-ok.py"})
+        self.assertEqual(seen["bad.py"], ("sha-bad.py", [finding]))
+        self.assertEqual(seen["ok.py"], ("sha-ok.py", None))
+
+    def test_killed_mid_sweep_recovers_far_more_than_the_old_batched_checkpoint(self):
+        # EMPIRICAL REPRODUCTION of the 2026-08-12 defect this fix closes: a
+        # real audit of FlexFactor's own 12-file codebase was killed after 11
+        # files had genuinely completed review (with real findings) - only 1
+        # of those 11 survived to the checkpoint file, because the OLD code
+        # only flushed every-10th-file as a full-dict-snapshot loop that
+        # (see _review_all's call-site comment) defeated RunCheckpoint's own
+        # elapsed-time throttle down to a single disk write per batch.
+        #
+        # This proves the FIX on the exact same shape of failure: drive an
+        # 11-file sweep through a REAL flexfactor_runstate.RunCheckpoint via
+        # _review_all's (now per-file) checkpoint_cb, never call finish()
+        # (simulating a kill - nothing more runs after the sweep), then
+        # reload the checkpoint FROM DISK (a fresh read, not the in-memory
+        # object) exactly as a resumed run would. The old code recovered
+        # 1/11; this must recover SIGNIFICANTLY more.
+        import flexfactor_runstate as ffrs
+        n_files = 11
+        files = [f"f{i}.py" for i in range(n_files)]
+        real_read = ff._read_text_and_sha
+        real_review = ff.review_file
+        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
+        ff.review_file = lambda rv, rel, text, context="": ([], "clean")  # all clean, real findings not the point here
+
+        class _R:
+            model = "m"
+        cp = ffrs.new_run(ff.RUNS_PATH, program="killtest", project_dir="/proj",
+                          mode="audit", policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+
+        def cb(rel, sha, findings):
+            if sha:
+                cp.record_reviewed(rel, sha, findings)
+
+        try:
+            ff._review_all([_R()], "/proj", files, workers=1, checkpoint_cb=cb)
+        finally:
+            ff._read_text_and_sha = real_read
+            ff.review_file = real_review
+        # No cp.finish() call - this IS the kill. Reload from disk, fresh.
+        reloaded = ffrs.load(ff.RUNS_PATH, cp.run_id)
+        self.assertIsNotNone(reloaded, "checkpoint file must exist at all - "
+                             "even the OLD code got at least the sweep-end save")
+        recovered = len(reloaded.data.get("reviewed") or {})
+        self.assertGreater(recovered, 1,
+                           f"only {recovered}/{n_files} survived the simulated kill - "
+                           "no better than the OLD 1-of-11 defect this test reproduces")
+        self.assertGreaterEqual(recovered, n_files - 3,
+                                f"recovered {recovered}/{n_files}; the fix should lose "
+                                "at most a handful of the tail, not most of the sweep")
+        # The in-memory checkpoint (what a NON-killed process would have)
+        # always has every file - proving checkpoint_cb itself fires for
+        # every completed review, immediately, with no batching gap.
+        self.assertEqual(len(cp.data.get("reviewed") or {}), n_files)
 
     def test_interrupted_run_resumes_without_rebilling_review(self):
         # End to end THROUGH THE REAL ENTRY POINT: run 1 completes clean;

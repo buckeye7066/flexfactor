@@ -234,6 +234,56 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   primary still wins;
   `_cached_system()` marks Anthropic system prompts cacheable; `_judge()` routes
   classification calls to the judge tier
+- **CONCURRENT FREE-REVIEW POOL** (2026-08-12, owner correction): local Ollama
+  on this machine is CPU-only (measured: 20+ min for one large-file review);
+  the FCC proxy (`http://127.0.0.1:8082`, `~/.fcc`/`fcc-server`) answers the
+  same review in well under a minute. The old free-first check only ever
+  asked `_usable('ollama')` and picked ONE winner, leaving a usable second
+  free backend idle. Owner: "make sure these different models are not
+  working independently... orchestrated... optimized." Fix, when free-first
+  applies (no explicit `--provider`):
+  - `_auto_activate_fcc_proxy()` gives zero-setup: probes
+    `127.0.0.1:8082/health` directly (no launcher/env pre-setup required),
+    and if reachable (or startable via `fcc-server` on PATH), sets
+    `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` FOR THIS PROCESS and flips
+    the module-level `_FCC_PROXY_ACTIVE` flag BEFORE any call is made (that
+    flag is read-only elsewhere, frozen at import in the launcher-driven
+    case, so activating it late but before first use is the only safe way
+    to arm it without duplicating the deadline/restart protections it
+    gates). A real `ANTHROPIC_API_KEY` already present is preserved as
+    `FLEXFACTOR_FALLBACK_ANTHROPIC_KEY` (paid rescue), never discarded.
+  - `build_audit_providers` then builds `_LAST_FREE_REVIEW_POOL`
+    (`[(name, provider, concurrency), ...]`) from EVERY free backend usable
+    at once (FCC proxy at 2x concurrency = its own `PROVIDER_MAX_CONCURRENCY`;
+    Ollama at 2x = `_ollama_gate()`'s own default), not just one.
+  - `_review_all`'s new `_ReviewerPool` puts them all to work on ONE shared
+    file queue: `acquire()` tries every backend's semaphore in order and
+    returns whichever frees up first, so a fast backend naturally pulls more
+    files with no hardcoded ratio - self-balancing by real throughput.
+  - The single-provider AUTHOR/FIX phase (inherently more serial -
+    build-gating, cross-verification, commits) is NOT pooled; it stays on
+    whichever pool member is fastest (`pool[0]`), same as a single free-first
+    primary always has been. `reviewers` (the pre-existing --use-both
+    cross-check list) still runs on top of the pool result, unchanged
+    semantics, filtered so a backend already IN the pool is never
+    double-reviewed by itself.
+  - `flexfactor_tests.py` neutralizes `_auto_activate_fcc_proxy` to a no-op
+    at import (same TEST HYGIENE pattern as BRAIN_PATH/RUNS_PATH/STATUS_PATH):
+    this dev machine genuinely runs `fcc-server`, so an unguarded test would
+    silently activate real proxy routing mid-suite and poison every test
+    that ran after it (measured: broke an unrelated deadline test and a
+    transport-recovery test). `FreeReviewPoolTests` installs its own fakes
+    per-test and restores the no-op in `tearDown`.
+  - Gemini free tier (stretch goal, investigated 2026-08-12, NOT added): no
+    `GEMINI_API_KEY`/`GOOGLE_API_KEY` exists anywhere on this machine (env or
+    persisted user vars), and AITime's `config.json` Gemini entry is a
+    browser-launcher only (`aistudio.google.com`/`gemini.google.com` links,
+    "Google exposes no per-account quota API" - no programmatic credential
+    tracked at all). Adding it would mean the owner first provisioning a real
+    API key, then a brand-new `GeminiProvider` class (complete/grade/
+    structured/ping) wired into `make_provider`/pricing - a real new
+    integration, not the "clean, low-effort addition" the brief asked for.
+    Revisit if the owner provisions a Gemini API key.
 - Audit loop: `run_audit` → `audit_one_program` (cycle loop, until-clean) →
   `_review_all` (parallel, judge tier, 35% budget frac) → `_fix_files` →
   `_commit_and_sync`; sandbox branch `flexfactor/audit-<slug>`
@@ -354,6 +404,30 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   key (`_load_resume_state`/`_save_resume_state`, now deleted). A module
   existing and passing its own tests is not evidence it is wired in; grep for
   every symbol it exports before trusting a "this is now used" claim.
+  **Checkpoint-flush gap (found + fixed 2026-08-12):** `_review_all`'s
+  `checkpoint_cb` was gated `done["n"] % 10 == 0` - a full-dict-SNAPSHOT
+  callback fired only every 10th completed file. Empirically reproduced: a
+  real audit of FlexFactor's own 12-file codebase, killed after 11 files had
+  genuinely completed review, recovered only 1 of them. Root cause was two
+  compounding bugs, not one: (1) the 10-file batching itself, and (2) within
+  ONE batched call, looping `record_reviewed()` over 10 entries essentially
+  instantaneously defeated `RunCheckpoint.save()`'s own elapsed-time throttle
+  - real wall-clock time had passed since the LAST physical flush, so entry
+  #1 of the batch tripped the elapsed-time condition and reset the clock,
+  and the other 9 landed in memory only (too fast for the throttle to fire
+  again). Fixed by making `checkpoint_cb` a per-file DELTA callback -
+  `(rel, sha, findings)`, called immediately after EVERY completed review
+  (not batched) - exactly what the function's own docstring always promised.
+  This also drops the old post-loop full-snapshot re-flush (redundant once
+  every file already reported itself) and keeps the caller O(n) instead of
+  O(n^2) on a large sweep. `audit_one_program` also now force-flushes the
+  checkpoint at the review/fix phase boundary (`checkpoint.save(force=True)`),
+  matching the other phase-change force-saves. Proven in
+  `flexfactor_tests.py::ResumeCheckpointTests::
+  test_killed_mid_sweep_recovers_far_more_than_the_old_batched_checkpoint`:
+  the SAME 11-file-kill shape now recovers 10/11 from disk (vs the old 1/11),
+  driven through a REAL `flexfactor_runstate.RunCheckpoint`, never calling
+  `finish()` (the kill), then reloading fresh from disk.
 - Console progress: `ConsoleMeter` (2026-08-11, "no progress meter in option 4")
   draws ONE live status line fed from the same `report(**fields)` stream the
   dashboard uses, with a background tick so spinner/elapsed move during long

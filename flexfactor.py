@@ -1217,6 +1217,85 @@ def _ensure_fcc_proxy(wait_s: float = 90.0) -> bool:
         return False
 
 
+def _auto_activate_fcc_proxy(timeout: float = 3.0) -> bool:
+    """FREE-FIRST, zero-setup FCC proxy activation (2026-08-12).
+
+    build_audit_providers's free-first branch used to only ever check local
+    Ollama, because the FCC proxy only counts as "usable" once
+    ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN are already in the environment -
+    a signature the launchers set, not flexfactor.py itself. Measured on
+    this machine: local Ollama is CPU-only (a single large-file review took
+    20+ minutes) while the FCC proxy answers the same review in well under a
+    minute. So a bare `python flexfactor.py audit ...` with no launcher/env
+    setup was silently choosing the SLOW free tier over the FAST one whenever
+    both were reachable, and never even trying the fast one when nothing had
+    pre-configured it.
+
+    This probes the proxy's WELL-KNOWN default loopback address directly and,
+    if it's up (or startable via `fcc-server` on PATH, using the very
+    `_ensure_fcc_proxy` restart path above), activates routing FOR THIS
+    PROCESS ONLY: sets ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN and flips the
+    module-level `_FCC_PROXY_ACTIVE` flag so every deadline/restart
+    protection documented at that flag's definition arms correctly (those
+    protections exist precisely because a proxy call misclassified as "dead"
+    silently bills a paid key for healthy free traffic - skipping them here
+    would reintroduce that exact bug for a pool member no launcher armed).
+
+    Never touches an ALREADY-configured ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN
+    (some other setup - launcher, shell profile - already pointed this
+    somewhere; that choice is authoritative and untouched). A real
+    ANTHROPIC_API_KEY already present is never discarded: it moves to
+    FLEXFACTOR_FALLBACK_ANTHROPIC_KEY (unless something is already there), so
+    the exact same key that would otherwise have been used as an expensive
+    paid PRIMARY instead becomes the paid RESCUE key while the free proxy is
+    tried first - a strict improvement, not a loss of capability. Idempotent
+    and cheap to call repeatedly (a multi-program run calls this once per
+    program via build_audit_providers; every call after the first is a no-op
+    because ANTHROPIC_BASE_URL is then already set)."""
+    global _FCC_PROXY_ACTIVE
+    if os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return _FCC_PROXY_ACTIVE  # already configured by something else - leave it alone
+    default_base = "http://127.0.0.1:8082"
+
+    def _probe() -> bool:
+        import urllib.request
+        try:
+            with urllib.request.urlopen(default_base + "/health", timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    healthy = _probe()
+    if not healthy and not shutil.which("fcc-server"):
+        return False  # not reachable, and nothing on PATH that could start it
+    real_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if real_key and not os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"):
+        os.environ["FLEXFACTOR_FALLBACK_ANTHROPIC_KEY"] = real_key
+    if real_key:
+        os.environ["ANTHROPIC_API_KEY"] = ""  # must resolve via AUTH_TOKEN, not a real key
+    os.environ["ANTHROPIC_BASE_URL"] = default_base
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = "freecc"
+    _FCC_PROXY_ACTIVE = True  # arm every deadline/restart protection BEFORE any call is made
+    if not healthy:
+        healthy = _ensure_fcc_proxy()  # starts fcc-server and waits for /health
+    if not healthy:
+        # Roll back cleanly - nothing to route through.
+        _FCC_PROXY_ACTIVE = False
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+        if real_key:
+            os.environ["ANTHROPIC_API_KEY"] = real_key
+        return False
+    print("  [preflight] FREE-FIRST: FCC proxy detected/started at "
+          f"{default_base} - activated automatically, no env var setup "
+          "needed.", file=sys.stderr)
+    if real_key:
+        print("  [preflight] the ANTHROPIC_API_KEY already in this environment was "
+              "preserved as the paid rescue key (FLEXFACTOR_FALLBACK_ANTHROPIC_KEY) "
+              "while the free proxy is tried first.", file=sys.stderr)
+    return True
+
+
 def _stream_with_deadline(client, *, deadline_s: float | None = None,
                           idle_s: float | None = None,
                           **stream_kwargs) -> object:
@@ -2488,6 +2567,25 @@ def _provider_health(name: str, meter: "CostMeter | None" = None) -> tuple[bool,
 # (e.g. keys are present but every one is out of credits / rejected).
 _PROVIDER_DIAGNOSIS: str = ""
 
+# Set by build_audit_providers when the free-first POOL applies (2026-08-12
+# owner correction): [(name, provider, concurrency), ...] for every genuinely
+# free backend usable AT ONCE, so _review_all can keep them ALL busy on one
+# shared file queue instead of picking a single winner and idling the rest.
+# Empty when the pool doesn't apply (explicit --provider, only one free
+# backend usable, or neither usable). audit_one_program reads this
+# immediately after calling build_audit_providers, same pattern as
+# _PROVIDER_DIAGNOSIS.
+_LAST_FREE_REVIEW_POOL: list[tuple[str, object, int]] = []
+
+# Per-backend concurrency ceilings for the free-review pool, matching each
+# backend's OWN real capacity limit that already governs it elsewhere in this
+# file (not a new number invented for the pool):
+#   - FCC proxy: PROVIDER_MAX_CONCURRENCY=2 (see the stall-classifier comment
+#     block above _stream_deadline_seconds - a 3rd concurrent call queues).
+#   - Ollama: _ollama_gate()'s own default of 2 in-flight HTTP calls.
+_FCC_POOL_CONCURRENCY = 2
+_OLLAMA_POOL_CONCURRENCY = 2
+
 
 def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[str, object]]:
     """Build the active provider list for audit, keyed by which API keys exist.
@@ -2497,8 +2595,9 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     provider's key present, the second provider is appended for cross-model
     verification. All providers share `meter` so token spend bills into one
     budget. Returns [] if no key is set at all (caller errors out)."""
-    global _PROVIDER_DIAGNOSIS
+    global _PROVIDER_DIAGNOSIS, _LAST_FREE_REVIEW_POOL
     _PROVIDER_DIAGNOSIS = ""
+    _LAST_FREE_REVIEW_POOL = []
     primary = args.provider
     if primary == "ollama":
         # LOCAL-ONLY: never silently add a CLOUD cross-checker to a run the
@@ -2547,11 +2646,52 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # provider, the local (free) model AUTHORS and the cloud provider stays on as the
     # cross-check reviewer that keeps it on target. An EXPLICIT `--provider ollama`
     # still means LOCAL-ONLY / zero-egress and adds no cloud secondary (set above).
-    if _free_first_applies and _usable("ollama"):
-        primary, other = "ollama", None
-        print("  [preflight] FREE-FIRST: authoring locally with 'ollama'; "
-              "cloud cross-check disabled to preserve local-only source handling.",
-              file=sys.stderr)
+    #
+    # CONCURRENT FREE POOL (owner correction 2026-08-12): the FCC proxy and
+    # local Ollama are BOTH genuinely free, but not equally fast on this
+    # machine (Ollama is CPU-only - a large-file review measured 20+ minutes
+    # locally vs under a minute through the proxy). The old free-first check
+    # only ever asked "_usable('ollama')?" and picked a single winner,
+    # leaving a usable second free backend completely idle. "make sure these
+    # different models are not working independently, but are orchestrated
+    # within FlexFactor so their work is optimized" (owner) - so when more
+    # than one free backend is usable, build a POOL that _review_all puts ALL
+    # of them to work on simultaneously via a shared file queue (self-
+    # balancing: a fast backend's semaphore frees up sooner, so it naturally
+    # pulls more files - see _ReviewerPool). The single-provider AUTHOR/FIX
+    # phase (inherently more serial - build-gating, cross-verification,
+    # commits) is deliberately NOT pooled; it stays on whichever pool member
+    # is fastest, exactly as a single free-first primary always has.
+    if _free_first_applies:
+        _auto_activate_fcc_proxy()  # zero-setup: give the fast free tier a chance too
+        fcc_usable = _usable("anthropic") and _provider_free_routed("anthropic")
+        ollama_usable = _usable("ollama")
+        if fcc_usable or ollama_usable:
+            judge_override = getattr(args, "judge_model", None)
+            pool: list[tuple[str, object, int]] = []
+            if fcc_usable:
+                pool.append(("anthropic",
+                             make_provider("anthropic", DEFAULT_MODELS["anthropic"], meter,
+                                          judge_model=judge_override),
+                             _FCC_POOL_CONCURRENCY))
+            if ollama_usable:
+                pool.append(("ollama",
+                             make_provider("ollama", DEFAULT_MODELS["ollama"], meter,
+                                          judge_model=judge_override),
+                             _OLLAMA_POOL_CONCURRENCY))
+            _LAST_FREE_REVIEW_POOL = pool
+            primary, other = pool[0][0], None  # fastest usable free backend authors/fixes
+            if len(pool) > 1:
+                names = " + ".join(f"{n}({c}x concurrent)" for n, _, c in pool)
+                print(f"  [preflight] FREE-FIRST POOL: {names} all usable - reviewing "
+                      f"concurrently across every free backend instead of picking one "
+                      f"and leaving the rest idle; authoring/fixing with '{primary}' "
+                      "(the fastest).", file=sys.stderr)
+            else:
+                print(f"  [preflight] FREE-FIRST: authoring locally with '{primary}'"
+                      + (("; cloud cross-check disabled to preserve local-only "
+                          "source handling.") if primary == "ollama" else "."),
+                      file=sys.stderr)
 
     if not _usable(primary):
         # ENV-MISMATCH GUARD (2026-08-11 live failure): a stale script passed
@@ -7410,12 +7550,54 @@ REVIEW_WORKERS = 8
 FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead of the apply loop
 
 
+class _ReviewerPool:
+    """Concurrent orchestration across MULTIPLE free review backends that are
+    all genuinely usable at once (2026-08-12 owner correction: "make sure
+    these different models are not working independently, but are
+    orchestrated within FlexFactor so their work is optimized" - the FCC
+    proxy and local Ollama must not sit one idle while the other works).
+
+    Each entry carries its OWN concurrency ceiling (a semaphore, sized to
+    that backend's real capacity - see _FCC_POOL_CONCURRENCY/
+    _OLLAMA_POOL_CONCURRENCY). `acquire()` tries every backend's semaphore in
+    order and returns whichever has a free slot FIRST; a backend that
+    finishes a review quickly frees its slot sooner and gets checked (and
+    re-claimed) again immediately, so a fast backend naturally pulls more of
+    the shared file queue with no hardcoded ratio - self-balancing by real
+    throughput, exactly as asked."""
+
+    def __init__(self, entries: list[tuple[str, object, int]]):
+        self.entries = list(entries)  # [(name, provider, concurrency), ...]
+        self._sems = [threading.Semaphore(max(1, c)) for _, _, c in self.entries]
+
+    def total_concurrency(self) -> int:
+        return sum(max(1, c) for _, _, c in self.entries) if self.entries else 0
+
+    def acquire(self) -> int:
+        """Block until SOME backend has a free slot; return its index."""
+        while True:
+            for i, sem in enumerate(self._sems):
+                if sem.acquire(blocking=False):
+                    return i
+            time.sleep(0.05)  # brief poll; every slot is currently in flight
+
+    def release(self, idx: int) -> None:
+        self._sems[idx].release()
+
+    def provider(self, idx: int):
+        return self.entries[idx][1]
+
+    def name(self, idx: int) -> str:
+        return self.entries[idx][0]
+
+
 def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 soft_cap_usd: float | None = None,
                 workers: int = REVIEW_WORKERS,
                 context: str = "",
-                checkpoint_cb=None) -> tuple[dict, list, set, dict, set]:
+                checkpoint_cb=None,
+                reviewer_pool: "_ReviewerPool | None" = None) -> tuple[dict, list, set, dict, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
@@ -7433,9 +7615,24 @@ def _review_all(reviewers: list, project_dir: str,
         through to a real, paid review. That re-hash is what keeps resume from
         reporting findings about bytes that no longer exist. Replay is free, so
         it proceeds even after the budget cutoff has stopped new model calls.
-      - `on_reviewed(rel, sha, findings)` is called for every COMPLETED review so
-        the caller can checkpoint incrementally; a killed process then resumes
-        from the last flush instead of re-reviewing the whole repository."""
+      - `checkpoint_cb(rel, sha, findings)` is called for every COMPLETED review,
+        immediately (2026-08-12 fix: this docstring always promised per-file,
+        but the implementation batched every 10 files until proven to lose 10
+        of 11 completed reviews on a kill - see the comment at the call site),
+        so the caller can checkpoint incrementally; a killed process then
+        resumes from the last flush instead of re-reviewing the whole
+        repository.
+
+    CONCURRENT FREE POOL (2026-08-12): `reviewer_pool`, when given, covers the
+    PRIMARY review duty for every file - one pool member reviews each file
+    (whichever backend's semaphore frees up first, see _ReviewerPool), so
+    multiple free backends work the shared file queue TOGETHER instead of one
+    idling while `reviewers` alone drives every file serially through a
+    single backend. `reviewers` still runs on top of the pool result for
+    every file when given alongside a pool (e.g. an explicit --use-both
+    cross-check reviewer) - unchanged cross-check semantics, just no longer
+    the only way to get review throughput. `reviewers` stays the ONLY review
+    mechanism when `reviewer_pool` is None (legacy path, unchanged)."""
     file_findings: dict[str, list[dict]] = {}
     flat: list[dict] = []
     unreadable: set[str] = set()          # contained read REFUSED (never mark clean)
@@ -7468,7 +7665,30 @@ def _review_all(reviewers: list, project_dir: str,
         # files belongs at ENUMERATION, not as a pre-review 'clean'.)
         merged: list[dict] = []
         complete = True  # only a review where EVERY reviewer COMPLETED can be clean
+        # PRIMARY duty: one pool backend (whichever frees up first) reviews this
+        # file - see _ReviewerPool. Skipped entirely when no pool was given
+        # (legacy single/multi-reviewer path below is unchanged).
+        if reviewer_pool is not None and reviewer_pool.entries:
+            idx = reviewer_pool.acquire()
+            try:
+                findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
+                                                 context=context)
+                merged.extend(findings)
+            except BudgetExceededError:
+                stop.set()
+                complete = False
+            except Exception as ex:  # one bad LLM call must not abort the sweep
+                print(f"  [skip] {rel}: review failed via {reviewer_pool.name(idx)} ({ex})")
+                complete = False
+            finally:
+                reviewer_pool.release(idx)
+        # CROSS-CHECK duty (unchanged semantics): every entry in `reviewers`
+        # reviews EVERY file too - this is the existing --use-both quality
+        # cross-check, orthogonal to the throughput pool above. When no pool
+        # was given, this loop IS the whole review (exactly as before).
         for reviewer in reviewers:
+            if not complete:
+                break
             # Budget is reserved inside the provider call (the single chokepoint), so
             # concurrent review workers can't collectively pass --max-cost. A refusal
             # raises BudgetExceededError -> stop the whole sweep cleanly.
@@ -7486,7 +7706,15 @@ def _review_all(reviewers: list, project_dir: str,
             return (rel, "incomplete")  # NEVER clean; re-reviewed next cycle
         return (rel, _dedupe_findings(merged), sha)
 
-    n_workers = max(1, min(workers, total)) if total else 1
+    if reviewer_pool is not None and reviewer_pool.entries:
+        # As many OS threads as the pool can genuinely use at once (sum of
+        # every backend's own concurrency ceiling), capped by an explicit
+        # --review-workers if the owner set one lower, and never more than
+        # there are files.
+        n_workers = (max(1, min(workers, reviewer_pool.total_concurrency(), total))
+                    if total else 1)
+    else:
+        n_workers = max(1, min(workers, total)) if total else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_review_one, rel): rel for rel in files}
         for fut in concurrent.futures.as_completed(futures):
@@ -7517,12 +7745,26 @@ def _review_all(reviewers: list, project_dir: str,
                     reviewed_sha[rel] = res[2]
                 else:
                     reviewed_clean[rel] = res[2]  # fully reviewed, empty -> clean allowlist
-                # RESUME checkpoint: persist completed reviews every 10 files so
-                # a crash mid-sweep loses at most the last few paid calls.
-                if checkpoint_cb is not None and done["n"] % 10 == 0:
+                # RESUME checkpoint: persist THIS ONE completed review immediately,
+                # not batched. Empirically proven 2026-08-12: batching every 10
+                # files, combined with RunCheckpoint.save()'s own elapsed-time
+                # throttle, meant a single checkpoint_cb call (looping over a
+                # full-dict snapshot) flushed only its FIRST entry to disk - real
+                # wall-clock time had passed since the last flush, so entry #1
+                # tripped the elapsed-time condition and reset the clock, and the
+                # other 9 landed in memory only (the loop re-called record_reviewed
+                # for all 10 essentially instantly, too fast for the elapsed-time
+                # or pending-count conditions to fire again). A killed run
+                # recovered 1 of 11 completed reviews instead of 11. A per-file
+                # delta call gives RunCheckpoint's own throttle real wall-clock
+                # gaps between calls (each review is a genuine LLM round-trip),
+                # so it flushes as designed - see flexfactor_runstate's
+                # DEFAULT_FLUSH_EVERY/DEFAULT_FLUSH_INTERVAL_S - and stays O(1)
+                # per call (O(n) total) instead of O(n) per call re-scanning the
+                # whole sweep so far (O(n^2) total on a large repo).
+                if checkpoint_cb is not None:
                     try:
-                        checkpoint_cb(dict(file_findings), dict(reviewed_clean),
-                                      dict(reviewed_sha))
+                        checkpoint_cb(rel, res[2], merged if merged else None)
                     except Exception:
                         pass  # checkpointing must never break the sweep
                 sev_counts: dict[str, int] = {}
@@ -7547,11 +7789,9 @@ def _review_all(reviewers: list, project_dir: str,
     if incomplete:
         print(f"  [warn] {len(incomplete)} file(s) had an INCOMPLETE review "
               "(budget/error) - NOT marked clean, will be re-reviewed")
-    if checkpoint_cb is not None:
-        try:
-            checkpoint_cb(dict(file_findings), dict(reviewed_clean), dict(reviewed_sha))
-        except Exception:
-            pass
+    # No trailing full-snapshot flush needed here: every completed review
+    # already reported its own delta via checkpoint_cb above, immediately
+    # when it finished (see the per-file call inside the loop).
     return file_findings, flat, unreadable, reviewed_clean, incomplete
 
 
@@ -8349,9 +8589,27 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = why
             return result
         author = providers[0][1]
-        reviewers = [p for _, p in providers]
         cross = providers[1][1] if len(providers) > 1 else None
-        active = ", ".join(f"{n}:{p.model}" for n, p in providers)
+        # CONCURRENT FREE POOL (2026-08-12): when build_audit_providers found
+        # multiple free backends usable at once, it populated
+        # _LAST_FREE_REVIEW_POOL - wrap it so _review_all splits the file
+        # queue across all of them instead of reviewing serially through the
+        # single `author` provider. `reviewers` then holds only whatever is
+        # GENUINELY additional to the pool (e.g. an explicit --use-both
+        # cross-check on a paid provider) so nothing gets double-reviewed by
+        # the same backend twice.
+        reviewer_pool = (_ReviewerPool(_LAST_FREE_REVIEW_POOL)
+                         if _LAST_FREE_REVIEW_POOL else None)
+        if reviewer_pool is not None:
+            pool_names = {n for n, _, _ in _LAST_FREE_REVIEW_POOL}
+            reviewers = [p for n, p in providers if n not in pool_names]
+            active = " + ".join(f"{n}(pool):{p.model}" for n, p, _ in _LAST_FREE_REVIEW_POOL)
+            if reviewers:
+                active += ", " + ", ".join(f"{n}(cross):{p.model}"
+                                           for n, p in providers if n not in pool_names)
+        else:
+            reviewers = [p for _, p in providers]
+            active = ", ".join(f"{n}:{p.model}" for n, p in providers)
 
         print(f"{pfx}FlexFactor AUDIT | dir={project_dir}")
         print(f"{pfx}providers={active} fix>={args.fix_severity} "
@@ -8584,23 +8842,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             review_reserve = (meter.limit_usd * REVIEW_BUDGET_FRAC
                               if meter.limit_usd else None)
             soft = review_reserve if cycle == 1 else None
-            def _resume_checkpoint(ffs: dict, sweep_clean: dict, shas: dict,
+            def _resume_checkpoint(rel: str, sha: str, findings: list | None,
                                    _cycle=cycle):
-                # Persist completed reviews mid-flight so a crash resumes
-                # instead of re-paying. `checkpoint.data["reviewed"]` already
-                # holds every entry recovered at start (RunCheckpoint was
-                # continued, not recreated, in that case) plus everything
+                # Persist ONE completed review immediately (per-file delta, not
+                # a full-dict snapshot - see _review_all's call site) so a
+                # crash resumes instead of re-paying. `checkpoint.data["reviewed"]`
+                # already holds every entry recovered at start (RunCheckpoint
+                # was continued, not recreated, in that case) plus everything
                 # recorded on earlier calls of THIS run - record_reviewed only
                 # ADDS/overwrites the given key, so nothing here needs to be
                 # replayed by hand the way the old brain-based save did.
-                if checkpoint is None:
+                if checkpoint is None or not sha:
                     return
-                for rel, fl in ffs.items():
-                    sha = shas.get(rel)
-                    if sha:
-                        checkpoint.record_reviewed(rel, sha, fl)
-                for rel, sha in sweep_clean.items():
-                    checkpoint.record_reviewed(rel, sha, None)
+                checkpoint.record_reviewed(rel, sha, findings)
 
             sweep_files = files
             if cycle == 1 and resume_findings:
@@ -8609,7 +8863,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             file_findings, flat, unreadable, reviewed_clean, review_incomplete = _review_all(
                 reviewers, project_dir, sweep_files, report=report, meter=meter, soft_cap_usd=soft,
                 workers=getattr(args, "review_workers", REVIEW_WORKERS),
-                context=purpose_blob, checkpoint_cb=_resume_checkpoint)
+                context=purpose_blob, checkpoint_cb=_resume_checkpoint,
+                reviewer_pool=reviewer_pool)
+            if checkpoint is not None:
+                # Force a durable flush now, at the review/fix phase boundary
+                # (same pattern as the other phase-change force-saves:
+                # set_phase/record_cycle/finish). Every completed review this
+                # sweep was already recorded in memory via `_resume_checkpoint`
+                # immediately, per file (see _review_all's checkpoint_cb call),
+                # but the physical write is throttled (flexfactor_runstate's
+                # DEFAULT_FLUSH_EVERY/_INTERVAL_S) so the tail end of a sweep
+                # can still be sitting unflushed when the (also crash-capable)
+                # fixing phase starts.
+                checkpoint.save(force=True)
             if cycle == 1 and resume_findings:
                 # Recovered reviews join the sweep's results exactly as if they
                 # had been reviewed this cycle (they were - by the interrupted
