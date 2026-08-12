@@ -319,15 +319,41 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   env or `~/.flexfactor/policy.json`.
 - State: `~/.flexfactor/brain.json` (per-project memory incl. clean_files skip),
   `~/.flexfactor/status.json` (dashboard bus via `ProgressBus`)
-- RESUME (owner order 2026-08-11, "there needs to be a resume"): `_review_all`
-  checkpoints every completed per-file review (sha-keyed) into the brain's
-  per-project `resume` record every 10 files + at sweep end
-  (`_save_resume_state`); `audit_one_program` recovers sha-matching entries at
-  start (`_load_resume_state`) - recovered clean files join the skip set,
-  recovered findings skip cycle-1 review and go straight to fixing. Cleared
-  only when a run CONVERGES (`_brain_record_run`); a cost-capped or crashed
-  run keeps it. `--recheck` ignores it. Policy-versioned like clean_files -
-  never trusted across a content or policy change.
+- RESUME (owner order 2026-08-11, "there needs to be a resume"; FIXED
+  2026-08-12 - it was never actually wired in, see the trap note below):
+  storage lives in `flexfactor_runstate.py`, one durable file per run under
+  `RUNS_PATH` (`~/.flexfactor/runs/<run-id>/checkpoint.json`) -
+  deliberately NOT brain.json, which is capped at `MAX_BRAIN_PROJECTS` (40)
+  with LRU eviction and is exactly what destroyed every real project's
+  memory on 2026-08-11. `audit_one_program` calls `_resume_recover` at start:
+  it finds the latest resumable checkpoint for this program+dir
+  (`flexfactor_runstate.latest_resumable`) and re-verifies every recorded
+  entry against the file's CURRENT contained-read sha
+  (`flexfactor_runstate.verify_reviewed`) - recovered clean files join the
+  skip set, recovered findings skip cycle-1 review and go straight to
+  fixing, anything changed or unreadable is dropped and re-reviewed.
+  `_resume_checkpoint_for` then either CONTINUES that same checkpoint (same
+  run_id, `resume_count` incremented) or starts a fresh one
+  (`flexfactor_runstate.new_run`) if nothing was resumable. During the run,
+  `_review_all`'s existing `checkpoint_cb` (every 10 files + at sweep end)
+  now calls `checkpoint.record_reviewed(...)` directly - the checkpoint's own
+  `reviewed` map already carries forward every recovered entry, so nothing is
+  replayed by hand the way the old brain-based save did. At the end of the
+  run `checkpoint.finish(status=...)` marks it `"finished"` (converged -
+  nothing left to resume) or `"interrupted"` (cost cap / manual-review
+  leftovers / a caught exception - stays resumable); a genuine crash never
+  reaches `finish()` at all, so the checkpoint stays `"running"`, which is
+  also resumable. `--recheck` ignores it. Policy-versioned like clean_files -
+  never trusted across a content or policy change. `flexfactor_tests.py`
+  redirects `RUNS_PATH` to a tempdir at import, same as `BRAIN_PATH`/
+  `STATUS_PATH` (`TestSessionIsolationTests` guards all three).
+  **Trap (found 2026-08-12):** `flexfactor_runstate.py` was written, committed,
+  and independently adversarial-tested in isolation - and then never called
+  from anywhere else in the file. The resume mechanism that actually ran in
+  production was a DIFFERENT, older one living inside brain.json's `resume`
+  key (`_load_resume_state`/`_save_resume_state`, now deleted). A module
+  existing and passing its own tests is not evidence it is wired in; grep for
+  every symbol it exports before trusting a "this is now used" claim.
 - Console progress: `ConsoleMeter` (2026-08-11, "no progress meter in option 4")
   draws ONE live status line fed from the same `report(**fields)` stream the
   dashboard uses, with a background tick so spinner/elapsed move during long

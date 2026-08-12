@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -40,6 +41,10 @@ import tempfile as _tempfile  # noqa: E402
 _TEST_STATE_DIR = _tempfile.mkdtemp(prefix="flexfactor-tests-state-")
 ff.BRAIN_PATH = os.path.join(_TEST_STATE_DIR, "brain.json")
 ff.STATUS_PATH = os.path.join(_TEST_STATE_DIR, "status.json")
+# RUNS_PATH holds the flexfactor_runstate resume checkpoints (~/.flexfactor/runs
+# for real; here, the tempdir) - the SAME class of owner-state hazard as
+# BRAIN_PATH/STATUS_PATH, so it gets the identical unconditional redirection.
+ff.RUNS_PATH = os.path.join(_TEST_STATE_DIR, "runs")
 if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
     ff._PROGRESS.path = ff.STATUS_PATH
 
@@ -52,11 +57,13 @@ class TestSessionIsolationTests(unittest.TestCase):
     def test_brain_and_status_paths_are_not_the_real_ones(self):
         home_flex = os.path.join(os.path.expanduser("~"), ".flexfactor")
         for name, path in (("BRAIN_PATH", ff.BRAIN_PATH),
-                           ("STATUS_PATH", ff.STATUS_PATH)):
+                           ("STATUS_PATH", ff.STATUS_PATH),
+                           ("RUNS_PATH", ff.RUNS_PATH)):
             self.assertFalse(
                 os.path.abspath(path).lower().startswith(os.path.abspath(home_flex).lower()),
                 f"{name} points at the owner's real state ({path}); a test run "
-                "would evict real projects from brain.json")
+                "would evict real projects from brain.json or write resume "
+                "checkpoints into the owner's real ~/.flexfactor/runs")
 
     def test_the_real_brain_is_untouched_by_a_write(self):
         real = os.path.join(os.path.expanduser("~"), ".flexfactor", "brain.json")
@@ -9026,29 +9033,97 @@ class GapClosureVerifiedOnlyTests(unittest.TestCase):
 class ResumeCheckpointTests(unittest.TestCase):
     """Owner order 2026-08-11: "Is there a 'resume' button...? If not, there
     needs to be." An interrupted run checkpoints every completed per-file
-    review (sha-keyed) into the brain; re-running the same command recovers
+    review (sha-keyed) into its own durable file under RUNS_PATH
+    (flexfactor_runstate.py - NOT brain.json, which is capped at
+    MAX_BRAIN_PROJECTS with LRU eviction and is what destroyed every real
+    project's memory on 2026-08-11); re-running the same command recovers
     them instead of re-paying. Fix commits already survive via per-cycle
-    commits - this covers the REVIEW side, which used to be lost entirely."""
+    commits - this covers the REVIEW side, which used to be lost entirely.
+
+    `flexfactor_runstate`'s OWN internal safety logic (sha-verification,
+    policy-version invalidation, crash-mid-write handling) has its own
+    dedicated test coverage; these tests are about the WIRING - that
+    `audit_one_program` actually reads and writes through it, which used to
+    be false (the module existed but nothing outside itself ever called it)."""
 
     def setUp(self):
-        # BRAIN_PATH is already redirected to a temp dir at import; make each
-        # test start from an empty brain anyway.
+        # BRAIN_PATH/RUNS_PATH are already redirected to temp dirs at import;
+        # make each test start from empty state anyway.
         with contextlib.suppress(OSError):
             os.remove(ff.BRAIN_PATH)
+        with contextlib.suppress(OSError):
+            shutil.rmtree(ff.RUNS_PATH)
 
-    def test_save_load_roundtrip_and_policy_guard(self):
-        ff._save_resume_state("/proj", {"a.py": {"sha": "s1", "findings": [{"t": 1}]}},
-                              {"b.py": "s2"})
-        prior = ff._load_brain().get("/proj") or {}
-        rs = ff._load_resume_state(prior)
-        self.assertEqual(rs["findings"]["a.py"]["sha"], "s1")
-        self.assertEqual(rs["clean"], {"b.py": "s2"})
-        # A checkpoint written under a DIFFERENT policy version is never
-        # trusted (the review rules changed; the cached verdicts may not hold).
-        prior2 = json.loads(json.dumps(prior))
-        prior2["resume"]["policy"] = "some-older-policy"
-        rs2 = ff._load_resume_state(prior2)
-        self.assertEqual(rs2, {"findings": {}, "clean": {}})
+    def test_resume_recover_and_checkpoint_for_roundtrip(self):
+        import flexfactor_runstate as ffrs
+        root = ff.RUNS_PATH
+        # Seed a checkpoint as if a prior run of this program was interrupted.
+        cp = ffrs.new_run(root, program="proj", project_dir="/proj", mode="audit",
+                          policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+        cp.record_reviewed("a.py", "s1", [{"t": 1}])
+        cp.record_reviewed("b.py", "s2", None)
+        cp.finish(status="interrupted")
+
+        real_hash = ff._file_sha_contained
+        ff._file_sha_contained = lambda pd, rel: {"a.py": "s1", "b.py": "s2"}.get(rel)
+        try:
+            recovered, clean, cache, stale = ff._resume_recover(ffrs, "/proj", "proj", False)
+        finally:
+            ff._file_sha_contained = real_hash
+        self.assertIsNotNone(recovered)
+        self.assertEqual(clean, {"b.py": "s2"})
+        self.assertEqual(cache["a.py"]["findings"], [{"t": 1}])
+        self.assertEqual(stale, 0)
+
+        # --recheck must behave as if nothing was ever recorded.
+        recovered2, clean2, cache2, stale2 = ff._resume_recover(ffrs, "/proj", "proj", True)
+        self.assertIsNone(recovered2)
+        self.assertEqual((clean2, cache2, stale2), ({}, {}, 0))
+
+        # Continuing the recovered checkpoint keeps the SAME run_id (so its
+        # "reviewed" map is carried forward, never replayed by hand) and
+        # counts the resume.
+        cp2 = ff._resume_checkpoint_for(ffrs, recovered, program="proj",
+                                        project_dir="/proj", mode="audit")
+        self.assertEqual(cp2.run_id, cp.run_id)
+        self.assertEqual(cp2.data["resume_count"], 1)
+        self.assertIn("a.py", cp2.data["reviewed"])
+
+        # A CHANGED file's stale sha must be dropped, not trusted.
+        ff._file_sha_contained = lambda pd, rel: {"a.py": "CHANGED", "b.py": "s2"}.get(rel)
+        try:
+            recovered3, clean3, cache3, stale3 = ff._resume_recover(ffrs, "/proj", "proj", False)
+        finally:
+            ff._file_sha_contained = real_hash
+        self.assertEqual(clean3, {"b.py": "s2"})
+        self.assertEqual(cache3, {})
+        self.assertEqual(stale3, 1)
+
+    def test_finished_checkpoint_is_not_resumable_but_interrupted_is(self):
+        import flexfactor_runstate as ffrs
+        root = ff.RUNS_PATH
+        cp = ffrs.new_run(root, program="proj2", project_dir="/proj2", mode="audit",
+                          policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+        cp.record_reviewed("a.py", "sX", [{"t": 1}])
+        cp.finish(status="interrupted")
+        self.assertTrue(ffrs.is_resumable(ffrs.load(root, cp.run_id).data),
+                        "a non-converged run must stay resumable")
+        cp.finish(status="finished")
+        self.assertFalse(ffrs.is_resumable(ffrs.load(root, cp.run_id).data),
+                         "a converged (finished) run has nothing left to resume")
+
+    def test_checkpoint_for_starts_fresh_when_nothing_recovered(self):
+        # The other branch of `_resume_checkpoint_for`: no resumable prior
+        # run (first-ever audit of a program) must still get a live, usable
+        # checkpoint - just a brand new one, never a resume_count bump.
+        import flexfactor_runstate as ffrs
+        cp = ff._resume_checkpoint_for(ffrs, None, program="proj3",
+                                       project_dir="/proj3", mode="prodready")
+        self.assertIsNotNone(cp)
+        self.assertEqual(cp.data["status"], "running")
+        self.assertEqual(cp.data.get("resume_count"), 0)
+        self.assertEqual(cp.data.get("reviewed"), {})
+        self.assertEqual(cp.data.get("mode"), "prodready")
 
     def test_review_all_fires_checkpoint_with_full_snapshot(self):
         finding = {"file": "bad.py", "line": 1, "severity": "high",
@@ -9075,22 +9150,22 @@ class ResumeCheckpointTests(unittest.TestCase):
         self.assertEqual(seen["shas"], {"bad.py": "sha-bad.py"})
         self.assertEqual(seen["clean"], {"ok.py": "sha-ok.py"})
 
-    def test_converged_run_clears_resume_but_interrupted_keeps_it(self):
-        ff._save_resume_state("/proj", {"a.py": {"sha": "s", "findings": [{}]}}, {})
-        ff._brain_record_run("/proj", {"when": "now", "converged": False,
-                                       "defects": 1, "fixed": 0, "usd": 0.0})
-        self.assertIn("resume", ff._load_brain()["/proj"],
-                      "a non-converged run must keep its checkpoint")
-        ff._brain_record_run("/proj", {"when": "now", "converged": True,
-                                       "defects": 0, "fixed": 1, "usd": 0.0})
-        self.assertNotIn("resume", ff._load_brain()["/proj"],
-                         "a converged run has nothing to resume")
-
     def test_interrupted_run_resumes_without_rebilling_review(self):
-        # End to end: run 1 completes clean; simulate an interruption checkpoint
-        # holding a completed review-with-findings for the (unchanged) file;
-        # run 2 must recover it - reporting the defect WITHOUT a single
-        # provider call - and still run as a real apply run.
+        # End to end THROUGH THE REAL ENTRY POINT: run 1 completes clean;
+        # simulate an INTERRUPTED run's flexfactor_runstate checkpoint (not
+        # brain.json - that mechanism is gone) holding a completed
+        # review-with-findings for the (unchanged) file; run 2, through the
+        # real audit_one_program, must recover it - reporting the defect
+        # WITHOUT a single provider call - and still run as a real apply run.
+        #
+        # This pins the WIRING: flexfactor_runstate.py existed and was
+        # independently proven sound in isolation, but nothing outside
+        # itself ever called it (`_runstate_module()` was defined and never
+        # used elsewhere) - the interrupted GrantFlow run this module exists
+        # to prevent would still have re-paid for 858 files under the old,
+        # never-actually-connected code. If a future refactor disconnects
+        # the wiring again, this test fails instead of silently doing so.
+        import flexfactor_runstate as ffrs
         helper = AuditPipelineIntegrationTests()
         with helper._run_one({"app.py": "x = 1\n"},
                              ("--no-purpose-gap", "--no-readiness")) as (res, root):
@@ -9105,13 +9180,20 @@ class ResumeCheckpointTests(unittest.TestCase):
                 brain = ff._load_brain()
                 rec = brain.get(key) or {}
                 rec.pop("clean_files", None)  # force re-enumeration of app.py
-                rec["resume"] = {"policy": ff.POLICY_VERSION, "tool": ff.TOOL_VERSION,
-                                 "when": "t",
-                                 "findings": {"app.py": {"sha": sha,
-                                                         "findings": [finding]}},
-                                 "clean": {}}
                 brain[key] = rec
                 ff._save_brain(brain)
+            # `display_name` is what audit_one_program will resolve `root` to
+            # (resolve_program_input -> _gather_from_folder: the folder's own
+            # basename) - the checkpoint's "program" field must match that
+            # for latest_resumable() to find it, exactly as a real prior run
+            # of THIS SAME invocation would have recorded.
+            display_name = os.path.basename(root.rstrip("\\/")) or root
+            cp = ffrs.new_run(ff.RUNS_PATH, program=display_name, project_dir=key,
+                              mode="prodready", policy=ff.POLICY_VERSION,
+                              tool=ff.TOOL_VERSION)
+            cp.record_reviewed("app.py", sha, [finding])
+            cp.finish(status="interrupted")  # killed mid-run: not converged
+
             args = helper._args(["prodready", "--program", root, "--no-bootstrap",
                                  "--no-preflight", "--no-dashboard", "--no-tests",
                                  "--no-e2e", "--no-full-suite", "--no-purpose-gap",
@@ -9127,6 +9209,15 @@ class ResumeCheckpointTests(unittest.TestCase):
                              "the recovered finding must reach the results")
             self.assertEqual(stub.calls, [],
                              "a recovered review must not be re-billed")
+            # This second run converges (nothing left to fix at fix-severity
+            # 'medium' since the finding is 'low'... but readiness/purpose are
+            # off and the only finding is sub-floor, so nothing gets fixed and
+            # the run should still finish and leave its OWN checkpoint marked
+            # "finished" - not stuck "running"/"interrupted" forever.
+            run2 = ffrs.load(ff.RUNS_PATH, cp.run_id)
+            self.assertIn(run2.data.get("status"), ("finished", "interrupted"),
+                         "the resumed checkpoint must reach a terminal status, "
+                         "not be left dangling mid-run")
 
 
 class EconomyFlagUniformityTests(unittest.TestCase):

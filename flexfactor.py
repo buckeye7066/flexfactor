@@ -537,11 +537,10 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
             rec["clean_files"] = {"policy": POLICY_VERSION,
                                   "tool": TOOL_VERSION,
                                   "files": dict(clean_map)}
-        # A CONVERGED run has nothing left to resume; anything else (cost cap,
-        # interruption recorded later, incomplete review) keeps its checkpoint
-        # so the next run picks up where this one left off.
-        if summary.get("converged"):
-            rec.pop("resume", None)
+        # Resume state itself no longer lives here (see the RUNS_PATH comment
+        # above): `audit_one_program` finishes its own `flexfactor_runstate`
+        # checkpoint directly (status "finished" on convergence, "interrupted"
+        # otherwise) - nothing to pop from the brain record any more.
         brain[project_dir] = rec
         # The top-level dict is keyed by project dir and would otherwise grow (and be
         # re-serialized) forever; keep the most recently audited projects only.
@@ -554,45 +553,69 @@ def _brain_record_run(project_dir: str, summary: dict, clean_map=None) -> None:
         _save_brain(brain)
 
 
-def _load_resume_state(prior: dict) -> dict:
-    """Recover the mid-run review checkpoint left by an interrupted run.
+def _resume_mode_for(args) -> str:
+    """Informational only (goes in the checkpoint's 'mode' field): prodready
+    sets its own branch-prefix default before this is read, so that is the
+    cheapest reliable signal without threading an explicit mode string through
+    every caller."""
+    return "prodready" if "prodready" in str(getattr(args, "branch_prefix", "")) else "audit"
+
+
+def _resume_recover(rs_module, project_dir: str, program: str, recheck: bool):
+    """Look up the newest resumable checkpoint for this program+dir (via
+    `flexfactor_runstate`, NOT brain.json - see the RUNS_PATH comment above)
+    and re-verify every recorded review against the CURRENT on-disk bytes.
 
     Owner order 2026-08-11: "there needs to be a resume" - a run that dies
     mid-flow (crash, Ctrl-C, power loss, credits) must not make the next run
-    re-pay for reviews that already completed. The checkpoint is sha-keyed per
-    file and policy-versioned, so nothing is ever trusted across a content
-    change or a review-policy change."""
-    rs = (prior or {}).get("resume")
-    if isinstance(rs, dict) and rs.get("policy") == POLICY_VERSION:
-        f = rs.get("findings")
-        c = rs.get("clean")
-        return {"findings": dict(f) if isinstance(f, dict) else {},
-                "clean": dict(c) if isinstance(c, dict) else {}}
-    return {"findings": {}, "clean": {}}
+    re-pay for reviews that already completed. `verify_reviewed` is sha-keyed
+    per file and policy-versioned, so nothing is ever trusted across a content
+    or review-policy change.
+
+    Returns (raw_checkpoint_data_or_None, clean:{rel: sha},
+    resume_cache:{rel: {"sha","findings"}}, dropped_count)."""
+    if rs_module is None or recheck:
+        return None, {}, {}, 0
+    data = rs_module.latest_resumable(RUNS_PATH, program=program, project_dir=project_dir)
+    if data is None:
+        return None, {}, {}, 0
+    hasher = lambda rel: _file_sha_contained(project_dir, rel)  # noqa: E731
+    clean, findings, dropped = rs_module.verify_reviewed(data, hasher, POLICY_VERSION)
+    cache = {rel: {"sha": sha, "findings": list(fl)} for rel, (sha, fl) in findings.items()}
+    return data, dict(clean), cache, len(dropped)
 
 
-def _save_resume_state(project_dir: str, findings_cache: dict, clean: dict) -> None:
-    """Persist the in-flight review state (atomic, best-effort - a failed
-    checkpoint must never break the run it is trying to protect).
+def _resume_checkpoint_for(rs_module, recovered: dict | None, *, program: str,
+                           project_dir: str, mode: str):
+    """Get this run's live checkpoint object: CONTINUE the recovered one
+    (its 'reviewed' map already holds every entry re-verified by
+    `_resume_recover`, so per-file checkpointing only ever ADDS to it) or
+    start a fresh one. None when the module is unavailable - resume simply
+    goes away, same fail-soft contract as `_runstate_module()`.
 
-    `findings_cache` is {rel: {"sha": <reviewed sha>, "findings": [...]}} for
-    completed reviews that FOUND something; `clean` is {rel: sha} for completed
-    reviews that found nothing. Overwritten on every checkpoint so it always
-    reflects the latest completed work; cleared by _brain_record_run once a run
-    CONVERGES (a finished-clean program has nothing to resume)."""
+    A recovered checkpoint written under a DIFFERENT policy is never
+    continued, even though `is_resumable()` (which only checks schema/pid
+    liveness, not policy) would allow it: `_resume_recover` already refused
+    to surface any of its old entries this run (policy mismatch drops
+    everything), so continuing it would just relabel a semantically stale
+    document as current - and a later resume of THAT continued checkpoint
+    would then wrongly compare fresh entries recorded THIS run against the
+    OLD policy tag still sitting in `data["policy"]`. Starting fresh keeps
+    the checkpoint's policy honest for its own future resumes."""
+    if rs_module is None:
+        return None
     try:
-        with _BRAIN_LOCK, _brain_file_lock():
-            brain = _load_brain()
-            rec = brain.get(project_dir) or {"history": [], "cumulative": {}}
-            rec["resume"] = {"policy": POLICY_VERSION, "tool": TOOL_VERSION,
-                             "when": _now_iso(),
-                             "findings": dict(findings_cache),
-                             "clean": dict(clean)}
-            brain[project_dir] = rec
-            _save_brain(brain)
+        if (recovered is not None and rs_module.is_resumable(recovered)
+                and recovered.get("policy") == POLICY_VERSION):
+            cp = rs_module.RunCheckpoint(RUNS_PATH, dict(recovered))
+            cp.data["resume_count"] = int(cp.data.get("resume_count") or 0) + 1
+            cp.data["status"] = "running"
+            cp.save(force=True)
+            return cp
+        return rs_module.new_run(RUNS_PATH, program=program, project_dir=project_dir,
+                                 mode=mode, policy=POLICY_VERSION, tool=TOOL_VERSION)
     except Exception:
-        pass  # checkpointing is protection, never a new failure mode
-
+        return None  # checkpointing is protection, never a new failure mode
 
 
 # --------------------------------------------------------------------------- #
@@ -8160,6 +8183,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
               "fixed": 0, "unverified": 0, "test_status": None, "e2e_status": "skipped",
               "commit_status": "n/a", "report_path": None, "cycles": 0, "error": None}
     lock_path: str | None = None
+    # This run's durable resume checkpoint (flexfactor_runstate.RunCheckpoint),
+    # created below once the project is resolved. Declared here so the
+    # top-level except/finally can always see it, even if something fails
+    # before it is created.
+    checkpoint = None
     # Live console meter (spinner/heartbeat). Created up front so `finally` can
     # always stop it; started once the program is resolved and reporting begins.
     console_meter = ConsoleMeter()
@@ -8210,43 +8238,36 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     prior_clean[rel] = sha
                     clean_files.add(rel.replace("\\", "/"))
         # RESUME (owner order 2026-08-11: "there needs to be a resume"). An
-        # interrupted run checkpoints every completed per-file review into the
-        # brain; recover them here so re-running the same command picks up
-        # where the run died instead of re-paying for finished reviews. Every
-        # entry is sha-verified against the file's CURRENT contained read -
-        # anything changed since it was reviewed is dropped and re-reviewed.
-        # --recheck opts out (same switch as the clean-file memory).
+        # interrupted run checkpoints every completed per-file review into its
+        # OWN durable file under RUNS_PATH (flexfactor_runstate.py) - NOT
+        # brain.json, which is capped at MAX_BRAIN_PROJECTS with LRU eviction
+        # and is exactly what destroyed every project's memory on 2026-08-11.
+        # Recover it here so re-running the same command picks up where the
+        # run died instead of re-paying for finished reviews. Every entry is
+        # sha-verified against the file's CURRENT contained read - anything
+        # changed since it was reviewed is dropped and re-reviewed. --recheck
+        # opts out (same switch as the clean-file memory).
         resume_findings: dict[str, list[dict]] = {}
-        resume_cache: dict[str, dict] = {}   # rel -> {"sha","findings"} carried forward
-        if not getattr(args, "recheck", False):
-            _rs = _load_resume_state(prior)
-            stale = 0
-            for rel, sha in (_rs.get("clean") or {}).items():
-                key = str(rel).replace("\\", "/")
-                if key in clean_files:
-                    continue
-                cur = _file_sha_contained(project_dir, rel)
-                if cur is not None and cur == sha:
-                    prior_clean[key] = sha
-                    clean_files.add(key)
-                else:
-                    stale += 1
-            for rel, entry in (_rs.get("findings") or {}).items():
-                sha = (entry or {}).get("sha")
-                found = (entry or {}).get("findings")
-                cur = _file_sha_contained(project_dir, rel)
-                if sha and isinstance(found, list) and found and cur == sha:
-                    key = str(rel).replace("\\", "/")
-                    resume_findings[key] = found
-                    resume_cache[key] = {"sha": sha, "findings": found}
-                else:
-                    stale += 1
-            if resume_findings or stale:
-                print(f"{pfx}Resume: recovered {len(resume_findings)} completed "
-                      "review(s) with findings from the interrupted run "
-                      "(sha-verified, not re-billed)"
-                      + (f"; {stale} stale entr{'y' if stale == 1 else 'ies'} "
-                         "dropped for re-review" if stale else "") + ".")
+        _rsmod = _runstate_module()
+        recovered_run, recovered_clean, resume_cache, stale = _resume_recover(
+            _rsmod, project_dir, display_name, getattr(args, "recheck", False))
+        for rel, sha in recovered_clean.items():
+            key = str(rel).replace("\\", "/")
+            if key in clean_files:
+                continue
+            prior_clean[key] = sha
+            clean_files.add(key)
+        for rel, entry in resume_cache.items():
+            resume_findings[str(rel).replace("\\", "/")] = list(entry.get("findings") or [])
+        if resume_findings or stale:
+            print(f"{pfx}Resume: recovered {len(resume_findings)} completed "
+                  "review(s) with findings from the interrupted run "
+                  "(sha-verified, not re-billed)"
+                  + (f"; {stale} stale entr{'y' if stale == 1 else 'ies'} "
+                     "dropped for re-review" if stale else "") + ".")
+        checkpoint = _resume_checkpoint_for(
+            _rsmod, recovered_run, program=display_name, project_dir=project_dir,
+            mode=_resume_mode_for(args))
         if prior.get("last_run"):
             lr = prior["last_run"]
             cum = prior.get("cumulative") or {}
@@ -8553,16 +8574,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             def _resume_checkpoint(ffs: dict, sweep_clean: dict, shas: dict,
                                    _cycle=cycle):
                 # Persist completed reviews mid-flight so a crash resumes
-                # instead of re-paying. Carries forward the still-valid
-                # recovered entries plus everything this run proved clean.
-                cache = dict(resume_cache)
+                # instead of re-paying. `checkpoint.data["reviewed"]` already
+                # holds every entry recovered at start (RunCheckpoint was
+                # continued, not recreated, in that case) plus everything
+                # recorded on earlier calls of THIS run - record_reviewed only
+                # ADDS/overwrites the given key, so nothing here needs to be
+                # replayed by hand the way the old brain-based save did.
+                if checkpoint is None:
+                    return
                 for rel, fl in ffs.items():
-                    if rel in shas:
-                        cache[rel] = {"sha": shas[rel], "findings": fl}
-                clean_now = dict(prior_clean)
-                clean_now.update(run_clean_sha)
-                clean_now.update(sweep_clean)
-                _save_resume_state(project_dir, cache, clean_now)
+                    sha = shas.get(rel)
+                    if sha:
+                        checkpoint.record_reviewed(rel, sha, fl)
+                for rel, sha in sweep_clean.items():
+                    checkpoint.record_reviewed(rel, sha, None)
 
             sweep_files = files
             if cycle == 1 and resume_findings:
@@ -9176,6 +9201,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                               "severity": f.get("severity"), "title": f.get("title")}
                              for f in low_findings[:500]],
         }, clean_map=clean_map)
+        # Finish THIS run's own durable checkpoint (flexfactor_runstate.py,
+        # not brain.json - see the RUNS_PATH/RESUME comments above). A
+        # CONVERGED run has nothing left to resume, so it is marked
+        # "finished" (no longer resumable); anything else (cost cap, manual-
+        # review leftovers, an aborted cycle) is marked "interrupted" so the
+        # next invocation of the same program recovers it.
+        if checkpoint is not None:
+            with contextlib.suppress(Exception):
+                checkpoint.finish(
+                    status=("finished" if converged else "interrupted"),
+                    defects_found=len(all_findings), defects_fixed=len(applied_files))
+        if _rsmod is not None:
+            with contextlib.suppress(Exception):
+                _rsmod.prune(RUNS_PATH)  # bound ~/.flexfactor/runs; keep finished runs pruned first
         # End-of-run branch restore: never leave the repo PARKED on the sandbox
         # branch. Parking is what broke the live SermonSmith run of 2026-08-11 -
         # the NEXT run then sees prev_branch == the sandbox branch, self-merges
@@ -9202,6 +9241,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     except Exception as ex:  # one program must never abort the batch
         print(f"{pfx}FATAL (recovered): {ex}", file=sys.stderr)
         result["error"] = str(ex)
+        if checkpoint is not None:
+            with contextlib.suppress(Exception):
+                checkpoint.finish(status="interrupted", error=str(ex)[:200])
         try:
             _PROGRESS.update(index, phase="error", done=True, error=str(ex)[:200])
         except Exception:
