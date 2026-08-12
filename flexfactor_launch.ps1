@@ -316,10 +316,17 @@ if ($mode -eq "3") {
     # Build a repeatable --program list, one flag per program.
     $programArgs = @()
     foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
-    $providerArgs = @('--provider', $primary)
+    # NO '--provider' (owner order 2026-08-11, same reasoning as prodready mode
+    # above - this was a real bug: prodready omitted --provider correctly but
+    # audit mode still built and passed it here, which marks the choice EXPLICIT
+    # and suppresses FREE-FIRST, silently sending the whole audit to a paid
+    # cloud key even when a healthy local ollama is sitting idle. $primary above
+    # is still validated (errors out if neither credential exists) but is no
+    # longer forwarded to the CLI; preflight picks the free local model as
+    # author and keeps a usable cloud key as the cross-check reviewer.
 
     Write-Host ""
-    $null = Invoke-FlexFactorJob (@('audit') + $providerArgs + $programArgs + $extraArgs)
+    $null = Invoke-FlexFactorJob (@('audit') + $programArgs + $extraArgs)
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0

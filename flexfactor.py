@@ -93,13 +93,15 @@ except ImportError:
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "openai": "gpt-4o",
-    # LOCAL tier: strongest installed local coder. qwen3-coder:30b is a Mixture-of-
-    # Experts model, so it activates far fewer parameters per token than the dense
-    # deepseek-coder:33b it replaced - materially faster on the same hardware, and a
-    # newer code-specialised checkpoint. Both are installed on this machine (verified
-    # via `ollama list` 2026-08-11); relative QUALITY on these repos is NOT yet
-    # benchmarked. Override with --model.
-    "ollama": "qwen3-coder:30b",
+    # LOCAL tier. qwen3-coder:30b and deepseek-coder:33b (~18GB each) were both
+    # tried and BOTH fail to load on this machine's hardware - measured 2026-08-12:
+    # deepseek-coder:33b timed out with "timed out waiting for llama-server to
+    # start" after 5+ minutes; qwen3-coder:30b is the same size class and was not
+    # expected to fare differently (MoE lowers per-token compute once loaded, not
+    # the RAM/VRAM footprint required to load 18GB of weights in the first place).
+    # qwen2.5-coder:7b is VERIFIED working on this machine: ~2min cold load, then
+    # fast, correct code generation. Override with --model if hardware changes.
+    "ollama": "qwen2.5-coder:7b",
 }
 
 # JUDGE tier: a much cheaper model for the high-volume *classification* calls
