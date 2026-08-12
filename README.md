@@ -9,21 +9,29 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   rewrite -> grade -> accept at threshold.
 - **scout** - profiles a program (folder / .lnk / URL / description), searches the
   local Repo Rewards service for useful open-source repos, LLM-judges each repo's
-  benefit, and (by default) APPLIES the ADOPT-tier integrations on a
-  `flexfactor/adopt-<repo>` branch, verified by the project's own build, with hard
-  rollback on failure. `--report-only` to just get the report.
+  benefit, and writes a report. Proposal-only by default: `--apply` emits
+  integration PROPOSALS on a `flexfactor/adopt-<repo>` branch, verified by the
+  project's own build with hard rollback; actually mutating the target needs the
+  separate FlexFactor apply approval (`.flexfactor-apply-approval.json`).
 - **prodready** - point it at any program and walk away. Detects every toolchain
   in the tree (13 ecosystems, monorepo-aware), installs the project's own
   dependencies so the build gate measures the CODE rather than a missing
   `node_modules`, runs the full audit fix loop down to medium severity, then
-  scores the result against a 12-gate production-readiness rubric and writes a
+  scores the result against a 13-gate production-readiness rubric and writes a
   scorecard naming exactly what still blocks release. Asks nothing beyond the
-  program. `--report-only` / `--dry-run` still just look.
+  program. Every run is REAL (owner order 2026-08-11): there is no
+  report-only/dry-run mode - invoking prodready or audit means fixes get
+  applied.
 - **audit** - aggressive line-by-line defect hunt and auto-fix across a whole
   codebase (up to 5 programs in parallel). Dual-model adversarial review, per-file
   build gate, cross-model veto, unit + e2e test generation, converges with
   `--until-clean`, hard `--max-cost` budget (default $50/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
+  **Resume is automatic**: every completed per-file review is checkpointed
+  (sha-keyed) as the sweep runs, and fixes commit per cycle - if a run dies
+  mid-flow (crash, Ctrl-C, credits), re-running the same command picks up
+  where it left off instead of re-paying for finished work. `--recheck`
+  discards the memory and starts fresh.
 
 ## Token economics (how cost is kept down)
 
@@ -104,7 +112,7 @@ Desktop launchers (in `G:\One Drive\Desktop`): **FlexFactor.lnk** (menu),
 
 ## What "production ready" is allowed to mean
 
-The verdict is a checklist with evidence, not a judgement call. 12 deterministic
+The verdict is a checklist with evidence, not a judgement call. 13 deterministic
 gates (no model involved) cover buildability, tests, committed secrets,
 dependency pinning, config externalisation, CI, docs, licence and a deployable
 artifact. A gate is `pass`, `fail`, `na`, or `unknown` — and `unknown` is
