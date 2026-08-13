@@ -2858,6 +2858,101 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
         return path, ""
 
 
+# A LAUNCHER shortcut points at a shell and names the real program in its
+# Arguments / WorkingDirectory: "Factory Deck.lnk" is
+#   cmd.exe /c "C:\Users\firer\local-ai-factory\scripts\start-factory.cmd"
+# so reading TargetPath alone only ever sees an interpreter and the program can
+# never resolve. Every launcher-style Desktop shortcut failed this way.
+_LAUNCHER_SHELLS = {"cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe",
+                    "cscript.exe", "conhost.exe", "explorer.exe"}
+
+# Shortcuts whose real source repo cannot be derived from the launcher at all.
+# "Claude Code - FREE (Ollama)" runs ~/.fcc/fcc-toggle.ps1 -- a TOGGLE for the
+# free review route. Its WorkingDirectory is the whole user profile and the
+# script sits in ~/.fcc, a config dir holding .env + .env.bak files with live
+# keys. Neither is auditable, but the free route DOES have real source, so the
+# shortcut is mapped to it instead of being dropped: excluding it would have
+# silently removed a free backend's code from the portfolio.
+_SHORTCUT_PROJECT_OVERRIDES = {
+    "claude code - free (ollama)": r"C:\Users\firer\fcc-ollama",
+}
+
+
+def _shortcut_working_dir(path: str) -> str:
+    """WorkingDirectory of a .lnk ("" if unavailable). Separate from
+    _resolve_shortcut so that function's (target, args) arity stays intact for
+    its existing callers."""
+    if not path.lower().endswith(".lnk") or any(ord(ch) < 32 for ch in path):
+        return ""
+    ps_path = path.replace("'", "''")
+    ps = ("$ws = New-Object -ComObject WScript.Shell; "
+          f"$s = $ws.CreateShortcut('{ps_path}'); "
+          "Write-Output $s.WorkingDirectory")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=15)
+        lines = out.stdout.splitlines()
+        return lines[0].strip() if lines else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _is_auditable_project_dir(d: str) -> bool:
+    """Reject 'folders' that are not programs. A dirname-walk off a launcher will
+    otherwise happily hand back the user-profile root or a dot-config dir, and
+    pointing an audit at ~/.fcc would aim the reviewer straight at .env files
+    full of live keys."""
+    if not d or not os.path.isdir(d):
+        return False
+    real = os.path.realpath(d)
+    # Drive root ("C:\\") -- os.path.dirname of a top-level dir returns itself.
+    if os.path.dirname(real).rstrip("\\/") == real.rstrip("\\/"):
+        return False
+    base = os.path.basename(real)
+    if base.startswith("."):          # .fcc, .claude, .cache ...
+        return False
+    low = real.lower().rstrip("\\/")
+    if low in {os.path.expanduser("~").lower().rstrip("\\/"),
+               r"c:\users", r"c:\windows", r"c:\program files",
+               r"c:\program files (x86)"}:
+        return False
+    return True
+
+
+def _launcher_project_dir(lnk_path: str, target: str, sc_args: str) -> str | None:
+    """Recover the real source folder behind a LAUNCHER shortcut, or None.
+
+    Tries the shortcut's WorkingDirectory first (the most reliable signal), then
+    any existing path mentioned in its Arguments, walking each up to its git root
+    so .../local-ai-factory/scripts/start-factory.cmd lands on the repo, not
+    scripts/. Every candidate must pass _is_auditable_project_dir."""
+    override = _SHORTCUT_PROJECT_OVERRIDES.get(
+        os.path.splitext(os.path.basename(lnk_path))[0].strip().lower())
+    if override and os.path.isdir(override):
+        return override
+    if os.path.basename(target).lower() not in _LAUNCHER_SHELLS:
+        return None
+
+    candidates: list[str] = []
+    wd = _shortcut_working_dir(lnk_path)
+    if wd:
+        candidates.append(wd)
+    # Pull real filesystem paths out of the argument string (quoted or bare).
+    for tok in re.findall(r'"([^"]+)"|(\S+)', sc_args or ""):
+        raw = (tok[0] or tok[1]).strip()
+        if len(raw) > 3 and (":\\" in raw or ":/" in raw):
+            candidates.append(raw if os.path.isdir(raw) else os.path.dirname(raw))
+
+    for cand in candidates:
+        if not cand or not os.path.isdir(cand):
+            continue
+        r = _git(["rev-parse", "--show-toplevel"], cand)
+        root = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else cand
+        if _is_auditable_project_dir(root):
+            return os.path.realpath(root)
+    return None
+
+
 def _project_root_and_rel(abspath: str) -> tuple[str, str]:
     """Anchor a file at its GIT repo root (if any) else its own directory, returning
     (root, repo-relative-path) so the containment openat-walk covers the FULL ancestor
@@ -3851,6 +3946,13 @@ def resolve_project_dir(program_arg: str, profile_name: str) -> str | None:
         target, sc_args = _resolve_shortcut(arg)
         if os.path.isdir(target):
             return target
+        # A LAUNCHER shortcut (cmd.exe/powershell.exe wrapper) names its program in
+        # Arguments/WorkingDirectory, not TargetPath. Checked before the name-based
+        # fuzzy match because it is exact: 'Factory Deck' fuzzy-matches nothing, yet
+        # its WorkingDirectory IS C:\Users\firer\local-ai-factory.
+        launcher_dir = _launcher_project_dir(arg, target, sc_args)
+        if launcher_dir:
+            return launcher_dir
         # A .lnk that opens a code-host page (Chrome --new-window github.com/o/repo)
         # still names a local project: try the URL's repo name AND the shortcut's
         # own name (minus generic words like 'Repo'), then the profile name.
