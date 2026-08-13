@@ -7549,6 +7549,21 @@ REVIEW_BUDGET_FRAC = 0.35
 REVIEW_WORKERS = 8
 FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead of the apply loop
 
+# Owner report 2026-08-12: "we are at 0/331 ... I don't want the fixes to come
+# at the end of the run, but to happen during the run." Root cause: a cycle
+# used to review its ENTIRE sweep (every file) before _fix_files was called
+# even once, so on a large codebase the console's "resolved" (fix_done/
+# fix_total) counter sat frozen at 0 for the whole review phase - most of a
+# run's wall-clock time - and every fix then landed in one batch at the very
+# end. Chunking the sweep into batches of this size and interleaving
+# review-then-fix PER BATCH (see the cycle loop in audit_one_program) makes
+# fixes start landing, and the counter start climbing, within the first
+# batch instead of after the last file of the whole sweep. Override with
+# --review-fix-batch-size; every per-file safety mechanism (build gate,
+# adversarial verify, rollback, budget cap, commit cadence) is unchanged -
+# only the grouping of files handed to review/_fix_files per call changed.
+REVIEW_FIX_BATCH_SIZE = 20
+
 
 class _ReviewerPool:
     """Concurrent orchestration across MULTIPLE free review backends that are
@@ -8856,74 +8871,225 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     return
                 checkpoint.record_reviewed(rel, sha, findings)
 
+            def _checkpoint(_c=cycle):
+                # Commit+push+merge progress mid-cycle so an interruption (e.g.
+                # credits running out) can't lose this cycle's accumulated fixes.
+                nonlocal committed_any
+                if git:
+                    s = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                         f"cycle {_c} checkpoint", stack)
+                    if "committed" in s:  # a real commit landed on the branch
+                        committed_any = True
+                    print(f"{pfx}git (checkpoint): {s}")
+
             sweep_files = files
             if cycle == 1 and resume_findings:
                 skip = set(resume_findings)
                 sweep_files = [f for f in files if f not in skip]
-            file_findings, flat, unreadable, reviewed_clean, review_incomplete = _review_all(
-                reviewers, project_dir, sweep_files, report=report, meter=meter, soft_cap_usd=soft,
-                workers=getattr(args, "review_workers", REVIEW_WORKERS),
-                context=purpose_blob, checkpoint_cb=_resume_checkpoint,
-                reviewer_pool=reviewer_pool)
-            if checkpoint is not None:
-                # Force a durable flush now, at the review/fix phase boundary
-                # (same pattern as the other phase-change force-saves:
-                # set_phase/record_cycle/finish). Every completed review this
-                # sweep was already recorded in memory via `_resume_checkpoint`
-                # immediately, per file (see _review_all's checkpoint_cb call),
-                # but the physical write is throttled (flexfactor_runstate's
-                # DEFAULT_FLUSH_EVERY/_INTERVAL_S) so the tail end of a sweep
-                # can still be sitting unflushed when the (also crash-capable)
-                # fixing phase starts.
-                checkpoint.save(force=True)
-            if cycle == 1 and resume_findings:
-                # Recovered reviews join the sweep's results exactly as if they
-                # had been reviewed this cycle (they were - by the interrupted
-                # run, against the same bytes).
-                for rel, fl in resume_findings.items():
-                    file_findings.setdefault(rel, fl)
-                    flat.extend(fl)
-            # A file the contained read REFUSED is never clean and never auto-fixed:
-            # set it aside for manual review (a swapped symlink / fail-closed platform).
-            for rel in unreadable:
-                manual_review.add(rel)
-                fix_notes.append(f"{rel}: could not be safely read (containment refused) - manual review")
-            all_findings = flat  # latest cycle reflects the current code state
-            latest_findings_by_file.update(file_findings)  # keep each file's most-recent findings
-            print(f"{pfx}Found {len(flat)} defect(s) across {len(file_findings)} file(s).")
-            report(defects=len(flat), severity=_severity_breakdown(flat),
-                   phase=f"fixing (cycle {cycle}/{cycle_cap})")
 
-            # Hard cost cap: if we're already over budget, don't start fixing.
-            if meter.over_limit():
-                print(f"{pfx}cost cap reached before fixing ({meter.summary()}); stopping.")
-                fix_notes.append(f"stopped at cost cap: {meter.summary()}")
-                stop_reason = f"hit ${args.max_cost:.0f} cost cap (NOT fully clean)"
-                break
+            # BATCHED review-then-fix (owner fix 2026-08-12; see REVIEW_FIX_BATCH_SIZE
+            # above). Review a chunk of the sweep, immediately fix whatever THAT chunk
+            # turned up, then move to the next chunk - instead of reviewing the WHOLE
+            # sweep (which can be hundreds of files) before _fix_files is ever called
+            # once. Every stop condition below fires exactly where the old single-shot
+            # code fired it - cost-cap, DirtyTreeError, verifier-outage and "nothing
+            # auto-fixable" all still abort the WHOLE RUN (not just one chunk); only
+            # the GROUPING of files handed to _review_all/_fix_files per call changed.
+            batch_size = max(1, int(getattr(args, "review_fix_batch_size", REVIEW_FIX_BATCH_SIZE)))
+            batches = ([sweep_files[i:i + batch_size]
+                       for i in range(0, len(sweep_files), batch_size)] or [[]])
+            # Recovered (already-reviewed, already-paid-for) resume findings never go
+            # through `_review_all` again - fold their rels into the FIRST batch so
+            # they get the SAME fix-eligibility treatment as anything freshly reviewed
+            # this cycle, without waiting for (or re-billing) a live re-review.
+            resume_keys = sorted(resume_findings) if (cycle == 1 and resume_findings) else []
+            resume_keys_set = set(resume_keys)
+            if resume_keys:
+                batches[0] = resume_keys + batches[0]
 
-            # Files that still have fixable (>= fix-severity) defects.
-            still_fixable = [rel for rel in files
-                             if any(should_fix_finding(f, args.fix_severity)
-                                    for f in file_findings.get(rel, []))]
-            # Anti-oscillation: a file repeatedly re-flagging serious defects after
-            # MAX_FIX_ATTEMPTS is set aside for manual review instead of looping forever.
-            fixable_files = [rel for rel in still_fixable
-                             if fix_attempts.get(rel, 0) < MAX_FIX_ATTEMPTS]
-            for rel in still_fixable:
-                if fix_attempts.get(rel, 0) >= MAX_FIX_ATTEMPTS:
+            file_findings: dict[str, list[dict]] = {}
+            flat: list[dict] = []
+            unreadable: set[str] = set()
+            reviewed_clean: dict[str, str] = {}
+            review_incomplete: set[str] = set()
+            fixable_files: list[str] = []   # every batch's fix candidates this cycle
+            any_fixable_this_cycle = False  # did ANY batch have a fixable file?
+            any_applied_this_cycle = False  # did ANY batch's fix call actually apply something?
+            cycle_stopped = False           # a hard-stop fired mid-cycle -> stop the whole run
+
+            for bidx, batch in enumerate(batches):
+                if not batch:
+                    continue
+                to_review = [rel for rel in batch
+                            if not (bidx == 0 and rel in resume_keys_set)]
+                resume_part = {rel: resume_findings[rel] for rel in batch
+                               if bidx == 0 and rel in resume_keys_set}
+                if to_review:
+                    b_findings, b_flat, b_unreadable, b_clean, b_incomplete = _review_all(
+                        reviewers, project_dir, to_review, report=report, meter=meter,
+                        soft_cap_usd=soft, workers=getattr(args, "review_workers", REVIEW_WORKERS),
+                        context=purpose_blob, checkpoint_cb=_resume_checkpoint,
+                        reviewer_pool=reviewer_pool)
+                else:
+                    b_findings, b_flat, b_unreadable, b_clean, b_incomplete = {}, [], set(), {}, set()
+                if checkpoint is not None:
+                    # Force a durable flush now, at this batch's review/fix boundary
+                    # (same pattern as the other phase-change force-saves:
+                    # set_phase/record_cycle/finish). Every completed review this
+                    # batch was already recorded in memory via `_resume_checkpoint`
+                    # immediately, per file (see _review_all's checkpoint_cb call),
+                    # but the physical write is throttled (flexfactor_runstate's
+                    # DEFAULT_FLUSH_EVERY/_INTERVAL_S) so the tail of a batch can
+                    # still be sitting unflushed when this batch's fixing starts.
+                    checkpoint.save(force=True)
+                if resume_part:
+                    # Recovered reviews join this batch's results exactly as if they
+                    # had been reviewed this cycle (they were - by the interrupted
+                    # run, against the same bytes).
+                    for rel, fl in resume_part.items():
+                        b_findings.setdefault(rel, fl)
+                        b_flat.extend(fl)
+                file_findings.update(b_findings)
+                flat.extend(b_flat)
+                unreadable |= b_unreadable
+                reviewed_clean.update(b_clean)
+                review_incomplete |= b_incomplete
+                # A file the contained read REFUSED is never clean and never auto-fixed:
+                # set it aside for manual review (a swapped symlink / fail-closed platform).
+                for rel in b_unreadable:
                     manual_review.add(rel)
-            # Clean is an ALLOWLIST: only files ACTUALLY reviewed this sweep with a fresh
-            # verified read, a COMPLETED review, AND empty findings. A file dropped by the
-            # budget/stop cutoff, or whose review aborted, is NOT in reviewed_clean, so it
-            # is never clean by default. Record the sha of the EXACT bytes reviewed so the
-            # save-time revalidation drops any file changed between review and save.
-            for rel, sha in reviewed_clean.items():
-                if rel not in still_fixable and rel not in manual_review:
-                    run_clean.add(rel)
-                    run_clean_sha[rel] = sha
-            done_set |= run_clean  # clean files count as resolved (cumulative)
-            report(fix_done=len(done_set), fix_total=total_to_review)
-            if not fixable_files:
+                    fix_notes.append(f"{rel}: could not be safely read (containment refused) - manual review")
+                all_findings = flat  # latest cycle reflects the current code state
+                latest_findings_by_file.update(b_findings)  # keep each file's most-recent findings
+                print(f"{pfx}Found {len(b_flat)} defect(s) across {len(b_findings)} file(s) "
+                      f"(batch {bidx + 1}/{len(batches)}).")
+                report(defects=len(flat), severity=_severity_breakdown(flat),
+                       phase=f"fixing (cycle {cycle}/{cycle_cap})")
+
+                # Hard cost cap: if we're already over budget, don't start fixing.
+                if meter.over_limit():
+                    print(f"{pfx}cost cap reached before fixing ({meter.summary()}); stopping.")
+                    fix_notes.append(f"stopped at cost cap: {meter.summary()}")
+                    stop_reason = f"hit ${args.max_cost:.0f} cost cap (NOT fully clean)"
+                    cycle_stopped = True
+                    break
+
+                # Files in THIS batch that still have fixable (>= fix-severity) defects.
+                batch_still_fixable = [rel for rel in batch
+                                       if any(should_fix_finding(f, args.fix_severity)
+                                              for f in b_findings.get(rel, []))]
+                # Anti-oscillation: a file repeatedly re-flagging serious defects after
+                # MAX_FIX_ATTEMPTS is set aside for manual review instead of looping forever.
+                batch_fixable = [rel for rel in batch_still_fixable
+                                 if fix_attempts.get(rel, 0) < MAX_FIX_ATTEMPTS]
+                for rel in batch_still_fixable:
+                    if fix_attempts.get(rel, 0) >= MAX_FIX_ATTEMPTS:
+                        manual_review.add(rel)
+                # Clean is an ALLOWLIST: only files ACTUALLY reviewed this batch with a fresh
+                # verified read, a COMPLETED review, AND empty findings. A file dropped by the
+                # budget/stop cutoff, or whose review aborted, is NOT in reviewed_clean, so it
+                # is never clean by default. Record the sha of the EXACT bytes reviewed so the
+                # save-time revalidation drops any file changed between review and save.
+                for rel, sha in b_clean.items():
+                    if rel not in batch_still_fixable and rel not in manual_review:
+                        run_clean.add(rel)
+                        run_clean_sha[rel] = sha
+                done_set |= run_clean  # clean files count as resolved (cumulative)
+                report(fix_done=len(done_set), fix_total=total_to_review)
+
+                if not batch_fixable:
+                    continue  # nothing THIS batch needs fixed; move on to the next batch
+
+                any_fixable_this_cycle = True
+                for rel in batch_fixable:
+                    fix_attempts[rel] = fix_attempts.get(rel, 0) + 1
+                print(f"{pfx}Fixing defects in {len(batch_fixable)} file(s) "
+                      f"(batch {bidx + 1}/{len(batches)}, each fix build-verified"
+                      + (" + cross-model-checked" if cross is not None else "") + ")...")
+                batch_findings = {rel: file_findings[rel] for rel in batch_fixable}
+
+                try:
+                    applied_c, unver_c, notes_c = _fix_files(
+                        author, cross, project_dir, batch_findings, stack, baseline_ok, args,
+                        meter=meter, oversized=oversized, report=report, err_base=errors_total,
+                        done_set=done_set, total_overall=total_to_review,
+                        commit_cb=(_checkpoint if git else None),
+                        adversarial=getattr(args, "adversarial", True),
+                        adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                        materiality=getattr(args, "adversarial_materiality", "material"))
+                except DirtyTreeError as dte:
+                    # Fail-CLOSED: _fix_files could not roll back a written candidate (a
+                    # contained-write refusal during rollback = the FS is swapping paths
+                    # under us). The tree holds an UNVERIFIED candidate. NEVER commit it:
+                    # best-effort git-restore the affected file(s), then abort the cycle
+                    # WITHOUT committing (this stop skips the cycle commit below, and
+                    # `dirty_abort` skips the post-loop test/e2e commits).
+                    dirty_abort = True
+                    for df in dte.files:
+                        if git:
+                            _git(["checkout", "--", df], project_dir)
+                    msg = ("dirty-abort: a refused rollback left an unverified candidate on "
+                           f"disk ({', '.join(dte.files)}); NOT committing this cycle")
+                    print(f"{pfx}{msg}", file=sys.stderr)
+                    fix_notes.append(msg)
+                    stop_reason = "aborted: refused rollback left an unverified candidate (see notes)"
+                    errors_total += len(dte.files)
+                    report(errors=errors_total, cost=round(meter.usd, 4))
+                    cycle_stopped = True
+                    break
+
+                fixable_files.extend(batch_fixable)
+                applied_set |= set(applied_c)
+                unverified_set |= set(unver_c)
+                fix_notes += notes_c
+                if applied_c:
+                    any_applied_this_cycle = True
+                # Master Prompt 83/88: a verifier outage must label the run failed and
+                # must not leave a success-shaped commit of unverified work. Per-file
+                # rollback already restored candidates; abort remaining cycles here.
+                if any("verifier unavailable" in n or "verifier outage fail-closed" in n
+                       for n in notes_c):
+                    stop_reason = ("FAILED: adversarial verifier unavailable "
+                                   "(fail-closed; pre-change tree restored, no UNVERIFIED keep)")
+                    print(f"{pfx}{stop_reason}", file=sys.stderr)
+                    # Still attempt a commit ONLY if something verified landed;
+                    # typically applied_c is empty after outage rollbacks.
+                    if git and applied_c:
+                        status = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                                  f"cycle {cycle}", stack)
+                        if "committed" in status:
+                            committed_any = True
+                        print(f"{pfx}git: {status}")
+                    errors_total = sum(1 for n in fix_notes
+                                       if "rolled back" in n or "rejected by" in n) + len(set(oversized))
+                    report(fixed=len(applied_set), errors=errors_total, cost=round(meter.usd, 4))
+                    cycle_stopped = True
+                    break
+                # Recompute (don't increment) to avoid double-counting across cycles:
+                # reverts + cross-model rejects so far, plus distinct oversized skips.
+                errors_total = sum(1 for n in fix_notes
+                                   if "rolled back" in n or "rejected by" in n) + len(set(oversized))
+                report(fixed=len(applied_set), errors=errors_total, cost=round(meter.usd, 4),
+                       phase=f"committing (cycle {cycle}/{cycle_cap})")
+
+                if git:
+                    status = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                              f"cycle {cycle}", stack)
+                    if "committed" in status:  # a real commit landed on the branch
+                        committed_any = True
+                    print(f"{pfx}git: {status}")
+
+                if meter.over_limit():
+                    print(f"{pfx}cost cap reached ({meter.summary()}); stopping after cycle {cycle}.")
+                    stop_reason = f"hit ${args.max_cost:.0f} cost cap (NOT fully clean)"
+                    cycle_stopped = True
+                    break
+            # end per-batch loop
+
+            if cycle_stopped:
+                break  # a hard-stop fired inside a batch; stop the whole run here
+
+            if not any_fixable_this_cycle:
                 if review_incomplete:
                     # "Nothing to fix" is UNPROVEN: files whose review errored
                     # out (provider outage / budget) were never inspected, so a
@@ -8949,96 +9115,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     stop_reason = "converged: found == fixed"
                 break
 
-            for rel in fixable_files:
-                fix_attempts[rel] = fix_attempts.get(rel, 0) + 1
-            print(f"{pfx}Fixing defects in {len(fixable_files)} file(s) (each fix build-verified"
-                  + (" + cross-model-checked" if cross is not None else "") + ")...")
-            cycle_findings = {rel: file_findings[rel] for rel in fixable_files}
-
-            def _checkpoint(_c=cycle):
-                # Commit+push+merge progress mid-cycle so an interruption (e.g.
-                # credits running out) can't lose this cycle's accumulated fixes.
-                nonlocal committed_any
-                if git:
-                    s = _commit_and_sync(project_dir, branch, prev_branch, args,
-                                         f"cycle {_c} checkpoint", stack)
-                    if "committed" in s:  # a real commit landed on the branch
-                        committed_any = True
-                    print(f"{pfx}git (checkpoint): {s}")
-
-            try:
-                applied_c, unver_c, notes_c = _fix_files(
-                    author, cross, project_dir, cycle_findings, stack, baseline_ok, args,
-                    meter=meter, oversized=oversized, report=report, err_base=errors_total,
-                    done_set=done_set, total_overall=total_to_review,
-                    commit_cb=(_checkpoint if git else None),
-                    adversarial=getattr(args, "adversarial", True),
-                    adversarial_rounds=getattr(args, "adversarial_rounds", 2),
-                    materiality=getattr(args, "adversarial_materiality", "material"))
-            except DirtyTreeError as dte:
-                # Fail-CLOSED: _fix_files could not roll back a written candidate (a
-                # contained-write refusal during rollback = the FS is swapping paths
-                # under us). The tree holds an UNVERIFIED candidate. NEVER commit it:
-                # best-effort git-restore the affected file(s), then abort the cycle
-                # WITHOUT committing (this `break` skips the cycle commit below, and
-                # `dirty_abort` skips the post-loop test/e2e commits).
-                dirty_abort = True
-                for df in dte.files:
-                    if git:
-                        _git(["checkout", "--", df], project_dir)
-                msg = ("dirty-abort: a refused rollback left an unverified candidate on "
-                       f"disk ({', '.join(dte.files)}); NOT committing this cycle")
-                print(f"{pfx}{msg}", file=sys.stderr)
-                fix_notes.append(msg)
-                stop_reason = "aborted: refused rollback left an unverified candidate (see notes)"
-                errors_total += len(dte.files)
-                report(errors=errors_total, cost=round(meter.usd, 4))
-                break
-            applied_set |= set(applied_c)
-            unverified_set |= set(unver_c)
-            fix_notes += notes_c
-            # Master Prompt 83/88: a verifier outage must label the run failed and
-            # must not leave a success-shaped commit of unverified work. Per-file
-            # rollback already restored candidates; abort remaining cycles here.
-            if any("verifier unavailable" in n or "verifier outage fail-closed" in n
-                   for n in notes_c):
-                stop_reason = ("FAILED: adversarial verifier unavailable "
-                               "(fail-closed; pre-change tree restored, no UNVERIFIED keep)")
-                print(f"{pfx}{stop_reason}", file=sys.stderr)
-                # Still attempt a cycle commit ONLY if something verified landed;
-                # typically applied_c is empty after outage rollbacks.
-                if git and applied_c:
-                    status = _commit_and_sync(project_dir, branch, prev_branch, args,
-                                              f"cycle {cycle}", stack)
-                    if "committed" in status:
-                        committed_any = True
-                    print(f"{pfx}git: {status}")
-                errors_total = sum(1 for n in fix_notes
-                                   if "rolled back" in n or "rejected by" in n) + len(set(oversized))
-                report(fixed=len(applied_set), errors=errors_total, cost=round(meter.usd, 4))
-                break
-            # Recompute (don't increment) to avoid double-counting across cycles:
-            # reverts + cross-model rejects so far, plus distinct oversized skips.
-            errors_total = sum(1 for n in fix_notes
-                               if "rolled back" in n or "rejected by" in n) + len(set(oversized))
-            report(fixed=len(applied_set), errors=errors_total, cost=round(meter.usd, 4),
-                   phase=f"committing (cycle {cycle}/{cycle_cap})")
-
-            if git:
-                status = _commit_and_sync(project_dir, branch, prev_branch, args,
-                                          f"cycle {cycle}", stack)
-                if "committed" in status:  # a real commit landed on the branch
-                    committed_any = True
-                print(f"{pfx}git: {status}")
-
-            if meter.over_limit():
-                print(f"{pfx}cost cap reached ({meter.summary()}); stopping after cycle {cycle}.")
-                stop_reason = f"hit ${args.max_cost:.0f} cost cap (NOT fully clean)"
-                break
-
-            if not applied_c:
-                # Nothing could be applied (oversized / repeatedly rejected / not
-                # auto-fixable). Re-reviewing the same files would just loop, so stop.
+            if not any_applied_this_cycle:
+                # Nothing could be applied across the whole cycle (oversized / repeatedly
+                # rejected / not auto-fixable). Re-reviewing the same files would just
+                # loop, so stop.
                 print(f"{pfx}stopping: remaining defects could not be auto-fixed this cycle")
                 stop_reason = "remaining defects not auto-fixable (see report notes)"
                 break
@@ -10551,6 +10631,14 @@ def main(argv=None) -> int:
                             help=f"Fix generations kept in flight ahead of the apply/verify loop "
                                  f"(default: {FIX_PREFETCH_WORKERS}; 0 = fully serial). In-flight "
                                  f"calls can overshoot --max-cost by at most this many calls.")
+        parser.add_argument("--review-fix-batch-size", type=int, default=REVIEW_FIX_BATCH_SIZE,
+                            dest="review_fix_batch_size",
+                            help=f"Files per review-then-fix batch within a cycle (default: "
+                                 f"{REVIEW_FIX_BATCH_SIZE}). Fixes are applied as soon as a batch's "
+                                 f"review turns them up, so the fix/resolved progress counter climbs "
+                                 f"throughout the run instead of staying at 0 until the whole sweep "
+                                 f"is reviewed. Lower for more frequent (but smaller) fix/commit "
+                                 f"cycles; 0 or negative is clamped up to 1.")
         parser.add_argument("--max-test-modules", type=int, default=12, dest="max_test_modules",
                             help="Max modules to generate unit tests for (default: 12).")
         parser.add_argument("--include", action="append", default=[],
