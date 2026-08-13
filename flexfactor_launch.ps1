@@ -148,22 +148,23 @@ $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
 # prodready asks NOTHING beyond the program. That is the point of the mode: the
 # owner should not have to know which of ~40 audit flags make a run trustworthy.
 if ($mode -eq "4") {
-    # Programs: prodready takes UP TO FIVE in one run, same as audit. Each can
-    # be a folder, file, .lnk, URL, or name. Dropped paths are used as-is.
+    # Programs: prodready takes UP TO TEN in one run, same as audit (flexfactor.py's
+    # run_audit() validates 1..10 - owner order 2026-08-13). Each can be a folder,
+    # file, .lnk, URL, or name. Dropped paths are used as-is.
     $programs = @()
     $droppedAll = @($args | Where-Object { $_ })
     if ($droppedAll.Count -ge 1) {
-        $programs = @($droppedAll | Select-Object -First 5 | ForEach-Object { $_.Trim('"') })
+        $programs = @($droppedAll | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
         Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
     } else {
-        $countRaw = Read-Host "How many programs to make production ready? (1-5, Enter = 1)"
+        $countRaw = Read-Host "How many programs to make production ready? (1-10, Enter = 1)"
         $count = 1
-        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 5) { $count = 1 }
+        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
         for ($i = 1; $i -le $count; $i++) {
             $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
             if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
         }
-        $programs = @($programs | Select-Object -First 5)
+        $programs = @($programs | Select-Object -First 10)
     }
     if ($programs.Count -eq 0) {
         Write-Host "No program given." -ForegroundColor Red
@@ -171,11 +172,23 @@ if ($mode -eq "4") {
     }
     $programArgs = @()
     foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
+    # prodready runs every program at the same time, no question asked (owner
+    # order 2026-08-13: "I want all programs to run at the same time"). run_audit()
+    # genuinely fans these out onto a ThreadPoolExecutor of that width - not a
+    # cosmetic flag - so N programs really do progress concurrently, each with
+    # its own free-proxy/FCC-backed review pool.
+    if ($programs.Count -ge 2) {
+        $programArgs += '--parallel'
+        $programArgs += "$($programs.Count)"
+    }
     Write-Host ""
     Write-Host "  Running: detect toolchains -> install dependencies -> review + fix" -ForegroundColor DarkGray
     Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
     Write-Host "  Verified fixes commit straight to your CURRENT branch and push to" -ForegroundColor DarkGray
     Write-Host "  origin (green-build gated). No sandbox branch, no merge step." -ForegroundColor DarkGray
+    if ($programs.Count -ge 2) {
+        Write-Host "  Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
+    }
     Write-Host ""
     # NO '--provider' (owner order 2026-08-11). Passing one marks the choice as
     # EXPLICIT, which suppresses FREE-FIRST and sends the whole run to a paid cloud
@@ -250,22 +263,23 @@ if ($mode -eq "3") {
     }
     $primary = $provider
 
-    # Programs: audit can take UP TO FIVE in one run. Each can be a folder, file,
-    # .lnk, URL, or name. Multiple dropped paths are used as-is (capped at 5).
+    # Programs: audit can take UP TO TEN in one run (flexfactor.py's run_audit()
+    # validates 1..10 - owner order 2026-08-13). Each can be a folder, file, .lnk,
+    # URL, or name. Multiple dropped paths are used as-is (capped at 10).
     $programs = @()
     $droppedAll = @($args | Where-Object { $_ })
     if ($droppedAll.Count -ge 1) {
-        $programs = @($droppedAll | Select-Object -First 5 | ForEach-Object { $_.Trim('"') })
+        $programs = @($droppedAll | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
         Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
     } else {
-        $countRaw = Read-Host "How many programs to audit? (1-5, Enter = 1)"
+        $countRaw = Read-Host "How many programs to audit? (1-10, Enter = 1)"
         $count = 1
-        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 5) { $count = 1 }
+        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
         for ($i = 1; $i -le $count; $i++) {
             $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
             if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
         }
-        $programs = @($programs | Select-Object -First 5)
+        $programs = @($programs | Select-Object -First 10)
     }
     if ($programs.Count -eq 0) {
         Write-Host "No program given." -ForegroundColor Red
@@ -304,13 +318,14 @@ if ($mode -eq "3") {
         Write-Host "Dirty trees: a program with uncommitted changes will hard-stop (commit or stash it, then rerun)." -ForegroundColor DarkGray
     }
 
-    # When 2+ programs were given, offer to run them concurrently.
+    # 2+ programs always run at the same time now, no question asked (owner
+    # order 2026-08-13: "I want all programs to run at the same time"). Real
+    # concurrency - run_audit() fans these out onto a ThreadPoolExecutor of
+    # this width, not a cosmetic flag.
     if ($programs.Count -ge 2) {
-        $par = Read-Host "Run them at the same time (parallel)? [y/N]"
-        if ($par -match '^(y|yes)$') {
-            $extraArgs += "--parallel"
-            $extraArgs += "$($programs.Count)"
-        }
+        $extraArgs += "--parallel"
+        $extraArgs += "$($programs.Count)"
+        Write-Host "Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
     }
 
     # Build a repeatable --program list, one flag per program.

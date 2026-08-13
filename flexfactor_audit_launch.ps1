@@ -14,25 +14,26 @@ Write-Host "  [##]  FlexFactor Audit" -ForegroundColor Cyan
 Write-Host "  Line-by-line, tests every function and button, fixes it all." -ForegroundColor DarkGray
 Write-Host ""
 
-# Program targets: audit can take UP TO FIVE programs in one run. Accept
-# anything for each - a folder, a file, a .lnk shortcut, a URL, or a plain name.
+# Program targets: audit can take UP TO TEN programs in one run (flexfactor.py's
+# run_audit() validates 1..10 - owner order 2026-08-13). Accept anything for
+# each - a folder, a file, a .lnk shortcut, a URL, or a plain name.
 $programs = @()
 $dropped = @($args | Where-Object { $_ })
 if ($dropped.Count -ge 1) {
-    # Multiple dropped paths: use them all (capped at 5), no prompting.
-    $programs = @($dropped | Select-Object -First 5 | ForEach-Object { $_.Trim('"') })
+    # Multiple dropped paths: use them all (capped at 10), no prompting.
+    $programs = @($dropped | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
     Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
 } else {
     # Ask how many, then read each one. Bad input falls back to 1.
-    $countRaw = Read-Host "How many programs to audit? (1-5, Enter = 1)"
+    $countRaw = Read-Host "How many programs to audit? (1-10, Enter = 1)"
     $count = 1
-    if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 5) { $count = 1 }
+    if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
     for ($i = 1; $i -le $count; $i++) {
         $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
         if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
     }
-    # Cap at 5 collected entries.
-    $programs = @($programs | Select-Object -First 5)
+    # Cap at 10 collected entries.
+    $programs = @($programs | Select-Object -First 10)
 }
 if ($programs.Count -eq 0) {
     Write-Host "No program given." -ForegroundColor Red
@@ -135,13 +136,13 @@ if ($dirty -match '^(y|yes)$') {
     Write-Host "Dirty trees: a program with uncommitted changes will hard-stop (commit or stash it, then rerun)." -ForegroundColor DarkGray
 }
 
-# When 2+ programs were given, offer to run them concurrently.
+# 2+ programs always run at the same time now, no question asked (owner order
+# 2026-08-13: "I want all programs to run at the same time"). Real concurrency -
+# run_audit() fans these out onto a ThreadPoolExecutor of this width.
 if ($programs.Count -ge 2) {
-    $par = Read-Host "Run them at the same time (parallel)? [y/N]"
-    if ($par -match '^(y|yes)$') {
-        $extraArgs += "--parallel"
-        $extraArgs += "$($programs.Count)"
-    }
+    $extraArgs += "--parallel"
+    $extraArgs += "$($programs.Count)"
+    Write-Host "Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
 }
 
 # Build a repeatable --program list, one flag per program.
