@@ -1177,8 +1177,23 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         self.assertTrue(ff._confirm_scout_apply(self._args(assume_yes=True), self._adopt_eval()))
 
     def test_no_tty_without_yes_refuses(self):
-        # Default stdin under the test runner is non-interactive -> must refuse.
-        self.assertFalse(ff._confirm_scout_apply(self._args(), self._adopt_eval()))
+        # HERMETIC stdin, never the runner's own. Under a hidden/interactive
+        # console the runner's stdin reports isatty()==True (measured 2026-08-13:
+        # `Start-Process -WindowStyle Hidden` without stdin redirection), and this
+        # assertion then walked past the no-TTY refusal into input() and blocked
+        # the ENTIRE suite forever at 377 tests - twice. Same stub pattern as the
+        # audit-side no-TTY tests, which already document the Git Bash
+        # `isatty()==True under < /dev/null` variant of this trap.
+        class _NoTTY:
+            def isatty(self_):
+                return False
+        saved = sys.stdin
+        sys.stdin = _NoTTY()
+        try:
+            self.assertFalse(
+                ff._confirm_scout_apply(self._args(), self._adopt_eval()))
+        finally:
+            sys.stdin = saved
 
     def test_dry_run_needs_no_confirmation(self):
         self.assertTrue(ff._confirm_scout_apply(self._args(dry_run=True), self._adopt_eval()))
@@ -4676,10 +4691,23 @@ class ScoutPolicyFileTests(unittest.TestCase):
             dry_run = False
             assume_yes = False
             allow_scripts = False
+
+        # HERMETIC stdin (see test_no_tty_without_yes_refuses): under a
+        # hidden/interactive console the runner's stdin IS a tty, and this
+        # assertion then blocked forever at _approve_candidate's input()
+        # prompt - the second full-suite hang found on 2026-08-13.
+        class _NoTTY:
+            def isatty(self_):
+                return False
         e = {"need": "n", "evidence": {"license": "MIT"},
              "verdicts": {"safe_to_integrate": True}, "benefit": {}}
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertFalse(ff._approve_candidate(A(), e, tmp))
+        saved = sys.stdin
+        sys.stdin = _NoTTY()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertFalse(ff._approve_candidate(A(), e, tmp))
+        finally:
+            sys.stdin = saved
 
     def test_approve_candidate_yes_and_dry_run_proceed(self):
         import tempfile
@@ -4707,12 +4735,24 @@ class ScoutPolicyFileTests(unittest.TestCase):
                 "verdicts": {"safe_to_integrate": True}, "benefit": {}}
         gpl = {"need": "n", "evidence": {"license": "GPL-3.0"},
                "verdicts": {"safe_to_integrate": False}, "benefit": {}}
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
-                      encoding="utf-8") as fh:
-                json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
-            self.assertTrue(ff._approve_candidate(A(), good, tmp))
-            self.assertFalse(ff._approve_candidate(A(), gpl, tmp))
+        # HERMETIC stdin: the gpl candidate matches no policy entry, so
+        # _approve_candidate falls through to the TTY check - with the
+        # runner's own (possibly interactive) stdin that is a live input()
+        # prompt and a full-suite hang. Stub it non-interactive.
+        class _NoTTY:
+            def isatty(self_):
+                return False
+        saved = sys.stdin
+        sys.stdin = _NoTTY()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
+                          encoding="utf-8") as fh:
+                    json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
+                self.assertTrue(ff._approve_candidate(A(), good, tmp))
+                self.assertFalse(ff._approve_candidate(A(), gpl, tmp))
+        finally:
+            sys.stdin = saved
 
     def test_confirm_scout_apply_policy_authorizes_no_tty(self):
         # Sol finding: the blanket gate refused before the policy file could
@@ -4731,12 +4771,24 @@ class ScoutPolicyFileTests(unittest.TestCase):
                   "need": "x", "benefit": {"benefit_score": 90},
                   "evidence": {"license": "MIT"},
                   "verdicts": {"safe_to_integrate": True}}]
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertFalse(ff._confirm_scout_apply(A(), evals, tmp))
-            with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
-                      encoding="utf-8") as fh:
-                json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
-            self.assertTrue(ff._confirm_scout_apply(A(), evals, tmp))
+        # HERMETIC stdin: before the policy file exists, _confirm_scout_apply
+        # falls through to the TTY check; with an interactive runner stdin
+        # that is a blocking input() prompt (full-suite hang class of
+        # 2026-08-13). Stub it non-interactive for both assertions.
+        class _NoTTY:
+            def isatty(self_):
+                return False
+        saved = sys.stdin
+        sys.stdin = _NoTTY()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertFalse(ff._confirm_scout_apply(A(), evals, tmp))
+                with open(os.path.join(tmp, ff.SCOUT_POLICY_FILE), "w",
+                          encoding="utf-8") as fh:
+                    json.dump({"auto_approve": True, "licenses": ["MIT"]}, fh)
+                self.assertTrue(ff._confirm_scout_apply(A(), evals, tmp))
+        finally:
+            sys.stdin = saved
 
 
 class NpmSpecValidationTests(unittest.TestCase):
@@ -7330,12 +7382,16 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertLess(cap_a, blank_a.start(), "Anthropic rescue capture must precede blanking")
         self.assertLess(cap_o, blank_o.start(), "OpenAI rescue capture must precede blanking")
 
-    def test_launcher_prodready_prompts_up_to_five_programs(self):
-        # Owner order 2026-08-10: option 4 (prodready) takes up to five programs
+    def test_launcher_prodready_prompts_up_to_ten_programs(self):
+        # Owner order 2026-08-10: option 4 (prodready) takes multiple programs
         # interactively, same as option 3 (audit) - not just via drag-and-drop.
+        # Owner order 2026-08-13 raised the cap 5 -> 10 (launchers + run_audit's
+        # own 1..10 validation changed the same day); this pin was still on the
+        # old prompt text and failed the first COMPLETE suite run (the stdin
+        # hang used to end every run before reaching this test).
         text = self._launcher_text()
-        self.assertIn("How many programs to make production ready? (1-5", text)
-        self.assertIn("How many programs to audit? (1-5", text)
+        self.assertIn("How many programs to make production ready? (1-10", text)
+        self.assertIn("How many programs to audit? (1-10", text)
 
 
 class TruncatedJsonSalvageTests(unittest.TestCase):
