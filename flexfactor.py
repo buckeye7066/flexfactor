@@ -9677,10 +9677,10 @@ def _confirm_audit_apply(args, programs) -> bool:
 
 
 def run_audit(args) -> int:
-    # 1. Validate the program list (1..5).
+    # 1. Validate the program list (1..10).
     programs = list(args.program or [])
-    if len(programs) < 1 or len(programs) > 5:
-        print("audit accepts 1 to 5 programs", file=sys.stderr)
+    if len(programs) < 1 or len(programs) > 10:
+        print("audit accepts 1 to 10 programs", file=sys.stderr)
         return 2
     total = len(programs)
     parallel = max(1, min(args.parallel, total))
@@ -10518,7 +10518,7 @@ def main(argv=None) -> int:
         )
         parser.add_argument("--program", required=True, action="append",
                             help="Program to audit: a project folder, file, .lnk, URL, or name. "
-                                 "Repeatable: pass up to 5 to audit several programs in one run.")
+                                 "Repeatable: pass up to 10 to audit several programs in one run.")
         parser.add_argument("--parallel", type=int, default=1, dest="parallel",
                             help="How many programs to audit concurrently (default: 1).")
         parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
