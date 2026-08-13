@@ -537,7 +537,8 @@ class StepResult:
 
 
 def bootstrap_plan(toolchains: list[Toolchain], allow_scripts: bool = False,
-                   force: bool = False) -> list[tuple[Toolchain, list[str]]]:
+                   force: bool = False,
+                   project_dir: str | None = None) -> list[tuple[Toolchain, list[str]]]:
     """(toolchain, argv) install steps to run, in order.
 
     `allow_scripts=False` appends --ignore-scripts to npm/pnpm/yarn installs.
@@ -546,10 +547,28 @@ def bootstrap_plan(toolchains: list[Toolchain], allow_scripts: bool = False,
     execution on the owner's machine triggered by a repo they merely pointed the
     tool at. Some native packages genuinely need their scripts to build, so the
     escape hatch exists - it is just not the default.
+
+    When a lockfile exists under the component root, prefer a frozen install argv
+    (npm ci / pnpm --frozen-lockfile / etc.). Lock drift is a finding — not an
+    incidental bootstrap mutation via a casual unlock install.
     """
+    try:
+        import flexfactor_trust as _trust
+    except Exception:
+        _trust = None
     plan: list[tuple[Toolchain, list[str]]] = []
     for tc in toolchains:
         if tc.deps_installed and not force:
+            continue
+        frozen = None
+        if _trust is not None and project_dir:
+            root = os.path.normpath(os.path.join(project_dir, tc.root))
+            lock = _trust.lockfile_for_ecosystem(root, tc.ecosystem)
+            if lock:
+                frozen = _trust.frozen_install_argv(
+                    tc.ecosystem, tc.manager, lock, allow_scripts=allow_scripts)
+        if frozen:
+            plan.append((tc, list(frozen)))
             continue
         for cmd in tc.install:
             argv = list(cmd)
@@ -572,7 +591,8 @@ def run_bootstrap(project_dir: str, toolchains: list[Toolchain], run,
     `verification_is_real` is what enforces that distinction downstream.
     """
     results: list[StepResult] = []
-    for tc, cmd in bootstrap_plan(toolchains, allow_scripts, force):
+    for tc, cmd in bootstrap_plan(toolchains, allow_scripts, force,
+                                    project_dir=project_dir):
         cwd = os.path.normpath(os.path.join(project_dir, tc.root))
         if log:
             log(f"    bootstrap [{tc.ecosystem}:{tc.root}]: {' '.join(cmd)}")
@@ -646,6 +666,317 @@ class Gate:
 # docs/CI/licence gaps be reported rather than veto a release.
 BLOCKING_SEVERITY = "high"
 _SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+# Explicit owner/repository purpose contract filenames. File excerpts, README
+# claims, a Dockerfile, a license file, or a model self-score cannot establish
+# purpose fulfillment — an explicit contract is required for certification.
+PURPOSE_CONTRACT_FILES = (
+    ".flexfactor-purpose.json",
+    "PURPOSE_CONTRACT.json",
+    "PURPOSE_CONTRACT.md",
+    ".flexfactor/purpose.json",
+)
+
+# Evidence categories for the contract-aware scorecard. Existence of a gate in
+# the 12-item rubric is NOT certification of an arbitrary application.
+EVIDENCE_CATEGORIES = (
+    "build_test",
+    "source_review_coverage",
+    "purpose_journeys",
+    "auth_privacy_safety",
+    "dependency_supply_chain",
+    "deploy_package_identity",
+    "ops_recovery",
+    "external_blockers",
+)
+
+
+@dataclass
+class PurposeContract:
+    """Owner-declared purpose for certification. Never invent speculative features."""
+    purpose: str
+    journeys: list[str] = field(default_factory=list)
+    auth_required: bool | None = None
+    privacy_sensitive: bool | None = None
+    deploy_surfaces: list[str] = field(default_factory=list)
+    source_path: str = ""
+    raw: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "purpose": self.purpose,
+            "journeys": list(self.journeys),
+            "auth_required": self.auth_required,
+            "privacy_sensitive": self.privacy_sensitive,
+            "deploy_surfaces": list(self.deploy_surfaces),
+            "source_path": self.source_path,
+        }
+
+
+def load_purpose_contract(project_dir: str) -> PurposeContract | None:
+    """Load an explicit owner purpose contract, or None if absent.
+
+    Absence is NOT failure of detection — it is an UNKNOWN that blocks
+    certification. Speculative feature invention is forbidden."""
+    for name in PURPOSE_CONTRACT_FILES:
+        path = os.path.join(project_dir, name.replace("/", os.sep))
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(MAX_CONFIG_BYTES)
+        except OSError:
+            continue
+        if name.endswith(".json"):
+            try:
+                data = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            purpose = str(data.get("purpose") or data.get("binding_purpose") or "").strip()
+            if not purpose:
+                continue
+            journeys = data.get("journeys") or data.get("purpose_journeys") or []
+            if not isinstance(journeys, list):
+                journeys = [str(journeys)]
+            return PurposeContract(
+                purpose=purpose,
+                journeys=[str(j).strip() for j in journeys if str(j).strip()],
+                auth_required=data.get("auth_required"),
+                privacy_sensitive=data.get("privacy_sensitive"),
+                deploy_surfaces=[str(s) for s in (data.get("deploy_surfaces") or [])],
+                source_path=name,
+                raw=data,
+            )
+        # Markdown: require a Purpose: line or # Purpose heading body.
+        purpose = ""
+        journeys: list[str] = []
+        for line in text.splitlines():
+            m = re.match(r"(?i)^\s*purpose\s*:\s*(.+)$", line)
+            if m:
+                purpose = m.group(1).strip()
+            m = re.match(r"(?i)^\s*-\s+journey\s*:\s*(.+)$", line)
+            if m:
+                journeys.append(m.group(1).strip())
+            if re.match(r"(?i)^#\s*purpose\b", line) and not purpose:
+                purpose = "(see PURPOSE_CONTRACT.md)"
+        if purpose:
+            return PurposeContract(
+                purpose=purpose, journeys=journeys, source_path=name, raw={"markdown": True})
+    return None
+
+
+def contract_aware_gates(project_dir: str, toolchains: list,
+                         base_gates: list[Gate],
+                         *,
+                         purpose_contract: PurposeContract | None = None,
+                         journey_evidence: dict | None = None,
+                         review_coverage: dict | None = None,
+                         deploy_identity: dict | None = None,
+                         ops_evidence: dict | None = None,
+                         external_blockers: list[str] | None = None,
+                         ) -> list[Gate]:
+    """Augment the existence rubric with contract-aware evidence gates.
+
+    Unknown critical properties BLOCK certification. README / Dockerfile /
+    LICENSE / model self-score alone cannot pass purpose fulfillment.
+    """
+    gates = list(base_gates)
+    contract = purpose_contract if purpose_contract is not None else load_purpose_contract(project_dir)
+
+    if contract is None:
+        gates.append(Gate(
+            id="purpose_contract",
+            title="Explicit owner purpose contract present",
+            status="fail",
+            severity="critical",
+            evidence=("no .flexfactor-purpose.json / PURPOSE_CONTRACT.* — "
+                      "cannot certify arbitrary apps from a generic rubric"),
+            remediation=("Add an owner-authored purpose contract naming the binding "
+                         "purpose and purpose-defining journeys. Do not invent features."),
+        ))
+        gates.append(Gate(
+            id="purpose_fulfillment",
+            title="Purpose-defining journeys verified by evidence",
+            status="unknown",
+            severity="critical",
+            evidence="blocked: no purpose contract",
+            remediation="Declare the contract, then record journey evidence.",
+        ))
+    else:
+        gates.append(Gate(
+            id="purpose_contract",
+            title="Explicit owner purpose contract present",
+            status="pass",
+            severity="critical",
+            evidence=f"loaded {contract.source_path}: {contract.purpose[:120]}",
+        ))
+        je = journey_evidence or {}
+        inspected = list(je.get("inspected_journeys") or [])
+        required = list(contract.journeys) or ["(contract journeys not listed)"]
+        missing = [j for j in required if j not in inspected and required != ["(contract journeys not listed)"]]
+        if not contract.journeys:
+            gates.append(Gate(
+                id="purpose_fulfillment",
+                title="Purpose-defining journeys verified by evidence",
+                status="unknown",
+                severity="critical",
+                evidence="contract lacks journeys[]; cannot invent them",
+                remediation="List purpose-defining journeys in the contract.",
+            ))
+        elif missing or not inspected:
+            gates.append(Gate(
+                id="purpose_fulfillment",
+                title="Purpose-defining journeys verified by evidence",
+                status="fail" if not inspected else "fail",
+                severity="critical",
+                evidence=(f"inspected={len(inspected)} required={len(required)} "
+                          f"missing={missing[:5]}"),
+                remediation="Run and inspect each purpose-defining journey; record outputs.",
+            ))
+        else:
+            gates.append(Gate(
+                id="purpose_fulfillment",
+                title="Purpose-defining journeys verified by evidence",
+                status="pass",
+                severity="critical",
+                evidence=f"inspected journeys: {', '.join(inspected[:8])}",
+            ))
+
+        if contract.auth_required:
+            gates.append(Gate(
+                id="authz_evidence",
+                title="Authentication/authorization evidence recorded",
+                status="unknown" if not (journey_evidence or {}).get("auth_checked") else "pass",
+                severity="critical",
+                evidence=("auth_required=true in contract; "
+                          + ("auth journey checked" if (journey_evidence or {}).get("auth_checked")
+                             else "no auth journey evidence")),
+                remediation="Record login/logout/protected-route evidence for the contract.",
+            ))
+        if contract.privacy_sensitive:
+            gates.append(Gate(
+                id="privacy_safety_evidence",
+                title="Privacy/safety evidence recorded",
+                status="unknown" if not (journey_evidence or {}).get("privacy_checked") else "pass",
+                severity="critical",
+                evidence=("privacy_sensitive=true; "
+                          + ("privacy checks recorded" if (journey_evidence or {}).get("privacy_checked")
+                             else "no privacy evidence")),
+                remediation="Record privacy/safety checks required by the contract.",
+            ))
+
+    cov = review_coverage or {}
+    if not cov:
+        gates.append(Gate(
+            id="source_review_coverage",
+            title="Source/review coverage and omissions recorded",
+            status="unknown",
+            severity="high",
+            evidence="no review coverage map supplied",
+            remediation="Record files reviewed, skipped, and why.",
+        ))
+    else:
+        omitted = cov.get("omitted") or []
+        gates.append(Gate(
+            id="source_review_coverage",
+            title="Source/review coverage and omissions recorded",
+            status="pass" if cov.get("reviewed") else "fail",
+            severity="high",
+            evidence=(f"reviewed={len(cov.get('reviewed') or [])} "
+                      f"omitted={len(omitted)}"),
+        ))
+
+    dep = deploy_identity or {}
+    if contract and contract.deploy_surfaces:
+        if not dep.get("sha"):
+            gates.append(Gate(
+                id="deploy_package_identity",
+                title="Deployment/package identity tied to exact SHA",
+                status="unknown",
+                severity="critical",
+                evidence="contract lists deploy_surfaces but no SHA identity evidence",
+                remediation="Record deployed/package SHA for each surface.",
+            ))
+        else:
+            gates.append(Gate(
+                id="deploy_package_identity",
+                title="Deployment/package identity tied to exact SHA",
+                status="pass",
+                severity="critical",
+                evidence=f"sha={dep.get('sha')} surfaces={dep.get('surfaces')}",
+            ))
+
+    ops = ops_evidence or {}
+    for key, title in (
+        ("backup_restore", "Backup/restore path evidenced"),
+        ("observability", "Observability/alerts evidenced"),
+        ("rollback", "Rollback path evidenced"),
+    ):
+        if key in ops:
+            gates.append(Gate(
+                id=f"ops_{key}",
+                title=title,
+                status="pass" if ops[key] else "fail",
+                severity="high",
+                evidence=str(ops.get(f"{key}_detail") or ops[key]),
+            ))
+        else:
+            gates.append(Gate(
+                id=f"ops_{key}",
+                title=title,
+                status="unknown",
+                severity="high",
+                evidence="not evaluated",
+                remediation=f"Record {key} evidence or mark external blocker.",
+            ))
+
+    blockers = list(external_blockers or [])
+    gates.append(Gate(
+        id="external_blockers",
+        title="External blockers explicitly listed (or none)",
+        status="pass" if external_blockers is not None else "unknown",
+        severity="high",
+        evidence=("none" if external_blockers == [] else
+                  (", ".join(blockers[:8]) if blockers else "not declared")),
+        remediation="List owner-only actions that remain, or pass an empty list.",
+    ))
+
+    # Honesty: a Dockerfile / LICENSE / README cannot pass purpose fulfillment.
+    # If purpose_fulfillment somehow passed without journeys inspected, reopen it.
+    for g in gates:
+        if g.id == "purpose_fulfillment" and g.status == "pass":
+            if not (journey_evidence or {}).get("inspected_journeys"):
+                g.status = "fail"
+                g.evidence = ("purpose fulfillment cannot be proven by README/"
+                              "Dockerfile/LICENSE alone")
+    return gates
+
+
+def certification_verdict(gates: list[Gate],
+                          floor: str = BLOCKING_SEVERITY
+                          ) -> tuple[str, bool, list[Gate]]:
+    """Return (label, certifiable, blockers).
+
+    Labels:
+      - CERTIFIED — all blocking gates pass under an explicit purpose contract
+      - NOT CERTIFIED — blockers remain
+      - SOFTWARE COMPLETE — EXTERNAL RELEASE BLOCKER — only external_blockers
+        remain (every repository-accessible gate pass/na)
+    """
+    ready, blockers = readiness_verdict(gates, floor)
+    has_contract = any(g.id == "purpose_contract" and g.status == "pass" for g in gates)
+    if ready and has_contract:
+        return "CERTIFIED", True, []
+    # External-only remainder?
+    non_external = [g for g in blockers if g.id != "external_blockers"]
+    ext = [g for g in gates if g.id == "external_blockers"]
+    if not non_external and ext and ext[0].status == "pass" and ext[0].evidence not in (
+            "none", "not declared") and "none" not in ext[0].evidence:
+        # Has listed external blockers and everything else is clear.
+        return "SOFTWARE COMPLETE — EXTERNAL RELEASE BLOCKER", False, blockers
+    return "NOT CERTIFIED", False, blockers
 
 _SECRET_FILE_PAT = re.compile(
     r"(?:^|/)(?:\.env(?:\.[\w-]+)?|.*\.pem|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
@@ -878,7 +1209,10 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         remediation="Add a Dockerfile or Procfile that starts the service.",
         auto_fixable=True)
 
-    return gates
+    # Contract-aware evidence layer: the 12 existence gates above cannot certify
+    # arbitrary applications. Require an explicit purpose contract and treat
+    # unknown critical properties as blockers.
+    return contract_aware_gates(project_dir, toolchains, gates)
 
 
 def is_blocking(gate: Gate, floor: str = BLOCKING_SEVERITY) -> bool:
@@ -921,10 +1255,16 @@ def render_scorecard(project_name: str, toolchains: list[Toolchain],
     """Markdown scorecard. Leads with the verdict and the blockers, because a
     reader who stops after the first section must not come away with a rosier
     picture than the evidence supports."""
-    ready, blockers = readiness_verdict(gates, floor)
+    label, certifiable, blockers = certification_verdict(gates, floor)
     passed, evaluated, total = readiness_score(gates)
     out: list[str] = [f"# Production readiness — {project_name}", ""]
-    out.append(f"**Verdict: {'PRODUCTION READY' if ready else 'NOT PRODUCTION READY'}**")
+    # Do not use a generic "PRODUCTION READY" label for arbitrary apps.
+    out.append(f"**Verdict: {label}**")
+    if not certifiable:
+        out.append("")
+        out.append("_A generic build/test/docs rubric is not certification. "
+                   "CERTIFIED requires an explicit purpose contract plus "
+                   "journey/identity evidence; unknown critical properties block._")
     out.append("")
     out.append(f"- Gates passed: {passed}/{evaluated} evaluated ({total} total)")
     out.append(f"- Blocking failures: {len(blockers)} (severity >= {floor})")

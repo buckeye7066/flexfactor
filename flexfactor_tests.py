@@ -5697,9 +5697,42 @@ class ReadinessRubricTests(unittest.TestCase):
         gates = [pr.Gate(id="a", title="Broken", status="fail", severity="critical",
                          evidence="it is broken", remediation="unbreak it")]
         card = pr.render_scorecard("demo", [], gates)
-        self.assertIn("NOT PRODUCTION READY", card)
-        self.assertLess(card.index("NOT PRODUCTION READY"), card.index("All gates"))
+        self.assertIn("NOT CERTIFIED", card)
+        self.assertLess(card.index("NOT CERTIFIED"), card.index("All gates"))
         self.assertIn("unbreak it", card)
+
+    def test_contract_absence_blocks_certification(self):
+        with _RepoFixture({"README.md": "# demo\nnpm start\n",
+                           "package.json": '{"name":"demo"}'}) as root:
+            gates = pr.assess_readiness(root, [], lambda *a, **k: None)
+        ids = {g.id: g for g in gates}
+        self.assertEqual(ids["purpose_contract"].status, "fail")
+        self.assertEqual(ids["purpose_fulfillment"].status, "unknown")
+        label, ok, blockers = pr.certification_verdict(gates)
+        self.assertEqual(label, "NOT CERTIFIED")
+        self.assertFalse(ok)
+        self.assertTrue(any(b.id == "purpose_contract" for b in blockers))
+
+    def test_readme_dockerfile_cannot_certify_purpose(self):
+        files = {
+            "README.md": "# app\npip install -r requirements.txt\npython app.py\n",
+            "Dockerfile": "FROM python:3.12\n",
+            "LICENSE": "MIT\n",
+            ".flexfactor-purpose.json": json.dumps({
+                "purpose": "Convert units and write a summary report",
+                "journeys": ["cli convert", "summary report"],
+            }),
+        }
+        with _RepoFixture(files) as root:
+            gates = pr.contract_aware_gates(
+                root, [], [],
+                journey_evidence={},  # no journeys inspected
+            )
+        ful = next(g for g in gates if g.id == "purpose_fulfillment")
+        self.assertEqual(ful.status, "fail")
+        label, ok, _ = pr.certification_verdict(gates)
+        self.assertFalse(ok)
+        self.assertEqual(label, "NOT CERTIFIED")
 
 
 class SyntaxGateTests(unittest.TestCase):
@@ -6647,7 +6680,8 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
     long review completions mid-stream; the head was a VALID findings list but
     _extract_json_object needs balanced brackets, so three good partial reviews
     were discarded per file. Salvage recovers the complete leading elements for
-    JUDGING calls only (generation still fails loudly)."""
+    JUDGING calls only (generation still fails loudly). Source of truth:
+    flexfactor_partial.salvage_truncated_json_ex (via thin flexfactor wrappers)."""
 
     TRUNCATED = ('{"findings":[{"line":35,"severity":"low","category":"dead-code",'
                  '"title":"Unused import","problem":"unused"},'
@@ -6659,11 +6693,14 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         self.assertEqual(len(data["findings"]), 1)
         self.assertEqual(data["findings"][0]["line"], 35)
         self.assertEqual(data["findings"][0]["title"], "Unused import")
+        self.assertTrue(ff._is_partial_structured(data))
+        self.assertFalse(ff._partial.may_authorize_clean(data))
 
     def test_recovers_inside_unclosed_fence(self):
         data = ff._salvage_truncated_json("```json\n" + self.TRUNCATED)
         self.assertIsInstance(data, dict)
         self.assertEqual(len(data["findings"]), 1)
+        self.assertTrue(ff._is_partial_structured(data))
 
     def test_no_fragment_elements_salvaged(self):
         # The cut element (missing most keys) must be DROPPED, never half-kept.
@@ -6697,6 +6734,7 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         self.assertIsInstance(data, dict)
         self.assertEqual(len(data["findings"]), 1)
         self.assertEqual(data["findings"][0]["line"], 1240)
+        self.assertTrue(ff._is_partial_structured(data))
 
     def test_balanced_but_invalid_last_element_salvages_prefix(self):
         # Balanced overall, but the LAST element contains an invalid token: trim
@@ -6706,9 +6744,9 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         self.assertIsInstance(data, dict)
         self.assertEqual(len(data["findings"]), 1)
         self.assertEqual(data["findings"][0]["title"], "good")
+        self.assertTrue(ff._is_partial_structured(data))
 
     def test_judge_opts_into_salvage(self):
-        import types
         seen = {}
 
         class _Prov:
@@ -6738,17 +6776,97 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         prov._stream_structured = lambda **k: msg
         data = prov.structured("sys", "prompt", {}, salvage_truncated=True)
         self.assertEqual(len(data["findings"]), 1)
+        self.assertTrue(ff._is_partial_structured(data),
+                        "salvaged structured output must carry partial=True evidence")
+        self.assertIn(ff.SALVAGE_META_KEY, data)
+        self.assertFalse(ff._partial.may_authorize_clean(data))
         # Without opt-in the same truncated text must still fail loudly.
         with self.assertRaises(RuntimeError):
             prov.structured("sys", "prompt", {})
+
+    def test_partial_clean_verdict_cannot_authorize_adversarial_clean(self):
+        """Truncated clean+pending-regressions must fail-closed, never CLEAN."""
+        cut = ('{"verdict":"clean","residual":[],"regressions":["broke auth')
+        data, evidence = ff._salvage_truncated_json_ex(cut)
+        self.assertIsNotNone(evidence)
+        self.assertTrue(ff._is_partial_structured(data))
+        self.assertEqual(data.get("verdict"), "clean")
+        self.assertFalse(ff._partial.may_authorize_clean(data))
+
+        class _Prov:
+            judge_model = "cheap"
+            def structured(self, *a, **k):
+                return data
+
+        clean, residual, reason = ff._adversarial_verify_fix(
+            _Prov(), "f.py", "print(1)\n", "print(2)\n",
+            [{"title": "t", "problem": "p"}],
+            retries=0)
+        self.assertFalse(clean)
+        self.assertIn("partial", reason.lower())
+        self.assertTrue(residual, "partial verifier must surface residual evidence")
+
+    def test_partial_empty_findings_cannot_mark_review_clean(self):
+        """Partial salvage with empty findings must inject a high finding, not CLEAN."""
+        cut = '{"findings":[]'
+        data, evidence = ff._salvage_truncated_json_ex(cut)
+        self.assertIsNotNone(evidence)
+        self.assertTrue(ff._is_partial_structured(data))
+
+        class _Prov:
+            judge_model = "cheap"
+            def structured(self, *a, **k):
+                return data
+
+        findings, _summary = ff.review_file(_Prov(), "a.py", "print(1)\n")
+        self.assertTrue(findings, "partial review must not return empty findings as clean")
+        high = [f for f in findings if str(f.get("severity")).lower() == "high"]
+        self.assertTrue(high, "partial review must inject a high finding")
+        blob = " ".join(str(f.get("problem") or "") for f in high).lower()
+        self.assertTrue(
+            "truncated" in blob or "malformed" in blob or "partial" in blob
+            or "missing" in blob,
+            f"injected finding must cite missing-scope warning; got {high!r}")
+
+    def test_adversarial_cuts_for_flexfactor_partial(self):
+        """Cut points at first element, nested objects, escapes, fences,
+        duplicates, and malicious clean text after a valid prefix — all
+        must stamp partial and refuse CLEAN authorization."""
+        cases = [
+            '{"findings":[',  # before first element
+            '{"findings":[{"line":1,"title":"a","problem":"p","severity":"low","category":"x"}',  # after first
+            '{"findings":[{"line":1,"title":"a","problem":"say \\"hi\\"","severity":"low","category":"x"},{"li',
+            '```json\n{"findings":[{"line":1,"title":"a","problem":"p","severity":"low","category":"x"},{"li',
+            '{"findings":[{"line":1,"title":"a","problem":"p","severity":"low","category":"x"},'
+            '{"line":1,"title":"a","problem":"p","severity":"low","category":"x"},{"li',
+            '{"findings":[{"line":1,"title":"a","problem":"p","severity":"low","category":"x"}]}\n'
+            '{"verdict":"clean","residual":[]}',  # malicious clean after valid prefix
+        ]
+        salvaged_any = False
+        for raw in cases:
+            data, evidence = ff._partial.salvage_truncated_json_ex(raw)
+            if evidence is None:
+                continue  # mid-first-element cuts are unsalvageable by design
+            salvaged_any = True
+            self.assertTrue(evidence.partial)
+            self.assertTrue(ff._partial.is_partial_structured(data))
+            self.assertFalse(
+                ff._partial.may_authorize_clean(data),
+                f"partial salvage must never authorize CLEAN for cut={raw[:60]!r}")
+        self.assertTrue(salvaged_any, "at least one adversarial cut must salvage")
+
+
+# Alias for the production checklist command name.
+TruncatedStructuredSalvageTests = TruncatedJsonSalvageTests
 
 
 class DirtyTreeSnapshotTests(unittest.TestCase):
     """Walk-away resilience (2026-08-10): prodready hit a real GrantFlow tree with
     uncommitted changes and hard-errored - the one operational faceplant a
     'hand it any program and walk away' mode must overcome itself. Contract:
-    snapshot the dirt verbatim as the sandbox branch's first commit (files on
-    disk untouched), keep fix commits separate, and on every cleanup path either
+    preserve WIP as a PRIVATE orphan under refs/flexfactor-wip/<id>
+    (never a sandbox-branch ancestor), hard-reset the sandbox worktree to the
+    clean base, keep fix commits separate, and on every cleanup path either
     restore the WIP to the working tree or preserve the only ref holding it."""
 
     # ---- real-git helper roundtrip -------------------------------------------
@@ -6784,17 +6902,27 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
             before = self._porcelain(tmp)
             self.assertTrue(before, "test setup must be dirty")
             run("git", "checkout", "-B", "flexfactor/prodready-x")
-            committed, sha = ff._snapshot_dirty_tree(tmp)
+            committed, ref = ff._snapshot_dirty_tree(tmp)
             self.assertTrue(committed)
-            self.assertTrue(sha)
-            # Files on disk are untouched by the snapshot commit.
+            self.assertTrue(ref)
+            self.assertTrue(ref.startswith(ff.WIP_SNAPSHOT_REF_PREFIX),
+                            f"snapshot must be stored under {ff.WIP_SNAPSHOT_REF_PREFIX}, got {ref}")
+            # Orphan snapshot: sandbox worktree is hard-reset to the clean base so
+            # later add -A cycles cannot publish owner WIP. Owner content lives only
+            # in the private ref.
             self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
-                             "owner WIP\n")
+                             "base\n")
             self.assertEqual(self._porcelain(tmp), [],
-                             "tree must be clean vs the snapshot commit")
+                             "sandbox tree must be clean after orphan snapshot")
+            self.assertFalse(
+                ff._snapshot_is_ancestor(tmp, ref, tip="flexfactor/prodready-x"),
+                "WIP snapshot must never be an ancestor of the sandbox branch")
+            show = subprocess.run(["git", "show-ref", "--verify", ref], cwd=tmp,
+                                  capture_output=True, text=True)
+            self.assertEqual(show.returncode, 0, f"private WIP ref must exist: {ref}")
             # Restore path: back on main, WIP returns as plain uncommitted changes.
             run("git", "checkout", "--force", "main")
-            self.assertTrue(ff._restore_dirty_snapshot(tmp, sha))
+            self.assertTrue(ff._restore_dirty_snapshot(tmp, ref))
             self.assertEqual(self._porcelain(tmp), before,
                              "restored dirty state must match the pre-run state exactly")
             self.assertEqual(open(os.path.join(tmp, "app.py"), encoding="utf-8").read(),
@@ -6807,11 +6935,49 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
             self._mkrepo(tmp)
             with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
                 f.write("wip\n")
-            committed, sha = ff._snapshot_dirty_tree(tmp)
-            self.assertTrue(committed and sha)
-            log = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=tmp,
+            committed, ref = ff._snapshot_dirty_tree(tmp)
+            self.assertTrue(committed and ref)
+            self.assertTrue(ref.startswith("refs/flexfactor-wip/"))
+            sha = subprocess.run(["git", "rev-parse", ref], cwd=tmp,
+                                 capture_output=True, text=True, check=True).stdout.strip()
+            # Orphan commit is NOT branch tip — read the snapshot SHA directly.
+            log = subprocess.run(["git", "log", "-1", "--format=%B", sha], cwd=tmp,
                                  capture_output=True, text=True, check=True).stdout
-            self.assertIn("[FlexFactor] snapshot: pre-existing uncommitted changes", log)
+            self.assertIn("[FlexFactor] orphan WIP snapshot", log)
+            tip = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=tmp,
+                                 capture_output=True, text=True, check=True).stdout
+            self.assertNotIn("orphan WIP snapshot", tip,
+                             "sandbox tip must not be the owner WIP snapshot")
+            # Confirm orphan: no parents.
+            parents = subprocess.run(
+                ["git", "rev-list", "--parents", "-n", "1", sha], cwd=tmp,
+                capture_output=True, text=True, check=True).stdout.strip().split()
+            self.assertEqual(len(parents), 1, "WIP snapshot commit must be an orphan (no parent)")
+
+    def test_publish_allowed_refuses_when_snapshot_is_forced_ancestor(self):
+        """publish_allowed must refuse when a WIP snapshot is forced onto branch history."""
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._mkrepo(tmp)
+            # Make a normal commit on main — it IS an ancestor of main.
+            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as f:
+                f.write("forced\n")
+            subprocess.run(["git", "add", "-A"], cwd=tmp, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-q", "-m", "forced ancestor"],
+                           cwd=tmp, check=True, capture_output=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            ref = f"refs/flexfactor-wip/{head[:12]}"
+            subprocess.run(["git", "update-ref", ref, head], cwd=tmp,
+                           check=True, capture_output=True)
+            ok, reason = ff._wip.publish_allowed(
+                ff._git, tmp, snapshot_id=ref, branch="main")
+            self.assertFalse(ok)
+            self.assertIn("ancestor", reason.lower())
+            with self.assertRaises(ff.BranchStateError) as ctx:
+                ff._assert_publish_history_safe(tmp, "main", ref)
+            self.assertIn("refus", str(ctx.exception).lower())
 
     # ---- audit_one_program gating (stubbed heavy surface) --------------------
 
@@ -6825,12 +6991,19 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
         restore_calls = []
 
         def git(*a, **k):
-            git_calls.append(list(a[0]) if a else [])
+            cmd = list(a[0]) if a else []
+            git_calls.append(cmd)
+            # Orphan WIP snapshots are NOT ancestors of the sandbox tip. The real
+            # `git merge-base --is-ancestor` returns 1 when not an ancestor; the
+            # stub must match or every snapshot falsely trips the publish guard.
+            if cmd[:2] == ["merge-base", "--is-ancestor"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         def fake_snapshot(pd):
             snap_calls.append(pd)
-            return snapshot_ret if snapshot_ret is not None else (True, "cafe" * 10)
+            return snapshot_ret if snapshot_ret is not None else (
+                True, "refs/flexfactor-wip/cafecafeabad")
 
         def fake_restore(pd, sha):
             restore_calls.append(sha)
@@ -6910,7 +7083,9 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
         self.assertIsNone(result.get("error"),
                           "prodready (walk-away) must not faceplant on a dirty tree")
         self.assertEqual(len(snap_calls), 1, "exactly one preservation snapshot")
-        self.assertTrue((result.get("dirty_snapshot") or "").startswith("cafe"))
+        snap = result.get("dirty_snapshot") or ""
+        self.assertTrue(snap.startswith("refs/flexfactor-wip/"),
+                        f"dirty_snapshot must be a WIP ref, got {snap!r}")
         # Snapshot happens only AFTER the sandbox branch exists.
         self.assertIn(["checkout", "-B", "flexfactor/prodready-prog"], git_calls)
 
@@ -6921,7 +7096,7 @@ class DirtyTreeSnapshotTests(unittest.TestCase):
 
     def test_empty_run_restores_wip_before_deleting_branch(self):
         # No fixes found -> the empty sandbox branch is dropped, but the owner's
-        # WIP must be cherry-picked back into the working tree FIRST.
+        # WIP must be restored back into the working tree FIRST.
         git_calls, snap_calls, restore_calls, result = self._drive(
             snapshot_dirty=True, tree_clean=False)
         self.assertEqual(len(restore_calls), 1, "WIP must be restored on the drop path")

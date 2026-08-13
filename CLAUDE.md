@@ -60,16 +60,18 @@ Closes two silent-failure holes the audit had:
   still win — checked against RAW argv because they share a dest with `--apply`.
 - **Dirty-tree walk-away (2026-08-10).** Prodready no longer faceplants on a
   dirty tree (the GrantFlow failure): `--snapshot-dirty` (default ON in prodready,
-  OFF in audit) commits the pre-existing changes verbatim as the sandbox branch's
-  FIRST commit (`_snapshot_dirty_tree`, `--no-verify`, files on disk untouched) so
-  the per-cycle `git add -A` commits contain only FlexFactor's changes. Every
-  cleanup path is fail-closed: the empty-branch drop paths call
-  `_drop_branch_restoring_wip` which cherry-picks the snapshot back onto the
-  original branch as plain uncommitted changes (conflict-free by construction —
-  same parent) BEFORE `branch -D`; if the restore fails the branch is PRESERVED
-  (never delete the only ref holding owner WIP). Snapshot-commit failure refuses
-  to run + unwinds. `--allow-dirty` keeps legacy sweep-it-in behavior and wins
-  over snapshot mode.
+  OFF in audit) preserves pre-existing changes as a private ORPHAN commit under
+  `refs/flexfactor-wip/*` (`flexfactor_wip.capture_orphan_wip_snapshot` via
+  `_snapshot_dirty_tree`) so they are NEVER an ancestor of a pushed/merged
+  sandbox branch; the worktree is hard-reset to the clean base so per-cycle
+  `git add -A` commits contain only FlexFactor's changes. Every cleanup path is
+  fail-closed: the empty-branch drop paths call `_drop_branch_restoring_wip`
+  which restores the orphan snapshot back onto the original branch as plain
+  uncommitted changes BEFORE `branch -D`; if the restore fails the WIP ref is
+  PRESERVED (never delete the only ref holding owner WIP). Snapshot-commit
+  failure refuses to run + unwinds. `_commit_and_sync` calls
+  `publish_allowed` before push/merge. `--allow-dirty` keeps legacy sweep-it-in
+  behavior and wins over snapshot mode.
 
 Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
 again; when it does, `flexfactor.py` silently drops out of its own audit
@@ -99,7 +101,10 @@ again; when it does, `flexfactor.py` silently drops out of its own audit
   hunts residual/new/uncovered defects, and each `needs_work` verdict feeds the
   residual list back so the author re-fixes; loops until a genuinely CLEAN verdict
   or `--adversarial-rounds` (default 2) is hit (then reject+rollback). Fail-CLOSED:
-  a downed verifier accepts the fix but marks it `[unverified]` (never a clean pass).
+  a downed verifier REJECTS the fix and rolls the candidate back (pre-change
+  tree restored; never keeps an UNVERIFIED fix from a verifier outage). Partial/
+  truncated structured salvage is stamped `partial=true` and also cannot
+  authorize CLEAN/READY/merge/push.
   If a candidate is WRITTEN but its rollback is REFUSED (any of the build-gate / veto /
   adversarial / budget paths), `_fix_files` raises `DirtyTreeError`; `audit_one_program`
   catches it, git-restores the file, and ABORTS the cycle WITHOUT committing (so an

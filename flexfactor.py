@@ -85,6 +85,17 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_scout_contract as _scout_contract
 
+# First-class partial structured salvage + orphan WIP snapshot modules.
+# Hard import: silently falling back to inline duplicates would diverge from the
+# fail-closed CLEAN/publish contracts these modules own.
+try:
+    import flexfactor_partial as _partial
+    import flexfactor_wip as _wip
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_partial as _partial
+    import flexfactor_wip as _wip
+
 # Model defaults per provider. Claude Opus 4.8 is the strongest current Claude
 # model; override either with --model. This is the AUTHOR tier - used only where
 # the model writes code (whole-file rewrite, defect fix, integration, test-gen).
@@ -782,15 +793,14 @@ class AnthropicProvider:
             raise RuntimeError("Model returned no text content to parse.")
         data, _ = _extract_json_object(text)
         if data is None and salvage_truncated:
-            # Judging-only truncation repair (see _salvage_truncated_json): the FCC
-            # proxy's upstream sometimes cuts long completions mid-stream on big
-            # files; recovering the complete leading elements beats discarding an
-            # entire review. The file is NOT marked clean by a partial review, so
-            # the until-clean loop still re-reviews it.
-            data = _salvage_truncated_json(text)
-            if data is not None:
-                print("  [salvage] structured output was truncated mid-stream; "
-                      "recovered the complete leading elements (partial tail dropped)")
+            # Judging-only truncation repair via flexfactor_partial: recovered
+            # prefixes are stamped partial=True and MUST NOT authorize
+            # CLEAN/READY/certify/publish (enforced at review/verify).
+            data, evidence = _partial.salvage_truncated_json_ex(
+                text, provider=getattr(self, "name", None) or "anthropic")
+            if evidence is not None:
+                print("  [salvage] structured output was truncated/malformed; "
+                      "recovered leading elements as PARTIAL (cannot authorize CLEAN)")
         if data is None:
             # head AND tail: the tail shows WHERE a truncated stream was cut
             # (mid-first-element cuts are unsalvageable by design; knowing the cut
@@ -936,14 +946,13 @@ class OpenAIProvider:
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
                    model: str | None = None, salvage_truncated: bool = False) -> dict:
-        # (salvage_truncated accepted for signature parity with AnthropicProvider;
-        # OpenAI json mode already fails loudly on truncation via finish_reason.)
         # OpenAI json mode isn't schema-constrained, so we inline the schema into
         # the system prompt and tolerantly parse — the caller's code defends
         # against missing keys with .get() defaults. Whole-file callers request a
         # large budget; clamp to gpt-4o's 16384-token output ceiling so the API
-        # doesn't reject the request (very large files may still truncate, which
-        # surfaces as a parse error the caller degrades to a [skip]).
+        # doesn't reject the request. Judging callers may opt into
+        # salvage_truncated (via _judge) so a truncated stream can INFORM further
+        # work as PARTIAL — never authorize CLEAN.
         # `model` lets a caller route a judging call to the cheap tier; defaults to
         # the author model so code-generation callers are unchanged.
         use_model = model or self.model
@@ -966,7 +975,16 @@ class OpenAIProvider:
             )
             self._meter(resp, use_model)
         choice = resp.choices[0]
+        text = choice.message.content or ""
         if choice.finish_reason == "length":
+            if salvage_truncated:
+                data, evidence = _partial.salvage_truncated_json_ex(
+                    text, provider="openai")
+                if data is not None:
+                    if evidence is not None:
+                        print("  [salvage] structured output was truncated/malformed; "
+                              "recovered leading elements as PARTIAL (cannot authorize CLEAN)")
+                    return data
             # Same guard AnthropicProvider.structured has: raising here (with the
             # "token budget" phrasing the fix loop keys on to record the file as
             # oversized) beats returning truncated JSON that dies downstream as an
@@ -974,7 +992,18 @@ class OpenAIProvider:
             raise RuntimeError(
                 f"Model output hit the {min(max_tokens, 16384)}-token budget (file too "
                 "large to regenerate in one response); raise max_tokens for this call.")
-        return json.loads(choice.message.content or "{}")
+        try:
+            return json.loads(text or "{}")
+        except Exception:
+            if salvage_truncated:
+                data, evidence = _partial.salvage_truncated_json_ex(
+                    text, provider="openai")
+                if data is not None:
+                    if evidence is not None:
+                        print("  [salvage] structured output was truncated/malformed; "
+                              "recovered leading elements as PARTIAL (cannot authorize CLEAN)")
+                    return data
+            raise
 
     def ping(self) -> None:
         """One-token liveness check on the JUDGE tier, ROUTED THROUGH the adapter so
@@ -1083,8 +1112,12 @@ class OllamaProvider:
             return json.loads(text or "{}")
         except Exception:
             if salvage_truncated:
-                data = _salvage_truncated_json(text)
+                data, evidence = _partial.salvage_truncated_json_ex(
+                    text, provider="ollama")
                 if data is not None:
+                    if evidence is not None:
+                        print("  [salvage] structured output was truncated/malformed; "
+                              "recovered leading elements as PARTIAL (cannot authorize CLEAN)")
                     return data
             raise
 
@@ -1193,68 +1226,52 @@ def _extract_json_object(text: str):
     return None, s
 
 
-def _salvage_truncated_json(text: str):
-    """Best-effort repair of TRUNCATED structured output (stream cut mid-response,
-    e.g. the FCC proxy's upstream dropping a long completion partway): trim back
-    to the last position where a complete JSON value just closed, then append the
-    closers for every still-open container. Returns the parsed value or None.
+# Partial structured-output salvage: owned by flexfactor_partial. Thin wrappers
+# keep call sites / tests stable while the module is the source of truth.
+SALVAGE_META_KEY = _partial.PARTIAL_META_KEY  # "_flexfactor_partial"
+MISSING_SCOPE_WARNING = _partial.MISSING_SCOPE_WARNING
 
-    The trailing incomplete element is DROPPED, so the result is PARTIAL - callers
-    must only use this where partial data is safe (judging/review calls, where the
-    until-clean cycle loop re-reviews the file anyway and fail-safe .get() defaults
-    treat missing keys conservatively). Never used for code generation: a partial
-    edit list must keep failing loudly rather than half-apply."""
-    if not text:
-        return None
-    s = text.strip()
-    # A truncated response may OPEN a ```json fence and never close it. Only strip
-    # a fence the response actually STARTS with - findings routinely quote ``` in
-    # their problem strings, and matching one mid-text would garble the input.
-    fence = re.match(r"```(?:json|JSON)?\s*(.*)", s, re.S)
-    if fence:
-        s = fence.group(1).strip()
-    starts = [i for i in (s.find("{"), s.find("[")) if i >= 0]
-    if not starts:
-        return None
-    start = min(starts)
-    closers: list[str] = []      # stack of the closer each open container needs
-    in_str = esc = False
-    candidates: list[tuple[int, str]] = []  # (end index, closers suffix) after a complete value
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch in "{[":
-            closers.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if not closers or ch != closers[-1]:
-                break  # malformed from here on - try the candidates collected so far
-            closers.pop()
-            # A complete object/array ELEMENT just closed - a safe cut point.
-            # (Only container closes qualify: cutting mid-string/number would
-            # salvage a fragment element with most of its keys missing.) When the
-            # TOP-LEVEL container closes the suffix is empty; that full-value
-            # candidate usually re-fails (it is why we are here), but earlier
-            # candidates still rescue a valid prefix from a malformed tail
-            # (e.g. a bad escape or stray key in the LAST element).
-            candidates.append((i + 1, "".join(reversed(closers))))
-            if not closers:
-                break  # top-level closed: anything after is trailing junk
-    for idx, suffix in reversed(candidates):
-        frag = s[start:idx].rstrip().rstrip(",")
-        try:
-            return json.loads(frag + suffix)
-        except Exception:
-            continue
-    return None
+
+def _is_partial_structured(data) -> bool:
+    """True when structured output was recovered from a truncated/malformed stream.
+
+    A partial payload may INFORM further work but must NEVER authorize CLEAN,
+    READY, approval, merge, push, or a skipped remainder."""
+    return _partial.is_partial_structured(data)
+
+
+def _stamp_salvage_meta(data, meta: dict):
+    """Attach first-class partial evidence (compat for callers/tests)."""
+    if data is None or meta is None:
+        return data
+    evidence = _partial.PartialSalvageEvidence(
+        partial=True,
+        cut_point=meta.get("cut_point"),
+        provider=meta.get("provider"),
+        closers_appended=str(meta.get("closers_appended") or ""),
+        missing_scope_warning=str(
+            meta.get("missing_scope_warning") or MISSING_SCOPE_WARNING),
+        continuation_history=list(
+            meta.get("continuation_history") or meta.get("retry_history") or []),
+        correlation_id=meta.get("correlation_id"),
+        raw_len=int(meta.get("raw_len") or 0),
+        reason=str(meta.get("reason") or "truncated_or_malformed_tail"),
+    )
+    return _partial.attach_partial_meta(data, evidence)
+
+
+def _salvage_truncated_json_ex(text: str, **kwargs):
+    """Delegate to flexfactor_partial.salvage_truncated_json_ex.
+
+    Returns (payload_or_None, PartialSalvageEvidence_or_None). When partial,
+    the payload already carries PARTIAL_META_KEY evidence."""
+    return _partial.salvage_truncated_json_ex(text, **kwargs)
+
+
+def _salvage_truncated_json(text: str):
+    """Compat wrapper: salvaged payload with partial meta attached when partial."""
+    data, _evidence = _partial.salvage_truncated_json_ex(text)
+    return data
 
 
 def _feedback(grade: Grade) -> str:
@@ -2523,49 +2540,85 @@ def _git_tree_clean(path: str) -> bool:
     return True
 
 
-DIRTY_SNAPSHOT_MSG = (
-    "[FlexFactor] snapshot: pre-existing uncommitted changes\n\n"
-    "These changes were already in the working tree when the run started. They are\n"
-    "preserved verbatim as this sandbox branch's FIRST commit so FlexFactor's own\n"
-    "fix commits stay separate from your work. Your files on disk were not touched.\n"
-    "To put them back on your original branch as uncommitted changes:\n"
-    "  git cherry-pick --no-commit <this-commit> && git reset")
+DIRTY_SNAPSHOT_MSG = _wip.DIRTY_SNAPSHOT_MSG
+WIP_SNAPSHOT_REF_PREFIX = _wip.WIP_REF_PREFIX  # refs/flexfactor-wip/
+
+
+def _wip_short(snapshot_id: str | None) -> str:
+    """Short label for logs: ref tail or bare sha prefix."""
+    if not snapshot_id:
+        return "?"
+    if _wip.is_wip_snapshot_ref(snapshot_id):
+        return snapshot_id.rsplit("/", 1)[-1][:12]
+    return snapshot_id[:9]
+
+
+def _wip_ref_label(snapshot_id: str | None) -> str:
+    """Canonical refs/flexfactor-wip/... label for a stored snapshot id."""
+    if not snapshot_id:
+        return WIP_SNAPSHOT_REF_PREFIX + "?"
+    if _wip.is_wip_snapshot_ref(snapshot_id):
+        return snapshot_id
+    return WIP_SNAPSHOT_REF_PREFIX + snapshot_id
 
 
 def _snapshot_dirty_tree(project_dir: str) -> tuple[bool, str | None]:
-    """Commit the tree's pre-existing changes verbatim as a labeled snapshot commit
-    on the CURRENT (sandbox) branch. Committing records the tree without modifying
-    any file on disk, and afterwards every `git add -A` cycle commit contains ONLY
-    FlexFactor's own changes. Returns (committed, sha). committed=False means the
-    tree is untouched except a possible staged->unstaged round trip; the caller
-    must then refuse to proceed (sweeping owner WIP into fix commits is never
-    acceptable). committed=True with sha=None means the commit landed but could
-    not be identified - the caller must PRESERVE the branch, never delete it."""
-    add = _git(["add", "-A"], project_dir)
-    if add.returncode != 0:
+    """Preserve pre-existing WIP as a private ORPHAN commit under refs/flexfactor-wip/*,
+    then reset the sandbox working tree to the clean base.
+
+    Delegates to flexfactor_wip.capture_orphan_wip_snapshot. Returns (committed, ref).
+    committed=False means the tree is left as found and the caller must refuse.
+    committed=True with ref=None means the object may exist but is unidentifiable —
+    the caller must PRESERVE any holding ref, never delete it. The returned ref
+    (not a bare sha) is what callers store in result['dirty_snapshot']."""
+    ok, ref, _secrets = _wip.capture_orphan_wip_snapshot(_git, project_dir)
+    if not ok:
         return False, None
-    # --no-verify: this is a verbatim preservation snapshot of the owner's own
-    # in-progress work; repo lint/pre-commit hooks must not be able to block it.
-    c = _git(["commit", "--no-verify", "-m", DIRTY_SNAPSHOT_MSG], project_dir)
-    if c.returncode != 0:
-        _git(["reset"], project_dir)  # unstage; leave the WIP exactly as found
-        return False, None
-    sha = _git(["rev-parse", "HEAD"], project_dir)
-    out = (sha.stdout or "").strip()
-    return True, (out if sha.returncode == 0 and out else None)
+    return True, ref
 
 
-def _restore_dirty_snapshot(project_dir: str, snapshot_sha: str) -> bool:
+def _restore_dirty_snapshot(project_dir: str, snapshot_id: str) -> bool:
     """Re-apply a pre-run dirty-tree snapshot as plain uncommitted working-tree
-    changes. Called after the ORIGINAL branch is checked back out; that branch tip
-    is the snapshot's parent (the sandbox branch was created from it), so the
-    apply is conflict-free by construction. True on success."""
-    cp = _git(["cherry-pick", "--no-commit", snapshot_sha], project_dir)
-    if cp.returncode != 0:
-        _git(["cherry-pick", "--abort"], project_dir)
-        return False
-    _git(["reset"], project_dir)  # unstage: exactly the pre-run dirty state
-    return True
+    changes. Delegates to flexfactor_wip.restore_orphan_wip_snapshot."""
+    return _wip.restore_orphan_wip_snapshot(_git, project_dir, snapshot_id)
+
+
+def _snapshot_is_ancestor(project_dir: str, snapshot_id: str, tip: str = "HEAD") -> bool:
+    """True when the WIP snapshot is reachable from tip (forbidden for publish)."""
+    anc = _wip.snapshot_is_ancestor_of(_git, project_dir, snapshot_id, tip)
+    return bool(anc)
+
+
+def _scan_snapshot_for_secrets(project_dir: str, snapshot_id: str) -> list[str]:
+    """Return paths inside the snapshot whose blob text matches secret patterns."""
+    sha = _wip.resolve_snapshot_sha(_git, project_dir, snapshot_id) or snapshot_id
+    findings = _wip.scan_tree_for_secrets(_git, project_dir, sha)
+    return [str(f.get("path") or f.get("category") or "?") for f in findings]
+
+
+def _assert_publish_history_safe(project_dir: str, branch: str,
+                                 dirty_snapshot: str | None) -> None:
+    """Refuse push/merge when a WIP snapshot would enter published history or
+    when the retained snapshot contains secret-shaped material.
+
+    Uses flexfactor_wip.publish_allowed (fail closed). Never pushes refs/flexfactor-wip/*."""
+    if not dirty_snapshot:
+        return
+    sha = _wip.resolve_snapshot_sha(_git, project_dir, dirty_snapshot)
+    secret_findings: list[dict] = []
+    if sha:
+        secret_findings = _wip.scan_tree_for_secrets(_git, project_dir, sha)
+    else:
+        secret_findings = [{"category": "scan_error", "path": None,
+                            "detail": "unresolvable WIP snapshot; treat as unscanned"}]
+    ok, reason = _wip.publish_allowed(
+        _git, project_dir,
+        snapshot_id=dirty_snapshot,
+        branch=branch,
+        secret_findings=secret_findings if secret_findings else None,
+    )
+    if not ok:
+        raise BranchStateError(f"refusing publish: {reason}")
 
 
 def _tail(text: str, lines: int = 25) -> str:
@@ -5421,7 +5474,25 @@ def review_file(provider, rel_path: str, text: str,
     # No-op against the real API, where structured() already returns the object.
     if isinstance(data, list):
         data = {"findings": data, "summary": ""}
-    findings = data.get("findings") or []
+    findings = list(data.get("findings") or []) if isinstance(data, dict) else []
+    # Partial/truncated salvage may INFORM further work but must NEVER authorize
+    # an empty-findings CLEAN path. Inject a high finding citing the missing-
+    # scope warning so the file is not marked clean.
+    if _partial.is_partial_structured(data):
+        meta = _partial.partial_evidence(data) or {}
+        warning = str(meta.get("missing_scope_warning") or MISSING_SCOPE_WARNING)
+        findings.append({
+            "file": rel_path,
+            "line": 0,
+            "severity": "high",
+            "category": "partial-output",
+            "title": "partial structured review output",
+            "problem": warning,
+            "fix": ("Re-run the review to completion; truncated structured output "
+                     "must not authorize CLEAN, READY, approval, merge, or push."),
+        })
+        print(f"  [partial] {rel_path}: structured review was truncated/malformed; "
+              "injected high finding (cannot mark file clean)")
     for f in findings:
         f["file"] = rel_path
         # The proxy/NIM upstream ignores output_config, so models sometimes emit a
@@ -5439,7 +5510,7 @@ def review_file(provider, rel_path: str, text: str,
         findings = [f for f in findings if not _is_line_number_artifact(f)]
         print(f"  [artifact] {rel_path}: dropped {len(dropped)} line-number-prefix "
               "finding(s) (harness artifact, not source)")
-    return findings, str(data.get("summary", ""))
+    return findings, str(data.get("summary", "") if isinstance(data, dict) else "")
 
 
 def _gap_to_finding(g: dict) -> dict:
@@ -5737,13 +5808,19 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
 
 
 def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
-                         allow_scripts: bool = False) -> list:
+                         allow_scripts: bool = False,
+                         allow_untrusted_exec: bool = False) -> list:
     """Install every detected component's dependencies through the gated `_run`.
 
     Deliberately never raises and never aborts the audit: a project whose install
     fails is still worth reviewing (the review phase needs no toolchain at all).
     The failure is recorded and surfaced so a subsequent red baseline build is
-    attributed to the missing dependencies rather than blamed on the code."""
+    attributed to the missing dependencies rather than blamed on the code.
+
+    Truthful containment: install/build executes third-party code. Command policy
+    is not an OS sandbox. Unattended bootstrap requires a trusted_repos match
+    (or explicit --allow-untrusted-exec).
+    """
     try:
         import flexfactor_prodready as _pr
     except Exception:
@@ -5751,7 +5828,23 @@ def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
     chains = stack.get("toolchains") or []
     if not chains:
         return []
-    plan = _pr.bootstrap_plan(chains, allow_scripts=allow_scripts)
+    try:
+        import flexfactor_trust as _trust
+        decision = _trust.require_trusted_for_exec(
+            project_dir, allow_untrusted=allow_untrusted_exec)
+        print(f"{pfx}containment: {_trust.containment_claim()}")
+        if not decision.allowed:
+            print(f"{pfx}bootstrap BLOCKED (untrusted tree): {decision.reason}",
+                  file=sys.stderr)
+            return [_pr.StepResult(
+                label="trust:blocked", cmd=["flexfactor-trust"], cwd=".",
+                ok=False, detail=decision.reason, skipped=True)]
+        print(f"{pfx}trust: {decision.reason}")
+    except Exception as ex:
+        print(f"{pfx}bootstrap BLOCKED: trust gate error ({ex})", file=sys.stderr)
+        return []
+    plan = _pr.bootstrap_plan(chains, allow_scripts=allow_scripts,
+                              project_dir=project_dir)
     if not plan:
         print(f"{pfx}dependencies already present for all "
               f"{len(chains)} component(s); skipping install.")
@@ -5795,15 +5888,16 @@ def _assess_readiness_phase(project_dir: str, stack: dict, name: str,
     except Exception as exc:                      # never let scoring kill the run
         print(f"{pfx}readiness assessment failed: {type(exc).__name__}: {exc}")
         return None
-    ready, blockers = _pr.readiness_verdict(gates)
+    label, certifiable, blockers = _pr.certification_verdict(gates)
+    ready = certifiable  # legacy key: only true under contract-aware CERTIFIED
     passed, evaluated, total = _pr.readiness_score(gates)
     card = _pr.render_scorecard(name, chains, gates, bootstrap)
     path = _safe_report_write(project_dir,
                               f"{_slugify(name) or 'program'}_readiness.md", card)
-    print(f"{pfx}readiness: {'PRODUCTION READY' if ready else 'NOT production ready'} "
+    print(f"{pfx}readiness: {label} "
           f"({passed}/{evaluated} gates passed, {len(blockers)} blocker(s)) -> {path}")
-    return {"ready": ready, "passed": passed, "evaluated": evaluated, "total": total,
-            "report_path": path,
+    return {"ready": ready, "label": label, "passed": passed, "evaluated": evaluated,
+            "total": total, "report_path": path,
             "gates": [g.to_dict() for g in gates],
             "blockers": [g.to_dict() for g in blockers]}
 
@@ -6135,6 +6229,22 @@ def _adversarial_verify_fix(reviewer, rel_path: str, original: str, fixed: str,
             data = None
     if data is None:
         return False, [], f"adversarial verify unavailable: {last_ex}"
+    # Partial may INFORM residuals but must NEVER authorize clean=True.
+    data = _partial.refuse_clean_if_partial(data)
+    if _partial.is_partial_structured(data) or not _partial.may_authorize_clean(data):
+        meta = _partial.partial_evidence(data) or {}
+        residual = [r for r in (data.get("residual") or []) if isinstance(r, dict)]
+        if not residual:
+            residual = [{
+                "severity": "high", "line": 0,
+                "title": "partial verifier output",
+                "problem": str(meta.get("missing_scope_warning") or MISSING_SCOPE_WARNING),
+                "realistic_input": True, "affects_core": True,
+            }]
+        return False, residual, (
+            "adversarial verify partial/truncated "
+            f"(cut_point={meta.get('cut_point')}; fail-closed, no CLEAN)"
+        )
     verdict = str(data.get("verdict"))
     residual = [r for r in (data.get("residual") or []) if isinstance(r, dict)]
     regressions = [str(g) for g in (data.get("regressions") or []) if str(g).strip()]
@@ -6786,10 +6896,17 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             f"{label}: 'git commit' failed (rc={rc.returncode}) - staged changes are "
             f"NOT committed, stopping: {_tail(rc.stdout + rc.stderr, 4)}")
     status = f"{label}: committed on {branch} (build {'ok' if final_ok else 'FAILED'})"
+    dirty_snapshot = getattr(args, "_dirty_snapshot", None)
+    if args.push or args.merge:
+        # Owner WIP under refs/flexfactor-wip/* must never enter publishable history;
+        # publish_allowed (via _assert_publish_history_safe) fail-closes on
+        # ancestor / unscanned / secret hits. Never push those WIP refs.
+        _assert_publish_history_safe(project_dir, branch, dirty_snapshot)
     if args.push and _git_has_remote(project_dir):
         # Force-push: the audit branch is FlexFactor's own sandbox, recreated with
         # `checkout -B` each run, so its remote copy from a prior run legitimately
         # diverges. --force-with-lease keeps it safe (won't clobber others' work).
+        # Never push refs/flexfactor-wip/* — those hold owner WIP only.
         pr = _git(["push", "--force-with-lease", "-u", "origin", branch], project_dir)
         status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
     if args.merge and final_ok and prev_branch:
@@ -7019,16 +7136,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    A dirty tree is handled three ways: --allow-dirty sweeps the dirt into
         #    the cycle commits (legacy, explicit opt-in); --snapshot-dirty (prodready's
         #    default - "walk away" must not faceplant on the most common real-world
-        #    state) preserves it verbatim as the branch's first commit; otherwise
-        #    hard-stop, because `git add -A` below would silently commit owner WIP
-        #    as FlexFactor's work.
+        #    state) preserves WIP as a PRIVATE orphan ref (never an ancestor of the
+        #    sandbox branch), then hard-resets the worktree to the clean base;
+        #    otherwise hard-stop, because `git add -A` below would silently commit
+        #    owner WIP as FlexFactor's work.
         tree_dirty = (git and not args.dry_run and not report_only
                       and not _git_tree_clean(project_dir))
         snapshot_mode = bool(getattr(args, "snapshot_dirty", False))
         if tree_dirty and not args.allow_dirty and not snapshot_mode:
             print(f"{pfx}error: working tree isn't clean. Commit/stash, pass --allow-dirty, "
-                  "or pass --snapshot-dirty to preserve the changes as the sandbox "
-                  "branch's first commit (prodready does this automatically).",
+                  "or pass --snapshot-dirty to preserve the changes as a private orphan "
+                  "snapshot (prodready does this automatically).",
                   file=sys.stderr)
             result["error"] = "working tree isn't clean"
             return result
@@ -7047,20 +7165,33 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Sandbox branch: {branch} (from {prev_branch})")
 
         # 2a. Dirty-tree preservation snapshot (walk-away mode). Runs AFTER the
-        #     sandbox branch exists so the snapshot commit lands on FlexFactor's
-        #     branch, never on the owner's. Every failure path here is fail-closed:
-        #     proceed only when the owner's WIP is provably separated.
+        #     sandbox branch exists. WIP is stored ONLY under
+        #     refs/flexfactor-wip/<id> as an ORPHAN commit — never as a sandbox-
+        #     branch ancestor — then the worktree is hard-reset to the clean
+        #     base so cycle commits cannot sweep owner files. Fail-closed.
         dirty_snapshot = None
         if created_branch and tree_dirty and not args.allow_dirty and snapshot_mode:
             committed, dirty_snapshot = _snapshot_dirty_tree(project_dir)
             if committed and dirty_snapshot:
+                if _snapshot_is_ancestor(project_dir, dirty_snapshot, tip=branch):
+                    # Invariant broken — refuse rather than publishable contamination.
+                    _git(["checkout", prev_branch], project_dir)
+                    print(f"{pfx}error: dirty snapshot {_wip_short(dirty_snapshot)} unexpectedly "
+                          f"became an ancestor of {branch}; refusing to continue. "
+                          f"Private ref {_wip_ref_label(dirty_snapshot)} "
+                          "PRESERVED for recovery.", file=sys.stderr)
+                    result["error"] = "dirty snapshot became branch ancestor"
+                    result["dirty_snapshot"] = dirty_snapshot
+                    return result
                 print(f"{pfx}Dirty tree handled: pre-existing uncommitted changes preserved "
-                      f"verbatim as snapshot commit {dirty_snapshot[:9]} (first commit on "
-                      f"{branch}); files on disk untouched, fix commits stay separate.")
+                      f"as private orphan WIP snapshot {_wip_short(dirty_snapshot)} "
+                      f"({_wip_ref_label(dirty_snapshot)}); sandbox worktree "
+                      "reset to clean base so fix commits stay separate from owner WIP.")
                 result["dirty_snapshot"] = dirty_snapshot
+                args._dirty_snapshot = dirty_snapshot
             elif committed:
-                # Commit landed but is unidentifiable: this branch is now the only
-                # ref holding the owner's WIP - PRESERVE it, never proceed/delete.
+                # Object may exist but has no identifiable private ref — PRESERVE
+                # the sandbox branch (may still hold staged WIP) and stop.
                 print(f"{pfx}error: dirty-tree snapshot committed but could not be "
                       f"identified; branch {branch} PRESERVED (holds your changes) - "
                       "inspect manually.", file=sys.stderr)
@@ -7077,6 +7208,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                       "Commit/stash manually, or pass --allow-dirty.", file=sys.stderr)
                 result["error"] = "dirty tree; snapshot commit failed"
                 return result
+        else:
+            args._dirty_snapshot = None
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
@@ -7580,7 +7713,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if dirty_snapshot and not _restore_dirty_snapshot(project_dir, dirty_snapshot):
                 _git(["checkout", branch], project_dir)
                 return (f"; WARNING branch {branch} PRESERVED - it holds your pre-run "
-                        f"uncommitted changes (snapshot {dirty_snapshot[:9]}); "
+                        f"uncommitted changes (snapshot {_wip_short(dirty_snapshot)}); "
                         "automatic restore failed")
             _git(["branch", "-D", branch], project_dir)
             return ("; pre-run uncommitted changes restored to the working tree"
@@ -7635,7 +7768,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # On every path that KEEPS the branch, say where the owner's pre-run WIP is.
         if dirty_snapshot and "pre-run uncommitted changes" not in commit_status:
             commit_status += (f"; NOTE your pre-run uncommitted changes are preserved as "
-                              f"snapshot commit {dirty_snapshot[:9]} (first commit on {branch})")
+                              f"private orphan WIP snapshot {_wip_short(dirty_snapshot)} "
+                              f"({_wip_ref_label(dirty_snapshot)}; not a "
+                              f"branch ancestor)")
 
         print(f"{pfx}Git: {commit_status}")
         suite_txt = ("GREEN" if suite_status else "RED" if suite_status is False else "not run")
@@ -8410,6 +8545,12 @@ def main(argv=None) -> int:
                                  "during bootstrap. Off by default: installing a tree runs "
                                  "that tree's third-party code on your machine. Some native "
                                  "packages genuinely need it.")
+        parser.add_argument("--allow-untrusted-exec", action="store_true",
+                            dest="allow_untrusted_exec", default=False,
+                            help="Permit unattended install/build/test on a tree that is NOT "
+                                 "listed in ~/.flexfactor/policy.json trusted_repos (or "
+                                 "FLEXFACTOR_TRUSTED_REPOS). This is NOT an OS sandbox — "
+                                 "third-party code may still run. Default: refuse unknown trees.")
         # Both default to None, not True/False: two flags sharing a dest means the
         # LAST registered default wins, which would silently switch the scorecard on
         # for plain `audit` too. None = "not specified" and the mode decides below.
@@ -8489,8 +8630,9 @@ def main(argv=None) -> int:
         parser.add_argument("--snapshot-dirty", action=argparse.BooleanOptionalAction,
                             default=None, dest="snapshot_dirty",
                             help="On a dirty tree, preserve the pre-existing uncommitted "
-                                 "changes verbatim as the sandbox branch's first commit "
-                                 "and continue, instead of refusing to run. Default: on "
+                                 "changes as a private orphan WIP snapshot under "
+                                 "refs/flexfactor-wip/* (never a branch ancestor) and "
+                                 "continue, instead of refusing to run. Default: on "
                                  "in prodready (walk-away must not stop for this), off "
                                  "in audit.")
         parser.add_argument("--dry-run", action="store_true", dest="dry_run",
