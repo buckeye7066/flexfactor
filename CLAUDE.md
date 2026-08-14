@@ -146,6 +146,64 @@ system correctly declining to break working code** — there is a comment at the
 no-op accounting saying so, because counting it honestly as an error is what
 made this visible. Do not "fix" that accounting into a success.
 
+## A file key is an IDENTITY — canonicalize it (2026-08-14)
+
+`rel` is not merely a path in this tool: it is the identity a file is tracked by
+in `done_set`, the brain's `clean_files` skip set, and the findings map. **Two
+spellings mean two files.**
+
+`os.path.relpath` emits **backslashes** on Windows, while every other producer
+normalizes to forward slashes (`_gap_to_finding`, the purpose-bridging list,
+`clean_files`). Measured from the live GrantFlow run's log: of 28 per-file
+outcome lines, **19 backslash / 9 forward**, and **eight files appeared under
+BOTH spellings**, each processed twice in one run. `NotificationBell.jsx` and
+`GrantPortalAssistant.jsx` were **`[fixed]` twice** — the second pass re-applying
+findings the first pass had already resolved. The author model caught the rest:
+*"already fixed in the current file content"*, *"the findings appear to describe
+a different (broken) revision of this file than the one provided"*. That is how
+a "fix" reintroduces a bug that was already repaired.
+
+- `_canon_rel()` is the canonical form: backslashes → forward, whole leading
+  `./` segments stripped. **Never `lstrip("./")`** — that strips a character SET
+  and turns `.github/wf.yml` into `github/wf.yml`.
+- `_enumerate_source_files` emits canonical keys.
+- `_fix_files` folds its incoming `file_findings` through `_canon_rel` as
+  defence in depth, **merging** both spellings' findings rather than letting one
+  win — canonicalizing must never drop a real defect.
+
+Side effect worth knowing: the purpose-first sweep ordering
+(`pf = [f for f in purpose_files if f in set(files)]`) compared forward-slash
+gap paths against backslash enumeration keys, so it silently matched **nothing**.
+With canonical keys it actually orders the sweep now.
+
+## Bare-list salvage is SHARED (2026-08-14) — never discard a good payload over its envelope
+
+`_check_structured_type` is the one chokepoint every provider's `structured()`
+output passes through, so its bare-list salvage serves the EDIT path and the
+REVIEW path alike. `e4ef6b6` fixed the symptom where it was first seen (edits)
+by demanding that **every** element carry **all** of `items.required` — and that
+rule then discarded good reviews.
+
+Live GrantFlow 2026-08-14: `FunderDetailDialog.jsx` review failed with
+`expected a JSON object, got list`. The payload head was `{"findings":[` — a
+valid envelope whose closing brace was cut, so `_extract_json_object` fell
+through to the balanced inner `[...]` span and returned a bare list. One finding
+omitted `category`, the all-keys rule rejected it, and the whole well-formed
+review was thrown away; the file was retried on a slower backend and ended that
+cycle **UNREVIEWED**. (It is correctly *not* marked clean — do not weaken that.)
+
+`_list_fits_array_prop()` now SCORES fit instead of demanding perfection, and
+`_check_structured_type` wraps into the **unique best-scoring** array property.
+Teeth retained: every element must be the right JSON type; for object items every
+element must show **at least one** required key and average coverage must clear
+`_LIST_FIT_MIN_COVERAGE` (0.34); a **tie** between two array properties is
+genuinely ambiguous and still raises. The separate `_salvage_truncated_json`
+path (text that does not parse at all) is untouched and regression-tested.
+
+Note the ordering that made this reachable: `_extract_json_object` runs BEFORE
+`_salvage_truncated_json`, so a cut envelope with a complete inner array never
+reaches truncation repair — it arrives here as a bare list.
+
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
 A stall threshold **below the free route's healthy latency** silently converts a

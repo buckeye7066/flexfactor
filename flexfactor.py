@@ -2359,6 +2359,57 @@ def _extract_json_object(text: str):
     return None, s
 
 
+_LIST_FIT_MIN_COVERAGE = 0.34  # avg share of an item's required keys to call it a fit
+
+
+def _list_fits_array_prop(data: list, spec: dict) -> float | None:
+    """How well a bare list fits ONE array-typed schema property.
+
+    Returns a 0..1 fit score, or None when the list plainly is not this
+    property's payload. Used by the bare-list salvage in
+    `_check_structured_type` to choose which property to wrap a bare list into.
+
+    WHY THIS IS SCORED AND NOT ALL-OR-NOTHING (live GrantFlow 2026-08-14):
+    the previous rule required EVERY element to carry ALL of `items.required`.
+    Real models routinely omit one optional-in-practice key - a findings list
+    where a single entry lacks `category` failed the test, and a complete,
+    well-formed review of FunderDetailDialog.jsx was DISCARDED with
+    "expected a JSON object, got list". The file then had to be re-reviewed on
+    a slower backend; that cycle it ended up UNREVIEWED. Reproduced exactly:
+    two findings, one missing `category`, head `{"findings":[{"line":`.
+
+    Discrimination is kept by two rules that a genuinely unrelated list fails:
+      * every element must be the right JSON type, and
+      * for object items, every element must show at least ONE required key,
+        and the AVERAGE required-key coverage must clear
+        _LIST_FIT_MIN_COVERAGE.
+    """
+    if not data:
+        return None
+    items = (spec or {}).get("items") or {}
+    want = items.get("type")
+    if want == "string":
+        return 1.0 if all(isinstance(e, str) for e in data) else None
+    if want in ("integer", "number"):
+        return 1.0 if all(isinstance(e, (int, float))
+                          and not isinstance(e, bool) for e in data) else None
+    if want and want != "object":
+        return None
+    if want == "object" or items.get("required") or items.get("properties"):
+        if not all(isinstance(e, dict) for e in data):
+            return None
+    req = list(items.get("required") or [])
+    if not req:
+        # Unconstrained items: a real but WEAK fit, so a schema property with
+        # actual required keys always outranks it.
+        return 0.25
+    covers = [sum(1 for k in req if k in e) / len(req) for e in data]
+    if any(c == 0 for c in covers):
+        return None  # an element with none of the required keys -> another list
+    avg = sum(covers) / len(covers)
+    return avg if avg >= _LIST_FIT_MIN_COVERAGE else None
+
+
 def _check_structured_type(data, schema: dict, text: str):
     """Every provider's structured() promises the caller a value shaped like
     `schema` (almost always a top-level JSON object with named keys the caller
@@ -2386,25 +2437,22 @@ def _check_structured_type(data, schema: dict, text: str):
         # schema (by items type/required), wrap it there instead of failing.
         # Ambiguous or non-conforming lists still raise exactly as before.
         if isinstance(data, list) and data:
-            candidates = []
+            scored = []
             for prop, spec in (schema.get("properties") or {}).items():
                 if (spec or {}).get("type") != "array":
                     continue
-                items = (spec or {}).get("items") or {}
-                want_type = items.get("type")
-                need_keys = items.get("required") or []
-                def _elem_ok(e):
-                    if want_type == "object":
-                        return isinstance(e, dict) and all(k in e for k in need_keys)
-                    if want_type == "string":
-                        return isinstance(e, str)
-                    return True
-                if all(_elem_ok(e) for e in data):
-                    candidates.append(prop)
-            if len(candidates) == 1:
+                fit = _list_fits_array_prop(data, spec)
+                if fit is not None:
+                    scored.append((fit, prop))
+            # Unique BEST fit wins. A tie between two array properties is
+            # genuinely ambiguous - guessing there could file findings under the
+            # wrong key - so it still raises, exactly as before.
+            scored.sort(reverse=True)
+            if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+                fit, prop = scored[0]
                 print(f"  [salvage] structured output was a bare list; wrapped "
-                      f"into '{candidates[0]}' per schema")
-                return {candidates[0]: data}
+                      f"into '{prop}' per schema (element fit {fit:.0%})")
+                return {prop: data}
         raise RuntimeError(
             f"Structured output did not match schema (expected a JSON object, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
@@ -6687,6 +6735,21 @@ def _safe_report_write(project_dir: str, report_name: str, body: str) -> str:
     return last
 
 
+def _canon_rel(rel: str) -> str:
+    """THE canonical form of a repo-relative file key.
+
+    A rel is not merely a path in this tool - it is the IDENTITY a file is
+    tracked by in `done_set`, the brain's `clean_files` skip set and the
+    findings map. Two spellings therefore mean two files. Windows
+    `os.path.relpath` emits backslashes while every other producer normalizes,
+    and on the live GrantFlow run of 2026-08-14 that split identity processed
+    eight files twice, [fixed]-ing two of them twice over."""
+    s = str(rel or "").replace("\\", "/")
+    # Strip only whole leading './' segments. NEVER lstrip("./") - that strips a
+    # character SET and would turn '.github/wf.yml' into 'github/wf.yml'.
+    return re.sub(r"^(?:\./)+", "", s)
+
+
 def _is_test_path(rel: str) -> bool:
     low = rel.replace("\\", "/").lower()
     return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
@@ -6819,9 +6882,20 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 continue
             if size == 0 or size > MAX_REVIEW_BYTES:
                 continue
-            out.append((rel, size))
+            # FORWARD SLASHES ARE THE CANONICAL FILE KEY (live GrantFlow
+            # 2026-08-14). os.path.relpath yields BACKSLASHES on Windows, while
+            # every other producer of a file key normalizes ('src/a.jsx'):
+            # purpose gaps (_gap_to_finding), the bridging list, brain
+            # clean_files. A rel is not just a path here - it is the IDENTITY
+            # used by done_set, the clean-file skip set and the findings map.
+            # Two spellings meant two identities: eight GrantFlow files were
+            # processed TWICE in one run, and NotificationBell.jsx and
+            # GrantPortalAssistant.jsx were [fixed] twice - the second pass
+            # applying findings that the first pass had already resolved, which
+            # is exactly how a "fix" reintroduces a repaired bug.
+            out.append((relslash, size))
     out.sort(key=lambda t: (_is_test_path(t[0]),
-                            not t[0].replace("\\", "/").startswith("src/"),
+                            not t[0].startswith("src/"),
                             -t[1]))
     return [rel for rel, _ in out] if max_files <= 0 else [rel for rel, _ in out[:max_files]]
 
@@ -8462,6 +8536,21 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     defects_fixed = 0  # individual defects addressed across kept fixes (for the dashboard)
     since_commit = 0    # kept fixes since the last incremental commit
     MAX_FIX_TRIES = 3   # per-file salvage attempts (build-break / veto feedback loop)
+    # CANONICAL KEYS, DEFENCE IN DEPTH (live GrantFlow 2026-08-14). A file key is
+    # an IDENTITY (done_set, clean-file skips, the findings map), so two
+    # spellings of one path are two identities. Windows os.path.relpath emits
+    # backslashes while purpose gaps and the bridging list emit forward slashes;
+    # eight files were processed TWICE in one run and two were [fixed] TWICE -
+    # the second pass re-applying findings the first pass had already resolved
+    # (the author model caught it: "already fixed in the current file content",
+    # "the findings appear to describe a different revision of this file").
+    # _enumerate_source_files now emits forward slashes; folding here as well
+    # means no future producer can reintroduce the split. Findings for the same
+    # file under different spellings MERGE rather than racing each other.
+    merged_findings: dict[str, list[dict]] = {}
+    for _rel, _fs in file_findings.items():
+        merged_findings.setdefault(_canon_rel(_rel), []).extend(_fs or [])
+    file_findings = merged_findings
     fixable_files = [rel for rel, fs in file_findings.items()
                      if any(should_fix_finding(f, args.fix_severity) for f in fs)]
 

@@ -4399,6 +4399,259 @@ class ReviewFixBatchSizeTests(unittest.TestCase):
                 self.assertEqual(flat, files, f"n={n} size={size} lost files")
 
 
+class CanonicalFileKeyTests(unittest.TestCase):
+    """A file key is an IDENTITY, so two spellings of one path are two files.
+
+    Live GrantFlow 2026-08-14, measured from gfrun11.log: of 28 per-file
+    outcome lines, 19 used BACKSLASH paths and 9 used forward slashes, and
+    EIGHT files appeared under BOTH spellings - each processed twice in one
+    run. Two of them, NotificationBell.jsx and GrantPortalAssistant.jsx, were
+    `[fixed]` TWICE: the second pass re-applied findings the first pass had
+    already resolved. The author model called it out on the others - "already
+    fixed in the current file content" and "the findings appear to describe a
+    different (broken) revision of this file than the one provided" - which is
+    exactly how a "fix" reintroduces a bug that was already repaired.
+
+    Cause: os.path.relpath emits backslashes on Windows, while every other
+    producer of a file key normalizes to forward slashes (_gap_to_finding, the
+    purpose-bridging list, brain clean_files). done_set could never match
+    across the two, so nothing suppressed the second pass."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_enumeration_emits_forward_slash_keys(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "src", "components", "billing")
+            os.makedirs(nested)
+            with open(os.path.join(nested, "AutoTimeTracker.jsx"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("const x = 1;\n")
+            got = ff._enumerate_source_files(tmp, max_files=0)
+        self.assertEqual(got, ["src/components/billing/AutoTimeTracker.jsx"])
+        for g in got:
+            self.assertNotIn("\\", g, "a backslash key forks the file's identity")
+
+    def test_mixed_spellings_of_one_file_are_fixed_ONCE(self):
+        # The live shape: the same file arrives under both spellings. Pre-fix
+        # this generated TWO fixes; the second re-applied resolved findings.
+        import tempfile
+        import types
+        gen_calls = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "src", "components", "notifications")
+            os.makedirs(nested)
+            rel_fwd = "src/components/notifications/NotificationBell.jsx"
+            with open(os.path.join(nested, "NotificationBell.jsx"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None,
+                           **_k):
+                gen_calls.append(rel)
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=0)
+            findings = {rel_fwd: finding("a"),
+                        rel_fwd.replace("/", "\\"): finding("b")}
+            done_set = set()
+            real_edits = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff._gate_file = lambda *a, **k: (True, "")
+                applied, _unver, _notes = ff._fix_files(
+                    object(), None, tmp, findings, self.STACK, True, args,
+                    done_set=done_set, adversarial=False)
+            finally:
+                ff.generate_file_fix_edits = real_edits
+                ff._gate_file = real_gate
+
+        self.assertEqual(len(gen_calls), 1,
+                         f"the file was fixed more than once: {gen_calls}")
+        self.assertEqual(len(applied), 1, f"duplicate applied entries: {applied}")
+        self.assertNotIn("\\", applied[0])
+        self.assertEqual(done_set, {rel_fwd},
+                         "done_set must hold ONE canonical identity per file")
+
+    def test_canon_rel_never_mangles_a_dotfile_directory(self):
+        self.assertEqual(ff._canon_rel(r"src\a.jsx"), "src/a.jsx")
+        self.assertEqual(ff._canon_rel("./src/a.jsx"), "src/a.jsx")
+        self.assertEqual(ff._canon_rel(r".\src\a.jsx"), "src/a.jsx")
+        # lstrip("./") would strip a character SET and break these:
+        self.assertEqual(ff._canon_rel(".github/wf.yml"), ".github/wf.yml")
+        self.assertEqual(ff._canon_rel(".env.example"), ".env.example")
+        self.assertEqual(ff._canon_rel("src/a.jsx"), "src/a.jsx")
+
+    def test_findings_from_both_spellings_are_merged_not_dropped(self):
+        # Canonicalizing must not LOSE the other spelling's findings - they are
+        # the same file's defects and both must reach the author.
+        import tempfile
+        import types
+        seen = {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None, **_k):
+                seen[rel] = [t["title"] for t in targets]
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=0)
+            real_edits = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff._gate_file = lambda *a, **k: (True, "")
+                ff._fix_files(object(), None, tmp,
+                              {"a.py": finding("from-review"),
+                               ".\\a.py": finding("from-purpose-gap")},
+                              self.STACK, True, args, adversarial=False)
+            finally:
+                ff.generate_file_fix_edits = real_edits
+                ff._gate_file = real_gate
+
+        self.assertEqual(len(seen), 1, f"still processed twice: {list(seen)}")
+        titles = sorted(next(iter(seen.values())))
+        self.assertEqual(titles, ["from-purpose-gap", "from-review"],
+                         "merging must keep BOTH spellings' findings")
+
+
+class ReviewBareListSalvageTests(unittest.TestCase):
+    """A well-formed findings set must never be discarded over its envelope.
+
+    Live GrantFlow 2026-08-14:
+        [retry] FunderDetailDialog.jsx: review failed via anthropic
+                (Structured output did not match schema (expected a JSON object,
+                got list)) - retrying on another backend
+    The payload head was `{"findings":[` - a valid envelope whose CLOSING brace
+    was cut, so _extract_json_object fell through to the balanced inner `[...]`
+    span and handed back a bare list. e4ef6b6 added bare-list salvage at the
+    shared chokepoint, but it demanded that EVERY element carry ALL of
+    items.required; one finding missing `category` defeated it and the whole
+    review was thrown away. That cycle the file ended up UNREVIEWED.
+
+    Reproduced exactly before fixing: two findings, one lacking `category`,
+    head `{"findings":[{"line":`.
+
+    The fix scores element fit instead of demanding perfection, and keeps its
+    teeth two ways: every element must be the right JSON type, and (for object
+    items) must show at least one required key with average coverage clearing
+    _LIST_FIT_MIN_COVERAGE. A tie between two array properties is still
+    ambiguous and still raises."""
+
+    FULL = {"line": 73, "severity": "high", "category": "bug",
+            "title": "t", "problem": "p", "fix": "f"}
+    NO_CATEGORY = {"line": 86, "severity": "high",
+                   "title": "t2", "problem": "p2", "fix": "f2"}
+
+    def test_the_live_payload_shape_is_salvaged(self):
+        # The exact live shape: envelope opened, closing brace cut, inner array
+        # complete, one element missing a required key.
+        text = '{"findings":' + json.dumps([self.FULL, self.NO_CATEGORY])
+        data, _raw = ff._extract_json_object(text)
+        self.assertIsInstance(data, list, "precondition: extraction yields a bare list")
+        out = ff._check_structured_type(data, ff.AUDIT_FINDINGS_SCHEMA, text)
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["findings"][1]["title"], "t2")
+
+    def test_a_perfect_bare_list_still_salvages(self):
+        out = ff._check_structured_type([self.FULL, self.FULL],
+                                        ff.AUDIT_FINDINGS_SCHEMA, "x")
+        self.assertEqual(len(out["findings"]), 2)
+
+    def test_a_non_conforming_list_still_raises(self):
+        for bad in ([{"a": 1}, {"b": 2}], ["x", "y"], [], [1, 2, 3]):
+            with self.assertRaises(RuntimeError, msg=f"{bad!r} must not be salvaged"):
+                ff._check_structured_type(bad, ff.AUDIT_FINDINGS_SCHEMA, "x")
+
+    def test_an_ambiguous_two_array_schema_still_raises(self):
+        # Two array properties the list fits EQUALLY well: guessing could file
+        # findings under the wrong key, so this must stay a failure.
+        item = {"type": "object", "properties": {"a": {"type": "string"}},
+                "required": ["a"]}
+        schema = {"type": "object",
+                  "properties": {"left": {"type": "array", "items": item},
+                                 "right": {"type": "array", "items": item}}}
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type([{"a": "x"}], schema, "x")
+
+    def test_the_better_fitting_property_wins_when_not_a_tie(self):
+        schema = {"type": "object", "properties": {
+            "loose": {"type": "array", "items": {}},
+            "findings": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"line": {}, "title": {}},
+                "required": ["line", "title"]}}}}
+        out = ff._check_structured_type([{"line": 1, "title": "t"}], schema, "x")
+        self.assertIn("findings", out, "the constrained property must outrank a "
+                                       "wide-open one")
+
+    def test_truncated_list_salvage_is_not_regressed(self):
+        # The OTHER salvage path (e4ef6b6 / _salvage_truncated_json): text that
+        # does not parse at all, cut mid-element. Must still recover the
+        # complete leading elements AND pass the type check.
+        text = '{"findings":' + json.dumps([self.FULL, self.FULL])[:-1] + ',{"line":9,"sev'
+        self.assertIsNone(_json_or_none(text), "precondition: text must not parse")
+        data = ff._salvage_truncated_json(text)
+        self.assertIsNotNone(data, "truncation salvage regressed")
+        out = ff._check_structured_type(data, ff.AUDIT_FINDINGS_SCHEMA, text)
+        self.assertGreaterEqual(len(out["findings"]), 2)
+
+    def test_the_file_ends_up_REVIEWED_not_requeued(self):
+        # The consequence that actually matters: with the salvage working, the
+        # file is REVIEWED this cycle instead of being retried on another
+        # backend and left unreviewed.
+        text = '{"findings":' + json.dumps([self.FULL, self.NO_CATEGORY])
+
+        class _RawProvider:
+            """Runs the SAME final parse steps the real providers run, so this
+            exercises the shared chokepoint rather than a stub of it."""
+            model = "m"
+            judge_model = "m"
+
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, salvage_truncated=False):
+                data, _ = ff._extract_json_object(text)
+                return ff._check_structured_type(data, schema, text)
+
+        real_read = ff._read_text_and_sha
+        ff._read_text_and_sha = lambda pd, rel, cap=0: ("code\n", "sha-x")
+        try:
+            ffindings, flat, unreadable, clean, incomplete = ff._review_all(
+                [_RawProvider()], "/proj", ["FunderDetailDialog.jsx"], workers=1)
+        finally:
+            ff._read_text_and_sha = real_read
+
+        self.assertEqual(incomplete, set(),
+                         "the file was re-queued instead of reviewed")
+        self.assertEqual(len(ffindings.get("FunderDetailDialog.jsx") or []), 2)
+        self.assertEqual(len(flat), 2)
+
+
+def _json_or_none(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 class VersionAwareReviewTests(unittest.TestCase):
     """FlexFactor must not recommend APIs that don't exist in the installed version.
 
