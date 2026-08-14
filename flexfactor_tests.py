@@ -4315,6 +4315,54 @@ class PrefetchWaitIsBoundedTests(unittest.TestCase):
         self.assertIn("fine.py", applied)
 
 
+class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
+    """REGRESSION GUARD, not a fix: source-before-tests ordering already worked.
+
+    Measured against the live GrantFlow tree 2026-08-14 with the shipped
+    _enumerate_source_files: 3,241 files enumerated, 1,040 of them test-ish, and
+    the FIRST test file sat at index 2,201 - i.e. all 2,201 non-test files come
+    first, and the first three batches contain zero test files. So the ordering
+    lever asked for was already in place and no reorder was needed.
+
+    It is locked here because it is invisible: nothing fails loudly if a future
+    refactor drops the sort key, the sweep just quietly spends its budget on
+    .test/.spec files before the source they cover. Tests are REORDERED, never
+    filtered - they are still reviewed, just last."""
+
+    def test_tests_sort_after_source_and_nothing_is_filtered_out(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            rels = ["src/pages/MyProfiles.jsx",
+                    "src/pages/MyProfiles.test.jsx",
+                    "src/utils/fieldDisplay.js",
+                    "src/utils/__tests__/fieldDisplay.spec.js",
+                    "backend/tests/health.test.js",
+                    "backend/server.js"]
+            for rel in rels:
+                path = os.path.join(tmp, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("const x = 1;\n")
+            got = ff._enumerate_source_files(tmp, max_files=0)
+
+        norm = [g.replace("\\", "/") for g in got]
+        self.assertEqual(sorted(norm), sorted(rels),
+                         "tests must be REORDERED, never filtered out of the sweep")
+        flags = [ff._is_test_path(g) for g in norm]
+        self.assertEqual(flags, sorted(flags),
+                         f"test files must sort AFTER all source files: {norm}")
+        self.assertFalse(flags[0], "the sweep must open on real source")
+
+    def test_the_test_path_markers_catch_the_real_world_shapes(self):
+        for rel in ("src/pages/MyProfiles.test.jsx", "a/b.spec.ts",
+                    "src/__tests__/x.js", "backend/tests/health.test.js",
+                    "pkg/test/util.go", "api/test_client.py"):
+            self.assertTrue(ff._is_test_path(rel), f"{rel} not detected as a test")
+        for rel in ("src/pages/MyProfiles.jsx", "backend/server.js",
+                    "src/utils/fieldDisplay.js", "src/latest/contest.js"):
+            self.assertFalse(ff._is_test_path(rel), f"{rel} wrongly called a test")
+
+
 class ReviewFixBatchSizeTests(unittest.TestCase):
     """A batch's fixes only land after EVERY file in that batch is reviewed, so
     the batch size is the granularity at which VERIFIED work reaches the branch.
