@@ -151,10 +151,13 @@ grep -q 'flexfactor-phone.env' "$HOME/.bashrc" 2>/dev/null || \
 mkdir -p "$HOME/.local/bin"
 chmod +x "$APP_DIR/scripts/phone/engine.sh" "$APP_DIR/scripts/phone/setup.sh"
 ln -sf "$APP_DIR/scripts/phone/engine.sh" "$HOME/.local/bin/flexfactor-engine"
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) : ;;
-  *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc" ;;
-esac
+# Test the FILE, not the live $PATH. Testing $PATH is subtly wrong: whoever
+# runs setup often already has ~/.local/bin exported, so the check passes, the
+# line is never written, and an interactive shell later cannot find the engine.
+for rc in "$HOME/.bashrc" "$HOME/.profile"; do
+  touch "$rc"
+  grep -q 'local/bin' "$rc" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+done
 
 # --- 7. start at boot -----------------------------------------------------
 mkdir -p "$HOME/.termux/boot"
