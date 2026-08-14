@@ -7,6 +7,7 @@ BEFORE exec_module, or @dataclass with future annotations dies at import.
 """
 import contextlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -10993,6 +10994,152 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
     def test_ollama_rejects_non_loopback_base_url(self):
         with self.assertRaisesRegex(ValueError, "non-local"):
             ff.OllamaProvider("test", base_url="https://ollama.example")
+
+
+class PathMapSalvageTests(unittest.TestCase):
+    """Live Family Castle Clash 2026-08-14: asked for TEST_GEN_SCHEMA
+    ({"files":[{"path","contents"}],"notes"}) the model answered a bare
+    path->contents map ({"test/shared/cards.test.js": "import ..."}) and every
+    retry reproduced the shape, so the module was skipped with zero tests.
+    _wrap_path_map rebuilds the intended array; the decoy guard's false-clean
+    protection must keep its teeth for everything else."""
+
+    LIVE = {"test/shared/cards.test.js":
+            "import { describe, it, expect } from 'vitest';\n"
+            "import { CARDS } from '../../shared/cards.js';\n"}
+
+    def test_the_live_payload_shape_is_salvaged(self):
+        out = ff._check_structured_type(dict(self.LIVE), ff.TEST_GEN_SCHEMA, "x")
+        self.assertEqual(len(out["files"]), 1)
+        self.assertEqual(out["files"][0]["path"], "test/shared/cards.test.js")
+        self.assertTrue(out["files"][0]["contents"].startswith("import"))
+
+    def test_a_multi_file_map_is_salvaged_in_full(self):
+        data = dict(self.LIVE)
+        data["test/server/db.test.js"] = "import assert from 'node:assert';\n"
+        out = ff._check_structured_type(data, ff.TEST_GEN_SCHEMA, "x")
+        self.assertEqual({f["path"] for f in out["files"]}, set(data))
+
+    def test_a_decoy_object_still_raises(self):
+        # {"ok": 1} fails every-value-is-a-string; {"ok": "yes"} fails
+        # path-shaped-key. Both must keep raising - a decoy flowing through as
+        # a zero-findings review is a silent false-clean, the worst outcome.
+        for decoy in ({"ok": 1}, {"ok": "yes"}, {"status": "done", "count": 3}):
+            with self.assertRaises(RuntimeError, msg=f"{decoy!r} must not be salvaged"):
+                ff._check_structured_type(decoy, ff.TEST_GEN_SCHEMA, "x")
+
+    def test_an_empty_value_is_not_salvaged(self):
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type({"a/b.test.js": "   "}, ff.TEST_GEN_SCHEMA, "x")
+
+    def test_an_ambiguous_schema_returns_none_and_raises(self):
+        item = {"type": "object",
+                "properties": {"path": {"type": "string"},
+                               "contents": {"type": "string"}},
+                "required": ["path", "contents"]}
+        schema = {"type": "object",
+                  "properties": {"left": {"type": "array", "items": item},
+                                 "right": {"type": "array", "items": item}},
+                  "required": ["left", "right"]}
+        self.assertIsNone(ff._wrap_path_map(dict(self.LIVE), schema))
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(dict(self.LIVE), schema, "x")
+
+    def test_a_schema_without_a_pathish_field_is_never_guessed(self):
+        # EDIT_FIX-style items ({"search","replace"}) carry no path-ish field:
+        # which one takes the dict key would be a guess, so no salvage.
+        item = {"type": "object",
+                "properties": {"search": {"type": "string"},
+                               "replace": {"type": "string"}},
+                "required": ["search", "replace"]}
+        schema = {"type": "object",
+                  "properties": {"edits": {"type": "array", "items": item}},
+                  "required": ["edits"]}
+        self.assertIsNone(ff._wrap_path_map(dict(self.LIVE), schema))
+
+    def test_a_real_partial_answer_is_untouched(self):
+        # A dict that DOES carry a schema key never reaches the salvage.
+        out = ff._check_structured_type({"files": []}, ff.TEST_GEN_SCHEMA, "x")
+        self.assertEqual(out, {"files": []})
+
+
+class TestGenBudgetRetryTests(unittest.TestCase):
+    """Live Family Castle Clash 2026-08-14: server/index.js and
+    tools/socket-security-test.js were skipped with 'hit the 32000-token
+    budget ... raise max_tokens for this call' - the caller ignoring its own
+    error message's advice. _gen_unit_tests retries ONCE at 64k with a
+    focused-scope instruction; other errors and a second budget failure still
+    raise."""
+
+    class _BudgetThenOk:
+        calls: list
+
+        def __init__(self):
+            self.calls = []
+
+        def structured(self, system, prompt, schema, max_tokens=8000, **kw):
+            self.calls.append((max_tokens, prompt))
+            if len(self.calls) == 1:
+                raise RuntimeError(
+                    f"Model output hit the {max_tokens}-token budget (file too "
+                    "large to regenerate in one response); raise max_tokens for "
+                    "this call.")
+            return {"files": [{"path": "test/x.test.js", "contents": "ok"}],
+                    "notes": "n"}
+
+    def test_budget_exhaustion_retries_once_at_64k(self):
+        author = self._BudgetThenOk()
+        gen = ff._gen_unit_tests(author, "server/index.js", "src", ["npm", "test"])
+        self.assertEqual(len(author.calls), 2)
+        self.assertEqual(author.calls[0][0], 32000)
+        self.assertEqual(author.calls[1][0], 64000)
+        self.assertIn("overflowed the output budget", author.calls[1][1],
+                      "the retry must tell the model to be selective")
+        self.assertEqual(gen["files"][0]["path"], "test/x.test.js")
+
+    def test_a_second_budget_failure_still_raises(self):
+        class _AlwaysBudget:
+            n = 0
+
+            def structured(self, *a, max_tokens=8000, **kw):
+                type(self).n += 1
+                raise RuntimeError(f"Model output hit the {max_tokens}-token budget (x)")
+
+        with self.assertRaisesRegex(RuntimeError, "token budget"):
+            ff._gen_unit_tests(_AlwaysBudget(), "m.js", "src", ["npm", "test"])
+        self.assertEqual(_AlwaysBudget.n, 2, "exactly one retry, never a loop")
+
+    def test_a_non_budget_error_is_not_retried(self):
+        class _Boom:
+            n = 0
+
+            def structured(self, *a, **kw):
+                type(self).n += 1
+                raise RuntimeError("connection reset")
+
+        with self.assertRaisesRegex(RuntimeError, "connection reset"):
+            ff._gen_unit_tests(_Boom(), "m.js", "src", ["npm", "test"])
+        self.assertEqual(_Boom.n, 1)
+
+
+class CheckpointPhaseWiringTests(unittest.TestCase):
+    """The 2026-08-12 resume trap, third instance: set_phase/record_cycle
+    existed in flexfactor_runstate.py, passed their own tests, and were called
+    from NOWHERE - so every checkpoint carried phase='starting', cycle=0,
+    files_total=0, spend 0.0 for its whole run (live Family Castle Clash
+    2026-08-14 read as a wedged just-started run 7 hours in). A source-level
+    wiring assertion is deliberately weak but CAN fail: deleting the call
+    sites reddens it. The behavioral halves live in flexfactor_runstate's own
+    tests."""
+
+    def test_the_audit_pipeline_actually_calls_the_checkpoint_mutators(self):
+        src = inspect.getsource(ff.audit_one_program)
+        for needle in ("checkpoint.set(files_total=",
+                       "checkpoint.record_cycle(",
+                       "checkpoint.set_phase("):
+            self.assertIn(needle, src,
+                          f"{needle!r} unwired from audit_one_program - the "
+                          "checkpoint would lie 'starting/0 files' all run")
 
 
 if __name__ == "__main__":

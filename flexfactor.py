@@ -2410,6 +2410,56 @@ def _list_fits_array_prop(data: list, spec: dict) -> float | None:
     return avg if avg >= _LIST_FIT_MIN_COVERAGE else None
 
 
+_PATH_MAP_KEY_HINTS = ("path", "file", "name", "key")
+
+
+def _wrap_path_map(data: dict, schema: dict):
+    """PATH-MAP SALVAGE (live Family Castle Clash 2026-08-14): asked for
+    {"files": [{"path","contents"}], "notes"} the model answered
+    {"test/shared/cards.test.js": "import ..."} — the payload is intact, only
+    the envelope shape is wrong, and every retry reproduced the same shape
+    until the module was skipped with zero tests. If the schema has EXACTLY
+    ONE array property whose items require exactly two string fields, one of
+    them path-ish (_PATH_MAP_KEY_HINTS), and EVERY key of the dict looks like
+    a relative path (contains '/' or '.') with a non-empty string value,
+    rebuild the intended array. Anything else returns None and the decoy
+    guard raises exactly as before — a decoy like {"ok": 1} fails the
+    every-value-is-a-string rule, {"ok": "yes"} fails the path-shaped-key
+    rule, so the false-clean protection keeps its teeth."""
+    if not isinstance(data, dict) or not data:
+        return None
+    candidates = []
+    for prop, spec in (schema.get("properties") or {}).items():
+        spec = spec or {}
+        if spec.get("type") != "array":
+            continue
+        items = spec.get("items") or {}
+        req = list(items.get("required") or [])
+        if len(req) != 2:
+            continue
+        props = items.get("properties") or {}
+        if not all((props.get(r) or {}).get("type") == "string" for r in req):
+            continue
+        key_fields = [r for r in req if any(h in r.lower() for h in _PATH_MAP_KEY_HINTS)]
+        if len(key_fields) != 1:
+            continue  # ambiguous which field would take the dict key
+        candidates.append((prop, key_fields[0],
+                           next(r for r in req if r != key_fields[0])))
+    if len(candidates) != 1:
+        return None  # zero or ambiguous target property -> keep the raise
+    prop, key_field, value_field = candidates[0]
+    for k, v in data.items():
+        if not (isinstance(k, str) and isinstance(v, str) and v.strip()):
+            return None
+        if "/" not in k and "." not in k:
+            return None  # not path-shaped -> likely a decoy object
+    wrapped = [{key_field: k, value_field: v} for k, v in data.items()]
+    print(f"  [salvage] structured output was a path->contents map; wrapped "
+          f"{len(wrapped)} entr{'y' if len(wrapped) == 1 else 'ies'} into "
+          f"'{prop}' per schema")
+    return {prop: wrapped}
+
+
 def _check_structured_type(data, schema: dict, text: str):
     """Every provider's structured() promises the caller a value shaped like
     `schema` (almost always a top-level JSON object with named keys the caller
@@ -2439,6 +2489,9 @@ def _check_structured_type(data, schema: dict, text: str):
         # is a normal partial answer and still passes.
         req = [k for k in (schema.get("required") or []) if isinstance(k, str)]
         if req and not any(k in data for k in req):
+            salvaged = _wrap_path_map(data, schema)
+            if salvaged is not None:
+                return salvaged
             raise RuntimeError(
                 "Structured output matched no schema key (decoy/unrelated JSON "
                 f"object; expected one of {req}); len={len(text)} "
@@ -5997,6 +6050,37 @@ TEST_GEN_SCHEMA = {
     "required": ["files", "notes"],
     "additionalProperties": False,
 }
+
+
+def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") -> dict:
+    """Generate unit tests for ONE module, with one bounded budget retry.
+
+    Live Family Castle Clash 2026-08-14: large modules (server/index.js,
+    tools/socket-security-test.js) hit the 32k output budget and the module
+    was SKIPPED with zero tests — while the error message itself said "raise
+    max_tokens for this call" and the caller ignored its own advice. On a
+    budget exhaustion (the "token budget" phrase both providers' structured()
+    raises with) retry ONCE at 64k with an explicit instruction to cover only
+    the most critical functions, so the largest modules get their most
+    important tests instead of none at all. Any other failure, and a second
+    budget failure, still raise (the caller records the [skip])."""
+    prompt = (f"MODULE: {rel}\nTest framework command: {' '.join(test_cmd)}\n\n"
+              "SOURCE:\n" + _fence_untrusted("source", text)
+              + "\n\nWrite runnable unit tests for this module's functions.")
+    try:
+        return author.structured(UNIT_TEST_SYSTEM, prompt, TEST_GEN_SCHEMA,
+                                 max_tokens=32000)
+    except Exception as ex:
+        if "token budget" not in str(ex):
+            raise
+        print(f"{pfx}[retry] tests for {rel}: 32k output budget hit; retrying once "
+              "at 64k with a focused scope")
+        return author.structured(
+            UNIT_TEST_SYSTEM,
+            prompt + ("\n\nIMPORTANT: your previous attempt overflowed the output "
+                      "budget. Cover ONLY the most critical functions (public API, "
+                      "error paths, boundary cases) in ONE compact test file."),
+            TEST_GEN_SCHEMA, max_tokens=64000)
 
 AUDIT_SYSTEM = (
     "You are a ruthless, senior code auditor performing an adversarial line-by-line "
@@ -9716,6 +9800,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                  else f"up to {args.cycles} cycle(s)")
               + f" (max {cycle_cap}, ${args.max_cost:.0f} cap)...")
         report(files_total=len(files), cycles=cycle_cap)
+        if checkpoint is not None:
+            # Mirror the run's real shape into the durable checkpoint. Without
+            # this the checkpoint carried its new_run() defaults (phase
+            # "starting", files_total 0, cycle 0, spend 0.0) for the ENTIRE
+            # run — live Family Castle Clash 2026-08-14 read as a wedged
+            # just-started run 7 hours and 87 reviewed files in. Same trap as
+            # the 2026-08-12 resume finding: set_phase/record_cycle/record_spend
+            # existed in flexfactor_runstate.py, passed their own tests, and
+            # were called from nowhere.
+            checkpoint.set(files_total=len(files))
         all_files = list(files)  # full list preserved; `files` shrinks each cycle
 
         # 3. Cycle: review -> fix -> commit -> (next cycle re-reads the saved code).
@@ -9762,6 +9856,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         bridged_early: list[str] = []
         if getattr(args, "purpose_gap", True) and purpose_blob:
             report(phase="purpose gap (baseline)")
+            if checkpoint is not None:
+                checkpoint.set_phase("purpose gap (baseline)")
             print(f"{pfx}PHASE 1 - purpose: measuring the gap between this program "
                   "and the job it was created to do...")
             try:
@@ -9851,6 +9947,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             report(cycle=cycle, phase=f"reviewing (cycle {cycle}/{cycle_cap})",
                    reviewed=0, fix_done=len(done_set), fix_total=total_to_review,
                    cost=round(meter.usd, 4))
+            if checkpoint is not None:
+                checkpoint.record_cycle(cycle,
+                                        phase=f"reviewing (cycle {cycle}/{cycle_cap})",
+                                        spend_usd=round(meter.usd, 6))
             # First cycle reviews the (large) repo: reserve most of the budget for
             # fixing so a capped run actually fixes instead of spending it all on
             # review. Later cycles re-review only the small just-fixed set, so the
@@ -9966,6 +10066,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                       f"(batch {bidx + 1}/{len(batches)}).")
                 report(defects=len(flat), severity=_severity_breakdown(flat),
                        phase=f"fixing (cycle {cycle}/{cycle_cap})")
+                if checkpoint is not None:
+                    checkpoint.set_phase(f"fixing (cycle {cycle}/{cycle_cap})",
+                                         defects_found=len(flat),
+                                         spend_usd=round(meter.usd, 6))
 
                 # Hard cost cap: if we're already over budget, don't start fixing.
                 if meter.over_limit():
@@ -10275,6 +10379,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         test_status = None
         if args.tests and stack.get("test_cmd") and not dirty_abort:
             print(f"{pfx}Generating + running unit tests...")
+            if checkpoint is not None:
+                checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
             for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
                 text, read_status = _classify_source_read(project_dir, rel)
                 if read_status == "refused":
@@ -10289,14 +10395,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 if read_status == "empty":
                     continue  # a GENUINELY empty module -> nothing to test-gen, skip quietly
                 try:
-                    gen = author.structured(
-                        UNIT_TEST_SYSTEM,
-                        (f"MODULE: {rel}\nTest framework command: {' '.join(stack['test_cmd'])}\n\n"
-                         "SOURCE:\n" + _fence_untrusted("source", text)
-                         + "\n\nWrite runnable unit tests for this module's functions."),
-                        TEST_GEN_SCHEMA,
-                        max_tokens=32000,  # whole test files — avoid JSON truncation
-                    )
+                    gen = _gen_unit_tests(author, rel, text, stack["test_cmd"], pfx=pfx)
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     continue
