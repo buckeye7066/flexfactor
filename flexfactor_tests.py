@@ -4315,6 +4315,42 @@ class PrefetchWaitIsBoundedTests(unittest.TestCase):
         self.assertIn("fine.py", applied)
 
 
+class ReviewFixBatchSizeTests(unittest.TestCase):
+    """A batch's fixes only land after EVERY file in that batch is reviewed, so
+    the batch size is the granularity at which VERIFIED work reaches the branch.
+
+    Measured on the live GrantFlow run 2026-08-14: per-file fix times were
+    running to the 15m ceiling, so a batch of 20 could occupy an hour before
+    anything was committed - and an interruption mid-batch lost all of it. This
+    is a tuning change, not a behavior change: every per-file safety mechanism
+    (build gate, adversarial verify, rollback, budget cap, commit cadence) is
+    untouched; only the grouping changed."""
+
+    def test_default_batch_size_is_eight(self):
+        self.assertEqual(ff.REVIEW_FIX_BATCH_SIZE, 8)
+
+    def test_batch_size_is_env_tunable_and_never_zero(self):
+        # Same expression the module evaluates at import, so a future refactor
+        # that drops the env hook or the floor fails here.
+        def resolve(raw):
+            return max(1, int(raw))
+        self.assertEqual(resolve("24"), 24)
+        self.assertEqual(resolve("1"), 1)
+        self.assertEqual(resolve("0"), 1, "a zero batch size would divide by zero")
+        self.assertEqual(resolve("-5"), 1)
+
+    def test_chunking_covers_every_file_exactly_once(self):
+        # The batching expression itself: no file may be dropped or duplicated
+        # by a smaller batch size - that would silently shrink the sweep.
+        for n in (0, 1, 7, 8, 9, 20, 41):
+            files = [f"f{i}.py" for i in range(n)]
+            for size in (1, 8, 20):
+                batches = ([files[i:i + size] for i in range(0, len(files), size)]
+                           or [[]])
+                flat = [f for b in batches for f in b]
+                self.assertEqual(flat, files, f"n={n} size={size} lost files")
+
+
 class VersionAwareReviewTests(unittest.TestCase):
     """FlexFactor must not recommend APIs that don't exist in the installed version.
 

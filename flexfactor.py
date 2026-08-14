@@ -8084,7 +8084,16 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 # --review-fix-batch-size; every per-file safety mechanism (build gate,
 # adversarial verify, rollback, budget cap, commit cadence) is unchanged -
 # only the grouping of files handed to review/_fix_files per call changed.
-REVIEW_FIX_BATCH_SIZE = 20
+# 20 -> 8 (2026-08-14, measured on the live GrantFlow run): a batch's fixes only
+# land after EVERY file in that batch is reviewed, so the batch size is the
+# granularity at which verified work reaches the branch. With 20 and per-file fix
+# times running to the 15m ceiling, a batch could occupy an hour before anything
+# was committed - and a run interrupted mid-batch lost all of it. 8 keeps the
+# per-batch review call efficient while roughly halving the worst-case distance
+# between verified fixes landing. Env-tunable so a fast backend can raise it
+# without a code change; --review-fix-batch-size still wins over both.
+REVIEW_FIX_BATCH_SIZE = max(1, int(os.environ.get(
+    "FLEXFACTOR_REVIEW_FIX_BATCH_SIZE", "8")))
 
 # Files above this size never route to a CPU-only ollama pool entry for review
 # (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
