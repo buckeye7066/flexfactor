@@ -2425,6 +2425,24 @@ def _check_structured_type(data, schema: dict, text: str):
     passes through - turns that into a normal generation failure the existing
     retry/edit-fallback/[skip] handling already copes with."""
     expected = schema.get("type")
+    if expected == "object" and isinstance(data, dict):
+        # DECOY-OBJECT GUARD (measured 2026-08-14 probing the extraction order).
+        # _extract_json_object returns the FIRST balanced {...} span, so a
+        # response like `Here you go: {"ok":1}\n{"findings":[...` hands back the
+        # DECOY, not the payload. That dict then flows on as a review with ZERO
+        # findings - and an empty successful review marks the file CLEAN in
+        # `reviewed_clean`. A silent false-clean is the worst outcome this tool
+        # has: the file is never looked at again. A dict carrying NONE of the
+        # schema's required keys is not this schema's object, so raise and let
+        # the existing retry/another-backend path handle it. Narrow on purpose:
+        # a response missing SOME required keys (e.g. findings but no summary)
+        # is a normal partial answer and still passes.
+        req = [k for k in (schema.get("required") or []) if isinstance(k, str)]
+        if req and not any(k in data for k in req):
+            raise RuntimeError(
+                "Structured output matched no schema key (decoy/unrelated JSON "
+                f"object; expected one of {req}); len={len(text)} "
+                f"head={text[:200]!r}")
     if expected == "object" and not isinstance(data, dict):
         # BARE-LIST SALVAGE (live GrantFlow failure 2026-08-13): the economy
         # author tier answers the edit-fix prompt with prose + a bare JSON array
@@ -8515,8 +8533,73 @@ def _fixtrace(event: str, rel: str = "", **kw) -> None:
         pass
 
 
+# A no-op note that REJECTS the finding: the author model inspected the file and
+# concluded there was nothing to fix. These are quotes from live GrantFlow runs.
+# Deliberately conservative - an unmatched note falls back to the generic marker
+# rather than being guessed into either bucket.
+_NOOP_REJECTED_PATTERNS = (
+    r"already\s+(been\s+)?(fixed|correct|handled|resolved|addressed|applied)",
+    r"already\s+(syntactically\s+)?correct",
+    r"no\s+(code\s+|in-file\s+)?(change|edit|fix)\s*(is|was|were)?\s*"
+    r"(required|needed|necessary)",
+    r"nothing\s+(was\s+)?(changed|to\s+fix)",
+    r"no\s+fix\s+(is|was)?\s*(needed|required)",
+    r"(is|are|was|were)\s+not\s+(a\s+)?(real\s+)?(defect|bug|issue|problem)",
+    r"no\s+(actual\s+|real\s+)?(defect|bug|issue)\s+(is\s+)?(present|exists|found)",
+    r"describe[sd]?\s+a\s+different\b.{0,40}\brevision",
+    r"do(es)?\s+not\s+match\s+the\s+actual\s+file",
+    r"false\s+positive",
+    r"separate\s+(component\s+)?scopes",
+)
+# A no-op that is a genuine FAILURE: a real defect the loop could not land.
+_NOOP_NO_FIX_PATTERNS = (
+    r"\b(unable|not\s+able)\s+to\b",
+    r"\bcould\s+not\s+(determine|produce|generate|construct|find)\b",
+    r"\bcannot\s+(determine|produce|generate|safely)\b",
+    r"insufficient\s+(context|information)",
+    r"requires?\s+(a\s+)?(change|edit|refactor)s?\s+(outside|beyond|in\s+other)",
+    r"cross-file\s+(change|refactor)",
+    r"needs?\s+more\s+context",
+)
+
+
+def _classify_noop(reason: str) -> str | None:
+    """Split the two OPPOSITE outcomes that share the `[no-op]` marker.
+
+    Returns "rejected" (the author inspected the file and refused to change
+    working code), "no-fix" (a real defect it could not land), or None when the
+    note does not clearly say - in which case the caller keeps the generic
+    marker rather than guessing.
+
+    WHY THIS MATTERS (owner's purpose rule): run 5 showed 19 no-ops against 41
+    fixes, and that ratio is UNREADABLE because it mixes a success of judgement
+    with a failure of capability. Live example of the first: SamErrorPanel.jsx
+    no-op'd because the finding alleged a conflict between two setStatus calls
+    that are in SEPARATE COMPONENT SCOPES - refusing was correct. The REJECTED
+    rate is the direct measure of REVIEW PRECISION, and review precision is what
+    decides whether FlexFactor improves a program or damages it (see the
+    react-query v5 regression). The author model already states its reason; the
+    information existed and was being thrown away.
+
+    BOTH remain non-successes in the anti-no-op accounting. A rejected finding
+    must NEVER quietly become a success - that would recreate the 2026-08-11
+    defect the exit-code-3 rule exists to prevent."""
+    text = str(reason or "").strip()
+    if not text or text in ("[]", "()", "{}"):
+        return None
+    low = " ".join(text.lower().split())
+    rejected = any(re.search(p, low) for p in _NOOP_REJECTED_PATTERNS)
+    no_fix = any(re.search(p, low) for p in _NOOP_NO_FIX_PATTERNS)
+    if rejected and not no_fix:
+        return "rejected"
+    if no_fix and not rejected:
+        return "no-fix"
+    return None  # silent or self-contradictory -> generic, never a guess
+
+
 def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict,
                baseline_ok: bool, args, meter=None, oversized=None, report=None,
+               noop_stats: dict | None = None,
                err_base: int = 0, done_set=None, total_overall: int = 0,
                commit_cb=None, commit_every: int = 12,
                adversarial: bool = True, adversarial_rounds: int = 2,
@@ -9011,9 +9094,23 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             # could not produce a passing fix because there was no defect. The
             # real bug was upstream in REVIEW, now gated by _version_conflict();
             # counting the no-op honestly is what made it visible.
+            #
+            # SPLIT MARKER (2026-08-14): the two opposite outcomes above are now
+            # distinguishable, because 19 no-ops against 41 fixes is unreadable
+            # when a success of judgement and a failure of capability share one
+            # label. BOTH still count as errors - see the paragraph above.
             errors += 1
-            print(f"  [no-op] {rel}: model returned no change ({outcome[1]})")
-            notes.append(f"{rel}: NO-OP - author model returned no change for "
+            kindly = _classify_noop(outcome[1])
+            marker = ("[no-op: finding rejected]" if kindly == "rejected" else
+                      "[no-op: no fix found]" if kindly == "no-fix" else "[no-op]")
+            if noop_stats is not None:
+                noop_stats[kindly or "unclear"] = noop_stats.get(kindly or "unclear", 0) + 1
+            label = ("REJECTED FINDING (author model found nothing to fix)"
+                     if kindly == "rejected" else
+                     "NO FIX FOUND (real defect the loop could not land)"
+                     if kindly == "no-fix" else "NO-OP")
+            print(f"  {marker} {rel}: model returned no change ({outcome[1]})")
+            notes.append(f"{rel}: {label} - author model returned no change for "
                          f"{len(targets)} finding(s): {outcome[1] or 'no reason given'}")
         elif kind == "revert":
             errors += 1
@@ -9310,6 +9407,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # persistent "brain" so we can recall what we did to this program before.
         meter = CostMeter(args.max_cost if getattr(args, "max_cost", 0) else None)
         oversized: list[str] = []
+        # {"rejected"|"no-fix"|"unclear": n} - the split of the [no-op] marker.
+        # The REJECTED count is the run's measure of REVIEW PRECISION; without
+        # it, "19 no-ops" says nothing about whether review is any good.
+        noop_stats: dict[str, int] = {}
         def report(**kw):  # dashboard feed + live console meter (same stream)
             _PROGRESS.update(index, **kw)
             console_meter.update(**kw)
@@ -9651,7 +9752,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 try:
                     applied_p, unver_p, notes_p = _fix_files(
                         author, cross, project_dir, gap_ff, stack, baseline_ok, args,
-                        meter=meter, oversized=oversized, report=report,
+                        meter=meter, oversized=oversized, report=report, noop_stats=noop_stats,
                         err_base=errors_total, done_set=done_set,
                         total_overall=total_to_review, commit_cb=None,
                         adversarial=getattr(args, "adversarial", True),
@@ -9853,7 +9954,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 try:
                     applied_c, unver_c, notes_c = _fix_files(
                         author, cross, project_dir, batch_findings, stack, baseline_ok, args,
-                        meter=meter, oversized=oversized, report=report, err_base=errors_total,
+                        meter=meter, oversized=oversized, report=report, noop_stats=noop_stats, err_base=errors_total,
                         done_set=done_set, total_overall=total_to_review,
                         commit_cb=(_checkpoint if git else None),
                         adversarial=getattr(args, "adversarial", True),
@@ -10059,7 +10160,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 try:
                     applied_g, unver_g, notes_g = _fix_files(
                         author, cross, project_dir, gap_findings, stack, baseline_ok, args,
-                        meter=meter, oversized=oversized, report=report, err_base=errors_total,
+                        meter=meter, oversized=oversized, report=report, noop_stats=noop_stats, err_base=errors_total,
                         done_set=done_set, total_overall=total_to_review,
                         commit_cb=None,
                         adversarial=getattr(args, "adversarial", True),
@@ -10324,6 +10425,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
             "review_incomplete": len(review_incomplete),
+            # The [no-op] split. "rejected" is the run's REVIEW PRECISION signal:
+            # findings the author model inspected and refused to act on because
+            # there was nothing to fix. Still counted as non-successes.
+            "noop_stats": dict(noop_stats),
         }
         # THE SCOREBOARD (owner order 2026-08-11): the run is scored on CRITERIA
         # CLOSED, not defects fixed. "A run that fixes 498 files and closes zero
@@ -10827,6 +10932,7 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "verification_note": a.get("verification_note"),
         "purpose_fulfillment_pct": (a.get("purpose_gap") or {}).get("fulfillment_pct"),
         "purpose_gaps": len((a.get("purpose_gap") or {}).get("gaps") or []),
+        "noop_stats": a.get("noop_stats") or {},
         "purpose_bridged_files": list(a.get("bridged_files") or []),
         # Purpose awareness + the owner's status vocabulary, as evidence.
         "purpose_authored": bool((a.get("purpose_gap") or {}).get("authored")),
@@ -10851,6 +10957,40 @@ def _write_run_manifest(project_dir: str, a: dict, *,
     return written
 
 
+def _noop_split_lines(a: dict) -> list[str]:
+    """Render the [no-op] split, or nothing when there were no no-ops.
+
+    "N no-ops" alone is unreadable: it mixes a SUCCESS OF JUDGEMENT (the author
+    refused to change working code because the finding was bogus) with a FAILURE
+    OF CAPABILITY (a real defect the loop could not land). The rejected count is
+    the run's REVIEW PRECISION signal - the number that says whether review is
+    helping or generating work that would damage the program.
+
+    Both are reported as NON-SUCCESSES. A rejected finding is not a win for the
+    fix loop; it is a defect in REVIEW."""
+    st = a.get("noop_stats") or {}
+    total = sum(int(v or 0) for v in st.values())
+    if not total:
+        return []
+    rej, nofix, unclear = (int(st.get("rejected") or 0),
+                           int(st.get("no-fix") or 0),
+                           int(st.get("unclear") or 0))
+    line = (f"- **No-ops:** {total} (none are successes) — "
+            f"**{rej} rejected finding(s)** (author found nothing to fix — a "
+            f"REVIEW-precision defect, not a fix failure), "
+            f"**{nofix} no fix found** (a real defect the loop could not land)")
+    if unclear:
+        line += f", {unclear} unclassified (the note did not say)"
+    out = [line]
+    fixed = len(a.get("applied_files") or [])
+    if rej and (rej + fixed):
+        out.append(f"- **Review precision (this run):** {fixed} fix(es) landed vs "
+                   f"{rej} finding(s) rejected as not-a-defect "
+                   f"({100.0 * rej / (rej + fixed):.0f}% of acted-on findings "
+                   "were rejected)")
+    return out
+
+
 def _write_audit_report(project_dir: str, a: dict) -> str:
     report_name = f"{_slugify(a['name']) or 'program'}_audit_report.md"
     L = [f"# FlexFactor audit — {a['name']}", "",
@@ -10861,6 +11001,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          f"- **Files fixed:** {len(a['applied_files'])}"
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
             if a['unverified_files'] else ""),
+         *_noop_split_lines(a),
          # Tri-state. None = the build never ran (no build command exists),
          # which is NOT a pass and must never read like one.
          f"- **Baseline build:** {'passed' if a['baseline_ok'] is True else 'NOT RUN (unverified)' if a['baseline_ok'] is None else 'FAILED'}",

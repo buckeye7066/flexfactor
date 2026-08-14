@@ -167,6 +167,31 @@ system correctly declining to break working code** — there is a comment at the
 no-op accounting saying so, because counting it honestly as an error is what
 made this visible. Do not "fix" that accounting into a success.
 
+### The `[no-op]` marker is SPLIT (2026-08-14) — it hid two opposite outcomes
+
+Run 5: **19 no-ops against 41 fixes**, a ratio that says nothing, because one
+marker covered both a *success of judgement* and a *failure of capability*:
+
+- `[no-op: finding rejected]` — the author inspected the file and refused to
+  change working code. Live: `SamErrorPanel.jsx` rejected a finding alleging a
+  conflict between two `setStatus` calls that are in **separate component
+  scopes**. Refusing was correct.
+- `[no-op: no fix found]` — a real defect the loop could not land.
+- `[no-op]` — the note did not clearly say. `_classify_noop` **falls back rather
+  than guessing**, and a note matching both families is treated as unclear.
+
+The author model already stated its reason; the information existed and was
+being thrown away. **The rejected count is the run's REVIEW PRECISION signal** —
+the number that says whether review is helping or manufacturing work that would
+damage the program. `noop_stats` rides into the audit dict, the report
+(`_noop_split_lines`, which also prints a rejected-vs-landed precision ratio) and
+the run manifest.
+
+**BOTH remain non-successes** in the anti-no-op accounting — `errors += 1` for
+every branch, and the report says "none are successes". Letting "rejected"
+become a success would recreate the 2026-08-11 defect the exit-code-3 rule
+exists to prevent. A rejected finding is a defect in REVIEW, not a win for FIX.
+
 ## A file key is an IDENTITY — canonicalize it (2026-08-14)
 
 `rel` is not merely a path in this tool: it is the identity a file is tracked by
@@ -224,6 +249,26 @@ path (text that does not parse at all) is untouched and regression-tested.
 Note the ordering that made this reachable: `_extract_json_object` runs BEFORE
 `_salvage_truncated_json`, so a cut envelope with a complete inner array never
 reaches truncation repair — it arrives here as a bare list.
+
+**That ordering was investigated and is NOT a defect (measured 2026-08-14).**
+Comparing both paths on five truncated payload shapes: where extraction returns
+something (cut envelope with a complete inner array; cut inside `summary` after
+the array) it yields the *same* findings count salvage would; where extraction
+returns `None` (cut mid-element, cut array after a leading `summary`) salvage
+correctly runs and recovers the leading elements. Reordering would change
+nothing. Do not "fix" it.
+
+The probe did surface a **different** hazard, now guarded: `_extract_json_object`
+returns the FIRST balanced `{...}` span, so `Here you go: {"ok":1}\n{"findings":[…`
+hands back the **decoy**. That dict flowed on as a review with ZERO findings —
+and an empty *successful* review marks the file CLEAN in `reviewed_clean`, so it
+is never looked at again. **A silent false-clean is the worst outcome this tool
+has.** `_check_structured_type` now raises when a dict carries **none** of the
+schema's `required` keys, sending it down the existing retry/another-backend
+path. Narrow on purpose: missing *some* required keys (findings but no summary)
+is a normal partial answer and still passes, and a schema with no `required` can
+never trip it. No production instance was observed — this is a guard against a
+measured mechanism, not a fixed incident.
 
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
