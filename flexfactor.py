@@ -8163,13 +8163,41 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         # snapshot is authoritative: it is exactly the text the model was shown.
         pf = prefetched.pop(rel, None)
         pre = None
+        pf_timed_out = False
         if pf is not None:
             try:
-                res = pf.result()
+                # BOUNDED WAIT. This used to be a bare pf.result() - no timeout -
+                # and it is where a live GrantFlow run wedged HARD on 2026-08-14
+                # (py-spy: MainThread parked in concurrent/futures/_base.py:451
+                # under this line for 25+ minutes, cost meter frozen, zero
+                # progress). _stream_with_deadline is deliberately TWO-PHASE with
+                # no total-elapsed cap, so a stream that keeps dribbling an event
+                # inside the 120s idle budget never times out and this wait never
+                # returns. The per-file ceiling could not save it either: that
+                # deadline is armed BELOW this point and is only tested BETWEEN
+                # attempts, so it never covered prefetch consumption at all.
+                # Bound it by the same per-file budget and, on expiry, abandon
+                # the file LOUDLY and re-queue it - keeping the queue moving is
+                # the whole job.
+                res = pf.result(timeout=FIX_FILE_MAX_SECONDS)
                 # 'capped'/'unreadable' are control sentinels, not a usable prefetch.
                 pre = res if res and res[0] not in ("capped", "unreadable") else None
+            except concurrent.futures.TimeoutError:
+                pf_timed_out = True
             except Exception:
                 pre = None  # cancelled/died -> generate inline exactly as before
+        if pf_timed_out:
+            # Do NOT fall through to inline generation: the same wedged backend
+            # would just hang the main thread instead of a pool thread.
+            mins = FIX_FILE_MAX_SECONDS // 60
+            print(f"  [timeout] {rel}: prefetched fix generation still running after "
+                  f"{mins}m; abandoned and re-queued "
+                  f"(raise FLEXFACTOR_FIX_FILE_MAX_SECONDS to allow longer)")
+            notes.append(f"{rel}: fix generation exceeded {mins}m wall clock - "
+                         "abandoned and re-queued")
+            errors += 1
+            _tick(rel)
+            continue
         original = pre[1] if pre is not None else _read_contained(project_dir, rel)
         if original is None:
             # Contained read REFUSED (swap / fail-closed): never feed "" to the model or

@@ -101,6 +101,20 @@ measured **307.8s**, nearly all of it queued. So:
 - `_stream_with_deadline` is **two-phase, never total-elapsed**: the first-event
   budget absorbs queueing; after the first event a 120s **idle** timer (reset on
   every event) applies. A long-but-progressing generation is never killed.
+- **CONSEQUENCE of "never total-elapsed" (live wedge 2026-08-14, fixed):** a
+  stream that keeps dribbling ONE event inside the 120s idle window never times
+  out — by design. So the two-phase deadline cannot be the only bound on a
+  generation. `_fix_files` consumed its prefetched first attempt with a bare
+  `pf.result()` (no timeout) and a live GrantFlow run froze on one file for 25+
+  minutes, cost meter static, zero `[timeout]` output (py-spy: MainThread in
+  `concurrent/futures/_base.py:451`). `FIX_FILE_MAX_SECONDS` could not save it:
+  that deadline is armed BELOW the prefetch consumption and is only tested
+  BETWEEN attempts. The wait is now `pf.result(timeout=FIX_FILE_MAX_SECONDS)`
+  and expiry abandons the file LOUDLY + re-queues it
+  (`PrefetchWaitIsBoundedTests`). **Residual, still open:** the INLINE
+  generation path (a file with no prefetch — notably the first file of a batch)
+  is still unbounded for the same reason; bounding it needs the same
+  thread-abandonment treatment.
 - `_is_backpressure` — 429/overloaded/503/model-loading/cold-start means *alive,
   be patient*: back off and retry FREE, never rescue. **Trap:** markers must be
   specific phrases. A bare `"queue"` marker made `StreamDeadlineError`

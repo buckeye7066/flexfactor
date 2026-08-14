@@ -4237,6 +4237,84 @@ class AdversarialFixLoopTests(unittest.TestCase):
         self.assertTrue(any("rejected by cross-model review" in n for n in notes))
 
 
+class PrefetchWaitIsBoundedTests(unittest.TestCase):
+    """A hung prefetch must not freeze the whole fix queue.
+
+    Live GrantFlow wedge 2026-08-14: the run sat on ONE file for 25+ minutes
+    with the cost meter frozen and zero progress. py-spy showed the MainThread
+    parked in concurrent/futures/_base.py:451 under a bare `pf.result()` in
+    _fix_files, while the prefetch worker sat in _stream_with_deadline and its
+    stream thread blocked in httpcore read().
+
+    Nothing could break that: _stream_with_deadline is deliberately two-phase
+    (first-event budget, then an IDLE budget) with NO total-elapsed cap, so a
+    stream that keeps dribbling one event inside the 120s idle window never
+    times out; and the per-file FIX_FILE_MAX_SECONDS ceiling is armed further
+    down and only tested BETWEEN attempts, so it never covered the prefetch
+    wait at all. The wait itself has to be bounded."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_hung_prefetch_is_abandoned_and_the_queue_keeps_moving(self):
+        import tempfile
+        import types
+        release = threading.Event()
+        hung_entered = threading.Event()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Order matters: _top_up_prefetch only prefetches files AHEAD of the
+            # one being worked, so the hung file must sit mid-queue to reproduce
+            # the production shape (a prefetched generation that never returns).
+            # A hung file in FIRST position takes the inline path instead.
+            for name in ("lead.py", "hangs.py", "fine.py"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write("orig\n")
+
+            def fake_gen(author, rel, original, targets, feedback=None):
+                if rel == "hangs.py":
+                    hung_entered.set()
+                    release.wait(30)  # never released before the assertions
+                    raise RuntimeError("released after the test finished")
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=2)
+            findings = {"lead.py": finding("a"), "hangs.py": finding("b"),
+                        "fine.py": finding("c")}
+            real_gen = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            real_max = ff.FIX_FILE_MAX_SECONDS
+            try:
+                ff.generate_file_fix_edits = fake_gen
+                ff._gate_file = lambda *a, **k: (True, "")
+                ff.FIX_FILE_MAX_SECONDS = 1  # keep the test fast
+                started = time.time()
+                applied, _unver, notes = ff._fix_files(
+                    object(), None, tmp, findings, self.STACK, True, args,
+                    adversarial=False)
+                elapsed = time.time() - started
+            finally:
+                release.set()  # let the abandoned pool thread die, or exit hangs
+                ff.generate_file_fix_edits = real_gen
+                ff._gate_file = real_gate
+                ff.FIX_FILE_MAX_SECONDS = real_max
+
+        self.assertTrue(hung_entered.is_set(), "the hung generation never started")
+        # THE POINT: it returned at all. Pre-fix this blocked forever.
+        self.assertLess(elapsed, 25, "the fix queue did not bound its prefetch wait")
+        self.assertNotIn("hangs.py", applied)
+        self.assertTrue(any("wall clock" in n and "hangs.py" in n for n in notes),
+                        f"no loud abandonment note for the hung file: {notes}")
+        # And the queue KEPT MOVING - the healthy file behind it still got fixed.
+        self.assertIn("fine.py", applied)
+
+
 class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
     """Sol HIGH r3: when _fix_files raises DirtyTreeError (a refused rollback left an
     unverified candidate on disk), audit_one_program must NOT call _commit_and_sync -
