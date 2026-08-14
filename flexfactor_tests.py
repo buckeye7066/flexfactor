@@ -7540,6 +7540,72 @@ class PoolSizeRoutingTests(unittest.TestCase):
         finally:
             pool.release(idx)
 
+    def test_exclude_skips_a_backend_and_returns_minus_one_when_exhausted(self):
+        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
+        idx = pool.acquire(10, exclude={0})
+        try:
+            self.assertEqual(pool.name(idx), "ollama")
+        finally:
+            pool.release(idx)
+        self.assertEqual(pool.acquire(10, exclude={0, 1}), -1)
+
+    def test_exclude_is_honored_on_the_fail_open_path(self):
+        # A BIG file with an ollama-only pool takes the fail-open branch. If
+        # that branch ignored `exclude`, the retry loop would be handed the
+        # backend that just failed, forever.
+        pool = ff._ReviewerPool([("ollama", object(), 1)])
+        self.assertEqual(
+            pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES * 10, exclude={0}), -1)
+
+
+class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
+    """A backend failing ONE file must not blind-spot that file.
+
+    Live GrantFlow 2026-08-13, twice in one night: ollama timed out and the
+    file was logged '[skip] ... review failed via ollama (timed out)' then
+    'review INCOMPLETE (budget/error) - NOT clean' - while a HEALTHY anthropic
+    backend sat in the same pool able to review it in under a minute. Tuning
+    _OLLAMA_MAX_REVIEW_BYTES cannot fix this (30000 missed 23.5KB files, 15000
+    then missed 14,856-byte files); the sweep has to RETRY on another backend."""
+
+    def _run(self, entries):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.js"), "w", encoding="utf-8") as fh:
+                fh.write("console.log(1);\n")
+            pool = ff._ReviewerPool(entries)
+            return ff._review_all([], tmp, ["a.js"], reviewer_pool=pool)
+
+    def test_file_is_reviewed_by_the_healthy_backend_after_one_times_out(self):
+        calls = []
+
+        def fake_review_file(provider, rel, text, context=""):
+            calls.append(provider)
+            if provider == "slow":
+                raise RuntimeError("timed out")
+            return ([], "clean")
+
+        with _patched(ff, "review_file", fake_review_file):
+            _ff, _flat, _unread, reviewed_clean, incomplete = self._run(
+                [("ollama", "slow", 1), ("anthropic", "fast", 1)])
+        self.assertIn("a.js", reviewed_clean,
+                      "the healthy backend reviewed it, so it IS a completed "
+                      "clean review - not a blind spot")
+        self.assertNotIn("a.js", incomplete)
+        self.assertIn("fast", calls, "never retried on the healthy backend")
+
+    def test_still_incomplete_when_every_backend_fails_that_file(self):
+        # The safety property must survive the retry: if NOTHING could review
+        # it, it is still NOT clean.
+        def always_fail(provider, rel, text, context=""):
+            raise RuntimeError("timed out")
+
+        with _patched(ff, "review_file", always_fail):
+            _ff, _flat, _unread, reviewed_clean, incomplete = self._run(
+                [("ollama", "slow", 1), ("anthropic", "fast", 1)])
+        self.assertNotIn("a.js", reviewed_clean)
+        self.assertIn("a.js", incomplete)
+
 
 class TruncatedJsonSalvageTests(unittest.TestCase):
     """Live GrantFlow run 2026-08-10: on big files the FCC proxy's upstream cut

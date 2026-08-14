@@ -7714,13 +7714,19 @@ REVIEW_FIX_BATCH_SIZE = 20
 # Files above this size never route to a CPU-only ollama pool entry for review
 # (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
 # Env-tunable; the pool fails open when ollama is the ONLY backend.
-# 30000 was the first guess and it was TOO HIGH: live GrantFlow 2026-08-13 still
-# logged 'review failed via ollama (timed out)' on Reports.jsx (23.5KB) and
-# Settings.jsx (24.3KB). Measured ceiling is lower than assumed, so 15000 - well
-# under the smallest observed failure, still leaving the many small files that
-# make up most of a sweep on the free local backend.
+# PERFORMANCE HEURISTIC, NOT A CORRECTNESS GATE. Every attempt to tune this by
+# guessing has been wrong within one run: 30000 let Reports.jsx (23.5KB) and
+# Settings.jsx (24.3KB) time out; 15000 - chosen as "well under the smallest
+# observed failure" - promptly let AdminKnowledgeBase.jsx (14,856 B) and
+# AdminSystemHealth.jsx (14,937 B) time out too, because the smallest OBSERVED
+# failure is only the smallest file that happened to be sampled, not the real
+# ceiling. So stop treating this number as the thing that keeps files from being
+# skipped: _review_all now RETRIES a failed file on another pool backend, and
+# this value only decides how often that retry is needed. 12000 reflects the
+# 14,856-byte failure with margin; being wrong again now costs one retry, not a
+# blind spot.
 _OLLAMA_MAX_REVIEW_BYTES = int(os.environ.get(
-    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "15000"))
+    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "12000"))
 
 # Wall-clock ceiling for ALL fix attempts on ONE file. Individual model calls
 # are already deadline-bounded, but those budgets compound across stream
@@ -7755,24 +7761,38 @@ class _ReviewerPool:
     def total_concurrency(self) -> int:
         return sum(max(1, c) for _, _, c in self.entries) if self.entries else 0
 
-    def acquire(self, size_bytes: int = 0) -> int:
+    def acquire(self, size_bytes: int = 0,
+                exclude: "set[int] | None" = None) -> int:
         """Block until SOME backend eligible for this file has a free slot;
-        return its index.
+        return its index, or -1 when `exclude` rules out every backend.
 
         SIZE-AWARE (live GrantFlow failures 2026-08-13): local Ollama on this
         machine is CPU-only - a large-file review measured 20+ minutes and the
-        run logged two '[skip] review failed via ollama (timed out)' on big
-        pages while the FCC backend answers the same file in under a minute.
-        Self-balancing by throughput cannot save a file that TIMES OUT, so
+        run logged '[skip] review failed via ollama (timed out)' on big pages
+        while the FCC backend answers the same file in under a minute. So
         files over _OLLAMA_MAX_REVIEW_BYTES never go to an ollama entry.
+
+        That size gate is a PERFORMANCE heuristic ONLY - it is explicitly NOT
+        what makes the sweep correct, because every attempt to tune it has been
+        wrong: 30000 let 23.5KB/24.3KB files time out, and lowering it to 15000
+        promptly let 14,856-byte and 14,937-byte files time out too. Correctness
+        comes from the caller RETRYING a failed file on a different backend
+        (see _review_all), which is why `exclude` exists.
+
         Fail-open: if every pool entry is ollama (owner pointed at ollama
         explicitly), the gate stands down rather than deadlocking - slow
-        beats never."""
+        beats never. `exclude` is honored on BOTH paths; letting the fail-open
+        branch hand back an already-failed backend would spin the retry loop
+        forever."""
+        exclude = exclude or set()
         eligible = [i for i, (name, _, _) in enumerate(self.entries)
-                    if size_bytes <= _OLLAMA_MAX_REVIEW_BYTES
-                    or "ollama" not in name.lower()]
+                    if (size_bytes <= _OLLAMA_MAX_REVIEW_BYTES
+                        or "ollama" not in name.lower())
+                    and i not in exclude]
         if not eligible:
-            eligible = list(range(len(self.entries)))
+            eligible = [i for i in range(len(self.entries)) if i not in exclude]
+        if not eligible:
+            return -1  # caller has burned through every backend for this file
         while True:
             for i in eligible:
                 if self._sems[i].acquire(blocking=False):
@@ -7866,20 +7886,43 @@ def _review_all(reviewers: list, project_dir: str,
         # PRIMARY duty: one pool backend (whichever frees up first) reviews this
         # file - see _ReviewerPool. Skipped entirely when no pool was given
         # (legacy single/multi-reviewer path below is unchanged).
+        # A backend that FAILS this file (ollama timing out on a big page is the
+        # measured case) used to end the file's primary review right there:
+        # complete=False, "review INCOMPLETE - NOT clean", and a real blind spot
+        # for the whole cycle even though a HEALTHY sibling backend was sitting
+        # in the same pool able to review it in under a minute. Retry the file on
+        # the backends that have not failed it yet; only give up when every one
+        # of them has. This is what makes the size gate above a performance knob
+        # instead of a correctness gate.
         if reviewer_pool is not None and reviewer_pool.entries:
-            idx = reviewer_pool.acquire(len(text))
-            try:
-                findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
-                                                 context=context)
-                merged.extend(findings)
-            except BudgetExceededError:
-                stop.set()
-                complete = False
-            except Exception as ex:  # one bad LLM call must not abort the sweep
-                print(f"  [skip] {rel}: review failed via {reviewer_pool.name(idx)} ({ex})")
-                complete = False
-            finally:
-                reviewer_pool.release(idx)
+            failed_idx: set[int] = set()
+            while True:
+                idx = reviewer_pool.acquire(len(text), exclude=failed_idx)
+                if idx < 0:                    # no backend left to try
+                    complete = False
+                    break
+                try:
+                    findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
+                                                     context=context)
+                    merged.extend(findings)
+                    break                      # reviewed successfully
+                except BudgetExceededError:
+                    stop.set()
+                    complete = False
+                    break
+                except Exception as ex:  # one bad LLM call must not abort the sweep
+                    failed_idx.add(idx)
+                    nm = reviewer_pool.name(idx)
+                    if len(failed_idx) < len(reviewer_pool.entries):
+                        print(f"  [retry] {rel}: review failed via {nm} ({ex}) "
+                              "- retrying on another backend")
+                    else:
+                        print(f"  [skip] {rel}: review failed via {nm} ({ex}); "
+                              "every pool backend failed this file")
+                        complete = False
+                        break
+                finally:
+                    reviewer_pool.release(idx)
         # CROSS-CHECK duty (unchanged semantics): every entry in `reviewers`
         # reviews EVERY file too - this is the existing --use-both quality
         # cross-check, orthogonal to the throughput pool above. When no pool
