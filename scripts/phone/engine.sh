@@ -32,14 +32,39 @@ url() { python "$APP_DIR/flexfactor_web.py" --host 127.0.0.1 --port "$PORT" --pr
 http_ok() { curl -fsS --max-time 4 -o /dev/null "$(url)"; }
 
 # Hand the freshly-minted token to the app, so the owner never types it. The
-# dashboard mints its own token in ~/.flexfactor/web-token.txt, which an APK
-# cannot read (different UID), and `am start` is the only channel between the
-# two that needs no storage permission.
+# dashboard mints its own token into ~/.flexfactor/web-token.txt, which an APK
+# cannot read (different UID), and no storage permission is involved either way.
+#
+# A BROADCAST, not `am start`. Measured on an S25 Ultra (Android 16): `am start`
+# from Termux prints "Starting: Intent {...}", exits 0, and the activity never
+# resumes -- Android's background-activity-start restriction drops it silently.
+# A handover that reports success while doing nothing is worse than none, so
+# this uses `-W` and reads the receiver's own result code instead of assuming.
 tell_app() {
   command -v am >/dev/null || return 0
-  am start -n "$APP_PKG/com.firer.console.MainActivity" \
-     --es local "$(url)" --es mode local >/dev/null 2>&1 \
-    || echo "note: could not hand the URL to $APP_PKG (is the app installed?)" >&2
+  out="$(am broadcast -n "$APP_PKG/com.firer.console.ConfigReceiver" \
+          --es local "$(url)" 2>&1)" || true
+  case "$out" in
+    *"result=1"*)
+      echo "app configured: $APP_PKG now points at this phone" ;;
+    *"result=2"*)
+      echo "app REFUSED the address as non-loopback -- that is a bug, report it" >&2 ;;
+    *"result=3"*)
+      echo "app rejected the handover (no address sent) -- that is a bug" >&2 ;;
+    *"without waiting"*)
+      # Measured on an S25 Ultra (Android 16): from Termux's UID `am` prints
+      # "Broadcast sent without waiting for result" and returns nothing, while
+      # the same command from `adb shell` prints result=1. So the delivery is
+      # real but UNCONFIRMABLE from here. Say exactly that -- claiming success
+      # on an unread result is the failure this whole handover was rewritten to
+      # avoid, and printing the URL costs one line.
+      echo "handover sent to $APP_PKG (Android does not report the result to Termux)."
+      echo "  If the app still shows the laptop: gear icon -> \"This phone's engine\" ="
+      echo "  $(url)" ;;
+    *)
+      echo "could not configure $APP_PKG. Is it installed, and is it v2.0.0 or newer?" >&2
+      echo "  set it by hand: gear icon -> \"This phone's engine\" = $(url)" >&2 ;;
+  esac
 }
 
 cmd_start() {
