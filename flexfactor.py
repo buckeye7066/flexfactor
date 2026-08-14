@@ -9100,12 +9100,39 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     status = (f"{label}: committed on {branch} "
               f"(build {'ok' if final_ok is True else 'NOT VERIFIED' if final_ok is None else 'FAILED'})")
     if args.push and _git_has_remote(project_dir):
-        # NEVER force-push (owner order 2026-08-11 removed sandbox branches). This is
-        # now the owner's REAL branch, not a disposable sandbox that legitimately
-        # diverges - a --force-with-lease here could discard commits pushed from
-        # another machine. A fast-forward push or an honest rejection, nothing else.
-        pr = _git(["push", "-u", "origin", branch], project_dir)
-        status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
+        # PUBLICATION GATE (live GrantFlow 2026-08-14 - FlexFactor pushed a RED
+        # BUILD to main). The gate below the commit was ALREADY tri-state and
+        # ALREADY correct: it ran `npm run typecheck` + `npm run build`, they
+        # failed, and it returned False. The bug was that this push was never
+        # gated on it AT ALL - only the merge was. Since the 2026-08-11 order
+        # removed sandbox branches, `branch` IS the owner's real branch (the run
+        # commits "on main"), so prev_branch == branch, the merge block is
+        # skipped entirely, and this unconditional push was the ONLY thing
+        # publishing - which made the merge gate decorative. Measured across one
+        # run's five batches: 4 pushed green, 1 pushed FAILED - roughly a 1-in-5
+        # chance per batch of putting a repo's main red, unattended.
+        #
+        # `is True` is load-bearing, exactly as it is for the merge: False =
+        # the build genuinely failed; None = no build/verify command existed so
+        # NOTHING was verified. Neither may be published. The local COMMIT above
+        # still happens in every case - the work is never lost, and the next
+        # cycle still builds on it; only PUBLICATION waits for evidence. When a
+        # later cycle's gate does pass, that push carries these commits with it,
+        # so nothing is stranded and the branch tip origin ever sees is green.
+        if final_ok is True:
+            # NEVER force-push (owner order 2026-08-11 removed sandbox branches). This is
+            # now the owner's REAL branch, not a disposable sandbox that legitimately
+            # diverges - a --force-with-lease here could discard commits pushed from
+            # another machine. A fast-forward push or an honest rejection, nothing else.
+            pr = _git(["push", "-u", "origin", branch], project_dir)
+            status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
+        else:
+            status += ("; PUSH REFUSED - the final build gate "
+                       + ("FAILED" if final_ok is False else
+                          "did not run (no build/verify command exists), so "
+                          "NOTHING was verified")
+                       + f"; the work is committed LOCALLY on {branch} and will "
+                         "be pushed by the first cycle whose gate passes")
     # prev_branch == branch happens when a repo was left PARKED on the sandbox
     # branch by an earlier interrupted run (live SermonSmith 2026-08-11): a
     # "merge" would be a meaningless self-merge, so it is skipped rather than
@@ -9115,6 +9142,9 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     # gate read as green and auto-merged unverified work to the default branch on
     # every repo whose toolchain FlexFactor cannot drive. Unverified never ships.
     if final_ok is None:
+        # Until 2026-08-14 this message was HALF A LIE: the merge really was
+        # refused, but the push above had already published the work. The push
+        # is now gated too, so the sentence is finally true as written.
         status += ("; merge+push REFUSED - no build/verify command exists for this "
                    "repo, so the final gate proved nothing (work is committed on "
                    f"{branch}; merge it yourself once you can verify it)")

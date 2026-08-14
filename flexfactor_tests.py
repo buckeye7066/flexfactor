@@ -9610,6 +9610,39 @@ class NeverReviewOnlyTests(unittest.TestCase):
                          "review-only was removed; the gate must not return")
 
 
+def _drive_commit_and_sync(gate, want_status=False):
+    """Run the REAL _commit_and_sync with git stubbed, returning every git
+    argv it issued. Mirrors the live topology that produced the defect: the
+    audit commits directly ON the owner's branch (sandbox branches were removed
+    2026-08-11), so prev_branch == branch and the merge block never runs - the
+    branch push is the only thing that can publish."""
+    import types
+    calls = []
+
+    def fake_git(argv, project_dir, *a, **k):
+        calls.append(list(argv))
+        rc = 0
+        if argv[:1] == ["diff"]:
+            rc = 1  # 1 = there ARE staged changes (exit code is data here)
+        return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+    args = types.SimpleNamespace(push=True, merge=True)
+    orig = {}
+    stubs = {"_git": fake_git,
+             "_git_has_remote": lambda pd: True,
+             "_git_current_branch": lambda pd: "main",
+             "_full_gate": lambda pd, st: (gate, "log")}
+    for name, fn in stubs.items():
+        orig[name] = getattr(ff, name)
+        setattr(ff, name, fn)
+    try:
+        status = ff._commit_and_sync("/proj", "main", "main", args, "cycle 1", {})
+    finally:
+        for name, o in orig.items():
+            setattr(ff, name, o)
+    return (calls, status) if want_status else calls
+
+
 class VacuousGateTests(unittest.TestCase):
     """A gate that runs no command proved nothing. It must not read as green,
     and it must not be allowed to ship code to the default branch."""
@@ -9626,6 +9659,47 @@ class VacuousGateTests(unittest.TestCase):
                       "the merge gate must require True, not truthiness - None "
                       "(no build command) auto-merged unverified work to main")
         self.assertIn("merge+push REFUSED", src)
+
+    def test_merge_and_push_refusal_is_BEHAVIOURAL_not_just_a_string(self):
+        # The source-grep guard above passed the whole time FlexFactor was
+        # pushing red builds to main: it proved the SENTENCE existed, never that
+        # the push obeyed it. A check that cannot fail proves nothing, so this
+        # drives the real decision instead.
+        for gate in (False, None):
+            calls = _drive_commit_and_sync(gate)
+            pushes = [c for c in calls if c[:1] == ["push"]]
+            commits = [c for c in calls if c[:1] == ["commit"]]
+            self.assertEqual(pushes, [],
+                             f"gate={gate!r} PUBLISHED an unverified/failing "
+                             f"build: {pushes}")
+            self.assertEqual(len(commits), 1,
+                             f"gate={gate!r} must still commit LOCALLY - "
+                             "refusing to publish must not lose the work")
+
+    def test_a_failing_build_says_PUSH_REFUSED_out_loud(self):
+        calls, status = _drive_commit_and_sync(False, want_status=True)
+        self.assertIn("build FAILED", status)
+        self.assertIn("PUSH REFUSED", status)
+        self.assertNotIn("; pushed", status)
+
+    def test_a_green_build_still_pushes(self):
+        # The other half of the gate: this must NOT become a blanket block.
+        calls, status = _drive_commit_and_sync(True, want_status=True)
+        pushes = [c for c in calls if c[:1] == ["push"]]
+        self.assertEqual(len(pushes), 1, "a verified green build must still ship")
+        self.assertEqual(pushes[0], ["push", "-u", "origin", "main"])
+        self.assertIn("; pushed", status)
+        self.assertNotIn("REFUSED", status)
+
+    def test_no_build_command_is_still_None_not_False(self):
+        # Load-bearing distinction (CLAUDE.md): a repo with no runnable build is
+        # UNVERIFIED, not FAILED. Refusing to publish must not be achieved by
+        # redefining what counts as a build.
+        ok, _log = ff._full_gate("/nope", {})
+        self.assertIsNone(ok)
+        _calls, status = _drive_commit_and_sync(None, want_status=True)
+        self.assertIn("NOT VERIFIED", status)
+        self.assertNotIn("build FAILED", status)
 
     def test_unrunnable_baseline_is_not_claimed_as_passed(self):
         # No build command -> tri-state None (unverified), never a pass.

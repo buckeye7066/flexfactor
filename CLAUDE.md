@@ -42,6 +42,27 @@ of riding a review mode. The surviving rules, and the defect each one killed:
   `final_ok is True`; `None` prints `merge+push REFUSED`. A baseline with no
   runnable build command is likewise `None`, not `True` (the report used to say
   "Baseline build: passed" for a build that never ran).
+- **THE PUSH IS GATED TOO (2026-08-14) — this is what made the merge gate real.**
+  Live GrantFlow measured across one run's five batches: **4 committed+pushed
+  green, 1 committed+pushed with `build FAILED`** — roughly a 1-in-5 chance per
+  batch of putting a repo's `main` red, unattended and auto-pushed. The gate was
+  never the problem: it ran `npm run typecheck` + `npm run build`, they failed,
+  and it correctly returned `False`. **The branch push was simply not gated on
+  it** — only the merge was. And because the 2026-08-11 order removed sandbox
+  branches, `branch` IS the owner's real branch, so `prev_branch == branch`, the
+  merge block is skipped entirely, and that ungated push was the *only* thing
+  publishing. The merge gate was decorative. The `None` branch's own
+  `merge+push REFUSED` message was therefore half a lie: the push had already
+  happened above it.
+  Now `if final_ok is True:` guards the push, with `False` and `None` each
+  printing an explicit `PUSH REFUSED - ...` naming which state it was. **The
+  local commit still happens in every case** — work is never lost, the next
+  cycle still builds on it, and the first cycle whose gate passes pushes the
+  accumulated commits, so the tip origin ever sees is green.
+  The old guard `test_merge_and_push_refused_on_an_unverified_gate` was a
+  **source grep for the sentence** and passed happily the entire time red builds
+  were shipping — a check that cannot fail proves nothing. The replacements
+  drive the real `_commit_and_sync` decision and assert on the git argv issued.
 - **Scout is deliberately exempt.** `scout --apply` stays opt-in: the owner's own
   contract for Scout requires "proposal-only default; separate explicit
   FlexFactor apply approval". Never flip it to match audit.
