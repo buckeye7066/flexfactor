@@ -205,9 +205,15 @@ Closes two silent-failure holes the audit had:
   repos made the next run see prev_branch == the sandbox branch), and
   `_commit_and_sync` skips the meaningless self-merge when prev == branch.
 
-Trap: `MAX_REVIEW_BYTES` had to go 400k -> 600k because this file outgrew it
-again; when it does, `flexfactor.py` silently drops out of its own audit
-(`test_flexfactor_can_review_itself` is the guard).
+Trap (RESOLVED 2026-08-13): `MAX_REVIEW_BYTES` was hand-bumped four times
+(200k -> 300k -> 400k -> 600k) because this file kept outgrowing it, and each
+time `flexfactor.py` silently dropped out of its own audit. It happened a FIFTH
+time that night — a 5-line comment took the file to 600,003 bytes, three over
+the cap, and `test_flexfactor_can_review_itself` caught it. The constant is no
+longer hand-maintained: `MAX_REVIEW_BYTES` is now
+`max(600k, sizeof(flexfactor.py) + 200k)`, so ordinary growth can never recreate
+the blind spot. 600k remains the floor for every other repo, and the test is
+still the guard.
 
 ## Map (all in flexfactor.py)
 - Constants: `DEFAULT_MODELS` (author tier), `JUDGE_MODELS` (cheap tier),

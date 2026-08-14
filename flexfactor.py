@@ -5868,13 +5868,27 @@ _CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
               ".ex", ".exs", ".swift", ".dart", ".c", ".cc", ".cpp", ".cxx",
               ".h", ".hpp", ".m", ".mm", ".sh", ".bash", ".lua", ".pl", ".pm",
               ".clj", ".cljs", ".hs", ".jl", ".r", ".sql", ".tf", ".gradle"}
-# Per-file review ceiling. 600k (was 200k, 300k, then 400k) because this file
-# itself keeps outgrowing the cap, and each time it did, the tool silently
-# stopped auditing its own largest, most defect-dense module. The prompt cost is
-# unaffected: review_file truncates the numbered source at 60k chars regardless,
-# so this governs only whether a file is ENUMERATED - and a skipped file is a
-# permanent blind spot, which is strictly worse than a truncated review.
-MAX_REVIEW_BYTES = 600_000
+# Per-file review ceiling. The prompt cost is unaffected: review_file truncates
+# the numbered source at 60k chars regardless, so this governs only whether a
+# file is ENUMERATED - and a skipped file is a permanent blind spot, which is
+# strictly worse than a truncated review.
+#
+# This constant was hand-bumped FOUR times (200k -> 300k -> 400k -> 600k), every
+# time for the same reason: flexfactor.py outgrew it and silently dropped out of
+# its own audit. On 2026-08-13 it happened a fifth time - a 5-line COMMENT took
+# the file to 600,003 bytes, three over the cap. A ceiling that a normal edit can
+# cross is a ceiling that will keep failing, so stop hand-maintaining it: derive
+# the floor from this module's own size plus room to grow. The literal remains
+# the floor for every other repo. `test_flexfactor_can_review_itself` guards it.
+_MAX_REVIEW_BYTES_FLOOR = 600_000
+_SELF_GROWTH_HEADROOM = 200_000
+try:
+    MAX_REVIEW_BYTES = max(_MAX_REVIEW_BYTES_FLOOR,
+                           os.path.getsize(os.path.abspath(__file__))
+                           + _SELF_GROWTH_HEADROOM)
+except (OSError, NameError):
+    # Frozen/exec'd without a real __file__ - the static floor still applies.
+    MAX_REVIEW_BYTES = _MAX_REVIEW_BYTES_FLOOR
 # Requested output ceilings per model-call kind. Single source of truth so the
 # budget RESERVATION (before a concurrent call) matches what the call can spend.
 REVIEW_MAX_TOKENS = 16000       # review_file()
@@ -7700,8 +7714,13 @@ REVIEW_FIX_BATCH_SIZE = 20
 # Files above this size never route to a CPU-only ollama pool entry for review
 # (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
 # Env-tunable; the pool fails open when ollama is the ONLY backend.
+# 30000 was the first guess and it was TOO HIGH: live GrantFlow 2026-08-13 still
+# logged 'review failed via ollama (timed out)' on Reports.jsx (23.5KB) and
+# Settings.jsx (24.3KB). Measured ceiling is lower than assumed, so 15000 - well
+# under the smallest observed failure, still leaving the many small files that
+# make up most of a sweep on the free local backend.
 _OLLAMA_MAX_REVIEW_BYTES = int(os.environ.get(
-    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "30000"))
+    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "15000"))
 
 # Wall-clock ceiling for ALL fix attempts on ONE file. Individual model calls
 # are already deadline-bounded, but those budgets compound across stream
