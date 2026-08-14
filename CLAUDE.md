@@ -146,6 +146,34 @@ system correctly declining to break working code** — there is a comment at the
 no-op accounting saying so, because counting it honestly as an error is what
 made this visible. Do not "fix" that accounting into a success.
 
+## Bare-list salvage is SHARED (2026-08-14) — never discard a good payload over its envelope
+
+`_check_structured_type` is the one chokepoint every provider's `structured()`
+output passes through, so its bare-list salvage serves the EDIT path and the
+REVIEW path alike. `e4ef6b6` fixed the symptom where it was first seen (edits)
+by demanding that **every** element carry **all** of `items.required` — and that
+rule then discarded good reviews.
+
+Live GrantFlow 2026-08-14: `FunderDetailDialog.jsx` review failed with
+`expected a JSON object, got list`. The payload head was `{"findings":[` — a
+valid envelope whose closing brace was cut, so `_extract_json_object` fell
+through to the balanced inner `[...]` span and returned a bare list. One finding
+omitted `category`, the all-keys rule rejected it, and the whole well-formed
+review was thrown away; the file was retried on a slower backend and ended that
+cycle **UNREVIEWED**. (It is correctly *not* marked clean — do not weaken that.)
+
+`_list_fits_array_prop()` now SCORES fit instead of demanding perfection, and
+`_check_structured_type` wraps into the **unique best-scoring** array property.
+Teeth retained: every element must be the right JSON type; for object items every
+element must show **at least one** required key and average coverage must clear
+`_LIST_FIT_MIN_COVERAGE` (0.34); a **tie** between two array properties is
+genuinely ambiguous and still raises. The separate `_salvage_truncated_json`
+path (text that does not parse at all) is untouched and regression-tested.
+
+Note the ordering that made this reachable: `_extract_json_object` runs BEFORE
+`_salvage_truncated_json`, so a cut envelope with a complete inner array never
+reaches truncation repair — it arrives here as a bare list.
+
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
 A stall threshold **below the free route's healthy latency** silently converts a
