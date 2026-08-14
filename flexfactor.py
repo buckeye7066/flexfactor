@@ -7703,6 +7703,15 @@ REVIEW_FIX_BATCH_SIZE = 20
 _OLLAMA_MAX_REVIEW_BYTES = int(os.environ.get(
     "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "30000"))
 
+# Wall-clock ceiling for ALL fix attempts on ONE file. Individual model calls
+# are already deadline-bounded, but those budgets compound across stream
+# retries x fix tries x adversarial rounds - measured 59 minutes on a single
+# 17KB file with 3,189 findings queued behind it. 15m is comfortably above a
+# healthy multi-round fix on the free route (307s queued call + rounds) and far
+# below "the queue stopped moving".
+FIX_FILE_MAX_SECONDS = int(os.environ.get(
+    "FLEXFACTOR_FIX_FILE_MAX_SECONDS", "900"))
+
 
 class _ReviewerPool:
     """Concurrent orchestration across MULTIPLE free review backends that are
@@ -8140,7 +8149,22 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         adv_rounds = 0     # substantive adversarial needs_work rounds used
         build_tries = 0    # build-breaking attempts used (adversarial path only)
         max_tries = (MAX_FIX_TRIES + adversarial_rounds + 2) if adv_active else MAX_FIX_TRIES
+        # PER-FILE WALL-CLOCK CEILING (live GrantFlow 2026-08-13). Every
+        # individual model call IS deadline-bounded, but the budgets COMPOUND:
+        # 3 stream attempts x 600s, times max_tries, times the adversarial
+        # rounds. Measured that night: 59 MINUTES on one 17KB file
+        # (OrganizationEmailComposer.jsx) with 3,189 findings queued behind it
+        # and the cost meter frozen - the run was alive and getting nowhere.
+        # Bounding attempts is not enough; bound the TIME. On expiry the file
+        # is abandoned LOUDLY (never silently) and re-queued by the until-clean
+        # loop, so nothing is lost and the queue keeps moving - which is the
+        # whole job.
+        file_deadline = time.time() + FIX_FILE_MAX_SECONDS
+        timed_out = False
         for attempt in range(1, max_tries + 1):
+            if time.time() > file_deadline:
+                timed_out = True
+                break
             _fixtrace("attempt.start", rel, attempt=attempt, mode=("edits" if edit_mode else "whole"),
                       author=getattr(author, "model", "?"))
             patch = None
@@ -8341,6 +8365,25 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             notes.append(f"{rel}: DIRTY - rollback refused after a candidate write")
             _tick(rel)
             break
+
+        if timed_out:
+            # Wall-clock ceiling hit. Restore the file (a candidate may be on
+            # disk from the attempt that ran long) and account for it LOUDLY -
+            # the until-clean loop re-queues it next cycle with a fresh route.
+            if _replace_contained(project_dir, rel, original) is None:
+                dirty_files.append(rel)
+                print(f"  [dirty-abort] {rel}: rollback refused after per-file timeout")
+                notes.append(f"{rel}: DIRTY - rollback refused after per-file timeout")
+                _tick(rel)
+                break
+            errors += 1
+            mins = FIX_FILE_MAX_SECONDS // 60
+            print(f"  [timeout] {rel}: no verified fix within {mins}m "
+                  f"(after {attempt} attempt(s)) - rolled back, re-queued for the next cycle")
+            notes.append(f"{rel}: TIMED OUT after {mins}m of fix attempts - rolled back and "
+                         f"re-queued (raise FLEXFACTOR_FIX_FILE_MAX_SECONDS to allow longer)")
+            _tick(rel)
+            continue
 
         kind = outcome[0]
         _fixtrace("attempt.outcome", rel, outcome=kind, detail=str(outcome[1])[:300],
