@@ -7394,6 +7394,79 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertIn("How many programs to audit? (1-10", text)
 
 
+class BareListSalvageTests(unittest.TestCase):
+    """Live GrantFlow run 2026-08-13: the economy author tier answered the
+    edit-fix prompt with prose + a BARE JSON ARRAY of edit objects instead of
+    the {"changed":..., "edits":[...]} envelope. The payload was intact; only
+    the wrapper was missing - yet the type check raised, sending an 82KB file
+    down whole-file regeneration (22+ min on the free route, then failure).
+    _check_structured_type now wraps a bare list into the UNIQUE array-typed
+    schema property whose item shape the elements match; ambiguity still
+    raises exactly as before."""
+
+    def test_edit_list_wraps_into_edits(self):
+        data = [{"search": "a", "replace": "b"}, {"search": "c", "replace": "d"}]
+        out = ff._check_structured_type(data, ff.FIX_EDITS_SCHEMA, "[]")
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["edits"], data)
+
+    def test_string_list_wraps_into_fixed_titles(self):
+        # Strings conform only to fixed_titles (items.type=string), not edits
+        # (items require search+replace) - unambiguous, so it wraps.
+        out = ff._check_structured_type(["Unused import"], ff.FIX_EDITS_SCHEMA, "[]")
+        self.assertEqual(out["fixed_titles"], ["Unused import"])
+
+    def test_nonconforming_list_still_raises(self):
+        # Dicts missing the required edit keys match NO array property.
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type([{"foo": 1}], ff.FIX_EDITS_SCHEMA, "[]")
+
+    def test_empty_list_still_raises(self):
+        # An empty list conforms to every array property - ambiguous - and the
+        # model said nothing actionable anyway. Behave exactly as before.
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type([], ff.FIX_EDITS_SCHEMA, "[]")
+
+    def test_dict_passes_through_unchanged(self):
+        d = {"changed": True, "edits": []}
+        self.assertIs(ff._check_structured_type(d, ff.FIX_EDITS_SCHEMA, "{}"), d)
+
+
+class PoolSizeRoutingTests(unittest.TestCase):
+    """Live GrantFlow run 2026-08-13: two '[skip] review failed via ollama
+    (timed out)' on big pages - CPU-only ollama cannot finish a large-file
+    review inside the timeout, and throughput self-balancing cannot save a
+    file that never completes. Files over _OLLAMA_MAX_REVIEW_BYTES must not
+    route to an ollama pool entry; an ollama-ONLY pool fails open."""
+
+    def test_big_file_skips_ollama(self):
+        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
+        idx = pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES + 1)
+        try:
+            self.assertEqual(pool.name(idx), "anthropic")
+        finally:
+            pool.release(idx)
+
+    def test_small_file_may_use_ollama(self):
+        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
+        # Exhaust anthropic; a small file must still be able to land on ollama.
+        a = pool.acquire(10)
+        b = pool.acquire(10)
+        try:
+            self.assertEqual({pool.name(a), pool.name(b)}, {"anthropic", "ollama"})
+        finally:
+            pool.release(a)
+            pool.release(b)
+
+    def test_ollama_only_pool_fails_open(self):
+        pool = ff._ReviewerPool([("ollama", object(), 1)])
+        idx = pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES * 10)
+        try:
+            self.assertEqual(pool.name(idx), "ollama")  # slow beats never
+        finally:
+            pool.release(idx)
+
+
 class TruncatedJsonSalvageTests(unittest.TestCase):
     """Live GrantFlow run 2026-08-10: on big files the FCC proxy's upstream cut
     long review completions mid-stream; the head was a VALID findings list but

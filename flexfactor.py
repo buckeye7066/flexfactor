@@ -1798,7 +1798,7 @@ class AnthropicProvider:
             # point separates those from salvage bugs when diagnosing skips).
             raise RuntimeError(f"Structured output was not JSON; len={len(text)} "
                                f"head={text[:200]!r} tail={text[-120:]!r}")
-        _check_structured_type(data, schema, text)
+        data = _check_structured_type(data, schema, text)
         return data
 
     def _stream_structured(self, *, model, max_tokens, system, messages, fmt) -> "Message":
@@ -2045,7 +2045,7 @@ class OpenAIProvider:
                 "large to regenerate in one response); raise max_tokens for this call.")
         text = choice.message.content or "{}"
         data = json.loads(text)
-        _check_structured_type(data, schema, text)
+        data = _check_structured_type(data, schema, text)
         return data
 
     def ping(self) -> None:
@@ -2201,10 +2201,10 @@ class OllamaProvider:
             if salvage_truncated:
                 data = _salvage_truncated_json(text)
                 if data is not None:
-                    _check_structured_type(data, schema, text)
+                    data = _check_structured_type(data, schema, text)
                     return data
             raise
-        _check_structured_type(data, schema, text)
+        data = _check_structured_type(data, schema, text)
         return data
 
     def ping(self) -> None:
@@ -2328,6 +2328,36 @@ def _check_structured_type(data, schema: dict, text: str):
     retry/edit-fallback/[skip] handling already copes with."""
     expected = schema.get("type")
     if expected == "object" and not isinstance(data, dict):
+        # BARE-LIST SALVAGE (live GrantFlow failure 2026-08-13): the economy
+        # author tier answers the edit-fix prompt with prose + a bare JSON array
+        # of edit objects ('1 bug fixed.\n```json\n[{"search":...') instead of
+        # the {"changed":..., "edits":[...]} wrapper. The payload the caller
+        # needs is INTACT - only the envelope is missing - yet this raise sent
+        # an 82KB file down the whole-file-regeneration fallback, which the
+        # free route cannot carry (22+ min, then truncation -> [skip]). If the
+        # list's elements conform to EXACTLY ONE array-typed property of the
+        # schema (by items type/required), wrap it there instead of failing.
+        # Ambiguous or non-conforming lists still raise exactly as before.
+        if isinstance(data, list) and data:
+            candidates = []
+            for prop, spec in (schema.get("properties") or {}).items():
+                if (spec or {}).get("type") != "array":
+                    continue
+                items = (spec or {}).get("items") or {}
+                want_type = items.get("type")
+                need_keys = items.get("required") or []
+                def _elem_ok(e):
+                    if want_type == "object":
+                        return isinstance(e, dict) and all(k in e for k in need_keys)
+                    if want_type == "string":
+                        return isinstance(e, str)
+                    return True
+                if all(_elem_ok(e) for e in data):
+                    candidates.append(prop)
+            if len(candidates) == 1:
+                print(f"  [salvage] structured output was a bare list; wrapped "
+                      f"into '{candidates[0]}' per schema")
+                return {candidates[0]: data}
         raise RuntimeError(
             f"Structured output did not match schema (expected a JSON object, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
@@ -2335,6 +2365,7 @@ def _check_structured_type(data, schema: dict, text: str):
         raise RuntimeError(
             f"Structured output did not match schema (expected a JSON array, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
+    return data
 
 
 def _salvage_truncated_json(text: str):
@@ -7666,6 +7697,12 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 # only the grouping of files handed to review/_fix_files per call changed.
 REVIEW_FIX_BATCH_SIZE = 20
 
+# Files above this size never route to a CPU-only ollama pool entry for review
+# (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
+# Env-tunable; the pool fails open when ollama is the ONLY backend.
+_OLLAMA_MAX_REVIEW_BYTES = int(os.environ.get(
+    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "30000"))
+
 
 class _ReviewerPool:
     """Concurrent orchestration across MULTIPLE free review backends that are
@@ -7690,13 +7727,29 @@ class _ReviewerPool:
     def total_concurrency(self) -> int:
         return sum(max(1, c) for _, _, c in self.entries) if self.entries else 0
 
-    def acquire(self) -> int:
-        """Block until SOME backend has a free slot; return its index."""
+    def acquire(self, size_bytes: int = 0) -> int:
+        """Block until SOME backend eligible for this file has a free slot;
+        return its index.
+
+        SIZE-AWARE (live GrantFlow failures 2026-08-13): local Ollama on this
+        machine is CPU-only - a large-file review measured 20+ minutes and the
+        run logged two '[skip] review failed via ollama (timed out)' on big
+        pages while the FCC backend answers the same file in under a minute.
+        Self-balancing by throughput cannot save a file that TIMES OUT, so
+        files over _OLLAMA_MAX_REVIEW_BYTES never go to an ollama entry.
+        Fail-open: if every pool entry is ollama (owner pointed at ollama
+        explicitly), the gate stands down rather than deadlocking - slow
+        beats never."""
+        eligible = [i for i, (name, _, _) in enumerate(self.entries)
+                    if size_bytes <= _OLLAMA_MAX_REVIEW_BYTES
+                    or "ollama" not in name.lower()]
+        if not eligible:
+            eligible = list(range(len(self.entries)))
         while True:
-            for i, sem in enumerate(self._sems):
-                if sem.acquire(blocking=False):
+            for i in eligible:
+                if self._sems[i].acquire(blocking=False):
                     return i
-            time.sleep(0.05)  # brief poll; every slot is currently in flight
+            time.sleep(0.05)  # brief poll; every eligible slot is in flight
 
     def release(self, idx: int) -> None:
         self._sems[idx].release()
@@ -7786,7 +7839,7 @@ def _review_all(reviewers: list, project_dir: str,
         # file - see _ReviewerPool. Skipped entirely when no pool was given
         # (legacy single/multi-reviewer path below is unchanged).
         if reviewer_pool is not None and reviewer_pool.entries:
-            idx = reviewer_pool.acquire()
+            idx = reviewer_pool.acquire(len(text))
             try:
                 findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
                                                  context=context)
