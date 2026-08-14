@@ -71,9 +71,33 @@ FlexFactor reads **why the program exists** before it reads any code.
   defects against this program's job. `assess_purpose_gap` then scores each
   numbered acceptance criterion; each gap must cite `acceptance_ref`, so
   `acceptance_coverage()` can render the criteria table a generic linter cannot.
-- `fulfillment_pct` with a contract is **measured** (criteria met / total), not
+- `fulfillment_pct` with a contract is derived from criteria met / total, not
   the model's impression. The owner's purpose text always overrides the model's
   paraphrase.
+- **The criteria figure is an ASSESSMENT, not a measurement — and it is
+  UNSTABLE.** Live GrantFlow 2026-08-14: the same unchanged tree scored 2/10,
+  then 0/10, then 3/10 on three consecutive runs (~30% variance), while the
+  doctrine treats it as the headline scoreboard. Determinism is deliberately
+  **not** forced (temperature/seed pinning would hide the uncertainty, and what
+  the number should MEAN is an owner design decision). Instead
+  `assess_purpose_gap` takes `PURPOSE_ASSESS_SAMPLES` (env
+  `FLEXFACTOR_PURPOSE_SAMPLES`, default 3) independent assessments
+  **concurrently** — N cheap calls, ~1 call of wall clock — and folds them via
+  `aggregate_coverage()`:
+  - per criterion, the **majority** verdict; a split vote is `UNKNOWN`, never
+    `met` (same doctrine as an unattributed whole-purpose gap);
+  - gaps are **UNIONed**, de-duplicated by normalized **TITLE only** — the ref
+    is the wobbly part, and keying on (ref, title) would emit one gap three
+    times, burn fix budget on duplicates, and break `gap_progress()`, which
+    closes gaps BY TITLE. Every ref any sample proposed is kept in
+    `acceptance_refs_seen`;
+  - the observed spread (`criteria_met_samples`, `criteria_noise_band`,
+    `assessment_stable`) rides with the number into **every** print, the audit
+    report and the run manifest.
+  `movement_is_real()` gates the PURPOSE SCORE line: a before→after swing **inside
+  the observed band is reported "WITHIN MEASUREMENT NOISE"**, never as criteria
+  closed or regressed. A single-sample run reports variance `UNMEASURED` —
+  which is NOT the same as stable and must never be printed as agreement.
 - Gap-driven fixing: an owner-authored gap is an unmet requirement, so it
   **bypasses `--fix-severity`** and gets `MAX_PURPOSE_GAP_FIXES_AUTHORED` (12)
   instead of 3, worst-severity first. Inferred gaps still respect the fix floor

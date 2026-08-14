@@ -481,6 +481,123 @@ def acceptance_coverage(contract: PurposeContract, gaps: list[dict]) -> list[dic
     return rows
 
 
+_SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+
+def aggregate_coverage(sample_rows: list[list[dict]]) -> dict:
+    """Fold N independent `acceptance_coverage` assessments of the SAME tree into
+    one consensus verdict plus the variance actually observed.
+
+    WHY (live GrantFlow, 2026-08-14): the same unchanged tree measured 2/10,
+    then 0/10, then 3/10 acceptance criteria met on three consecutive runs. The
+    engine runs correctly (58d8210); the instability is inherent - this figure
+    is a MODEL-DERIVED ASSESSMENT, not a measurement, and it carries roughly
+    30% run-to-run variance. Publishing one sample as "the" number turns that
+    noise into headline progress or regression, which is precisely the
+    false-progress reporting the owner's standing rules forbid.
+
+    Deliberately NOT fixed by forcing determinism (temperature/seed pinning):
+    that is a design decision about what the number MEANS, and it would hide the
+    uncertainty rather than report it. Instead: vote, and publish the spread.
+
+    `met` per criterion:
+      True  - a STRICT majority of samples say met
+      False - a strict majority say blocked
+      None  - the samples DISAGREE (no majority). A split vote is UNKNOWN, and
+              unknown is never evidence of met - the same rule that already
+              governs unattributed whole-purpose gaps.
+
+    Returns {} for no input. Otherwise a dict carrying the consensus `rows`, the
+    consensus counts, and the observed spread (`met_samples`, `met_low`,
+    `met_high`, `noise_band`, `stable`) so every caller can label the figure
+    honestly and refuse to read a swing inside the band as movement.
+    """
+    samples = [r for r in (sample_rows or []) if r]
+    if not samples:
+        return {}
+    per_sample_met = [sum(1 for r in rows if r.get("met") is True) for rows in samples]
+    total = max(len(rows) for rows in samples)
+    out_rows: list[dict] = []
+    for i in range(total):
+        votes = [rows[i] for rows in samples if len(rows) > i]
+        yes = sum(1 for v in votes if v.get("met") is True)
+        no = sum(1 for v in votes if v.get("met") is False)
+        k = len(votes)
+        if yes * 2 > k:
+            met = True
+        elif no * 2 > k:
+            met = False
+        else:
+            met = None  # split vote -> UNKNOWN, never "met"
+        titles: list[str] = []
+        for v in votes:
+            for t in (v.get("gap_titles") or []):
+                if t not in titles:
+                    titles.append(t)
+        worst = None
+        for v in votes:
+            sev = str(v.get("worst_severity") or "").lower()
+            if sev in _SEV_RANK and (worst is None or _SEV_RANK[sev] > _SEV_RANK[worst]):
+                worst = sev
+        out_rows.append({
+            "index": votes[0].get("index", i + 1),
+            "criterion": votes[0].get("criterion", ""),
+            "met": met,
+            "met_votes": yes,
+            "blocked_votes": no,
+            "samples": k,
+            "unanimous": (yes == k or no == k),
+            # Worst case across samples: if ANY sample saw a blocker, the
+            # criterion is not quietly reported as unblocked.
+            "blocking_gaps": max(int(v.get("blocking_gaps") or 0) for v in votes),
+            "unattributed_gaps": max(int(v.get("unattributed_gaps") or 0) for v in votes),
+            "worst_severity": worst,
+            "gap_titles": titles,
+        })
+    lo, hi = min(per_sample_met), max(per_sample_met)
+    return {
+        "rows": out_rows,
+        "criteria_met": sum(1 for r in out_rows if r["met"] is True),
+        "criteria_unknown": sum(1 for r in out_rows if r["met"] is None),
+        "criteria_total": len(out_rows),
+        "samples": len(samples),
+        "met_samples": per_sample_met,
+        "met_low": lo,
+        "met_high": hi,
+        "noise_band": hi - lo,
+        "stable": lo == hi,
+        "unstable_indices": [r["index"] for r in out_rows if not r["unanimous"]],
+    }
+
+
+def assessment_label(pg: dict | None) -> str:
+    """The honest one-liner that must ride with every printed/reported criteria
+    figure. Never let a bare "3/10" stand on its own: it is an ASSESSMENT, and
+    when the samples disagreed the reader has to be told the band."""
+    if not pg:
+        return ""
+    n = int(pg.get("assessment_samples") or 1)
+    if n <= 1:
+        return "assessed, single sample - variance UNMEASURED"
+    lo, hi = pg.get("criteria_met_low"), pg.get("criteria_met_high")
+    if pg.get("assessment_stable"):
+        return f"assessed, {n} samples agreed"
+    return f"assessed, {n} samples, observed {lo}-{hi} - UNSTABLE"
+
+
+def movement_is_real(before: int | None, after: int | None,
+                     noise_band: int) -> bool | None:
+    """Is a before->after change in criteria-met bigger than the sampling noise?
+
+    None when either measurement is missing. False when the swing is inside the
+    observed band - the report must then say "within measurement noise", never
+    "closed N criteria" or "regressed". The owner's rule: never present a swing
+    inside the noise band as progress or regression."""
+    if before is None or after is None:
+        return None
+    return abs(after - before) > max(0, int(noise_band or 0))
+
+
 def gap_progress(before: list[dict], closed_titles: list[str]) -> dict:
     """Summarize a run as movement toward the purpose, not as a score.
 

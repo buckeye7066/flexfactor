@@ -6962,6 +6962,15 @@ def _gap_to_finding(g: dict) -> dict:
 
 PURPOSE_GAP_SOURCE_CAP = 48000       # total chars of source shown to the assessor
 PURPOSE_GAP_PER_FILE_CAP = 8000      # chars per file (head of file carries intent)
+# How many independent assessments of the SAME tree to fold into one verdict.
+# The criteria figure is a MODEL-DERIVED ASSESSMENT: the same GrantFlow tree
+# scored 2/10, 0/10 and 3/10 on three consecutive runs (2026-08-14). One sample
+# published as "the" number turns ~30% noise into headline progress. Samples run
+# CONCURRENTLY, so N costs N cheap-tier calls but roughly ONE call of wall clock
+# - and wall clock is the binding constraint, not dollars. 1 = legacy single
+# shot (variance then reported as UNMEASURED, never as agreement).
+PURPOSE_ASSESS_SAMPLES = max(1, int(os.environ.get(
+    "FLEXFACTOR_PURPOSE_SAMPLES", "3")))
 
 
 def _purpose_module():
@@ -6972,6 +6981,26 @@ def _purpose_module():
         return _fp
     except Exception:
         return None
+
+
+def _purpose_label(pg: dict | None) -> str:
+    """The honesty tag that must ride with EVERY printed criteria figure: this
+    number is a model-derived assessment, and these are the samples behind it."""
+    fp = _purpose_module()
+    if fp is None or not hasattr(fp, "assessment_label"):
+        return "assessed"
+    return fp.assessment_label(pg) or "assessed"
+
+
+def _criteria_noise_band(*assessments) -> int:
+    """Worst observed sampling spread across the assessments being compared.
+    Used to refuse to call a swing inside the band progress or regression.
+    An UNMEASURED assessment (single sample) contributes no evidence of
+    stability, so it is treated as unknown by the caller, not as band 0."""
+    bands = [int(a.get("criteria_noise_band") or 0)
+             for a in assessments if isinstance(a, dict)
+             and a.get("criteria_noise_band") is not None]
+    return max(bands) if bands else 0
 
 
 def load_purpose_contract(display_name: str, project_dir: str | None):
@@ -6992,10 +7021,10 @@ def load_purpose_contract(display_name: str, project_dir: str | None):
         return None
 
 
-def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
-                       findings: list[dict], project_dir: str | None = None,
-                       contract=None) -> dict | None:
-    """One cheap-tier call per program: infer the program's purpose from its own
+def _purpose_gap_sample(provider, purpose_blob: str, files: list[str],
+                        findings: list[dict], project_dir: str | None = None,
+                        contract=None) -> dict | None:
+    """ONE cheap-tier call per program: infer the program's purpose from its own
     metadata and measure the gap to what the code delivers. Returns the normalized
     {purpose, fulfillment_pct, gaps} dict, or None when the response is unusable
     (never raises for a malformed answer - the audit proceeds without it).
@@ -7099,6 +7128,114 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
     else:
         out["authored"] = False
     return out
+
+
+def _merge_gaps(samples: list[dict]) -> list[dict]:
+    """UNION the gaps across samples, de-duplicated by normalized TITLE.
+
+    Union, not majority: a gap is a candidate UNMET REQUIREMENT, and dropping
+    one because 2 of 3 samples happened not to mention it would be rewriting the
+    purpose downward to make a run look finished. The MET verdict is a positive
+    claim and still needs a majority (see aggregate_coverage) - the two rules
+    point the same way, toward never overclaiming.
+
+    Keyed on TITLE ALONE, deliberately: the title is the gap's identity, while
+    `acceptance_ref` is the model's ATTRIBUTION of it and is exactly the part
+    that wobbles between samples. Keying on (ref, title) would emit the same gap
+    three times under three different refs, burn the fix budget on duplicates,
+    and break `gap_progress`, which identifies closed gaps BY TITLE. The refs
+    every sample proposed are kept in `acceptance_refs_seen` so an unstable
+    attribution stays visible rather than being silently picked."""
+    seen: dict[str, dict] = {}
+    refs: dict[str, list] = {}
+    for s in samples:
+        for g in (s.get("gaps") or []):
+            key = " ".join(str(g.get("title") or "").lower().split())
+            ref = g.get("acceptance_ref")
+            bucket = refs.setdefault(key, [])
+            if ref not in bucket:
+                bucket.append(ref)
+            prev = seen.get(key)
+            if prev is None:
+                seen[key] = dict(g)
+            elif (SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0)
+                  > SEVERITY_RANK.get(str(prev.get("severity", "")).lower(), 0)):
+                seen[key] = dict(g)   # keep the worst-severity phrasing
+    for key, g in seen.items():
+        g["acceptance_refs_seen"] = list(refs.get(key) or [])
+    return list(seen.values())
+
+
+def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
+                       findings: list[dict], project_dir: str | None = None,
+                       contract=None, samples: int | None = None) -> dict | None:
+    """Measure this program's gap to the job it was created to do.
+
+    The criteria figure is an ASSESSMENT, not a measurement (same tree scored
+    2/10, 0/10, 3/10 on three consecutive live runs, 2026-08-14). So when there
+    is an acceptance CONTRACT to vote on, this takes `samples` independent
+    assessments CONCURRENTLY and folds them into a per-criterion MAJORITY
+    verdict, carrying the observed spread with it. Every consumer must print the
+    spread alongside the number (`flexfactor_purpose.assessment_label`) and must
+    refuse to call a swing inside the band progress (`movement_is_real`).
+
+    Determinism is NOT forced here: pinning temperature/seed would hide the
+    uncertainty instead of reporting it, and what the number should MEAN is the
+    owner's design decision, not this function's.
+
+    With no contract (INFERRED purpose) there are no criteria to vote on, so a
+    single sample is taken exactly as before - and labelled UNMEASURED, never
+    presented as agreement."""
+    fp = _purpose_module()
+    n = PURPOSE_ASSESS_SAMPLES if samples is None else max(1, int(samples))
+    has_contract = bool(contract is not None and getattr(contract, "purpose", ""))
+    if n <= 1 or not has_contract or fp is None:
+        out = _purpose_gap_sample(provider, purpose_blob, files, findings,
+                                  project_dir=project_dir, contract=contract)
+        if out is not None:
+            out["assessment_samples"] = 1
+            out["assessment_stable"] = None   # UNMEASURED - not the same as stable
+            out["criteria_noise_band"] = None
+        return out
+
+    def _one(_i):
+        try:
+            return _purpose_gap_sample(provider, purpose_blob, files, findings,
+                                       project_dir=project_dir, contract=contract)
+        except BudgetExceededError:
+            raise
+        except Exception:
+            return None   # one bad sample must never sink the assessment
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(_one, range(n)))
+    good = [r for r in results if isinstance(r, dict) and r.get("acceptance_coverage")]
+    if not good:
+        return next((r for r in results if isinstance(r, dict)), None)
+    if len(good) == 1:
+        out = good[0]
+        out["assessment_samples"] = 1
+        out["assessment_stable"] = None
+        out["criteria_noise_band"] = None
+        return out
+
+    agg = fp.aggregate_coverage([r["acceptance_coverage"] for r in good])
+    base = dict(good[0])
+    base["gaps"] = _merge_gaps(good)
+    base["acceptance_coverage"] = agg["rows"]
+    base["criteria_met"] = agg["criteria_met"]
+    base["criteria_unknown"] = agg["criteria_unknown"]
+    base["criteria_total"] = agg["criteria_total"]
+    base["fulfillment_pct"] = (round(100.0 * agg["criteria_met"] / agg["criteria_total"])
+                               if agg["criteria_total"] else base.get("fulfillment_pct"))
+    base["assessment_samples"] = agg["samples"]
+    base["assessment_stable"] = agg["stable"]
+    base["criteria_met_samples"] = agg["met_samples"]
+    base["criteria_met_low"] = agg["met_low"]
+    base["criteria_met_high"] = agg["met_high"]
+    base["criteria_noise_band"] = agg["noise_band"]
+    base["criteria_unstable_indices"] = agg["unstable_indices"]
+    return base
 
 
 def generate_file_fix(provider, rel_path: str, text: str, findings: list[dict],
@@ -9148,9 +9285,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if purpose_before:
             b_gaps = purpose_before.get("gaps") or []
             if purpose_before.get("criteria_total"):
+                _lbl = _purpose_label(purpose_before)
                 print(f"{pfx}Baseline: {purpose_before['criteria_met']}/"
-                      f"{purpose_before['criteria_total']} acceptance criteria met; "
-                      f"{len(b_gaps)} gap(s) stand between this program and its purpose.")
+                      f"{purpose_before['criteria_total']} acceptance criteria met "
+                      f"({_lbl}); {len(b_gaps)} gap(s) stand between this program "
+                      "and its purpose.")
             authored_b = bool(purpose_before.get("authored"))
             floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
             bridgeable_b: list[tuple[str, dict]] = []
@@ -9545,7 +9684,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
                       f"{purpose_gap['criteria_total']} of the owner's acceptance "
-                      f"criteria met ({pct}%)"
+                      f"criteria met ({pct}%; {_purpose_label(purpose_gap)})"
                       + (f", {unk} UNKNOWN (whole-purpose gaps open)" if unk else "")
                       + f" - {len(gaps)} gap(s) to close")
             else:
@@ -9865,9 +10004,37 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if met_before is not None and met_after is not None and total_crit:
             closed = met_after - met_before
             audit["criteria_closed"] = closed
+            # NEVER report a swing inside the sampling noise as movement. Both
+            # figures are model-derived assessments; the same GrantFlow tree
+            # scored 2/10, 0/10, 3/10 on three consecutive runs, so a bare
+            # "+3 criteria closed" can be pure noise. The band is the widest
+            # spread actually observed across this run's own samples.
+            band = _criteria_noise_band(purpose_before, purpose_gap)
+            _fp_mod = _purpose_module()
+            real = (_fp_mod.movement_is_real(met_before, met_after, band)
+                    if _fp_mod is not None and hasattr(_fp_mod, "movement_is_real")
+                    else None)
+            unmeasured = (purpose_before or {}).get("criteria_noise_band") is None or \
+                         (purpose_gap or {}).get("criteria_noise_band") is None
+            audit["criteria_noise_band"] = None if unmeasured else band
+            audit["criteria_movement_is_real"] = None if unmeasured else bool(real)
             print(f"{pfx}{'='*54}")
-            print(f"{pfx}PURPOSE SCORE: {closed:+d} criteria closed this run "
-                  f"({met_before} -> {met_after} of {total_crit} met).")
+            if unmeasured:
+                print(f"{pfx}PURPOSE SCORE: {met_before} -> {met_after} of "
+                      f"{total_crit} criteria met ({closed:+d}). Variance "
+                      "UNMEASURED (single-sample assessment) - this delta is "
+                      "NOT evidence of progress or regression.")
+            elif real:
+                print(f"{pfx}PURPOSE SCORE: {closed:+d} criteria closed this run "
+                      f"({met_before} -> {met_after} of {total_crit} met); "
+                      f"beyond the observed sampling band of +/-{band} "
+                      f"({_purpose_label(purpose_gap)}).")
+            else:
+                print(f"{pfx}PURPOSE SCORE: {met_before} -> {met_after} of "
+                      f"{total_crit} criteria met ({closed:+d}) - WITHIN "
+                      f"MEASUREMENT NOISE (observed sampling band +/-{band}; "
+                      f"{_purpose_label(purpose_gap)}). No claim of progress or "
+                      "regression can be made from this run's criteria count.")
             if closed <= 0 and (len(applied_set) or 0) > 0:
                 print(f"{pfx}  NOTE: {len(applied_set)} file(s) were fixed but NO "
                       "criteria closed - this run tidied code without moving the "
@@ -10334,6 +10501,15 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "purpose_contract": a.get("purpose_contract"),
         "purpose_acceptance_coverage": (a.get("purpose_gap") or {}).get("acceptance_coverage"),
         "purpose_progress": (a.get("purpose_gap") or {}).get("progress"),
+        # The criteria figure is an ASSESSMENT, not a measurement. Ship its
+        # provenance with it so no downstream consumer can read a swing inside
+        # the sampling band as progress.
+        "purpose_assessment_samples": (a.get("purpose_gap") or {}).get("assessment_samples"),
+        "purpose_assessment_stable": (a.get("purpose_gap") or {}).get("assessment_stable"),
+        "purpose_criteria_met_samples": (a.get("purpose_gap") or {}).get("criteria_met_samples"),
+        "purpose_criteria_noise_band": (a.get("purpose_gap") or {}).get("criteria_noise_band"),
+        "criteria_closed": a.get("criteria_closed"),
+        "criteria_movement_is_real": a.get("criteria_movement_is_real"),
         "release_status": _release_status(a)[0],
         "release_status_unmet": _release_status(a)[1],
         "paid_rescue": paid_rescue_stats(),
@@ -10421,29 +10597,88 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                   "criterion(s) remain blocked.", ""]
         if pg.get("criteria_total"):
             L += [f"**Acceptance:** {pg.get('criteria_met')} of "
-                  f"{pg.get('criteria_total')} owner criteria met ({pct}%).", ""]
+                  f"{pg.get('criteria_total')} owner criteria met ({pct}%) — "
+                  f"*{_purpose_label(pg)}*.", ""]
+            # The number is model-derived. Say so, with the spread, right where
+            # a reader would otherwise treat it as a measurement.
+            band = pg.get("criteria_noise_band")
+            if band is None:
+                L += ["> **This figure is an ASSESSMENT, not a measurement, and "
+                      "its run-to-run variance was NOT measured on this run "
+                      "(single sample).** Do not read a change in it against "
+                      "another run as progress or regression.", ""]
+            elif not pg.get("assessment_stable"):
+                L += [f"> **This figure is an ASSESSMENT, not a measurement.** "
+                      f"{pg.get('assessment_samples')} independent samples of "
+                      f"this same tree returned "
+                      f"{pg.get('criteria_met_samples')} criteria met "
+                      f"(spread {pg.get('criteria_met_low')}–"
+                      f"{pg.get('criteria_met_high')}). The table below is the "
+                      f"per-criterion MAJORITY verdict; a split vote is reported "
+                      f"UNKNOWN, never met. **Any change of "
+                      f"{band} or less against another run is inside the noise "
+                      f"and is not evidence of progress or regression.**", ""]
+            else:
+                L += [f"> This figure is an assessment, not a measurement, but "
+                      f"all {pg.get('assessment_samples')} samples of this tree "
+                      f"agreed on it.", ""]
         else:
             L += [f"**Fulfillment:** {pct if pct is not None else '?'}% — "
                   f"{len(gaps)} gap(s)"
                   + (f", {len(bridged)} bridged this run (build-gated fixes)"
                      if bridged else ""), ""]
+        _closed = a.get("criteria_closed")
+        if _closed is not None:
+            _real = a.get("criteria_movement_is_real")
+            if _real is True:
+                L += [f"**Criteria movement this run: {_closed:+d}** — larger "
+                      f"than the observed sampling band "
+                      f"(±{a.get('criteria_noise_band')}), so it is real "
+                      "movement, not noise.", ""]
+            elif _real is False:
+                L += [f"**Criteria movement this run: {_closed:+d} — WITHIN "
+                      f"MEASUREMENT NOISE** (observed band "
+                      f"±{a.get('criteria_noise_band')}). This is NOT evidence "
+                      "of progress or regression.", ""]
+            else:
+                L += [f"**Criteria movement this run: {_closed:+d} — variance "
+                      "UNMEASURED** (single-sample assessment). This delta is "
+                      "NOT evidence of progress or regression.", ""]
         cov = pg.get("acceptance_coverage") or []
         if cov:
-            L += ["### Acceptance criteria (the owner's, verbatim)", "",
-                  "| # | Met | Criterion | Blocked by |", "|---|---|---|---|"]
+            voted = any(r.get("samples") for r in cov)
+            head = ("| # | Met | Agreement | Criterion | Blocked by |"
+                    if voted else "| # | Met | Criterion | Blocked by |")
+            rule = "|---|---|---|---|---|" if voted else "|---|---|---|---|"
+            L += ["### Acceptance criteria (the owner's, verbatim)", "", head, rule]
             for row in cov:
                 met = row.get("met")
                 if met is None:
-                    # No gap names this criterion, but whole-purpose gaps are
-                    # open - "met" would be an overclaim.
+                    # Two different reasons land here and the reader must be
+                    # able to tell them apart: no gap names this criterion but
+                    # whole-purpose gaps are open (met would be an overclaim),
+                    # OR the samples split (a split vote is not evidence of met).
                     label = "UNKNOWN"
                     blockers = (f"— ({row.get('unattributed_gaps', 0)} "
                                 "whole-purpose gap(s) open)")
+                    if row.get("samples") and not row.get("unanimous"):
+                        label = "UNKNOWN (split)"
+                        blockers = ("; ".join(str(t) for t in (row.get("gap_titles") or []))
+                                    or blockers)
                 else:
                     label = "yes" if met else "NO"
                     blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
-                L.append(f"| {row['index']} | {label} | "
-                         f"{row['criterion']} | {blockers} |")
+                if voted:
+                    n = int(row.get("samples") or 1)
+                    agree = (int(row.get("met_votes") or 0) if met is True
+                             else int(row.get("blocked_votes") or 0) if met is False
+                             else max(int(row.get("met_votes") or 0),
+                                      int(row.get("blocked_votes") or 0)))
+                    L.append(f"| {row['index']} | {label} | {agree}/{n} | "
+                             f"{row['criterion']} | {blockers} |")
+                else:
+                    L.append(f"| {row['index']} | {label} | "
+                             f"{row['criterion']} | {blockers} |")
             L.append("")
             L += ["### Gaps", ""]
         for g in gaps:

@@ -9607,6 +9607,188 @@ class UnattributedGapHonestyTests(unittest.TestCase):
         self.assertEqual(len(out["gaps"]), 6)
 
 
+class PurposeAssessmentStabilityTests(unittest.TestCase):
+    """The purpose baseline is UNSTABLE and the report must say so.
+
+    Live GrantFlow 2026-08-14: the same unchanged tree measured 2/10, then
+    0/10, then 3/10 acceptance criteria met across three consecutive runs. The
+    engine runs correctly (58d8210) - the figure is simply a MODEL-DERIVED
+    ASSESSMENT carrying ~30% run-to-run variance, while the doctrine treats it
+    as the headline scoreboard. Publishing one sample as "the" number turns
+    that noise into "+3 criteria closed", which is exactly the false-progress
+    reporting the owner's standing rules forbid.
+
+    Determinism is deliberately NOT forced (that is a design decision about what
+    the number means). Instead: multi-sample, take the per-criterion MAJORITY,
+    and publish the observed spread everywhere the figure appears."""
+
+    def _contract(self):
+        return fp.PurposeContract(
+            name="Demo", slug="demo", purpose="do the thing", authored=True,
+            acceptance_criteria=["c1", "c2", "c3", "c4"])
+
+    @staticmethod
+    def _rows(met_flags):
+        return [{"index": i + 1, "criterion": f"c{i+1}", "met": m,
+                 "blocking_gaps": 0 if m is not False else 1,
+                 "unattributed_gaps": 0, "worst_severity": None,
+                 "gap_titles": [] if m is not False else [f"g{i+1}"]}
+                for i, m in enumerate(met_flags)]
+
+    def test_majority_verdict_and_split_votes_are_unknown_not_met(self):
+        # c1: met in all 3. c2: met in 2 of 3 -> majority met. c3: 1 of 3 ->
+        # blocked. c4: a dead 'split' - no majority either way -> UNKNOWN.
+        agg = fp.aggregate_coverage([
+            self._rows([True, True, True, True]),
+            self._rows([True, True, False, False]),
+            self._rows([True, False, False, None]),
+        ])
+        got = [r["met"] for r in agg["rows"]]
+        self.assertEqual(got, [True, True, False, None])
+        self.assertIsNone(agg["rows"][3]["met"],
+                          "a split vote must be UNKNOWN, never 'met'")
+        self.assertFalse(agg["rows"][3]["unanimous"])
+        self.assertTrue(agg["rows"][0]["unanimous"])
+        self.assertEqual(agg["criteria_met"], 2)
+
+    def test_the_observed_variance_is_reported_not_hidden(self):
+        agg = fp.aggregate_coverage([
+            self._rows([True, True, False, False]),   # 2 met
+            self._rows([False, False, False, False]),  # 0 met
+            self._rows([True, True, True, False]),    # 3 met
+        ])
+        # The exact live GrantFlow shape: 2 -> 0 -> 3 on one unchanged tree.
+        self.assertEqual(agg["met_samples"], [2, 0, 3])
+        self.assertEqual((agg["met_low"], agg["met_high"]), (0, 3))
+        self.assertEqual(agg["noise_band"], 3)
+        self.assertFalse(agg["stable"])
+
+    def test_a_swing_inside_the_noise_band_is_not_progress(self):
+        # THE OWNER'S RULE: never present a swing inside the noise band as
+        # progress or regression. 0 -> 3 with a band of 3 is NOT movement.
+        self.assertFalse(fp.movement_is_real(0, 3, 3))
+        self.assertFalse(fp.movement_is_real(3, 0, 3))
+        self.assertTrue(fp.movement_is_real(0, 4, 3))
+        self.assertIsNone(fp.movement_is_real(None, 3, 3))
+
+    def test_assess_purpose_gap_multisamples_and_publishes_the_spread(self):
+        # An assessor that answers differently every call - the live behavior.
+        answers = [
+            {"purpose": "p", "fulfillment_pct": 50,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 3,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g2", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+            {"purpose": "p", "fulfillment_pct": 0,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 1,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g2", "severity": "high", "acceptance_ref": 2,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g3", "severity": "high", "acceptance_ref": 3,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g4", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+            {"purpose": "p", "fulfillment_pct": 75,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+        ]
+        lock = threading.Lock()
+        calls = {"n": 0}
+
+        class _P:
+            model = "m"
+
+            def structured(self, *a, **k):
+                with lock:
+                    i = calls["n"]
+                    calls["n"] += 1
+                return answers[i % len(answers)]
+
+        real_n = ff.PURPOSE_ASSESS_SAMPLES
+        try:
+            ff.PURPOSE_ASSESS_SAMPLES = 3
+            out = ff.assess_purpose_gap(_P(), "blob", [], [],
+                                        contract=self._contract())
+        finally:
+            ff.PURPOSE_ASSESS_SAMPLES = real_n
+
+        self.assertEqual(calls["n"], 3, "the assessment was not multi-sampled")
+        # THE POINT: the spread is published, not silently collapsed to one number.
+        self.assertEqual(out["assessment_samples"], 3)
+        self.assertEqual(sorted(out["criteria_met_samples"]), [0, 2, 3])
+        self.assertEqual(out["criteria_noise_band"], 3)
+        self.assertIs(out["assessment_stable"], False)
+        # Criterion 4 is blocked in all three samples -> unanimous NO.
+        self.assertIs(out["acceptance_coverage"][3]["met"], False)
+        # Gaps are UNIONed, never majority-filtered: dropping a gap 2 of 3
+        # samples missed would rewrite the purpose downward. De-duplicated by
+        # TITLE (g1..g4), not by (ref, title) - the ref is the wobbly part, and
+        # emitting one gap three times under three refs would burn fix budget
+        # on duplicates and break gap_progress, which closes gaps BY TITLE.
+        self.assertEqual(sorted(g["title"] for g in out["gaps"]),
+                         ["g1", "g2", "g3", "g4"])
+        g1 = next(g for g in out["gaps"] if g["title"] == "g1")
+        self.assertEqual(sorted(str(r) for r in g1["acceptance_refs_seen"]),
+                         ["1", "3", "4"], "unstable attribution must stay visible")
+
+    def test_single_sample_is_labelled_unmeasured_not_stable(self):
+        data = {"purpose": "p", "fulfillment_pct": 100, "gaps": []}
+
+        class _P:
+            model = "m"
+            def structured(self, *a, **k):
+                return data
+
+        out = ff.assess_purpose_gap(_P(), "blob", [], [],
+                                    contract=self._contract(), samples=1)
+        self.assertEqual(out["assessment_samples"], 1)
+        # NOT False and NOT True: unmeasured variance is not evidence of
+        # stability, and must never be reported as agreement.
+        self.assertIsNone(out["assessment_stable"])
+        self.assertIsNone(out["criteria_noise_band"])
+        self.assertIn("UNMEASURED", fp.assessment_label(out))
+
+    def _report(self, audit_extra, pg_extra):
+        import tempfile
+        pg = {"purpose": "do the thing", "authored": True, "gaps": [],
+              "fulfillment_pct": 75, "criteria_met": 3, "criteria_total": 4,
+              "criteria_unknown": 0, "acceptance_coverage": [],
+              "assessment_samples": 3}
+        pg.update(pg_extra)
+        a = {"name": "Demo", "dir": "d", "branch": "b", "files_reviewed": 1,
+             "findings": [], "applied_files": [], "unverified_files": [],
+             "baseline_ok": True, "fix_notes": [], "purpose_gap": pg,
+             "commit_status": "", "ecosystems": [], "test_files": [],
+             "test_status": "", "e2e": {}, "file_findings": {}}
+        a.update(audit_extra)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = ff._write_audit_report(tmp, a)
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+
+    def test_report_refuses_to_call_a_noise_band_swing_progress(self):
+        text = self._report(
+            {"criteria_closed": 2, "criteria_movement_is_real": False,
+             "criteria_noise_band": 3},
+            {"assessment_stable": False, "criteria_noise_band": 3,
+             "criteria_met_samples": [2, 0, 3], "criteria_met_low": 0,
+             "criteria_met_high": 3})
+        self.assertIn("WITHIN MEASUREMENT NOISE", text)
+        self.assertIn("NOT evidence", text)
+        self.assertIn("ASSESSMENT, not a measurement", text)
+        self.assertIn("[2, 0, 3]", text)
+
+    def test_report_labels_a_single_sample_figure_as_unmeasured(self):
+        text = self._report(
+            {"criteria_closed": 2, "criteria_movement_is_real": None,
+             "criteria_noise_band": None},
+            {"assessment_samples": 1, "assessment_stable": None,
+             "criteria_noise_band": None})
+        self.assertIn("variance", text)
+        self.assertIn("UNMEASURED", text)
+        self.assertNotIn("WITHIN MEASUREMENT NOISE", text)
+
+
 class ReviewIncompleteHonestyTests(unittest.TestCase):
     """Defect: _review_all tracked files whose review ERRORED but never
     returned them, so a sweep where every review failed converged as CLEAN and
