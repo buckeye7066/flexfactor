@@ -91,8 +91,12 @@ cd "$APP_DIR"
 # pip BUILDS it here. That is a long compile and it is opt-in for that reason.
 if [ "${WITH_SDK:-0}" = "1" ]; then
   say "installing cloud provider SDKs (pydantic-core compiles from source; slow)"
-  pkg install -y rust binutils
-  pip install --upgrade pip
+  # NOT `pip install --upgrade pip`: Termux refuses it outright --
+  #   ERROR: Installing pip is forbidden, this will break the python-pip package
+  # -- and under `set -e` that aborts the whole setup before a single SDK is
+  # fetched. pip is a pkg-managed component here, so it is installed the same
+  # way everything else is. Measured on an S25 Ultra.
+  pkg install -y rust binutils python-pip
   # Pinned to the pair the desktop is tested against (requirements.txt).
   pip install "anthropic==0.116.0" "openai==2.44.0" || die "SDK build failed.
 This is the known pydantic-core/Rust build. Options, in order of honesty:
