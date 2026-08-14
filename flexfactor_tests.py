@@ -550,7 +550,7 @@ class FreeReviewPoolTests(unittest.TestCase):
         class _SlowProvider:
             model = "slow-model"
 
-        def fake_review(provider, rel, text, context=""):
+        def fake_review(provider, rel, text, context="", project_dir=None):
             name = "fast" if provider.model == "fast-model" else "slow"
             with lock:
                 calls[name] += 1
@@ -587,7 +587,7 @@ class FreeReviewPoolTests(unittest.TestCase):
         class _R:
             model = "m"
 
-        def fake_review(provider, rel, text, context=""):
+        def fake_review(provider, rel, text, context="", project_dir=None):
             seen.append(rel)
             return [], "ok"
 
@@ -3101,7 +3101,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha-" + rel)
         real_rf = ff.review_file
-        ff.review_file = lambda reviewer, rel, text, context="": ([], "")  # no findings, COMPLETES
+        ff.review_file = lambda reviewer, rel, text, context="", project_dir=None: ([], "")  # no findings, COMPLETES
         try:
             _, _, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py", "b.py"], workers=2)
@@ -3117,7 +3117,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
         real_rf = ff.review_file
 
-        def boom(reviewer, rel, text, context=""):
+        def boom(reviewer, rel, text, context="", project_dir=None):
             raise RuntimeError("provider exploded")
 
         ff.review_file = boom
@@ -3135,7 +3135,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
         real_rf = ff.review_file
 
-        def budget(reviewer, rel, text, context=""):
+        def budget(reviewer, rel, text, context="", project_dir=None):
             raise ff.BudgetExceededError("cap")
 
         ff.review_file = budget
@@ -3376,7 +3376,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("   \n\t  \n", "wsha")
         real_rf = ff.review_file
-        ff.review_file = lambda reviewer, rel, text, context="": (ran.append(rel) or ([], ""))
+        ff.review_file = lambda reviewer, rel, text, context="", project_dir=None: (ran.append(rel) or ([], ""))
         try:
             _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
@@ -3390,7 +3390,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("  \n  ", "s")
         real_rf = ff.review_file
 
-        def boom(reviewer, rel, text, context=""):
+        def boom(reviewer, rel, text, context="", project_dir=None):
             raise RuntimeError("provider down")
 
         ff.review_file = boom
@@ -4313,6 +4313,136 @@ class PrefetchWaitIsBoundedTests(unittest.TestCase):
                         f"no loud abandonment note for the hung file: {notes}")
         # And the queue KEPT MOVING - the healthy file behind it still got fixed.
         self.assertIn("fine.py", applied)
+
+
+class VersionAwareReviewTests(unittest.TestCase):
+    """FlexFactor must not recommend APIs that don't exist in the installed version.
+
+    Live GrantFlow 2026-08-14: findings on GrantMonitoring.jsx L73,
+    MyProfiles.jsx L86 and Organizations.jsx L118 each claimed cache
+    invalidation was broken and recommended the ARRAY form
+    `invalidateQueries(['key'])`. GrantFlow runs @tanstack/react-query 5.101.4,
+    where that signature was REMOVED in v5. The object form already in the code
+    is correct, `refetchType` is valid, and keys match by PREFIX so
+    `['profiles']` already matches `['profiles', isAdmin]`. Applying those three
+    "fixes" would have BROKEN invalidation on three working pages - FlexFactor
+    damaging the program it exists to improve.
+
+    The filter is deliberately NARROW: it only fires when the installed major is
+    KNOWN and at/past the removal, and only on the finding's ADVICE. Broad
+    suppression would trade false positives for false negatives and cost real
+    defects, so the v4 case below is as load-bearing as the v5 one."""
+
+    ARRAY_FORM = {
+        "file": "src/pages/MyProfiles.jsx", "line": 86, "severity": "high",
+        "category": "bug", "title": "Cache invalidation does not refetch",
+        "problem": "The object form does not invalidate the list query.",
+        "fix": "Call queryClient.invalidateQueries(['profiles']) instead.",
+    }
+    NORMAL = {
+        "file": "src/pages/MyProfiles.jsx", "line": 12, "severity": "high",
+        "category": "bug", "title": "Unhandled promise rejection",
+        "problem": "The await is not wrapped in try/catch.",
+        "fix": "Wrap the await in try/catch and surface the error.",
+    }
+
+    @staticmethod
+    def _project(tmp, react_query_range, lock_version=None):
+        pkg = {"name": "demo", "dependencies": {
+            "@tanstack/react-query": react_query_range, "react": "^18.2.0"}}
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            json.dump(pkg, fh)
+        if lock_version:
+            lock = {"lockfileVersion": 3, "packages": {
+                "": {}, "node_modules/@tanstack/react-query":
+                    {"version": lock_version}}}
+            with open(os.path.join(tmp, "package-lock.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(lock, fh)
+        ff._DEP_VERSION_CACHE.pop(os.path.abspath(tmp), None)
+        return tmp
+
+    def _review(self, tmp, findings, text="import { useQueryClient } "
+                                          "from '@tanstack/react-query';\n"):
+        captured = {}
+
+        class _P:
+            model = "m"
+
+            def structured(self, *a, **k):
+                captured["prompt"] = a[1] if len(a) > 1 else k.get("prompt", "")
+                return {"findings": [dict(f) for f in findings], "summary": ""}
+
+        got, _ = ff.review_file(_P(), "src/pages/MyProfiles.jsx", text,
+                                project_dir=tmp)
+        return got, captured.get("prompt", "")
+
+    def test_v5_project_rejects_the_removed_array_form_finding(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(got, [], "a fix recommending an API removed in the "
+                                  "INSTALLED major must never reach the author model")
+
+    def test_v4_project_keeps_the_same_finding(self):
+        # THE ANTI-BLANKET-SUPPRESSION TEST. On v4 the array form is correct
+        # advice, so the identical finding must survive untouched.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^4.36.1", lock_version="4.36.1")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["title"], self.ARRAY_FORM["title"])
+
+    def test_a_normal_finding_is_unaffected_on_either_version(self):
+        import tempfile
+        for rng, lock in (("^5.101.4", "5.101.4"), ("^4.36.1", "4.36.1")):
+            with tempfile.TemporaryDirectory() as tmp:
+                self._project(tmp, rng, lock_version=lock)
+                got, _ = self._review(tmp, [self.NORMAL, self.ARRAY_FORM])
+            titles = [f["title"] for f in got]
+            self.assertIn(self.NORMAL["title"], titles,
+                          f"an unrelated finding was suppressed on {rng}")
+
+    def test_object_form_advice_is_never_mistaken_for_the_array_form(self):
+        import tempfile
+        obj = dict(self.ARRAY_FORM,
+                   fix="Call queryClient.invalidateQueries({ queryKey: "
+                       "['profiles'], refetchType: 'active' }).")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            got, _ = self._review(tmp, [obj])
+        self.assertEqual(len(got), 1, "the v5-correct object form must survive")
+
+    def test_unknown_version_never_drops_a_finding(self):
+        # Fail OPEN on unknown: dropping a real defect is worse than keeping a
+        # questionable one.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "workspace:*")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(len(got), 1)
+
+    def test_installed_versions_are_shown_to_the_reviewer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            _got, prompt = self._review(tmp, [])
+        self.assertIn("INSTALLED DEPENDENCY VERSIONS", prompt)
+        self.assertIn("@tanstack/react-query: 5.101.4", prompt,
+                      "the lockfile's resolved version must reach the reviewer")
+        # Only what the file imports: react is a dep but is not imported here.
+        self.assertNotIn("react: ^18.2.0", prompt)
+
+    def test_version_major_parses_ranges_and_refuses_to_guess(self):
+        self.assertEqual(ff._version_major("^5.101.4"), 5)
+        self.assertEqual(ff._version_major("~4.2.0"), 4)
+        self.assertEqual(ff._version_major(">=3 <4"), 3)
+        self.assertEqual(ff._version_major("5.101.4"), 5)
+        for junk in ("workspace:*", "latest", "*", "", None):
+            self.assertIsNone(ff._version_major(junk),
+                              f"{junk!r} must stay UNKNOWN, never a guessed major")
 
 
 class InlineFixGenerationIsBoundedTests(unittest.TestCase):
@@ -7760,7 +7890,7 @@ class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
     def test_file_is_reviewed_by_the_healthy_backend_after_one_times_out(self):
         calls = []
 
-        def fake_review_file(provider, rel, text, context=""):
+        def fake_review_file(provider, rel, text, context="", project_dir=None):
             calls.append(provider)
             if provider == "slow":
                 raise RuntimeError("timed out")
@@ -7778,7 +7908,7 @@ class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
     def test_still_incomplete_when_every_backend_fails_that_file(self):
         # The safety property must survive the retry: if NOTHING could review
         # it, it is still NOT clean.
-        def always_fail(provider, rel, text, context=""):
+        def always_fail(provider, rel, text, context="", project_dir=None):
             raise RuntimeError("timed out")
 
         with _patched(ff, "review_file", always_fail):
@@ -9954,7 +10084,7 @@ class ResumeCheckpointTests(unittest.TestCase):
         real_read = ff._read_text_and_sha
         real_review = ff.review_file
         ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = (lambda rv, rel, text, context="":
+        ff.review_file = (lambda rv, rel, text, context="", project_dir=None:
                           (([finding], "s") if rel == "bad.py" else ([], "s")))
         seen = {}
 
@@ -9994,7 +10124,7 @@ class ResumeCheckpointTests(unittest.TestCase):
         real_read = ff._read_text_and_sha
         real_review = ff.review_file
         ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = lambda rv, rel, text, context="": ([], "clean")  # all clean, real findings not the point here
+        ff.review_file = lambda rv, rel, text, context="", project_dir=None: ([], "clean")  # all clean, real findings not the point here
 
         class _R:
             model = "m"

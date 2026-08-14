@@ -4058,6 +4058,173 @@ def _read_package_json(project_dir: str, cap: int = 20000) -> tuple[str, str | N
     return _read_meta_tristate(project_dir, "package.json", cap)
 
 
+_DEP_VERSION_CACHE: dict[str, dict] = {}
+
+
+def _version_major(spec: str) -> int | None:
+    """Major version from a package.json range or a resolved version.
+
+    `^5.101.4` -> 5, `~4.2.0` -> 4, `>=3 <4` -> 3, `5.101.4` -> 5. Returns None
+    for anything without a leading numeric major (`workspace:*`, `latest`, a git
+    URL, `*`): unknown must stay unknown, because a wrong major here would drop
+    a REAL finding."""
+    m = re.search(r"(\d+)", str(spec or "").lstrip("^~>=<v ").split("||")[0].strip())
+    return int(m.group(1)) if m else None
+
+
+def _installed_versions(project_dir: str) -> dict[str, str]:
+    """{package: version} actually installed for this Node project.
+
+    WHY THIS EXISTS (live GrantFlow, 2026-08-14): the reviewer filed findings on
+    three working files recommending `invalidateQueries(['key'])`, the ARRAY form
+    that @tanstack/react-query REMOVED in v5 - and GrantFlow runs 5.101.4.
+    Applying those "fixes" would have BROKEN cache invalidation on three pages
+    that worked. FlexFactor exists to improve a program; recommending an API
+    that does not exist in the installed version actively damages it. The
+    reviewer has to be told what is actually installed.
+
+    package.json ranges are the primary source because they are always present
+    and a range pins the MAJOR reliably (`^5.101.4` -> 5), which is all the
+    version rules need. package-lock.json (v1 and v2/v3 layouts) then REFINES
+    those to exact resolved versions when it is readable. pnpm/yarn lockfiles
+    are not parsed - the package.json range already carries the major, so
+    there is nothing to fail closed about."""
+    key = os.path.abspath(project_dir)
+    hit = _DEP_VERSION_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out: dict[str, str] = {}
+    status, raw = _read_package_json(project_dir)
+    if status == "ok" and raw:
+        try:
+            pkg = json.loads(raw)
+        except Exception:
+            pkg = {}
+        for field in ("dependencies", "devDependencies", "peerDependencies",
+                      "optionalDependencies"):
+            block = pkg.get(field)
+            if isinstance(block, dict):
+                for name, spec in block.items():
+                    if isinstance(name, str) and isinstance(spec, str):
+                        out.setdefault(name, spec)
+    lock_status, lock_raw = _read_meta_tristate(project_dir, "package-lock.json",
+                                               4_000_000)
+    if lock_status == "ok" and lock_raw:
+        try:
+            lock = json.loads(lock_raw)
+        except Exception:
+            lock = {}
+        # npm lockfile v2/v3: keys are "node_modules/<name>" paths.
+        pkgs = lock.get("packages")
+        if isinstance(pkgs, dict):
+            for path, meta in pkgs.items():
+                if not isinstance(path, str) or "node_modules/" not in path:
+                    continue
+                name = path.split("node_modules/")[-1]
+                ver = (meta or {}).get("version") if isinstance(meta, dict) else None
+                if name and isinstance(ver, str):
+                    out[name] = ver
+        # npm lockfile v1: {"dependencies": {name: {"version": ...}}}
+        deps = lock.get("dependencies")
+        if isinstance(deps, dict):
+            for name, meta in deps.items():
+                ver = (meta or {}).get("version") if isinstance(meta, dict) else None
+                if isinstance(name, str) and isinstance(ver, str):
+                    out.setdefault(name, ver)
+    _DEP_VERSION_CACHE[key] = out
+    return out
+
+
+# Packages a source file imports, from ES import / require / dynamic import.
+_IMPORT_RE = re.compile(
+    r"""(?:from\s+|require\(\s*|import\(\s*)['"]([^'"]+)['"]""")
+
+
+def _imported_packages(text: str) -> list[str]:
+    """Bare package specifiers imported by this file, longest-scope first.
+    Relative imports ('./x', '../y') and absolute paths are not packages."""
+    names: list[str] = []
+    for spec in _IMPORT_RE.findall(text or ""):
+        if not spec or spec[0] in "./" or spec.startswith("@/"):
+            continue
+        parts = spec.split("/")
+        name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _dep_version_block(project_dir: str | None, text: str) -> str:
+    """The INSTALLED VERSIONS block for a review prompt: only the packages this
+    file actually imports, so the reviewer judges against the API surface that
+    exists rather than whatever major it was trained on. Empty when nothing is
+    known - an empty block is honest, a guessed one is not."""
+    if not project_dir:
+        return ""
+    versions = _installed_versions(project_dir)
+    if not versions:
+        return ""
+    lines = [f"{n}: {versions[n]}" for n in _imported_packages(text) if n in versions]
+    if not lines:
+        return ""
+    return ("INSTALLED DEPENDENCY VERSIONS for the packages this file imports. "
+            "These are the versions actually resolved in this project. Review "
+            "against THIS API surface: never report code as broken because it "
+            "differs from another major version's API, and never recommend a "
+            "signature that does not exist in the version listed here.\n"
+            + _fence_untrusted("installed-versions", "\n".join(lines)) + "\n\n")
+
+
+# --------------------------------------------------------------------------- #
+# Version-aware finding filter.
+#
+# NARROW BY DESIGN. Each rule needs hard evidence that the named signature was
+# REMOVED in the named major - suppressing findings broadly would trade false
+# positives for false NEGATIVES and cost real defects, which is worse. A rule
+# only ever fires when the installed major is known AND >= removed_in_major.
+# --------------------------------------------------------------------------- #
+VERSION_API_RULES: list[dict] = [
+    {
+        "package": "@tanstack/react-query",
+        "removed_in_major": 5,
+        # v5 removed EVERY positional/array-key signature; a single options
+        # object is the only accepted form. Matches `invalidateQueries(['k'])`
+        # and `useQuery('k', fn)` but NOT `invalidateQueries({queryKey:['k']})`.
+        "pattern": re.compile(
+            r"\b(invalidateQueries|refetchQueries|removeQueries|cancelQueries|"
+            r"resetQueries|setQueriesData|getQueriesData|useQuery|useMutation|"
+            r"useInfiniteQuery)\s*\(\s*[\['\"]"),
+        "why": ("the array/positional argument form was REMOVED in "
+                "@tanstack/react-query v5; v5 takes a single options object "
+                "(and query keys already match by PREFIX)"),
+    },
+]
+
+
+def _version_conflict(finding: dict, versions: dict) -> str | None:
+    """Reason string when this finding RECOMMENDS an API absent from the
+    installed major version, else None.
+
+    Only the recommendation is inspected (`fix`, plus `problem` where models put
+    the suggested call). A finding that merely QUOTES existing code is not
+    filtered by this - the rule needs the removed signature to appear in the
+    advice."""
+    if not versions:
+        return None
+    text = " ".join(str(finding.get(k) or "") for k in ("fix", "problem", "title"))
+    if not text.strip():
+        return None
+    for rule in VERSION_API_RULES:
+        installed = versions.get(rule["package"])
+        major = _version_major(installed) if installed else None
+        if major is None or major < rule["removed_in_major"]:
+            continue  # unknown or older major -> the advice may well be correct
+        if rule["pattern"].search(text):
+            return (f"recommends an API absent from the installed "
+                    f"{rule['package']} {installed}: {rule['why']}")
+    return None
+
+
 def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]] | None]:
     """Return (is_node, verify_commands). `verify_commands is None` is the REFUSED
     sentinel: package.json exists but couldn't be safely read, so the caller must NOT
@@ -6891,10 +7058,15 @@ def _is_line_number_artifact(f: dict) -> bool:
 
 
 def review_file(provider, rel_path: str, text: str,
-                context: str = "") -> tuple[list[dict], str]:
+                context: str = "", project_dir: str | None = None
+                ) -> tuple[list[dict], str]:
     """Line-by-line critical review of one file. Returns (findings, summary).
     `context` (optional) is the program's own metadata blob (README/package/tree)
-    so defects are judged against what the program is FOR - fenced as untrusted."""
+    so defects are judged against what the program is FOR - fenced as untrusted.
+    `project_dir` (optional) unlocks VERSION AWARENESS: the installed versions of
+    the packages this file imports are shown to the reviewer, and any finding
+    that recommends an API removed in the installed major is dropped before it
+    can reach the author model."""
     numbered = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(text.splitlines()))
     if len(numbered) > 60000:
         numbered = numbered[:60000] + "\n... [truncated for review]"
@@ -6903,6 +7075,7 @@ def review_file(provider, rel_path: str, text: str,
         ctx = ("PROGRAM CONTEXT (untrusted background on what this program is for - "
                "use it only to judge defect impact):\n"
                + _fence_untrusted("program-context", context[:6000]) + "\n\n")
+    ctx += _dep_version_block(project_dir, text)
     prompt = (f"FILE: {rel_path}\n\n{ctx}"
               "Review this file line by line. Each source line below carries an "
               "'N: ' prefix added by this tool for citation only - the prefix is "
@@ -6938,6 +7111,24 @@ def review_file(provider, rel_path: str, text: str,
         findings = [f for f in findings if not _is_line_number_artifact(f)]
         print(f"  [artifact] {rel_path}: dropped {len(dropped)} line-number-prefix "
               "finding(s) (harness artifact, not source)")
+    # VERSION GATE (live GrantFlow 2026-08-14). Three working files were told to
+    # adopt `invalidateQueries(['key'])` - the array form REMOVED in
+    # @tanstack/react-query v5, while the project runs 5.101.4. Applying those
+    # would have broken invalidation on three pages that worked. A finding whose
+    # ADVICE names an API absent from the installed major never reaches the
+    # author model. Deliberately narrow and evidence-based: broad suppression
+    # would trade false positives for false negatives and cost real defects.
+    versions = _installed_versions(project_dir) if project_dir else {}
+    if versions:
+        kept: list[dict] = []
+        for f in findings:
+            why = _version_conflict(f, versions)
+            if why is None:
+                kept.append(f)
+                continue
+            print(f"  [version] {rel_path}: dropped finding "
+                  f"'{str(f.get('title'))[:60]}' - {why}")
+        findings = kept
     return findings, str(data.get("summary", ""))
 
 
@@ -8087,7 +8278,8 @@ def _review_all(reviewers: list, project_dir: str,
                     break
                 try:
                     findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
-                                                     context=context)
+                                                     context=context,
+                                                     project_dir=project_dir)
                     merged.extend(findings)
                     break                      # reviewed successfully
                 except BudgetExceededError:
@@ -8118,7 +8310,8 @@ def _review_all(reviewers: list, project_dir: str,
             # concurrent review workers can't collectively pass --max-cost. A refusal
             # raises BudgetExceededError -> stop the whole sweep cleanly.
             try:
-                findings, _summary = review_file(reviewer, rel, text, context=context)
+                findings, _summary = review_file(reviewer, rel, text, context=context,
+                                                 project_dir=project_dir)
                 merged.extend(findings)
             except BudgetExceededError:
                 stop.set()
@@ -8709,6 +8902,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             # a run of all-noops reported empty fix_notes and 0 errors - reading
             # exactly like a clean converge (observed live 2026-08-11: 3 defects,
             # 0 fixed, no notes, 'not auto-fixable').
+            #
+            # DO NOT "fix" this accounting into a success. A no-op is counted as
+            # an error because it leaves a reported defect unresolved - but a
+            # no-op is SOMETIMES THE SYSTEM CORRECTLY DECLINING TO BREAK WORKING
+            # CODE. Live GrantFlow 2026-08-14: GrantMonitoring.jsx, MyProfiles.jsx
+            # and Organizations.jsx all no-op'd (and timed out) against findings
+            # that told them to adopt `invalidateQueries(['key'])`, an API
+            # REMOVED in the installed @tanstack/react-query v5. The author model
+            # could not produce a passing fix because there was no defect. The
+            # real bug was upstream in REVIEW, now gated by _version_conflict();
+            # counting the no-op honestly is what made it visible.
             errors += 1
             print(f"  [no-op] {rel}: model returned no change ({outcome[1]})")
             notes.append(f"{rel}: NO-OP - author model returned no change for "

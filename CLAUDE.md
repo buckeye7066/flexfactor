@@ -110,6 +110,42 @@ FlexFactor reads **why the program exists** before it reads any code.
   is the tripwire for "build passes"/"tests pass"/"deployed"/"works locally"/
   "health endpoint returns 200" being used as readiness.
 
+## Version-aware review (2026-08-14) — never recommend an API that isn't installed
+
+The one class where FlexFactor actively **damages** the program it exists to
+improve. Live GrantFlow: findings on `GrantMonitoring.jsx` L73, `MyProfiles.jsx`
+L86 and `Organizations.jsx` L118 each claimed cache invalidation was broken and
+recommended the ARRAY form `invalidateQueries(['key'])`. GrantFlow runs
+**@tanstack/react-query 5.101.4**, where that signature was REMOVED in v5. The
+object form already in the code is correct, `refetchType` is valid, and keys
+match by **PREFIX** so `['profiles']` already matches `['profiles', isAdmin]`.
+Applying those three "fixes" would have broken invalidation on three working
+pages.
+
+Two defenses, both narrow:
+1. **Tell the reviewer what is installed.** `_installed_versions()` reads
+   package.json ranges (always present; a range pins the MAJOR reliably) and
+   REFINES them from `package-lock.json` (v1 and v2/v3 layouts) when readable.
+   `_dep_version_block()` puts the versions of **only the packages this file
+   imports** into the review prompt, fenced as repo data with the instruction
+   outside the fence. `review_file(..., project_dir=...)` is what enables it.
+2. **Gate the advice.** `_version_conflict()` drops a finding whose
+   RECOMMENDATION names a signature removed in the installed major, printing
+   `[version] <file>: dropped finding ...`. `VERSION_API_RULES` is the table;
+   adding a rule requires hard evidence of removal.
+
+Fail-OPEN everywhere: an unknown major (`workspace:*`, `latest`, a git URL) or
+an older major never drops anything — dropping a REAL defect is worse than
+keeping a questionable one. That is why the v4-keeps-it test matters as much as
+the v5-drops-it test.
+
+Corroboration, not a separate bug: those same three files produced repeated
+`[no-op]` and timeout outcomes, because the author model could not generate a
+passing fix for a non-defect. **A no-op on a file with findings is sometimes the
+system correctly declining to break working code** — there is a comment at the
+no-op accounting saying so, because counting it honestly as an error is what
+made this visible. Do not "fix" that accounting into a success.
+
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
 A stall threshold **below the free route's healthy latency** silently converts a
