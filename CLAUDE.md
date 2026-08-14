@@ -71,9 +71,33 @@ FlexFactor reads **why the program exists** before it reads any code.
   defects against this program's job. `assess_purpose_gap` then scores each
   numbered acceptance criterion; each gap must cite `acceptance_ref`, so
   `acceptance_coverage()` can render the criteria table a generic linter cannot.
-- `fulfillment_pct` with a contract is **measured** (criteria met / total), not
+- `fulfillment_pct` with a contract is derived from criteria met / total, not
   the model's impression. The owner's purpose text always overrides the model's
   paraphrase.
+- **The criteria figure is an ASSESSMENT, not a measurement — and it is
+  UNSTABLE.** Live GrantFlow 2026-08-14: the same unchanged tree scored 2/10,
+  then 0/10, then 3/10 on three consecutive runs (~30% variance), while the
+  doctrine treats it as the headline scoreboard. Determinism is deliberately
+  **not** forced (temperature/seed pinning would hide the uncertainty, and what
+  the number should MEAN is an owner design decision). Instead
+  `assess_purpose_gap` takes `PURPOSE_ASSESS_SAMPLES` (env
+  `FLEXFACTOR_PURPOSE_SAMPLES`, default 3) independent assessments
+  **concurrently** — N cheap calls, ~1 call of wall clock — and folds them via
+  `aggregate_coverage()`:
+  - per criterion, the **majority** verdict; a split vote is `UNKNOWN`, never
+    `met` (same doctrine as an unattributed whole-purpose gap);
+  - gaps are **UNIONed**, de-duplicated by normalized **TITLE only** — the ref
+    is the wobbly part, and keying on (ref, title) would emit one gap three
+    times, burn fix budget on duplicates, and break `gap_progress()`, which
+    closes gaps BY TITLE. Every ref any sample proposed is kept in
+    `acceptance_refs_seen`;
+  - the observed spread (`criteria_met_samples`, `criteria_noise_band`,
+    `assessment_stable`) rides with the number into **every** print, the audit
+    report and the run manifest.
+  `movement_is_real()` gates the PURPOSE SCORE line: a before→after swing **inside
+  the observed band is reported "WITHIN MEASUREMENT NOISE"**, never as criteria
+  closed or regressed. A single-sample run reports variance `UNMEASURED` —
+  which is NOT the same as stable and must never be printed as agreement.
 - Gap-driven fixing: an owner-authored gap is an unmet requirement, so it
   **bypasses `--fix-severity`** and gets `MAX_PURPOSE_GAP_FIXES_AUTHORED` (12)
   instead of 3, worst-severity first. Inferred gaps still respect the fix floor
@@ -85,6 +109,42 @@ FlexFactor reads **why the program exists** before it reads any code.
   critical condition that is `unknown` blocks. `DONE` raises. `forbidden_claims()`
   is the tripwire for "build passes"/"tests pass"/"deployed"/"works locally"/
   "health endpoint returns 200" being used as readiness.
+
+## Version-aware review (2026-08-14) — never recommend an API that isn't installed
+
+The one class where FlexFactor actively **damages** the program it exists to
+improve. Live GrantFlow: findings on `GrantMonitoring.jsx` L73, `MyProfiles.jsx`
+L86 and `Organizations.jsx` L118 each claimed cache invalidation was broken and
+recommended the ARRAY form `invalidateQueries(['key'])`. GrantFlow runs
+**@tanstack/react-query 5.101.4**, where that signature was REMOVED in v5. The
+object form already in the code is correct, `refetchType` is valid, and keys
+match by **PREFIX** so `['profiles']` already matches `['profiles', isAdmin]`.
+Applying those three "fixes" would have broken invalidation on three working
+pages.
+
+Two defenses, both narrow:
+1. **Tell the reviewer what is installed.** `_installed_versions()` reads
+   package.json ranges (always present; a range pins the MAJOR reliably) and
+   REFINES them from `package-lock.json` (v1 and v2/v3 layouts) when readable.
+   `_dep_version_block()` puts the versions of **only the packages this file
+   imports** into the review prompt, fenced as repo data with the instruction
+   outside the fence. `review_file(..., project_dir=...)` is what enables it.
+2. **Gate the advice.** `_version_conflict()` drops a finding whose
+   RECOMMENDATION names a signature removed in the installed major, printing
+   `[version] <file>: dropped finding ...`. `VERSION_API_RULES` is the table;
+   adding a rule requires hard evidence of removal.
+
+Fail-OPEN everywhere: an unknown major (`workspace:*`, `latest`, a git URL) or
+an older major never drops anything — dropping a REAL defect is worse than
+keeping a questionable one. That is why the v4-keeps-it test matters as much as
+the v5-drops-it test.
+
+Corroboration, not a separate bug: those same three files produced repeated
+`[no-op]` and timeout outcomes, because the author model could not generate a
+passing fix for a non-defect. **A no-op on a file with findings is sometimes the
+system correctly declining to break working code** — there is a comment at the
+no-op accounting saying so, because counting it honestly as an error is what
+made this visible. Do not "fix" that accounting into a success.
 
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
@@ -111,10 +171,17 @@ measured **307.8s**, nearly all of it queued. So:
   that deadline is armed BELOW the prefetch consumption and is only tested
   BETWEEN attempts. The wait is now `pf.result(timeout=FIX_FILE_MAX_SECONDS)`
   and expiry abandons the file LOUDLY + re-queues it
-  (`PrefetchWaitIsBoundedTests`). **Residual, still open:** the INLINE
-  generation path (a file with no prefetch — notably the first file of a batch)
-  is still unbounded for the same reason; bounding it needs the same
-  thread-abandonment treatment.
+  (`PrefetchWaitIsBoundedTests`). The INLINE generation path (a file with no
+  prefetch — notably the FIRST file of every batch, and every retry attempt) had
+  the same unbounded shape and is now bounded too: `_call_bounded` runs the
+  generation on a DAEMON thread and waits only until `file_deadline`; on expiry
+  the thread is ABANDONED (Windows cannot interrupt a blocking recv), the file
+  is rolled back through the contained chokepoint, accounted `[timeout]` and
+  re-queued, and a REFUSED rollback still takes the `[dirty-abort]` path
+  (`InlineFixGenerationIsBoundedTests`). `_AbandonedCallTimeout` is caught
+  BEFORE the generic `except Exception`, so a timeout never demotes to
+  whole-file mode against the same wedged backend. daemon=True is load-bearing:
+  a `ThreadPoolExecutor` thread would keep the interpreter alive at exit.
 - `_is_backpressure` — 429/overloaded/503/model-loading/cold-start means *alive,
   be patient*: back off and retry FREE, never rescue. **Trap:** markers must be
   specific phrases. A bare `"queue"` marker made `StreamDeadlineError`

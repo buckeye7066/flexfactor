@@ -285,6 +285,53 @@ class DirtyTreeError(RuntimeError):
         super().__init__("un-rolled-back candidate(s) left on disk: " + ", ".join(self.files))
 
 
+class _AbandonedCallTimeout(RuntimeError):
+    """A bounded wait on a model call expired. The worker thread was ABANDONED
+    (it is still running); the caller must treat the file as timed out, roll it
+    back and re-queue it. Never caught by the generic `except Exception`
+    fallbacks - it is checked FIRST at every call site so a wedged backend can
+    never be "recovered" into another equally wedged call."""
+
+
+def _call_bounded(fn, timeout_s: float):
+    """Run `fn()` on a DAEMON thread and wait at most `timeout_s` seconds.
+
+    Why a thread and not a deadline inside the call: `_stream_with_deadline` is
+    deliberately two-phase (first-event budget, then a per-event IDLE budget)
+    with NO total-elapsed cap, so a stream that keeps dribbling one event inside
+    the idle window never times out - by design, so a slow-but-progressing
+    generation is never killed. That is exactly why it cannot be the only bound.
+    Windows cannot interrupt a thread blocked in a socket recv, so on expiry the
+    worker is ABANDONED (it dies on its own transport deadline) and
+    `_AbandonedCallTimeout` is raised on the caller's thread.
+
+    daemon=True is load-bearing: an abandoned worker must never keep the
+    interpreter alive at exit (a `ThreadPoolExecutor` thread would, because
+    `concurrent.futures` joins its threads at shutdown).
+
+    Whatever `fn` raises is re-raised on the caller's thread, so existing
+    except-paths (BudgetExceededError, oversized/token-budget, edit fallback)
+    behave exactly as they do in a direct call."""
+    box: dict = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            box["v"] = fn()
+        except BaseException as ex:  # noqa: BLE001 - re-raised on the caller's thread
+            box["e"] = ex
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True,
+                     name="flexfactor-bounded-call").start()
+    if not done.wait(max(0.0, timeout_s)):
+        raise _AbandonedCallTimeout(f"call did not return within {timeout_s:.0f}s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 @contextlib.contextmanager
 def _budget_guard(meter, model: str, prompt_chars: int, max_tokens: int):
     """THE budget chokepoint: every provider call runs inside this. It atomically
@@ -4011,6 +4058,173 @@ def _read_package_json(project_dir: str, cap: int = 20000) -> tuple[str, str | N
     return _read_meta_tristate(project_dir, "package.json", cap)
 
 
+_DEP_VERSION_CACHE: dict[str, dict] = {}
+
+
+def _version_major(spec: str) -> int | None:
+    """Major version from a package.json range or a resolved version.
+
+    `^5.101.4` -> 5, `~4.2.0` -> 4, `>=3 <4` -> 3, `5.101.4` -> 5. Returns None
+    for anything without a leading numeric major (`workspace:*`, `latest`, a git
+    URL, `*`): unknown must stay unknown, because a wrong major here would drop
+    a REAL finding."""
+    m = re.search(r"(\d+)", str(spec or "").lstrip("^~>=<v ").split("||")[0].strip())
+    return int(m.group(1)) if m else None
+
+
+def _installed_versions(project_dir: str) -> dict[str, str]:
+    """{package: version} actually installed for this Node project.
+
+    WHY THIS EXISTS (live GrantFlow, 2026-08-14): the reviewer filed findings on
+    three working files recommending `invalidateQueries(['key'])`, the ARRAY form
+    that @tanstack/react-query REMOVED in v5 - and GrantFlow runs 5.101.4.
+    Applying those "fixes" would have BROKEN cache invalidation on three pages
+    that worked. FlexFactor exists to improve a program; recommending an API
+    that does not exist in the installed version actively damages it. The
+    reviewer has to be told what is actually installed.
+
+    package.json ranges are the primary source because they are always present
+    and a range pins the MAJOR reliably (`^5.101.4` -> 5), which is all the
+    version rules need. package-lock.json (v1 and v2/v3 layouts) then REFINES
+    those to exact resolved versions when it is readable. pnpm/yarn lockfiles
+    are not parsed - the package.json range already carries the major, so
+    there is nothing to fail closed about."""
+    key = os.path.abspath(project_dir)
+    hit = _DEP_VERSION_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out: dict[str, str] = {}
+    status, raw = _read_package_json(project_dir)
+    if status == "ok" and raw:
+        try:
+            pkg = json.loads(raw)
+        except Exception:
+            pkg = {}
+        for field in ("dependencies", "devDependencies", "peerDependencies",
+                      "optionalDependencies"):
+            block = pkg.get(field)
+            if isinstance(block, dict):
+                for name, spec in block.items():
+                    if isinstance(name, str) and isinstance(spec, str):
+                        out.setdefault(name, spec)
+    lock_status, lock_raw = _read_meta_tristate(project_dir, "package-lock.json",
+                                               4_000_000)
+    if lock_status == "ok" and lock_raw:
+        try:
+            lock = json.loads(lock_raw)
+        except Exception:
+            lock = {}
+        # npm lockfile v2/v3: keys are "node_modules/<name>" paths.
+        pkgs = lock.get("packages")
+        if isinstance(pkgs, dict):
+            for path, meta in pkgs.items():
+                if not isinstance(path, str) or "node_modules/" not in path:
+                    continue
+                name = path.split("node_modules/")[-1]
+                ver = (meta or {}).get("version") if isinstance(meta, dict) else None
+                if name and isinstance(ver, str):
+                    out[name] = ver
+        # npm lockfile v1: {"dependencies": {name: {"version": ...}}}
+        deps = lock.get("dependencies")
+        if isinstance(deps, dict):
+            for name, meta in deps.items():
+                ver = (meta or {}).get("version") if isinstance(meta, dict) else None
+                if isinstance(name, str) and isinstance(ver, str):
+                    out.setdefault(name, ver)
+    _DEP_VERSION_CACHE[key] = out
+    return out
+
+
+# Packages a source file imports, from ES import / require / dynamic import.
+_IMPORT_RE = re.compile(
+    r"""(?:from\s+|require\(\s*|import\(\s*)['"]([^'"]+)['"]""")
+
+
+def _imported_packages(text: str) -> list[str]:
+    """Bare package specifiers imported by this file, longest-scope first.
+    Relative imports ('./x', '../y') and absolute paths are not packages."""
+    names: list[str] = []
+    for spec in _IMPORT_RE.findall(text or ""):
+        if not spec or spec[0] in "./" or spec.startswith("@/"):
+            continue
+        parts = spec.split("/")
+        name = "/".join(parts[:2]) if spec.startswith("@") else parts[0]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _dep_version_block(project_dir: str | None, text: str) -> str:
+    """The INSTALLED VERSIONS block for a review prompt: only the packages this
+    file actually imports, so the reviewer judges against the API surface that
+    exists rather than whatever major it was trained on. Empty when nothing is
+    known - an empty block is honest, a guessed one is not."""
+    if not project_dir:
+        return ""
+    versions = _installed_versions(project_dir)
+    if not versions:
+        return ""
+    lines = [f"{n}: {versions[n]}" for n in _imported_packages(text) if n in versions]
+    if not lines:
+        return ""
+    return ("INSTALLED DEPENDENCY VERSIONS for the packages this file imports. "
+            "These are the versions actually resolved in this project. Review "
+            "against THIS API surface: never report code as broken because it "
+            "differs from another major version's API, and never recommend a "
+            "signature that does not exist in the version listed here.\n"
+            + _fence_untrusted("installed-versions", "\n".join(lines)) + "\n\n")
+
+
+# --------------------------------------------------------------------------- #
+# Version-aware finding filter.
+#
+# NARROW BY DESIGN. Each rule needs hard evidence that the named signature was
+# REMOVED in the named major - suppressing findings broadly would trade false
+# positives for false NEGATIVES and cost real defects, which is worse. A rule
+# only ever fires when the installed major is known AND >= removed_in_major.
+# --------------------------------------------------------------------------- #
+VERSION_API_RULES: list[dict] = [
+    {
+        "package": "@tanstack/react-query",
+        "removed_in_major": 5,
+        # v5 removed EVERY positional/array-key signature; a single options
+        # object is the only accepted form. Matches `invalidateQueries(['k'])`
+        # and `useQuery('k', fn)` but NOT `invalidateQueries({queryKey:['k']})`.
+        "pattern": re.compile(
+            r"\b(invalidateQueries|refetchQueries|removeQueries|cancelQueries|"
+            r"resetQueries|setQueriesData|getQueriesData|useQuery|useMutation|"
+            r"useInfiniteQuery)\s*\(\s*[\['\"]"),
+        "why": ("the array/positional argument form was REMOVED in "
+                "@tanstack/react-query v5; v5 takes a single options object "
+                "(and query keys already match by PREFIX)"),
+    },
+]
+
+
+def _version_conflict(finding: dict, versions: dict) -> str | None:
+    """Reason string when this finding RECOMMENDS an API absent from the
+    installed major version, else None.
+
+    Only the recommendation is inspected (`fix`, plus `problem` where models put
+    the suggested call). A finding that merely QUOTES existing code is not
+    filtered by this - the rule needs the removed signature to appear in the
+    advice."""
+    if not versions:
+        return None
+    text = " ".join(str(finding.get(k) or "") for k in ("fix", "problem", "title"))
+    if not text.strip():
+        return None
+    for rule in VERSION_API_RULES:
+        installed = versions.get(rule["package"])
+        major = _version_major(installed) if installed else None
+        if major is None or major < rule["removed_in_major"]:
+            continue  # unknown or older major -> the advice may well be correct
+        if rule["pattern"].search(text):
+            return (f"recommends an API absent from the installed "
+                    f"{rule['package']} {installed}: {rule['why']}")
+    return None
+
+
 def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]] | None]:
     """Return (is_node, verify_commands). `verify_commands is None` is the REFUSED
     sentinel: package.json exists but couldn't be safely read, so the caller must NOT
@@ -6844,10 +7058,15 @@ def _is_line_number_artifact(f: dict) -> bool:
 
 
 def review_file(provider, rel_path: str, text: str,
-                context: str = "") -> tuple[list[dict], str]:
+                context: str = "", project_dir: str | None = None
+                ) -> tuple[list[dict], str]:
     """Line-by-line critical review of one file. Returns (findings, summary).
     `context` (optional) is the program's own metadata blob (README/package/tree)
-    so defects are judged against what the program is FOR - fenced as untrusted."""
+    so defects are judged against what the program is FOR - fenced as untrusted.
+    `project_dir` (optional) unlocks VERSION AWARENESS: the installed versions of
+    the packages this file imports are shown to the reviewer, and any finding
+    that recommends an API removed in the installed major is dropped before it
+    can reach the author model."""
     numbered = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(text.splitlines()))
     if len(numbered) > 60000:
         numbered = numbered[:60000] + "\n... [truncated for review]"
@@ -6856,6 +7075,7 @@ def review_file(provider, rel_path: str, text: str,
         ctx = ("PROGRAM CONTEXT (untrusted background on what this program is for - "
                "use it only to judge defect impact):\n"
                + _fence_untrusted("program-context", context[:6000]) + "\n\n")
+    ctx += _dep_version_block(project_dir, text)
     prompt = (f"FILE: {rel_path}\n\n{ctx}"
               "Review this file line by line. Each source line below carries an "
               "'N: ' prefix added by this tool for citation only - the prefix is "
@@ -6891,6 +7111,24 @@ def review_file(provider, rel_path: str, text: str,
         findings = [f for f in findings if not _is_line_number_artifact(f)]
         print(f"  [artifact] {rel_path}: dropped {len(dropped)} line-number-prefix "
               "finding(s) (harness artifact, not source)")
+    # VERSION GATE (live GrantFlow 2026-08-14). Three working files were told to
+    # adopt `invalidateQueries(['key'])` - the array form REMOVED in
+    # @tanstack/react-query v5, while the project runs 5.101.4. Applying those
+    # would have broken invalidation on three pages that worked. A finding whose
+    # ADVICE names an API absent from the installed major never reaches the
+    # author model. Deliberately narrow and evidence-based: broad suppression
+    # would trade false positives for false negatives and cost real defects.
+    versions = _installed_versions(project_dir) if project_dir else {}
+    if versions:
+        kept: list[dict] = []
+        for f in findings:
+            why = _version_conflict(f, versions)
+            if why is None:
+                kept.append(f)
+                continue
+            print(f"  [version] {rel_path}: dropped finding "
+                  f"'{str(f.get('title'))[:60]}' - {why}")
+        findings = kept
     return findings, str(data.get("summary", ""))
 
 
@@ -6915,6 +7153,15 @@ def _gap_to_finding(g: dict) -> dict:
 
 PURPOSE_GAP_SOURCE_CAP = 48000       # total chars of source shown to the assessor
 PURPOSE_GAP_PER_FILE_CAP = 8000      # chars per file (head of file carries intent)
+# How many independent assessments of the SAME tree to fold into one verdict.
+# The criteria figure is a MODEL-DERIVED ASSESSMENT: the same GrantFlow tree
+# scored 2/10, 0/10 and 3/10 on three consecutive runs (2026-08-14). One sample
+# published as "the" number turns ~30% noise into headline progress. Samples run
+# CONCURRENTLY, so N costs N cheap-tier calls but roughly ONE call of wall clock
+# - and wall clock is the binding constraint, not dollars. 1 = legacy single
+# shot (variance then reported as UNMEASURED, never as agreement).
+PURPOSE_ASSESS_SAMPLES = max(1, int(os.environ.get(
+    "FLEXFACTOR_PURPOSE_SAMPLES", "3")))
 
 
 def _purpose_module():
@@ -6925,6 +7172,26 @@ def _purpose_module():
         return _fp
     except Exception:
         return None
+
+
+def _purpose_label(pg: dict | None) -> str:
+    """The honesty tag that must ride with EVERY printed criteria figure: this
+    number is a model-derived assessment, and these are the samples behind it."""
+    fp = _purpose_module()
+    if fp is None or not hasattr(fp, "assessment_label"):
+        return "assessed"
+    return fp.assessment_label(pg) or "assessed"
+
+
+def _criteria_noise_band(*assessments) -> int:
+    """Worst observed sampling spread across the assessments being compared.
+    Used to refuse to call a swing inside the band progress or regression.
+    An UNMEASURED assessment (single sample) contributes no evidence of
+    stability, so it is treated as unknown by the caller, not as band 0."""
+    bands = [int(a.get("criteria_noise_band") or 0)
+             for a in assessments if isinstance(a, dict)
+             and a.get("criteria_noise_band") is not None]
+    return max(bands) if bands else 0
 
 
 def load_purpose_contract(display_name: str, project_dir: str | None):
@@ -6945,10 +7212,10 @@ def load_purpose_contract(display_name: str, project_dir: str | None):
         return None
 
 
-def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
-                       findings: list[dict], project_dir: str | None = None,
-                       contract=None) -> dict | None:
-    """One cheap-tier call per program: infer the program's purpose from its own
+def _purpose_gap_sample(provider, purpose_blob: str, files: list[str],
+                        findings: list[dict], project_dir: str | None = None,
+                        contract=None) -> dict | None:
+    """ONE cheap-tier call per program: infer the program's purpose from its own
     metadata and measure the gap to what the code delivers. Returns the normalized
     {purpose, fulfillment_pct, gaps} dict, or None when the response is unusable
     (never raises for a malformed answer - the audit proceeds without it).
@@ -7052,6 +7319,114 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
     else:
         out["authored"] = False
     return out
+
+
+def _merge_gaps(samples: list[dict]) -> list[dict]:
+    """UNION the gaps across samples, de-duplicated by normalized TITLE.
+
+    Union, not majority: a gap is a candidate UNMET REQUIREMENT, and dropping
+    one because 2 of 3 samples happened not to mention it would be rewriting the
+    purpose downward to make a run look finished. The MET verdict is a positive
+    claim and still needs a majority (see aggregate_coverage) - the two rules
+    point the same way, toward never overclaiming.
+
+    Keyed on TITLE ALONE, deliberately: the title is the gap's identity, while
+    `acceptance_ref` is the model's ATTRIBUTION of it and is exactly the part
+    that wobbles between samples. Keying on (ref, title) would emit the same gap
+    three times under three different refs, burn the fix budget on duplicates,
+    and break `gap_progress`, which identifies closed gaps BY TITLE. The refs
+    every sample proposed are kept in `acceptance_refs_seen` so an unstable
+    attribution stays visible rather than being silently picked."""
+    seen: dict[str, dict] = {}
+    refs: dict[str, list] = {}
+    for s in samples:
+        for g in (s.get("gaps") or []):
+            key = " ".join(str(g.get("title") or "").lower().split())
+            ref = g.get("acceptance_ref")
+            bucket = refs.setdefault(key, [])
+            if ref not in bucket:
+                bucket.append(ref)
+            prev = seen.get(key)
+            if prev is None:
+                seen[key] = dict(g)
+            elif (SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0)
+                  > SEVERITY_RANK.get(str(prev.get("severity", "")).lower(), 0)):
+                seen[key] = dict(g)   # keep the worst-severity phrasing
+    for key, g in seen.items():
+        g["acceptance_refs_seen"] = list(refs.get(key) or [])
+    return list(seen.values())
+
+
+def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
+                       findings: list[dict], project_dir: str | None = None,
+                       contract=None, samples: int | None = None) -> dict | None:
+    """Measure this program's gap to the job it was created to do.
+
+    The criteria figure is an ASSESSMENT, not a measurement (same tree scored
+    2/10, 0/10, 3/10 on three consecutive live runs, 2026-08-14). So when there
+    is an acceptance CONTRACT to vote on, this takes `samples` independent
+    assessments CONCURRENTLY and folds them into a per-criterion MAJORITY
+    verdict, carrying the observed spread with it. Every consumer must print the
+    spread alongside the number (`flexfactor_purpose.assessment_label`) and must
+    refuse to call a swing inside the band progress (`movement_is_real`).
+
+    Determinism is NOT forced here: pinning temperature/seed would hide the
+    uncertainty instead of reporting it, and what the number should MEAN is the
+    owner's design decision, not this function's.
+
+    With no contract (INFERRED purpose) there are no criteria to vote on, so a
+    single sample is taken exactly as before - and labelled UNMEASURED, never
+    presented as agreement."""
+    fp = _purpose_module()
+    n = PURPOSE_ASSESS_SAMPLES if samples is None else max(1, int(samples))
+    has_contract = bool(contract is not None and getattr(contract, "purpose", ""))
+    if n <= 1 or not has_contract or fp is None:
+        out = _purpose_gap_sample(provider, purpose_blob, files, findings,
+                                  project_dir=project_dir, contract=contract)
+        if out is not None:
+            out["assessment_samples"] = 1
+            out["assessment_stable"] = None   # UNMEASURED - not the same as stable
+            out["criteria_noise_band"] = None
+        return out
+
+    def _one(_i):
+        try:
+            return _purpose_gap_sample(provider, purpose_blob, files, findings,
+                                       project_dir=project_dir, contract=contract)
+        except BudgetExceededError:
+            raise
+        except Exception:
+            return None   # one bad sample must never sink the assessment
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(_one, range(n)))
+    good = [r for r in results if isinstance(r, dict) and r.get("acceptance_coverage")]
+    if not good:
+        return next((r for r in results if isinstance(r, dict)), None)
+    if len(good) == 1:
+        out = good[0]
+        out["assessment_samples"] = 1
+        out["assessment_stable"] = None
+        out["criteria_noise_band"] = None
+        return out
+
+    agg = fp.aggregate_coverage([r["acceptance_coverage"] for r in good])
+    base = dict(good[0])
+    base["gaps"] = _merge_gaps(good)
+    base["acceptance_coverage"] = agg["rows"]
+    base["criteria_met"] = agg["criteria_met"]
+    base["criteria_unknown"] = agg["criteria_unknown"]
+    base["criteria_total"] = agg["criteria_total"]
+    base["fulfillment_pct"] = (round(100.0 * agg["criteria_met"] / agg["criteria_total"])
+                               if agg["criteria_total"] else base.get("fulfillment_pct"))
+    base["assessment_samples"] = agg["samples"]
+    base["assessment_stable"] = agg["stable"]
+    base["criteria_met_samples"] = agg["met_samples"]
+    base["criteria_met_low"] = agg["met_low"]
+    base["criteria_met_high"] = agg["met_high"]
+    base["criteria_noise_band"] = agg["noise_band"]
+    base["criteria_unstable_indices"] = agg["unstable_indices"]
+    return base
 
 
 def generate_file_fix(provider, rel_path: str, text: str, findings: list[dict],
@@ -7709,7 +8084,16 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 # --review-fix-batch-size; every per-file safety mechanism (build gate,
 # adversarial verify, rollback, budget cap, commit cadence) is unchanged -
 # only the grouping of files handed to review/_fix_files per call changed.
-REVIEW_FIX_BATCH_SIZE = 20
+# 20 -> 8 (2026-08-14, measured on the live GrantFlow run): a batch's fixes only
+# land after EVERY file in that batch is reviewed, so the batch size is the
+# granularity at which verified work reaches the branch. With 20 and per-file fix
+# times running to the 15m ceiling, a batch could occupy an hour before anything
+# was committed - and a run interrupted mid-batch lost all of it. 8 keeps the
+# per-batch review call efficient while roughly halving the worst-case distance
+# between verified fixes landing. Env-tunable so a fast backend can raise it
+# without a code change; --review-fix-batch-size still wins over both.
+REVIEW_FIX_BATCH_SIZE = max(1, int(os.environ.get(
+    "FLEXFACTOR_REVIEW_FIX_BATCH_SIZE", "8")))
 
 # Files above this size never route to a CPU-only ollama pool entry for review
 # (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
@@ -7903,7 +8287,8 @@ def _review_all(reviewers: list, project_dir: str,
                     break
                 try:
                     findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
-                                                     context=context)
+                                                     context=context,
+                                                     project_dir=project_dir)
                     merged.extend(findings)
                     break                      # reviewed successfully
                 except BudgetExceededError:
@@ -7934,7 +8319,8 @@ def _review_all(reviewers: list, project_dir: str,
             # concurrent review workers can't collectively pass --max-cost. A refusal
             # raises BudgetExceededError -> stop the whole sweep cleanly.
             try:
-                findings, _summary = review_file(reviewer, rel, text, context=context)
+                findings, _summary = review_file(reviewer, rel, text, context=context,
+                                                 project_dir=project_dir)
                 merged.extend(findings)
             except BudgetExceededError:
                 stop.set()
@@ -8265,8 +8651,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                             raise pre[2]  # same fallback path as an inline failure
                         epatch = pre[2]
                     else:
-                        epatch = generate_file_fix_edits(author, rel, original, targets,
-                                                         feedback=feedback)
+                        # BOUNDED. The INLINE path (no prefetch - notably the
+                        # FIRST file of a batch, and every retry) had exactly the
+                        # same unbounded shape the prefetch consumption did: a
+                        # wedged backend parks THIS thread forever, meter frozen,
+                        # no output. file_deadline is the per-file ceiling; it
+                        # used to be tested only BETWEEN attempts, which a call
+                        # that never returns never reaches.
+                        epatch = _call_bounded(
+                            lambda: generate_file_fix_edits(
+                                author, rel, original, targets, feedback=feedback),
+                            file_deadline - time.time())
                     if not epatch.get("changed"):
                         outcome = ("noop", epatch.get("notes", ""))
                         break
@@ -8290,6 +8685,12 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         edit_mode = False
                         print(f"  [edit-fallback] {rel}: {apply_err or 'edits were a no-op'}"
                               " -> regenerating whole file")
+                except _AbandonedCallTimeout:
+                    # Do NOT demote to whole-file mode: the SAME wedged backend
+                    # would just park this thread again. Route into the per-file
+                    # timeout path (rollback + loud [timeout] + re-queue).
+                    timed_out = True
+                    break
                 except BudgetExceededError:
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
@@ -8305,8 +8706,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                             raise pre[2]  # keep oversized/skip handling identical
                         patch = pre[2]
                     else:
-                        patch = generate_file_fix(author, rel, original, targets,
-                                                  feedback=feedback)
+                        patch = _call_bounded(  # BOUNDED - see the edits path above
+                            lambda: generate_file_fix(
+                                author, rel, original, targets, feedback=feedback),
+                            file_deadline - time.time())
+                except _AbandonedCallTimeout:
+                    timed_out = True
+                    break
                 except BudgetExceededError:
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
@@ -8505,6 +8911,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             # a run of all-noops reported empty fix_notes and 0 errors - reading
             # exactly like a clean converge (observed live 2026-08-11: 3 defects,
             # 0 fixed, no notes, 'not auto-fixable').
+            #
+            # DO NOT "fix" this accounting into a success. A no-op is counted as
+            # an error because it leaves a reported defect unresolved - but a
+            # no-op is SOMETIMES THE SYSTEM CORRECTLY DECLINING TO BREAK WORKING
+            # CODE. Live GrantFlow 2026-08-14: GrantMonitoring.jsx, MyProfiles.jsx
+            # and Organizations.jsx all no-op'd (and timed out) against findings
+            # that told them to adopt `invalidateQueries(['key'])`, an API
+            # REMOVED in the installed @tanstack/react-query v5. The author model
+            # could not produce a passing fix because there was no defect. The
+            # real bug was upstream in REVIEW, now gated by _version_conflict();
+            # counting the no-op honestly is what made it visible.
             errors += 1
             print(f"  [no-op] {rel}: model returned no change ({outcome[1]})")
             notes.append(f"{rel}: NO-OP - author model returned no change for "
@@ -9081,9 +9498,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if purpose_before:
             b_gaps = purpose_before.get("gaps") or []
             if purpose_before.get("criteria_total"):
+                _lbl = _purpose_label(purpose_before)
                 print(f"{pfx}Baseline: {purpose_before['criteria_met']}/"
-                      f"{purpose_before['criteria_total']} acceptance criteria met; "
-                      f"{len(b_gaps)} gap(s) stand between this program and its purpose.")
+                      f"{purpose_before['criteria_total']} acceptance criteria met "
+                      f"({_lbl}); {len(b_gaps)} gap(s) stand between this program "
+                      "and its purpose.")
             authored_b = bool(purpose_before.get("authored"))
             floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
             bridgeable_b: list[tuple[str, dict]] = []
@@ -9478,7 +9897,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
                       f"{purpose_gap['criteria_total']} of the owner's acceptance "
-                      f"criteria met ({pct}%)"
+                      f"criteria met ({pct}%; {_purpose_label(purpose_gap)})"
                       + (f", {unk} UNKNOWN (whole-purpose gaps open)" if unk else "")
                       + f" - {len(gaps)} gap(s) to close")
             else:
@@ -9798,9 +10217,37 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if met_before is not None and met_after is not None and total_crit:
             closed = met_after - met_before
             audit["criteria_closed"] = closed
+            # NEVER report a swing inside the sampling noise as movement. Both
+            # figures are model-derived assessments; the same GrantFlow tree
+            # scored 2/10, 0/10, 3/10 on three consecutive runs, so a bare
+            # "+3 criteria closed" can be pure noise. The band is the widest
+            # spread actually observed across this run's own samples.
+            band = _criteria_noise_band(purpose_before, purpose_gap)
+            _fp_mod = _purpose_module()
+            real = (_fp_mod.movement_is_real(met_before, met_after, band)
+                    if _fp_mod is not None and hasattr(_fp_mod, "movement_is_real")
+                    else None)
+            unmeasured = (purpose_before or {}).get("criteria_noise_band") is None or \
+                         (purpose_gap or {}).get("criteria_noise_band") is None
+            audit["criteria_noise_band"] = None if unmeasured else band
+            audit["criteria_movement_is_real"] = None if unmeasured else bool(real)
             print(f"{pfx}{'='*54}")
-            print(f"{pfx}PURPOSE SCORE: {closed:+d} criteria closed this run "
-                  f"({met_before} -> {met_after} of {total_crit} met).")
+            if unmeasured:
+                print(f"{pfx}PURPOSE SCORE: {met_before} -> {met_after} of "
+                      f"{total_crit} criteria met ({closed:+d}). Variance "
+                      "UNMEASURED (single-sample assessment) - this delta is "
+                      "NOT evidence of progress or regression.")
+            elif real:
+                print(f"{pfx}PURPOSE SCORE: {closed:+d} criteria closed this run "
+                      f"({met_before} -> {met_after} of {total_crit} met); "
+                      f"beyond the observed sampling band of +/-{band} "
+                      f"({_purpose_label(purpose_gap)}).")
+            else:
+                print(f"{pfx}PURPOSE SCORE: {met_before} -> {met_after} of "
+                      f"{total_crit} criteria met ({closed:+d}) - WITHIN "
+                      f"MEASUREMENT NOISE (observed sampling band +/-{band}; "
+                      f"{_purpose_label(purpose_gap)}). No claim of progress or "
+                      "regression can be made from this run's criteria count.")
             if closed <= 0 and (len(applied_set) or 0) > 0:
                 print(f"{pfx}  NOTE: {len(applied_set)} file(s) were fixed but NO "
                       "criteria closed - this run tidied code without moving the "
@@ -10267,6 +10714,15 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "purpose_contract": a.get("purpose_contract"),
         "purpose_acceptance_coverage": (a.get("purpose_gap") or {}).get("acceptance_coverage"),
         "purpose_progress": (a.get("purpose_gap") or {}).get("progress"),
+        # The criteria figure is an ASSESSMENT, not a measurement. Ship its
+        # provenance with it so no downstream consumer can read a swing inside
+        # the sampling band as progress.
+        "purpose_assessment_samples": (a.get("purpose_gap") or {}).get("assessment_samples"),
+        "purpose_assessment_stable": (a.get("purpose_gap") or {}).get("assessment_stable"),
+        "purpose_criteria_met_samples": (a.get("purpose_gap") or {}).get("criteria_met_samples"),
+        "purpose_criteria_noise_band": (a.get("purpose_gap") or {}).get("criteria_noise_band"),
+        "criteria_closed": a.get("criteria_closed"),
+        "criteria_movement_is_real": a.get("criteria_movement_is_real"),
         "release_status": _release_status(a)[0],
         "release_status_unmet": _release_status(a)[1],
         "paid_rescue": paid_rescue_stats(),
@@ -10354,29 +10810,88 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                   "criterion(s) remain blocked.", ""]
         if pg.get("criteria_total"):
             L += [f"**Acceptance:** {pg.get('criteria_met')} of "
-                  f"{pg.get('criteria_total')} owner criteria met ({pct}%).", ""]
+                  f"{pg.get('criteria_total')} owner criteria met ({pct}%) — "
+                  f"*{_purpose_label(pg)}*.", ""]
+            # The number is model-derived. Say so, with the spread, right where
+            # a reader would otherwise treat it as a measurement.
+            band = pg.get("criteria_noise_band")
+            if band is None:
+                L += ["> **This figure is an ASSESSMENT, not a measurement, and "
+                      "its run-to-run variance was NOT measured on this run "
+                      "(single sample).** Do not read a change in it against "
+                      "another run as progress or regression.", ""]
+            elif not pg.get("assessment_stable"):
+                L += [f"> **This figure is an ASSESSMENT, not a measurement.** "
+                      f"{pg.get('assessment_samples')} independent samples of "
+                      f"this same tree returned "
+                      f"{pg.get('criteria_met_samples')} criteria met "
+                      f"(spread {pg.get('criteria_met_low')}–"
+                      f"{pg.get('criteria_met_high')}). The table below is the "
+                      f"per-criterion MAJORITY verdict; a split vote is reported "
+                      f"UNKNOWN, never met. **Any change of "
+                      f"{band} or less against another run is inside the noise "
+                      f"and is not evidence of progress or regression.**", ""]
+            else:
+                L += [f"> This figure is an assessment, not a measurement, but "
+                      f"all {pg.get('assessment_samples')} samples of this tree "
+                      f"agreed on it.", ""]
         else:
             L += [f"**Fulfillment:** {pct if pct is not None else '?'}% — "
                   f"{len(gaps)} gap(s)"
                   + (f", {len(bridged)} bridged this run (build-gated fixes)"
                      if bridged else ""), ""]
+        _closed = a.get("criteria_closed")
+        if _closed is not None:
+            _real = a.get("criteria_movement_is_real")
+            if _real is True:
+                L += [f"**Criteria movement this run: {_closed:+d}** — larger "
+                      f"than the observed sampling band "
+                      f"(±{a.get('criteria_noise_band')}), so it is real "
+                      "movement, not noise.", ""]
+            elif _real is False:
+                L += [f"**Criteria movement this run: {_closed:+d} — WITHIN "
+                      f"MEASUREMENT NOISE** (observed band "
+                      f"±{a.get('criteria_noise_band')}). This is NOT evidence "
+                      "of progress or regression.", ""]
+            else:
+                L += [f"**Criteria movement this run: {_closed:+d} — variance "
+                      "UNMEASURED** (single-sample assessment). This delta is "
+                      "NOT evidence of progress or regression.", ""]
         cov = pg.get("acceptance_coverage") or []
         if cov:
-            L += ["### Acceptance criteria (the owner's, verbatim)", "",
-                  "| # | Met | Criterion | Blocked by |", "|---|---|---|---|"]
+            voted = any(r.get("samples") for r in cov)
+            head = ("| # | Met | Agreement | Criterion | Blocked by |"
+                    if voted else "| # | Met | Criterion | Blocked by |")
+            rule = "|---|---|---|---|---|" if voted else "|---|---|---|---|"
+            L += ["### Acceptance criteria (the owner's, verbatim)", "", head, rule]
             for row in cov:
                 met = row.get("met")
                 if met is None:
-                    # No gap names this criterion, but whole-purpose gaps are
-                    # open - "met" would be an overclaim.
+                    # Two different reasons land here and the reader must be
+                    # able to tell them apart: no gap names this criterion but
+                    # whole-purpose gaps are open (met would be an overclaim),
+                    # OR the samples split (a split vote is not evidence of met).
                     label = "UNKNOWN"
                     blockers = (f"— ({row.get('unattributed_gaps', 0)} "
                                 "whole-purpose gap(s) open)")
+                    if row.get("samples") and not row.get("unanimous"):
+                        label = "UNKNOWN (split)"
+                        blockers = ("; ".join(str(t) for t in (row.get("gap_titles") or []))
+                                    or blockers)
                 else:
                     label = "yes" if met else "NO"
                     blockers = "; ".join(str(t) for t in (row.get("gap_titles") or [])) or "—"
-                L.append(f"| {row['index']} | {label} | "
-                         f"{row['criterion']} | {blockers} |")
+                if voted:
+                    n = int(row.get("samples") or 1)
+                    agree = (int(row.get("met_votes") or 0) if met is True
+                             else int(row.get("blocked_votes") or 0) if met is False
+                             else max(int(row.get("met_votes") or 0),
+                                      int(row.get("blocked_votes") or 0)))
+                    L.append(f"| {row['index']} | {label} | {agree}/{n} | "
+                             f"{row['criterion']} | {blockers} |")
+                else:
+                    L.append(f"| {row['index']} | {label} | "
+                             f"{row['criterion']} | {blockers} |")
             L.append("")
             L += ["### Gaps", ""]
         for g in gaps:

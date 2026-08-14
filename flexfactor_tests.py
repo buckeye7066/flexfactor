@@ -550,7 +550,7 @@ class FreeReviewPoolTests(unittest.TestCase):
         class _SlowProvider:
             model = "slow-model"
 
-        def fake_review(provider, rel, text, context=""):
+        def fake_review(provider, rel, text, context="", project_dir=None):
             name = "fast" if provider.model == "fast-model" else "slow"
             with lock:
                 calls[name] += 1
@@ -587,7 +587,7 @@ class FreeReviewPoolTests(unittest.TestCase):
         class _R:
             model = "m"
 
-        def fake_review(provider, rel, text, context=""):
+        def fake_review(provider, rel, text, context="", project_dir=None):
             seen.append(rel)
             return [], "ok"
 
@@ -3101,7 +3101,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha-" + rel)
         real_rf = ff.review_file
-        ff.review_file = lambda reviewer, rel, text, context="": ([], "")  # no findings, COMPLETES
+        ff.review_file = lambda reviewer, rel, text, context="", project_dir=None: ([], "")  # no findings, COMPLETES
         try:
             _, _, unreadable, reviewed_clean, _inc = ff._review_all(
                 [object()], "/proj", ["a.py", "b.py"], workers=2)
@@ -3117,7 +3117,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
         real_rf = ff.review_file
 
-        def boom(reviewer, rel, text, context=""):
+        def boom(reviewer, rel, text, context="", project_dir=None):
             raise RuntimeError("provider exploded")
 
         ff.review_file = boom
@@ -3135,7 +3135,7 @@ class ReviewCleanAllowlistTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("code\n", "sha")
         real_rf = ff.review_file
 
-        def budget(reviewer, rel, text, context=""):
+        def budget(reviewer, rel, text, context="", project_dir=None):
             raise ff.BudgetExceededError("cap")
 
         ff.review_file = budget
@@ -3376,7 +3376,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         real = ff._read_text_and_sha
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("   \n\t  \n", "wsha")
         real_rf = ff.review_file
-        ff.review_file = lambda reviewer, rel, text, context="": (ran.append(rel) or ([], ""))
+        ff.review_file = lambda reviewer, rel, text, context="", project_dir=None: (ran.append(rel) or ([], ""))
         try:
             _, _, _, reviewed_clean, _inc = ff._review_all([object()], "/proj", ["ws.py"], workers=1)
         finally:
@@ -3390,7 +3390,7 @@ class WhitespaceFileReviewedTests(unittest.TestCase):
         ff._read_text_and_sha = lambda pd, rel, cap=ff.MAX_REVIEW_BYTES: ("  \n  ", "s")
         real_rf = ff.review_file
 
-        def boom(reviewer, rel, text, context=""):
+        def boom(reviewer, rel, text, context="", project_dir=None):
             raise RuntimeError("provider down")
 
         ff.review_file = boom
@@ -4310,6 +4310,323 @@ class PrefetchWaitIsBoundedTests(unittest.TestCase):
         self.assertLess(elapsed, 25, "the fix queue did not bound its prefetch wait")
         self.assertNotIn("hangs.py", applied)
         self.assertTrue(any("wall clock" in n and "hangs.py" in n for n in notes),
+                        f"no loud abandonment note for the hung file: {notes}")
+        # And the queue KEPT MOVING - the healthy file behind it still got fixed.
+        self.assertIn("fine.py", applied)
+
+
+class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
+    """REGRESSION GUARD, not a fix: source-before-tests ordering already worked.
+
+    Measured against the live GrantFlow tree 2026-08-14 with the shipped
+    _enumerate_source_files: 3,241 files enumerated, 1,040 of them test-ish, and
+    the FIRST test file sat at index 2,201 - i.e. all 2,201 non-test files come
+    first, and the first three batches contain zero test files. So the ordering
+    lever asked for was already in place and no reorder was needed.
+
+    It is locked here because it is invisible: nothing fails loudly if a future
+    refactor drops the sort key, the sweep just quietly spends its budget on
+    .test/.spec files before the source they cover. Tests are REORDERED, never
+    filtered - they are still reviewed, just last."""
+
+    def test_tests_sort_after_source_and_nothing_is_filtered_out(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            rels = ["src/pages/MyProfiles.jsx",
+                    "src/pages/MyProfiles.test.jsx",
+                    "src/utils/fieldDisplay.js",
+                    "src/utils/__tests__/fieldDisplay.spec.js",
+                    "backend/tests/health.test.js",
+                    "backend/server.js"]
+            for rel in rels:
+                path = os.path.join(tmp, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("const x = 1;\n")
+            got = ff._enumerate_source_files(tmp, max_files=0)
+
+        norm = [g.replace("\\", "/") for g in got]
+        self.assertEqual(sorted(norm), sorted(rels),
+                         "tests must be REORDERED, never filtered out of the sweep")
+        flags = [ff._is_test_path(g) for g in norm]
+        self.assertEqual(flags, sorted(flags),
+                         f"test files must sort AFTER all source files: {norm}")
+        self.assertFalse(flags[0], "the sweep must open on real source")
+
+    def test_the_test_path_markers_catch_the_real_world_shapes(self):
+        for rel in ("src/pages/MyProfiles.test.jsx", "a/b.spec.ts",
+                    "src/__tests__/x.js", "backend/tests/health.test.js",
+                    "pkg/test/util.go", "api/test_client.py"):
+            self.assertTrue(ff._is_test_path(rel), f"{rel} not detected as a test")
+        for rel in ("src/pages/MyProfiles.jsx", "backend/server.js",
+                    "src/utils/fieldDisplay.js", "src/latest/contest.js"):
+            self.assertFalse(ff._is_test_path(rel), f"{rel} wrongly called a test")
+
+
+class ReviewFixBatchSizeTests(unittest.TestCase):
+    """A batch's fixes only land after EVERY file in that batch is reviewed, so
+    the batch size is the granularity at which VERIFIED work reaches the branch.
+
+    Measured on the live GrantFlow run 2026-08-14: per-file fix times were
+    running to the 15m ceiling, so a batch of 20 could occupy an hour before
+    anything was committed - and an interruption mid-batch lost all of it. This
+    is a tuning change, not a behavior change: every per-file safety mechanism
+    (build gate, adversarial verify, rollback, budget cap, commit cadence) is
+    untouched; only the grouping changed."""
+
+    def test_default_batch_size_is_eight(self):
+        self.assertEqual(ff.REVIEW_FIX_BATCH_SIZE, 8)
+
+    def test_batch_size_is_env_tunable_and_never_zero(self):
+        # Same expression the module evaluates at import, so a future refactor
+        # that drops the env hook or the floor fails here.
+        def resolve(raw):
+            return max(1, int(raw))
+        self.assertEqual(resolve("24"), 24)
+        self.assertEqual(resolve("1"), 1)
+        self.assertEqual(resolve("0"), 1, "a zero batch size would divide by zero")
+        self.assertEqual(resolve("-5"), 1)
+
+    def test_chunking_covers_every_file_exactly_once(self):
+        # The batching expression itself: no file may be dropped or duplicated
+        # by a smaller batch size - that would silently shrink the sweep.
+        for n in (0, 1, 7, 8, 9, 20, 41):
+            files = [f"f{i}.py" for i in range(n)]
+            for size in (1, 8, 20):
+                batches = ([files[i:i + size] for i in range(0, len(files), size)]
+                           or [[]])
+                flat = [f for b in batches for f in b]
+                self.assertEqual(flat, files, f"n={n} size={size} lost files")
+
+
+class VersionAwareReviewTests(unittest.TestCase):
+    """FlexFactor must not recommend APIs that don't exist in the installed version.
+
+    Live GrantFlow 2026-08-14: findings on GrantMonitoring.jsx L73,
+    MyProfiles.jsx L86 and Organizations.jsx L118 each claimed cache
+    invalidation was broken and recommended the ARRAY form
+    `invalidateQueries(['key'])`. GrantFlow runs @tanstack/react-query 5.101.4,
+    where that signature was REMOVED in v5. The object form already in the code
+    is correct, `refetchType` is valid, and keys match by PREFIX so
+    `['profiles']` already matches `['profiles', isAdmin]`. Applying those three
+    "fixes" would have BROKEN invalidation on three working pages - FlexFactor
+    damaging the program it exists to improve.
+
+    The filter is deliberately NARROW: it only fires when the installed major is
+    KNOWN and at/past the removal, and only on the finding's ADVICE. Broad
+    suppression would trade false positives for false negatives and cost real
+    defects, so the v4 case below is as load-bearing as the v5 one."""
+
+    ARRAY_FORM = {
+        "file": "src/pages/MyProfiles.jsx", "line": 86, "severity": "high",
+        "category": "bug", "title": "Cache invalidation does not refetch",
+        "problem": "The object form does not invalidate the list query.",
+        "fix": "Call queryClient.invalidateQueries(['profiles']) instead.",
+    }
+    NORMAL = {
+        "file": "src/pages/MyProfiles.jsx", "line": 12, "severity": "high",
+        "category": "bug", "title": "Unhandled promise rejection",
+        "problem": "The await is not wrapped in try/catch.",
+        "fix": "Wrap the await in try/catch and surface the error.",
+    }
+
+    @staticmethod
+    def _project(tmp, react_query_range, lock_version=None):
+        pkg = {"name": "demo", "dependencies": {
+            "@tanstack/react-query": react_query_range, "react": "^18.2.0"}}
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            json.dump(pkg, fh)
+        if lock_version:
+            lock = {"lockfileVersion": 3, "packages": {
+                "": {}, "node_modules/@tanstack/react-query":
+                    {"version": lock_version}}}
+            with open(os.path.join(tmp, "package-lock.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(lock, fh)
+        ff._DEP_VERSION_CACHE.pop(os.path.abspath(tmp), None)
+        return tmp
+
+    def _review(self, tmp, findings, text="import { useQueryClient } "
+                                          "from '@tanstack/react-query';\n"):
+        captured = {}
+
+        class _P:
+            model = "m"
+
+            def structured(self, *a, **k):
+                captured["prompt"] = a[1] if len(a) > 1 else k.get("prompt", "")
+                return {"findings": [dict(f) for f in findings], "summary": ""}
+
+        got, _ = ff.review_file(_P(), "src/pages/MyProfiles.jsx", text,
+                                project_dir=tmp)
+        return got, captured.get("prompt", "")
+
+    def test_v5_project_rejects_the_removed_array_form_finding(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(got, [], "a fix recommending an API removed in the "
+                                  "INSTALLED major must never reach the author model")
+
+    def test_v4_project_keeps_the_same_finding(self):
+        # THE ANTI-BLANKET-SUPPRESSION TEST. On v4 the array form is correct
+        # advice, so the identical finding must survive untouched.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^4.36.1", lock_version="4.36.1")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["title"], self.ARRAY_FORM["title"])
+
+    def test_a_normal_finding_is_unaffected_on_either_version(self):
+        import tempfile
+        for rng, lock in (("^5.101.4", "5.101.4"), ("^4.36.1", "4.36.1")):
+            with tempfile.TemporaryDirectory() as tmp:
+                self._project(tmp, rng, lock_version=lock)
+                got, _ = self._review(tmp, [self.NORMAL, self.ARRAY_FORM])
+            titles = [f["title"] for f in got]
+            self.assertIn(self.NORMAL["title"], titles,
+                          f"an unrelated finding was suppressed on {rng}")
+
+    def test_object_form_advice_is_never_mistaken_for_the_array_form(self):
+        import tempfile
+        obj = dict(self.ARRAY_FORM,
+                   fix="Call queryClient.invalidateQueries({ queryKey: "
+                       "['profiles'], refetchType: 'active' }).")
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            got, _ = self._review(tmp, [obj])
+        self.assertEqual(len(got), 1, "the v5-correct object form must survive")
+
+    def test_unknown_version_never_drops_a_finding(self):
+        # Fail OPEN on unknown: dropping a real defect is worse than keeping a
+        # questionable one.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "workspace:*")
+            got, _ = self._review(tmp, [self.ARRAY_FORM])
+        self.assertEqual(len(got), 1)
+
+    def test_installed_versions_are_shown_to_the_reviewer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._project(tmp, "^5.101.4", lock_version="5.101.4")
+            _got, prompt = self._review(tmp, [])
+        self.assertIn("INSTALLED DEPENDENCY VERSIONS", prompt)
+        self.assertIn("@tanstack/react-query: 5.101.4", prompt,
+                      "the lockfile's resolved version must reach the reviewer")
+        # Only what the file imports: react is a dep but is not imported here.
+        self.assertNotIn("react: ^18.2.0", prompt)
+
+    def test_version_major_parses_ranges_and_refuses_to_guess(self):
+        self.assertEqual(ff._version_major("^5.101.4"), 5)
+        self.assertEqual(ff._version_major("~4.2.0"), 4)
+        self.assertEqual(ff._version_major(">=3 <4"), 3)
+        self.assertEqual(ff._version_major("5.101.4"), 5)
+        for junk in ("workspace:*", "latest", "*", "", None):
+            self.assertIsNone(ff._version_major(junk),
+                              f"{junk!r} must stay UNKNOWN, never a guessed major")
+
+
+class InlineFixGenerationIsBoundedTests(unittest.TestCase):
+    """The INLINE fix-generation path must be bounded too.
+
+    `b7a9a07` bounded the PREFETCH consumption (`pf.result(timeout=...)`), but a
+    file with NO prefetched candidate - notably the FIRST file of every batch,
+    and every RETRY attempt - generates inline on the main thread. That call had
+    exactly the same unbounded shape: `_stream_with_deadline` is two-phase with
+    no total-elapsed cap, so a stream dribbling one event inside the idle window
+    never returns, and `FIX_FILE_MAX_SECONDS` is only tested BETWEEN attempts -
+    a call that never returns never reaches that test. A wedged backend parked
+    the main thread directly, cost meter frozen, no `[timeout]` output.
+
+    NOTE the placement: the hung file sits FIRST so it takes the INLINE path
+    (`_top_up_prefetch` only prefetches files AHEAD of the current one). A file
+    placed mid-queue would exercise the already-fixed prefetch path instead.
+
+    The body runs `_fix_files` on a daemon thread because on PRE-FIX code it
+    never returns - the assertion is that it returns at all."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_hung_inline_generation_is_abandoned_and_the_queue_keeps_moving(self):
+        import tempfile
+        import types
+        release = threading.Event()
+        hung_entered = threading.Event()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("hangs.py", "fine.py"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None):
+                if rel == "hangs.py":
+                    hung_entered.set()
+                    release.wait(90)  # never released before the assertions
+                    raise RuntimeError("released after the test finished")
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def fake_whole(author, rel, original, targets, feedback=None):
+                # A timeout must NOT demote to whole-file mode against the same
+                # wedged backend; if it does, this makes the test say so.
+                raise AssertionError(f"whole-file fallback taken for {rel}")
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=2)
+            findings = {"hangs.py": finding("a"), "fine.py": finding("b")}
+            box = {}
+
+            def drive():
+                try:
+                    box["res"] = ff._fix_files(object(), None, tmp, findings,
+                                               self.STACK, True, args,
+                                               adversarial=False)
+                except BaseException as ex:      # noqa: BLE001
+                    box["err"] = ex
+
+            real_edits = ff.generate_file_fix_edits
+            real_whole = ff.generate_file_fix
+            real_gate = ff._gate_file
+            real_max = ff.FIX_FILE_MAX_SECONDS
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff.generate_file_fix = fake_whole
+                ff._gate_file = lambda *a, **k: (True, "")
+                ff.FIX_FILE_MAX_SECONDS = 2  # keep the test fast
+                worker = threading.Thread(target=drive, daemon=True)
+                started = time.time()
+                worker.start()
+                worker.join(30)
+                elapsed = time.time() - started
+                alive = worker.is_alive()
+                with open(os.path.join(tmp, "hangs.py"), encoding="utf-8") as fh:
+                    hung_text = fh.read()
+            finally:
+                release.set()  # let the abandoned worker die, or exit hangs
+                ff.generate_file_fix_edits = real_edits
+                ff.generate_file_fix = real_whole
+                ff._gate_file = real_gate
+                ff.FIX_FILE_MAX_SECONDS = real_max
+
+        self.assertTrue(hung_entered.is_set(), "the hung generation never started")
+        # THE POINT: it returned at all. Pre-fix this blocked forever.
+        self.assertFalse(alive, "inline fix generation was never bounded - "
+                                "_fix_files never returned")
+        self.assertIsNone(box.get("err"), f"_fix_files raised: {box.get('err')}")
+        self.assertLess(elapsed, 30, "the fix queue did not bound its inline wait")
+        applied, _unver, notes = box["res"]
+        self.assertNotIn("hangs.py", applied)
+        # Rolled back through the contained chokepoint, not left half-written.
+        self.assertEqual(hung_text, "orig\n", "the timed-out file was not restored")
+        self.assertTrue(any("TIMED OUT" in n and "hangs.py" in n for n in notes),
                         f"no loud abandonment note for the hung file: {notes}")
         # And the queue KEPT MOVING - the healthy file behind it still got fixed.
         self.assertIn("fine.py", applied)
@@ -7657,7 +7974,7 @@ class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
     def test_file_is_reviewed_by_the_healthy_backend_after_one_times_out(self):
         calls = []
 
-        def fake_review_file(provider, rel, text, context=""):
+        def fake_review_file(provider, rel, text, context="", project_dir=None):
             calls.append(provider)
             if provider == "slow":
                 raise RuntimeError("timed out")
@@ -7675,7 +7992,7 @@ class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
     def test_still_incomplete_when_every_backend_fails_that_file(self):
         # The safety property must survive the retry: if NOTHING could review
         # it, it is still NOT clean.
-        def always_fail(provider, rel, text, context=""):
+        def always_fail(provider, rel, text, context="", project_dir=None):
             raise RuntimeError("timed out")
 
         with _patched(ff, "review_file", always_fail):
@@ -9504,6 +9821,188 @@ class UnattributedGapHonestyTests(unittest.TestCase):
         self.assertEqual(len(out["gaps"]), 6)
 
 
+class PurposeAssessmentStabilityTests(unittest.TestCase):
+    """The purpose baseline is UNSTABLE and the report must say so.
+
+    Live GrantFlow 2026-08-14: the same unchanged tree measured 2/10, then
+    0/10, then 3/10 acceptance criteria met across three consecutive runs. The
+    engine runs correctly (58d8210) - the figure is simply a MODEL-DERIVED
+    ASSESSMENT carrying ~30% run-to-run variance, while the doctrine treats it
+    as the headline scoreboard. Publishing one sample as "the" number turns
+    that noise into "+3 criteria closed", which is exactly the false-progress
+    reporting the owner's standing rules forbid.
+
+    Determinism is deliberately NOT forced (that is a design decision about what
+    the number means). Instead: multi-sample, take the per-criterion MAJORITY,
+    and publish the observed spread everywhere the figure appears."""
+
+    def _contract(self):
+        return fp.PurposeContract(
+            name="Demo", slug="demo", purpose="do the thing", authored=True,
+            acceptance_criteria=["c1", "c2", "c3", "c4"])
+
+    @staticmethod
+    def _rows(met_flags):
+        return [{"index": i + 1, "criterion": f"c{i+1}", "met": m,
+                 "blocking_gaps": 0 if m is not False else 1,
+                 "unattributed_gaps": 0, "worst_severity": None,
+                 "gap_titles": [] if m is not False else [f"g{i+1}"]}
+                for i, m in enumerate(met_flags)]
+
+    def test_majority_verdict_and_split_votes_are_unknown_not_met(self):
+        # c1: met in all 3. c2: met in 2 of 3 -> majority met. c3: 1 of 3 ->
+        # blocked. c4: a dead 'split' - no majority either way -> UNKNOWN.
+        agg = fp.aggregate_coverage([
+            self._rows([True, True, True, True]),
+            self._rows([True, True, False, False]),
+            self._rows([True, False, False, None]),
+        ])
+        got = [r["met"] for r in agg["rows"]]
+        self.assertEqual(got, [True, True, False, None])
+        self.assertIsNone(agg["rows"][3]["met"],
+                          "a split vote must be UNKNOWN, never 'met'")
+        self.assertFalse(agg["rows"][3]["unanimous"])
+        self.assertTrue(agg["rows"][0]["unanimous"])
+        self.assertEqual(agg["criteria_met"], 2)
+
+    def test_the_observed_variance_is_reported_not_hidden(self):
+        agg = fp.aggregate_coverage([
+            self._rows([True, True, False, False]),   # 2 met
+            self._rows([False, False, False, False]),  # 0 met
+            self._rows([True, True, True, False]),    # 3 met
+        ])
+        # The exact live GrantFlow shape: 2 -> 0 -> 3 on one unchanged tree.
+        self.assertEqual(agg["met_samples"], [2, 0, 3])
+        self.assertEqual((agg["met_low"], agg["met_high"]), (0, 3))
+        self.assertEqual(agg["noise_band"], 3)
+        self.assertFalse(agg["stable"])
+
+    def test_a_swing_inside_the_noise_band_is_not_progress(self):
+        # THE OWNER'S RULE: never present a swing inside the noise band as
+        # progress or regression. 0 -> 3 with a band of 3 is NOT movement.
+        self.assertFalse(fp.movement_is_real(0, 3, 3))
+        self.assertFalse(fp.movement_is_real(3, 0, 3))
+        self.assertTrue(fp.movement_is_real(0, 4, 3))
+        self.assertIsNone(fp.movement_is_real(None, 3, 3))
+
+    def test_assess_purpose_gap_multisamples_and_publishes_the_spread(self):
+        # An assessor that answers differently every call - the live behavior.
+        answers = [
+            {"purpose": "p", "fulfillment_pct": 50,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 3,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g2", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+            {"purpose": "p", "fulfillment_pct": 0,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 1,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g2", "severity": "high", "acceptance_ref": 2,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g3", "severity": "high", "acceptance_ref": 3,
+                       "code_fixable": False, "file": ""},
+                      {"title": "g4", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+            {"purpose": "p", "fulfillment_pct": 75,
+             "gaps": [{"title": "g1", "severity": "high", "acceptance_ref": 4,
+                       "code_fixable": False, "file": ""}]},
+        ]
+        lock = threading.Lock()
+        calls = {"n": 0}
+
+        class _P:
+            model = "m"
+
+            def structured(self, *a, **k):
+                with lock:
+                    i = calls["n"]
+                    calls["n"] += 1
+                return answers[i % len(answers)]
+
+        real_n = ff.PURPOSE_ASSESS_SAMPLES
+        try:
+            ff.PURPOSE_ASSESS_SAMPLES = 3
+            out = ff.assess_purpose_gap(_P(), "blob", [], [],
+                                        contract=self._contract())
+        finally:
+            ff.PURPOSE_ASSESS_SAMPLES = real_n
+
+        self.assertEqual(calls["n"], 3, "the assessment was not multi-sampled")
+        # THE POINT: the spread is published, not silently collapsed to one number.
+        self.assertEqual(out["assessment_samples"], 3)
+        self.assertEqual(sorted(out["criteria_met_samples"]), [0, 2, 3])
+        self.assertEqual(out["criteria_noise_band"], 3)
+        self.assertIs(out["assessment_stable"], False)
+        # Criterion 4 is blocked in all three samples -> unanimous NO.
+        self.assertIs(out["acceptance_coverage"][3]["met"], False)
+        # Gaps are UNIONed, never majority-filtered: dropping a gap 2 of 3
+        # samples missed would rewrite the purpose downward. De-duplicated by
+        # TITLE (g1..g4), not by (ref, title) - the ref is the wobbly part, and
+        # emitting one gap three times under three refs would burn fix budget
+        # on duplicates and break gap_progress, which closes gaps BY TITLE.
+        self.assertEqual(sorted(g["title"] for g in out["gaps"]),
+                         ["g1", "g2", "g3", "g4"])
+        g1 = next(g for g in out["gaps"] if g["title"] == "g1")
+        self.assertEqual(sorted(str(r) for r in g1["acceptance_refs_seen"]),
+                         ["1", "3", "4"], "unstable attribution must stay visible")
+
+    def test_single_sample_is_labelled_unmeasured_not_stable(self):
+        data = {"purpose": "p", "fulfillment_pct": 100, "gaps": []}
+
+        class _P:
+            model = "m"
+            def structured(self, *a, **k):
+                return data
+
+        out = ff.assess_purpose_gap(_P(), "blob", [], [],
+                                    contract=self._contract(), samples=1)
+        self.assertEqual(out["assessment_samples"], 1)
+        # NOT False and NOT True: unmeasured variance is not evidence of
+        # stability, and must never be reported as agreement.
+        self.assertIsNone(out["assessment_stable"])
+        self.assertIsNone(out["criteria_noise_band"])
+        self.assertIn("UNMEASURED", fp.assessment_label(out))
+
+    def _report(self, audit_extra, pg_extra):
+        import tempfile
+        pg = {"purpose": "do the thing", "authored": True, "gaps": [],
+              "fulfillment_pct": 75, "criteria_met": 3, "criteria_total": 4,
+              "criteria_unknown": 0, "acceptance_coverage": [],
+              "assessment_samples": 3}
+        pg.update(pg_extra)
+        a = {"name": "Demo", "dir": "d", "branch": "b", "files_reviewed": 1,
+             "findings": [], "applied_files": [], "unverified_files": [],
+             "baseline_ok": True, "fix_notes": [], "purpose_gap": pg,
+             "commit_status": "", "ecosystems": [], "test_files": [],
+             "test_status": "", "e2e": {}, "file_findings": {}}
+        a.update(audit_extra)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = ff._write_audit_report(tmp, a)
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+
+    def test_report_refuses_to_call_a_noise_band_swing_progress(self):
+        text = self._report(
+            {"criteria_closed": 2, "criteria_movement_is_real": False,
+             "criteria_noise_band": 3},
+            {"assessment_stable": False, "criteria_noise_band": 3,
+             "criteria_met_samples": [2, 0, 3], "criteria_met_low": 0,
+             "criteria_met_high": 3})
+        self.assertIn("WITHIN MEASUREMENT NOISE", text)
+        self.assertIn("NOT evidence", text)
+        self.assertIn("ASSESSMENT, not a measurement", text)
+        self.assertIn("[2, 0, 3]", text)
+
+    def test_report_labels_a_single_sample_figure_as_unmeasured(self):
+        text = self._report(
+            {"criteria_closed": 2, "criteria_movement_is_real": None,
+             "criteria_noise_band": None},
+            {"assessment_samples": 1, "assessment_stable": None,
+             "criteria_noise_band": None})
+        self.assertIn("variance", text)
+        self.assertIn("UNMEASURED", text)
+        self.assertNotIn("WITHIN MEASUREMENT NOISE", text)
+
+
 class ReviewIncompleteHonestyTests(unittest.TestCase):
     """Defect: _review_all tracked files whose review ERRORED but never
     returned them, so a sweep where every review failed converged as CLEAN and
@@ -9669,7 +10168,7 @@ class ResumeCheckpointTests(unittest.TestCase):
         real_read = ff._read_text_and_sha
         real_review = ff.review_file
         ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = (lambda rv, rel, text, context="":
+        ff.review_file = (lambda rv, rel, text, context="", project_dir=None:
                           (([finding], "s") if rel == "bad.py" else ([], "s")))
         seen = {}
 
@@ -9709,7 +10208,7 @@ class ResumeCheckpointTests(unittest.TestCase):
         real_read = ff._read_text_and_sha
         real_review = ff.review_file
         ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = lambda rv, rel, text, context="": ([], "clean")  # all clean, real findings not the point here
+        ff.review_file = lambda rv, rel, text, context="", project_dir=None: ([], "clean")  # all clean, real findings not the point here
 
         class _R:
             model = "m"
