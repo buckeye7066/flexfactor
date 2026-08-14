@@ -4516,6 +4516,87 @@ class NoopSplitTests(unittest.TestCase):
         self.assertEqual(ff._noop_split_lines({}), [])
 
 
+class NoopNoteStarvationTests(unittest.TestCase):
+    """The classifier was WIRED, TESTED and largely INERT - because it was STARVED.
+
+    Measured 2026-08-14 across every no-op note this machine has produced
+    (31 notes, GrantFlow runs 4-6): 24 UNCLEAR, and **20 of those were EMPTY**.
+    Only 7 of 31 classified at all. `_classify_noop` was not buggy; the field it
+    reads was documented as applying to only ONE of the two families:
+
+        "Only defects genuinely left unfixed because they need changes outside
+         this file / new deps / backend work"
+
+    A model REJECTING a finding read that "only", concluded the field did not
+    apply, and satisfied a required string with "". No unit test could catch it,
+    because tests supply notes and production mostly did not - the same shape as
+    every other defect this session: a mechanism that exists, is documented, is
+    tested, and does nothing.
+
+    These tests FAIL on pre-fix code - the discriminator adopted this session,
+    since a check that cannot fail proves nothing."""
+
+    def test_the_notes_field_demands_a_reason_whenever_changed_is_false(self):
+        # Pre-fix this description said "Only defects genuinely left unfixed
+        # because they need changes outside this file" - no mention of
+        # changed=false and no mention of the rejection family at all.
+        d = ff._NOTES_FIELD_DESCRIPTION.lower()
+        self.assertIn("changed=false", d)
+        self.assertIn("never leave this empty", d)
+        # Both families must be nameable from the description alone.
+        self.assertIn("the finding is wrong", d)
+        self.assertIn("the defect is real", d)
+
+    def test_both_fix_schemas_share_one_notes_description(self):
+        # They drifted independently before (two copies of the same sentence).
+        # A single constant is what keeps the edit path and the whole-file path
+        # from diverging the next time either is edited.
+        self.assertEqual(
+            ff.FIX_PATCH_SCHEMA["properties"]["notes"]["description"],
+            ff.FIX_EDITS_SCHEMA["properties"]["notes"]["description"])
+        self.assertEqual(
+            ff.FIX_PATCH_SCHEMA["properties"]["notes"]["description"],
+            ff._NOTES_FIELD_DESCRIPTION)
+        # Still required in both - an optional field would reintroduce silence.
+        self.assertIn("notes", ff.FIX_PATCH_SCHEMA["required"])
+        self.assertIn("notes", ff.FIX_EDITS_SCHEMA["required"])
+
+    def test_live_notes_the_old_pattern_table_missed_now_classify(self):
+        # Every one of these is a VERBATIM shape from a production note that the
+        # pre-fix table returned None for. Rejections dominate the notes that say
+        # anything, so a gap here biases review precision DOWNWARD.
+        for note in (
+            # AgentOverviewCards.jsx, run 6
+            "This is a spurious TypeScript-oriented audit finding being applied "
+            "to a JavaScript file.",
+            # anyaBackgroundQueue.jsx, run 5
+            "Every `window` access is already guarded by a typeof window check.",
+            # fundingResultsStore.js, run 5
+            "The file already contains the necessary guards and no safe in-file "
+            "change is warranted.",
+            "The finding does not apply to this file.",
+        ):
+            self.assertEqual(ff._classify_noop(note), "rejected", note[:60])
+
+    def test_a_note_carrying_BOTH_families_is_still_unclear(self):
+        # Guards the widened table against over-reach. This is the real
+        # fundingResultsStore shape: several findings rejected as false
+        # positives AND one that genuinely needs a cross-file change. Forcing
+        # that into either bucket would be a guess, and over-crediting
+        # "rejected" would inflate the review-precision number - worse than
+        # undercounting it.
+        note = ("All four listed defects appear to be false positives; the file "
+                "already contains the necessary guards. The fifth needs a "
+                "cross-file change.")
+        self.assertIsNone(ff._classify_noop(note))
+
+    def test_an_empty_note_is_still_unclear_not_guessed(self):
+        # The schema change is what should make these rare; it must NEVER make
+        # the classifier invent a verdict when the note is still silent.
+        for note in ("", "   ", "[]", "()", None):
+            self.assertIsNone(ff._classify_noop(note), repr(note))
+
+
 class CanonicalFileKeyTests(unittest.TestCase):
     """A file key is an IDENTITY, so two spellings of one path are two files.
 
