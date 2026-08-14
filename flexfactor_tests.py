@@ -4399,6 +4399,140 @@ class ReviewFixBatchSizeTests(unittest.TestCase):
                 self.assertEqual(flat, files, f"n={n} size={size} lost files")
 
 
+class CanonicalFileKeyTests(unittest.TestCase):
+    """A file key is an IDENTITY, so two spellings of one path are two files.
+
+    Live GrantFlow 2026-08-14, measured from gfrun11.log: of 28 per-file
+    outcome lines, 19 used BACKSLASH paths and 9 used forward slashes, and
+    EIGHT files appeared under BOTH spellings - each processed twice in one
+    run. Two of them, NotificationBell.jsx and GrantPortalAssistant.jsx, were
+    `[fixed]` TWICE: the second pass re-applied findings the first pass had
+    already resolved. The author model called it out on the others - "already
+    fixed in the current file content" and "the findings appear to describe a
+    different (broken) revision of this file than the one provided" - which is
+    exactly how a "fix" reintroduces a bug that was already repaired.
+
+    Cause: os.path.relpath emits backslashes on Windows, while every other
+    producer of a file key normalizes to forward slashes (_gap_to_finding, the
+    purpose-bridging list, brain clean_files). done_set could never match
+    across the two, so nothing suppressed the second pass."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_enumeration_emits_forward_slash_keys(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "src", "components", "billing")
+            os.makedirs(nested)
+            with open(os.path.join(nested, "AutoTimeTracker.jsx"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("const x = 1;\n")
+            got = ff._enumerate_source_files(tmp, max_files=0)
+        self.assertEqual(got, ["src/components/billing/AutoTimeTracker.jsx"])
+        for g in got:
+            self.assertNotIn("\\", g, "a backslash key forks the file's identity")
+
+    def test_mixed_spellings_of_one_file_are_fixed_ONCE(self):
+        # The live shape: the same file arrives under both spellings. Pre-fix
+        # this generated TWO fixes; the second re-applied resolved findings.
+        import tempfile
+        import types
+        gen_calls = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "src", "components", "notifications")
+            os.makedirs(nested)
+            rel_fwd = "src/components/notifications/NotificationBell.jsx"
+            with open(os.path.join(nested, "NotificationBell.jsx"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None,
+                           **_k):
+                gen_calls.append(rel)
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=0)
+            findings = {rel_fwd: finding("a"),
+                        rel_fwd.replace("/", "\\"): finding("b")}
+            done_set = set()
+            real_edits = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff._gate_file = lambda *a, **k: (True, "")
+                applied, _unver, _notes = ff._fix_files(
+                    object(), None, tmp, findings, self.STACK, True, args,
+                    done_set=done_set, adversarial=False)
+            finally:
+                ff.generate_file_fix_edits = real_edits
+                ff._gate_file = real_gate
+
+        self.assertEqual(len(gen_calls), 1,
+                         f"the file was fixed more than once: {gen_calls}")
+        self.assertEqual(len(applied), 1, f"duplicate applied entries: {applied}")
+        self.assertNotIn("\\", applied[0])
+        self.assertEqual(done_set, {rel_fwd},
+                         "done_set must hold ONE canonical identity per file")
+
+    def test_canon_rel_never_mangles_a_dotfile_directory(self):
+        self.assertEqual(ff._canon_rel(r"src\a.jsx"), "src/a.jsx")
+        self.assertEqual(ff._canon_rel("./src/a.jsx"), "src/a.jsx")
+        self.assertEqual(ff._canon_rel(r".\src\a.jsx"), "src/a.jsx")
+        # lstrip("./") would strip a character SET and break these:
+        self.assertEqual(ff._canon_rel(".github/wf.yml"), ".github/wf.yml")
+        self.assertEqual(ff._canon_rel(".env.example"), ".env.example")
+        self.assertEqual(ff._canon_rel("src/a.jsx"), "src/a.jsx")
+
+    def test_findings_from_both_spellings_are_merged_not_dropped(self):
+        # Canonicalizing must not LOSE the other spelling's findings - they are
+        # the same file's defects and both must reach the author.
+        import tempfile
+        import types
+        seen = {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None, **_k):
+                seen[rel] = [t["title"] for t in targets]
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=0)
+            real_edits = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff._gate_file = lambda *a, **k: (True, "")
+                ff._fix_files(object(), None, tmp,
+                              {"a.py": finding("from-review"),
+                               ".\\a.py": finding("from-purpose-gap")},
+                              self.STACK, True, args, adversarial=False)
+            finally:
+                ff.generate_file_fix_edits = real_edits
+                ff._gate_file = real_gate
+
+        self.assertEqual(len(seen), 1, f"still processed twice: {list(seen)}")
+        titles = sorted(next(iter(seen.values())))
+        self.assertEqual(titles, ["from-purpose-gap", "from-review"],
+                         "merging must keep BOTH spellings' findings")
+
+
 class ReviewBareListSalvageTests(unittest.TestCase):
     """A well-formed findings set must never be discarded over its envelope.
 

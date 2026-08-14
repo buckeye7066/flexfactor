@@ -146,6 +146,36 @@ system correctly declining to break working code** — there is a comment at the
 no-op accounting saying so, because counting it honestly as an error is what
 made this visible. Do not "fix" that accounting into a success.
 
+## A file key is an IDENTITY — canonicalize it (2026-08-14)
+
+`rel` is not merely a path in this tool: it is the identity a file is tracked by
+in `done_set`, the brain's `clean_files` skip set, and the findings map. **Two
+spellings mean two files.**
+
+`os.path.relpath` emits **backslashes** on Windows, while every other producer
+normalizes to forward slashes (`_gap_to_finding`, the purpose-bridging list,
+`clean_files`). Measured from the live GrantFlow run's log: of 28 per-file
+outcome lines, **19 backslash / 9 forward**, and **eight files appeared under
+BOTH spellings**, each processed twice in one run. `NotificationBell.jsx` and
+`GrantPortalAssistant.jsx` were **`[fixed]` twice** — the second pass re-applying
+findings the first pass had already resolved. The author model caught the rest:
+*"already fixed in the current file content"*, *"the findings appear to describe
+a different (broken) revision of this file than the one provided"*. That is how
+a "fix" reintroduces a bug that was already repaired.
+
+- `_canon_rel()` is the canonical form: backslashes → forward, whole leading
+  `./` segments stripped. **Never `lstrip("./")`** — that strips a character SET
+  and turns `.github/wf.yml` into `github/wf.yml`.
+- `_enumerate_source_files` emits canonical keys.
+- `_fix_files` folds its incoming `file_findings` through `_canon_rel` as
+  defence in depth, **merging** both spellings' findings rather than letting one
+  win — canonicalizing must never drop a real defect.
+
+Side effect worth knowing: the purpose-first sweep ordering
+(`pf = [f for f in purpose_files if f in set(files)]`) compared forward-slash
+gap paths against backslash enumeration keys, so it silently matched **nothing**.
+With canonical keys it actually orders the sweep now.
+
 ## Bare-list salvage is SHARED (2026-08-14) — never discard a good payload over its envelope
 
 `_check_structured_type` is the one chokepoint every provider's `structured()`

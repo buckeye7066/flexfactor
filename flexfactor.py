@@ -6735,6 +6735,21 @@ def _safe_report_write(project_dir: str, report_name: str, body: str) -> str:
     return last
 
 
+def _canon_rel(rel: str) -> str:
+    """THE canonical form of a repo-relative file key.
+
+    A rel is not merely a path in this tool - it is the IDENTITY a file is
+    tracked by in `done_set`, the brain's `clean_files` skip set and the
+    findings map. Two spellings therefore mean two files. Windows
+    `os.path.relpath` emits backslashes while every other producer normalizes,
+    and on the live GrantFlow run of 2026-08-14 that split identity processed
+    eight files twice, [fixed]-ing two of them twice over."""
+    s = str(rel or "").replace("\\", "/")
+    # Strip only whole leading './' segments. NEVER lstrip("./") - that strips a
+    # character SET and would turn '.github/wf.yml' into 'github/wf.yml'.
+    return re.sub(r"^(?:\./)+", "", s)
+
+
 def _is_test_path(rel: str) -> bool:
     low = rel.replace("\\", "/").lower()
     return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
@@ -6867,9 +6882,20 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 continue
             if size == 0 or size > MAX_REVIEW_BYTES:
                 continue
-            out.append((rel, size))
+            # FORWARD SLASHES ARE THE CANONICAL FILE KEY (live GrantFlow
+            # 2026-08-14). os.path.relpath yields BACKSLASHES on Windows, while
+            # every other producer of a file key normalizes ('src/a.jsx'):
+            # purpose gaps (_gap_to_finding), the bridging list, brain
+            # clean_files. A rel is not just a path here - it is the IDENTITY
+            # used by done_set, the clean-file skip set and the findings map.
+            # Two spellings meant two identities: eight GrantFlow files were
+            # processed TWICE in one run, and NotificationBell.jsx and
+            # GrantPortalAssistant.jsx were [fixed] twice - the second pass
+            # applying findings that the first pass had already resolved, which
+            # is exactly how a "fix" reintroduces a repaired bug.
+            out.append((relslash, size))
     out.sort(key=lambda t: (_is_test_path(t[0]),
-                            not t[0].replace("\\", "/").startswith("src/"),
+                            not t[0].startswith("src/"),
                             -t[1]))
     return [rel for rel, _ in out] if max_files <= 0 else [rel for rel, _ in out[:max_files]]
 
@@ -8510,6 +8536,21 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     defects_fixed = 0  # individual defects addressed across kept fixes (for the dashboard)
     since_commit = 0    # kept fixes since the last incremental commit
     MAX_FIX_TRIES = 3   # per-file salvage attempts (build-break / veto feedback loop)
+    # CANONICAL KEYS, DEFENCE IN DEPTH (live GrantFlow 2026-08-14). A file key is
+    # an IDENTITY (done_set, clean-file skips, the findings map), so two
+    # spellings of one path are two identities. Windows os.path.relpath emits
+    # backslashes while purpose gaps and the bridging list emit forward slashes;
+    # eight files were processed TWICE in one run and two were [fixed] TWICE -
+    # the second pass re-applying findings the first pass had already resolved
+    # (the author model caught it: "already fixed in the current file content",
+    # "the findings appear to describe a different revision of this file").
+    # _enumerate_source_files now emits forward slashes; folding here as well
+    # means no future producer can reintroduce the split. Findings for the same
+    # file under different spellings MERGE rather than racing each other.
+    merged_findings: dict[str, list[dict]] = {}
+    for _rel, _fs in file_findings.items():
+        merged_findings.setdefault(_canon_rel(_rel), []).extend(_fs or [])
+    file_findings = merged_findings
     fixable_files = [rel for rel, fs in file_findings.items()
                      if any(should_fix_finding(f, args.fix_severity) for f in fs)]
 
