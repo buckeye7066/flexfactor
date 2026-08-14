@@ -615,6 +615,19 @@ still the guard.
   key (`_load_resume_state`/`_save_resume_state`, now deleted). A module
   existing and passing its own tests is not evidence it is wired in; grep for
   every symbol it exports before trusting a "this is now used" claim.
+  **Third instance (found + fixed 2026-08-14, live Family Castle Clash):**
+  `set_phase`/`record_cycle`/`record_spend` had the SAME fate — present in
+  `flexfactor_runstate.py`, tested, called from nowhere — so every checkpoint
+  carried `phase='starting', files_total=0, cycle=0, spend 0.0` for its whole
+  run; the live run read as wedged-at-start 7 hours and 87 reviewed files in.
+  Now wired at the real phase boundaries in `audit_one_program` (purpose
+  baseline, cycle start, fixing, unit tests) + `files_total` after
+  enumeration; `CheckpointPhaseWiringTests` reddens if the call sites are
+  deleted. Same commit: test-gen retries ONCE at 64k on a 32k output-budget
+  hit (`_gen_unit_tests` — the old code skipped the module while its own
+  error said "raise max_tokens"), and `_wrap_path_map` salvages a bare
+  path→contents map into a schema's single path-ish array property (the
+  decoy guard's `{"ok":1}`/`{"ok":"yes"}` raises are regression-tested).
   **Checkpoint-flush gap (found + fixed 2026-08-12):** `_review_all`'s
   `checkpoint_cb` was gated `done["n"] % 10 == 0` - a full-dict-SNAPSHOT
   callback fired only every 10th completed file. Empirically reproduced: a
