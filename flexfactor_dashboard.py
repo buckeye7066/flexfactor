@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 
 STATUS_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
@@ -60,6 +61,55 @@ def read_status(path: str) -> list[dict]:
         return progs if isinstance(progs, list) else []
     except (OSError, ValueError):
         return []
+
+
+def attempt_info(p: dict) -> str:
+    """'attempt 5 - 3 commits landed' - the two numbers that SURVIVE a restart.
+
+    `cycle` in status.json counts cycles inside the CURRENT process, so it resets
+    to 1 every relaunch: on 2026-08-14 the panel read 'cycle 1/12' after five
+    attempts, hiding that four of them had produced zero commits. Read straight
+    off disk (checkpoint dirs + git log) so this needs no change to the running
+    audit and no new status.json field. Best-effort: never raises, returns "" when
+    it cannot tell."""
+    try:
+        prog = str(p.get("name") or "")
+        proj = str(p.get("dir") or "")
+        slug = "".join(c.lower() if c.isalnum() else "-" for c in prog).strip("-")
+        runs_dir = os.path.join(os.path.expanduser("~"), ".flexfactor", "runs")
+        attempts = 0
+        resumes = 0
+        if slug and os.path.isdir(runs_dir):
+            for d in os.listdir(runs_dir):
+                if not d.startswith(slug + "-"):
+                    continue
+                attempts += 1
+                try:
+                    with open(os.path.join(runs_dir, d, "checkpoint.json"),
+                              encoding="utf-8") as fh:
+                        resumes += int(json.load(fh).get("resume_count") or 0)
+                except (OSError, ValueError, TypeError):
+                    pass
+        landed = None
+        if proj and os.path.isdir(os.path.join(proj, ".git")):
+            try:
+                out = subprocess.run(
+                    ["git", "-C", proj, "log", "--oneline", "--grep=FlexFactor"],
+                    capture_output=True, text=True, timeout=5)
+                if out.returncode == 0:
+                    landed = len([ln for ln in out.stdout.splitlines() if ln.strip()])
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if not attempts and landed is None:
+            return ""
+        bits = []
+        if attempts:
+            bits.append(f"attempt {attempts}" + (f" (+{resumes} resumes)" if resumes else ""))
+        if landed is not None:
+            bits.append(f"{landed} commit{'' if landed == 1 else 's'} landed")
+        return " - ".join(bits)
+    except Exception:
+        return ""
 
 
 def bar_targets(p: dict) -> dict:
@@ -158,6 +208,17 @@ def _main() -> int:
                 if cyc and cycles and not done and "cycle" not in phase else "")
             canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
                                font=("Segoe UI", 8))
+            # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
+            # process, so it resets to 1 on every restart - after five restarts the
+            # panel still read "cycle 1/12" while four earlier attempts had produced
+            # nothing. That hides exactly what the honesty doctrine cares about. These
+            # two numbers survive restarts: `attempt` (how many times this program has
+            # been (re)launched + resumed) and `landed` (commits actually on the
+            # branch - the DURABLE metric; the per-cycle "fixed" counter resets too).
+            att = attempt_info(p)
+            if att:
+                canvas.create_text(cx + col_w / 2, top + 47, text=att[:46], fill=DIM,
+                                   font=("Segoe UI", 8))
 
             t = bar_targets(p)
             # Three bars side by side. Baseline lifted to leave room below for the
@@ -185,6 +246,17 @@ def _main() -> int:
             # reads as "files", not a bare percentage that looks like defects.
             bars[1] = ("fix", bars[1][1], FIX, "Files fixed",
                        f"{fixed}/{fix_total}" if fix_total else "0/0")
+            # SCOPE FIX (2026-08-14, owner caught it): `reviewed`/`files_total`/
+            # `defects` are THIS BATCH (20 files); `fix_done`/`fix_total` are the
+            # WHOLE PROGRAM (3,140 files). The Review bar therefore hit 100% while
+            # 0.6% of the program had been reviewed, and "45 defects" next to
+            # "/3140" implied 45 defects across the whole program. Same panel, two
+            # scopes, unlabelled - a false impression of progress, which is exactly
+            # what the honesty doctrine forbids. Label the batch bar as a batch.
+            batch_n = int(p.get("files_total") or 0)
+            if batch_n and fix_total and batch_n < fix_total:
+                bars[0] = (bars[0][0], bars[0][1], bars[0][2], "Review (batch)",
+                           f"{int(p.get('reviewed') or 0)}/{batch_n}")
 
             for j, (key, target, color, label, vtxt) in enumerate(bars):
                 bx = cx + gap + j * (bw + gap)
@@ -197,8 +269,15 @@ def _main() -> int:
             defects = int(p.get("defects") or 0)
             defects_fixed = int(p.get("defects_fixed") or 0)
             errors = int(p.get("errors") or 0)
-            canvas.create_text(cx + col_w / 2, stats_y,
-                               text=f"defects found: {defects}",
+            # "defects found" counts ONLY the files reviewed in the current batch,
+            # so say so - unqualified next to a /3140 denominator it read as a
+            # whole-program total (owner, 2026-08-14: "3140 files ... yet only 45
+            # defects found. That is quite a gap").
+            scoped = (f"defects found: {defects}  (in {int(p.get('reviewed') or 0)} "
+                      f"files reviewed so far)"
+                      if batch_n and fix_total and batch_n < fix_total
+                      else f"defects found: {defects}")
+            canvas.create_text(cx + col_w / 2, stats_y, text=scoped,
                                fill=TEXT, font=("Segoe UI", 9, "bold"))
 
             # Severity breakdown: one colored "label N" chip per present severity,
