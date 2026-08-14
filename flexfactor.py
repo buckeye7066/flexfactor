@@ -2425,6 +2425,24 @@ def _check_structured_type(data, schema: dict, text: str):
     passes through - turns that into a normal generation failure the existing
     retry/edit-fallback/[skip] handling already copes with."""
     expected = schema.get("type")
+    if expected == "object" and isinstance(data, dict):
+        # DECOY-OBJECT GUARD (measured 2026-08-14 probing the extraction order).
+        # _extract_json_object returns the FIRST balanced {...} span, so a
+        # response like `Here you go: {"ok":1}\n{"findings":[...` hands back the
+        # DECOY, not the payload. That dict then flows on as a review with ZERO
+        # findings - and an empty successful review marks the file CLEAN in
+        # `reviewed_clean`. A silent false-clean is the worst outcome this tool
+        # has: the file is never looked at again. A dict carrying NONE of the
+        # schema's required keys is not this schema's object, so raise and let
+        # the existing retry/another-backend path handle it. Narrow on purpose:
+        # a response missing SOME required keys (e.g. findings but no summary)
+        # is a normal partial answer and still passes.
+        req = [k for k in (schema.get("required") or []) if isinstance(k, str)]
+        if req and not any(k in data for k in req):
+            raise RuntimeError(
+                "Structured output matched no schema key (decoy/unrelated JSON "
+                f"object; expected one of {req}); len={len(text)} "
+                f"head={text[:200]!r}")
     if expected == "object" and not isinstance(data, dict):
         # BARE-LIST SALVAGE (live GrantFlow failure 2026-08-13): the economy
         # author tier answers the edit-fix prompt with prose + a bare JSON array

@@ -4720,6 +4720,29 @@ class ReviewBareListSalvageTests(unittest.TestCase):
         self.assertIn("findings", out, "the constrained property must outrank a "
                                        "wide-open one")
 
+    def test_a_decoy_object_never_becomes_a_silent_clean_review(self):
+        # MEASURED hazard: _extract_json_object returns the FIRST balanced
+        # {...} span, so a decoy object ahead of the real payload is what the
+        # caller gets - a review with ZERO findings, which marks the file CLEAN
+        # in reviewed_clean and means it is never looked at again. A silent
+        # false-clean is worse than a loud failure, so this must raise.
+        text = 'Here you go: {"ok":1}\n{"findings":[{"line":1}'
+        data, _raw = ff._extract_json_object(text)
+        self.assertEqual(data, {"ok": 1}, "precondition: the decoy is extracted")
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(data, ff.AUDIT_FINDINGS_SCHEMA, text)
+
+    def test_a_partial_but_real_answer_still_passes(self):
+        # Narrowness guard: missing SOME required keys is a normal partial
+        # answer (findings present, summary absent) and must NOT raise.
+        out = ff._check_structured_type({"findings": []},
+                                        ff.AUDIT_FINDINGS_SCHEMA, "x")
+        self.assertEqual(out, {"findings": []})
+        # A schema with no `required` at all can never trip the guard.
+        self.assertEqual(
+            ff._check_structured_type({"anything": 1}, {"type": "object"}, "x"),
+            {"anything": 1})
+
     def test_truncated_list_salvage_is_not_regressed(self):
         # The OTHER salvage path (e4ef6b6 / _salvage_truncated_json): text that
         # does not parse at all, cut mid-element. Must still recover the

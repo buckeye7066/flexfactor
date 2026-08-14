@@ -250,6 +250,26 @@ Note the ordering that made this reachable: `_extract_json_object` runs BEFORE
 `_salvage_truncated_json`, so a cut envelope with a complete inner array never
 reaches truncation repair — it arrives here as a bare list.
 
+**That ordering was investigated and is NOT a defect (measured 2026-08-14).**
+Comparing both paths on five truncated payload shapes: where extraction returns
+something (cut envelope with a complete inner array; cut inside `summary` after
+the array) it yields the *same* findings count salvage would; where extraction
+returns `None` (cut mid-element, cut array after a leading `summary`) salvage
+correctly runs and recovers the leading elements. Reordering would change
+nothing. Do not "fix" it.
+
+The probe did surface a **different** hazard, now guarded: `_extract_json_object`
+returns the FIRST balanced `{...}` span, so `Here you go: {"ok":1}\n{"findings":[…`
+hands back the **decoy**. That dict flowed on as a review with ZERO findings —
+and an empty *successful* review marks the file CLEAN in `reviewed_clean`, so it
+is never looked at again. **A silent false-clean is the worst outcome this tool
+has.** `_check_structured_type` now raises when a dict carries **none** of the
+schema's `required` keys, sending it down the existing retry/another-backend
+path. Narrow on purpose: missing *some* required keys (findings but no summary)
+is a normal partial answer and still passes, and a schema with no `required` can
+never trip it. No production instance was observed — this is a guard against a
+measured mechanism, not a fixed incident.
+
 ## Free-vs-paid failover: the numbers, and why they are those numbers
 
 A stall threshold **below the free route's healthy latency** silently converts a
