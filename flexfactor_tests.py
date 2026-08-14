@@ -4399,6 +4399,123 @@ class ReviewFixBatchSizeTests(unittest.TestCase):
                 self.assertEqual(flat, files, f"n={n} size={size} lost files")
 
 
+class NoopSplitTests(unittest.TestCase):
+    """`[no-op]` hid two OPPOSITE outcomes behind one marker.
+
+    Run 5 showed 19 no-ops against 41 fixes and the ratio is unreadable, because
+    it mixes a SUCCESS OF JUDGEMENT with a FAILURE OF CAPABILITY:
+      * correct refusal - the finding was bogus and the author rightly declined
+        to change working code. Live: SamErrorPanel.jsx no-op'd because the
+        finding alleged a conflict between two setStatus calls that are in
+        SEPARATE COMPONENT SCOPES. Refusing was the right answer.
+      * genuine failure - a real defect the loop could not land.
+    The author model already states its reason, so the information existed and
+    was being discarded. The REJECTED rate is the direct measure of REVIEW
+    PRECISION, and review precision decides whether FlexFactor improves a
+    program or damages it (see the react-query v5 regression).
+
+    BOTH stay non-successes: a rejected finding must never quietly become a
+    success, which would recreate the 2026-08-11 defect the exit-code-3 rule
+    exists to prevent."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_live_rejection_notes_classify_as_rejected(self):
+        for note in (
+            "The defect described is already fixed in the current file content.",
+            "appears ALREADY FIXED in the current file contents.",
+            "The findings appear to describe a different (broken) revision of "
+            "this file than the one provided.",
+            "do not match the actual file content supplied",
+            "No code change required.",
+            "No in-file fix was needed; nothing was changed.",
+            "The two setStatus calls are in separate component scopes, so this "
+            "is not a real defect.",
+        ):
+            self.assertEqual(ff._classify_noop(note), "rejected", note[:50])
+
+    def test_capability_failures_classify_as_no_fix(self):
+        for note in (
+            "Unable to produce a safe fix without touching other modules.",
+            "could not determine the correct behavior from this file alone",
+            "This requires changes outside this file (cross-file refactor).",
+            "insufficient context to fix",
+        ):
+            self.assertEqual(ff._classify_noop(note), "no-fix", note[:50])
+
+    def test_unclear_notes_fall_back_to_the_generic_marker(self):
+        # The brief is explicit: where the note is unclear, fall back rather
+        # than guess. Silence and self-contradiction both land here.
+        for note in ("", "[]", "()", None, "no change",
+                     "already fixed, but I was also unable to determine the fix"):
+            self.assertIsNone(ff._classify_noop(note), repr(note))
+
+    def _run_noop(self, note):
+        import tempfile
+        import types
+        stats = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None, **_k):
+                return {"changed": False, "notes": note}
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=0)
+            findings = {"a.py": [{"severity": "high", "line": 1, "title": "t",
+                                  "problem": "p", "fix": "f", "category": "bug"}]}
+            real_edits = ff.generate_file_fix_edits
+            real_gate = ff._gate_file
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff._gate_file = lambda *a, **k: (True, "")
+                applied, _unver, notes = ff._fix_files(
+                    object(), None, tmp, findings, self.STACK, True, args,
+                    noop_stats=stats, adversarial=False)
+            finally:
+                ff.generate_file_fix_edits = real_edits
+                ff._gate_file = real_gate
+        return applied, notes, stats
+
+    def test_a_rejected_finding_is_counted_and_is_NOT_a_success(self):
+        applied, notes, stats = self._run_noop(
+            "This is already fixed in the current file content.")
+        self.assertEqual(stats, {"rejected": 1})
+        # THE LOAD-BEARING ASSERTION: rejected must never become a success.
+        self.assertEqual(applied, [], "a rejected finding was counted as a fix")
+        self.assertTrue(any("REJECTED FINDING" in n for n in notes), notes)
+
+    def test_a_no_fix_noop_is_counted_separately_and_is_not_a_success(self):
+        applied, notes, stats = self._run_noop(
+            "Unable to produce a fix without cross-file changes.")
+        self.assertEqual(stats, {"no-fix": 1})
+        self.assertEqual(applied, [])
+        self.assertTrue(any("NO FIX FOUND" in n for n in notes), notes)
+
+    def test_an_unclear_noop_keeps_the_generic_marker(self):
+        applied, notes, stats = self._run_noop("")
+        self.assertEqual(stats, {"unclear": 1})
+        self.assertEqual(applied, [])
+        self.assertTrue(any("NO-OP" in n for n in notes), notes)
+
+    def test_the_report_surfaces_the_split_and_calls_neither_a_success(self):
+        lines = ff._noop_split_lines(
+            {"noop_stats": {"rejected": 12, "no-fix": 5, "unclear": 2},
+             "applied_files": ["a.py"] * 41})
+        text = "\n".join(lines)
+        self.assertIn("19 (none are successes)", text)
+        self.assertIn("12 rejected finding(s)", text)
+        self.assertIn("5 no fix found", text)
+        self.assertIn("2 unclassified", text)
+        self.assertIn("Review precision", text)
+        self.assertIn("23% of acted-on findings were rejected", text)
+
+    def test_the_report_says_nothing_when_there_were_no_noops(self):
+        self.assertEqual(ff._noop_split_lines({"noop_stats": {}}), [])
+        self.assertEqual(ff._noop_split_lines({}), [])
+
+
 class CanonicalFileKeyTests(unittest.TestCase):
     """A file key is an IDENTITY, so two spellings of one path are two files.
 
