@@ -1,0 +1,6 @@
+# Shell scripts must reach Android/Termux with LF endings. A CRLF shebang line
+# fails as `bad interpreter: /data/data/.../bash^M`, which reads like a missing
+# interpreter rather than a line-ending problem and wastes an hour every time.
+# This repo is developed on Windows with core.autocrlf=true, so the guard is
+# not theoretical.
+*.sh text eol=lf
