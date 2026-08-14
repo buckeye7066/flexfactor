@@ -4315,6 +4315,109 @@ class PrefetchWaitIsBoundedTests(unittest.TestCase):
         self.assertIn("fine.py", applied)
 
 
+class InlineFixGenerationIsBoundedTests(unittest.TestCase):
+    """The INLINE fix-generation path must be bounded too.
+
+    `b7a9a07` bounded the PREFETCH consumption (`pf.result(timeout=...)`), but a
+    file with NO prefetched candidate - notably the FIRST file of every batch,
+    and every RETRY attempt - generates inline on the main thread. That call had
+    exactly the same unbounded shape: `_stream_with_deadline` is two-phase with
+    no total-elapsed cap, so a stream dribbling one event inside the idle window
+    never returns, and `FIX_FILE_MAX_SECONDS` is only tested BETWEEN attempts -
+    a call that never returns never reaches that test. A wedged backend parked
+    the main thread directly, cost meter frozen, no `[timeout]` output.
+
+    NOTE the placement: the hung file sits FIRST so it takes the INLINE path
+    (`_top_up_prefetch` only prefetches files AHEAD of the current one). A file
+    placed mid-queue would exercise the already-fixed prefetch path instead.
+
+    The body runs `_fix_files` on a daemon thread because on PRE-FIX code it
+    never returns - the assertion is that it returns at all."""
+
+    STACK = {"is_node": False, "is_python": True}
+
+    def test_hung_inline_generation_is_abandoned_and_the_queue_keeps_moving(self):
+        import tempfile
+        import types
+        release = threading.Event()
+        hung_entered = threading.Event()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("hangs.py", "fine.py"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write("orig\n")
+
+            def fake_edits(author, rel, original, targets, feedback=None):
+                if rel == "hangs.py":
+                    hung_entered.set()
+                    release.wait(90)  # never released before the assertions
+                    raise RuntimeError("released after the test finished")
+                return {"changed": True,
+                        "edits": [{"search": "orig", "replace": "fixed"}],
+                        "fixed_titles": ["t"], "notes": ""}
+
+            def fake_whole(author, rel, original, targets, feedback=None):
+                # A timeout must NOT demote to whole-file mode against the same
+                # wedged backend; if it does, this makes the test say so.
+                raise AssertionError(f"whole-file fallback taken for {rel}")
+
+            def finding(title):
+                return [{"severity": "high", "line": 1, "title": title,
+                         "problem": "p", "fix": "f", "category": "bug"}]
+
+            args = types.SimpleNamespace(fix_severity="high",
+                                         whole_file_fixes=False, fix_prefetch=2)
+            findings = {"hangs.py": finding("a"), "fine.py": finding("b")}
+            box = {}
+
+            def drive():
+                try:
+                    box["res"] = ff._fix_files(object(), None, tmp, findings,
+                                               self.STACK, True, args,
+                                               adversarial=False)
+                except BaseException as ex:      # noqa: BLE001
+                    box["err"] = ex
+
+            real_edits = ff.generate_file_fix_edits
+            real_whole = ff.generate_file_fix
+            real_gate = ff._gate_file
+            real_max = ff.FIX_FILE_MAX_SECONDS
+            try:
+                ff.generate_file_fix_edits = fake_edits
+                ff.generate_file_fix = fake_whole
+                ff._gate_file = lambda *a, **k: (True, "")
+                ff.FIX_FILE_MAX_SECONDS = 2  # keep the test fast
+                worker = threading.Thread(target=drive, daemon=True)
+                started = time.time()
+                worker.start()
+                worker.join(30)
+                elapsed = time.time() - started
+                alive = worker.is_alive()
+                with open(os.path.join(tmp, "hangs.py"), encoding="utf-8") as fh:
+                    hung_text = fh.read()
+            finally:
+                release.set()  # let the abandoned worker die, or exit hangs
+                ff.generate_file_fix_edits = real_edits
+                ff.generate_file_fix = real_whole
+                ff._gate_file = real_gate
+                ff.FIX_FILE_MAX_SECONDS = real_max
+
+        self.assertTrue(hung_entered.is_set(), "the hung generation never started")
+        # THE POINT: it returned at all. Pre-fix this blocked forever.
+        self.assertFalse(alive, "inline fix generation was never bounded - "
+                                "_fix_files never returned")
+        self.assertIsNone(box.get("err"), f"_fix_files raised: {box.get('err')}")
+        self.assertLess(elapsed, 30, "the fix queue did not bound its inline wait")
+        applied, _unver, notes = box["res"]
+        self.assertNotIn("hangs.py", applied)
+        # Rolled back through the contained chokepoint, not left half-written.
+        self.assertEqual(hung_text, "orig\n", "the timed-out file was not restored")
+        self.assertTrue(any("TIMED OUT" in n and "hangs.py" in n for n in notes),
+                        f"no loud abandonment note for the hung file: {notes}")
+        # And the queue KEPT MOVING - the healthy file behind it still got fixed.
+        self.assertIn("fine.py", applied)
+
+
 class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
     """Sol HIGH r3: when _fix_files raises DirtyTreeError (a refused rollback left an
     unverified candidate on disk), audit_one_program must NOT call _commit_and_sync -

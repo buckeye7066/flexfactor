@@ -111,10 +111,17 @@ measured **307.8s**, nearly all of it queued. So:
   that deadline is armed BELOW the prefetch consumption and is only tested
   BETWEEN attempts. The wait is now `pf.result(timeout=FIX_FILE_MAX_SECONDS)`
   and expiry abandons the file LOUDLY + re-queues it
-  (`PrefetchWaitIsBoundedTests`). **Residual, still open:** the INLINE
-  generation path (a file with no prefetch — notably the first file of a batch)
-  is still unbounded for the same reason; bounding it needs the same
-  thread-abandonment treatment.
+  (`PrefetchWaitIsBoundedTests`). The INLINE generation path (a file with no
+  prefetch — notably the FIRST file of every batch, and every retry attempt) had
+  the same unbounded shape and is now bounded too: `_call_bounded` runs the
+  generation on a DAEMON thread and waits only until `file_deadline`; on expiry
+  the thread is ABANDONED (Windows cannot interrupt a blocking recv), the file
+  is rolled back through the contained chokepoint, accounted `[timeout]` and
+  re-queued, and a REFUSED rollback still takes the `[dirty-abort]` path
+  (`InlineFixGenerationIsBoundedTests`). `_AbandonedCallTimeout` is caught
+  BEFORE the generic `except Exception`, so a timeout never demotes to
+  whole-file mode against the same wedged backend. daemon=True is load-bearing:
+  a `ThreadPoolExecutor` thread would keep the interpreter alive at exit.
 - `_is_backpressure` — 429/overloaded/503/model-loading/cold-start means *alive,
   be patient*: back off and retry FREE, never rescue. **Trap:** markers must be
   specific phrases. A bare `"queue"` marker made `StreamDeadlineError`

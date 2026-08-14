@@ -285,6 +285,53 @@ class DirtyTreeError(RuntimeError):
         super().__init__("un-rolled-back candidate(s) left on disk: " + ", ".join(self.files))
 
 
+class _AbandonedCallTimeout(RuntimeError):
+    """A bounded wait on a model call expired. The worker thread was ABANDONED
+    (it is still running); the caller must treat the file as timed out, roll it
+    back and re-queue it. Never caught by the generic `except Exception`
+    fallbacks - it is checked FIRST at every call site so a wedged backend can
+    never be "recovered" into another equally wedged call."""
+
+
+def _call_bounded(fn, timeout_s: float):
+    """Run `fn()` on a DAEMON thread and wait at most `timeout_s` seconds.
+
+    Why a thread and not a deadline inside the call: `_stream_with_deadline` is
+    deliberately two-phase (first-event budget, then a per-event IDLE budget)
+    with NO total-elapsed cap, so a stream that keeps dribbling one event inside
+    the idle window never times out - by design, so a slow-but-progressing
+    generation is never killed. That is exactly why it cannot be the only bound.
+    Windows cannot interrupt a thread blocked in a socket recv, so on expiry the
+    worker is ABANDONED (it dies on its own transport deadline) and
+    `_AbandonedCallTimeout` is raised on the caller's thread.
+
+    daemon=True is load-bearing: an abandoned worker must never keep the
+    interpreter alive at exit (a `ThreadPoolExecutor` thread would, because
+    `concurrent.futures` joins its threads at shutdown).
+
+    Whatever `fn` raises is re-raised on the caller's thread, so existing
+    except-paths (BudgetExceededError, oversized/token-budget, edit fallback)
+    behave exactly as they do in a direct call."""
+    box: dict = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            box["v"] = fn()
+        except BaseException as ex:  # noqa: BLE001 - re-raised on the caller's thread
+            box["e"] = ex
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True,
+                     name="flexfactor-bounded-call").start()
+    if not done.wait(max(0.0, timeout_s)):
+        raise _AbandonedCallTimeout(f"call did not return within {timeout_s:.0f}s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 @contextlib.contextmanager
 def _budget_guard(meter, model: str, prompt_chars: int, max_tokens: int):
     """THE budget chokepoint: every provider call runs inside this. It atomically
@@ -8265,8 +8312,17 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                             raise pre[2]  # same fallback path as an inline failure
                         epatch = pre[2]
                     else:
-                        epatch = generate_file_fix_edits(author, rel, original, targets,
-                                                         feedback=feedback)
+                        # BOUNDED. The INLINE path (no prefetch - notably the
+                        # FIRST file of a batch, and every retry) had exactly the
+                        # same unbounded shape the prefetch consumption did: a
+                        # wedged backend parks THIS thread forever, meter frozen,
+                        # no output. file_deadline is the per-file ceiling; it
+                        # used to be tested only BETWEEN attempts, which a call
+                        # that never returns never reaches.
+                        epatch = _call_bounded(
+                            lambda: generate_file_fix_edits(
+                                author, rel, original, targets, feedback=feedback),
+                            file_deadline - time.time())
                     if not epatch.get("changed"):
                         outcome = ("noop", epatch.get("notes", ""))
                         break
@@ -8290,6 +8346,12 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         edit_mode = False
                         print(f"  [edit-fallback] {rel}: {apply_err or 'edits were a no-op'}"
                               " -> regenerating whole file")
+                except _AbandonedCallTimeout:
+                    # Do NOT demote to whole-file mode: the SAME wedged backend
+                    # would just park this thread again. Route into the per-file
+                    # timeout path (rollback + loud [timeout] + re-queue).
+                    timed_out = True
+                    break
                 except BudgetExceededError:
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
@@ -8305,8 +8367,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                             raise pre[2]  # keep oversized/skip handling identical
                         patch = pre[2]
                     else:
-                        patch = generate_file_fix(author, rel, original, targets,
-                                                  feedback=feedback)
+                        patch = _call_bounded(  # BOUNDED - see the edits path above
+                            lambda: generate_file_fix(
+                                author, rel, original, targets, feedback=feedback),
+                            file_deadline - time.time())
+                except _AbandonedCallTimeout:
+                    timed_out = True
+                    break
                 except BudgetExceededError:
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
