@@ -6648,6 +6648,80 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(res.get("bootstrap"), [])
 
 
+class PurposeEngineSurvivesFullyPooledProvidersTests(unittest.TestCase):
+    """The purpose engine must still get a provider when the free pool covers
+    EVERY backend - the normal shape on this machine.
+
+    `reviewers` is deliberately filtered down to only what is GENUINELY
+    ADDITIONAL to the concurrent free-review pool. When the pool covers every
+    usable backend (anthropic-via-FCC + ollama pooled, providers==['anthropic'])
+    that list is EMPTY. The two assess_purpose_gap calls indexed it directly
+    (reviewers[-1] baseline, reviewers[0] final), so both raised IndexError,
+    both non-fatal handlers swallowed it, and the purpose-first phase never ran.
+    Live evidence, GrantFlow prodready 2026-08-13:
+    "purpose baseline failed (non-fatal): list index out of range".
+
+    This test drives the REAL audit_one_program in exactly that provider shape
+    and fails against the pre-fix code."""
+
+    def _run_fully_pooled(self, files):
+        captured = {}
+
+        def fake_run_audit(a):
+            captured["args"] = a
+            return 0
+
+        with _RepoFixture(files) as root:
+            with _patched(ff, "run_audit", fake_run_audit):
+                ff.main(["prodready", "--program", root, "--no-bootstrap",
+                         "--no-preflight", "--no-dashboard", "--no-tests",
+                         "--no-e2e", "--no-full-suite"])
+            args = captured["args"]
+            stub = _StubProvider()
+            seen = []
+
+            def fake_build(a, m=None):
+                # EXACTLY what build_audit_providers does when every usable
+                # backend is free and pooled: the pool holds it, and the
+                # returned provider list names the same backend - so the
+                # reviewers filter removes it and leaves [].
+                ff._LAST_FREE_REVIEW_POOL = [("stub", stub, 2)]
+                return [("stub", stub)]
+
+            def spy_assess(reviewer, *a, **kw):
+                seen.append(reviewer)
+                return {"gaps": [], "criteria_total": 0, "fulfillment_pct": 100}
+
+            real_pool = ff._LAST_FREE_REVIEW_POOL
+            try:
+                with _patched(ff, "build_audit_providers", fake_build), \
+                     _patched(ff, "assess_purpose_gap", spy_assess), \
+                     _patched(ff, "_full_gate",
+                              lambda d, s: (None, "(build stubbed offline in tests)")):
+                    res = ff.audit_one_program(root, args, 0, 1, None)
+            finally:
+                ff._LAST_FREE_REVIEW_POOL = real_pool
+            return res, seen, stub
+
+    def test_purpose_engine_still_runs_when_pool_covers_every_backend(self):
+        res, seen, stub = self._run_fully_pooled({
+            "package.json": '{"name":"x","scripts":{"build":"tsc"}}',
+            "README.md": "# Widget\n\nTurns widgets into gadgets for the owner.\n",
+            "src/app.js": "console.log(1);\n"})
+        self.assertIsNone(res.get("error"), res.get("error"))
+        self.assertTrue(
+            seen,
+            "assess_purpose_gap was NEVER called: with every backend pooled, "
+            "`reviewers` is empty and the old reviewers[-1]/reviewers[0] "
+            "indexing raised IndexError into a non-fatal handler, silently "
+            "disabling the purpose-first phase")
+        for reviewer in seen:
+            self.assertIsNotNone(
+                reviewer, "the purpose engine was handed a None provider")
+        self.assertIs(seen[0], stub,
+                      "the fallback must be the live author provider (pool[0])")
+
+
 class ScoutBridge94to100Tests(unittest.TestCase):
     """Production exit criteria 98-100 (+ bridge 94-97 invariants)."""
 

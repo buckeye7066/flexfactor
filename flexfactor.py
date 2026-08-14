@@ -8842,6 +8842,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         else:
             reviewers = [p for _, p in providers]
             active = ", ".join(f"{n}:{p.model}" for n, p in providers)
+        # PURPOSE ENGINE PROVIDER. The two assess_purpose_gap calls below used to
+        # index `reviewers` directly ([-1] for the PHASE 1 baseline, [0] for the
+        # final assessment). But `reviewers` is filtered to only what is
+        # GENUINELY ADDITIONAL to the free pool - so whenever the pool covers
+        # every usable backend, which is the NORMAL case on this machine
+        # (anthropic-via-FCC + ollama both pooled, providers==['anthropic']),
+        # that list is EMPTY and both calls raised IndexError. Both are wrapped
+        # in non-fatal handlers, so the failure printed one line and the
+        # purpose-first phase that is the entire point of the tool silently
+        # never ran - degrading every run to exactly the generic defect sweep
+        # the owner's doctrine says it must not be. Live evidence, GrantFlow
+        # 2026-08-13: "purpose baseline failed (non-fatal): list index out of
+        # range". The author is always a live provider (pool[0], the fastest
+        # free backend), so it is the correct fallback.
+        purpose_reviewer = reviewers[-1] if reviewers else author
+        purpose_reviewer_final = reviewers[0] if reviewers else author
 
         print(f"{pfx}FlexFactor AUDIT | dir={project_dir}")
         print(f"{pfx}providers={active} fix>={args.fix_severity} "
@@ -8984,7 +9000,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                   "and the job it was created to do...")
             try:
                 purpose_before = assess_purpose_gap(
-                    reviewers[-1], purpose_blob, all_files, [],
+                    purpose_reviewer, purpose_blob, all_files, [],
                     project_dir=project_dir, contract=purpose_contract)
             except BudgetExceededError:
                 print(f"{pfx}purpose baseline skipped: cost cap reached")
@@ -9377,7 +9393,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Assessing purpose gap (metadata vs delivered behavior)...")
             try:
                 purpose_gap = assess_purpose_gap(
-                    reviewers[0], purpose_blob, all_files, all_findings,
+                    purpose_reviewer_final, purpose_blob, all_files, all_findings,
                     project_dir=project_dir, contract=purpose_contract)
             except BudgetExceededError:
                 print(f"{pfx}purpose-gap skipped: cost cap reached")
