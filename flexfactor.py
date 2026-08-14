@@ -5873,6 +5873,35 @@ AUDIT_FINDINGS_SCHEMA = {
     "additionalProperties": False,
 }
 
+# WHY THIS FIELD IS WORDED THIS WAY (2026-08-14, measured — do not narrow it back).
+#
+# `_classify_noop` splits `[no-op]` into "finding rejected" (a success of
+# judgement) and "no fix found" (a failure of capability), and the REJECTED rate
+# is the run's review-precision signal. It reads THIS field. The previous wording
+# was "Only defects genuinely left unfixed because they need changes outside this
+# file / new deps / backend work" — which scopes the field to ONE of the two
+# families and, by saying "only", tells the model the field does not apply when
+# it is rejecting a finding as wrong.
+#
+# Measured across every no-op note this machine has produced (31 notes, runs 4-6):
+# 24 were UNCLEAR and **20 of those were EMPTY** — the model satisfied a required
+# string field with "" because the description said the case did not apply. Only
+# 7 of 31 classified. The classifier was not buggy; it was STARVED, and no unit
+# test could catch it because tests supply notes and production mostly did not.
+#
+# The `changed` field above already names both families ("already correct" /
+# "nothing can be safely changed in this file alone"). This asks for the same
+# distinction in prose so it survives into the report and the manifest.
+_NOTES_FIELD_DESCRIPTION = (
+    "REQUIRED whenever changed=false: state WHY, naming the findings, in one of "
+    "two forms - (a) THE FINDING IS WRONG for this file (already correct, a false "
+    "positive, describes a different revision, or does not apply here), or (b) THE "
+    "DEFECT IS REAL but cannot be fixed in this file alone (needs changes outside "
+    "this file / new deps / backend work). Say which of (a) or (b) applies; never "
+    "leave this empty when changed=false. When changed=true, list only the defects "
+    "genuinely left unfixed and why."
+)
+
 # The corrected file produced from a list of findings.
 FIX_PATCH_SCHEMA = {
     "type": "object",
@@ -5884,7 +5913,7 @@ FIX_PATCH_SCHEMA = {
         "fixed_titles": {"type": "array", "items": {"type": "string"},
                          "description": "Titles of the findings actually fixed."},
         "notes": {"type": "string",
-                  "description": "Only defects genuinely left unfixed because they need changes outside this file / new deps / backend work - with which findings, and why."},
+                  "description": _NOTES_FIELD_DESCRIPTION},
     },
     "required": ["changed", "contents", "fixed_titles", "notes"],
     "additionalProperties": False,
@@ -5920,7 +5949,7 @@ FIX_EDITS_SCHEMA = {
         "fixed_titles": {"type": "array", "items": {"type": "string"},
                          "description": "Titles of the findings actually fixed."},
         "notes": {"type": "string",
-                  "description": "Only defects genuinely left unfixed because they need changes outside this file / new deps / backend work - with which findings, and why."},
+                  "description": _NOTES_FIELD_DESCRIPTION},
     },
     "required": ["changed", "edits", "fixed_titles", "notes"],
     "additionalProperties": False,
@@ -8550,6 +8579,14 @@ _NOOP_REJECTED_PATTERNS = (
     r"do(es)?\s+not\s+match\s+the\s+actual\s+file",
     r"false\s+positive",
     r"separate\s+(component\s+)?scopes",
+    # Added 2026-08-14 from the live 31-note corpus - each is a VERBATIM shape
+    # from a production note the table previously missed. Rejections outnumber
+    # no-fixes among notes that say anything at all, so a gap here biases the
+    # review-precision number DOWNWARD (it under-credits correct refusals).
+    r"\bspurious\b",                                   # AgentOverviewCards.jsx
+    r"already\s+guarded",                              # anyaBackgroundQueue.jsx
+    r"no\s+safe\s+in-file\s+(change|edit)\s+is\s+warranted",   # fundingResultsStore.js
+    r"does\s+not\s+apply\s+(to\s+)?(this|the)\s+file",
 )
 # A no-op that is a genuine FAILURE: a real defect the loop could not land.
 _NOOP_NO_FIX_PATTERNS = (
