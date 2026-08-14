@@ -3507,8 +3507,29 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
 # --------------------------------------------------------------------------- #
 _SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".next", "out", ".venv",
               "__pycache__", ".cache", "coverage", "vendor"}
-_PROJECT_ROOTS = [r"C:\Users\firer", "G:\\", r"C:\Users\firer\source",
-                  r"C:\Users\firer\Documents\Projects"]
+def _default_project_roots() -> "list[str]":
+    """Where a bare program NAME is searched for.
+
+    FLEXFACTOR_PROJECT_ROOTS (os.pathsep-separated) wins outright when set. It
+    exists because the built-in list is Windows-absolute, so on any other host
+    -- the Android/Termux checkout is the live case -- every one of these
+    entries misses and `--program GrantFlow` resolves to nothing while
+    `--program /abs/path` still works. That asymmetry is confusing enough to be
+    worth an env var; silently searching four non-existent Windows paths is
+    not a useful default anywhere but this laptop.
+    """
+    raw = (os.environ.get("FLEXFACTOR_PROJECT_ROOTS") or "").strip()
+    if raw:
+        return [p for p in (s.strip() for s in raw.split(os.pathsep)) if p]
+    if os.name == "nt":
+        return [r"C:\Users\firer", "G:\\", r"C:\Users\firer\source",
+                r"C:\Users\firer\Documents\Projects"]
+    home = os.path.expanduser("~")
+    return [os.path.join(home, "phone-console"), home,
+            os.path.join(home, "source"), os.path.join(home, "Projects")]
+
+
+_PROJECT_ROOTS = _default_project_roots()
 
 
 def _slugify(text: str) -> str:
