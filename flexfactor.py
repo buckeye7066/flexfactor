@@ -7868,6 +7868,35 @@ def _full_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     return True, "\n\n".join(logs)
 
 
+def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
+    """Verify the exact tree strongly enough to publish it.
+
+    A bundle/typecheck gate is necessary, but it is not a substitute for a
+    repository's own tests. Family Castle Clash proved the distinction on
+    2026-08-14: FlexFactor changed an ES-module test from ``import`` to
+    ``require`` and pushed the commit as "Final build gate: passed" because
+    Vite could still build the client. The target's own mechanics test failed
+    immediately with ``require is not defined in ES module scope``.
+
+    Run the normal build gate first, then the strongest test command the
+    project explicitly exposes (``test:all``/CI via ``full_suite_cmd``, falling
+    back to ``test_cmd``). Repositories with no test command retain the build
+    result; the status message makes that narrower evidence explicit. A
+    defined-but-red suite is a hard publication failure.
+    """
+    build_ok, build_log = _full_gate(project_dir, stack)
+    if build_ok is not True:
+        return build_ok, build_log
+    suite_cmd = stack.get("full_suite_cmd") or stack.get("test_cmd")
+    if not suite_cmd:
+        return True, build_log + "\n\n(no project test suite configured)"
+    print(f"    publication verify: {' '.join(suite_cmd)}")
+    r = _run(suite_cmd, project_dir, timeout=2400)
+    suite_log = (f"$ {' '.join(suite_cmd)}\n"
+                 f"{_tail(r.stdout + chr(10) + r.stderr, 80)}")
+    return (r.returncode == 0, build_log + "\n\n" + suite_log)
+
+
 def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     """Run the project's own test suite. None if there's no runner."""
     if not stack.get("test_cmd"):
@@ -9321,12 +9350,20 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     if diff.returncode != 1:
         raise BranchStateError(
             f"{label}: 'git diff --cached' errored (rc={diff.returncode}): {_tail(diff.stderr, 3)}")
-    final_ok, _ = _full_gate(project_dir, stack)
-    gate_word = ("passed" if final_ok is True else
+    # PUBLICATION VERIFICATION is stronger than the bundle/build gate. If the
+    # target defines a test:all/CI/test command, it must pass BEFORE this
+    # checkpoint can be pushed or merged. A green build with a red suite is the
+    # exact failure mode that let FlexFactor publish broken Family Castle Clash
+    # commits while labelling every one "Final build gate: passed".
+    final_ok, _gate_log = _publication_gate(project_dir, stack)
+    has_suite = bool(stack.get("full_suite_cmd") or stack.get("test_cmd"))
+    gate_word = (("passed (build + project test suite)" if has_suite else
+                  "passed (build only; no project test suite configured)")
+                 if final_ok is True else
                  "NOT RUN - no build/verify command, so NOTHING was verified"
                  if final_ok is None else "FAILED — see report")
     full_msg = (f"FlexFactor audit {label}\n\n"
-                f"Final build gate: {gate_word}.\n"
+                f"Final verification gate: {gate_word}.\n"
                 "Co-Authored-By: FlexFactor <noreply@flexfactor.local>")
     rc = _git(["commit", "-m", full_msg], project_dir)
     if rc.returncode != 0:
@@ -9336,8 +9373,16 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         raise BranchStateError(
             f"{label}: 'git commit' failed (rc={rc.returncode}) - staged changes are "
             f"NOT committed, stopping: {_tail(rc.stdout + rc.stderr, 4)}")
-    status = (f"{label}: committed on {branch} "
-              f"(build {'ok' if final_ok is True else 'NOT VERIFIED' if final_ok is None else 'FAILED'})")
+    if final_ok is True:
+        verification_word = ("build + project tests ok" if has_suite else
+                             "build ok; no project test suite configured")
+    elif final_ok is None:
+        verification_word = "build NOT VERIFIED"
+    elif has_suite:
+        verification_word = "build and/or project tests FAILED"
+    else:
+        verification_word = "build FAILED"
+    status = f"{label}: committed on {branch} ({verification_word})"
     if args.push and _git_has_remote(project_dir):
         # PUBLICATION GATE (live GrantFlow 2026-08-14 - FlexFactor pushed a RED
         # BUILD to main). The gate below the commit was ALREADY tri-state and
@@ -9366,7 +9411,7 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             pr = _git(["push", "-u", "origin", branch], project_dir)
             status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
         else:
-            status += ("; PUSH REFUSED - the final build gate "
+            status += ("; PUSH REFUSED - the final verification gate "
                        + ("FAILED" if final_ok is False else
                           "did not run (no build/verify command exists), so "
                           "NOTHING was verified")
@@ -10698,10 +10743,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # "finished" (no longer resumable); anything else (cost cap, manual-
         # review leftovers, an aborted cycle) is marked "interrupted" so the
         # next invocation of the same program recovers it.
+        # Review convergence is only one layer of completion. A red project
+        # suite or an explicitly failed production-readiness score means the
+        # run is still unfinished even when the model sweep found==fixed.
+        # Family Castle Clash demonstrated why: the sweep converged, some files
+        # were fixed, and the process could still exit 0 / mark its checkpoint
+        # finished while the repository's mechanics test crashed.
+        run_complete = (converged
+                        and suite_status is not False
+                        and (readiness is None or readiness.get("ready") is not False))
         if checkpoint is not None:
             with contextlib.suppress(Exception):
                 checkpoint.finish(
-                    status=("finished" if converged else "interrupted"),
+                    status=("finished" if run_complete else "interrupted"),
                     defects_found=len(all_findings), defects_fixed=len(applied_files))
         if _rsmod is not None:
             with contextlib.suppress(Exception):
@@ -10725,7 +10779,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             else:
                 print(f"{pfx}note: could not return to '{prev_branch}' "
                       f"({_tail(back.stderr, 2)}); still on {branch}.")
-        report(phase=("done - CLEAN" if converged else "done - partial"), done=True,
+        report(phase=("done - verified" if run_complete else "done - partial"), done=True,
                fix_done=len(done_set), fix_total=total_to_review, fixed=len(done_set),
                defects=len(all_findings), errors=errors_total, cost=round(meter.usd, 4))
         return result
@@ -10879,6 +10933,20 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     """
     if any(r.get("error") is not None for r in results):
         return 1
+    # A run that changed files is not successful merely because it changed
+    # *something*. Explicitly partial review, a red repository suite, or a
+    # failed readiness verdict must remain visible to supervisors as failure.
+    # Before this check, FCC could have fixed>0, suite_status=False, and exit 0.
+    incomplete = [r for r in results
+                  if r.get("converged") is False
+                  or r.get("suite_status") is False
+                  or r.get("readiness_ready") is False]
+    if incomplete:
+        names = ", ".join(str(r.get("name")) for r in incomplete)
+        print(f"\nFAILED: {len(incomplete)} program(s) ({names}) did not reach a "
+              "verified complete state (review convergence, project suite, or "
+              "production-readiness gate is still red).", file=sys.stderr)
+        return 1
     if not apply_requested:
         return 0
     # "Applied nothing" means no file fixed AND no defects were found to fix.
@@ -11019,7 +11087,16 @@ def _print_audit_summary(a: dict) -> None:
     print(f"  button/UI tests:  {'pass' if e.get('ok') else 'fail' if e.get('ran') else 'skipped'}")
     ss = a.get("suite_status")
     print(f"  full test suite:  {'GREEN' if ss else 'RED' if ss is False else 'not run'}")
-    print(f"  convergence:      {'CLEAN (found == fixed)' if a.get('converged') else a.get('stop_reason', '?')}")
+    if a.get("converged"):
+        if a.get("suite_status") is False:
+            convergence_label = "REVIEW CONVERGED; PROJECT SUITE RED"
+        elif (a.get("readiness") or {}).get("ready") is False:
+            convergence_label = "REVIEW CONVERGED; RELEASE READINESS BLOCKED"
+        else:
+            convergence_label = "REVIEW CONVERGED (found == fixed)"
+    else:
+        convergence_label = a.get("stop_reason", "?")
+    print(f"  convergence:      {convergence_label}")
     print(f"  files now clean:   {len(a.get('clean_files') or [])} (remembered; skipped next run)")
     print(f"  cycles run:       {a.get('cycles', 1)}")
     print(f"  providers:        {', '.join(a.get('providers') or []) or '(unknown)'}")

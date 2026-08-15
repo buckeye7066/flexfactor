@@ -9913,6 +9913,43 @@ class VacuousGateTests(unittest.TestCase):
         self.assertIn("; pushed", status)
         self.assertNotIn("REFUSED", status)
 
+    def test_green_build_but_red_project_suite_is_committed_locally_not_published(self):
+        """FCC built successfully while its own ESM mechanics test crashed.
+        A build-only publication gate pushed that red tree to main."""
+        import types
+        calls = []
+
+        def fake_git(argv, project_dir, *a, **k):
+            calls.append(list(argv))
+            rc = 1 if argv[:2] == ["diff", "--cached"] else 0
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+        def fake_run(argv, cwd, timeout=None):
+            self.assertEqual(argv, ["npm", "run", "test:all"])
+            return types.SimpleNamespace(returncode=1, stdout="",
+                                         stderr="require is not defined")
+
+        args = types.SimpleNamespace(push=True, merge=True)
+        stack = {"full_suite_cmd": ["npm", "run", "test:all"]}
+        originals = {name: getattr(ff, name) for name in
+                     ("_git", "_git_has_remote", "_git_current_branch",
+                      "_full_gate", "_run")}
+        ff._git = fake_git
+        ff._git_has_remote = lambda pd: True
+        ff._git_current_branch = lambda pd: "main"
+        ff._full_gate = lambda pd, st: (True, "build green")
+        ff._run = fake_run
+        try:
+            status = ff._commit_and_sync("/proj", "main", "main", args,
+                                         "cycle 1", stack)
+        finally:
+            for name, value in originals.items():
+                setattr(ff, name, value)
+        self.assertEqual([c for c in calls if c[:1] == ["push"]], [])
+        self.assertEqual(len([c for c in calls if c[:1] == ["commit"]]), 1)
+        self.assertIn("project tests FAILED", status)
+        self.assertIn("PUSH REFUSED", status)
+
     def test_no_build_command_is_still_None_not_False(self):
         # Load-bearing distinction (CLAUDE.md): a repo with no runnable build is
         # UNVERIFIED, not FAILED. Refusing to publish must not be achieved by
@@ -9961,6 +9998,22 @@ class ApplyExitCodeTests(unittest.TestCase):
     def test_apply_that_fixed_something_exits_zero(self):
         results = [{"name": "A", "error": None, "defects": 10, "fixed": 4}]
         self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 0)
+
+    def test_fixed_something_but_red_project_suite_exits_failure(self):
+        results = [{"name": "A", "error": None, "defects": 10, "fixed": 4,
+                    "converged": True, "suite_status": False}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 1)
+
+    def test_fixed_something_but_review_not_converged_exits_failure(self):
+        results = [{"name": "A", "error": None, "defects": 10, "fixed": 4,
+                    "converged": False, "suite_status": True}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 1)
+
+    def test_prodready_blocked_exits_failure_even_after_fixes(self):
+        results = [{"name": "A", "error": None, "defects": 10, "fixed": 4,
+                    "converged": True, "suite_status": True,
+                    "readiness_ready": False}]
+        self.assertEqual(ff._audit_exit_code(results, apply_requested=True), 1)
 
     def test_genuinely_clean_repo_exits_zero(self):
         results = [{"name": "A", "error": None, "defects": 0, "fixed": 0}]
