@@ -9950,6 +9950,28 @@ class VacuousGateTests(unittest.TestCase):
         self.assertIn("project tests FAILED", status)
         self.assertIn("PUSH REFUSED", status)
 
+    def test_the_suite_is_not_run_when_the_build_already_failed(self):
+        # Publication is already impossible on a red/unverified build, and the
+        # project suite can take 20+ minutes - _publication_gate must return
+        # the build verdict without spending that time.
+        import types
+        ran = []
+
+        def fake_run(argv, cwd, timeout=None):
+            ran.append(list(argv))
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        orig_gate, orig_run = ff._full_gate, ff._run
+        ff._full_gate = lambda pd, st: (False, "build red")
+        ff._run = fake_run
+        try:
+            ok, _log = ff._publication_gate(
+                "/proj", {"full_suite_cmd": ["npm", "run", "test:all"]})
+        finally:
+            ff._full_gate, ff._run = orig_gate, orig_run
+        self.assertIs(ok, False)
+        self.assertEqual(ran, [], "a red build still spent the suite's runtime")
+
     def test_no_build_command_is_still_None_not_False(self):
         # Load-bearing distinction (CLAUDE.md): a repo with no runnable build is
         # UNVERIFIED, not FAILED. Refusing to publish must not be achieved by

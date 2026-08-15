@@ -63,6 +63,30 @@ of riding a review mode. The surviving rules, and the defect each one killed:
   **source grep for the sentence** and passed happily the entire time red builds
   were shipping — a check that cannot fail proves nothing. The replacements
   drive the real `_commit_and_sync` decision and assert on the git argv issued.
+- **PUBLICATION REQUIRES THE PROJECT'S OWN TEST SUITE (2026-08-14, owner:
+  "when you find flexfactor bugs like the push gate, fix them").** The build
+  gate alone let a BUILD-CLEAN regression ship: the live Family Castle Clash
+  audit rewrote an ESM `import` to `require` and widened the room-code
+  alphabet past the join validator — Vite still built, four per-cycle pushes
+  labelled "Final build gate: passed" carried both to the owner's main, and
+  only the ungated end-of-run suite reported RED. `_publication_gate()` now
+  fronts `_commit_and_sync`: the build gate first (red/unverified returns
+  immediately — the suite's 20+ minutes are never spent on an unpublishable
+  tree), then the STRONGEST suite the project exposes (`full_suite_cmd`,
+  i.e. test:all/ci, falling back to `test_cmd`; detected in
+  `_enrich_stack_with_toolchains`). A defined-but-red suite is a hard
+  publication failure — push AND merge refuse on the same verdict, the work
+  stays committed locally, and the commit message says which evidence backed
+  it ("build + project test suite" vs "build only; no project test suite
+  configured" — a repo with no runner still publishes on the build, since a
+  blanket unpublish is not a safety gate). Completion honesty rides along:
+  `checkpoint.finish` marks a run "finished" only when the sweep converged
+  AND the suite isn't red AND readiness didn't fail — a converged sweep atop
+  a crashed mechanics test is "interrupted", and the console says
+  "done - verified" vs "done - partial". NOTE: two implementations of this
+  gate were built concurrently (this one via the GitHub-hosted runner; a
+  local one, discarded as the narrower of the two) — when reworking it,
+  check origin/main first.
 - **Scout is deliberately exempt.** `scout --apply` stays opt-in: the owner's own
   contract for Scout requires "proposal-only default; separate explicit
   FlexFactor apply approval". Never flip it to match audit.
