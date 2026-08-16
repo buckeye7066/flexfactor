@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.7"
+TOOL_VERSION = "0.3.8"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -1718,8 +1718,9 @@ class AnthropicProvider:
             # Explicit base_url too: free mode leaves OPENAI_BASE_URL="" in the
             # env, and the SDK honors an empty-but-present env value as a literal
             # base URL -> APIConnectionError (verified live 2026-08-10).
-            prov.client = openai.OpenAI(api_key=key,
-                                        base_url="https://api.openai.com/v1")
+            prov.client = openai.OpenAI(
+                api_key=key, base_url="https://api.openai.com/v1",
+                timeout=_openai_call_timeout_seconds(), max_retries=0)
             self._oai_rescue = prov
         return self._oai_rescue
 
@@ -2082,6 +2083,30 @@ class AnthropicProvider:
             oai.ping()
 
 
+OPENAI_CALL_TIMEOUT_S = 300.0
+
+
+def _openai_call_timeout_seconds() -> float:
+    """Hard SDK deadline for one paid OpenAI request.
+
+    The OpenAI SDK otherwise permits a long request timeout and retries it by
+    default. A stalled request can therefore hold a purpose-assessment worker
+    for tens of minutes while the console, checkpoint, and cost meter are all
+    silent. Keep the deadline configurable for unusually slow accounts, but
+    never allow a non-finite or non-positive value to disable the fail-safe.
+    """
+    raw = (os.environ.get("FLEXFACTOR_OPENAI_CALL_TIMEOUT") or "").strip()
+    if not raw:
+        return OPENAI_CALL_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return OPENAI_CALL_TIMEOUT_S
+    if value != value or value <= 0.0 or value > 1800.0:
+        return OPENAI_CALL_TIMEOUT_S
+    return value
+
+
 class OpenAIProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import openai  # lazy import
@@ -2089,7 +2114,12 @@ class OpenAIProvider:
         self.model = model  # AUTHOR tier (code generation)
         self.judge_model = judge_model or model  # cheap tier for classification calls
         self.meter = None  # set by make_provider; records token spend if present
-        self.client = openai.OpenAI()  # resolves OPENAI_API_KEY from the environment
+        # `max_retries=0` is load-bearing. The SDK's default long timeout plus
+        # automatic retries made three concurrent GrantFlow purpose samples sit
+        # silent for 12+ minutes. One bounded failure is visible and resumable;
+        # several hidden retries are neither.
+        self.client = openai.OpenAI(
+            timeout=_openai_call_timeout_seconds(), max_retries=0)
 
     def _meter(self, resp, model: str) -> None:
         # Bill against the model ACTUALLY used (author vs judge), not self.model.
@@ -8316,27 +8346,46 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
                                   project_dir=project_dir, contract=contract)
         if out is not None:
             out["assessment_samples"] = 1
+            out["assessment_expected_samples"] = 1
+            out["assessment_errors"] = []
             out["assessment_stable"] = None   # UNMEASURED - not the same as stable
             out["criteria_noise_band"] = None
         return out
 
     def _one(_i):
         try:
-            return _purpose_gap_sample(provider, purpose_blob, files, findings,
-                                       project_dir=project_dir, contract=contract)
+            return (_purpose_gap_sample(provider, purpose_blob, files, findings,
+                                        project_dir=project_dir, contract=contract), None)
         except BudgetExceededError:
             raise
-        except Exception:
-            return None   # one bad sample must never sink the assessment
+        except Exception as ex:
+            # Keep partial voting available, but never erase the reason a sample
+            # disappeared. The audit completion gate below treats these as
+            # incomplete evidence rather than quietly publishing a smaller vote.
+            return None, f"{type(ex).__name__}: {ex}"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
-        results = list(pool.map(_one, range(n)))
+        rows = list(pool.map(_one, range(n)))
+    results = [result for result, _error in rows]
+    errors = [error for _result, error in rows if error]
     good = [r for r in results if isinstance(r, dict) and r.get("acceptance_coverage")]
     if not good:
-        return next((r for r in results if isinstance(r, dict)), None)
+        fallback = next((r for r in results if isinstance(r, dict)), None)
+        if fallback is None:
+            detail = "; ".join(errors[:3]) or "all responses were unusable"
+            raise RuntimeError(
+                f"all {n} purpose assessment samples failed: {detail}")
+        fallback["assessment_samples"] = 1
+        fallback["assessment_expected_samples"] = n
+        fallback["assessment_errors"] = errors
+        fallback["assessment_stable"] = None
+        fallback["criteria_noise_band"] = None
+        return fallback
     if len(good) == 1:
         out = good[0]
         out["assessment_samples"] = 1
+        out["assessment_expected_samples"] = n
+        out["assessment_errors"] = errors
         out["assessment_stable"] = None
         out["criteria_noise_band"] = None
         return out
@@ -8351,6 +8400,8 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
     base["fulfillment_pct"] = (round(100.0 * agg["criteria_met"] / agg["criteria_total"])
                                if agg["criteria_total"] else base.get("fulfillment_pct"))
     base["assessment_samples"] = agg["samples"]
+    base["assessment_expected_samples"] = n
+    base["assessment_errors"] = errors
     base["assessment_stable"] = agg["stable"]
     base["criteria_met_samples"] = agg["met_samples"]
     base["criteria_met_low"] = agg["met_low"]
@@ -11301,6 +11352,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # implicated in the purpose gap. A run that dies early has still closed
         # criteria; a run that finishes has closed the gap, not tidied the code.
         purpose_before = None      # baseline measurement (criteria met at start)
+        purpose_assessment_errors: list[str] = []
         bridged_early: list[str] = []
         # Competitor research (phase 1b). None = did not run / failed; the report
         # says which, because a silent absence reads as "no competitors exist".
@@ -11318,8 +11370,23 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     project_dir=project_dir, contract=purpose_contract)
             except BudgetExceededError:
                 print(f"{pfx}purpose baseline skipped: cost cap reached")
+                purpose_assessment_errors.append(
+                    "baseline purpose assessment skipped: cost cap reached")
             except Exception as ex:
                 print(f"{pfx}purpose baseline failed (non-fatal): {ex}")
+                purpose_assessment_errors.append(
+                    f"baseline purpose assessment failed: {type(ex).__name__}: {ex}")
+            if purpose_before:
+                _got = int(purpose_before.get("assessment_samples") or 0)
+                _want = int(purpose_before.get("assessment_expected_samples") or _got)
+                _sample_errors = list(purpose_before.get("assessment_errors") or [])
+                if _got < _want or _sample_errors:
+                    detail = (f"baseline purpose assessment incomplete: {_got}/{_want} "
+                              f"sample(s) usable"
+                              + (f"; {'; '.join(_sample_errors[:3])}"
+                                 if _sample_errors else ""))
+                    print(f"{pfx}WARNING: {detail}")
+                    purpose_assessment_errors.append(detail)
         purpose_files: list[str] = []
         if purpose_before:
             b_gaps = purpose_before.get("gaps") or []
@@ -11945,8 +12012,23 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     project_dir=project_dir, contract=purpose_contract)
             except BudgetExceededError:
                 print(f"{pfx}purpose-gap skipped: cost cap reached")
+                purpose_assessment_errors.append(
+                    "final purpose assessment skipped: cost cap reached")
             except Exception as ex:
                 print(f"{pfx}purpose-gap assessment failed (non-fatal): {ex}")
+                purpose_assessment_errors.append(
+                    f"final purpose assessment failed: {type(ex).__name__}: {ex}")
+            if purpose_gap:
+                _got = int(purpose_gap.get("assessment_samples") or 0)
+                _want = int(purpose_gap.get("assessment_expected_samples") or _got)
+                _sample_errors = list(purpose_gap.get("assessment_errors") or [])
+                if _got < _want or _sample_errors:
+                    detail = (f"final purpose assessment incomplete: {_got}/{_want} "
+                              f"sample(s) usable"
+                              + (f"; {'; '.join(_sample_errors[:3])}"
+                                 if _sample_errors else ""))
+                    print(f"{pfx}WARNING: {detail}")
+                    purpose_assessment_errors.append(detail)
         if purpose_gap:
             gaps = purpose_gap.get("gaps") or []
             pct = purpose_gap.get("fulfillment_pct")
@@ -12430,6 +12512,38 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             commit_status += (f"; NOTE your pre-run uncommitted changes are preserved as "
                               f"snapshot commit {dirty_snapshot[:9]} (first commit on {branch})")
 
+        # Purpose is the product contract, not optional decoration. A provider
+        # timeout used to disappear behind a "non-fatal" log and the audit could
+        # still exit 0 without ever measuring the job it was created to bridge.
+        # Preserve any already-verified fixes, but revoke convergence so the
+        # checkpoint remains resumable and supervisors see a real failure.
+        if (getattr(args, "purpose_gap", True) and purpose_blob
+                and (purpose_before is None or purpose_gap is None
+                     or purpose_assessment_errors)):
+            if purpose_before is None and not any(
+                    "baseline" in item for item in purpose_assessment_errors):
+                purpose_assessment_errors.append(
+                    "baseline purpose assessment returned no usable result")
+            if purpose_gap is None and not any(
+                    "final" in item for item in purpose_assessment_errors):
+                purpose_assessment_errors.append(
+                    "final purpose assessment returned no usable result")
+            converged = False
+            purpose_reason = ("purpose assessment incomplete: "
+                              + "; ".join(purpose_assessment_errors))
+            if (dirty_abort or infrastructure_abort
+                    or stop_reason.startswith("FAILED:")):
+                stop_reason += "; additionally, " + purpose_reason
+            else:
+                stop_reason = purpose_reason
+            all_findings.append({
+                "file": "(purpose)", "line": 0, "severity": "high",
+                "category": "quality-gate",
+                "title": "Purpose assessment evidence is incomplete",
+                "problem": "; ".join(purpose_assessment_errors),
+                "fix": "Retry the resumable run after restoring a responsive provider.",
+            })
+
         # 7.5 Exact deterministic evidence.  This is built from the tree as it
         # now exists, after repairs/tests and before any report claim.  A failed
         # or incomplete evidence gate revokes convergence; it cannot coexist
@@ -12602,6 +12716,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "verification_is_real": stack.get("verification_is_real"),
             "verification_note": stack.get("verification_note", ""),
             "purpose_gap": purpose_gap, "bridged_files": bridged_files,
+            "purpose_assessment_errors": list(purpose_assessment_errors),
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
             "purpose_contract": result.get("purpose_contract"),
