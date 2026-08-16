@@ -234,16 +234,31 @@ provider-sourced Scripture text*. That is the purpose contract acting as the
 authority, exactly as intended - a run where everything is accepted would mean
 the gate is not working.
 
-**KNOWN LIMITATION, measured not assumed: on the FREE judge tier, competitor
-ideas are effectively REPORT-ONLY.** The cheap model reliably fills
-`idea_title` / `why_valuable` / `purpose_reason` (after the one bounded retry)
-but omits `severity`, `code_fixable` and `file`, so `competitor_findings()`
-drops them at the severity floor and **0 ideas bridged** in the live run. That
-is the correct conservative behaviour - a missing severity must never be
-invented, and an idea with no file cannot be applied - but nobody should report
-"competitor research feeds the fix loop" as if it routinely fires. The lever,
-if the owner wants ideas to actually bridge, is routing `IDEA_SYSTEM` to the
-AUTHOR tier; that costs money and is an owner decision.
+**RESOLVED 2026-08-16 (two halves): idea extraction now runs on the AUTHOR
+tier, and every dropped idea is ACCOUNTED.** The live run had measured that on
+the FREE judge tier competitor ideas were effectively report-only: the cheap
+model filled `idea_title` / `why_valuable` / `purpose_reason` but omitted
+`severity`, `code_fixable` and `file`, so `competitor_findings()` dropped every
+idea and **0 of 8 bridged** — while the report said "2 accepted" with no word
+about where they went.
+1. `research_competitors(..., author=)` routes `IDEA_SYSTEM` extraction to the
+   injected STRONG-tier callable (the audit passes
+   `purpose_reviewer.structured`, NOT `_judge` — the tier is chosen per-call
+   via the `model=` arg, so the same provider object serves both). Discovery
+   and benefit judging STAY on the cheap judge; extraction is the one call
+   that decides whether an idea can actually be built. Falls back to `judge`
+   when no author is supplied. `CompetitorIdeaAuthorTierTests` pins the
+   routing at both the module and the audit call site.
+2. `competitor_findings()` writes `research["bridge_ledger"]`:
+   `candidates == bridged + dropped(by named reason)`, cap overflow recorded
+   (the `break` at the cap is GONE — the loop walks on so the tail is named),
+   `accounted: False` renders an ACCOUNTING-GAP warning in report + console.
+   The PHASE 1 purpose-gap loop got the same ledger (its three bare
+   `continue`s and the silent `[:cap_b]` truncation were the identical
+   shape — and its drops are the owner's own unmet acceptance criteria).
+   `CompetitorBridgeLedgerTests` pins both.
+A dropped idea remains correct conservative behaviour (a missing severity must
+never be invented) — the defect was the SILENCE, not the drop.
 
 **Second known limitation:** competitor *discovery* quality is the model's.
 "Scribe" resolved to `scribejava/scribejava`, which is not a sermon tool at all.

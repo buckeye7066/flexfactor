@@ -11796,6 +11796,190 @@ class CompetitorBridgeGateTests(unittest.TestCase):
                                                 file_exists=lambda x: False), [])
 
 
+class CompetitorBridgeLedgerTests(unittest.TestCase):
+    """The docstring said "everything it drops is still reported"; the live
+    SermonSmith run proved it a lie: 2 accepted, 0 bridged, no trace of why.
+    These tests pin the accounting contract: every candidate either bridges or
+    lands in the ledger with a reason, and candidates == bridged + dropped."""
+
+    @staticmethod
+    def _comp(name, **idea_over):
+        idea = {"accept": True, "code_fixable": True, "file": "src/app.js",
+                "severity": "high", "idea_title": f"T-{name}", "what_it_does": "W",
+                "why_valuable": "V", "purpose_reason": "P", "acceptance_ref": "3"}
+        idea.update(idea_over.pop("idea", {}))
+        c = {"name": name, "url": "https://x/", "evidence_urls": ["https://x/"],
+             "evidence_status": "verified", "reuse_mode": fc.REUSE_DIRECT,
+             "reuse_reason": "permissive", "license": "MIT", "idea": idea}
+        c.update(idea_over)
+        return c
+
+    def test_every_drop_reason_lands_in_the_ledger_and_the_sum_accounts(self):
+        research = {"competitors": [
+            self._comp("ok"),
+            self._comp("rejected", idea={"accept": False}),
+            self._comp("refonly", reuse_mode=fc.REUSE_REFERENCE),
+            self._comp("nofix", idea={"code_fixable": False}),
+            self._comp("nofile", idea={"file": ""}),
+            self._comp("lowsev", idea={"severity": "low"}),
+            self._comp("ghostfile", idea={"file": "gone/away.js"}),
+        ]}
+        out = fc.competitor_findings(research, severity_floor_rank=3,
+                                     severity_rank=ff.SEVERITY_RANK,
+                                     file_exists=lambda r: r == "src/app.js")
+        ledger = research["bridge_ledger"]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(ledger["candidates"], 7)
+        self.assertEqual(ledger["bridged"], 1)
+        self.assertEqual(ledger["dropped_total"], 6)
+        self.assertTrue(ledger["accounted"],
+                        "candidates != bridged + dropped: a candidate vanished")
+        reasons = "\n".join(ledger["dropped"].keys())
+        for frag, who in (("rejected by the purpose contract", "rejected"),
+                          ("not bridgeable", "refonly"),
+                          ("not code_fixable", "nofix"),
+                          ("no target file", "nofile"),
+                          ("below the --fix-severity floor", "lowsev"),
+                          ("does not exist in the repo", "ghostfile")):
+            self.assertIn(frag, reasons)
+            self.assertTrue(any(who in names for r, names
+                                in ledger["dropped"].items() if frag in r),
+                            f"{who} not attributed to reason {frag!r}")
+
+    def test_cap_overflow_is_recorded_not_silently_truncated(self):
+        research = {"competitors": [self._comp(f"c{i}") for i in range(4)]}
+        out = fc.competitor_findings(research, max_findings=1,
+                                     file_exists=lambda r: True)
+        ledger = research["bridge_ledger"]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(ledger["dropped_total"], 3)
+        self.assertTrue(ledger["accounted"])
+        self.assertTrue(any("cap" in r for r in ledger["dropped"]),
+                        "over-the-cap candidates must be named, not vanish")
+
+    def test_cap_zero_records_every_candidate_as_disabled_not_dropped_silently(self):
+        research = {"competitors": [self._comp("a"), self._comp("b")]}
+        self.assertEqual(fc.competitor_findings(research, max_findings=0,
+                                                file_exists=lambda r: True), [])
+        ledger = research["bridge_ledger"]
+        self.assertEqual(ledger["candidates"], 2)
+        self.assertEqual(ledger["dropped_total"], 2)
+        self.assertTrue(ledger["accounted"])
+        self.assertTrue(any("disabled" in r for r in ledger["dropped"]))
+
+    def test_report_renders_the_ledger_with_reasons(self):
+        research = {"competitors": [self._comp("ok"),
+                                    self._comp("nofix",
+                                               idea={"code_fixable": False})],
+                    "target": 5, "verified": 2, "unverified": 0, "accepted": 2,
+                    "rejected": 0, "sources_used": ["github"],
+                    "sources_skipped": {}, "rr_endpoint": "n/a",
+                    "coverage_note": fc.coverage_note(2, 5)}
+        fc.competitor_findings(research, file_exists=lambda r: True)
+        text = "\n".join(fc.report_lines(research))
+        self.assertIn("Bridged into the fix stream:", text)
+        self.assertIn("1 of 2 candidate(s)", text)
+        self.assertIn("NOT bridged (1): nofix", text)
+        self.assertNotIn("ACCOUNTING GAP", text)
+
+    def test_phase1_purpose_gap_bridging_keeps_the_same_ledger(self):
+        # The purpose-gap loop had the IDENTICAL silent-drop shape (three bare
+        # continues plus an unrecorded [:cap] truncation) - and its drops are
+        # the owner's own unmet acceptance criteria, which makes silence there
+        # strictly worse. Pin that the loop records every drop, records the
+        # cap tail, and seals the same accounted invariant.
+        src = inspect.getsource(ff.audit_one_program)
+        start = src.index("authored_b = bool(")
+        seg = src[start:start + 4000]
+        self.assertIn("_gdrop(", seg)
+        self.assertIn("bridgeable_b[cap_b:]", seg,
+                      "the cap tail must be recorded, not silently truncated")
+        self.assertIn('purpose_before["bridge_ledger"]', seg)
+        self.assertIn('"accounted"', seg)
+        # Every filter branch must record before it continues: count the bare
+        # continues between the loop head and the ledger seal.
+        loop = seg[seg.index("for g in b_gaps:"):seg.index("bridgeable_b.sort")]
+        for block in loop.split("continue")[:-1]:
+            self.assertIn("_gdrop(", block.rsplit("if ", 1)[-1] + block,
+                          "a filter branch continues without recording a reason")
+
+    def test_an_unaccounted_ledger_is_called_out_in_the_report(self):
+        # Simulates the defect the invariant exists to catch: a future code
+        # path discarding a candidate without recording it.
+        research = {"competitors": [], "target": 1, "sources_used": [],
+                    "sources_skipped": {}, "rr_endpoint": "n/a",
+                    "coverage_note": "",
+                    "bridge_ledger": {"candidates": 3, "bridged": 1,
+                                      "dropped": {}, "dropped_total": 0,
+                                      "accounted": False}}
+        self.assertIn("ACCOUNTING GAP", "\n".join(fc.report_lines(research)))
+
+
+class CompetitorIdeaAuthorTierTests(unittest.TestCase):
+    """Measured on the first live runs: the FREE judge tier fills the prose
+    fields but omits severity/code_fixable/file, so 0 of 8 ideas bridged and
+    competitor research was effectively report-only. Idea EXTRACTION now goes
+    to the injected `author` callable (the strong tier); discovery and
+    benefit judging stay on the cheap judge. Falls back to judge when no
+    author is supplied."""
+
+    def _fakes(self):
+        calls = {"judge": [], "author": []}
+
+        def _answer(schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": [{"name": "openlp", "kind": "oss",
+                                         "why": "w", "search_query": "openlp"}]}
+            return {"idea_title": "T", "what_it_does": "W", "why_valuable": "V",
+                    "evidence_basis": "search result", "accept": True,
+                    "purpose_reason": "serves criterion 3", "acceptance_ref": "3",
+                    "severity": "high", "code_fixable": True,
+                    "file": "src/app.js", "confidence": "medium"}
+
+        def judge(system, prompt, schema):
+            calls["judge"].append(schema)
+            return _answer(schema)
+
+        def author(system, prompt, schema):
+            calls["author"].append(schema)
+            return _answer(schema)
+
+        opener = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
+                              "api.github.com": _GH_FIXTURE})
+        return calls, judge, author, opener
+
+    def test_idea_extraction_routes_to_the_author_tier_when_supplied(self):
+        calls, judge, author, opener = self._fakes()
+        fc.research_competitors(judge, "SermonSmith", "purpose", ["node"],
+                                opener=opener, target=1, author=author)
+        self.assertIn(fc.IDEA_SCHEMA, calls["author"],
+                      "idea extraction must use the strong author tier")
+        self.assertNotIn(fc.IDEA_SCHEMA, calls["judge"],
+                         "idea extraction leaked to the cheap judge tier")
+        self.assertIn(fc.DISCOVERY_SCHEMA, calls["judge"],
+                      "discovery must STAY on the cheap judge tier")
+        self.assertNotIn(fc.DISCOVERY_SCHEMA, calls["author"],
+                         "discovery escalated to the paid author tier")
+
+    def test_without_an_author_everything_falls_back_to_the_judge(self):
+        calls, judge, _, opener = self._fakes()
+        fc.research_competitors(judge, "SermonSmith", "purpose", ["node"],
+                                opener=opener, target=1)
+        self.assertIn(fc.IDEA_SCHEMA, calls["judge"])
+        self.assertEqual(calls["author"], [])
+
+    def test_audit_wires_the_author_tier_into_idea_extraction(self):
+        # The wired-from-nowhere trap: the module accepting author= proves
+        # nothing unless the audit call site actually passes it.
+        src = inspect.getsource(ff.audit_one_program)
+        call = src[src.index("research_competitors("):]
+        call = call[:call.index("except ")]
+        self.assertIn("author=", call)
+        self.assertIn("purpose_reviewer.structured", call,
+                      "author= must route to the provider's STRONG tier, "
+                      "not through _judge")
+
+
 class CompetitorCoverageHonestyTests(unittest.TestCase):
     def test_short_coverage_says_shortfall_out_loud(self):
         note = fc.coverage_note(2, 5, unverified=3)

@@ -512,11 +512,19 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          stack=None, *, rr_search=None, rr_endpoint: str = "",
                          target: int = DEFAULT_TARGET, opener=None,
                          log=print, max_workers: int = 4,
-                         file_list=None) -> dict:
+                         file_list=None, author=None) -> dict:
     """Find competitors, extract one adoptable idea each, judge against purpose.
 
     `judge(system, prompt, schema) -> dict` is injected (flexfactor routes it to
-    the cheap judge tier). `rr_search(query) -> [RankedResult]` is the existing
+    the cheap judge tier). `author(system, prompt, schema) -> dict` is the
+    STRONG tier, used only for idea EXTRACTION: the cheap model reliably fills
+    the prose fields but omits `severity`/`code_fixable`/`file`, so every idea
+    was dropped at the severity floor and competitor research was effectively
+    report-only (measured: 0 of 8 bridged). Extraction decides whether a
+    competitor's best idea can actually be built, so it gets the model that can
+    answer that; benefit scoring and purpose judging stay cheap. Falls back to
+    `judge` when no author callable is supplied.
+    `rr_search(query) -> [RankedResult]` is the existing
     Repo Rewards client, also injected - this module never speaks to Repo
     Rewards directly, so there is exactly one RR client in the codebase.
 
@@ -751,7 +759,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         last: dict = {}
         for text in attempts:
             try:
-                last = judge(IDEA_SYSTEM, text, IDEA_SCHEMA)
+                last = (author or judge)(IDEA_SYSTEM, text, IDEA_SCHEMA)
             except Exception as ex:
                 return {"error": f"{type(ex).__name__}: {ex}", "accept": False,
                         "idea_title": "(idea extraction failed)",
@@ -804,27 +812,84 @@ def competitor_findings(research: dict, max_findings: int = 3,
 
     Deliberately capped and filtered: a competitor idea is an OPINION about the
     market, so it may inform a bounded number of changes and never a rewrite
-    spree. Everything it drops is still reported.
+    spree.
+
+    ACCOUNTING (2026-08-16). This docstring used to claim "everything it drops
+    is still reported" and that was simply false: every filter below was a bare
+    `continue`, so an idea the purpose contract had ACCEPTED could fail to reach
+    the fix stream for five different reasons and leave no trace anywhere. The
+    live SermonSmith run is the evidence - 8 corroborated competitors, 2
+    accepted, **0 bridged**, and a report that said "2 accepted" without one
+    word about where those two went. That is the portfolio's #1 recurring
+    defect (find candidates, act on none, report success) reproduced inside the
+    tool built to catch it.
+
+    Every drop is now recorded in `research["bridge_ledger"]` with the reason
+    and the competitor name, and the ledger enforces
+    `candidates == bridged + sum(dropped) `. `report_lines` renders it and the
+    caller prints it, so "accepted but not bridged" can never again be silent.
+    The ledger is written onto `research` rather than returned so the existing
+    return type (and every caller of it) is unchanged.
     """
     rank = severity_rank or {"low": 1, "medium": 2, "high": 3, "critical": 4}
     out: list[tuple[str, dict]] = []
+    dropped: dict[str, list[str]] = {}
+    candidates = list(research.get("competitors") or [])
+
+    def _drop(reason: str, c: dict) -> None:
+        dropped.setdefault(reason, []).append(str(c.get("name") or "(unnamed)"))
+
+    def _seal() -> None:
+        n_dropped = sum(len(v) for v in dropped.values())
+        research["bridge_ledger"] = {
+            "candidates": len(candidates),
+            "bridged": len(out),
+            "dropped": {k: sorted(v) for k, v in sorted(dropped.items())},
+            "dropped_total": n_dropped,
+            # The invariant the owner's "never silently skip work" rule demands.
+            # False here means a code path discarded a candidate without saying
+            # so - the exact defect this ledger exists to make impossible.
+            "accounted": len(candidates) == len(out) + n_dropped,
+        }
+
     if max_findings <= 0:
         # The cap is checked BEFORE the append, not after: a post-append check
         # let max_findings=0 still emit one finding, which is the difference
         # between "--competitor-fixes 0" meaning off and meaning "one anyway".
+        for c in candidates:
+            _drop("competitor-fixes cap is 0 (bridging disabled)", c)
+        _seal()
         return out
-    for c in research.get("competitors") or []:
+    for c in candidates:
         idea = c.get("idea") or {}
-        if not idea.get("accept") or not may_bridge(c):
+        if len(out) >= max_findings:
+            # Reaching the cap does not make the remaining ideas disappear; a
+            # silent top-N truncation is the same dishonesty as a silent filter.
+            _drop(f"over the --competitor-fixes cap of {max_findings}", c)
+            continue
+        if not idea.get("accept"):
+            _drop("idea rejected by the purpose contract", c)
+            continue
+        if not may_bridge(c):
+            _drop(f"not bridgeable (evidence={c.get('evidence_status')}, "
+                  f"reuse_mode={c.get('reuse_mode')})", c)
             continue
         if not idea.get("code_fixable"):
+            # The free judge tier omits this field entirely, which is how 0 of 8
+            # bridged while the report said 2 accepted. Naming it is what makes
+            # the model-tier lever visible instead of looking like "no ideas".
+            _drop("idea is not code_fixable (or the model omitted the field)", c)
             continue
         rel = str(idea.get("file") or "").replace("\\", "/").strip()
         if not rel:
+            _drop("no target file named for the idea", c)
             continue
         if rank.get(str(idea.get("severity", "")).lower(), 0) < severity_floor_rank:
+            _drop(f"severity {idea.get('severity') or '(missing)'!r} is below "
+                  f"the --fix-severity floor", c)
             continue
         if file_exists is not None and not file_exists(rel):
+            _drop(f"named file does not exist in the repo: {rel}", c)
             continue
         problem = (f"{idea.get('what_it_does')}\n\nWhy it matters here: "
                    f"{idea.get('why_valuable')}\n\nPurpose justification: "
@@ -851,8 +916,9 @@ def competitor_findings(research: dict, max_findings: int = 3,
             "acceptance_ref": idea.get("acceptance_ref") or "",
             "source": "competitor-research",
         }))
-        if len(out) >= max_findings:
-            break
+        # No `break` at the cap: the loop must keep walking so the remaining
+        # candidates land in the ledger as "over the cap" instead of vanishing.
+    _seal()
     return out
 
 
@@ -876,6 +942,17 @@ def report_lines(research: dict) -> list[str]:
               f"{research.get('accepted', 0)} "
               f"(rejected {research.get('rejected', 0)} - the purpose contract, "
               "not the competitor, decides)", ""]
+    ledger = research.get("bridge_ledger")
+    if ledger:
+        L += [f"- **Bridged into the fix stream:** {ledger.get('bridged', 0)} "
+              f"of {ledger.get('candidates', 0)} candidate(s)"]
+        for reason, names in (ledger.get("dropped") or {}).items():
+            L.append(f"  - NOT bridged ({len(names)}): {', '.join(names)} - {reason}")
+        if not ledger.get("accounted", False):
+            L.append("  - **ACCOUNTING GAP: candidates != bridged + dropped. "
+                     "A code path discarded a candidate without recording why. "
+                     "This is a defect in FlexFactor itself - report it.**")
+        L.append("")
     if not (research.get("competitors") or []):
         L += ["_No competitor could be corroborated from any reachable source. "
               "This is reported as a gap in the research, NOT as evidence that "
