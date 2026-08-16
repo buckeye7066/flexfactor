@@ -10947,6 +10947,24 @@ class ResumeCheckpointTests(unittest.TestCase):
             self.assertEqual(latest.get("run_id"), b.run_id,
                              "the newer checkpoint must win regardless of "
                              "os.listdir ordering")
+            # FORCE the tie rather than hope for one. Millisecond `updated`
+            # stamps only SHRANK the window - CI (ubuntu, 14f90dc) saved two
+            # checkpoints inside one millisecond and picked the older, which is
+            # how this very test reddened main. With identical `updated` and
+            # `started` on both records the ONLY thing that can order them is
+            # the run_id tiebreak, so this assertion cannot pass by luck.
+            for cp in (a, b):
+                fp = ffrs.checkpoint_path(root, cp.run_id)
+                with open(fp, encoding="utf-8") as fh:
+                    d = json.load(fh)
+                d["updated"] = d["started"] = "2026-08-16T00:00:00.000"
+                with open(fp, "w", encoding="utf-8") as fh:
+                    json.dump(d, fh)
+            tied = ffrs.latest_resumable(root, program="same", project_dir=root)
+            self.assertIsNotNone(tied, "both checkpoints must still be resumable")
+            self.assertEqual(tied.get("run_id"), b.run_id,
+                             "on an exact timestamp tie the ordering must still "
+                             "be total - never os.listdir order")
 
     def test_interrupted_run_resumes_without_rebilling_review(self):
         # End to end THROUGH THE REAL ENTRY POINT: run 1 completes clean;
