@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.4"
+TOOL_VERSION = "0.3.5"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -1946,6 +1946,7 @@ class AnthropicProvider:
                 "free path on fallback hold after a recent hang"))
         last_text = None
         message = None
+        last_exception: Exception | None = None
         for attempt in range(3):
             try:
                 message = _stream_with_deadline(self.client, **call_kwargs)
@@ -1957,6 +1958,7 @@ class AnthropicProvider:
                 # transient stall doesn't kill the file.
                 message = None
                 last_text = None
+                last_exception = exc
                 if _is_backpressure(exc):
                     # ALIVE, ASKING FOR PATIENCE (429 / overloaded / 503 / model
                     # loading / queued). Paying a metered key to skip a free
@@ -2018,8 +2020,10 @@ class AnthropicProvider:
             return self._paid_message(call_kwargs, RuntimeError(
                 f"free path failed: {reason}"))
         if message is None:
-            raise RuntimeError("structured streaming call failed after retries "
-                               "(stream deadline exceeded or repeated empty/transport error)")
+            detail = (f"{type(last_exception).__name__}: {str(last_exception)[:300]}"
+                      if last_exception is not None else "no exception detail")
+            raise RuntimeError("structured streaming call failed after retries; "
+                               f"last error was {detail}")
         return message
 
     def ping(self) -> None:
@@ -9662,7 +9666,14 @@ def _review_all(reviewers: list, project_dir: str,
                 if getattr(reviewer, "_flexfactor_semantic_unhealthy", False):
                     continue
                 try:
-                    if len(unit) == 1 and len(_numbered_review_chunks(unit[0][1])) > 1:
+                    # A singleton is not a batch.  Sending it through the nested
+                    # batch schema needlessly exercises a less portable provider
+                    # capability. GrantFlow run #19 reached exactly this shape
+                    # when a small priority file preceded a large file: purpose
+                    # and competitor calls worked, the one-row batch schema failed,
+                    # and the only healthy provider was quarantined. Use the exact
+                    # per-file contract for every singleton, whether chunked or not.
+                    if len(unit) == 1:
                         rel, text, sha = unit[0]
                         findings, _ = review_file(reviewer, rel, text, context=context,
                                                   project_dir=project_dir)
@@ -9700,7 +9711,13 @@ def _review_all(reviewers: list, project_dir: str,
                     return [(rel, "incomplete") for rel, _text, _sha in unit]
                 except Exception as ex:
                     last_error = ex
-                    reviewer._flexfactor_semantic_unhealthy = True
+                    # With one route, a file-specific/schema failure does not
+                    # prove a provider outage. Leave it available for the next
+                    # semantic unit; the outer three-zero-batch circuit still
+                    # stops a genuinely dead endpoint quickly and fail-closed.
+                    # With multiple routes, quarantine preserves immediate
+                    # failover and avoids replaying a known-bad endpoint.
+                    reviewer._flexfactor_semantic_unhealthy = len(reviewers) > 1
                     if any(not getattr(r, "_flexfactor_semantic_unhealthy", False)
                            for r in reviewers[ridx + 1:]):
                         print(f"  [failover] semantic review batch failed via "
