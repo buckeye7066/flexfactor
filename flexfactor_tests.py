@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -12316,6 +12317,168 @@ class EditAnchorSafetyTests(unittest.TestCase):
     def test_an_empty_edit_list_is_refused(self):
         self.assertIsNone(ff._apply_edits("a\n", [])[0])
         self.assertIsNone(ff._apply_edits("a\n", None)[0])
+
+class SubprocessEncodingTests(unittest.TestCase):
+    """Live GrantFlow, 2026-08-16, an audit that died mid-cycle:
+
+        GrantFlow: ERROR - unsupported operand type(s) for +: 'NoneType' and 'str'
+        totals: 0/1 program(s) OK | 0 defect(s) found | 0 file(s) fixed
+
+    preceded by two subprocess reader-thread tracebacks ending in
+    `UnicodeDecodeError: 'charmap' codec can't decode byte 0x9d`. `_run` used
+    `text=True` with no encoding, so Windows decoded child output with the locale
+    codec (cp1252); one smart quote or em dash from npm/vite/eslint killed the
+    reader THREAD, `cp.stdout` came back None, and the first `stdout + "..."`
+    downstream took the whole audit down.
+    """
+
+    @staticmethod
+    def _emit(expr):
+        """A child that writes RAW bytes to stdout - no text layer, so the bytes
+        reach the parent's decoder exactly as a real toolchain's would."""
+        return [sys.executable, "-c",
+                "import sys; sys.stdout.buffer.write(%s); sys.stdout.buffer.flush()" % expr]
+
+    def test_a_byte_that_cp1252_cannot_decode_does_not_kill_the_run(self):
+        # 0x9d is undefined in cp1252 - the exact byte from the live crash.
+        cp = ff._run(self._emit('b"before" + bytes([0x9d]) + b"after"'), cwd=os.getcwd())
+        self.assertIsInstance(cp.stdout, str, "stdout must never come back None")
+        self.assertIn("before", cp.stdout)
+        self.assertIn("after", cp.stdout,
+                      "output AFTER the bad byte must survive - errors='replace', "
+                      "not a truncated or discarded stream")
+
+    def test_utf8_punctuation_from_a_real_toolchain_survives(self):
+        # Smart quotes and em dashes are what npm/vite/eslint actually emit.
+        cp = ff._run(self._emit(r'"— “build” done".encode("utf-8")'),
+                     cwd=os.getcwd())
+        self.assertIsInstance(cp.stdout, str)
+        self.assertIn("build", cp.stdout)
+        self.assertIn("—", cp.stdout, "utf-8 decoding must be exact, not lossy")
+
+    def test_stdout_and_stderr_are_always_strings_so_concatenation_is_safe(self):
+        # The crash was a TypeError, not a decode error: every caller does
+        # `cp.stdout + "..."` or scans it. Prove the contract at the chokepoint.
+        for expr in ('b""', 'bytes([0x9d, 0x81, 0x8d])',
+                     r'"café".encode("utf-8")'):
+            cp = ff._run(self._emit(expr), cwd=os.getcwd())
+            self.assertIsInstance(cp.stdout, str, expr)
+            self.assertIsInstance(cp.stderr, str, expr)
+            self.assertEqual(cp.stdout + "|" + cp.stderr, cp.stdout + "|" + cp.stderr)
+
+    def test_a_reader_thread_that_still_returns_none_is_coerced_not_propagated(self):
+        # Defence in depth: even if a future capture path hands back None for a
+        # reason we have not seen, _run must not let it reach a caller.
+        real = subprocess.run
+
+        def fake(*a, **k):
+            cp = subprocess.CompletedProcess(a[0] if a else [], 0, None, None)
+            return cp
+
+        try:
+            subprocess.run = fake
+            cp = ff._run(["anything"], cwd=os.getcwd())
+        finally:
+            subprocess.run = real
+        self.assertEqual(cp.stdout, "")
+        self.assertEqual(cp.stderr, "")
+
+    def test_every_capture_call_site_pins_an_encoding(self):
+        # A new `capture_output=True, text=True` without an encoding recreates the
+        # crash, and it would only show up on a Windows machine with non-ASCII
+        # build output. Pin it at the source level so the suite catches it.
+        src = inspect.getsource(ff)
+        for i, line in enumerate(src.splitlines()):
+            if "capture_output=True" in line:
+                window = "\n".join(src.splitlines()[max(0, i - 3):i + 4])
+                self.assertIn('encoding="utf-8"', window,
+                              f"capture_output site near line {i + 1} does not pin "
+                              "an encoding - on Windows it will decode as cp1252")
+                self.assertIn('errors="replace"', window,
+                              f"capture_output site near line {i + 1} does not set "
+                              "errors='replace'")
+
+class StayAnchoredOnLargeFilesTests(unittest.TestCase):
+    """The remaining half of the GrantFlow fix-loop failure: an ANCHOR failure
+    demoted the file to whole-file regeneration, and on a large file that is a
+    guaranteed `[skip] ... token budget` because whole-file output is strictly
+    larger than the edit that just failed."""
+
+    class _Author:
+        """Returns edits whose anchor never matches, so the apply always fails."""
+
+        def __init__(self, model="gpt-4o"):
+            self.model = model
+            self.modes = []
+
+        def structured(self, system, prompt, schema, max_tokens=8000, **kw):
+            self.modes.append("edits" if "edits" in json.dumps(schema) else "whole")
+            if self.modes[-1] == "edits":
+                return {"changed": True,
+                        "edits": [{"search": "ANCHOR-THAT-IS-NOT-PRESENT",
+                                   "replace": "x"}],
+                        "fixed_titles": [], "notes": ""}
+            return {"changed": True, "contents": "regenerated\n",
+                    "fixed_titles": [], "notes": ""}
+
+    def _run(self, body, model):
+        import io
+        import contextlib as _c
+        import types
+        with _RepoFixture({"f.js": body}) as root:
+            author = self._Author(model)
+            oversized = []
+            findings = {"f.js": [{"severity": "high", "line": 1, "title": "t",
+                                  "problem": "p", "fix": "f"}]}
+            args = types.SimpleNamespace(
+                whole_file_fixes=False, fix_prefetch=0, adversarial=False,
+                adversarial_rounds=0, adversarial_materiality="material",
+                fix_severity="high")
+            buf = io.StringIO()
+            with _c.redirect_stdout(buf):
+                applied, _unver, notes = ff._fix_files(
+                    author, None, root, findings,
+                    {"verify_cmds": [], "ecosystems": []}, True, args,
+                    oversized=oversized, adversarial=False)
+            return author, applied, notes, oversized, buf.getvalue()
+
+    def test_a_small_file_still_demotes_to_whole_file_as_before(self):
+        author, _a, _n, _o, out = self._run("x = 1\n", "gpt-4o")
+        self.assertIn("[edit-fallback]", out)
+        self.assertIn("whole", author.modes,
+                      "small files must keep the existing whole-file fallback")
+
+    def test_a_file_too_large_to_regenerate_stays_on_the_anchored_path(self):
+        # ~60KB against gpt-4o's 16384-token ceiling: whole-file cannot fit.
+        author, applied, _n, oversized, out = self._run("x = 1;\n" * 9000, "gpt-4o")
+        self.assertNotIn("whole", author.modes,
+                         "a file this size must never be sent to whole-file "
+                         "regeneration - that is a guaranteed token-budget skip")
+        self.assertIn("staying anchored", out)
+        self.assertEqual(applied, [])
+        self.assertIn("f.js", oversized,
+                      "exhausting anchored attempts on an unregenerable file is "
+                      "an OVERSIZED outcome, named, not a crash")
+
+    def test_exhausting_every_attempt_never_crashes_on_a_None_outcome(self):
+        # The attempt loop can end on a `continue` path that never set an
+        # outcome; `outcome[0]` on None is a TypeError that would end the audit.
+        _author, _applied, notes, _oversized, out = self._run("x = 1;\n" * 9000,
+                                                              "gpt-4o")
+        self.assertTrue(notes, "the file must be named in fix_notes")
+        self.assertNotIn("Traceback", out)
+
+    def test_plausibility_is_model_aware_and_errs_toward_staying_anchored(self):
+        class Small:
+            model = "gpt-4o"
+
+        class Big:
+            model = "claude-opus-4-8"
+
+        self.assertTrue(ff._whole_file_is_plausible(Small(), "x" * 10_000))
+        self.assertFalse(ff._whole_file_is_plausible(Small(), "x" * 60_000))
+        self.assertTrue(ff._whole_file_is_plausible(Big(), "x" * 60_000))
+        self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3135,11 +3135,14 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
         "Write-Output $s.TargetPath; Write-Output $s.Arguments"
     )
     try:
+        # encoding/errors: same Windows trap as _run - a shortcut target with a
+        # non-cp1252 character would kill the reader thread and hand back None.
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
         )
-        lines = out.stdout.splitlines()
+        lines = (out.stdout or "").splitlines()
         target = lines[0].strip() if lines else ""
         arguments = lines[1].strip() if len(lines) > 1 else ""
         return (target or path), arguments
@@ -3179,8 +3182,9 @@ def _shortcut_working_dir(path: str) -> str:
           "Write-Output $s.WorkingDirectory")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=15)
-        lines = out.stdout.splitlines()
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=15)
+        lines = (out.stdout or "").splitlines()
         return lines[0].strip() if lines else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -4246,8 +4250,17 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         cp.flexfactor_policy_blocked = True
         return cp
     try:
-        return subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout, env=env)
+        # encoding/errors are LOAD-BEARING on Windows (live GrantFlow crash,
+        # 2026-08-16). `text=True` with no encoding decodes child output with the
+        # locale codec - cp1252 here - so ONE smart quote or em dash from npm /
+        # vite / eslint raises UnicodeDecodeError inside subprocess's reader
+        # THREAD. The exception dies in that thread, `cp.stdout` comes back None,
+        # and the first `stdout + "..."` downstream raises
+        # `unsupported operand type(s) for +: 'NoneType' and 'str'` - which ended
+        # the whole audit: "0/1 program(s) OK | 0 defect(s) found".
+        cp = subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace",
+                            timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
         return _fail(124, out, f"timed out after {timeout}s")
@@ -4257,6 +4270,16 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         return _fail(1, "", f"failed to launch {(cmd or ['?'])[0]}: {e}")
     except Exception as e:  # e.g. ValueError on malformed args: still must not raise
         return _fail(1, "", f"could not run {(cmd or ['?'])[0]}: {type(e).__name__}: {e}")
+    # DEFENCE IN DEPTH for the same crash. utf-8 + errors="replace" should make a
+    # reader-thread decode failure impossible, but `capture_output` can still hand
+    # back None if a reader thread dies for ANY reason, and EVERY caller here
+    # concatenates or scans these strings. `_run` promises a CompletedProcess it
+    # never raises from; that promise is worthless if the fields can be None.
+    if cp.stdout is None:
+        cp.stdout = ""
+    if cp.stderr is None:
+        cp.stderr = ""
+    return cp
 
 
 def _spawn(cmd: list[str], cwd: str, env: dict | None = None
@@ -8005,6 +8028,39 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
     return base
 
 
+# Conservative chars-per-output-token for source code. Real code sits around
+# 3.5-4; 3.0 under-estimates the ceiling, which is the safe direction here: it
+# only ever keeps a file on the anchored-edit path, which works for files of any
+# size. Over-estimating would send a file into a whole-file regeneration that
+# cannot fit.
+_CHARS_PER_TOKEN = 3.0
+_WHOLE_FILE_HEADROOM = 0.8   # never plan to use the last fifth of the ceiling
+
+
+def _provider_output_ceiling(provider) -> int:
+    """Max output tokens this provider's AUTHOR model can emit in one response."""
+    model = str(getattr(provider, "model", "") or "")
+    if isinstance(provider, OpenAIProvider) or model.startswith(("gpt-", "o3", "o4")):
+        return _openai_output_ceiling(model)
+    # Anthropic (and the FCC proxy in front of it) stream up to the whole-file
+    # budget the fix path already requests.
+    return FIX_WHOLE_MAX_TOKENS
+
+
+def _whole_file_is_plausible(provider, text: str) -> bool:
+    """Could this model emit this whole file in ONE response?
+
+    The `[edit-fallback]` demotion assumed yes for every file. On a large file
+    that assumption turns a recoverable anchor failure into a guaranteed
+    `[skip] ... token budget` (live GrantFlow 2026-08-16), because whole-file
+    output is strictly larger than the edit that just failed. When this returns
+    False the fix loop STAYS ANCHORED and retries edits, which can still succeed
+    at any file size.
+    """
+    ceiling = _provider_output_ceiling(provider)
+    return (len(text or "") / _CHARS_PER_TOKEN) <= ceiling * _WHOLE_FILE_HEADROOM
+
+
 def generate_edits_shrinking(provider, rel_path: str, text: str,
                              findings: list[dict], feedback: str = "",
                              log=print) -> dict:
@@ -9692,16 +9748,25 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         patch = {"changed": True, "contents": new_text,
                                  "fixed_titles": epatch.get("fixed_titles") or [],
                                  "notes": epatch.get("notes", "")}
-                    elif edit_retries > 0:
-                        edit_retries -= 1
+                    elif edit_retries > 0 or not _whole_file_is_plausible(author, original):
+                        # STAY ANCHORED when whole-file regeneration could not
+                        # possibly fit this model's output ceiling. Demoting a
+                        # 60KB file to whole-file mode is not a fallback, it is a
+                        # guaranteed [skip]; another anchored attempt at least
+                        # can succeed. Files small enough to regenerate still
+                        # demote exactly as before after their one retry.
+                        if edit_retries > 0:
+                            edit_retries -= 1
                         feedback = (
                             f"Your previous edits could not be applied: "
                             f"{apply_err or 'they were a no-op'}. Regenerate ALL edits. "
                             "Every `search` must be copied VERBATIM from CURRENT "
                             "CONTENTS above — exact whitespace, indentation and line "
                             "breaks — and must occur exactly once in the file.")
+                        anchored = "" if _whole_file_is_plausible(author, original) else \
+                            " (too large to regenerate whole - staying anchored)"
                         print(f"  [edit-retry] {rel}: {apply_err or 'edits were a no-op'}"
-                              " -> regenerating edits with feedback")
+                              f" -> regenerating edits with feedback{anchored}")
                         continue
                     else:
                         edit_mode = False
@@ -9919,6 +9984,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             _tick(rel)
             continue
 
+        if outcome is None:
+            # LATENT CRASH, closed here: the attempt loop can end on a `continue`
+            # path that never sets an outcome - the edit-retry branch is one, and
+            # it became far more reachable once a too-large-to-regenerate file
+            # started staying anchored instead of demoting. `outcome[0]` on None
+            # is a TypeError that would take down the whole audit, which is
+            # exactly the class of failure the fix loop must never have. Name it
+            # and re-queue instead.
+            if not _whole_file_is_plausible(author, original):
+                outcome = ("oversized",
+                           f"{attempt} anchored attempt(s) failed and the file is too "
+                           "large for this model to regenerate whole")
+            else:
+                outcome = ("skip", f"no verified fix after {attempt} attempt(s)")
         kind = outcome[0]
         _fixtrace("attempt.outcome", rel, outcome=kind, detail=str(outcome[1])[:300],
                   attempts=attempt)

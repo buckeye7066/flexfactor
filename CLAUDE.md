@@ -378,6 +378,55 @@ to match **exactly once** - zero matches and two matches are both refused with a
 reason, never applied blindly. That invariant is what makes shrinking safe to
 lean on, and it has its own tests.
 
+## `text=True` WITHOUT an encoding ends the whole audit on Windows (2026-08-16)
+
+Live GrantFlow, mid-cycle:
+
+```
+GrantFlow: ERROR - unsupported operand type(s) for +: 'NoneType' and 'str'
+totals: 0/1 program(s) OK | 0 defect(s) found | 0 file(s) fixed
+```
+
+preceded in the log by two subprocess reader-thread tracebacks ending in
+`UnicodeDecodeError: 'charmap' codec can't decode byte 0x9d`.
+
+`_run` called `subprocess.run(..., capture_output=True, text=True)` with **no
+encoding**, so Windows decoded child output with the locale codec (cp1252). One
+smart quote or em dash from npm / vite / eslint raised inside subprocess's reader
+**thread**; the exception died there, `cp.stdout` came back `None`, and the first
+`stdout + "..."` downstream raised the TypeError that ended the run. Note the
+shape: the crash message named a type error, and the real cause was three frames
+and one thread away.
+
+- All three `capture_output=True` sites now pass `encoding="utf-8",
+  errors="replace"` (`_run` plus the two PowerShell shortcut readers).
+- `_run` additionally coerces `stdout`/`stderr` from `None` to `""`. `_run`'s
+  contract is "returns a CompletedProcess, never raises"; that is worthless if
+  the fields can be `None` when every caller concatenates them.
+- `test_every_capture_call_site_pins_an_encoding` greps the module source, so a
+  new capture site without an encoding reddens the suite instead of waiting to
+  kill a run on a machine with non-ASCII build output.
+
+The other three tests drive REAL child processes emitting `0x9d` and utf-8
+punctuation, so they exercise the decode path rather than asserting on a string.
+Verified: reverting the encoding on `_run` alone fails 3 of the 5.
+
+### The other half of the oversized-file fix: STAY ANCHORED
+
+`[edit-fallback]` demoted a file to whole-file regeneration whenever its edit
+anchors failed to apply. On a large file that converts a recoverable anchor
+failure into a guaranteed `[skip] ... token budget`, because whole-file output is
+strictly larger than the edit that just failed. `_whole_file_is_plausible()`
+(model-aware, via `_provider_output_ceiling`, deliberately using a conservative
+3.0 chars/token so it errs toward staying anchored) now gates the demotion: files
+that cannot be regenerated in one response keep retrying ANCHORED EDITS, which
+can succeed at any file size.
+
+That change made a **latent crash** reachable, now closed: the attempt loop can
+end on a `continue` path that never sets `outcome`, and `outcome[0]` on `None` is
+a TypeError that would take down the audit. It is now named as `oversized` (file
+too large to regenerate) or `skip` (attempts exhausted) and re-queued.
+
 ## A file key is an IDENTITY — canonicalize it (2026-08-14)
 
 `rel` is not merely a path in this tool: it is the identity a file is tracked by
