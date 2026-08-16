@@ -356,7 +356,19 @@ def list_runs(root: str) -> list[dict]:
         if not data or not data.get("run_id"):
             continue
         out.append(data)
-    out.sort(key=lambda d: str(d.get("updated") or ""), reverse=True)
+    # TOTAL ORDER, never a partial one (fixed 2026-08-16, second attempt).
+    # Sorting on `updated` ALONE leaves ties, and Python's stable sort then
+    # resolves a tie by `os.listdir` order - so "newest" became whatever the
+    # filesystem happened to hand back first, and a resumed run could recover an
+    # older checkpoint and re-review work it had already paid for. Millisecond
+    # timestamps shrank that tie window but did not close it: CI (ubuntu,
+    # 14f90dc) saved two checkpoints inside ONE millisecond and picked the wrong
+    # one. `run_id` carries microseconds and the pid, so appending it - after
+    # `started` - makes creation order the tiebreak and removes the filesystem
+    # from the decision entirely.
+    out.sort(key=lambda d: (str(d.get("updated") or ""),
+                            str(d.get("started") or ""),
+                            str(d.get("run_id") or "")), reverse=True)
     return out
 
 
