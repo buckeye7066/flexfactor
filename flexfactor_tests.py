@@ -12744,6 +12744,38 @@ class StayAnchoredOnLargeFilesTests(unittest.TestCase):
         self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
+    def test_single_provider_semantic_concurrency_is_explicit_and_bounded(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def batch(_provider, items, context="", project_dir=None):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=2)
+                return {rel: ([], "clean") for rel, _text in items}
+            finally:
+                with lock:
+                    active -= 1
+
+        class Provider:
+            model = "only-provider"
+
+        files = [f"f{i}.py" for i in range(16)]
+        with _patched(ff, "review_files_batch", batch), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("value = 1\n", f"sha-{rel}")):
+            found, flat, unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj", files, workers=8, batch_semantic=True,
+                single_provider_workers=2)
+        self.assertEqual(peak, 2)
+        self.assertEqual(set(clean), set(files))
+        self.assertEqual((found, flat, unreadable, incomplete), ({}, [], set(), set()))
+
     def test_anthropic_schema_adapter_removes_unsupported_max_items_recursively(self):
         original = {
             "type": "object",
