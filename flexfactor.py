@@ -159,6 +159,40 @@ _DEFAULT_PRICE = (max(p[0] for p in MODEL_PRICING.values()),
                   max(p[1] for p in MODEL_PRICING.values()))
 _WARNED_UNKNOWN_MODELS: set[str] = set()
 
+# Per-model OUTPUT ceilings for the OpenAI provider. Was a hardcoded 16384 -
+# gpt-4o's limit - applied to EVERY model, so a newer model was silently capped
+# at a fraction of what it can emit and large files came back
+# "hit the 16384-token budget" and were never fixable (live GrantFlow
+# 2026-08-16). Prefix-matched longest-first so a dated id like
+# `gpt-4.1-2025-04-14` resolves without a table entry per snapshot.
+#
+# The default is DELIBERATELY the small one: asking for more output than a model
+# allows is a hard API rejection (the whole call dies), while asking for too
+# little costs one shrink-and-retry. Unknown id -> conservative.
+OPENAI_OUTPUT_CEILING_DEFAULT = 16384
+OPENAI_OUTPUT_CEILINGS = {
+    "gpt-4o": 16384,
+    "gpt-4o-mini": 16384,
+    "gpt-4.1": 32768,
+    "gpt-4.1-mini": 32768,
+    "gpt-4.1-nano": 32768,
+    "gpt-5": 128000,
+    "gpt-5-mini": 128000,
+    "o3": 100000,
+    "o3-mini": 100000,
+    "o4-mini": 100000,
+}
+
+
+def _openai_output_ceiling(model: str) -> int:
+    """Max output tokens this OpenAI model accepts. Unknown ids fail SMALL."""
+    name = str(model or "").strip().lower()
+    best = ""
+    for known in OPENAI_OUTPUT_CEILINGS:
+        if name.startswith(known) and len(known) > len(best):
+            best = known
+    return OPENAI_OUTPUT_CEILINGS.get(best, OPENAI_OUTPUT_CEILING_DEFAULT)
+
 
 def _price_for(model: str) -> tuple[float, float]:
     # Local inference is free. ONLY the exact 'ollama:<model>' namespace that
@@ -274,6 +308,23 @@ def _estimate_call_cost(model: str, source_chars: int, max_out_tokens: int) -> f
 class BudgetExceededError(RuntimeError):
     """A provider call was REFUSED because it would push spend past --max-cost.
     Raised by the reservation chokepoint so no call site can spend past the cap."""
+
+
+class OutputBudgetError(RuntimeError):
+    """The model stopped because it hit its OUTPUT token ceiling, not because it
+    finished. A TYPE, not a phrase (live GrantFlow 2026-08-16): `_fix_files` used
+    to detect this by searching `str(ex)` for "token budget", and the branch that
+    mattered most - the EDITS path - caught it with a bare `except Exception` and
+    demoted the file to WHOLE-FILE regeneration. That is backwards: whole-file
+    output is strictly LARGER than an edit, so every large file demoted straight
+    into a guaranteed `[skip] fix generation failed (... 16384-token budget ...)`.
+    Measured mid-run on GrantFlow: reviewed 8, defects 155, fixed 1, errors 8.
+
+    The answer is to SHRINK THE UNIT OF GENERATION, not to keep raising the
+    ceiling. Callers catch this type and retry with fewer findings.
+
+    The message still contains the words "token budget" so older string-matching
+    call sites keep working, but nothing NEW should match on the text."""
 
 
 class DirtyTreeError(RuntimeError):
@@ -1839,7 +1890,7 @@ class AnthropicProvider:
         if message.stop_reason == "refusal":
             raise RuntimeError(f"Model refused (stop_details={message.stop_details}).")
         if message.stop_reason == "max_tokens":
-            raise RuntimeError(
+            raise OutputBudgetError(
                 f"Model output hit the {max_tokens}-token budget (file too large to "
                 "regenerate in one response); raise max_tokens for this call.")
         text = next((b.text for b in message.content if b.type == "text"), None)
@@ -2081,10 +2132,14 @@ class OpenAIProvider:
         # the author model so code-generation callers are unchanged.
         use_model = model or self.model
         prompt = _egress_gate(prompt)
-        # The reservation MUST equal the request's output cap. OpenAI clamps to
-        # gpt-4o's 16384 ceiling, so reserve that SAME clamped value (not the larger
-        # requested max_tokens) or we'd over-reserve and over-throttle the budget.
-        out_cap = min(max_tokens, 16384)
+        # The reservation MUST equal the request's output cap. The clamp is the
+        # MODEL's ceiling, not a hardcoded 16384 - that constant was gpt-4o's
+        # limit and it silently capped every newer model at less than a third of
+        # what it can emit (live GrantFlow 2026-08-16: large files were
+        # unfixable with "hit the 16384-token budget"). Unknown models still get
+        # 16384, because over-requesting is a hard API rejection while
+        # under-requesting only costs one shrink-and-retry.
+        out_cap = min(max_tokens, _openai_output_ceiling(use_model))
         with _budget_guard(self.meter, use_model, len(prompt) + len(system), out_cap):
             resp = self.client.chat.completions.create(
                 model=use_model,
@@ -2100,12 +2155,13 @@ class OpenAIProvider:
             self._meter(resp, use_model)
         choice = resp.choices[0]
         if choice.finish_reason == "length":
-            # Same guard AnthropicProvider.structured has: raising here (with the
-            # "token budget" phrasing the fix loop keys on to record the file as
-            # oversized) beats returning truncated JSON that dies downstream as an
-            # opaque "Unterminated string" parse error.
-            raise RuntimeError(
-                f"Model output hit the {min(max_tokens, 16384)}-token budget (file too "
+            # Same guard AnthropicProvider.structured has, and it raises the
+            # TYPED OutputBudgetError so callers can shrink the unit of
+            # generation instead of string-matching the message. Raising beats
+            # returning truncated JSON that dies downstream as an opaque
+            # "Unterminated string" parse error.
+            raise OutputBudgetError(
+                f"Model output hit the {out_cap}-token budget (file too "
                 "large to regenerate in one response); raise max_tokens for this call.")
         text = choice.message.content or "{}"
         data = json.loads(text)
@@ -3079,11 +3135,14 @@ def _resolve_shortcut(path: str) -> tuple[str, str]:
         "Write-Output $s.TargetPath; Write-Output $s.Arguments"
     )
     try:
+        # encoding/errors: same Windows trap as _run - a shortcut target with a
+        # non-cp1252 character would kill the reader thread and hand back None.
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
         )
-        lines = out.stdout.splitlines()
+        lines = (out.stdout or "").splitlines()
         target = lines[0].strip() if lines else ""
         arguments = lines[1].strip() if len(lines) > 1 else ""
         return (target or path), arguments
@@ -3123,8 +3182,9 @@ def _shortcut_working_dir(path: str) -> str:
           "Write-Output $s.WorkingDirectory")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=15)
-        lines = out.stdout.splitlines()
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=15)
+        lines = (out.stdout or "").splitlines()
         return lines[0].strip() if lines else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -4190,8 +4250,17 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         cp.flexfactor_policy_blocked = True
         return cp
     try:
-        return subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout, env=env)
+        # encoding/errors are LOAD-BEARING on Windows (live GrantFlow crash,
+        # 2026-08-16). `text=True` with no encoding decodes child output with the
+        # locale codec - cp1252 here - so ONE smart quote or em dash from npm /
+        # vite / eslint raises UnicodeDecodeError inside subprocess's reader
+        # THREAD. The exception dies in that thread, `cp.stdout` comes back None,
+        # and the first `stdout + "..."` downstream raises
+        # `unsupported operand type(s) for +: 'NoneType' and 'str'` - which ended
+        # the whole audit: "0/1 program(s) OK | 0 defect(s) found".
+        cp = subprocess.run(_winify(cmd), cwd=cwd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace",
+                            timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
         return _fail(124, out, f"timed out after {timeout}s")
@@ -4201,6 +4270,16 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         return _fail(1, "", f"failed to launch {(cmd or ['?'])[0]}: {e}")
     except Exception as e:  # e.g. ValueError on malformed args: still must not raise
         return _fail(1, "", f"could not run {(cmd or ['?'])[0]}: {type(e).__name__}: {e}")
+    # DEFENCE IN DEPTH for the same crash. utf-8 + errors="replace" should make a
+    # reader-thread decode failure impossible, but `capture_output` can still hand
+    # back None if a reader thread dies for ANY reason, and EVERY caller here
+    # concatenates or scans these strings. `_run` promises a CompletedProcess it
+    # never raises from; that promise is worthless if the fields can be None.
+    if cp.stdout is None:
+        cp.stdout = ""
+    if cp.stderr is None:
+        cp.stderr = ""
+    return cp
 
 
 def _spawn(cmd: list[str], cwd: str, env: dict | None = None
@@ -6477,6 +6556,11 @@ except (OSError, NameError):
 REVIEW_MAX_TOKENS = 16000       # review_file()
 FIX_EDITS_MAX_TOKENS = 32000    # generate_file_fix_edits()
 FIX_WHOLE_MAX_TOKENS = 128000   # generate_file_fix() whole-file regen
+# How many times generate_edits_shrinking() may HALVE the finding list when the
+# model runs out of output budget. 3 takes 16 findings down to 2 and costs at
+# most 3 extra cheap calls; a file that still cannot emit one edit is genuinely
+# beyond this model, and is reported as such rather than retried forever.
+_EDIT_SHRINK_STEPS = 3
 _TEST_MARKERS = (".test.", ".spec.", "__tests__", "/tests/", "/test/", "test_")
 
 
@@ -7944,6 +8028,81 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
     return base
 
 
+# Conservative chars-per-output-token for source code. Real code sits around
+# 3.5-4; 3.0 under-estimates the ceiling, which is the safe direction here: it
+# only ever keeps a file on the anchored-edit path, which works for files of any
+# size. Over-estimating would send a file into a whole-file regeneration that
+# cannot fit.
+_CHARS_PER_TOKEN = 3.0
+_WHOLE_FILE_HEADROOM = 0.8   # never plan to use the last fifth of the ceiling
+
+
+def _provider_output_ceiling(provider) -> int:
+    """Max output tokens this provider's AUTHOR model can emit in one response."""
+    model = str(getattr(provider, "model", "") or "")
+    if isinstance(provider, OpenAIProvider) or model.startswith(("gpt-", "o3", "o4")):
+        return _openai_output_ceiling(model)
+    # Anthropic (and the FCC proxy in front of it) stream up to the whole-file
+    # budget the fix path already requests.
+    return FIX_WHOLE_MAX_TOKENS
+
+
+def _whole_file_is_plausible(provider, text: str) -> bool:
+    """Could this model emit this whole file in ONE response?
+
+    The `[edit-fallback]` demotion assumed yes for every file. On a large file
+    that assumption turns a recoverable anchor failure into a guaranteed
+    `[skip] ... token budget` (live GrantFlow 2026-08-16), because whole-file
+    output is strictly larger than the edit that just failed. When this returns
+    False the fix loop STAYS ANCHORED and retries edits, which can still succeed
+    at any file size.
+    """
+    ceiling = _provider_output_ceiling(provider)
+    return (len(text or "") / _CHARS_PER_TOKEN) <= ceiling * _WHOLE_FILE_HEADROOM
+
+
+def generate_edits_shrinking(provider, rel_path: str, text: str,
+                             findings: list[dict], feedback: str = "",
+                             log=print) -> dict:
+    """`generate_file_fix_edits`, but SHRINKING THE UNIT when the model runs out
+    of output budget instead of giving up on the file.
+
+    This is the whole answer to the live GrantFlow 2026-08-16 failure, where
+    `SmartMatcher.jsx` and friends produced
+    `[skip] ...: fix generation failed (Model output hit the 16384-token budget)`
+    over and over — reviewed 8, defects 155, fixed 1, errors 8. The old code
+    treated a budget overrun as "this file is too big to fix", which is only
+    true if you insist on emitting the whole file. An EDIT is proportional to
+    the CHANGE, so a budget overrun means we asked for too many changes at once,
+    not that the file is unfixable.
+
+    So: on `OutputBudgetError`, keep the WORST-severity half of the findings and
+    ask again. Halving is bounded (`_EDIT_SHRINK_STEPS`) and stops at one
+    finding — if a SINGLE edit cannot fit the model's output budget the file
+    genuinely cannot be fixed by this model, and only then does the error
+    propagate. Findings that were dropped to make room are still reported by the
+    caller and will be picked up by the next until-clean cycle.
+    """
+    ranked = sorted(findings, key=lambda f: -SEVERITY_RANK.get(
+        str(f.get("severity", "")).lower(), 0))
+    subset = ranked
+    last: OutputBudgetError | None = None
+    for _step in range(_EDIT_SHRINK_STEPS + 1):
+        try:
+            return generate_file_fix_edits(provider, rel_path, text, subset,
+                                           feedback=feedback)
+        except OutputBudgetError as ex:
+            last = ex
+            if len(subset) <= 1:
+                break
+            keep = max(1, len(subset) // 2)
+            log(f"  [edit-shrink] {rel_path}: output budget hit with "
+                f"{len(subset)} finding(s) -> retrying with the worst {keep}")
+            subset = subset[:keep]
+    raise last if last is not None else OutputBudgetError(
+        "edit generation exhausted its shrink budget")
+
+
 def generate_file_fix(provider, rel_path: str, text: str, findings: list[dict],
                       feedback: str = "") -> dict:
     """Produce the complete corrected file from a list of findings. `feedback`
@@ -9353,6 +9512,11 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     notes: list[str] = []
     dirty_files: list[str] = []  # candidates written but rollback REFUSED (dirty tree)
     errors = 0  # this cycle's reverts + rejects + skips (added to err_base for display)
+    # Files this model physically cannot emit a fix for. Tracked SEPARATELY from
+    # `errors` (see the "oversized" branch below) because a capability limit and
+    # a failed fix are different facts, and the caller already counts `oversized`
+    # once in errors_total.
+    oversized_skips = 0
     defects_fixed = 0  # individual defects addressed across kept fixes (for the dashboard)
     since_commit = 0    # kept fixes since the last incremental commit
     MAX_FIX_TRIES = 3   # per-file salvage attempts (build-break / veto feedback loop)
@@ -9409,7 +9573,12 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         # BudgetExceededError payload, re-raised on the main thread and handled there.
         try:
             if use_edits:
-                return (kind, original, generate_file_fix_edits(author, rel, original, targets))
+                # Shrinking generator, same as the inline path: a prefetched
+                # first attempt that hits the output budget must shrink the
+                # finding set too, or the prefetch would hand the main thread an
+                # OutputBudgetError that had never been retried at all.
+                return (kind, original,
+                        generate_edits_shrinking(author, rel, original, targets))
             return (kind, original, generate_file_fix(author, rel, original, targets))
         except BudgetExceededError:
             return ("capped", "", None)
@@ -9568,7 +9737,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         # used to be tested only BETWEEN attempts, which a call
                         # that never returns never reaches.
                         epatch = _call_bounded(
-                            lambda: generate_file_fix_edits(
+                            lambda: generate_edits_shrinking(
                                 author, rel, original, targets, feedback=feedback),
                             file_deadline - time.time())
                     if not epatch.get("changed"):
@@ -9579,16 +9748,25 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                         patch = {"changed": True, "contents": new_text,
                                  "fixed_titles": epatch.get("fixed_titles") or [],
                                  "notes": epatch.get("notes", "")}
-                    elif edit_retries > 0:
-                        edit_retries -= 1
+                    elif edit_retries > 0 or not _whole_file_is_plausible(author, original):
+                        # STAY ANCHORED when whole-file regeneration could not
+                        # possibly fit this model's output ceiling. Demoting a
+                        # 60KB file to whole-file mode is not a fallback, it is a
+                        # guaranteed [skip]; another anchored attempt at least
+                        # can succeed. Files small enough to regenerate still
+                        # demote exactly as before after their one retry.
+                        if edit_retries > 0:
+                            edit_retries -= 1
                         feedback = (
                             f"Your previous edits could not be applied: "
                             f"{apply_err or 'they were a no-op'}. Regenerate ALL edits. "
                             "Every `search` must be copied VERBATIM from CURRENT "
                             "CONTENTS above — exact whitespace, indentation and line "
                             "breaks — and must occur exactly once in the file.")
+                        anchored = "" if _whole_file_is_plausible(author, original) else \
+                            " (too large to regenerate whole - staying anchored)"
                         print(f"  [edit-retry] {rel}: {apply_err or 'edits were a no-op'}"
-                              " -> regenerating edits with feedback")
+                              f" -> regenerating edits with feedback{anchored}")
                         continue
                     else:
                         edit_mode = False
@@ -9603,6 +9781,18 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 except BudgetExceededError:
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
+                    break
+                except OutputBudgetError as ex:
+                    # NEVER demote to whole-file on an output-budget overrun.
+                    # Whole-file output is strictly LARGER than an edit, so the
+                    # fallback was a guaranteed second failure - which is exactly
+                    # how live GrantFlow 2026-08-16 turned every large file into
+                    # "[skip] fix generation failed (... token budget ...)" with
+                    # errors outrunning fixes. generate_edits_shrinking has
+                    # already halved the findings as far as it is allowed to, so
+                    # reaching here means even ONE edit does not fit. Report it
+                    # as an OVERSIZED file, distinct from a real error.
+                    outcome = ("oversized", str(ex))
                     break
                 except Exception as ex:
                     edit_mode = False
@@ -9626,9 +9816,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     budget_hit = True
                     outcome = ("skip", "cost cap reached")
                     break
+                except OutputBudgetError as ex:
+                    # Whole-file mode only runs when the file was NOT reachable
+                    # by edits (an anchor failure demoted it), so an overrun here
+                    # is the honest "this model cannot emit this file" case.
+                    outcome = ("oversized", str(ex))
+                    break
                 except Exception as ex:
-                    if "token budget" in str(ex) and oversized is not None:
-                        oversized.append(rel)
                     outcome = ("skip", str(ex))
                     break
             if not patch.get("changed") or not (patch.get("contents") or "").strip():
@@ -9790,6 +9984,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             _tick(rel)
             continue
 
+        if outcome is None:
+            # LATENT CRASH, closed here: the attempt loop can end on a `continue`
+            # path that never sets an outcome - the edit-retry branch is one, and
+            # it became far more reachable once a too-large-to-regenerate file
+            # started staying anchored instead of demoting. `outcome[0]` on None
+            # is a TypeError that would take down the whole audit, which is
+            # exactly the class of failure the fix loop must never have. Name it
+            # and re-queue instead.
+            if not _whole_file_is_plausible(author, original):
+                outcome = ("oversized",
+                           f"{attempt} anchored attempt(s) failed and the file is too "
+                           "large for this model to regenerate whole")
+            else:
+                outcome = ("skip", f"no verified fix after {attempt} attempt(s)")
         kind = outcome[0]
         _fixtrace("attempt.outcome", rel, outcome=kind, detail=str(outcome[1])[:300],
                   attempts=attempt)
@@ -9814,6 +10022,27 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         elif kind == "skip":
             errors += 1
             print(f"  [skip] {rel}: fix generation failed ({outcome[1]})")
+        elif kind == "oversized":
+            # A DISTINCT non-success, deliberately NOT counted in `errors`.
+            #
+            # The tension is real and worth stating: this tool's standing rule is
+            # that a non-success must never be quietly reclassified. This is not
+            # that. The file is still named loudly here, still recorded in
+            # `oversized`, and `audit_one_program` already folds
+            # `len(set(oversized))` into `errors_total` for the dashboard and the
+            # report - so it is counted exactly ONCE, in the category that says
+            # what actually happened. What it stops is the OTHER dishonesty:
+            # live GrantFlow 2026-08-16 read "errors 8, fixed 1" when the truth
+            # was "one model cannot emit these files", which is a capability
+            # limit, not eight failed fixes. The until-clean loop re-queues them,
+            # and the next run against a larger-output model fixes them.
+            oversized_skips += 1
+            if oversized is not None:
+                oversized.append(rel)
+            notes.append(f"{rel}: too large for this model to fix in one "
+                         f"response ({str(outcome[1])[:160]})")
+            print(f"  [oversized] {rel}: even the smallest edit exceeds this "
+                  f"model's output budget - NOT fixed, re-queued ({outcome[1]})")
         elif kind == "noop":
             # NEVER silent (owner rule): a model declining to change a file that
             # HAS findings is a skipped defect, not a success. Without this note,
@@ -9860,6 +10089,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         _tick(rel)
     if prefetch_pool is not None:
         prefetch_pool.shutdown(wait=False, cancel_futures=True)
+    if oversized_skips:
+        # Loud, once, at the end: a run that "fixed 1 of 155" because the model
+        # cannot emit those files must say so in one line a human will read,
+        # not only as N interleaved per-file lines.
+        print(f"  [oversized] {oversized_skips} file(s) exceeded this model's "
+              "output budget even at the smallest edit - NOT fixed. Re-run with "
+              "a larger-output model (see OPENAI_OUTPUT_CEILINGS) to reach them.")
     if dirty_files:
         # Fail-CLOSED: a candidate could not be rolled back. Signal the caller (which
         # commits the cycle's tree UNCONDITIONALLY) so it aborts the commit instead of

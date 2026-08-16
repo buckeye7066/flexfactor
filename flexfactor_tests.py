@@ -12,6 +12,7 @@ import inspect
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -12134,6 +12135,350 @@ class CompetitorAuditWiringTests(unittest.TestCase):
         self.assertIn("https://github.com/openlp/openlp", text)
         self.assertIn("connection refused", text)
         self.assertIn("SHORTFALL", text)
+
+class OutputBudgetShrinkTests(unittest.TestCase):
+    """Live GrantFlow 2026-08-16: `[skip] src/pages/SmartMatcher.jsx: fix
+    generation failed (Model output hit the 16384-token budget ...)`, repeatedly,
+    with reviewed=8 defects=155 fixed=1 errors=8. Large files were UNFIXABLE
+    because a budget overrun in EDIT mode demoted the file to WHOLE-FILE
+    regeneration - which needs strictly MORE output. The answer is to shrink the
+    unit of generation, not to keep raising the ceiling."""
+
+    @staticmethod
+    def _findings(n):
+        sev = ["critical", "high", "medium", "low"]
+        return [{"severity": sev[i % 4], "line": i, "title": f"t{i}",
+                 "problem": "p", "fix": "f"} for i in range(n)]
+
+    def test_shrinking_halves_the_findings_until_the_output_fits(self):
+        seen = []
+
+        class P:
+            def structured(_s, system, prompt, schema, max_tokens=8000, **kw):
+                # Count findings by the bullet lines the generator emits.
+                n = prompt.count("=> FIX:")
+                seen.append(n)
+                if n > 2:
+                    raise ff.OutputBudgetError("Model output hit the 16384-token budget")
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}],
+                        "fixed_titles": [], "notes": ""}
+
+        out = ff.generate_edits_shrinking(P(), "big.jsx", "a" * 100,
+                                          self._findings(16), log=lambda m: None)
+        self.assertTrue(out["changed"])
+        self.assertEqual(seen, [16, 8, 4, 2], "each retry must HALVE the finding set")
+
+    def test_shrinking_keeps_the_worst_severity_findings(self):
+        kept = {}
+
+        class P:
+            def structured(_s, system, prompt, schema, max_tokens=8000, **kw):
+                if prompt.count("=> FIX:") > 2:
+                    raise ff.OutputBudgetError("token budget")
+                kept["prompt"] = prompt
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}]}
+
+        ff.generate_edits_shrinking(P(), "big.jsx", "a" * 100,
+                                    self._findings(16), log=lambda m: None)
+        self.assertIn("[critical]", kept["prompt"])
+        self.assertNotIn("[low]", kept["prompt"],
+                         "the survivors must be the worst-severity findings")
+
+    def test_a_single_finding_that_still_overruns_raises_rather_than_looping(self):
+        calls = {"n": 0}
+
+        class P:
+            def structured(_s, *a, **k):
+                calls["n"] += 1
+                raise ff.OutputBudgetError("Model output hit the 16384-token budget")
+
+        with self.assertRaises(ff.OutputBudgetError):
+            ff.generate_edits_shrinking(P(), "huge.jsx", "a" * 100,
+                                        self._findings(4), log=lambda m: None)
+        # 4 -> 2 -> 1 -> stop: bounded, never an infinite shrink loop.
+        self.assertLessEqual(calls["n"], ff._EDIT_SHRINK_STEPS + 1)
+
+    def test_no_overrun_means_no_extra_calls(self):
+        calls = {"n": 0}
+
+        class P:
+            def structured(_s, *a, **k):
+                calls["n"] += 1
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}]}
+
+        ff.generate_edits_shrinking(P(), "f.js", "a", self._findings(9),
+                                    log=lambda m: None)
+        self.assertEqual(calls["n"], 1, "the happy path must cost exactly one call")
+
+
+class OutputCeilingTests(unittest.TestCase):
+    def test_newer_models_are_no_longer_capped_at_gpt4os_ceiling(self):
+        self.assertEqual(ff._openai_output_ceiling("gpt-4o"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("gpt-4.1"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("gpt-5"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("o4-mini"), 16384)
+
+    def test_dated_model_snapshots_resolve_by_longest_prefix(self):
+        self.assertEqual(ff._openai_output_ceiling("gpt-4.1-2025-04-14"),
+                         ff._openai_output_ceiling("gpt-4.1"))
+        self.assertEqual(ff._openai_output_ceiling("gpt-4o-mini-2024-07-18"),
+                         ff._openai_output_ceiling("gpt-4o-mini"))
+
+    def test_an_unknown_model_fails_SMALL_not_large(self):
+        # Over-requesting output is a hard API rejection that kills the call;
+        # under-requesting only costs one shrink-and-retry.
+        self.assertEqual(ff._openai_output_ceiling("some-future-model"),
+                         ff.OPENAI_OUTPUT_CEILING_DEFAULT)
+        self.assertEqual(ff._openai_output_ceiling(""), ff.OPENAI_OUTPUT_CEILING_DEFAULT)
+
+
+class OversizedAccountingTests(unittest.TestCase):
+    """An unfixable-by-budget file must be named loudly, recorded distinctly,
+    and NEVER inflate the plain error count."""
+
+    class _Author:
+        model = "stub"
+
+        def __init__(self, exc):
+            self.exc = exc
+
+        def structured(self, *a, **k):
+            raise self.exc
+
+    def _run(self, exc):
+        import io
+        import contextlib as _c
+        with _RepoFixture({"big.jsx": "x = 1\n" * 50}) as root:
+            oversized = []
+            findings = {"big.jsx": [{"severity": "high", "line": 1, "title": "t",
+                                     "problem": "p", "fix": "f"}]}
+            import types
+            args = types.SimpleNamespace(
+                whole_file_fixes=False, fix_prefetch=0, adversarial=False,
+                adversarial_rounds=0, adversarial_materiality="material",
+                fix_severity="high")
+            buf = io.StringIO()
+            with _c.redirect_stdout(buf):
+                applied, unver, notes = ff._fix_files(
+                    self._Author(exc), None, root, findings,
+                    {"verify_cmds": [], "ecosystems": []}, True, args,
+                    oversized=oversized, adversarial=False)
+            return applied, notes, oversized, buf.getvalue()
+
+    def test_an_output_budget_overrun_is_oversized_not_a_generic_skip(self):
+        applied, notes, oversized, out = self._run(
+            ff.OutputBudgetError("Model output hit the 16384-token budget"))
+        self.assertEqual(applied, [])
+        self.assertIn("big.jsx", oversized, "the file must be recorded as oversized")
+        self.assertIn("[oversized]", out)
+        self.assertIn("big.jsx", out)
+        self.assertNotIn("[skip] big.jsx", out,
+                         "a budget limit is not a generic fix-generation failure")
+        self.assertTrue([n for n in notes if "big.jsx" in n and "too large" in n],
+                        "the skip must be NAMED in fix_notes, never silent")
+
+    def test_a_real_generation_failure_is_still_a_skip(self):
+        # The distinction must cut both ways, or "oversized" becomes a dumping
+        # ground that hides genuine errors.
+        _applied, _notes, oversized, out = self._run(RuntimeError("provider exploded"))
+        self.assertNotIn("big.jsx", oversized)
+        self.assertIn("[skip] big.jsx", out)
+
+    def test_an_output_budget_overrun_never_demotes_to_whole_file(self):
+        # The demotion was the defect: whole-file output is strictly larger than
+        # an edit, so falling back guaranteed a second failure.
+        _applied, _notes, _oversized, out = self._run(
+            ff.OutputBudgetError("Model output hit the 16384-token budget"))
+        self.assertNotIn("[edit-fallback]", out,
+                         "an output-budget overrun must not fall back to "
+                         "regenerating the whole file")
+
+
+class EditAnchorSafetyTests(unittest.TestCase):
+    """The targeted-edit path is only safe because an anchor must match exactly
+    once - applying a non-unique anchor would silently patch the wrong site."""
+
+    def test_a_unique_anchor_is_applied(self):
+        new, err = ff._apply_edits("alpha\nbeta\ngamma\n",
+                                   [{"search": "beta", "replace": "BETA"}])
+        self.assertEqual(err, "")
+        self.assertEqual(new, "alpha\nBETA\ngamma\n")
+
+    def test_a_missing_anchor_is_refused_not_guessed(self):
+        new, err = ff._apply_edits("alpha\n", [{"search": "nope", "replace": "x"}])
+        self.assertIsNone(new)
+        self.assertIn("not found", err)
+
+    def test_an_ambiguous_anchor_is_refused_rather_than_applied_blindly(self):
+        new, err = ff._apply_edits("dup\ndup\n", [{"search": "dup", "replace": "x"}])
+        self.assertIsNone(new)
+        self.assertIn("matches 2 times", err)
+
+    def test_an_empty_edit_list_is_refused(self):
+        self.assertIsNone(ff._apply_edits("a\n", [])[0])
+        self.assertIsNone(ff._apply_edits("a\n", None)[0])
+
+class SubprocessEncodingTests(unittest.TestCase):
+    """Live GrantFlow, 2026-08-16, an audit that died mid-cycle:
+
+        GrantFlow: ERROR - unsupported operand type(s) for +: 'NoneType' and 'str'
+        totals: 0/1 program(s) OK | 0 defect(s) found | 0 file(s) fixed
+
+    preceded by two subprocess reader-thread tracebacks ending in
+    `UnicodeDecodeError: 'charmap' codec can't decode byte 0x9d`. `_run` used
+    `text=True` with no encoding, so Windows decoded child output with the locale
+    codec (cp1252); one smart quote or em dash from npm/vite/eslint killed the
+    reader THREAD, `cp.stdout` came back None, and the first `stdout + "..."`
+    downstream took the whole audit down.
+    """
+
+    @staticmethod
+    def _emit(expr):
+        """A child that writes RAW bytes to stdout - no text layer, so the bytes
+        reach the parent's decoder exactly as a real toolchain's would."""
+        return [sys.executable, "-c",
+                "import sys; sys.stdout.buffer.write(%s); sys.stdout.buffer.flush()" % expr]
+
+    def test_a_byte_that_cp1252_cannot_decode_does_not_kill_the_run(self):
+        # 0x9d is undefined in cp1252 - the exact byte from the live crash.
+        cp = ff._run(self._emit('b"before" + bytes([0x9d]) + b"after"'), cwd=os.getcwd())
+        self.assertIsInstance(cp.stdout, str, "stdout must never come back None")
+        self.assertIn("before", cp.stdout)
+        self.assertIn("after", cp.stdout,
+                      "output AFTER the bad byte must survive - errors='replace', "
+                      "not a truncated or discarded stream")
+
+    def test_utf8_punctuation_from_a_real_toolchain_survives(self):
+        # Smart quotes and em dashes are what npm/vite/eslint actually emit.
+        cp = ff._run(self._emit(r'"— “build” done".encode("utf-8")'),
+                     cwd=os.getcwd())
+        self.assertIsInstance(cp.stdout, str)
+        self.assertIn("build", cp.stdout)
+        self.assertIn("—", cp.stdout, "utf-8 decoding must be exact, not lossy")
+
+    def test_stdout_and_stderr_are_always_strings_so_concatenation_is_safe(self):
+        # The crash was a TypeError, not a decode error: every caller does
+        # `cp.stdout + "..."` or scans it. Prove the contract at the chokepoint.
+        for expr in ('b""', 'bytes([0x9d, 0x81, 0x8d])',
+                     r'"café".encode("utf-8")'):
+            cp = ff._run(self._emit(expr), cwd=os.getcwd())
+            self.assertIsInstance(cp.stdout, str, expr)
+            self.assertIsInstance(cp.stderr, str, expr)
+            self.assertEqual(cp.stdout + "|" + cp.stderr, cp.stdout + "|" + cp.stderr)
+
+    def test_a_reader_thread_that_still_returns_none_is_coerced_not_propagated(self):
+        # Defence in depth: even if a future capture path hands back None for a
+        # reason we have not seen, _run must not let it reach a caller.
+        real = subprocess.run
+
+        def fake(*a, **k):
+            cp = subprocess.CompletedProcess(a[0] if a else [], 0, None, None)
+            return cp
+
+        try:
+            subprocess.run = fake
+            cp = ff._run(["anything"], cwd=os.getcwd())
+        finally:
+            subprocess.run = real
+        self.assertEqual(cp.stdout, "")
+        self.assertEqual(cp.stderr, "")
+
+    def test_every_capture_call_site_pins_an_encoding(self):
+        # A new `capture_output=True, text=True` without an encoding recreates the
+        # crash, and it would only show up on a Windows machine with non-ASCII
+        # build output. Pin it at the source level so the suite catches it.
+        src = inspect.getsource(ff)
+        for i, line in enumerate(src.splitlines()):
+            if "capture_output=True" in line:
+                window = "\n".join(src.splitlines()[max(0, i - 3):i + 4])
+                self.assertIn('encoding="utf-8"', window,
+                              f"capture_output site near line {i + 1} does not pin "
+                              "an encoding - on Windows it will decode as cp1252")
+                self.assertIn('errors="replace"', window,
+                              f"capture_output site near line {i + 1} does not set "
+                              "errors='replace'")
+
+class StayAnchoredOnLargeFilesTests(unittest.TestCase):
+    """The remaining half of the GrantFlow fix-loop failure: an ANCHOR failure
+    demoted the file to whole-file regeneration, and on a large file that is a
+    guaranteed `[skip] ... token budget` because whole-file output is strictly
+    larger than the edit that just failed."""
+
+    class _Author:
+        """Returns edits whose anchor never matches, so the apply always fails."""
+
+        def __init__(self, model="gpt-4o"):
+            self.model = model
+            self.modes = []
+
+        def structured(self, system, prompt, schema, max_tokens=8000, **kw):
+            self.modes.append("edits" if "edits" in json.dumps(schema) else "whole")
+            if self.modes[-1] == "edits":
+                return {"changed": True,
+                        "edits": [{"search": "ANCHOR-THAT-IS-NOT-PRESENT",
+                                   "replace": "x"}],
+                        "fixed_titles": [], "notes": ""}
+            return {"changed": True, "contents": "regenerated\n",
+                    "fixed_titles": [], "notes": ""}
+
+    def _run(self, body, model):
+        import io
+        import contextlib as _c
+        import types
+        with _RepoFixture({"f.js": body}) as root:
+            author = self._Author(model)
+            oversized = []
+            findings = {"f.js": [{"severity": "high", "line": 1, "title": "t",
+                                  "problem": "p", "fix": "f"}]}
+            args = types.SimpleNamespace(
+                whole_file_fixes=False, fix_prefetch=0, adversarial=False,
+                adversarial_rounds=0, adversarial_materiality="material",
+                fix_severity="high")
+            buf = io.StringIO()
+            with _c.redirect_stdout(buf):
+                applied, _unver, notes = ff._fix_files(
+                    author, None, root, findings,
+                    {"verify_cmds": [], "ecosystems": []}, True, args,
+                    oversized=oversized, adversarial=False)
+            return author, applied, notes, oversized, buf.getvalue()
+
+    def test_a_small_file_still_demotes_to_whole_file_as_before(self):
+        author, _a, _n, _o, out = self._run("x = 1\n", "gpt-4o")
+        self.assertIn("[edit-fallback]", out)
+        self.assertIn("whole", author.modes,
+                      "small files must keep the existing whole-file fallback")
+
+    def test_a_file_too_large_to_regenerate_stays_on_the_anchored_path(self):
+        # ~60KB against gpt-4o's 16384-token ceiling: whole-file cannot fit.
+        author, applied, _n, oversized, out = self._run("x = 1;\n" * 9000, "gpt-4o")
+        self.assertNotIn("whole", author.modes,
+                         "a file this size must never be sent to whole-file "
+                         "regeneration - that is a guaranteed token-budget skip")
+        self.assertIn("staying anchored", out)
+        self.assertEqual(applied, [])
+        self.assertIn("f.js", oversized,
+                      "exhausting anchored attempts on an unregenerable file is "
+                      "an OVERSIZED outcome, named, not a crash")
+
+    def test_exhausting_every_attempt_never_crashes_on_a_None_outcome(self):
+        # The attempt loop can end on a `continue` path that never set an
+        # outcome; `outcome[0]` on None is a TypeError that would end the audit.
+        _author, _applied, notes, _oversized, out = self._run("x = 1;\n" * 9000,
+                                                              "gpt-4o")
+        self.assertTrue(notes, "the file must be named in fix_notes")
+        self.assertNotIn("Traceback", out)
+
+    def test_plausibility_is_model_aware_and_errs_toward_staying_anchored(self):
+        class Small:
+            model = "gpt-4o"
+
+        class Big:
+            model = "claude-opus-4-8"
+
+        self.assertTrue(ff._whole_file_is_plausible(Small(), "x" * 10_000))
+        self.assertFalse(ff._whole_file_is_plausible(Small(), "x" * 60_000))
+        self.assertTrue(ff._whole_file_is_plausible(Big(), "x" * 60_000))
+        self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
