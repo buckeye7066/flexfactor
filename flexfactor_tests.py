@@ -478,7 +478,6 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._provider_key_present = real_key
             ff._provider_health = real_health
 
-
     def test_paid_openai_dead_reports_credit_rejection_not_mode_exclusion(self):
         # Live GrantFlow 2026-08-16: an explicit OpenAI-only paid run received
         # a 429 credit_balance_exhausted preflight, but the summary claimed paid
