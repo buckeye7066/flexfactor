@@ -9280,10 +9280,13 @@ class PaidFallbackRescueTests(unittest.TestCase):
             raise ConnectionError("transport drop")
 
         ff._stream_with_deadline = fake_swd
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as cm:
             prov._stream_structured(
                 model="claude-haiku-4-5", max_tokens=100, system=[],
                 messages=[{"role": "user", "content": "x"}], fmt={})
+        self.assertIn("ConnectionError: transport drop", str(cm.exception),
+                      "the final error must expose the exact SDK failure instead "
+                      "of hiding it behind a generic retry message")
 
     @_needs_anthropic_sdk
     def test_structured_delegates_to_openai_when_anthropic_tier_fails(self):
@@ -12515,6 +12518,53 @@ class StayAnchoredOnLargeFilesTests(unittest.TestCase):
         self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
+    def test_singleton_unit_uses_per_file_schema_not_nested_batch_schema(self):
+        calls = []
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            calls.append("batch" if schema is ff.AUDIT_BATCH_SCHEMA else "file")
+            if schema is ff.AUDIT_BATCH_SCHEMA:
+                raise RuntimeError("nested one-row schema rejected")
+            return {"findings": [], "summary": "clean"}
+
+        class Provider:
+            model = "only-provider"
+
+        with _patched(ff, "SEMANTIC_REVIEW_BATCH_CHARS", 1), \
+             _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("value = 1\n", f"sha-{rel}")):
+            found, flat, unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj", ["a.py"], workers=8,
+                batch_semantic=True)
+        self.assertEqual(calls, ["file"])
+        self.assertEqual(set(clean), {"a.py"})
+        self.assertEqual((found, flat, unreadable, incomplete), ({}, [], set(), set()))
+
+    def test_one_file_failure_does_not_quarantine_sole_provider(self):
+        calls = []
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            rel = "a.py" if "FILE: a.py" in prompt else "b.py"
+            calls.append(rel)
+            if rel == "a.py":
+                raise RuntimeError("file-local request rejected")
+            return {"findings": [], "summary": "clean"}
+
+        class Provider:
+            model = "only-provider"
+
+        with _patched(ff, "SEMANTIC_REVIEW_BATCH_CHARS", 1), \
+             _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("value = 1\n", f"sha-{rel}")):
+            _found, _flat, _unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj", ["a.py", "b.py"], workers=8,
+                batch_semantic=True)
+        self.assertEqual(calls, ["a.py", "b.py"])
+        self.assertEqual(set(clean), {"b.py"})
+        self.assertEqual(incomplete, {"a.py"})
+
     def test_semantic_engine_reviews_duplicate_nominations_exactly_once(self):
         import io
         calls = []
