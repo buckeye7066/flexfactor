@@ -507,22 +507,103 @@ def purpose_graph(contract: dict | None, purpose_gap: dict | None,
 def coverage_ledger(index: dict, *, run_id: str, test_command: list[str] | None,
                     tests_ran: bool, tests_passed: bool | None,
                     generated_test_modules: Iterable[str], e2e: dict | None) -> dict:
-    """Produce proof rows; never infer execution from the existence of a test."""
+    """Produce module-execution proof from successful native runs and imports.
+
+    A test file's mere existence is never evidence.  When the native suite is
+    green, however, a statically imported module (and its transitive static
+    imports) necessarily loaded during that execution.  Likewise, a successful
+    browser run loads the production entry graph.  This is stronger and far less
+    destructive than generating a second speculative test suite for every module.
+    It remains module-level evidence, never falsely labelled direct function
+    coverage.
+    """
     generated = {str(p).replace("\\", "/") for p in generated_test_modules}
     e2e = e2e or {}
+    source_files = {f["path"] for f in index.get("files", [])
+                    if f.get("category") == "source"}
+    test_files = {p for p in source_files if _is_test(p)}
+
+    # Resolve the conservative subset of local imports that can be tied to an
+    # indexed file without executing repository code.
+    by_noext: dict[str, set[str]] = {}
+    by_name: dict[str, set[str]] = {}
+    for rel in source_files:
+        noext = str(Path(rel).with_suffix("")).replace("\\", "/")
+        by_noext.setdefault(noext, set()).add(rel)
+        by_name.setdefault(Path(noext).name, set()).add(rel)
+
+    def targets(owner: str, module: str) -> set[str]:
+        module = str(module or "").replace("\\", "/")
+        keys: set[str] = set()
+        if module.startswith("@/"):
+            keys.add("src/" + module[2:])
+        elif module.startswith("~/"):
+            keys.add("src/" + module[2:])
+        elif module.startswith("."):
+            keys.add(os.path.normpath(os.path.join(
+                os.path.dirname(owner), module)).replace("\\", "/"))
+        else:
+            keys.update({module, module.replace(".", "/")})
+        resolved: set[str] = set()
+        for key in list(keys):
+            key = key.lstrip("./")
+            key_noext = (str(Path(key).with_suffix(""))
+                         if Path(key).suffix.lower() in SOURCE_EXTENSIONS else key)
+            resolved |= by_noext.get(key_noext, set())
+            resolved |= by_noext.get(key_noext + "/index", set())
+            # Bare local module names are accepted only when unambiguous.
+            named = by_name.get(Path(key_noext).name, set())
+            if len(named) == 1:
+                resolved |= named
+        return resolved
+
+    forward: dict[str, set[str]] = {rel: set() for rel in source_files}
+    for item in index.get("imports", []):
+        owner = str(item.get("file") or "").replace("\\", "/")
+        if owner in forward:
+            forward[owner] |= targets(owner, str(item.get("module") or ""))
+
+    roots: set[str] = set()
+    root_kind: dict[str, str] = {}
+    evidence_kind: dict[str, str] = {}
+    if tests_ran and tests_passed is True:
+        roots |= test_files
+        roots |= {p for p in generated if p in source_files}
+        for root in roots:
+            root_kind[root] = "native-test-import-path"
+    if e2e.get("ok") is True:
+        entry_rx = re.compile(
+            r"(?i)(?:^|/)(?:main|index|app|server|start|routes?)\.(?:[cm]?[jt]sx?|py)$")
+        browser_roots = {p for p in source_files
+                         if not _is_test(p) and entry_rx.search(p)}
+        roots |= browser_roots
+        for root in browser_roots:
+            root_kind.setdefault(root, "browser-entry-import-path")
+    executed_modules: set[str] = set()
+    frontier = [(root, root_kind[root]) for root in roots]
+    while frontier:
+        owner, kind = frontier.pop()
+        if owner in executed_modules:
+            continue
+        executed_modules.add(owner)
+        evidence_kind[owner] = kind
+        for target in forward.get(owner, set()):
+            if target not in executed_modules:
+                frontier.append((target, kind))
+
     function_rows = []
     for sym in index.get("symbols", []):
         if not str(sym.get("kind", "")).endswith("function"):
             continue
-        # A green generated module test is module-level execution evidence.  It
-        # is not direct function coverage, so the evidence type says exactly so.
         source = sym["file"]
-        module_attempted = any(Path(source).stem in Path(t).stem for t in generated)
-        executed = bool(tests_ran and tests_passed is True and module_attempted)
+        if _is_test(source):
+            continue  # test helpers are evidence producers, not product functions
+        executed = source in executed_modules
         function_rows.append({"id": sym["id"], "file": source, "line": sym["line"],
-            "name": sym["name"], "status": "module-test-executed" if executed else "unproven",
-            "invocation_evidence": ({"command": test_command, "test_files": sorted(generated)}
-                                    if executed else None),
+            "name": sym["name"], "status": "module-executed" if executed else "unproven",
+            "invocation_evidence": ({"command": test_command,
+                                      "type": evidence_kind.get(source, "static-import-path"),
+                                      "roots": sorted(roots)} if executed else None),
             "direct_function_coverage": False})
     route_evidence = list(e2e.get("route_evidence") or [])
     control_evidence = list(e2e.get("control_evidence") or [])
@@ -541,10 +622,13 @@ def coverage_ledger(index: dict, *, run_id: str, test_command: list[str] | None,
         "discovered_control_total": len(discovered_controls),
         "executed_control_total": sum(r.get("status") == "passed" for r in control_evidence),
         "function_total": len(function_rows),
-        "function_module_execution_total": sum(r["status"] == "module-test-executed" for r in function_rows),
+        "function_module_execution_total": sum(r["status"] == "module-executed" for r in function_rows),
         "function_direct_coverage_total": sum(bool(r["direct_function_coverage"]) for r in function_rows),
         "tests": {"command": test_command, "ran": bool(tests_ran), "passed": tests_passed,
-                  "collected": bool(tests_ran and generated)},
+                  "collected": bool(tests_ran and test_files)},
+        "executed_modules": sorted(executed_modules),
+        "unproven_modules": sorted({r["file"] for r in function_rows
+                                     if r["status"] == "unproven"}),
     }
 
 
