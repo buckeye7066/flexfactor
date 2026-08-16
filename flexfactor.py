@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.8"
+TOOL_VERSION = "0.3.9"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -7976,6 +7976,19 @@ def _unique_review_paths(files) -> list[str]:
     return unique
 
 
+def _update_incomplete_review_ledger(pending: set[str], *, completed,
+                                     incomplete) -> None:
+    """Carry unproven reviews across cycles until one actually completes.
+
+    A cycle-local set is insufficient: cycle 1 can mark a file incomplete, fix
+    other files, and cycle 2 then reviews only those fixes. If the cycle-1 set
+    is discarded, the run can converge without ever retrying the unproven file.
+    Completed reviews clear their own prior entry; new failures add theirs.
+    """
+    pending.difference_update(str(rel) for rel in completed)
+    pending.update(str(rel) for rel in incomplete)
+
+
 def _gap_to_finding(g: dict) -> dict:
     """Map a purpose-gap item onto the audit finding shape so it flows through the
     same report/fix machinery as any other defect."""
@@ -11332,7 +11345,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         total_to_review = len(files)
         cycles_run = 0
         errors_total = 0
-        review_incomplete: set[str] = set()  # last sweep's failed-review files
+        all_review_incomplete: set[str] = set()  # unproven files carried across cycles
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
         infrastructure_abort = False  # provider outage: stop expensive downstream phases
@@ -11769,6 +11782,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 review_incomplete |= b_incomplete
                 completed_review_files.update(b_findings)
                 completed_review_files.update(b_clean)
+                _update_incomplete_review_ledger(
+                    all_review_incomplete,
+                    completed=set(b_findings) | set(b_clean),
+                    incomplete=b_incomplete)
                 if failed_review_batches >= 3:
                     stop_reason = (
                         "provider outage: three consecutive semantic review batches "
@@ -11931,16 +11948,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 break  # a hard-stop fired inside a batch; stop the whole run here
 
             if not any_fixable_this_cycle:
-                if review_incomplete:
+                if all_review_incomplete:
                     # "Nothing to fix" is UNPROVEN: files whose review errored
                     # out (provider outage / budget) were never inspected, so a
                     # sweep of failed reviews must not read as a clean converge.
                     # This is the 3,464-defects-fixed-0-exit-0 invisibility all
                     # over again, one layer down - kill it here.
-                    print(f"{pfx}NOT converged: {len(review_incomplete)} file(s) "
+                    print(f"{pfx}NOT converged: {len(all_review_incomplete)} file(s) "
                           "never got a completed review (provider error/budget); "
                           "'nothing to fix' is unproven. Re-run to retry them.")
-                    stop_reason = (f"review incomplete: {len(review_incomplete)} "
+                    stop_reason = (f"review incomplete: {len(all_review_incomplete)} "
                                    "file(s) never got a completed review "
                                    "(provider error/budget) - NOT clean")
                     converged = False
@@ -11964,9 +11981,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 stop_reason = "remaining defects not auto-fixable (see report notes)"
                 break
 
-            # Shrink: next cycle re-reviews ONLY the files we just fixed (to confirm
-            # they're clean); files already clean have dropped out.
-            files = fixable_files
+            # Shrink to verified fixes plus every still-unproven review. A
+            # cycle-1 provider/evidence failure must not disappear when cycle 2
+            # narrows to files that were fixed.
+            files = _unique_review_paths(
+                list(fixable_files) + sorted(all_review_incomplete))
 
         applied_files = sorted(applied_set)
         unverified_files = sorted(unverified_set)
@@ -12722,7 +12741,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
-            "review_incomplete": len(review_incomplete),
+            "review_incomplete": len(all_review_incomplete),
             # The [no-op] split. "rejected" is the run's REVIEW PRECISION signal:
             # findings the author model inspected and refused to act on because
             # there was nothing to fix. Still counted as non-successes.
@@ -12812,7 +12831,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_fulfillment_pct=(purpose_gap or {}).get("fulfillment_pct"),
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
-            review_incomplete=len(review_incomplete),
+            review_incomplete=len(all_review_incomplete),
             evidence_run_id=evidence_run_id,
             evidence_paths=evidence_paths,
             quality_gate_passed=((evidence or {}).get("quality_gates") or {}).get("passed"),
@@ -12821,8 +12840,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # EVERY review failed and nothing was fixed: the run proved nothing at
         # all. That is an ERROR (exit 1, supervisors may retry a transient
         # provider outage), never a quiet success.
-        if (review_incomplete and not applied_files
-                and len(review_incomplete) >= total_to_review > 0):
+        if (all_review_incomplete and not applied_files
+                and len(all_review_incomplete) >= total_to_review > 0):
             result["error"] = (f"review never completed for any of the "
                                f"{total_to_review} file(s) (provider errors/"
                                "budget); nothing was reviewed, proven, or fixed")

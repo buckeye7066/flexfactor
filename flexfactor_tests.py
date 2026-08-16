@@ -1943,6 +1943,23 @@ class PurposeAssessmentFailureVisibilityTests(unittest.TestCase):
                 BrokenProvider(), "metadata", [], [], contract=Contract(), samples=3)
 
 
+class IncompleteReviewLedgerTests(unittest.TestCase):
+    def test_completed_review_clears_prior_failure_and_new_failure_persists(self):
+        pending = {"resolved.py", "still-pending.py"}
+        ff._update_incomplete_review_ledger(
+            pending,
+            completed={"resolved.py", "clean.py"},
+            incomplete={"new-pending.py"})
+        self.assertEqual(pending, {"still-pending.py", "new-pending.py"})
+
+    def test_audit_requeues_persistent_incompletes_with_fixed_files(self):
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn(
+            "list(fixable_files) + sorted(all_review_incomplete)", source)
+        self.assertIn(
+            '"review_incomplete": len(all_review_incomplete)', source)
+
+
 class CommitFailureIsFatalTests(unittest.TestCase):
     """Round-4 defect 2: a failed git commit must raise (stop the audit), never be
     returned as text so callers continue past an unsafe checkpoint."""
@@ -10824,7 +10841,7 @@ class ReviewIncompleteHonestyTests(unittest.TestCase):
     def test_incomplete_sweep_cannot_converge(self):
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("if review_incomplete:", src)
+        self.assertIn("if all_review_incomplete:", src)
         self.assertIn("review incomplete:", src)
 
     def test_release_status_defects_resolved_needs_complete_review(self):
