@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-FlexFactor - a self-improving code agent with two modes.
+FlexFactor - a self-improving code agent with four modes.
 
 REFACTOR (default): does reps on ONE source file.
     Reads a source file and a plain-English goal, asks an LLM to rewrite the file
@@ -57,8 +57,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 # Command classification + policy gate for the _run subprocess chokepoint.
@@ -3740,8 +3743,39 @@ def _file_tree(root: str, max_entries: int = 60) -> list[str]:
     return out
 
 
+def _repository_history_context(folder: str) -> str:
+    """Collect bounded, factual repository evidence used to determine purpose.
+
+    Purpose must not be inferred from README prose alone. Local Git supplies
+    branches, unfinished work, remotes, and recent change intent; GitHub CLI adds
+    pull-request evidence when it is installed/authenticated. Failures are named
+    explicitly so absence of evidence is never mistaken for evidence of absence.
+    """
+    if not _is_git_repo(folder):
+        return "Repository history: [not a Git working tree]"
+    sections: list[str] = []
+    for title, args in (
+        ("Working tree and branch", ["status", "--short", "--branch"]),
+        ("Local and remote branches", ["branch", "--all", "--no-color"]),
+        ("Configured remotes", ["remote", "-v"]),
+        ("Recent commits", ["log", "-20", "--date=short",
+                            "--pretty=format:%h %ad %s"]),
+    ):
+        r = _git(args, folder)
+        sections.append(f"{title}:\n" + ((r.stdout or "").strip()
+                                          if r.returncode == 0 else
+                                          f"[unavailable: {_tail(r.stderr, 2)}]"))
+    prs = _run(["gh", "pr", "list", "--state", "all", "--limit", "30",
+                "--json", "number,title,state,isDraft,headRefName,baseRefName,updatedAt"],
+               folder, timeout=60)
+    sections.append("Pull requests:\n" + ((prs.stdout or "").strip()
+                                           if prs.returncode == 0 else
+                                           f"[unavailable: {_tail(prs.stderr, 2)}]"))
+    return "\n\n".join(sections)
+
+
 def _gather_from_folder(folder: str) -> tuple[str, str]:
-    """Build a context blob (package.json, README, file tree) for a project folder."""
+    """Build purpose evidence from metadata, structure, history, branches, and PRs."""
     name = os.path.basename(folder.rstrip("\\/")) or folder
     parts: list[str] = [f"PROGRAM FOLDER: {folder}"]
 
@@ -3784,6 +3818,7 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     tree = _file_tree(folder)
     if tree:
         parts.append("File tree (shallow):\n  " + "\n  ".join(tree))
+    parts.append(_repository_history_context(folder))
     return name, "\n\n".join(parts)
 
 
@@ -4058,6 +4093,32 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         return _fail(1, "", f"failed to launch {(cmd or ['?'])[0]}: {e}")
     except Exception as e:  # e.g. ValueError on malformed args: still must not raise
         return _fail(1, "", f"could not run {(cmd or ['?'])[0]}: {type(e).__name__}: {e}")
+
+
+def _spawn(cmd: list[str], cwd: str, env: dict | None = None
+           ) -> tuple[subprocess.Popen | None, str]:
+    """Start a long-running subprocess through the same command-policy gate.
+
+    Dev servers cannot be launched with ``_run`` because it waits for process
+    completion. This companion chokepoint keeps classification and Windows
+    executable resolution identical while returning a truthful launch error.
+    Output is discarded to avoid a background server filling a pipe and hanging
+    the audit; Playwright captures browser, console, network, and assertion output.
+    """
+    ok, reason, _classes = _cmd_policy.command_allowed(cmd)
+    if not ok:
+        return None, f"[flexfactor-policy] {reason}"
+    try:
+        proc = subprocess.Popen(_winify(cmd), cwd=cwd, env=env,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                                               if os.name == "nt" else 0),
+                                start_new_session=(os.name != "nt"))
+        return proc, ""
+    except Exception as ex:
+        return None, f"could not start {(cmd or ['?'])[0]}: {type(ex).__name__}: {ex}"
 
 
 def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
@@ -6082,6 +6143,20 @@ def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") 
                       "error paths, boundary cases) in ONE compact test file."),
             TEST_GEN_SCHEMA, max_tokens=64000)
 
+
+def _test_generation_scope(all_files: list[str], max_modules: int
+                           ) -> tuple[list[str], list[str]]:
+    """Return (selected first-party modules, explicitly omitted modules).
+
+    Zero or a negative value means complete coverage. A positive bound is kept
+    as an operator escape hatch, but the omitted list is surfaced as blocking
+    evidence instead of disappearing from the completion claim.
+    """
+    candidates = [f for f in all_files if not _is_test_path(f)]
+    if max_modules <= 0:
+        return candidates, []
+    return candidates[:max_modules], candidates[max_modules:]
+
 AUDIT_SYSTEM = (
     "You are a ruthless, senior code auditor performing an adversarial line-by-line "
     "review. Assume the code is broken and prove it. Hunt for: real bugs, logic "
@@ -6282,10 +6357,9 @@ _CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
               ".ex", ".exs", ".swift", ".dart", ".c", ".cc", ".cpp", ".cxx",
               ".h", ".hpp", ".m", ".mm", ".sh", ".bash", ".lua", ".pl", ".pm",
               ".clj", ".cljs", ".hs", ".jl", ".r", ".sql", ".tf", ".gradle"}
-# Per-file review ceiling. The prompt cost is unaffected: review_file truncates
-# the numbered source at 60k chars regardless, so this governs only whether a
-# file is ENUMERATED - and a skipped file is a permanent blind spot, which is
-# strictly worse than a truncated review.
+# Legacy bounded-read ceiling for metadata and other intentionally sampled text.
+# Source enumeration and review do NOT use it as an exclusion ceiling: review_file
+# splits complete source into bounded chunks, so large files remain fully covered.
 #
 # This constant was hand-bumped FOUR times (200k -> 300k -> 400k -> 600k), every
 # time for the same reason: flexfactor.py outgrew it and silently dropped out of
@@ -6416,10 +6490,13 @@ def _walked_parent_fd(root: str, comps: list[str], *, make_dirs: bool = False):
                 pass
 
 
-def _read_from_fd(fd: int, cap: int) -> str:
+def _read_from_fd(fd: int, cap: int | None) -> str:
     buf = bytearray()
-    while len(buf) < cap:
-        chunk = os.read(fd, min(65536, cap - len(buf)))
+    while cap is None or len(buf) < cap:
+        want = 65536 if cap is None else min(65536, cap - len(buf))
+        if want <= 0:
+            break
+        chunk = os.read(fd, want)
         if not chunk:
             break
         buf += chunk
@@ -6478,7 +6555,8 @@ def _win_walk(project_dir: str, comps: list[str], *, make_dirs: bool = False) ->
     return ("ok", cur)
 
 
-def _read_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> str | None:
+def _read_contained(project_dir: str, rel: str,
+                    cap: int | None = MAX_REVIEW_BYTES) -> str | None:
     """Read a repo-relative file's text ONLY if EVERY component of its path stays inside
     project_dir with no symlink/junction anywhere. THE single entry point for reading a
     project file whose contents can enter a prompt (enumerated source AND static metadata).
@@ -6717,20 +6795,23 @@ def _file_sha_contained(project_dir: str, rel: str) -> str | None:
 
 
 def _read_text_and_sha(project_dir: str, rel: str,
-                       cap: int = MAX_REVIEW_BYTES) -> tuple[str, str] | None:
+                       cap: int | None = None) -> tuple[str, str] | None:
     """ONE contained no-follow read returning (text, sha256hex) where the sha is of the
     EXACT bytes decoded into `text`. Used so a reviewed-clean file records the hash of the
     bytes ACTUALLY reviewed; a later _file_sha_contained over the whole file then detects
-    any change between review and save. Returns None on refusal. (Enumerated review files
-    are <= MAX_REVIEW_BYTES, so this reads the whole file and the sha matches the full-file
-    _file_sha_contained.)"""
+    any change between review and save. ``cap=None`` (the default) reads the complete
+    file, so a reviewed-clean hash always covers every byte. Callers that intentionally
+    sample metadata may still pass a bound. Returns None on refusal."""
     with _open_contained_fd(project_dir, rel) as fd:
         if fd is None:
             return None
         try:
             buf = bytearray()
-            while len(buf) < cap:
-                chunk = os.read(fd, min(65536, cap - len(buf)))
+            while cap is None or len(buf) < cap:
+                want = 65536 if cap is None else min(65536, cap - len(buf))
+                if want <= 0:
+                    break
+                chunk = os.read(fd, want)
                 if not chunk:
                     break
                 buf += chunk
@@ -6799,7 +6880,7 @@ def _classify_source_read(project_dir: str, rel: str) -> tuple[str | None, str]:
     never conflated with an empty module. Returns (text, status): 'refused' (contained read
     refused -> record manual/error, never silently skip), 'empty' (a genuinely empty
     module -> skip quietly), or 'ok' (usable content)."""
-    text = _read_contained(project_dir, rel)
+    text = _read_contained(project_dir, rel, cap=None)
     if text is None:
         return (None, "refused")
     if not text.strip():
@@ -6981,7 +7062,8 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                             skip_clean: set[str] | None = None) -> list[str]:
     """Reviewable source files under project_dir, noise dirs pruned.
     Real source (non-test, under src/) is reviewed first; min/generated files and
-    empty/huge blobs are skipped so the budget is spent where bugs actually live.
+    empty files are skipped. Large source files remain in scope and are split into
+    bounded review chunks later; file size must never create a silent blind spot.
     `max_files<=0` means NO cap (whole codebase). `skip_clean` (rel paths the brain
     already drove clean) are excluded so repeated runs continue where the last
     stopped instead of re-reviewing finished files."""
@@ -7032,7 +7114,7 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                 size = os.path.getsize(full)
             except OSError:
                 continue
-            if size == 0 or size > MAX_REVIEW_BYTES:
+            if size == 0:
                 continue
             # FORWARD SLASHES ARE THE CANONICAL FILE KEY (live GrantFlow
             # 2026-08-14). os.path.relpath yields BACKSLASHES on Windows, while
@@ -7050,6 +7132,55 @@ def _enumerate_source_files(project_dir: str, max_files: int,
                             not t[0].startswith("src/"),
                             -t[1]))
     return [rel for rel, _ in out] if max_files <= 0 else [rel for rel, _ in out[:max_files]]
+
+
+def _inventory_project(project_dir: str) -> dict:
+    """Account for the complete local tree without reading artifact contents.
+
+    Source/config files are listed individually. Generated, dependency, cache,
+    and VCS subtrees are represented explicitly as excluded directory artifacts
+    rather than silently disappearing. Symlinks/reparse points are named but
+    never followed. This inventory is evidence of scope, not a claim that binary
+    or third-party artifacts were line-reviewed.
+    """
+    entries: list[dict] = []
+    category_counts: dict[str, int] = {}
+
+    def add(path: str, category: str, reason: str = "") -> None:
+        entries.append({"path": path.replace("\\", "/"),
+                        "category": category, "reason": reason})
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+    artifact_dirs = _SKIP_DIRS | {".git"}
+    for dirpath, dirnames, filenames in os.walk(project_dir):
+        kept: list[str] = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            rel = os.path.relpath(full, project_dir)
+            if _is_reparse(full):
+                add(rel, "reparse-directory", "named but not followed")
+            elif d in artifact_dirs:
+                add(rel + "/", "artifact-subtree",
+                    "generated, dependency, cache, build, vendor, or VCS contents not line-reviewed")
+            else:
+                kept.append(d)
+        dirnames[:] = kept
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, project_dir)
+            if _is_reparse(full):
+                add(rel, "reparse-file", "named but not followed")
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _CODE_EXTS:
+                add(rel, "first-party-source")
+            elif ext in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf",
+                         ".zip", ".gz", ".woff", ".woff2", ".ttf", ".exe", ".dll"}:
+                add(rel, "binary-asset", "inventoried; not text-reviewable")
+            else:
+                add(rel, "configuration-documentation-or-data")
+    return {"total_entries": len(entries), "category_counts": category_counts,
+            "entries": entries}
 
 
 def _detect_stack(project_dir: str) -> dict:
@@ -7283,6 +7414,47 @@ def _is_line_number_artifact(f: dict) -> bool:
                 and _LINE_ARTIFACT_SCOPE_RX.search(blob))
 
 
+REVIEW_CHUNK_CHARS = 54_000
+
+
+def _numbered_review_chunks(text: str,
+                            max_chars: int = REVIEW_CHUNK_CHARS) -> list[tuple[int, int, str]]:
+    """Return complete, non-truncated numbered source chunks.
+
+    Each tuple is ``(first_line, last_line, numbered_text)``. Normal files remain
+    one call. Large files are divided only at line boundaries; an individually
+    enormous generated line is split into multiple segments carrying the same
+    source line number. Consequently every source character reaches a reviewer
+    and findings still cite original, absolute line numbers.
+    """
+    lines = text.splitlines()
+    if not lines:
+        return [(1, 1, "1: ")]
+    chunks: list[tuple[int, int, str]] = []
+    current: list[str] = []
+    first = 1
+    used = 0
+    for lineno, line in enumerate(lines, 1):
+        prefix = f"{lineno}: "
+        segments = ([line[i:i + max(1, max_chars - len(prefix) - 1)]
+                     for i in range(0, len(line), max(1, max_chars - len(prefix) - 1))]
+                    or [""])
+        for segment in segments:
+            rendered = prefix + segment
+            extra = len(rendered) + (1 if current else 0)
+            if current and used + extra > max_chars:
+                chunks.append((first, lineno - 1 if segment == segments[0] else lineno,
+                               "\n".join(current)))
+                current = []
+                first = lineno
+                used = 0
+            current.append(rendered)
+            used += len(rendered) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append((first, len(lines), "\n".join(current)))
+    return chunks
+
+
 def review_file(provider, rel_path: str, text: str,
                 context: str = "", project_dir: str | None = None
                 ) -> tuple[list[dict], str]:
@@ -7293,33 +7465,39 @@ def review_file(provider, rel_path: str, text: str,
     the packages this file imports are shown to the reviewer, and any finding
     that recommends an API removed in the installed major is dropped before it
     can reach the author model."""
-    numbered = "\n".join(f"{i + 1}: {ln}" for i, ln in enumerate(text.splitlines()))
-    if len(numbered) > 60000:
-        numbered = numbered[:60000] + "\n... [truncated for review]"
     ctx = ""
     if context:
         ctx = ("PROGRAM CONTEXT (untrusted background on what this program is for - "
                "use it only to judge defect impact):\n"
                + _fence_untrusted("program-context", context[:6000]) + "\n\n")
     ctx += _dep_version_block(project_dir, text)
-    prompt = (f"FILE: {rel_path}\n\n{ctx}"
-              "Review this file line by line. Each source line below carries an "
-              "'N: ' prefix added by this tool for citation only - the prefix is "
-              "NOT part of the file; never report it as a defect. List every "
-              "concrete defect with its line number.\n\n"
-              + _fence_untrusted("source", numbered))
-    # A file with many defects produces a long findings list; give it headroom so
-    # the most thorough reviews aren't truncated (which would drop real defects).
-    # Review is the highest-volume call in the whole tool -> route to the cheap
-    # judge model (this is the biggest single cost saving).
-    data = _judge(provider, AUDIT_SYSTEM, prompt, AUDIT_FINDINGS_SCHEMA, max_tokens=REVIEW_MAX_TOKENS)
-    # The proxy/NIM upstream ignores output_config, so the model often elides the
-    # {"findings": [...], "summary": ...} envelope and emits the findings array
-    # directly. Coerce it back so the per-finding .get() paths work unchanged.
-    # No-op against the real API, where structured() already returns the object.
-    if isinstance(data, list):
-        data = {"findings": data, "summary": ""}
-    findings = data.get("findings") or []
+    chunks = _numbered_review_chunks(text)
+    findings: list[dict] = []
+    summaries: list[str] = []
+    for chunk_index, (first_line, last_line, numbered) in enumerate(chunks, 1):
+        scope = ("" if len(chunks) == 1 else
+                 f" REVIEW CHUNK {chunk_index}/{len(chunks)} (source lines "
+                 f"{first_line}-{last_line}); assess this entire chunk and do not "
+                 "assume omitted chunks are clean.\n")
+        prompt = (f"FILE: {rel_path}\n{scope}\n{ctx}"
+                  "Review this file line by line. Each source line below carries an "
+                  "'N: ' prefix added by this tool for citation only - the prefix is "
+                  "NOT part of the file; never report it as a defect. List every "
+                  "concrete defect with its line number.\n\n"
+                  + _fence_untrusted("source", numbered))
+        # A file with many defects produces a long findings list; give it headroom so
+        # the most thorough reviews aren't truncated (which would drop real defects).
+        # Review is the highest-volume call in the whole tool -> route to the cheap
+        # judge model (this is the biggest single cost saving).
+        data = _judge(provider, AUDIT_SYSTEM, prompt, AUDIT_FINDINGS_SCHEMA,
+                      max_tokens=REVIEW_MAX_TOKENS)
+        # The proxy/NIM upstream sometimes emits the findings array directly.
+        if isinstance(data, list):
+            data = {"findings": data, "summary": ""}
+        findings.extend(data.get("findings") or [])
+        if data.get("summary"):
+            summaries.append(str(data["summary"]))
+    findings = _dedupe_findings(findings)
     for f in findings:
         f["file"] = rel_path
         # The proxy/NIM upstream ignores output_config, so models sometimes emit a
@@ -7355,7 +7533,7 @@ def review_file(provider, rel_path: str, text: str,
             print(f"  [version] {rel_path}: dropped finding "
                   f"'{str(f.get('title'))[:60]}' - {why}")
         findings = kept
-    return findings, str(data.get("summary", ""))
+    return findings, " | ".join(summaries)
 
 
 def _gap_to_finding(g: dict) -> dict:
@@ -7985,6 +8163,143 @@ def _guess_dev_url(stack: dict) -> str:
     if fw == "react-scripts":
         return "http://localhost:3000"
     return "http://localhost:5173"  # vite/react default
+
+
+def _dev_server_command(stack: dict, port: int) -> tuple[list[str] | None, dict]:
+    """Build the project's own dev-server command and an explicit test env."""
+    script = stack.get("dev_script")
+    if not script:
+        return None, {}
+    env = os.environ.copy()
+    env.update({"PORT": str(port), "NODE_ENV": "test", "FLEXFACTOR_E2E": "1"})
+    fw = stack.get("framework")
+    cmd = ["npm", "run", script]
+    if fw in ("vite", "vue", "svelte"):
+        cmd += ["--", "--host", "127.0.0.1", "--port", str(port)]
+    elif fw == "next":
+        cmd += ["--", "-p", str(port), "-H", "127.0.0.1"]
+    return cmd, env
+
+
+def _wait_http_ready(url: str, proc: subprocess.Popen | None,
+                     timeout: int = 90) -> tuple[bool, str]:
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False, f"dev server exited early with code {proc.returncode}"
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if int(getattr(response, "status", 200)) < 500:
+                    return True, ""
+        except Exception as ex:
+            last = str(ex)
+        time.sleep(0.5)
+    return False, f"dev server was not reachable at {url}: {last or 'timeout'}"
+
+
+_UI_EXPLORER_JS = r'''const { chromium } = require('playwright');
+(async () => {
+  const base = new URL(process.argv[2]);
+  const allowDestructive = process.env.FLEXFACTOR_E2E_ISOLATED === '1';
+  const browser = await chromium.launch({headless: true});
+  const queue = [base.href], seen = new Set(), errors = [], skipped = [];
+  let controls = 0;
+  const dangerous = /delete|remove|destroy|purchase|pay|send|publish|deploy|logout|sign out/i;
+  while (queue.length && seen.size < 100) {
+    const url = queue.shift();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const page = await browser.newPage();
+    page.on('pageerror', e => errors.push(`${url}: pageerror: ${e.message}`));
+    page.on('console', m => { if (m.type() === 'error') errors.push(`${url}: console: ${m.text()}`); });
+    page.on('requestfailed', r => errors.push(`${url}: request failed: ${r.url()} ${r.failure()?.errorText || ''}`));
+    const response = await page.goto(url, {waitUntil: 'domcontentloaded', timeout: 30000});
+    if (!response || response.status() >= 500) errors.push(`${url}: HTTP ${response ? response.status() : 'no response'}`);
+    const links = await page.locator('a[href]').evaluateAll((els, origin) => els.map(e => e.href).filter(h => h.startsWith(origin)), base.origin);
+    for (const href of links) if (!seen.has(href) && !queue.includes(href)) queue.push(href);
+    const selector = 'button, [role="button"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"]';
+    const count = Math.min(await page.locator(selector).count(), 200);
+    for (let i = 0; i < count; i++) {
+      const control = page.locator(selector).nth(i);
+      if (!await control.isVisible().catch(() => false) || await control.isDisabled().catch(() => true)) continue;
+      const label = ((await control.innerText().catch(() => '')) || (await control.getAttribute('aria-label')) || (await control.getAttribute('value')) || '').trim();
+      if (!allowDestructive && dangerous.test(label)) { skipped.push(`${url}: ${label || selector + '[' + i + ']'}`); continue; }
+      controls++;
+      await control.click({timeout: 5000}).catch(e => errors.push(`${url}: control ${label || i}: ${e.message}`));
+      await page.waitForTimeout(100);
+    }
+    await page.close();
+  }
+  await browser.close();
+  const result = {pages: seen.size, controls, errors, skipped,
+    complete: errors.length === 0 && skipped.length === 0 && seen.size > 0};
+  console.log('FLEXFACTOR_E2E_RESULT=' + JSON.stringify(result));
+  process.exit(result.complete ? 0 : 1);
+})().catch(e => { console.error(e.stack || String(e)); process.exit(2); });
+'''
+
+
+def _run_live_ui_exploration(project_dir: str, stack: dict, base_url: str,
+                             port: int) -> dict:
+    """Start the real local app and drive every reachable route/control.
+
+    The explorer records console/page/network failures. Potentially destructive
+    controls are exercised only when the target declares an isolated disposable
+    environment with ``FLEXFACTOR_E2E_ISOLATED=1``; otherwise each is named and
+    the result is incomplete rather than falsely passing.
+    """
+    result = {"ran": False, "ok": None, "log": "", "spec_files": [],
+              "pages": 0, "controls": 0, "skipped_controls": []}
+    cmd, env = _dev_server_command(stack, port)
+    if cmd is None:
+        result["log"] = "No runnable dev/start script was detected."
+        return result
+    server, launch_error = _spawn(cmd, project_dir, env=env)
+    if server is None:
+        result["log"] = launch_error
+        return result
+    tmp = tempfile.mkdtemp(prefix="flexfactor-e2e-")
+    script_path = os.path.join(tmp, "explore.cjs")
+    try:
+        with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_UI_EXPLORER_JS)
+        ready, why = _wait_http_ready(base_url, server)
+        if not ready:
+            result["log"] = why
+            return result
+        run_env = env.copy()
+        node_modules = os.path.join(project_dir, "node_modules")
+        run_env["NODE_PATH"] = (node_modules + os.pathsep + run_env.get("NODE_PATH", "")).rstrip(os.pathsep)
+        explorer = _run(["node", script_path, base_url], project_dir,
+                        timeout=1800, env=run_env)
+        result["ran"] = True
+        output = (explorer.stdout or "") + "\n" + (explorer.stderr or "")
+        result["log"] = _tail(output, 80)
+        marker = "FLEXFACTOR_E2E_RESULT="
+        payload = next((line.split(marker, 1)[1] for line in output.splitlines()
+                        if marker in line), "")
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except ValueError:
+            parsed = {}
+        result["pages"] = int(parsed.get("pages") or 0)
+        result["controls"] = int(parsed.get("controls") or 0)
+        result["skipped_controls"] = list(parsed.get("skipped") or [])
+        result["errors"] = list(parsed.get("errors") or [])
+        result["ok"] = bool(explorer.returncode == 0 and parsed.get("complete") is True)
+        return result
+    finally:
+        try:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+        except Exception:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -9664,6 +9979,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         console_meter.start()  # in-place spinner on a TTY, heartbeat lines otherwise
 
         stack = _detect_stack(project_dir)
+        inventory = _inventory_project(project_dir)
+        result["inventory"] = inventory
+        print(f"{pfx}System inventory: {inventory['total_entries']} accounted entry/entries "
+              f"across {len(inventory['category_counts'])} category/categories.")
         if stack.get("config_refused"):
             # package.json exists but couldn't be safely read: auditing WITH build
             # verification silently off would ship unverified fixes. Fail closed.
@@ -10358,6 +10677,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 str(rg[1].get("severity", "")).lower(), 0))
             cap = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored else MAX_PURPOSE_GAP_FIXES
             bridgeable = bridgeable[:cap]
+            verified_bridged: set[str] = set()
             if bridgeable:
                 print(f"{pfx}Bridging {len(bridgeable)} code-fixable purpose gap(s) "
                       "(build-gated" + (" + cross-checked" if cross is not None else "") + ")...")
@@ -10401,6 +10721,69 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     stop_reason = ("aborted: refused rollback left an unverified "
                                    "candidate (see notes)")
 
+            # A build-passing purpose bridge is not yet clean evidence: it changed
+            # after the generic convergence loop. Re-review the exact new bytes and
+            # iterate residual corrections. Round four is an explicit escalation,
+            # never a quiet disappearance from the report.
+            pending_bridge = set(bridged_files) - set(unverified_set)
+            for bridge_round in range(2, 5):
+                if not pending_bridge or dirty_abort:
+                    break
+                report(phase=f"purpose bridge rescan round {bridge_round}")
+                rf, rflat, runreadable, rclean, rincomplete = _review_all(
+                    reviewers, project_dir, sorted(pending_bridge), report=report,
+                    meter=meter, workers=getattr(args, "review_workers", REVIEW_WORKERS),
+                    context=purpose_blob, reviewer_pool=reviewer_pool)
+                verified_bridged |= set(rclean)
+                failed_review = set(runreadable) | set(rincomplete)
+                if failed_review:
+                    manual_review |= failed_review
+                    fix_notes.append(
+                        f"purpose bridge round {bridge_round}: incomplete review for "
+                        + ", ".join(sorted(failed_review)))
+                residual_files = set(rf) - failed_review
+                all_findings.extend(rflat)
+                if not residual_files:
+                    pending_bridge = set()
+                    break
+                if bridge_round == 4:
+                    manual_review |= residual_files
+                    for rel in sorted(residual_files):
+                        note = (f"FOURTH-ROUND ESCALATION: {rel} still has "
+                                f"{len(rf.get(rel, []))} finding(s) after three "
+                                "correction/review rounds; target is NOT complete.")
+                        fix_notes.append(note)
+                        print(f"{pfx}{note}")
+                    break
+                try:
+                    applied_r, unver_r, notes_r = _fix_files(
+                        author, cross, project_dir,
+                        {rel: rf[rel] for rel in residual_files},
+                        stack, baseline_ok, args, meter=meter, oversized=oversized,
+                        report=report, noop_stats=noop_stats, err_base=errors_total,
+                        done_set=set(), total_overall=len(residual_files), commit_cb=None,
+                        adversarial=getattr(args, "adversarial", True),
+                        adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                        materiality=getattr(args, "adversarial_materiality", "material"))
+                    fix_notes += notes_r
+                    applied_set |= set(applied_r)
+                    unverified_set |= set(unver_r)
+                    if git and applied_r:
+                        s = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                             f"purpose bridge rescan round {bridge_round}", stack)
+                        if "committed" in s:
+                            committed_any = True
+                        print(f"{pfx}git (purpose rescan): {s}")
+                    pending_bridge = set(applied_r) - set(unver_r)
+                    unresolved = residual_files - set(applied_r)
+                    if unresolved:
+                        manual_review |= unresolved
+                        break
+                except (DirtyTreeError, BudgetExceededError) as ex:
+                    manual_review |= residual_files
+                    fix_notes.append(f"purpose bridge rescan stopped: {ex}")
+                    break
+
             # THE HEADLINE NUMBER. The owner asked for "closed N gaps toward the
             # app's purpose", not "scored X" - so the run's own summary is
             # movement against the contract, computed from what actually landed.
@@ -10409,7 +10792,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # A gap is only "closed" when the fix for its file APPLIED and
                 # was VERIFIED - an [unverified] apply (verifier down / build
                 # not runnable) is not evidence the gap is gone.
-                verified_bridged = set(bridged_files) - set(unverified_set)
                 closed = [g.get("title") for rel, g in bridgeable
                           if rel in verified_bridged]
                 purpose_gap["progress"] = _fp.gap_progress(gaps_before, closed)
@@ -10426,7 +10808,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Generating + running unit tests...")
             if checkpoint is not None:
                 checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
-            for rel in [f for f in all_files if not _is_test_path(f)][:args.max_test_modules]:
+            test_candidates, omitted = _test_generation_scope(
+                all_files, args.max_test_modules)
+            if omitted:
+                manual_review.update(omitted)
+                all_findings.append({
+                    "file": "(unit tests)", "line": 0, "severity": "high",
+                    "category": "test-coverage",
+                    "title": "First-party modules omitted from function execution",
+                    "problem": (f"--max-test-modules omitted {len(omitted)} module(s): "
+                                + ", ".join(omitted[:20])),
+                    "fix": "Use the default --max-test-modules 0 to exercise every module.",
+                })
+            for rel in test_candidates:
                 text, read_status = _classify_source_read(project_dir, rel)
                 if read_status == "refused":
                     # REFUSED (symlink/containment swap before test-gen) is NOT the same as
@@ -10443,6 +10837,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     gen = _gen_unit_tests(author, rel, text, stack["test_cmd"], pfx=pfx)
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
+                    manual_review.add(rel)
+                    all_findings.append({
+                        "file": rel, "line": 0, "severity": "high",
+                        "category": "test-coverage",
+                        "title": "Function execution coverage was not generated",
+                        "problem": ("FlexFactor could not generate runnable tests for this "
+                                    f"first-party module: {ex}"),
+                        "fix": "Generate and run tests that exercise every reachable function.",
+                    })
                     continue
                 for f in gen.get("files") or []:
                     p = f.get("path") or ""
@@ -10451,6 +10854,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     written = _write_contained(project_dir, p, f["contents"])
                     if written is None:  # escapes repo / symlinked leaf -> refuse
                         print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
+                        manual_review.add(rel)
                         continue
                     test_files.append(os.path.relpath(written, project_dir))
             if test_files:
@@ -10467,10 +10871,61 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # Save the generated tests too (so they land in the repo).
                 if git:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
+            elif test_candidates:
+                manual_review.update(test_candidates)
+                all_findings.append({
+                    "file": "(unit tests)", "line": 0, "severity": "high",
+                    "category": "test-coverage",
+                    "title": "No runnable function tests were produced",
+                    "problem": (f"FlexFactor attempted {len(test_candidates)} first-party "
+                                "module(s) but produced no runnable test file."),
+                    "fix": "Generate tests and run them through the project's own test command.",
+                })
+        elif all_files and not dirty_abort:
+            reason = ("Function execution was disabled by --no-tests."
+                      if not args.tests else
+                      "No project test command was detected, so first-party functions were not executed.")
+            manual_review.update(f for f in all_files if not _is_test_path(f))
+            all_findings.append({
+                "file": "(unit tests)", "line": 0, "severity": "high",
+                "category": "test-coverage",
+                "title": "First-party function execution is unavailable",
+                "problem": reason,
+                "fix": "Configure a runnable project test command and exercise every first-party function.",
+            })
 
-        # Button/UI (Playwright) sandbox REMOVED (owner order 2026-08-11):
-        # the live-like sandbox is not part of this app. e2e never runs.
-        e2e = {"ran": False, "ok": None, "log": "", "spec_files": []}
+        # 6. Live UI execution. A source audit cannot prove that routes, tabs,
+        # buttons, menus, and forms are wired. Start the project's own local app
+        # and drive the reachable interface with Playwright. An unavailable runner,
+        # a skipped destructive control without a declared disposable environment,
+        # or any browser/console/network failure remains UNKNOWN/FAILED and blocks a
+        # complete verification claim; it is never silently printed as a pass.
+        e2e = {"ran": False, "ok": None, "log": "", "spec_files": [],
+               "pages": 0, "controls": 0, "skipped_controls": []}
+        if stack.get("is_web") and not dirty_abort:
+            if getattr(args, "e2e", True):
+                report(phase="live route and control execution")
+                base_url = args.app_url or f"http://127.0.0.1:{e2e_port}"
+                print(f"{pfx}Driving live routes and controls at {base_url} ...")
+                e2e = _run_live_ui_exploration(project_dir, stack, base_url, e2e_port)
+            else:
+                e2e["log"] = "Live UI execution was disabled by --no-e2e."
+            if e2e.get("ok") is not True:
+                all_findings.append({
+                    "file": "(e2e)", "line": 0, "severity": "high",
+                    "category": "test-coverage",
+                    "title": "Live route/control verification is incomplete",
+                    "problem": (e2e.get("log") or
+                                "The web interface did not complete live execution."),
+                    "fix": ("Run the app in a disposable isolated environment and exercise "
+                            "every reachable route and control without browser, console, network, "
+                            "or skipped-control failures."),
+                })
+                manual_review.add("(e2e)")
+            print(f"{pfx}live UI: "
+                  f"{'PASS' if e2e.get('ok') else 'FAIL' if e2e.get('ran') else 'NOT RUN'} "
+                  f"({e2e.get('pages', 0)} page(s), {e2e.get('controls', 0)} control(s), "
+                  f"{len(e2e.get('skipped_controls') or [])} skipped)")
 
         # 6.5 Final full-suite gate: run the project's OWN suite (test:all / ci /
         #     verify) so "done" means the whole suite is green, not just that fixes
@@ -10528,6 +10983,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "problem": b.get("evidence", ""),
                         "fix": b.get("remediation", ""),
                     })
+
+        # Dynamic-coverage failures can be discovered after the static review
+        # loop said "converged". They are part of completion, so they must revoke
+        # that earlier static-only verdict instead of coexisting with a misleading
+        # REVIEW CONVERGED headline.
+        if manual_review:
+            converged = False
+            if stop_reason == "converged: found == fixed":
+                stop_reason = (f"static review converged, but {len(manual_review)} "
+                               "coverage/escalation item(s) remain - NOT complete")
 
         # 7. Final git status. Per-cycle commits already landed the fixes; here we just
         #    report and clean up an empty branch if the whole run changed nothing.
@@ -10631,6 +11096,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # findings the author model inspected and refused to act on because
             # there was nothing to fix. Still counted as non-successes.
             "noop_stats": dict(noop_stats),
+            "inventory": inventory,
         }
         # THE SCOREBOARD (owner order 2026-08-11): the run is scored on CRITERIA
         # CLOSED, not defects fixed. "A run that fixes 498 files and closes zero
@@ -11185,6 +11651,7 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "release_status": _release_status(a)[0],
         "release_status_unmet": _release_status(a)[1],
         "paid_rescue": paid_rescue_stats(),
+        "system_inventory": a.get("inventory") or {},
     }
     raw = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     written = _write_contained(project_dir, name, raw)
@@ -11263,6 +11730,17 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                     f"install step(s) succeeded"
                     + (" — a failed install can make the build gate red for reasons "
                        "unrelated to the code" if failed else ""))
+
+    inv = a.get("inventory") or {}
+    if inv:
+        L += ["## System inventory", "",
+              f"**{inv.get('total_entries', 0)} entries accounted for.**", "",
+              "| Category | Count |", "|---|---:|"]
+        for category, count in sorted((inv.get("category_counts") or {}).items()):
+            L.append(f"| {category} | {count} |")
+        L += ["", "The immutable run manifest contains the complete path-level "
+              "inventory. Artifact, binary, and reparse entries are named and "
+              "classified; they are not represented as line-reviewed source.", ""]
 
     rd = a.get("readiness")
     if rd:
@@ -11952,8 +12430,11 @@ def main(argv=None) -> int:
                                  f"throughout the run instead of staying at 0 until the whole sweep "
                                  f"is reviewed. Lower for more frequent (but smaller) fix/commit "
                                  f"cycles; 0 or negative is clamped up to 1.")
-        parser.add_argument("--max-test-modules", type=int, default=12, dest="max_test_modules",
-                            help="Max modules to generate unit tests for (default: 12).")
+        parser.add_argument("--max-test-modules", type=int, default=0, dest="max_test_modules",
+                            help="Max modules to generate unit tests for; 0 = every first-party "
+                                 "module (default: 0). A positive cap makes function coverage "
+                                 "explicitly incomplete and therefore cannot support a complete "
+                                 "verification claim.")
         parser.add_argument("--include", action="append", default=[],
                             help="Only review paths containing this substring (repeatable).")
         parser.add_argument("--exclude", action="append", default=[],
@@ -11974,11 +12455,12 @@ def main(argv=None) -> int:
                             help="Skip the interactive confirmation for --apply (for automation).")
         parser.add_argument("--no-tests", action="store_false", dest="tests",
                             help="Skip generating/running unit tests.")
-        # DEPRECATED no-op. The Playwright "live-like sandbox" was REMOVED by owner
-        # order 2026-08-11. Accepted-and-ignored so existing launchers/scheduled
-        # tasks that still pass it keep running instead of dying in argparse.
-        parser.add_argument("--no-e2e", action="store_true", dest="_e2e_removed",
-                            help=argparse.SUPPRESS)
+        parser.add_argument("--e2e", action="store_true", dest="e2e", default=True,
+                            help="Start the project's local web app and exercise reachable "
+                                 "routes and controls with Playwright (default: ON).")
+        parser.add_argument("--no-e2e", action="store_false", dest="e2e",
+                            help="Disable live UI execution. This leaves web journey coverage "
+                                 "unknown and cannot support a complete verification claim.")
         parser.add_argument("--app-url", default=None, dest="app_url",
                             help="Base URL the dev server serves on (default: guessed from framework).")
         parser.add_argument("--push", action="store_true", dest="push", default=False,
@@ -12097,4 +12579,3 @@ if __name__ == "__main__":
     except SystemExit:
         _mark_run_finished()  # argparse exit-2 etc. are intentional too
         raise
-

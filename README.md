@@ -1,6 +1,6 @@
 # FlexFactor
 
-A local, self-improving code tool with three modes, driven from desktop shortcuts
+A local, self-improving code tool with four modes, driven from desktop shortcuts
 or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-capped.
 
 ## Modes
@@ -27,6 +27,10 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   build gate, cross-model veto, unit + e2e test generation, converges with
   `--until-clean`, hard `--max-cost` budget (default $50/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
+  Large files are reviewed in complete line-numbered chunks rather than truncated
+  or omitted. Function-test generation covers every first-party module by default,
+  and web targets are started locally and driven route-by-route/control-by-control;
+  unavailable or incomplete execution is a blocker, never a silent pass.
   **Resume is automatic**: every completed per-file review is checkpointed
   (sha-keyed) as the sweep runs, and fixes commit per cycle - if a run dies
   mid-flow (crash, Ctrl-C, credits), re-running the same command picks up
@@ -65,7 +69,7 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 - Anthropic system prompts are cache-marked (`cache_control: ephemeral`); note the
   minimum cacheable prefix on haiku-4-5/opus-4-8 is 4096 tokens, so these short
   prompts don't actually cache today (harmless - a miss bills normal price).
-- **Local-only provider (`--provider ollama`).** All three modes can run
+- **Local-only provider (`--provider ollama`).** All four modes can run
   against a local Ollama server (default `deepseek-coder:33b` author +
   `llama3.2` judge; override with `--model`/`--judge-model` to match
   `ollama list`). ZERO cloud egress: the provider refuses any non-loopback
