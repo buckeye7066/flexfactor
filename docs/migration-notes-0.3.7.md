@@ -13,6 +13,10 @@ No checkpoint or target-repository migration is required.
   acceptance criterion has been removed.
 - README audit limits now match the executable defaults: ten programs and a
   $150 per-program hard cap.
+- Single-provider semantic review remains serial by default, but large hosted
+  runs can now opt into known-safe concurrency with
+  `--single-provider-review-workers N`. The value remains capped by the existing
+  `--review-workers` ceiling; no existing invocation becomes more aggressive.
 
 All resume records remain policy-version compatible. Failed preflight creates no
 new paid review work and does not relabel older evidence as current.

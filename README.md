@@ -43,7 +43,9 @@ paid service.
   `--until-clean`, hard `--max-cost` budget (default $150/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
   Large files are reviewed in complete line-numbered chunks rather than truncated
-  or omitted. Bounded files are grouped into semantic review batches with an exact
+  or omitted. Bounded files are grouped into semantic review batches, with an
+  opt-in concurrency control for known-capacity single-provider runs
+  (`--single-provider-review-workers`; serial by default), and with an exact
   response required for every requested path; missing rows and sustained provider
   outages fail closed instead of becoming clean results. Focused test generation
   covers behavior changed by the run without overwriting project tests, while the

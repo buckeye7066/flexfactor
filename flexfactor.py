@@ -9512,7 +9512,9 @@ def _review_all(reviewers: list, project_dir: str,
                 context: str = "",
                 checkpoint_cb=None,
                 reviewer_pool: "_ReviewerPool | None" = None,
-                batch_semantic: bool = False) -> tuple[dict, list, set, dict, set]:
+                batch_semantic: bool = False,
+                single_provider_workers: int = 1
+                ) -> tuple[dict, list, set, dict, set]:
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
@@ -9764,11 +9766,18 @@ def _review_all(reviewers: list, project_dir: str,
             print(f"  [skip] semantic review batch failed for {names}: {last_error}")
             return [(rel, "incomplete") for rel, _text, _sha in unit]
 
-        # One available provider means one actual capacity lane.  Fanning eight
-        # large schema calls into it concurrently turns its rate/transport limit
-        # into a fabricated outage. Multi-provider runs retain parallelism.
-        n_workers = (1 if len(reviewers) == 1 else
-                     max(1, min(workers, len(units)))) if units else 1
+        # A sole provider stays serial by default: fanning large schema calls into
+        # an unknown account tier can turn its rate/transport limit into a
+        # fabricated outage. Operators who know the provider's real capacity can
+        # opt in explicitly with --single-provider-review-workers. The ordinary
+        # --review-workers ceiling still applies, so the opt-in can never widen a
+        # deliberately lower global limit. Multi-provider runs retain parallelism.
+        if not units:
+            n_workers = 1
+        elif len(reviewers) == 1:
+            n_workers = max(1, min(workers, single_provider_workers, len(units)))
+        else:
+            n_workers = max(1, min(workers, len(units)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_review_unit, unit) for unit in units]
             for future in concurrent.futures.as_completed(futures):
@@ -11659,7 +11668,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         reviewers, project_dir, to_review, report=report, meter=meter,
                         soft_cap_usd=soft, workers=getattr(args, "review_workers", REVIEW_WORKERS),
                         context=purpose_blob, checkpoint_cb=_resume_checkpoint,
-                        reviewer_pool=reviewer_pool, batch_semantic=True)
+                        reviewer_pool=reviewer_pool, batch_semantic=True,
+                        single_provider_workers=getattr(
+                            args, "single_provider_review_workers", 1))
                 else:
                     b_findings, b_flat, b_unreadable, b_clean, b_incomplete = {}, [], set(), {}, set()
                 completed_reviews = len(to_review) - len(b_unreadable) - len(b_incomplete)
@@ -12035,7 +12046,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     reviewers, project_dir, sorted(pending_bridge), report=report,
                     meter=meter, workers=getattr(args, "review_workers", REVIEW_WORKERS),
                     context=purpose_blob, reviewer_pool=reviewer_pool,
-                    batch_semantic=True)
+                    batch_semantic=True,
+                    single_provider_workers=getattr(
+                        args, "single_provider_review_workers", 1))
                 verified_bridged |= set(rclean)
                 failed_review = set(runreadable) | set(rincomplete)
                 if failed_review:
@@ -14051,6 +14064,12 @@ def main(argv=None) -> int:
         parser.add_argument("--review-workers", type=int, default=REVIEW_WORKERS, dest="review_workers",
                             help=f"Parallel review threads for the whole-repo sweep "
                                  f"(default: {REVIEW_WORKERS}). Lower if you hit API rate limits.")
+        parser.add_argument("--single-provider-review-workers", type=int, default=1,
+                            dest="single_provider_review_workers",
+                            help="Opt-in semantic review concurrency when exactly one paid/API "
+                                 "provider is active (default: 1, deliberately serial). The "
+                                 "value is capped by --review-workers; use only when the "
+                                 "provider account's rate limits are known to support it.")
         parser.add_argument("--fix-prefetch", type=int, default=FIX_PREFETCH_WORKERS, dest="fix_prefetch",
                             help=f"Fix generations kept in flight ahead of the apply/verify loop "
                                  f"(default: {FIX_PREFETCH_WORKERS}; 0 = fully serial). In-flight "
