@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.6"
+TOOL_VERSION = "0.3.7"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -3030,14 +3030,32 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                   file=sys.stderr)
             primary, other = other, primary
     if not _usable(primary):
-        # Distinguish "no key at all" from "keys present but all dead" for the caller.
-        any_key = _provider_key_present(primary) or _provider_key_present(other)
-        mode_hint = (f"model mode '{model_mode}' excludes the configured routes"
-                     if any_key and model_mode != "auto" else "")
-        _PROVIDER_DIAGNOSIS = mode_hint or (
-            "every configured API key was rejected at preflight (out of credits or "
-            "revoked); top up credits or set a working key"
-            if any_key else "no LLM API key found")
+        # Distinguish three materially different failures for the caller:
+        #   1. a route permitted by the selected mode has a credential, but its
+        #      live preflight rejected it (out of credits/revoked);
+        #   2. credentials exist only on routes the selected mode forbids; or
+        #   3. no credential exists at all.
+        #
+        # The old code checked only ``any_key and model_mode != 'auto'``.  That
+        # made an explicitly paid OpenAI run whose funded route returned 429 say
+        # "paid mode excludes the configured routes" -- the exact opposite of
+        # what happened.  Diagnose permission before exclusion, using the same
+        # _permitted chokepoint that selected providers above.
+        candidates = ("anthropic", "openai", "ollama")
+        permitted_key = any(_permitted(name) and _provider_key_present(name)
+                            for name in candidates)
+        excluded_key = any(not _permitted(name) and _provider_key_present(name)
+                           for name in candidates)
+        if permitted_key:
+            _PROVIDER_DIAGNOSIS = (
+                "every configured API key permitted by model mode "
+                f"'{model_mode}' was rejected at preflight (out of credits or "
+                "revoked); top up credits or set a working key")
+        elif excluded_key:
+            _PROVIDER_DIAGNOSIS = (
+                f"model mode '{model_mode}' excludes the configured routes")
+        else:
+            _PROVIDER_DIAGNOSIS = "no LLM API key found"
         return []
 
     judge_override = getattr(args, "judge_model", None)
