@@ -23,9 +23,27 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 STATUS_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.expanduser("~"), ".flexfactor", "status.json")
+
+# THE BLACK-SCREEN-FLASH BUG (2026-08-16, owner report: "it flashes a black
+# screen constantly and I can't type or anything else"). This dashboard is
+# launched with pythonw.exe, so the process has NO console - and on Windows a
+# console-less parent that spawns a console child (git.exe) without
+# CREATE_NO_WINDOW gets a BRAND-NEW visible console window for every call.
+# attempt_info() ran `git log` from redraw(), and redraw reschedules itself
+# every 40ms - up to ~25 fresh black console windows per second, each one
+# stealing keyboard focus. The machine was unusable while an audit ran.
+# Two rules, both load-bearing:
+#   1. EVERY subprocess this file starts passes creationflags=_NO_WINDOW.
+#   2. NO disk/subprocess I/O runs per frame - slow facts go through the
+#      TTL cache below and refresh at most once per _FACTS_TTL_S per program.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+_FACTS_TTL_S = 5.0
+_FACTS_CACHE: dict[str, tuple[float, str]] = {}  # key -> (expires_at, value)
 
 # Dark palette.
 BG = "#0d1117"
@@ -71,7 +89,22 @@ def attempt_info(p: dict) -> str:
     attempts, hiding that four of them had produced zero commits. Read straight
     off disk (checkpoint dirs + git log) so this needs no change to the running
     audit and no new status.json field. Best-effort: never raises, returns "" when
-    it cannot tell."""
+    it cannot tell.
+
+    Called from redraw() at ~25fps, so the disk walk + git subprocess are behind
+    a per-program TTL cache: recomputed at most every _FACTS_TTL_S seconds, and
+    the subprocess runs with _NO_WINDOW (see the module comment - without it,
+    each call flashed a black console window and stole focus)."""
+    key = f"{p.get('name') or ''}|{p.get('dir') or ''}"
+    hit = _FACTS_CACHE.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    value = _attempt_info_uncached(p)
+    _FACTS_CACHE[key] = (time.monotonic() + _FACTS_TTL_S, value)
+    return value
+
+
+def _attempt_info_uncached(p: dict) -> str:
     try:
         prog = str(p.get("name") or "")
         proj = str(p.get("dir") or "")
@@ -95,7 +128,8 @@ def attempt_info(p: dict) -> str:
             try:
                 out = subprocess.run(
                     ["git", "-C", proj, "log", "--oneline", "--grep=FlexFactor"],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=_NO_WINDOW)
                 if out.returncode == 0:
                     landed = len([ln for ln in out.stdout.splitlines() if ln.strip()])
             except (OSError, subprocess.SubprocessError):

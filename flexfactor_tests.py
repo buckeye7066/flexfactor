@@ -12976,5 +12976,100 @@ class NativeImportCoverageTests(unittest.TestCase):
         self.assertNotIn("tests/api.test.js", {row["file"] for row in ledger["functions"]})
 
 
+class DashboardNoConsoleWindowTests(unittest.TestCase):
+    """THE BLACK-SCREEN-FLASH BUG (2026-08-16). The dashboards run under
+    pythonw (no console); a console child (git.exe) spawned without
+    CREATE_NO_WINDOW therefore gets a brand-new VISIBLE console window - and
+    attempt_info()/durable_facts() ran `git log` from redraw() (25fps / 2fps).
+    Owner report: "it flashes a black screen constantly and I can't type or
+    anything else." Two invariants: every subprocess call site in a dashboard
+    passes creationflags, and the render loop never pays for the disk/git walk
+    per frame (TTL cache)."""
+
+    @staticmethod
+    def _load(name):
+        path = os.path.join(_HERE, name + ".py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_every_dashboard_subprocess_call_site_suppresses_the_console_window(self):
+        # Source-level guard, same pattern as the capture-encoding test: a NEW
+        # subprocess call added to either dashboard without creationflags
+        # reddens the suite instead of waiting to strobe the owner's desktop.
+        import re
+        for name in ("flexfactor_dashboard", "flexfactor_dashboard_v2"):
+            with open(os.path.join(_HERE, name + ".py"), encoding="utf-8") as fh:
+                src = fh.read()
+            sites = [m.start() for m in
+                     re.finditer(r"subprocess\.(run|Popen|check_output|call)\(", src)]
+            self.assertTrue(sites, f"{name}: expected at least one subprocess site")
+            for pos in sites:
+                window = src[pos:pos + 400]
+                self.assertIn("creationflags", window,
+                              f"{name}: subprocess call at offset {pos} does not "
+                              "pass creationflags - under pythonw this flashes "
+                              "a console window per call")
+            self.assertIn("_NO_WINDOW = getattr(subprocess, \"CREATE_NO_WINDOW\"", src,
+                          f"{name}: the _NO_WINDOW constant is gone")
+
+    def test_the_spawned_git_call_actually_carries_the_no_window_flag(self):
+        import tempfile
+        dash = self._load("flexfactor_dashboard")
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(kw)
+            raise OSError("stop here - flags already captured")
+
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, ".git"))
+            dash.subprocess = type("S", (), {"run": staticmethod(fake_run),
+                                             "CREATE_NO_WINDOW":
+                                                 getattr(subprocess, "CREATE_NO_WINDOW", 0)})
+            try:
+                dash._attempt_info_uncached({"name": "demo", "dir": td})
+            finally:
+                dash.subprocess = sys.modules["subprocess"]
+        self.assertIn("creationflags", seen)
+        self.assertEqual(seen["creationflags"], dash._NO_WINDOW)
+
+    def test_attempt_info_is_ttl_cached_so_redraw_never_pays_per_frame(self):
+        dash = self._load("flexfactor_dashboard")
+        calls = {"n": 0}
+        dash._attempt_info_uncached = lambda p: calls.__setitem__("n", calls["n"] + 1) or "attempt 1"
+        dash._FACTS_CACHE.clear()
+        p = {"name": "demo", "dir": "X"}
+        for _ in range(50):   # two seconds of 25fps redraws
+            dash.attempt_info(p)
+        self.assertEqual(calls["n"], 1,
+                         "50 redraws must hit the disk/git walk exactly once")
+        # Expiry recomputes: pretend the TTL passed.
+        key, (_, val) = next(iter(dash._FACTS_CACHE.items()))
+        dash._FACTS_CACHE[key] = (0.0, val)
+        dash.attempt_info(p)
+        self.assertEqual(calls["n"], 2)
+
+    def test_v2_durable_facts_is_ttl_cached_too(self):
+        v2 = self._load("flexfactor_dashboard_v2")
+        calls = {"n": 0}
+        v2._durable_facts_uncached = (
+            lambda p: calls.__setitem__("n", calls["n"] + 1)
+            or {"attempts": 1, "resumes": 0, "landed": 0})
+        v2._FACTS_CACHE.clear()
+        p = {"name": "demo", "dir": "X"}
+        for _ in range(20):
+            v2.durable_facts(p)
+        self.assertEqual(calls["n"], 1)
+
+    def test_the_dashboard_is_still_launched_windowless(self):
+        # _launch_dashboard prefers pythonw.exe - that is WHY the children need
+        # CREATE_NO_WINDOW, and this pins the pairing so neither half is
+        # "simplified" away in isolation.
+        src = inspect.getsource(ff._launch_dashboard)
+        self.assertIn("pythonw.exe", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
