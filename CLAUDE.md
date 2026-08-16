@@ -217,6 +217,40 @@ search function and (in tests) the URL opener.
   gaps. `test_competitor_findings_are_merged_after_the_cycle_loop_not_before`
   asserts the ordering of the three call sites.
 
+### Measured on the first real runs (SermonSmith, 2026-08-16) - read before "improving" this
+
+Live against `C:\Users\firer\sermonsmith` (owner-authored purpose contract,
+java+node), free FCC route, production Repo Rewards, ~280s: **8 corroborated
+competitors, 0 unverified, 2 accepted / 6 rejected**, sources
+`web:duckduckgo + github + repo-rewards`, `web:searxng` a named skip
+(`FLEXFACTOR_SEARXNG_URL` is not set on this machine).
+
+The rejections are the evidence the design works, not a shortfall: OAuth
+(ScribeJava), a CLI Bible reader, a Wine installer for Logos, a changelog
+generator, a generic REST wrapper, and church member/event administration were
+each rejected **with a reason quoting SermonSmith's own purpose**. The two
+accepted ideas both cite the contract's requirement to preserve *exact
+provider-sourced Scripture text*. That is the purpose contract acting as the
+authority, exactly as intended - a run where everything is accepted would mean
+the gate is not working.
+
+**KNOWN LIMITATION, measured not assumed: on the FREE judge tier, competitor
+ideas are effectively REPORT-ONLY.** The cheap model reliably fills
+`idea_title` / `why_valuable` / `purpose_reason` (after the one bounded retry)
+but omits `severity`, `code_fixable` and `file`, so `competitor_findings()`
+drops them at the severity floor and **0 ideas bridged** in the live run. That
+is the correct conservative behaviour - a missing severity must never be
+invented, and an idea with no file cannot be applied - but nobody should report
+"competitor research feeds the fix loop" as if it routinely fires. The lever,
+if the owner wants ideas to actually bridge, is routing `IDEA_SYSTEM` to the
+AUTHOR tier; that costs money and is an owner decision.
+
+**Second known limitation:** competitor *discovery* quality is the model's.
+"Scribe" resolved to `scribejava/scribejava`, which is not a sermon tool at all.
+The licence gate handled it correctly (MIT, its own repo, direct-code-reuse) and
+the purpose gate rejected it - both layers did their jobs - but an ambiguous
+one-word competitor name still costs one idea-extraction call.
+
 ### Repo Rewards endpoint: local-first, production-by-default (2026-08-16)
 
 `resolve_repo_rewards_url()` is the one chooser for scout AND audit: an
