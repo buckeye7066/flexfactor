@@ -1880,6 +1880,69 @@ class OpenAIOutputCapTests(unittest.TestCase):
         self.assertEqual(sink.get("max_tokens"), 4000)
 
 
+class OpenAICallDeadlineTests(unittest.TestCase):
+    """Paid OpenAI calls must not inherit the SDK's long retrying default."""
+
+    def test_provider_constructs_one_attempt_bounded_client(self):
+        seen = {}
+
+        class FakeModule:
+            @staticmethod
+            def OpenAI(**kwargs):
+                seen.update(kwargs)
+                return object()
+
+        previous = sys.modules.get("openai")
+        sys.modules["openai"] = FakeModule
+        try:
+            ff.OpenAIProvider("gpt-4o", judge_model="gpt-4o-mini")
+        finally:
+            if previous is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = previous
+        self.assertEqual(seen.get("timeout"), ff.OPENAI_CALL_TIMEOUT_S)
+        self.assertEqual(seen.get("max_retries"), 0)
+
+    def test_timeout_override_is_positive_finite_and_bounded(self):
+        previous = os.environ.get("FLEXFACTOR_OPENAI_CALL_TIMEOUT")
+        try:
+            os.environ["FLEXFACTOR_OPENAI_CALL_TIMEOUT"] = "42.5"
+            self.assertEqual(ff._openai_call_timeout_seconds(), 42.5)
+            for invalid in ("0", "-1", "nan", "inf", "1801", "nonsense"):
+                os.environ["FLEXFACTOR_OPENAI_CALL_TIMEOUT"] = invalid
+                self.assertEqual(ff._openai_call_timeout_seconds(),
+                                 ff.OPENAI_CALL_TIMEOUT_S)
+        finally:
+            if previous is None:
+                os.environ.pop("FLEXFACTOR_OPENAI_CALL_TIMEOUT", None)
+            else:
+                os.environ["FLEXFACTOR_OPENAI_CALL_TIMEOUT"] = previous
+
+
+class PurposeAssessmentFailureVisibilityTests(unittest.TestCase):
+    def test_all_failed_samples_raise_with_exact_provider_error(self):
+        class BrokenProvider:
+            judge_model = "gpt-4o-mini"
+
+            def structured(self, *args, **kwargs):
+                raise TimeoutError("request exceeded the paid-call deadline")
+
+        class Contract:
+            purpose = "Do the stated job"
+            acceptance_criteria = ["criterion"]
+
+            @staticmethod
+            def prompt_block():
+                return "Purpose: Do the stated job\\n1. criterion"
+
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "all 3 purpose assessment samples failed: TimeoutError: request exceeded"):
+            ff.assess_purpose_gap(
+                BrokenProvider(), "metadata", [], [], contract=Contract(), samples=3)
+
+
 class CommitFailureIsFatalTests(unittest.TestCase):
     """Round-4 defect 2: a failed git commit must raise (stop the audit), never be
     returned as text so callers continue past an unsafe checkpoint."""
