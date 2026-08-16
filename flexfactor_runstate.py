@@ -58,7 +58,14 @@ DEFAULT_FLUSH_EVERY = 10
 
 
 def _now_iso() -> str:
-    return datetime.datetime.now().isoformat(timespec="seconds")
+    # MILLISECONDS, not seconds (fixed 2026-08-16). `list_runs` orders every
+    # checkpoint by this string, so two runs started in the same second TIED and
+    # a stable sort handed "newest" to whichever directory os.listdir happened to
+    # return first. Combined with the run_id collision below, a resumed run could
+    # recover the WRONG checkpoint and re-review work it had already paid for -
+    # the exact defect flexfactor_runstate exists to prevent. Ordering must never
+    # depend on listdir order.
+    return datetime.datetime.now().isoformat(timespec="milliseconds")
 
 
 def pid_alive(pid: int) -> bool:
@@ -253,9 +260,15 @@ def new_run(root: str, *, program: str, project_dir: str, mode: str,
             cycles_cap: int = 0, run_id: str | None = None,
             **extra) -> RunCheckpoint:
     """Start a fresh checkpoint for one program of one run."""
+    # MICROSECONDS in the id, for the same reason (fixed 2026-08-16):
+    # program + second + pid COLLIDES whenever one process starts two
+    # checkpoints for the same program inside one second, and the second
+    # new_run then silently OVERWRITES the first one's directory instead of
+    # getting its own. Two runs of one program in one second is not exotic -
+    # it is what the resume tests do, and what a fast retry does.
     rid = run_id or "{}-{}-{}".format(
         _slug(program),
-        datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
+        datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
         os.getpid())
     data = {
         "schema": SCHEMA_VERSION,

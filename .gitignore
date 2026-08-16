@@ -18,3 +18,10 @@ probe_tiers_out.json
 # same content is already in git history (the commit before the fcc-proxy
 # switch), so committing a second 380k copy would be pure duplication.
 *.bak-preproxy
+
+# Scout run artifacts. A scout run writes these into the CURRENT directory, so
+# running scout from the FlexFactor checkout leaves them in the repo root as
+# untracked noise (found there 2026-08-16). They are per-run evidence, not
+# source - same class as the audit logs above.
+_scout_report.json
+.flexfactor-scout-proposals.json

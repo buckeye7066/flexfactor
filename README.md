@@ -51,6 +51,44 @@ paid service.
   mid-flow (crash, Ctrl-C, credits), re-running the same command picks up
   where it left off instead of re-paying for finished work. `--recheck`
   discards the memory and starts fresh.
+  **Competitor research runs by default** (see below).
+
+## Competitor research (audit + prodready, ON by default)
+
+An audit used to be able to drive a program to 10/10 against its own acceptance
+criteria while it still shipped less than anything its users could switch to.
+Phase 1b closes that. Before the generic sweep, FlexFactor finds the program's
+real competitors - commercial products AND inspectable open-source projects -
+extracts the single most valuable adoptable idea from each, and judges that idea
+against the program's OWN purpose contract.
+
+- **Sources.** Scout's Repo Rewards search plus FlexFactor's own keyless web
+  search (self-hosted SearXNG when `FLEXFACTOR_SEARXNG_URL` is set, then
+  DuckDuckGo Lite, then Wikipedia) plus GitHub repository search, which supplies
+  the SPDX licence id. Every backend that fails is a NAMED skip in the report -
+  "no reachable source" is reported as a research gap, never as "this program
+  has no competitors", and a name nothing corroborates is marked `unverified`
+  and never acted on.
+- **The purpose contract is the authority.** A competitor idea that does not
+  advance this program's stated job is REJECTED and reported as rejected. The
+  goal is not to make every program resemble its competitors.
+- **The licence decides the reuse mode, mechanically.** Verified-permissive =>
+  `direct-code-reuse`. Copyleft/restricted, or a closed-source product with no
+  inspectable source => `clean-room-from-documented-behavior` (public behaviour
+  only, never the source). Unknown or unverifiable licence => `reference-only`.
+  Source is never copied from an unknown or incompatible licence, and the mode
+  plus the evidence URLs are recorded in the report and in the fix instructions.
+- **Bounded action.** Only accepted, corroborated, licence-permitted,
+  code-fixable ideas enter the fix stream, capped by `--competitor-fixes`
+  (default 3) and still subject to `--fix-severity`, the build gate and the
+  adversarial verifier like any other change.
+- Flags: `--no-competitors`, `--competitor-count N` (default 5),
+  `--competitor-fixes N` (default 3).
+
+**Repo Rewards endpoint (changed 2026-08-16):** local `localhost:3000` wins when
+it is actually up; otherwise the production deployment is used automatically.
+The endpoint in use is always printed and lands in the report. Opt out with
+`--no-remote-repo-rewards` or `FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0`.
 
 ## Executable completion evidence
 

@@ -155,6 +155,84 @@ FlexFactor reads **why the program exists** before it reads any code.
   is the tripwire for "build passes"/"tests pass"/"deployed"/"works locally"/
   "health endpoint returns 200" being used as readiness.
 
+## Competitor research (`flexfactor_competitors.py`, audit PHASE 1b, 2026-08-16)
+
+> "it would probably be a good thing for flexfactor to have it too. Maybe allow
+> flexfactor and factorydeck (and purpose foundry) by default also use scout and
+> repo rewards as well their own web search for competitors." — owner, 2026-08-16
+
+The purpose engine can drive a program to 10/10 against its own acceptance
+criteria while it still ships less than every product its users could switch to.
+Phase 1b runs between the purpose baseline and the generic sweep, is **ON by
+default** (`--no-competitors` opts out), and never aborts an audit: every failure
+is a NAMED skip in `sources_skipped` that reaches the console and the report.
+
+Containment mirrors `flexfactor_prodready.py`: stdlib only, **never imports
+flexfactor**, and the caller injects the judging callable, the Repo Rewards
+search function and (in tests) the URL opener.
+
+- **The purpose contract stays the authority.** Every competitor idea is a
+  PROPOSAL judged against the audited program's own job; `accept=false` ideas are
+  reported and never bridged. "Competitor X has feature Y" is not a reason to
+  build Y — copying a competitor's roadmap IS the "make every program resemble
+  the same generic application" failure the portfolio directive forbids.
+- **`license_reuse_mode(spdx, source_available)` is the legal gate, and it is
+  mechanical.** Verified-permissive → `direct-code-reuse`; copyleft/restricted OR
+  a closed-source product with no inspectable source → `clean-room-from-documented-behavior`;
+  anything unverifiable → `reference-only`. `may_copy_source()` is True for
+  exactly ONE mode and is the single place that answer lives. Note the asymmetry
+  that makes it safe: a KNOWN-BAD licence still permits clean-room work from
+  published behaviour, while an UNKNOWN licence permits less, because we cannot
+  even establish what reading the source would oblige. The mode and the evidence
+  URLs ride into the fix instruction, so the author model is told in-band whether
+  it may consult the source.
+- **One licence oracle at runtime.** `_competitors_module()` calls
+  `set_license_oracle(_license_compatible)` at import, so the scout integrate
+  gate and the competitor reuse gate cannot reach opposite conclusions about the
+  same repo. The module's standalone table exists only for use outside
+  FlexFactor, and `test_module_table_agrees_with_flexfactors_own_license_oracle`
+  reddens on drift.
+- **Nothing is invented.** A name the model recalled that NO reachable source
+  corroborated is kept, marked `evidence_status="unverified"`, has its `accept`
+  forced to False with the reason prefixed `NOT ACTED ON:`, is excluded from the
+  verified count, and cannot bridge. Fewer than `--competitor-count` (5) is said
+  out loud by `coverage_note()` as a **SHORTFALL, not evidence that fewer
+  competitors exist**. A report with no competitors says the research failed, not
+  that the program has none.
+- **Search ladder is keyless.** SearXNG (`FLEXFACTOR_SEARXNG_URL`) → DuckDuckGo
+  **Lite** → Wikipedia, plus GitHub repo search as the SPDX oracle
+  (`GITHUB_TOKEN`/`GH_TOKEN` only raises the rate limit). **Measured 2026-08-16:
+  `html.duckduckgo.com` answers 202 with a challenge page and ZERO results from
+  this machine; `lite.duckduckgo.com` answers 200 with real organic results.**
+  Do not "simplify" back to the html endpoint. Ad rows (`duckduckgo.com/y.js`)
+  are filtered — a sponsored link is not a competitor finding.
+- **Bridging is bounded.** Only accepted + corroborated + licence-permitted +
+  `code_fixable` ideas with a real file enter `_fix_files`, capped by
+  `--competitor-fixes` (default 3) and still under `--fix-severity`, the build
+  gate and the adversarial verifier. The cap is checked BEFORE the append — a
+  post-append check let `--competitor-fixes 0` still emit one finding.
+- **TRAP the tests pin:** `all_findings` is REASSIGNED wholesale by every cycle
+  (`all_findings = flat`), so competitor findings appended at phase 1b would be
+  silently discarded. They are merged in AFTER the cycle loop, next to the purpose
+  gaps. `test_competitor_findings_are_merged_after_the_cycle_loop_not_before`
+  asserts the ordering of the three call sites.
+
+### Repo Rewards endpoint: local-first, production-by-default (2026-08-16)
+
+`resolve_repo_rewards_url()` is the one chooser for scout AND audit: an
+explicitly named non-local host is obeyed; otherwise local wins when it is
+genuinely up; otherwise the production Railway deployment is used
+**automatically**. The old default-off opt-in (`--allow-remote-repo-rewards`)
+was a privacy guard against sending program-derived queries off-host, which the
+owner has overridden for their own tooling — and with local RR usually down it
+was simply turning the feature off. Opt back out with `--no-remote-repo-rewards`
+or `FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0` (note `_env_falsy`: an UNSET var is
+not an opt-out). The chosen endpoint is always printed and lands in the report;
+`None` comes back with a note naming every door that was tried.
+**LAUNCHER DRIFT:** `flexfactor_scout_launch.ps1` still passes
+`--allow-remote-repo-rewards`, so the flag is KEPT as an accepted no-op — deleting
+it is argparse exit 2 and a dead run.
+
 ## Version-aware review (2026-08-14) — never recommend an API that isn't installed
 
 The one class where FlexFactor actively **damages** the program it exists to
