@@ -11323,22 +11323,58 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             authored_b = bool(purpose_before.get("authored"))
             floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
             bridgeable_b: list[tuple[str, dict]] = []
+            # Same accounting contract as competitor_findings' bridge_ledger
+            # (2026-08-16): every gap the baseline found either bridges or is
+            # dropped WITH A RECORDED REASON. These are the owner's own unmet
+            # acceptance criteria - a bare `continue` here is FlexFactor
+            # finding the exact work it exists to do and quietly not doing it.
+            gap_dropped: dict[str, list[str]] = {}
+
+            def _gdrop(reason: str, g: dict) -> None:
+                gap_dropped.setdefault(reason, []).append(
+                    str(g.get("title") or g.get("file") or "(untitled gap)"))
+
             for g in b_gaps:
                 rel = str(g.get("file") or "").replace("\\", "/")
                 if rel:
                     purpose_files.append(rel)  # purpose-critical: swept first below
                 if not (g.get("code_fixable") and rel):
+                    _gdrop("not code-fixable, or no file named", g)
                     continue
                 if (not authored_b and
                         SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0) < floor_rank):
+                    _gdrop("inferred gap below the --fix-severity floor", g)
                     continue
                 if _read_text_and_sha(project_dir, rel) is None:
+                    _gdrop(f"named file unreadable in the repo: {rel}", g)
                     continue
                 bridgeable_b.append((rel, g))
             bridgeable_b.sort(key=lambda rg: -SEVERITY_RANK.get(
                 str(rg[1].get("severity", "")).lower(), 0))
             cap_b = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored_b else MAX_PURPOSE_GAP_FIXES
+            for _rel, _g in bridgeable_b[cap_b:]:
+                # The cap truncation was the silent half: a top-N cut has no
+                # filter reason of its own, so its tail vanished entirely.
+                _gdrop(f"over the per-run bridge cap of {cap_b} "
+                       "(worst-severity first; picked up next cycle)", _g)
             bridgeable_b = bridgeable_b[:cap_b]
+            purpose_before["bridge_ledger"] = {
+                "candidates": len(b_gaps),
+                "bridged": len(bridgeable_b),
+                "dropped": {k: sorted(v) for k, v in sorted(gap_dropped.items())},
+                "dropped_total": sum(len(v) for v in gap_dropped.values()),
+                "accounted": len(b_gaps) == len(bridgeable_b)
+                             + sum(len(v) for v in gap_dropped.values()),
+            }
+            if b_gaps:
+                print(f"{pfx}PHASE 1 - bridge ledger: {len(bridgeable_b)}/"
+                      f"{len(b_gaps)} purpose gap(s) entered the fix stream")
+                for _reason, _titles in gap_dropped.items():
+                    print(f"{pfx}  not bridged ({len(_titles)}): {_reason}")
+                if not purpose_before["bridge_ledger"]["accounted"]:
+                    print(f"{pfx}  WARNING: gap accounting mismatch - a gap was "
+                          "dropped without a recorded reason (FlexFactor defect; "
+                          "the run continues)")
             if bridgeable_b and not meter.over_limit():
                 print(f"{pfx}PHASE 1 - bridging {len(bridgeable_b)} code-fixable purpose "
                       "gap(s) BEFORE any generic sweep (build-gated"
@@ -11412,6 +11448,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         display_name,
                         purpose_blob or f"Program: {display_name}",
                         stack.get("ecosystems") or [],
+                        author=lambda system, prompt, schema: purpose_reviewer.structured(
+                            system, prompt, schema, max_tokens=8000,
+                            salvage_truncated=True),
                         rr_search=rr_fn,
                         rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
                         target=max(1, int(getattr(args, "competitor_count", 5) or 5)),
@@ -11459,6 +11498,21 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 for _rel, _f in comp_pairs:
                     competitor_bridged_findings.append(dict(_f, file=_rel))
                     purpose_files.append(_rel)
+                # The bridge ledger reaches the console, not just the report:
+                # "2 accepted" with zero bridged and no stated reason is the
+                # silent-skip defect this whole phase exists to prevent.
+                _bl = competitor_research.get("bridge_ledger") or {}
+                if _bl.get("candidates"):
+                    print(f"{pfx}PHASE 1b - bridge ledger: "
+                          f"{_bl.get('bridged', 0)}/{_bl.get('candidates', 0)} "
+                          "candidate idea(s) entered the fix stream")
+                    for _reason, _names in (_bl.get("dropped") or {}).items():
+                        print(f"{pfx}  not bridged ({len(_names)}): "
+                              f"{_fc._ascii(', '.join(_names))} - {_fc._ascii(_reason)}")
+                    if not _bl.get("accounted", False):
+                        print(f"{pfx}  WARNING: bridge accounting gap - a candidate "
+                              "was discarded without a recorded reason (FlexFactor "
+                              "defect; the run continues)")
                 if comp_pairs and not meter.over_limit():
                     print(f"{pfx}PHASE 1b - applying {len(comp_pairs)} "
                           "competitor-derived improvement(s) (build-gated"
