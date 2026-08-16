@@ -328,6 +328,56 @@ every branch, and the report says "none are successes". Letting "rejected"
 become a success would recreate the 2026-08-11 defect the exit-code-3 rule
 exists to prevent. A rejected finding is a defect in REVIEW, not a win for FIX.
 
+## Large files are fixable: SHRINK THE UNIT, don't raise the ceiling (2026-08-16)
+
+Live GrantFlow, mid-run: `[skip] src/pages/SmartMatcher.jsx: fix generation
+failed (Model output hit the 16384-token budget (file too large to regenerate in
+one response); raise max_tokens for this call.)`, repeatedly, with
+**reviewed 8 / defects 155 / fixed 1 / errors 8** - the error count outrunning
+the fix count because every large file was structurally unfixable.
+
+The edit-block path exists precisely so output scales with the CHANGE, not the
+file. It was being thrown away:
+
+- **The demotion was backwards.** A budget overrun in EDIT mode was caught by a
+  bare `except Exception` that printed `[edit-fallback]` and switched the file
+  to WHOLE-FILE regeneration. Whole-file output is strictly *larger* than an
+  edit, so the fallback was a guaranteed second failure. Every large file walked
+  straight into `[skip]`.
+- **The ceiling was gpt-4o's.** `OpenAIProvider.structured` clamped every model
+  to a hardcoded `16384`, so newer models were silently capped at a fraction of
+  what they can emit. `_openai_output_ceiling()` is now a longest-prefix lookup
+  (`OPENAI_OUTPUT_CEILINGS`), and an UNKNOWN id still gets 16384 on purpose:
+  over-requesting output is a hard API rejection that kills the call, while
+  under-requesting costs one shrink-and-retry.
+- **The detector was a string search.** `"token budget" in str(ex)` decided
+  whether a file was oversized. It is now the TYPE `OutputBudgetError`, raised by
+  both providers on `stop_reason == "max_tokens"` / `finish_reason == "length"`.
+  The message still contains the old phrase so nothing older breaks, but no new
+  code should match on text.
+
+`generate_edits_shrinking()` is the fix: on `OutputBudgetError` it keeps the
+**worst-severity half** of the findings and asks again, bounded by
+`_EDIT_SHRINK_STEPS` (3) and stopping at one finding. A budget overrun means we
+asked for too many changes at once - not that the file cannot be fixed. Dropped
+findings are still reported and the until-clean loop picks them up next cycle.
+Both the inline path and the `--fix-prefetch` path use it, or a prefetched first
+attempt would hand the main thread an error that had never been retried.
+
+**Accounting: `oversized` is a DISTINCT non-success, not an `errors` entry.**
+The standing rule is that a non-success is never quietly reclassified, and this
+does not break it: the file is printed loudly per-file AND in a one-line summary
+at the end of the sweep, added to `notes`, and recorded in `oversized` - which
+`audit_one_program` already folds into `errors_total` exactly once. What it stops
+is the opposite dishonesty: "errors 8, fixed 1" read as eight failed fixes when
+the truth was "this model cannot emit these files", which is a capability limit
+with a different remedy (a larger-output model), not a defect in the fix loop.
+
+The targeted-edit path is only safe because `_apply_edits` requires every anchor
+to match **exactly once** - zero matches and two matches are both refused with a
+reason, never applied blindly. That invariant is what makes shrinking safe to
+lean on, and it has its own tests.
+
 ## A file key is an IDENTITY — canonicalize it (2026-08-14)
 
 `rel` is not merely a path in this tool: it is the identity a file is tracked by

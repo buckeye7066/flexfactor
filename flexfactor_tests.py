@@ -12135,5 +12135,187 @@ class CompetitorAuditWiringTests(unittest.TestCase):
         self.assertIn("connection refused", text)
         self.assertIn("SHORTFALL", text)
 
+class OutputBudgetShrinkTests(unittest.TestCase):
+    """Live GrantFlow 2026-08-16: `[skip] src/pages/SmartMatcher.jsx: fix
+    generation failed (Model output hit the 16384-token budget ...)`, repeatedly,
+    with reviewed=8 defects=155 fixed=1 errors=8. Large files were UNFIXABLE
+    because a budget overrun in EDIT mode demoted the file to WHOLE-FILE
+    regeneration - which needs strictly MORE output. The answer is to shrink the
+    unit of generation, not to keep raising the ceiling."""
+
+    @staticmethod
+    def _findings(n):
+        sev = ["critical", "high", "medium", "low"]
+        return [{"severity": sev[i % 4], "line": i, "title": f"t{i}",
+                 "problem": "p", "fix": "f"} for i in range(n)]
+
+    def test_shrinking_halves_the_findings_until_the_output_fits(self):
+        seen = []
+
+        class P:
+            def structured(_s, system, prompt, schema, max_tokens=8000, **kw):
+                # Count findings by the bullet lines the generator emits.
+                n = prompt.count("=> FIX:")
+                seen.append(n)
+                if n > 2:
+                    raise ff.OutputBudgetError("Model output hit the 16384-token budget")
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}],
+                        "fixed_titles": [], "notes": ""}
+
+        out = ff.generate_edits_shrinking(P(), "big.jsx", "a" * 100,
+                                          self._findings(16), log=lambda m: None)
+        self.assertTrue(out["changed"])
+        self.assertEqual(seen, [16, 8, 4, 2], "each retry must HALVE the finding set")
+
+    def test_shrinking_keeps_the_worst_severity_findings(self):
+        kept = {}
+
+        class P:
+            def structured(_s, system, prompt, schema, max_tokens=8000, **kw):
+                if prompt.count("=> FIX:") > 2:
+                    raise ff.OutputBudgetError("token budget")
+                kept["prompt"] = prompt
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}]}
+
+        ff.generate_edits_shrinking(P(), "big.jsx", "a" * 100,
+                                    self._findings(16), log=lambda m: None)
+        self.assertIn("[critical]", kept["prompt"])
+        self.assertNotIn("[low]", kept["prompt"],
+                         "the survivors must be the worst-severity findings")
+
+    def test_a_single_finding_that_still_overruns_raises_rather_than_looping(self):
+        calls = {"n": 0}
+
+        class P:
+            def structured(_s, *a, **k):
+                calls["n"] += 1
+                raise ff.OutputBudgetError("Model output hit the 16384-token budget")
+
+        with self.assertRaises(ff.OutputBudgetError):
+            ff.generate_edits_shrinking(P(), "huge.jsx", "a" * 100,
+                                        self._findings(4), log=lambda m: None)
+        # 4 -> 2 -> 1 -> stop: bounded, never an infinite shrink loop.
+        self.assertLessEqual(calls["n"], ff._EDIT_SHRINK_STEPS + 1)
+
+    def test_no_overrun_means_no_extra_calls(self):
+        calls = {"n": 0}
+
+        class P:
+            def structured(_s, *a, **k):
+                calls["n"] += 1
+                return {"changed": True, "edits": [{"search": "a", "replace": "b"}]}
+
+        ff.generate_edits_shrinking(P(), "f.js", "a", self._findings(9),
+                                    log=lambda m: None)
+        self.assertEqual(calls["n"], 1, "the happy path must cost exactly one call")
+
+
+class OutputCeilingTests(unittest.TestCase):
+    def test_newer_models_are_no_longer_capped_at_gpt4os_ceiling(self):
+        self.assertEqual(ff._openai_output_ceiling("gpt-4o"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("gpt-4.1"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("gpt-5"), 16384)
+        self.assertGreater(ff._openai_output_ceiling("o4-mini"), 16384)
+
+    def test_dated_model_snapshots_resolve_by_longest_prefix(self):
+        self.assertEqual(ff._openai_output_ceiling("gpt-4.1-2025-04-14"),
+                         ff._openai_output_ceiling("gpt-4.1"))
+        self.assertEqual(ff._openai_output_ceiling("gpt-4o-mini-2024-07-18"),
+                         ff._openai_output_ceiling("gpt-4o-mini"))
+
+    def test_an_unknown_model_fails_SMALL_not_large(self):
+        # Over-requesting output is a hard API rejection that kills the call;
+        # under-requesting only costs one shrink-and-retry.
+        self.assertEqual(ff._openai_output_ceiling("some-future-model"),
+                         ff.OPENAI_OUTPUT_CEILING_DEFAULT)
+        self.assertEqual(ff._openai_output_ceiling(""), ff.OPENAI_OUTPUT_CEILING_DEFAULT)
+
+
+class OversizedAccountingTests(unittest.TestCase):
+    """An unfixable-by-budget file must be named loudly, recorded distinctly,
+    and NEVER inflate the plain error count."""
+
+    class _Author:
+        model = "stub"
+
+        def __init__(self, exc):
+            self.exc = exc
+
+        def structured(self, *a, **k):
+            raise self.exc
+
+    def _run(self, exc):
+        import io
+        import contextlib as _c
+        with _RepoFixture({"big.jsx": "x = 1\n" * 50}) as root:
+            oversized = []
+            findings = {"big.jsx": [{"severity": "high", "line": 1, "title": "t",
+                                     "problem": "p", "fix": "f"}]}
+            import types
+            args = types.SimpleNamespace(
+                whole_file_fixes=False, fix_prefetch=0, adversarial=False,
+                adversarial_rounds=0, adversarial_materiality="material",
+                fix_severity="high")
+            buf = io.StringIO()
+            with _c.redirect_stdout(buf):
+                applied, unver, notes = ff._fix_files(
+                    self._Author(exc), None, root, findings,
+                    {"verify_cmds": [], "ecosystems": []}, True, args,
+                    oversized=oversized, adversarial=False)
+            return applied, notes, oversized, buf.getvalue()
+
+    def test_an_output_budget_overrun_is_oversized_not_a_generic_skip(self):
+        applied, notes, oversized, out = self._run(
+            ff.OutputBudgetError("Model output hit the 16384-token budget"))
+        self.assertEqual(applied, [])
+        self.assertIn("big.jsx", oversized, "the file must be recorded as oversized")
+        self.assertIn("[oversized]", out)
+        self.assertIn("big.jsx", out)
+        self.assertNotIn("[skip] big.jsx", out,
+                         "a budget limit is not a generic fix-generation failure")
+        self.assertTrue([n for n in notes if "big.jsx" in n and "too large" in n],
+                        "the skip must be NAMED in fix_notes, never silent")
+
+    def test_a_real_generation_failure_is_still_a_skip(self):
+        # The distinction must cut both ways, or "oversized" becomes a dumping
+        # ground that hides genuine errors.
+        _applied, _notes, oversized, out = self._run(RuntimeError("provider exploded"))
+        self.assertNotIn("big.jsx", oversized)
+        self.assertIn("[skip] big.jsx", out)
+
+    def test_an_output_budget_overrun_never_demotes_to_whole_file(self):
+        # The demotion was the defect: whole-file output is strictly larger than
+        # an edit, so falling back guaranteed a second failure.
+        _applied, _notes, _oversized, out = self._run(
+            ff.OutputBudgetError("Model output hit the 16384-token budget"))
+        self.assertNotIn("[edit-fallback]", out,
+                         "an output-budget overrun must not fall back to "
+                         "regenerating the whole file")
+
+
+class EditAnchorSafetyTests(unittest.TestCase):
+    """The targeted-edit path is only safe because an anchor must match exactly
+    once - applying a non-unique anchor would silently patch the wrong site."""
+
+    def test_a_unique_anchor_is_applied(self):
+        new, err = ff._apply_edits("alpha\nbeta\ngamma\n",
+                                   [{"search": "beta", "replace": "BETA"}])
+        self.assertEqual(err, "")
+        self.assertEqual(new, "alpha\nBETA\ngamma\n")
+
+    def test_a_missing_anchor_is_refused_not_guessed(self):
+        new, err = ff._apply_edits("alpha\n", [{"search": "nope", "replace": "x"}])
+        self.assertIsNone(new)
+        self.assertIn("not found", err)
+
+    def test_an_ambiguous_anchor_is_refused_rather_than_applied_blindly(self):
+        new, err = ff._apply_edits("dup\ndup\n", [{"search": "dup", "replace": "x"}])
+        self.assertIsNone(new)
+        self.assertIn("matches 2 times", err)
+
+    def test_an_empty_edit_list_is_refused(self):
+        self.assertIsNone(ff._apply_edits("a\n", [])[0])
+        self.assertIsNone(ff._apply_edits("a\n", None)[0])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
