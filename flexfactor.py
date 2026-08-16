@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.2"
+TOOL_VERSION = "0.3.3"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -9643,9 +9643,31 @@ def _review_all(reviewers: list, project_dir: str,
                                                   project_dir=project_dir)
                         reviewer._flexfactor_semantic_unhealthy = False
                         return [(rel, findings, sha)]
-                    reviewed = review_files_batch(
-                        reviewer, [(rel, text) for rel, text, _ in unit],
-                        context=context, project_dir=project_dir)
+                    try:
+                        reviewed = review_files_batch(
+                            reviewer, [(rel, text) for rel, text, _ in unit],
+                            context=context, project_dir=project_dir)
+                    except BudgetExceededError:
+                        raise
+                    except Exception as batch_error:
+                        # A provider can be healthy while rejecting/struggling
+                        # with the larger nested batch schema.  Run #15 proved
+                        # this: purpose and competitor calls succeeded, then all
+                        # concurrent batch calls failed and the provider was
+                        # incorrectly quarantined. Degrade the SAME bytes to the
+                        # simpler per-file schema before declaring an outage.
+                        if len(unit) <= 1:
+                            raise
+                        print(f"  [degrade] semantic batch failed via "
+                              f"{getattr(reviewer, 'model', type(reviewer).__name__)} "
+                              f"({batch_error}); retrying {len(unit)} file(s) "
+                              "individually on the same provider")
+                        reviewed = {}
+                        for rel, text, _sha in unit:
+                            findings, summary = review_file(
+                                reviewer, rel, text, context=context,
+                                project_dir=project_dir)
+                            reviewed[rel] = (findings, summary)
                     reviewer._flexfactor_semantic_unhealthy = False
                     return [(rel, reviewed[rel][0], sha) for rel, _text, sha in unit]
                 except BudgetExceededError:
@@ -9665,7 +9687,11 @@ def _review_all(reviewers: list, project_dir: str,
             print(f"  [skip] semantic review batch failed for {names}: {last_error}")
             return [(rel, "incomplete") for rel, _text, _sha in unit]
 
-        n_workers = max(1, min(workers, len(units))) if units else 1
+        # One available provider means one actual capacity lane.  Fanning eight
+        # large schema calls into it concurrently turns its rate/transport limit
+        # into a fabricated outage. Multi-provider runs retain parallelism.
+        n_workers = (1 if len(reviewers) == 1 else
+                     max(1, min(workers, len(units)))) if units else 1
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_review_unit, unit) for unit in units]
             for future in concurrent.futures.as_completed(futures):

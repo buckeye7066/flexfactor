@@ -12574,9 +12574,33 @@ class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
             _, _, _, clean, incomplete = ff._review_all(
                 [Provider("primary"), Provider("fallback")], "/proj",
                 ["a.py", "b.py"], workers=1, batch_semantic=True)
-        self.assertEqual(calls, ["primary", "fallback"])
+        self.assertEqual(calls, ["primary", "primary", "primary"],
+                         "an incomplete batch should degrade to exact per-file "
+                         "verdicts before abandoning a healthy provider")
         self.assertEqual(set(clean), {"a.py", "b.py"})
         self.assertEqual(incomplete, set())
+
+    def test_batch_capability_failure_degrades_to_exact_per_file_reviews(self):
+        calls = []
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            calls.append("batch" if schema is ff.AUDIT_BATCH_SCHEMA else "file")
+            if schema is ff.AUDIT_BATCH_SCHEMA:
+                raise RuntimeError("nested batch schema rejected")
+            return {"findings": [], "summary": "clean"}
+
+        class Provider:
+            model = "only-provider"
+
+        with _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("value = 1\n", f"sha-{rel}")):
+            found, flat, unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj", ["a.py", "b.py"], workers=8,
+                batch_semantic=True)
+        self.assertEqual(calls, ["batch", "file", "file"])
+        self.assertEqual(set(clean), {"a.py", "b.py"})
+        self.assertEqual((found, flat, unreadable, incomplete), ({}, [], set(), set()))
 
     def test_purpose_retrieval_selects_evidence_for_each_contract_criterion(self):
         class Contract:
