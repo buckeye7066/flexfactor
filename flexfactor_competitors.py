@@ -826,20 +826,27 @@ def competitor_findings(research: dict, max_findings: int = 3,
             continue
         if file_exists is not None and not file_exists(rel):
             continue
+        problem = (f"{idea.get('what_it_does')}\n\nWhy it matters here: "
+                   f"{idea.get('why_valuable')}\n\nPurpose justification: "
+                   f"{idea.get('purpose_reason')}\n\nREUSE MODE: {c['reuse_mode']} "
+                   f"({c['reuse_reason']}). "
+                   + ("You MAY consult the competitor's source."
+                      if may_copy_source(c["reuse_mode"])
+                      else "You MUST NOT copy or paraphrase the competitor's "
+                           "source; implement independently from the described "
+                           "behaviour only.")
+                   + f"\n\nEvidence: {', '.join(c.get('evidence_urls') or []) or '(none)'}")
         out.append((rel, {
+            "line": 0,
             "severity": str(idea.get("severity") or "medium").lower(),
             "category": "competitive-gap",
             "title": f"[competitor: {c['name']}] {idea.get('idea_title')}",
-            "detail": (f"{idea.get('what_it_does')}\n\nWhy it matters here: "
-                       f"{idea.get('why_valuable')}\n\nPurpose justification: "
-                       f"{idea.get('purpose_reason')}\n\nREUSE MODE: {c['reuse_mode']} "
-                       f"({c['reuse_reason']}). "
-                       + ("You MAY consult the competitor's source."
-                          if may_copy_source(c["reuse_mode"])
-                          else "You MUST NOT copy or paraphrase the competitor's "
-                               "source; implement independently from the described "
-                               "behaviour only.")
-                       + f"\n\nEvidence: {', '.join(c.get('evidence_urls') or []) or '(none)'}"),
+            "problem": problem,
+            "fix": (idea.get("why_valuable") or
+                    "Implement the accepted capability independently in this file."),
+            # Compatibility aliases for report consumers predating the canonical
+            # audit shape. The fixer uses problem/fix above.
+            "detail": problem,
             "recommendation": idea.get("why_valuable") or "",
             "acceptance_ref": idea.get("acceptance_ref") or "",
             "source": "competitor-research",
