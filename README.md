@@ -38,9 +38,9 @@ paid service.
   report-only/dry-run mode - invoking prodready or audit means fixes get
   applied.
 - **audit** - aggressive line-by-line defect hunt and auto-fix across a whole
-  codebase (up to 5 programs in parallel). Dual-model adversarial review, per-file
+  codebase (up to 10 programs in parallel). Dual-model adversarial review, per-file
   build gate, cross-model veto, unit + e2e test generation, converges with
-  `--until-clean`, hard `--max-cost` budget (default $50/program), live Tkinter
+  `--until-clean`, hard `--max-cost` budget (default $150/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
   Large files are reviewed in complete line-numbered chunks rather than truncated
   or omitted. Bounded files are grouped into semantic review batches with an exact

@@ -351,14 +351,18 @@ if ($mode -eq "3") {
     # Build a repeatable --program list, one flag per program.
     $programArgs = @()
     foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
-    # NO '--provider' (owner order 2026-08-11, same reasoning as prodready mode
-    # above - this was a real bug: prodready omitted --provider correctly but
-    # audit mode still built and passed it here, which marks the choice EXPLICIT
-    # and suppresses FREE-FIRST, silently sending the whole audit to a paid
-    # cloud key even when a healthy local ollama is sitting idle. $primary above
-    # is still validated (errors out if neither credential exists) but is no
-    # longer forwarded to the CLI; preflight picks the free local model as
-    # author and keeps a usable cloud key as the cross-check reviewer.
+    # Preserve FREE-FIRST for local/auto runs, but paid mode is an explicit
+    # vendor choice. The launcher used to ask for a paid primary, validate the
+    # answer, then discard it here; choosing OpenAI could therefore launch
+    # Anthropic instead. Forward the selected provider in paid mode and keep the
+    # run single-provider so an OpenAI-only request cannot silently make paid
+    # calls to a second vendor.
+    if ($selectedRuntimeMode -eq "paid") {
+        $extraArgs += "--provider"
+        $extraArgs += $primary
+        $extraArgs += "--single"
+        Write-Host "Paid audit: using only $primary, exactly as selected." -ForegroundColor Yellow
+    }
 
     Write-Host ""
     $null = Invoke-FlexFactorJob (@('audit') + $programArgs + $extraArgs)

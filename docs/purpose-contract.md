@@ -1,6 +1,6 @@
 # Purpose & Acceptance Contract — FlexFactor
 
-**Version:** 0.1  
+**Version:** 0.2
 **Application:** FlexFactor  
 **Executor:** Cursor  
 **Repository:** buckeye7066/flexfactor (default `main`)  
@@ -15,7 +15,9 @@ A trustworthy local code auditor/refactorer that never retains unverified change
 1. Forced verifier outage leaves target byte-for-byte unchanged and creates no success commit
 2. Full Windows and Linux containment evidence
 3. Artifact files never enter integration commits
-4. One real report-only audit and one explicitly approved apply journey
+4. Every audit/prodready invocation performs a real apply journey; no report-only
+   or dry-run substitute exists, and verified changes are the only changes eligible
+   for commit/publication
 5. Exact manifests, budgets, commands, tests, commits, and rollback
 
 ## Forbidden substitutes
