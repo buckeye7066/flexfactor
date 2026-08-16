@@ -2115,9 +2115,9 @@ class OpenAIProvider:
         self.judge_model = judge_model or model  # cheap tier for classification calls
         self.meter = None  # set by make_provider; records token spend if present
         # `max_retries=0` is load-bearing. The SDK's default long timeout plus
-        # automatic retries made three concurrent GrantFlow purpose samples sit
-        # silent for 12+ minutes. One bounded failure is visible and resumable;
-        # several hidden retries are neither.
+        # automatic retries can leave concurrent purpose samples silent for many
+        # minutes. One bounded failure is visible and resumable; several hidden
+        # retries are neither.
         self.client = openai.OpenAI(
             timeout=_openai_call_timeout_seconds(), max_retries=0)
 
