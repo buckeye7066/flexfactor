@@ -479,6 +479,39 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._provider_health = real_health
 
 
+    def test_paid_openai_dead_reports_credit_rejection_not_mode_exclusion(self):
+        # Live GrantFlow 2026-08-16: an explicit OpenAI-only paid run received
+        # a 429 credit_balance_exhausted preflight, but the summary claimed paid
+        # mode "excludes the configured routes".  The OpenAI route is permitted;
+        # its credential is simply unusable.  Preserve that distinction so the
+        # operator gets the actionable remedy instead of a false mode diagnosis.
+        class Args:
+            provider = "openai"
+            explicit_provider = True
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = False
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name == "openai"
+        ff._provider_health = lambda name, meter=None: (
+            False, "credit balance is too low")
+        try:
+            self.assertEqual(ff.build_audit_providers(Args), [])
+            diagnosis = ff._PROVIDER_DIAGNOSIS.lower()
+            self.assertIn("credit", diagnosis)
+            self.assertIn("rejected", diagnosis)
+            self.assertNotIn("excludes", diagnosis)
+        finally:
+            ff._provider_key_present = real_key
+            ff._provider_health = real_health
+
+
 class FreeReviewPoolTests(unittest.TestCase):
     """2026-08-12 owner correction: the FCC proxy and local Ollama are both
     genuinely free but not equally fast on this machine (Ollama is CPU-only -
@@ -8360,6 +8393,16 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         text = self._launcher_text()
         self.assertIn('$extraArgs += "--apply"', text)
         self.assertIn('$extraArgs += "--yes"', text)
+
+    def test_launcher_paid_audit_forwards_selected_provider_as_single(self):
+        text = self._launcher_text()
+        paid = text.index('if ($selectedRuntimeMode -eq "paid")',
+                          text.index("# Audit has its own provider handling"))
+        invoke = text.index("Invoke-FlexFactorJob (@('audit')", paid)
+        block = text[paid:invoke]
+        self.assertIn('$extraArgs += "--provider"', block)
+        self.assertIn('$extraArgs += $primary', block)
+        self.assertIn('$extraArgs += "--single"', block)
 
     def test_launcher_captures_rescue_keys_BEFORE_blanking(self):
         # Order matters: capturing after blanking hands the fallback an empty
