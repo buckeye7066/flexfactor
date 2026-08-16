@@ -70,9 +70,33 @@ def read_status(path: str) -> tuple[list[dict], float]:
         return [], 0.0
 
 
+# Same black-screen-flash defence as flexfactor_dashboard.py (2026-08-16):
+# this GUI runs under pythonw (no console), so a spawned console child without
+# CREATE_NO_WINDOW flashes a brand-new black console window and steals focus -
+# durable_facts() ran `git log` from redraw() at 2Hz. Every subprocess here
+# passes _NO_WINDOW, and the disk/git walk sits behind a per-program TTL cache.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+_FACTS_TTL_S = 5.0
+_FACTS_CACHE: dict[str, tuple[float, dict]] = {}  # key -> (expires_at, facts)
+
+
 def durable_facts(p: dict) -> dict:
     """The numbers that SURVIVE a restart, read straight off disk. No new
-    status.json field needed, so this works against a running audit."""
+    status.json field needed, so this works against a running audit.
+
+    TTL-cached: called from redraw(), and a render loop must never pay for a
+    subprocess + directory walk per frame."""
+    key = f"{p.get('name') or ''}|{p.get('dir') or ''}"
+    hit = _FACTS_CACHE.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    facts = _durable_facts_uncached(p)
+    _FACTS_CACHE[key] = (time.monotonic() + _FACTS_TTL_S, facts)
+    return facts
+
+
+def _durable_facts_uncached(p: dict) -> dict:
     out = {"attempts": 0, "resumes": 0, "landed": None}
     try:
         prog = str(p.get("name") or "")
@@ -91,7 +115,8 @@ def durable_facts(p: dict) -> dict:
         proj = str(p.get("dir") or "")
         if proj and os.path.isdir(os.path.join(proj, ".git")):
             r = subprocess.run(["git", "-C", proj, "log", "--oneline", "--grep=FlexFactor"],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5,
+                               creationflags=_NO_WINDOW)
             if r.returncode == 0:
                 out["landed"] = len([x for x in r.stdout.splitlines() if x.strip()])
     except Exception:
