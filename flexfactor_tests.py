@@ -11258,7 +11258,10 @@ class GoverningPurposeCoverageTests(unittest.TestCase):
                 ff.MAX_REVIEW_BYTES = old
             self.assertEqual(files, ["large.py"])
             self.assertEqual(text, "x = 1\n" * 100)
-            self.assertEqual(digest, ff.hashlib.sha256(text.encode()).hexdigest())
+            # The stored digest covers exact bytes; the returned review text
+            # intentionally normalizes CRLF to LF. Compare against the raw-file
+            # helper so this assertion is valid on Windows as well as POSIX.
+            self.assertEqual(digest, ff._file_sha_contained(tmp, "large.py"))
 
     def test_function_test_generation_is_complete_by_default(self):
         files = ["src/a.py", "src/b.py", "tests/test_a.py", "src/c.js"]
