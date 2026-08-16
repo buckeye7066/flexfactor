@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flexfactor"
-version = "0.2.0"
-description = "Local, build-gated, budget-capped dual-provider code refactor/scout/audit tool."
+version = "0.3.0"
+description = "Purpose-driven autonomous code audit, repair, behavioral verification, and evidence tool."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -27,7 +27,21 @@ dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 flexfactor = "flexfactor:main"
 
 [tool.setuptools]
-py-modules = ["flexfactor", "flexfactor_cmdpolicy", "flexfactor_egress", "flexfactor_dashboard", "flexfactor_prodready", "flexfactor_purpose", "flexfactor_scout_contract"]
+py-modules = [
+  "flexfactor",
+  "flexfactor_cmdpolicy",
+  "flexfactor_dashboard",
+  "flexfactor_dashboard_v2",
+  "flexfactor_egress",
+  "flexfactor_evidence",
+  "flexfactor_prodready",
+  "flexfactor_purpose",
+  "flexfactor_runstate",
+  "flexfactor_scout_contract",
+  "flexfactor_self_audit_report",
+  "flexfactor_web",
+  "probe_tiers",
+]
 
 # Test runner: the suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py

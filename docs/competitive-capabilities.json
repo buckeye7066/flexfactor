@@ -1,0 +1,14 @@
+{
+  "schema": "flexfactor.competitive_capabilities.v1",
+  "recorded": "2026-08-16",
+  "policy": "Capability references only; no proprietary source, prompt, branding, interface, or protected asset copied.",
+  "references": [
+    {"product": "Devin", "patterns": ["bounded autonomous work", "durable progress", "failure monitoring"], "implementation": ["batched review-repair cycles", "checkpoint resume", "event ledger"], "source_code_used": false},
+    {"product": "Claude Code / Agent SDK", "patterns": ["provider adapters", "tool hooks", "structured outputs", "session resume"], "implementation": ["provider interface", "EventLedger hooks", "JSON schemas", "run checkpoints"], "source_code_used": false},
+    {"product": "CodeRabbit", "patterns": ["continuous review", "cross-file context", "independent final review"], "implementation": ["post-edit rescans", "dependency blast radius", "fresh exact-commit reviewer"], "source_code_used": false},
+    {"product": "SonarQube", "patterns": ["normalized quality gates", "common finding schema", "SARIF"], "implementation": ["quality-gates.json", "results.sarif", "fail-closed collection checks"], "source_code_used": false},
+    {"product": "mabl", "patterns": ["user-flow execution", "resilient semantic targeting", "traces and screenshots"], "implementation": ["Playwright route/control explorer", "low-confidence refusal", "Playwright trace and per-page screenshots"], "source_code_used": false}
+  ],
+  "new_runtime_dependencies": [],
+  "license_effect": "No new third-party runtime package is introduced. Optional Playwright remains supplied by the audited target project."
+}

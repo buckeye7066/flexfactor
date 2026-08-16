@@ -76,7 +76,7 @@ function Invoke-FlexFactorJob {
     param([string[]]$JobArgs)
     $maxAttempts = 5
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        if (-not (Ensure-FccProxy)) {
+        if ($selectedRuntimeMode -ne 'paid' -and -not (Ensure-FccProxy)) {
             Write-Host "  Proxy unavailable - cannot run this attempt." -ForegroundColor Red
             return 1
         }
@@ -107,20 +107,8 @@ function Invoke-FlexFactorJob {
     return 1
 }
 
-if (-not (Ensure-FccProxy)) {
-    Read-Host "Press Enter to close"; exit 1
-}
-Write-Host "  All model calls: FREE via the local FCC proxy at 127.0.0.1:8082." -ForegroundColor Green
-$fbA = -not [string]::IsNullOrEmpty($env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY)
-$fbO = -not [string]::IsNullOrEmpty($env:FLEXFACTOR_FALLBACK_OPENAI_KEY)
-if ($fbA -or $fbO) {
-    $tiers = @(); if ($fbA) { $tiers += 'Anthropic' }; if ($fbO) { $tiers += 'OpenAI' }
-    Write-Host "  Rescue fallbacks armed: $($tiers -join ' + ') (paid, used ONLY when the free path hangs/stalls)." -ForegroundColor DarkGray
-} else {
-    Write-Host "  No rescue fallback keys found in the environment - free-only (a stalled backend can stall runs)." -ForegroundColor DarkGray
-}
-
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
+$selectedRuntimeMode = "local"
 
 Write-Host ""
 Write-Host "  ____  _           ____         _             " -ForegroundColor Cyan
@@ -144,6 +132,38 @@ Write-Host "  3) audit     - aggressively find+fix every defect, test every func
 Write-Host "  4) prodready - hand it any program and walk away: detect the toolchains,"
 Write-Host "                 install the deps, fix the defects, score it production ready"
 $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
+
+# Audit/prodready expose the cost/privacy boundary directly. Local is the
+# shortcut-compatible default; paid restores captured real credentials and
+# clears the loopback route. The CLI receives the same boundary and refuses
+# to cross it even if environment variables are later changed.
+if ($mode -eq "3" -or $mode -eq "4") {
+    $selectedRuntimeMode = Read-Host "Model mode [local / paid / auto] (Enter = local)"
+    if ([string]::IsNullOrWhiteSpace($selectedRuntimeMode)) { $selectedRuntimeMode = "local" }
+    $selectedRuntimeMode = $selectedRuntimeMode.ToLowerInvariant()
+    if ($selectedRuntimeMode -notin @("local", "paid", "auto")) {
+        Write-Host "Unknown model mode '$selectedRuntimeMode'." -ForegroundColor Red
+        Read-Host "Press Enter to close"; exit 2
+    }
+    if ($selectedRuntimeMode -eq "paid") {
+        $env:ANTHROPIC_API_KEY = $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY
+        $env:OPENAI_API_KEY = $env:FLEXFACTOR_FALLBACK_OPENAI_KEY
+        Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY) -and [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
+            Write-Host "Paid mode requested, but no captured paid credential is available." -ForegroundColor Red
+            Read-Host "Press Enter to close"; exit 1
+        }
+        Write-Host "  Paid mode: only credentialed vendor APIs are permitted; no local fallback." -ForegroundColor Yellow
+    } elseif ($selectedRuntimeMode -eq "local") {
+        $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = ""
+        $env:FLEXFACTOR_FALLBACK_OPENAI_KEY = ""
+        Write-Host "  Local mode: free loopback/Ollama routes only; paid rescue is disabled." -ForegroundColor Green
+    } else {
+        Write-Host "  Auto mode: prefer free/local routes, then configured paid credentials." -ForegroundColor Yellow
+    }
+}
 
 # prodready asks NOTHING beyond the program. That is the point of the mode: the
 # owner should not have to know which of ~40 audit flags make a run trustworthy.
@@ -201,7 +221,7 @@ if ($mode -eq "4") {
     # and the whole run silently degrades to report-only (2026-08-11: 6h /
     # $17.75 GrantFlow review, 3464 defects found, 0 fixed). This menu already
     # IS the owner's confirmation - same reasoning as audit mode above.
-    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--economy', '--yes'))
+    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode, '--economy', '--yes'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
@@ -214,7 +234,7 @@ if ($mode -eq "3") {
     # Key detection. Audit wants BOTH models when it can get them.
     $haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
     $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
-    $extraArgs = @()
+    $extraArgs = @('--model-mode', $selectedRuntimeMode)
 
     if ($haveAnthropic -and $haveOpenai) {
         # Both keys present: run primary + cross-check. Do NOT pass --single.

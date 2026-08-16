@@ -3,6 +3,21 @@
 A local, self-improving code tool with four modes, driven from desktop shortcuts
 or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-capped.
 
+## Install and verify
+
+```text
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\python -m pip install -e ".[all]"
+.venv\Scripts\python flexfactor_tests.py
+```
+
+Linux/macOS use `python3.12 -m venv .venv` and `.venv/bin/python` for the same
+commands. A fresh install includes the CLI, durable run-state module, dashboards,
+purpose/readiness engines, and deterministic evidence runtime. Provider SDKs are
+optional; `.[all]` installs both cloud adapters. Ollama/local mode requires no
+paid service.
+
 ## Modes
 
 - **refactor** (default) - self-grading rewrite loop on one source file:
@@ -37,6 +52,21 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   where it left off instead of re-paying for finished work. `--recheck`
   discards the memory and starts fresh.
 
+## Executable completion evidence
+
+Every audit builds a pre-change and exact-final code index. The final pass records
+every tracked/relevant source file and content hash, symbols, imports, routes,
+controls, configuration boundaries, changed-file rescans, and reverse-dependency
+blast radius. It emits a machine-readable purpose graph; file/function/workflow
+coverage ledgers; normalized fail-closed gates; SARIF; a secret-redacted event
+trace; Playwright screenshots, accessibility/performance results and a trace for
+web targets; and an independent review of the exact final commit.
+
+Evidence is stored under `~/.flexfactor/evidence/<project>/<run>/`; resumable
+state remains under `~/.flexfactor/runs/`. Missing tools, zero tests collected,
+unexecuted material paths, an incomplete rescan, or a reviewer/commit mismatch
+blocks completion instead of becoming a pass.
+
 ## Token economics (how cost is kept down)
 
 - High-volume classification calls (review, grading, cross-verify, judging) run on
@@ -47,6 +77,11 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
   The build gate + cross-model veto + rollback safety net is unchanged, so a weak
   fix is vetoed and retried, never shipped. The Audit launcher asks and defaults
   economy ON; explicit `--model` overrides it. No-op on the openai provider.
+- **`--model-mode local|paid|auto` (audit/prodready)** makes the cost/privacy
+  boundary executable. `local` permits only loopback FCC/Ollama routes and
+  disables paid rescue; `paid` permits credentialed vendor APIs and forbids
+  free/local fallback; `auto` prefers local/free routes. An unavailable
+  requested class fails explicitly instead of crossing the boundary.
 - Fix generation returns minimal **search/replace edit blocks** (output scales with
   the size of the change, not the file), with automatic whole-file regeneration
   fallback when an edit anchor fails to apply. `--whole-file-fixes` restores legacy
@@ -96,8 +131,8 @@ or the command line. Dual-provider (Anthropic + OpenAI), build-gated, budget-cap
 ```bash
 python flexfactor.py --file <path> --goal "..."        # refactor
 python flexfactor.py scout --program <path|lnk|url>
-python flexfactor.py audit --program <path> [--program <path2> ...] [--parallel N]
-python flexfactor.py prodready --program <path>        # detect + install + fix + score
+python flexfactor.py audit --program <path> --model-mode local [--program <path2> ...] [--parallel N]
+python flexfactor.py prodready --program <path> --model-mode auto  # detect + install + fix + score
 python flexfactor.py policy init                        # write deny-by-default owner policy
 python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)
@@ -149,3 +184,8 @@ Swift, C/C++ (cmake/meson/make).
   instantly with WinError 2, check `_winify` and its `shutil` import survived.
 - `~/.flexfactor/` holds `brain.json` (per-project run memory) and `status.json`
   (dashboard bus) - machine-local state, not part of this repo.
+
+Architecture and operations: [execution architecture](docs/architecture.md),
+[purpose-contract schema](docs/purpose-contract.schema.json),
+[troubleshooting](docs/troubleshooting.md), and
+[migration notes](docs/migration-notes-0.3.md).
