@@ -10675,13 +10675,16 @@ class ReviewIncompleteHonestyTests(unittest.TestCase):
 
 class GapClosureVerifiedOnlyTests(unittest.TestCase):
     """Defect: gap closure counted every gap on an APPLIED file, including
-    [unverified] applies (verifier down). Only a verified fix closes a gap."""
+    [unverified] applies (verifier down). A fix only closes a gap after it is
+    both build-verified and clean on a post-change source rescan."""
 
     def test_closed_titles_exclude_unverified_files(self):
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("verified_bridged = set(bridged_files) - set(unverified_set)",
+        self.assertIn("verified_bridged: set[str] = set()", src)
+        self.assertIn("pending_bridge = set(bridged_files) - set(unverified_set)",
                       src)
+        self.assertIn("verified_bridged |= set(rclean)", src)
         self.assertIn("if rel in verified_bridged", src)
 
 
@@ -10919,8 +10922,11 @@ class ResumeCheckpointTests(unittest.TestCase):
                           lambda d, s: (None, "(build stubbed offline in tests)")):
                 res2 = ff.audit_one_program(root, args, 0, 1, None)
             self.assertIsNone(res2.get("error"), res2.get("error"))
-            self.assertEqual(res2.get("defects"), 1,
-                             "the recovered finding must reach the results")
+            # The recovered finding must reach the results. Completion-coverage
+            # blockers (for example this fixture's explicit --no-tests) may add
+            # further defects, so the total is intentionally not exact.
+            self.assertGreaterEqual(res2.get("defects", 0), 1,
+                                    "the recovered finding must reach the results")
             self.assertEqual(stub.calls, [],
                              "a recovered review must not be re-billed")
             # This second run converges (nothing left to fix at fix-severity
@@ -11215,6 +11221,83 @@ class CheckpointPhaseWiringTests(unittest.TestCase):
             self.assertIn(needle, src,
                           f"{needle!r} unwired from audit_one_program - the "
                           "checkpoint would lie 'starting/0 files' all run")
+
+
+class GoverningPurposeCoverageTests(unittest.TestCase):
+    """Behavioral guards for the governing purpose contract's coverage clauses."""
+
+    def test_large_review_is_chunked_without_truncating_the_tail(self):
+        calls = []
+        old = ff._judge
+        ff._judge = lambda provider, system, prompt, schema, max_tokens=0: (
+            calls.append(prompt) or {"findings": [], "summary": "clean chunk"})
+        try:
+            source = "\n".join(f"sentinel_{i} = '{'x' * 400}'" for i in range(1, 501))
+            findings, summary = ff.review_file(object(), "huge.py", source)
+        finally:
+            ff._judge = old
+        self.assertEqual(findings, [])
+        self.assertGreater(len(calls), 1)
+        combined = "\n".join(calls)
+        self.assertIn("1: sentinel_1", combined)
+        self.assertIn("500: sentinel_500", combined)
+        self.assertNotIn("truncated for review", combined)
+        self.assertEqual(summary.count("clean chunk"), len(calls))
+
+    def test_large_source_is_enumerated_instead_of_silently_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "large.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n" * 100)
+            old = ff.MAX_REVIEW_BYTES
+            ff.MAX_REVIEW_BYTES = 32
+            try:
+                files = ff._enumerate_source_files(tmp, max_files=0)
+                text, digest = ff._read_text_and_sha(tmp, "large.py")
+            finally:
+                ff.MAX_REVIEW_BYTES = old
+            self.assertEqual(files, ["large.py"])
+            self.assertEqual(text, "x = 1\n" * 100)
+            self.assertEqual(digest, ff.hashlib.sha256(text.encode()).hexdigest())
+
+    def test_function_test_generation_is_complete_by_default(self):
+        files = ["src/a.py", "src/b.py", "tests/test_a.py", "src/c.js"]
+        selected, omitted = ff._test_generation_scope(files, 0)
+        self.assertEqual(selected, ["src/a.py", "src/b.py", "src/c.js"])
+        self.assertEqual(omitted, [])
+        selected2, omitted2 = ff._test_generation_scope(files, 2)
+        self.assertEqual(selected2, ["src/a.py", "src/b.py"])
+        self.assertEqual(omitted2, ["src/c.js"])
+
+    def test_inventory_accounts_for_source_binary_and_artifact_subtrees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "node_modules", "pkg"))
+            with open(os.path.join(tmp, "app.py"), "w", encoding="utf-8") as fh:
+                fh.write("print('ok')\n")
+            with open(os.path.join(tmp, "logo.png"), "wb") as fh:
+                fh.write(b"\x89PNG")
+            with open(os.path.join(tmp, "node_modules", "pkg", "x.js"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("vendor")
+            inv = ff._inventory_project(tmp)
+        self.assertEqual(inv["category_counts"]["first-party-source"], 1)
+        self.assertEqual(inv["category_counts"]["binary-asset"], 1)
+        self.assertEqual(inv["category_counts"]["artifact-subtree"], 1)
+        paths = {e["path"] for e in inv["entries"]}
+        self.assertIn("node_modules/", paths)
+
+    def test_live_ui_without_a_dev_command_is_truthfully_not_run(self):
+        result = ff._run_live_ui_exploration(
+            _HERE, {"dev_script": None, "framework": "vite"},
+            "http://127.0.0.1:5199", 5199)
+        self.assertFalse(result["ran"])
+        self.assertIsNone(result["ok"])
+        self.assertIn("No runnable dev/start script", result["log"])
+
+    def test_background_processes_use_the_command_policy_gate(self):
+        proc, reason = ff._spawn(["vercel", "deploy", "--prod"], _HERE)
+        self.assertIsNone(proc)
+        self.assertIn("flexfactor-policy", reason)
 
 
 if __name__ == "__main__":
