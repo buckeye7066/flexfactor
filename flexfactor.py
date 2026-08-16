@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.5"
+TOOL_VERSION = "0.3.6"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -1082,6 +1082,22 @@ def _cached_system(system: str) -> list[dict]:
     this is the piece that actually turns caching on. Safe by construction: a cache
     miss just bills normal price (plus a one-time 1.25x write), never more."""
     return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+
+def _anthropic_output_schema(value):
+    """Return Anthropic's supported JSON-schema subset without mutating input.
+
+    Anthropic's live structured-output endpoint rejects ``maxItems`` with an
+    ``invalid_request_error``. FlexFactor still enforces those caps in its own
+    review batching/post-processing, so omitting this transport-only constraint
+    does not relax the audit contract; it only makes the schema admissible.
+    """
+    if isinstance(value, dict):
+        return {key: _anthropic_output_schema(item)
+                for key, item in value.items() if key != "maxItems"}
+    if isinstance(value, list):
+        return [_anthropic_output_schema(item) for item in value]
+    return value
 
 
 # Wall-clock deadline for one streaming SDK call when routing through the local
@@ -1869,7 +1885,8 @@ class AnthropicProvider:
         # the author model so code-generation callers are unchanged.
         use_model = model or self.model
         prompt = _egress_gate(prompt)
-        fmt = {"format": {"type": "json_schema", "schema": schema}}
+        fmt = {"format": {"type": "json_schema",
+                          "schema": _anthropic_output_schema(schema)}}
         sys_blocks = _cached_system(system)
         try:
             with _budget_guard(self.meter, use_model, len(prompt) + len(system), max_tokens):

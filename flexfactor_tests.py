@@ -12518,6 +12518,27 @@ class StayAnchoredOnLargeFilesTests(unittest.TestCase):
         self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
+    def test_anthropic_schema_adapter_removes_unsupported_max_items_recursively(self):
+        original = {
+            "type": "object",
+            "properties": {
+                "reviews": {"type": "array", "maxItems": 8,
+                            "items": {"type": "object", "properties": {
+                                "findings": {"type": "array", "maxItems": 3,
+                                             "items": {"type": "string"}}}}},
+            },
+        }
+        adapted = ff._anthropic_output_schema(original)
+        self.assertNotIn("maxItems", adapted["properties"]["reviews"])
+        self.assertNotIn(
+            "maxItems",
+            adapted["properties"]["reviews"]["items"]["properties"]["findings"])
+        self.assertEqual(original["properties"]["reviews"]["maxItems"], 8,
+                         "provider adaptation must not weaken the canonical schema")
+        self.assertEqual(
+            original["properties"]["reviews"]["items"]["properties"]
+                    ["findings"]["maxItems"], 3)
+
     def test_singleton_unit_uses_per_file_schema_not_nested_batch_schema(self):
         calls = []
 
