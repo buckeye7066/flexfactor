@@ -12515,6 +12515,41 @@ class StayAnchoredOnLargeFilesTests(unittest.TestCase):
         self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
 class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
+    def test_semantic_engine_reviews_duplicate_nominations_exactly_once(self):
+        import io
+        calls = []
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            calls.append(prompt)
+            return {"reviews": [
+                {"file": "src/a.py", "findings": [], "summary": "clean"},
+                {"file": "src/b.py", "findings": [], "summary": "clean"},
+            ]}
+
+        class Provider:
+            model = "only-provider"
+
+        out = io.StringIO()
+        with _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("value = 1\n", f"sha-{rel}")), \
+             contextlib.redirect_stdout(out):
+            found, flat, unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj",
+                ["src/a.py", "src\\a.py", "src/b.py", "src/a.py"],
+                workers=8, batch_semantic=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(clean), {"src/a.py", "src/b.py"})
+        self.assertEqual((found, flat, unreadable, incomplete), ({}, [], set(), set()))
+        self.assertIn("removed 2 duplicate semantic review path", out.getvalue())
+
+    def test_phase_nominations_are_unique_and_keep_first_priority(self):
+        self.assertEqual(
+            ff._unique_review_paths([
+                "src/crawlers.js", "src/crawlers.js", "src\\api.js",
+                "src/api.js", "src/other.js"]),
+            ["src/crawlers.js", "src/api.js", "src/other.js"])
+
     def test_semantic_batch_reviews_multiple_files_in_one_call(self):
         calls = []
         finding = {"line": 1, "severity": "high", "category": "bug",
