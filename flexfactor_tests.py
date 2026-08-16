@@ -4876,10 +4876,9 @@ class ReviewBareListSalvageTests(unittest.TestCase):
         out = ff._check_structured_type(data, ff.AUDIT_FINDINGS_SCHEMA, text)
         self.assertGreaterEqual(len(out["findings"]), 2)
 
-    def test_the_file_ends_up_REVIEWED_not_requeued(self):
-        # The consequence that actually matters: with the salvage working, the
-        # file is REVIEWED this cycle instead of being retried on another
-        # backend and left unreviewed.
+    def test_salvaged_legacy_findings_without_evidence_are_not_marked_clean(self):
+        # Salvage may recover JSON structure, but it cannot manufacture source
+        # evidence. The file remains incomplete rather than becoming clean.
         text = '{"findings":' + json.dumps([self.FULL, self.NO_CATEGORY])
 
         class _RawProvider:
@@ -4901,10 +4900,10 @@ class ReviewBareListSalvageTests(unittest.TestCase):
         finally:
             ff._read_text_and_sha = real_read
 
-        self.assertEqual(incomplete, set(),
-                         "the file was re-queued instead of reviewed")
-        self.assertEqual(len(ffindings.get("FunderDetailDialog.jsx") or []), 2)
-        self.assertEqual(len(flat), 2)
+        self.assertEqual(incomplete, {"FunderDetailDialog.jsx"})
+        self.assertEqual(ffindings, {})
+        self.assertEqual(flat, [])
+        self.assertEqual(clean, {})
 
 
 def _json_or_none(text):
@@ -9946,14 +9945,15 @@ class VacuousGateTests(unittest.TestCase):
             self.assertEqual(pushes, [],
                              f"gate={gate!r} PUBLISHED an unverified/failing "
                              f"build: {pushes}")
-            self.assertEqual(len(commits), 1,
-                             f"gate={gate!r} must still commit LOCALLY - "
-                             "refusing to publish must not lose the work")
+            self.assertEqual(commits, [],
+                             f"gate={gate!r} retained a rejected local commit")
+            self.assertTrue(any(c[:3] == ["reset", "--hard", "HEAD"] for c in calls),
+                            "a rejected tree must be restored transactionally")
 
     def test_a_failing_build_says_PUSH_REFUSED_out_loud(self):
         calls, status = _drive_commit_and_sync(False, want_status=True)
-        self.assertIn("build FAILED", status)
-        self.assertIn("PUSH REFUSED", status)
+        self.assertIn("verification FAILED", status)
+        self.assertIn("pre-change tree restored", status)
         self.assertNotIn("; pushed", status)
 
     def test_a_green_build_still_pushes(self):
@@ -9998,9 +9998,10 @@ class VacuousGateTests(unittest.TestCase):
             for name, value in originals.items():
                 setattr(ff, name, value)
         self.assertEqual([c for c in calls if c[:1] == ["push"]], [])
-        self.assertEqual(len([c for c in calls if c[:1] == ["commit"]]), 1)
-        self.assertIn("project tests FAILED", status)
-        self.assertIn("PUSH REFUSED", status)
+        self.assertEqual([c for c in calls if c[:1] == ["commit"]], [])
+        self.assertTrue(any(c[:3] == ["reset", "--hard", "HEAD"] for c in calls))
+        self.assertIn("verification FAILED", status)
+        self.assertIn("pre-change tree restored", status)
 
     def test_the_suite_is_not_run_when_the_build_already_failed(self):
         # Publication is already impossible on a red/unverified build, and the
@@ -10031,7 +10032,8 @@ class VacuousGateTests(unittest.TestCase):
         ok, _log = ff._full_gate("/nope", {})
         self.assertIsNone(ok)
         _calls, status = _drive_commit_and_sync(None, want_status=True)
-        self.assertIn("NOT VERIFIED", status)
+        self.assertIn("did not run", status)
+        self.assertIn("pre-change tree restored", status)
         self.assertNotIn("build FAILED", status)
 
     def test_unrunnable_baseline_is_not_claimed_as_passed(self):
@@ -11504,6 +11506,35 @@ class EvidenceRuntimeTests(unittest.TestCase):
             changed = ev.secret_findings(tmp, ev.build_repository_index(tmp, "r3"))
             self.assertTrue(any(f["disposition"] == "unresolved" for f in changed))
 
+    def test_explicit_fake_secret_in_test_context_is_visible_but_accepted(self):
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests"))
+            with open(os.path.join(tmp, "tests", "scanner_fixture.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write('fake_example_token = "ghp_' +
+                         'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"\n')
+            found = ev.secret_findings(tmp, ev.build_repository_index(tmp, "r"))
+        self.assertEqual(found[0]["disposition"], "accepted-contextual-example")
+        self.assertIn("deterministic", found[0]["baseline_reason"])
+
+    def test_suite_failure_output_is_preserved_in_gate_evidence(self):
+        ev = self._ev()
+        empty_idx = {"files": [], "symbols": [], "routes": [], "controls": [],
+                     "complete_source_inventory": True, "totals": {}}
+        coverage = ev.coverage_ledger(
+            empty_idx, run_id="r", test_command=["npm", "test"], tests_ran=True,
+            tests_passed=False, generated_test_modules=[], e2e={})
+        gates = ev.quality_gates(
+            run_id="r", baseline_ran=True, baseline_passed=True,
+            suite_command=["npm", "test"], suite_ran=True, suite_passed=False,
+            tests_collected=True, e2e={}, rescan={"complete": True},
+            blast={"ran": True}, secrets=[], index=empty_idx, coverage=coverage,
+            suite_evidence={"exit_code": 7, "output_tail": "database exploded"})
+        evidence = next(g for g in gates["gates"] if g["id"] == "tests")["evidence"]
+        self.assertEqual(evidence["exit_code"], 7)
+        self.assertIn("database exploded", evidence["output_tail"])
+
     def test_event_ledger_redacts_secrets_before_writing(self):
         ev = self._ev()
         with tempfile.TemporaryDirectory() as tmp:
@@ -11696,6 +11727,9 @@ class CompetitorBridgeGateTests(unittest.TestCase):
         self.assertIn("competitor: Rival", finding["title"])
         self.assertIn(fc.REUSE_DIRECT, finding["detail"])
         self.assertIn("MAY consult", finding["detail"])
+        self.assertEqual(finding["line"], 0)
+        self.assertTrue(finding["problem"])
+        self.assertTrue(finding["fix"])
 
     def test_clean_room_finding_tells_the_author_not_to_copy(self):
         r = self._research(competitor={"reuse_mode": fc.REUSE_CLEAN_ROOM})
@@ -12485,7 +12519,10 @@ class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
         calls = []
         finding = {"line": 1, "severity": "high", "category": "bug",
                    "title": "broken", "problem": "reachable wrong result",
-                   "fix": "return the correct value"}
+                   "fix": "return the correct value",
+                   "source_excerpt": "value = 'a.py'",
+                   "trigger": "import a.py and read value",
+                   "observable_failure": "the exported value is wrong"}
 
         def judge(provider, system, prompt, schema, max_tokens=8000):
             calls.append(prompt)

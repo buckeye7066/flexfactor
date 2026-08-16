@@ -666,12 +666,29 @@ def secret_findings(root: str, index: dict) -> list[dict]:
                 fingerprint = hashlib.sha256(m.group(0).encode("utf-8")).hexdigest()
                 key = (file["path"], rule_id, fingerprint)
                 reason = accepted.get(key)
+                path_lower = file["path"].lower()
+                line_start = text.rfind("\n", 0, m.start()) + 1
+                line_end = text.find("\n", m.end())
+                if line_end < 0:
+                    line_end = len(text)
+                nearby = text[max(0, line_start - 240):min(len(text), line_end + 240)].lower()
+                fixture_path = any(part in path_lower for part in (
+                    "/test", "tests/", "__tests__/", "/fixture", "fixtures/",
+                    "docs/", "security.md"))
+                fixture_words = any(word in nearby for word in (
+                    "fake", "example", "fixture", "placeholder", "redacted",
+                    "dummy", "sample", "should detect", "false positive"))
+                contextual = bool(not reason and fixture_path and fixture_words)
                 findings.append({"rule_id": f"secret.{kind}", "severity": "critical",
                     "message": f"Credential-shaped {kind} material is committed",
                     "file": file["path"], "line": text.count("\n", 0, m.start()) + 1,
                     "fingerprint": fingerprint,
-                    "disposition": "accepted-test-fixture" if reason else "unresolved",
-                    "baseline_reason": reason})
+                    "disposition": ("accepted-test-fixture" if reason else
+                                    "accepted-contextual-example" if contextual else
+                                    "unresolved"),
+                    "baseline_reason": (reason or (
+                        "deterministic docs/test context contains an explicit fake/example marker"
+                        if contextual else None))})
     return findings
 
 
@@ -679,7 +696,8 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
                   suite_command: list[str] | None, suite_ran: bool,
                   suite_passed: bool | None, tests_collected: bool,
                   e2e: dict | None, rescan: dict, blast: dict,
-                  secrets: list[dict], index: dict, coverage: dict) -> dict:
+                  secrets: list[dict], index: dict, coverage: dict,
+                  suite_evidence: dict | None = None) -> dict:
     def gate(gid: str, name: str, ran: bool, passed: bool | None, evidence: Any,
              category: str = "quality") -> dict:
         status = "pass" if ran and passed is True else "fail" if ran and passed is False else "blocked"
@@ -693,17 +711,19 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
         e2e.get("ok")
         and coverage.get("executed_route_total", 0) >= coverage.get("discovered_route_total", 0)
         and coverage.get("executed_control_total", 0) >= coverage.get("discovered_control_total", 0))
-    unresolved_secrets = [f for f in secrets if f.get("disposition") != "accepted-test-fixture"]
+    unresolved_secrets = [f for f in secrets
+                          if not str(f.get("disposition", "")).startswith("accepted-")]
     gates = [
         gate("build", "Compilation/build", baseline_ran, baseline_passed,
              {"result": baseline_passed}),
         gate("tests", "Unit/integration tests", suite_ran,
              bool(suite_passed is True and tests_collected) if suite_ran else None,
              {"command": suite_command, "result": suite_passed,
-              "tests_collected": tests_collected}),
+              "tests_collected": tests_collected, **(suite_evidence or {})}),
         gate("secrets", "Committed secret detection", True, not unresolved_secrets,
              {"unresolved": unresolved_secrets,
-              "accepted_test_fixtures": [f for f in secrets if f.get("disposition") == "accepted-test-fixture"]},
+              "accepted_test_fixtures": [f for f in secrets
+                                           if str(f.get("disposition", "")).startswith("accepted-")]},
              "security"),
         gate("inventory", "Relevant source inventory", True,
              bool(index.get("complete_source_inventory")), index.get("totals")),

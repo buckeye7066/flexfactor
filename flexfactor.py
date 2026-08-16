@@ -445,8 +445,8 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # Bump when the CLEAN-FILE memory semantics change (what "clean" means / how it's
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
-POLICY_VERSION = "2026-07-18"
-TOOL_VERSION = "0.3.1"
+POLICY_VERSION = "2026-08-16"
+TOOL_VERSION = "0.3.2"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -6144,7 +6144,7 @@ AUDIT_FINDINGS_SCHEMA = {
     "properties": {
         "findings": {
             "type": "array",
-            "maxItems": 12,
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "properties": {
@@ -6172,8 +6172,12 @@ AUDIT_FINDINGS_SCHEMA = {
                     "title": {"type": "string", "description": "Short defect title."},
                     "problem": {"type": "string", "description": "Exactly what is wrong and how it manifests."},
                     "fix": {"type": "string", "description": "The concrete change that resolves it."},
+                    "source_excerpt": {"type": "string", "description": "Exact verbatim source text at or next to the cited line proving the defect."},
+                    "trigger": {"type": "string", "description": "A concrete reachable input or execution path that triggers the defect."},
+                    "observable_failure": {"type": "string", "description": "The externally observable wrong result, crash, leak, or security consequence."},
                 },
-                "required": ["line", "severity", "category", "title", "problem", "fix"],
+                "required": ["line", "severity", "category", "title", "problem", "fix",
+                             "source_excerpt", "trigger", "observable_failure"],
                 "additionalProperties": False,
             },
         },
@@ -6345,8 +6349,11 @@ AUDIT_SYSTEM = (
     "and never invent problems that aren't there. For each candidate, verify that the "
     "claimed bad state is actually reachable from the code shown; optional chaining, "
     "fallbacks, validation, or error handling are not defects merely because they could "
-    "be more elaborate. Return at most the 12 highest-impact proven findings for a file, "
-    "ordered by severity and confidence, and omit advisory/style observations. If a file is "
+    "be more elaborate. Return at most the 3 highest-impact proven findings for a file. "
+    "For every finding, copy a short exact source_excerpt from at or next to the cited "
+    "line, name a concrete reachable trigger, and name the observable_failure. If you "
+    "cannot supply all three from the shown bytes, omit the finding. Order findings by "
+    "severity and confidence, and omit advisory/style observations. If a file is "
     "genuinely clean, return an empty findings list. "
     "Assign severity by REAL-WORLD impact and be CONSERVATIVE: reserve high/critical "
     "for defects that actually misbehave (wrong result, crash, security hole, data "
@@ -6372,9 +6379,12 @@ AUDIT_SYSTEM = (
     "\"category\": \"bug\"|\"security\"|\"error-handling\"|\"edge-case\"|\"concurrency\"|"
     "\"performance\"|\"correctness\"|\"dead-code\"|\"a11y\"|\"style\", \"title\": <short "
     "defect title>, \"problem\": <exactly what is wrong and how it manifests>, \"fix\": "
-    "<the concrete change that resolves it>}], \"summary\": <one sentence on the file's "
-    "overall health>}. EVERY finding object MUST contain all six keys - line, severity, "
-    "category, title, problem, fix - with non-empty string values (line is an integer). "
+    "<the concrete change that resolves it>, \"source_excerpt\": <exact verbatim source>, "
+    "\"trigger\": <reachable execution path>, \"observable_failure\": <observable bad "
+    "result>}], \"summary\": <one sentence on the file's overall health>}. EVERY finding "
+    "object MUST contain all nine keys - line, severity, category, title, problem, fix, "
+    "source_excerpt, trigger, observable_failure - with non-empty string values (line is "
+    "an integer). "
     "If the file is genuinely clean, return {\"findings\": [], \"summary\": \"...\"}. "
     "Respond with JSON only."
 )
@@ -7735,6 +7745,51 @@ def _postprocess_review_findings(findings: list[dict], rel_path: str,
         # title/problem/fix. Fold the prose into the schema fields so every
         # downstream consumer (report, fix-gen bullets, verifier) sees real text.
         _normalize_finding(f)
+    # MODEL OUTPUT IS A CLAIM, NOT EVIDENCE.  A live GrantFlow audit returned
+    # hundreds of findings citing lines beyond EOF and prose not present in the
+    # reviewed revision.  Require an exact excerpt near the cited line before a
+    # finding is allowed into the fixer.  This deterministic check is deliberately
+    # after normalization and shared by single-file and batched review paths.
+    if project_dir:
+        got = _read_text_and_sha(project_dir, rel_path)
+        source = got[0] if got is not None else None
+        if source is not None:
+            lines = source.splitlines()
+            grounded: list[dict] = []
+            rejected_ungrounded = 0
+            for finding in findings:
+                # Harness-prefix claims are a known deterministic artifact and
+                # are safely discarded below; they do not make the whole model
+                # verdict incomplete.
+                if _is_line_number_artifact(finding):
+                    grounded.append(finding)
+                    continue
+                try:
+                    line = int(finding.get("line", -1))
+                except (TypeError, ValueError):
+                    line = -1
+                excerpt = str(finding.get("source_excerpt") or "").strip()
+                trigger = str(finding.get("trigger") or "").strip()
+                failure = str(finding.get("observable_failure") or "").strip()
+                line_valid = line == 0 or 1 <= line <= len(lines)
+                if line == 0:
+                    nearby = source
+                elif line_valid:
+                    nearby = "\n".join(lines[max(0, line - 4):min(len(lines), line + 3)])
+                else:
+                    nearby = ""
+                if (line_valid and excerpt and excerpt in nearby and trigger and failure):
+                    grounded.append(finding)
+                else:
+                    rejected_ungrounded += 1
+                    print(f"  [evidence] {rel_path}: dropped ungrounded finding "
+                          f"'{str(finding.get('title') or '?')[:60]}' "
+                          "(invalid line/excerpt/trigger/failure)")
+            findings = grounded[:3]
+            if rejected_ungrounded and not findings:
+                raise RuntimeError(
+                    f"review for {rel_path} supplied findings but none had valid "
+                    "source evidence; verdict is incomplete, not clean")
     # Deterministic backstop for the prompt-level disclaimer above: a reviewer
     # that still mistakes the harness's 'N: ' prefix for source would file a
     # (false) critical that poisons the report and burns fix rounds on an
@@ -9574,26 +9629,39 @@ def _review_all(reviewers: list, project_dir: str,
         def _review_unit(unit: list[tuple[str, str, str]]):
             last_error: Exception | None = None
             for ridx, reviewer in enumerate(reviewers):
+                # Provider health persists across review/fix batches.  Replaying a
+                # known-dead endpoint for every eight files turned a failover into
+                # hours of identical timeouts.  One transport/deadline failure is
+                # enough to quarantine that route for this run; successful calls
+                # clear the marker.
+                if getattr(reviewer, "_flexfactor_semantic_unhealthy", False):
+                    continue
                 try:
                     if len(unit) == 1 and len(_numbered_review_chunks(unit[0][1])) > 1:
                         rel, text, sha = unit[0]
                         findings, _ = review_file(reviewer, rel, text, context=context,
                                                   project_dir=project_dir)
+                        reviewer._flexfactor_semantic_unhealthy = False
                         return [(rel, findings, sha)]
                     reviewed = review_files_batch(
                         reviewer, [(rel, text) for rel, text, _ in unit],
                         context=context, project_dir=project_dir)
+                    reviewer._flexfactor_semantic_unhealthy = False
                     return [(rel, reviewed[rel][0], sha) for rel, _text, sha in unit]
                 except BudgetExceededError:
                     stop.set()
                     return [(rel, "incomplete") for rel, _text, _sha in unit]
                 except Exception as ex:
                     last_error = ex
-                    if ridx + 1 < len(reviewers):
+                    reviewer._flexfactor_semantic_unhealthy = True
+                    if any(not getattr(r, "_flexfactor_semantic_unhealthy", False)
+                           for r in reviewers[ridx + 1:]):
                         print(f"  [failover] semantic review batch failed via "
                               f"{getattr(reviewer, 'model', type(reviewer).__name__)} "
                               f"({ex}); retrying the same bytes on the next provider")
             names = ", ".join(rel for rel, _text, _sha in unit)
+            if last_error is None:
+                last_error = RuntimeError("all semantic review providers quarantined")
             print(f"  [skip] semantic review batch failed for {names}: {last_error}")
             return [(rel, "incomplete") for rel, _text, _sha in unit]
 
@@ -10478,6 +10546,15 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     """Commit (and optionally push/merge) this cycle's work BEFORE the next cycle
     re-reads the code, so each cycle builds on saved progress. Always leaves the
     repo checked out on the audit branch for the next cycle."""
+    def _discard_bootstrap_side_effects() -> None:
+        for path in stack.get("bootstrap_dirty_paths") or []:
+            tracked = _git(["ls-files", "--error-unmatch", "--", path], project_dir)
+            if tracked.returncode == 0:
+                _git(["checkout", "--", path], project_dir)
+            else:
+                _git(["clean", "-fd", "--", path], project_dir)
+
+    _discard_bootstrap_side_effects()
     add = _git(["add", "-A"], project_dir)
     if add.returncode != 0:
         # An index lock / permission / filter failure here would otherwise leave
@@ -10498,7 +10575,30 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     # exact failure mode that let FlexFactor publish broken Family Castle Clash
     # commits while labelling every one "Final build gate: passed".
     final_ok, _gate_log = _publication_gate(project_dir, stack)
+    _discard_bootstrap_side_effects()
     has_suite = bool(stack.get("full_suite_cmd") or stack.get("test_cmd"))
+    if final_ok is not True:
+        # A red/unrunnable exact tree is not a checkpoint.  Retaining it as a
+        # local commit makes the next cycle build on code the repository itself
+        # rejected and leaves an ephemeral CI checkout ahead of main.  Restore
+        # the last verified commit, including only the newly-added paths staged
+        # by this function, and report the failed command output verbatim.
+        added = _git(["diff", "--cached", "--name-only", "--diff-filter=A", "-z"],
+                     project_dir)
+        added_paths = [p for p in (added.stdout or "").split("\0") if p]
+        reset = _git(["reset", "--hard", "HEAD"], project_dir)
+        for path in added_paths:
+            _git(["clean", "-fd", "--", path], project_dir)
+        if reset.returncode != 0:
+            raise BranchStateError(
+                f"{label}: verification failed and rollback failed: "
+                f"{_tail(reset.stderr, 3)}")
+        print(f"    publication verification FAILED; rejected tree restored:\n"
+              f"{_gate_log}", file=sys.stderr)
+        verdict = ("FAILED" if final_ok is False else
+                   "did not run (no build/verify command exists)")
+        return (f"{label}: REJECTED; final verification {verdict}; "
+                "pre-change tree restored; no local commit or push")
     gate_word = (("passed (build + project test suite)" if has_suite else
                   "passed (build only; no project test suite configured)")
                  if final_ok is True else
@@ -10518,12 +10618,8 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     if final_ok is True:
         verification_word = ("build + project tests ok" if has_suite else
                              "build ok; no project test suite configured")
-    elif final_ok is None:
-        verification_word = "build NOT VERIFIED"
-    elif has_suite:
-        verification_word = "build and/or project tests FAILED"
     else:
-        verification_word = "build FAILED"
+        verification_word = "build + project tests ok" if has_suite else "build ok"
     status = f"{label}: committed on {branch} ({verification_word})"
     if args.push and _git_has_remote(project_dir):
         # PUBLICATION GATE (live GrantFlow 2026-08-14 - FlexFactor pushed a RED
@@ -10996,6 +11092,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # the run reports a stale UNVERIFIED warning for a repo it just
             # successfully bootstrapped.
             _refresh_verification_status(stack)
+            if git:
+                bootstrap_status = _git(["status", "--porcelain=v1", "-z"], project_dir)
+                if bootstrap_status.returncode == 0:
+                    bootstrap_dirty: list[str] = []
+                    for record in (bootstrap_status.stdout or "").split("\0"):
+                        if len(record) >= 4:
+                            path = record[3:].replace("\\", "/")
+                            if path and path not in bootstrap_dirty:
+                                bootstrap_dirty.append(path)
+                    stack["bootstrap_dirty_paths"] = bootstrap_dirty
+                    if bootstrap_dirty:
+                        print(f"{pfx}bootstrap produced {len(bootstrap_dirty)} git-visible "
+                              "path(s); they are excluded from fix commits")
         result["bootstrap"] = [
             {"cmd": " ".join(s.cmd), "cwd": s.cwd, "ok": s.ok} for s in bootstrap_results]
 
@@ -11063,6 +11172,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         review_incomplete: set[str] = set()  # last sweep's failed-review files
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
+        infrastructure_abort = False  # provider outage: stop expensive downstream phases
+        completed_review_files: set[str] = set()
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
 
@@ -11418,11 +11529,28 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 unreadable |= b_unreadable
                 reviewed_clean.update(b_clean)
                 review_incomplete |= b_incomplete
+                completed_review_files.update(b_findings)
+                completed_review_files.update(b_clean)
                 if failed_review_batches >= 3:
                     stop_reason = (
                         "provider outage: three consecutive semantic review batches "
                         "completed zero files - stopped fail-closed for resumable retry")
                     print(f"{pfx}STOP: {stop_reason}", file=sys.stderr)
+                    # This is a resumable infrastructure abort, not an invitation
+                    # to spend more time on purpose/UI/native-suite phases against
+                    # a mostly unreviewed tree.  The checkpoint is already flushed.
+                    infrastructure_abort = True
+                    fix_notes.append(stop_reason)
+                    if git:
+                        # The run began from a required-clean tree and verified
+                        # batches are already committed. Remove uncommitted
+                        # bootstrap/tool side effects before a resumable retry.
+                        restored = _git(["reset", "--hard", "HEAD"], project_dir)
+                        cleaned = _git(["clean", "-fd"], project_dir)
+                        if restored.returncode != 0 or cleaned.returncode != 0:
+                            dirty_abort = True
+                            fix_notes.append(
+                                "provider-outage rollback failed; working tree requires inspection")
                     cycle_stopped = True
                     break
                 # A file the contained read REFUSED is never clean and never auto-fixed:
@@ -11636,7 +11764,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     "does what it exists to do".
         purpose_gap = None
         bridged_files: list[str] = []
-        if getattr(args, "purpose_gap", True) and purpose_blob and not dirty_abort:
+        if (getattr(args, "purpose_gap", True) and purpose_blob and not dirty_abort
+                and not infrastructure_abort):
             report(phase="purpose-gap assessment")
             print(f"{pfx}Assessing purpose gap (metadata vs delivered behavior)...")
             try:
@@ -11824,7 +11953,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # such evidence is targeted here and remains blocked by the final ledger.
         test_files: list[str] = []
         test_status = None
-        if args.tests and stack.get("test_cmd") and not dirty_abort:
+        if (args.tests and stack.get("test_cmd") and not dirty_abort
+                and not infrastructure_abort):
             print(f"{pfx}Generating focused regression tests for changed behavior...")
             if checkpoint is not None:
                 checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
@@ -11932,7 +12062,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             else:
                 print(f"{pfx}No source behavior changed; no synthetic tests generated. "
                       "The native full suite remains mandatory.")
-        elif all_files and not dirty_abort:
+        elif all_files and not dirty_abort and not infrastructure_abort:
             reason = ("Function execution was disabled by --no-tests."
                       if not args.tests else
                       "No project test command was detected, so first-party functions were not executed.")
@@ -11953,7 +12083,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # complete verification claim; it is never silently printed as a pass.
         e2e = {"ran": False, "ok": None, "log": "", "spec_files": [],
                "pages": 0, "controls": 0, "skipped_controls": []}
-        if stack.get("is_web") and not dirty_abort:
+        if stack.get("is_web") and not dirty_abort and not infrastructure_abort:
             if getattr(args, "e2e", True):
                 report(phase="live route and control execution")
                 base_url = args.app_url or f"http://127.0.0.1:{e2e_port}"
@@ -11987,10 +12117,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     built. Reported honestly; a red suite becomes a high-severity finding.
         suite_status = None
         suite_log = ""
+        suite_exit_code = None
         suite_cmd = stack.get("full_suite_cmd")
-        if getattr(args, "full_suite", True) and suite_cmd:
+        if (getattr(args, "full_suite", True) and suite_cmd and not dirty_abort
+                and not infrastructure_abort):
             if suite_cmd == stack.get("test_cmd") and test_status is not None:
                 suite_status = test_status  # already ran it as the unit-test step
+                suite_exit_code = 0 if suite_status else 1
                 print(f"{pfx}full suite ({' '.join(suite_cmd)}): reusing unit-test result "
                       f"{'GREEN' if suite_status else 'RED'}")
             else:
@@ -11998,8 +12131,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 report(phase="full test suite")
                 r = _run(suite_cmd, project_dir, timeout=2400)
                 suite_status = (r.returncode == 0)
+                suite_exit_code = r.returncode
                 suite_log = _tail(r.stdout + "\n" + r.stderr, 40)
-                print(f"{pfx}full suite: {'GREEN' if suite_status else 'RED'}")
+                print(f"{pfx}full suite: {'GREEN' if suite_status else 'RED'} "
+                      f"(exit {r.returncode})")
+                if not suite_status:
+                    print(f"{pfx}full suite failure output (last 40 lines):\n{suite_log}",
+                          file=sys.stderr)
             if suite_status is False:
                 all_findings.append({
                     "file": "(full suite)", "line": 0, "severity": "high", "category": "bug",
@@ -12069,6 +12207,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         if not git:
             commit_status = "no-git"
+        elif infrastructure_abort:
+            commit_status = (f"PROVIDER-OUTAGE ABORT on {branch}: checkpoint preserved; "
+                             "no unverified commit created")
         elif dirty_abort:
             # A refused rollback aborted the run mid-cycle. The audit branch may hold
             # VERIFIED checkpoint (or prior-cycle) commits, so it must NEVER be treated
@@ -12165,7 +12306,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     tests_collected=tests_collected,
                     e2e=e2e, rescan=rescan_evidence, blast=blast_evidence,
                     secrets=secret_evidence, index=final_index,
-                    coverage=coverage_evidence)
+                    coverage=coverage_evidence,
+                    suite_evidence={"exit_code": suite_exit_code,
+                                    "output_tail": suite_log})
                 review_summary = {
                     "quality_gates": gates_evidence,
                     "changed_file_rescan": rescan_evidence,
@@ -12176,6 +12319,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "secret_findings": secret_evidence,
                 }
                 try:
+                    if infrastructure_abort:
+                        raise RuntimeError("independent review skipped after provider outage")
                     independent_review = _independent_final_review(
                         cross or purpose_reviewer_final, project_dir,
                         initial_commit, final_sha, review_summary)
@@ -12268,7 +12413,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 8. Report.
         audit = {
             "name": display_name, "dir": project_dir, "branch": branch,
-            "files_reviewed": total_to_review, "findings": all_findings,
+            "files_reviewed": len(completed_review_files), "findings": all_findings,
             "file_findings": file_findings, "applied_files": applied_files,
             "unverified_files": unverified_files, "test_files": test_files,
             "test_status": test_status, "e2e": e2e, "fix_notes": fix_notes,
