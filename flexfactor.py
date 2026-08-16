@@ -446,7 +446,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.3"
+TOOL_VERSION = "0.3.4"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -7887,6 +7887,26 @@ def review_files_batch(provider, items: list[tuple[str, str]],
     return by_file
 
 
+def _unique_review_paths(files) -> list[str]:
+    """Return canonical repo-relative paths once each, preserving first order.
+
+    Purpose, competitor, and resume phases can independently nominate the same
+    file.  Their union is an ordering hint, not permission to review (or fix) a
+    file twice.  Keep this invariant at the semantic engine boundary as well as
+    at the callers so a future phase cannot turn a local duplicate into a
+    fabricated provider failure.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in files:
+        rel = str(value).replace("\\", "/")
+        if rel in seen:
+            continue
+        seen.add(rel)
+        unique.append(rel)
+    return unique
+
+
 def _gap_to_finding(g: dict) -> dict:
     """Map a purpose-gap item onto the audit finding shape so it flows through the
     same report/fix machinery as any other defect."""
@@ -9489,6 +9509,11 @@ def _review_all(reviewers: list, project_dir: str,
     cross-check reviewer) - unchanged cross-check semantics, just no longer
     the only way to get review throughput. `reviewers` stays the ONLY review
     mechanism when `reviewer_pool` is None (legacy path, unchanged)."""
+    supplied_count = len(files)
+    files = _unique_review_paths(files)
+    if len(files) != supplied_count:
+        print(f"  [dedupe] removed {supplied_count - len(files)} duplicate "
+              "semantic review path(s)")
     file_findings: dict[str, list[dict]] = {}
     flat: list[dict] = []
     unreadable: set[str] = set()          # contained read REFUSED (never mark clean)
@@ -11429,8 +11454,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if purpose_files and not dirty_abort:
             # Purpose-critical files lead the sweep, so even a run that stops at
             # the cost cap has reviewed the files that decide the program's job first.
-            pf = [f for f in purpose_files if f in set(files)]
-            rest_f = [f for f in files if f not in set(pf)]
+            file_set = set(files)
+            pf = [f for f in _unique_review_paths(purpose_files) if f in file_set]
+            pf_set = set(pf)
+            rest_f = [f for f in files if f not in pf_set]
             files = pf + rest_f
         # ================== END PHASE 1 =======================================
 
@@ -11500,7 +11527,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             resume_keys = sorted(resume_findings) if (cycle == 1 and resume_findings) else []
             resume_keys_set = set(resume_keys)
             if resume_keys:
-                batches[0] = resume_keys + batches[0]
+                batches[0] = resume_keys + [
+                    rel for rel in batches[0] if rel not in resume_keys_set]
 
             file_findings: dict[str, list[dict]] = {}
             flat: list[dict] = []
