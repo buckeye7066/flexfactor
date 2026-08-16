@@ -6,6 +6,7 @@ Uses the hermetic module-load pattern: register the module in sys.modules
 BEFORE exec_module, or @dataclass with future annotations dies at import.
 """
 import contextlib
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -11301,6 +11302,165 @@ class GoverningPurposeCoverageTests(unittest.TestCase):
         proc, reason = ff._spawn(["vercel", "deploy", "--prod"], _HERE)
         self.assertIsNone(proc)
         self.assertIn("flexfactor-policy", reason)
+
+
+class EvidenceRuntimeTests(unittest.TestCase):
+    """Executable guards for code intelligence, ledgers, gates, and mode policy."""
+
+    @staticmethod
+    def _ev():
+        import flexfactor_evidence
+        return flexfactor_evidence
+
+    def test_index_accounts_for_symbols_routes_controls_and_exact_hashes(self):
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "api.py"), "w", encoding="utf-8") as fh:
+                fh.write("from .worker import work\n@app.get('/health')\ndef health():\n return work()\n")
+            with open(os.path.join(tmp, "src", "worker.py"), "w", encoding="utf-8") as fh:
+                fh.write("def work():\n return 1\n")
+            with open(os.path.join(tmp, "src", "App.tsx"), "w", encoding="utf-8") as fh:
+                fh.write("export const App = () => <button aria-label='Run'>Run</button>\n")
+            idx = ev.build_repository_index(tmp, "run-1")
+        self.assertEqual(idx["totals"]["files"], 3)
+        self.assertGreaterEqual(idx["totals"]["functions"], 3)
+        self.assertEqual(idx["totals"]["routes"], 1)
+        self.assertEqual(idx["totals"]["controls"], 1)
+        self.assertTrue(idx["complete_source_inventory"])
+        self.assertTrue(all(f["sha256"] for f in idx["files"]))
+
+    def test_changed_files_are_rescanned_and_reverse_dependencies_expand(self):
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            for name, text in {
+                "src/a.py": "from src.b import work\ndef a(): return work()\n",
+                "src/b.py": "def work(): return 1\n",
+            }.items():
+                full = os.path.join(tmp, name)
+                with open(full, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            before = ev.build_repository_index(tmp, "run-2")
+            with open(os.path.join(tmp, "src", "b.py"), "w", encoding="utf-8") as fh:
+                fh.write("def work(): return 2\n")
+            after = ev.build_repository_index(tmp, "run-2")
+        changed = ev.diff_indexes(before, after)
+        self.assertEqual(changed, ["src/b.py"])
+        rescan = ev.changed_file_rescan(after, changed)
+        self.assertTrue(rescan["complete"])
+        blast = ev.dependency_blast_radius(after, changed)
+        self.assertTrue(blast["ran"])
+        self.assertEqual(set(blast["affected"]), {"src/a.py", "src/b.py"})
+
+    def test_zero_tests_collected_can_never_be_a_passing_gate(self):
+        ev = self._ev()
+        empty_idx = {"files": [], "symbols": [], "routes": [], "controls": [],
+                     "complete_source_inventory": True, "totals": {}}
+        coverage = ev.coverage_ledger(
+            empty_idx, run_id="r", test_command=["pytest"], tests_ran=True,
+            tests_passed=True, generated_test_modules=[], e2e={})
+        gates = ev.quality_gates(
+            run_id="r", baseline_ran=True, baseline_passed=True,
+            suite_command=["pytest"], suite_ran=True, suite_passed=True,
+            tests_collected=False, e2e={},
+            rescan={"complete": True}, blast={"ran": True}, secrets=[],
+            index=empty_idx, coverage=coverage)
+        test_gate = next(g for g in gates["gates"] if g["id"] == "tests")
+        self.assertEqual(test_gate["status"], "fail")
+        self.assertFalse(gates["passed"])
+
+    def test_secret_fixture_baseline_is_exact_and_visible(self):
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests"))
+            sample = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+            test_path = os.path.join(tmp, "tests", "test_secret.py")
+            with open(test_path, "w", encoding="utf-8") as fh:
+                fh.write(f'token = "{sample}"\n')
+            index = ev.build_repository_index(tmp, "r")
+            unresolved = ev.secret_findings(tmp, index)
+            self.assertEqual(unresolved[0]["disposition"], "unresolved")
+            baseline = {"schema": "flexfactor.secret_baseline.v1",
+                        "accepted_test_fixtures": [{
+                            "file": "tests/test_secret.py",
+                            "rule_id": "secret.github-token",
+                            "fingerprint": hashlib.sha256(sample.encode()).hexdigest(),
+                            "reason": "Fabricated scanner regression fixture"}]}
+            with open(os.path.join(tmp, ".flexfactor-secret-baseline.json"),
+                      "w", encoding="utf-8") as fh:
+                json.dump(baseline, fh)
+            index = ev.build_repository_index(tmp, "r2")
+            accepted = ev.secret_findings(tmp, index)
+            self.assertEqual(accepted[0]["disposition"], "accepted-test-fixture")
+            self.assertIn("Fabricated", accepted[0]["baseline_reason"])
+            with open(test_path, "a", encoding="utf-8") as fh:
+                fh.write('other = "ghp_' + 'Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"\n')
+            changed = ev.secret_findings(tmp, ev.build_repository_index(tmp, "r3"))
+            self.assertTrue(any(f["disposition"] == "unresolved" for f in changed))
+
+    def test_event_ledger_redacts_secrets_before_writing(self):
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "events.jsonl")
+            ev.EventLedger(path, "r").emit(
+                "provider.call", authorization="token=sk-proj-abcdefghijklmnopqrstuvwxyz1234")
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz1234", raw)
+        self.assertIn("REDACTED", raw)
+
+    def test_paid_mode_is_explicit_and_never_silently_uses_missing_credentials(self):
+        ev = self._ev()
+        with self.assertRaisesRegex(RuntimeError, "credentials are absent"):
+            ev.resolve_runtime_mode("paid", "anthropic", None, False, True)
+        local = ev.resolve_runtime_mode("local", "ollama", "qwen", False, True)
+        self.assertTrue(local.local_only)
+        self.assertEqual(local.mode, "local")
+
+    def test_audit_cli_exposes_runtime_mode_boundary(self):
+        captured = {}
+        real = ff.run_audit
+        ff.run_audit = lambda args: captured.setdefault("args", args) or 0
+        try:
+            ff.main(["audit", "--program", ".", "--model-mode", "local", "--yes"])
+        finally:
+            ff.run_audit = real
+        self.assertEqual(captured["args"].model_mode, "local")
+
+    def test_paid_runtime_never_falls_back_to_free_proxy_or_ollama(self):
+        class Args:
+            provider = "anthropic"
+            explicit_provider = False
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+
+        with _patched(ff, "_provider_key_present", lambda name: name in {"anthropic", "ollama"}), \
+             _patched(ff, "_provider_free_routed", lambda name: name == "anthropic"), \
+             _patched(ff, "make_provider", lambda *a, **k: object()):
+            providers = ff.build_audit_providers(Args)
+        self.assertEqual(providers, [])
+        self.assertIn("paid", ff._PROVIDER_DIAGNOSIS)
+
+    def test_audit_wires_exact_final_evidence_and_independent_review(self):
+        src = inspect.getsource(ff.audit_one_program)
+        for needle in ("build_repository_index(", "changed_file_rescan(",
+                       "dependency_blast_radius(", "coverage_ledger(",
+                       "quality_gates(", "_independent_final_review(",
+                       "write_evidence_bundle(", "dashboard_evidence"):
+            self.assertIn(needle, src)
+
+    def test_live_explorer_records_per_item_a11y_performance_and_trace_evidence(self):
+        src = ff._UI_EXPLORER_JS
+        for needle in ("routeEvidence", "controlEvidence", "formEvidence",
+                       "accessibility", "performance", "context.tracing.start",
+                       "blocked-low-confidence"):
+            self.assertIn(needle, src)
 
 
 if __name__ == "__main__":

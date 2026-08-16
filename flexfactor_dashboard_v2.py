@@ -216,6 +216,7 @@ def main() -> None:
             cost = float(p.get("cost") or 0.0)
             cap = float(p.get("cap") or 0.0)
             cur = str(p.get("current_file") or "")
+            evidence = p.get("evidence") if isinstance(p.get("evidence"), dict) else {}
 
             # ---- velocity history + real liveness (counters, not just mtime)
             h = state["hist"].setdefault(name, [])
@@ -328,7 +329,34 @@ def main() -> None:
                 frac_cost, BAD if frac_cost >= 0.9 else (WARN if frac_cost >= 0.5 else GOOD))
             y += 34
 
-            # ---- 7. CURRENT FILE + how long it has been stuck on it
+            # ---- 7. EXACT EXECUTABLE EVIDENCE
+            if evidence:
+                gates = evidence.get("gates") or {}
+                cov = evidence.get("coverage") or {}
+                impact = evidence.get("impact") or {}
+                gate_ok = gates.get("passed") is True
+                canvas.create_text(L, y, anchor="w", text="EVIDENCE",
+                                   fill=DIM, font=("Segoe UI", 8, "bold"))
+                canvas.create_text(x0 + col_w - 18, y, anchor="e",
+                                   text=("VERIFIED" if gate_ok else "INCOMPLETE"),
+                                   fill=(GOOD if gate_ok else BAD),
+                                   font=("Segoe UI", 9, "bold"))
+                canvas.create_text(L, y + 18, anchor="w",
+                                   text=(f"gates {gates.get('pass', 0)} pass / "
+                                         f"{gates.get('fail', 0)} fail / "
+                                         f"{gates.get('blocked', 0)} blocked"),
+                                   fill=TEXT, font=("Segoe UI", 9))
+                canvas.create_text(L, y + 34, anchor="w",
+                                   text=(f"functions {cov.get('functions_executed', 0)}/"
+                                         f"{cov.get('functions', 0)}  routes "
+                                         f"{cov.get('routes_executed', 0)}/{cov.get('routes', 0)}  "
+                                         f"controls {cov.get('controls_executed', 0)}/"
+                                         f"{cov.get('controls', 0)}  impact "
+                                         f"{impact.get('affected_files', 0)} files"),
+                                   fill=DIM, font=("Segoe UI", 8))
+                y += 46
+
+            # ---- 8. CURRENT FILE + how long it has been stuck on it
             if cur:
                 prev = state["file_since"].get(name)
                 if not prev or prev[0] != cur:

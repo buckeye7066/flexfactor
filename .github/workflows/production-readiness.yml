@@ -20,7 +20,18 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install -r requirements.txt
+          python -m pip install .
+          python -m pip check
           if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+      - name: Launcher parse and installed-module smoke
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\flexfactor_launch.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Error }
+          python -c "import flexfactor, flexfactor_runstate, flexfactor_evidence, flexfactor_web"
+          if ($LASTEXITCODE -ne 0) { throw "installed module smoke failed" }
       - name: Run FlexFactor suite
         shell: pwsh
         run: |
@@ -38,6 +49,9 @@ jobs:
       - name: Install pinned provider SDKs (PaidFallbackRescueTests import them)
         run: |
           python -m pip install -r requirements.txt
+          python -m pip install .
+          python -m pip check
+          python -m compileall -q .
       - name: Containment capability probe
         run: |
           python - <<'PY'
@@ -56,6 +70,16 @@ jobs:
       - name: Run FlexFactor suite (Linux containment evidence)
         run: |
           python flexfactor_tests.py
+      - name: Deterministic repository-intelligence smoke
+        run: |
+          python - <<'PY'
+          import flexfactor_evidence as ev
+          index = ev.build_repository_index('.', '${{ github.sha }}')
+          print(index['totals'])
+          assert index['totals']['tracked_or_relevant_source_files'] > 0
+          assert index['totals']['analyzed_source_files'] > 0
+          assert all(f.get('sha256') for f in index['files'] if f['category'] == 'source')
+          PY
       - name: Forced verifier-outage regression
         run: |
           python -m unittest \

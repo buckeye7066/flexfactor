@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+build/
+*.egg-info/
 *_repo_rewards_report.md
 *_audit_report.md
 *_readiness.md

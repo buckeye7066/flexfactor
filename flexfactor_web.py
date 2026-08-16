@@ -283,6 +283,10 @@ def build_state(sampler: Sampler) -> dict:
             "current_file": p.get("current_file") or "",
             "cycles": p.get("cycles"),
 
+            # Exact final-run proof: repository summary, purpose map, gates,
+            # function/workflow execution, blast radius, and trace artifacts.
+            "evidence": p.get("evidence") if isinstance(p.get("evidence"), dict) else {},
+
             "rate_per_min": round(rate, 2),
             "velocity": [round(v, 2) for v in sampler.velocity(name)],
         })
@@ -333,6 +337,7 @@ svg{display:block;width:100%;height:38px}
 .sev{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .sev span{font-size:11px;padding:2px 8px;border-radius:999px;background:#1c2530}
 .err{color:#f85149;font-weight:600}
+.ok{color:#3fb950;font-weight:600}
 .warnbox{background:#3a1d1d;border:1px solid #f85149;color:#ffb4ae;
  padding:9px 11px;border-radius:10px;font-size:12px;margin-top:10px}
 .empty{text-align:center;color:#7d8590;padding:44px 12px}
@@ -421,6 +426,24 @@ function card(p){
   h+='<div class="row"><span class="n">$'+p.cost.toFixed(2)+'</span>'+
      '<span class="dim n">cap $'+p.cap.toFixed(2)+'</span></div>';
   h+=bar(p.cap?p.cost/p.cap:0, p.cap&&p.cost/p.cap>0.8?"#d29922":"#3fb950");
+
+  // Exact evidence views. Compact on mobile, but every primary proof surface
+  // remains named and its denominator stays visible.
+  var e=p.evidence||{}, g=e.gates||{}, c=e.coverage||{}, r=e.repository||{},
+      im=e.impact||{}, pu=e.purpose||{};
+  if(Object.keys(e).length){
+    h+='<div class="lbl">Executable evidence</div>'+
+       '<div class="row"><span class="n">gates '+(g.pass||0)+' pass · '+
+       (g.fail||0)+' fail · '+(g.blocked||0)+' blocked</span>'+
+       '<span class="'+(g.passed?'ok':'err')+'">'+(g.passed?'VERIFIED':'INCOMPLETE')+'</span></div>'+
+       '<div class="dim">Repo '+(r.files||0)+' files · '+(r.functions||0)+' functions · purpose '+
+       (pu.confidence||'unknown')+' ('+(pu.nodes||0)+' nodes)</div>'+
+       '<div class="dim">Coverage '+(c.functions_executed||0)+'/'+(c.functions||0)+' functions · '+
+       (c.routes_executed||0)+'/'+(c.routes||0)+' routes · '+
+       (c.controls_executed||0)+'/'+(c.controls||0)+' controls</div>'+
+       '<div class="dim">Impact '+(im.affected_files||0)+' files · '+(im.tests||0)+' tests · commit '+
+       esc((e.final_commit||'').slice(0,12)||'—')+'</div>';
+  }
 
   // 7. right now
   if(p.current_file){
