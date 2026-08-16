@@ -3399,11 +3399,86 @@ def _env_truthy(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_falsy(name: str) -> bool:
+    """True only when the var is SET to an explicit off value. An unset var is
+    not an opt-out — that distinction is the whole point of a default-on flag."""
+    return (os.environ.get(name) or "").strip().lower() in ("0", "false", "no", "off")
+
+
 def allow_remote_repo_rewards(args=None) -> bool:
-    """Remote RR is a trust-boundary shift; require explicit operator opt-in."""
-    if args is not None and getattr(args, "allow_remote_repo_rewards", False):
-        return True
-    return _env_truthy("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS")
+    """Is the production (remote) Repo Rewards deployment usable?
+
+    DEFAULT ON since 2026-08-16, by owner order: "allow flexfactor and
+    factorydeck (and purpose foundry) by default also use scout and repo
+    rewards". The old default-off existed as a privacy guard because a search
+    sends program-derived queries off-host; the owner has overridden that for
+    their own tooling, and with local Repo Rewards usually down the guard was
+    simply turning the feature off. Local RR still WINS whenever it is up
+    (see `resolve_repo_rewards_url`) — this only governs the fallback.
+
+    Opt back out with `--no-remote-repo-rewards` or
+    FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0. `--allow-remote-repo-rewards`
+    remains accepted (both .ps1 launchers still pass it) and is now a no-op
+    that re-affirms the default.
+    """
+    if args is not None and getattr(args, "no_remote_repo_rewards", False):
+        return False
+    if _env_falsy("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS"):
+        return False
+    return True
+
+
+def _add_remote_rr_optout(parser) -> None:
+    """Register the ONE opt-out for the production Repo Rewards fallback.
+
+    Shared by the scout and audit parsers so the flag can never mean two
+    different things in two modes - the launcher-drift trap in reverse.
+    """
+    parser.add_argument("--no-remote-repo-rewards", action="store_true",
+                        dest="no_remote_repo_rewards", default=False,
+                        help="Do NOT fall back to the production Repo Rewards "
+                             "deployment when the local one is down. The fallback "
+                             "is ON by default (owner order 2026-08-16); this "
+                             "keeps every search on this host. Env "
+                             "FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0 does the same.")
+
+
+def resolve_repo_rewards_url(args=None, requested: str | None = None,
+                             auto_start: bool = False) -> tuple[str | None, str]:
+    """Pick the Repo Rewards endpoint to use: (url_or_None, plain-English note).
+
+    Order, and why: an explicitly requested NON-local URL is obeyed outright
+    (the operator named a host). Otherwise local wins when it is genuinely up,
+    because a local index costs nothing and leaks nothing; production is the
+    fallback so the default path WORKS on a machine where the local dev server
+    is not running — which is this machine, most of the time.
+
+    `None` means no endpoint is usable, and the note says which doors were tried.
+    That note is printed and lands in the report: RR being unreachable must be a
+    NAMED skip, never a silent no-op.
+    """
+    requested = (requested if requested is not None
+                 else getattr(args, "repo_rewards_url", None)
+                 or DEFAULT_REPO_REWARDS_URL).rstrip("/")
+    if requested not in LOCAL_REPO_REWARDS_URLS:
+        if _server_is_up(requested):
+            return requested, f"explicitly requested endpoint {requested}"
+        return None, f"requested endpoint {requested} is not reachable"
+    if _server_is_up(requested):
+        return requested, f"local Repo Rewards at {requested}"
+    if auto_start and _try_start_repo_rewards() and _server_is_up(requested):
+        return requested, f"local Repo Rewards at {requested} (auto-started)"
+    if not allow_remote_repo_rewards(args):
+        return None, (f"local Repo Rewards at {requested} is down and the remote "
+                      "production deployment is disabled "
+                      "(--no-remote-repo-rewards / "
+                      "FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0)")
+    if PRODUCTION_REPO_REWARDS_URL and _server_is_up(PRODUCTION_REPO_REWARDS_URL):
+        return PRODUCTION_REPO_REWARDS_URL, (
+            f"local Repo Rewards at {requested} is down; using the production "
+            f"deployment {PRODUCTION_REPO_REWARDS_URL}")
+    return None, (f"neither local Repo Rewards ({requested}) nor the production "
+                  f"deployment ({PRODUCTION_REPO_REWARDS_URL}) is reachable")
 
 
 def allow_remote_program_context(args=None) -> bool:
@@ -5376,35 +5451,22 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
 
 
 def run_scout(args) -> int:
-    base_url = args.repo_rewards_url.rstrip("/")
-    requested_url = base_url
+    requested_url = args.repo_rewards_url.rstrip("/")
 
-    # 1. Make sure Repo Rewards is reachable (the search backend).
-    if not _server_is_up(base_url):
-        if args.auto_start and base_url in LOCAL_REPO_REWARDS_URLS:
-            # Keep the explicitly requested local URL after auto-start — never
-            # rewrite to DEFAULT_REPO_REWARDS_URL (env may point elsewhere).
-            _try_start_repo_rewards()
-        if not _server_is_up(base_url):
-            # Remote fallback is opt-in only (trust boundary: queries leave the host).
-            if (requested_url in LOCAL_REPO_REWARDS_URLS
-                    and allow_remote_repo_rewards(args)
-                    and PRODUCTION_REPO_REWARDS_URL
-                    and _server_is_up(PRODUCTION_REPO_REWARDS_URL)):
-                print(f"Repo Rewards not reachable at {requested_url}; "
-                      f"using opted-in remote {PRODUCTION_REPO_REWARDS_URL}")
-                base_url = PRODUCTION_REPO_REWARDS_URL
-            else:
-                print(f"error: Repo Rewards isn't reachable at {requested_url}.", file=sys.stderr)
-                print("Start it first (double-click the 'Repo Rewards' desktop icon), "
-                      "set FLEXFACTOR_REPO_REWARDS_URL, or pass --repo-rewards-url.",
-                      file=sys.stderr)
-                if requested_url in LOCAL_REPO_REWARDS_URLS and not allow_remote_repo_rewards(args):
-                    print("Remote production fallback is OFF by default (privacy). "
-                          "Pass --allow-remote-repo-rewards or set "
-                          "FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 to opt in.",
-                          file=sys.stderr)
-                return 2
+    # 1. Pick the Repo Rewards endpoint (the search backend). Local wins when it
+    #    is up; the production deployment is the DEFAULT fallback since
+    #    2026-08-16 so scout works out of the box. Which endpoint was chosen is
+    #    always printed - a search that silently changed hosts is not acceptable.
+    base_url, rr_note = resolve_repo_rewards_url(
+        args, requested=requested_url,
+        auto_start=bool(getattr(args, "auto_start", False)))
+    if base_url is None:
+        print(f"error: Repo Rewards isn't usable - {rr_note}.", file=sys.stderr)
+        print("Start it first (double-click the 'Repo Rewards' desktop icon), "
+              "set FLEXFACTOR_REPO_REWARDS_URL, or pass --repo-rewards-url.",
+              file=sys.stderr)
+        return 2
+    print(f"Repo Rewards: {rr_note}")
 
     # 2. Characterize the entered program locally, then enforce the separate
     # cloud-context boundary before constructing or calling a remote provider.
@@ -7607,6 +7669,22 @@ def _purpose_module():
     try:
         import flexfactor_purpose as _fp
         return _fp
+    except Exception:
+        return None
+
+
+def _competitors_module():
+    """Lazy import of flexfactor_competitors (same containment pattern).
+
+    Installs flexfactor's own licence oracle into the module so the scout
+    integrate gate and the competitor reuse gate can never drift apart: there is
+    ONE `_license_compatible` at runtime, and the module's standalone table is
+    only the fallback for when it is used outside FlexFactor.
+    """
+    try:
+        import flexfactor_competitors as _fc
+        _fc.set_license_oracle(_license_compatible)
+        return _fc
     except Exception:
         return None
 
@@ -10425,6 +10503,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # criteria; a run that finishes has closed the gap, not tidied the code.
         purpose_before = None      # baseline measurement (criteria met at start)
         bridged_early: list[str] = []
+        # Competitor research (phase 1b). None = did not run / failed; the report
+        # says which, because a silent absence reads as "no competitors exist".
+        competitor_research: dict | None = None
+        competitor_bridged_findings: list[dict] = []
         if getattr(args, "purpose_gap", True) and purpose_blob:
             report(phase="purpose gap (baseline)")
             if checkpoint is not None:
@@ -10503,6 +10585,134 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     fix_notes.append(stop_reason)
                 except BudgetExceededError:
                     fix_notes.append("purpose bridging stopped at cost cap")
+        # ================== PHASE 1b - COMPETITOR RESEARCH ====================
+        # Owner order 2026-08-16. The purpose contract says what job this program
+        # must do; competitor research says what ELSE already does that job, so a
+        # program cannot score 10/10 against its own criteria while shipping less
+        # than anything its users could switch to. The purpose contract stays the
+        # authority: every competitor idea is judged against it and a
+        # purpose-irrelevant idea is REJECTED, however good it is in the abstract.
+        # Failure here is always a NAMED skip in the report, never a crash and
+        # never a silent no-op.
+        if (getattr(args, "competitors", True) and not dirty_abort
+                and not meter.over_limit()):
+            report(phase="competitor research")
+            if checkpoint is not None:
+                checkpoint.set_phase("competitor research")
+            _fc = _competitors_module()
+            if _fc is None:
+                print(f"{pfx}competitor research SKIPPED: flexfactor_competitors "
+                      "module could not be imported")
+                competitor_research = {
+                    "competitors": [], "sources_used": [], "target": 0,
+                    "sources_skipped": {"module": "flexfactor_competitors "
+                                                  "could not be imported"},
+                    "coverage_note": "competitor research did not run",
+                    "rr_endpoint": "(not used)"}
+            else:
+                rr_url, rr_note = resolve_repo_rewards_url(
+                    args, auto_start=False)
+                print(f"{pfx}PHASE 1b - competitors: Repo Rewards -> {rr_note}")
+                rr_fn = ((lambda q: repo_rewards_search(rr_url, q))
+                         if rr_url else None)
+                try:
+                    competitor_research = _fc.research_competitors(
+                        lambda system, prompt, schema: _judge(
+                            purpose_reviewer, system, prompt, schema),
+                        display_name,
+                        purpose_blob or f"Program: {display_name}",
+                        stack.get("ecosystems") or [],
+                        rr_search=rr_fn,
+                        rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
+                        target=max(1, int(getattr(args, "competitor_count", 5) or 5)),
+                        log=lambda m: print(f"{pfx}{m}"),
+                        file_list=all_files)
+                except BudgetExceededError:
+                    competitor_research = None
+                    print(f"{pfx}competitor research stopped at the cost cap")
+                except Exception as ex:   # never abort an audit over research
+                    competitor_research = None
+                    print(f"{pfx}competitor research failed (non-fatal): "
+                          f"{_fc._ascii(ex)}")
+            if competitor_research:
+                # Everything printed below is MODEL- or REPO-derived text, so it
+                # goes through _ascii first: a U+2011 in a competitor name raised
+                # UnicodeEncodeError on this machine's cp1252 console (live
+                # 2026-08-16) from inside an except handler, which escaped the
+                # phase entirely and would have failed the program's audit.
+                _sfe = _fc._ascii if _fc is not None else str
+                print(f"{pfx}{_sfe(competitor_research.get('coverage_note', ''))}")
+                for _cn, _cw in sorted((competitor_research.get("sources_skipped")
+                                        or {}).items()):
+                    print(f"{pfx}  [skipped source] {_sfe(_cn)}: {_sfe(_cw)}")
+                for _c in competitor_research.get("competitors") or []:
+                    _idea = _c.get("idea") or {}
+                    print(f"{pfx}  {_sfe(_c['name'])} [{_sfe(_c.get('license'))}"
+                          f" -> {_c.get('reuse_mode')}]: "
+                          f"{'ACCEPT' if _idea.get('accept') else 'reject'} - "
+                          f"{_sfe(_idea.get('idea_title', '(no idea)'))}")
+                # Accepted, corroborated, licence-permitted, code-fixable ideas
+                # enter the SAME build-gated fix stream as purpose gaps - capped,
+                # because a competitor idea is an opinion about the market, not a
+                # defect. Everything filtered out still appears in the report.
+                comp_pairs = _fc.competitor_findings(
+                    competitor_research,
+                    max_findings=max(0, int(getattr(args, "competitor_fixes", 3) or 0)),
+                    severity_floor_rank=SEVERITY_RANK.get(
+                        str(args.fix_severity).lower(), 3),
+                    severity_rank=SEVERITY_RANK,
+                    file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None)
+                # NOT appended to all_findings here: the cycle loop REPLACES
+                # all_findings wholesale with each cycle's review output, so an
+                # early append would be silently dropped. They are merged in
+                # after the loop, exactly where purpose gaps are.
+                for _rel, _f in comp_pairs:
+                    competitor_bridged_findings.append(dict(_f, file=_rel))
+                    purpose_files.append(_rel)
+                if comp_pairs and not meter.over_limit():
+                    print(f"{pfx}PHASE 1b - applying {len(comp_pairs)} "
+                          "competitor-derived improvement(s) (build-gated"
+                          + (" + cross-checked" if cross is not None else "") + ")...")
+                    comp_ff: dict[str, list[dict]] = {}
+                    for _rel, _f in comp_pairs:
+                        comp_ff.setdefault(_rel, []).append(_f)
+                    try:
+                        applied_c, unver_c, notes_c = _fix_files(
+                            author, cross, project_dir, comp_ff, stack, baseline_ok, args,
+                            meter=meter, oversized=oversized, report=report,
+                            noop_stats=noop_stats, err_base=errors_total,
+                            done_set=done_set, total_overall=total_to_review,
+                            commit_cb=None,
+                            adversarial=getattr(args, "adversarial", True),
+                            adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                            materiality=getattr(args, "adversarial_materiality", "material"))
+                        applied_set |= set(applied_c)
+                        unverified_set |= set(unver_c)
+                        fix_notes += notes_c
+                        bridged_early = sorted(set(bridged_early) | set(applied_c))
+                        competitor_research["applied_files"] = sorted(set(applied_c))
+                        if git and applied_c:
+                            s = _commit_and_sync(project_dir, branch, prev_branch, args,
+                                                 "competitor-derived improvements (phase 1b)",
+                                                 stack)
+                            if "committed" in s:
+                                committed_any = True
+                            print(f"{pfx}git (competitors phase 1b): {s}")
+                    except DirtyTreeError as dte:
+                        dirty_abort = True
+                        for df in dte.files:
+                            if git:
+                                _git(["checkout", "--", df], project_dir)
+                        stop_reason = ("aborted in competitor phase: refused rollback "
+                                       "left an unverified candidate")
+                        fix_notes.append(stop_reason)
+                    except BudgetExceededError:
+                        fix_notes.append("competitor bridging stopped at cost cap")
+        elif getattr(args, "competitors", True):
+            print(f"{pfx}competitor research SKIPPED: "
+                  + ("cost cap reached" if meter.over_limit() else "run aborted earlier"))
+        # ================== END PHASE 1b ======================================
+
         if purpose_files and not dirty_abort:
             # Purpose-critical files lead the sweep, so even a run that stops at
             # the cost cap has reviewed the files that decide the program's job first.
@@ -10819,6 +11029,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         low_findings = _dedupe_findings(low_findings)
         low_findings.sort(key=lambda f: (str(f.get("file", "")),
                                          int(f.get("line") or 0)))
+
+        # Competitor-derived findings from phase 1b join the finding record HERE,
+        # not at phase 1b: the cycle loop reassigns `all_findings` wholesale from
+        # each cycle's review output, so anything appended earlier is discarded.
+        if competitor_bridged_findings:
+            all_findings = list(all_findings) + competitor_bridged_findings
 
         # 4b. PURPOSE GAP: infer what this program was created FOR from its own
         #     metadata and measure the distance between that purpose and what the
@@ -11440,6 +11656,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "verification_is_real": stack.get("verification_is_real"),
             "verification_note": stack.get("verification_note", ""),
             "purpose_gap": purpose_gap, "bridged_files": bridged_files,
+            "competitor_research": competitor_research,
+            "competitors_enabled": bool(getattr(args, "competitors", True)),
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
@@ -12190,6 +12408,19 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                     L.append(f"  - Fix: {b['remediation']}")
             L.append("")
 
+    # Competitor research. Absence is reported explicitly: a missing section
+    # would read as "this program has no competitors", which is never what a
+    # skipped or failed research phase means.
+    _cr = a.get("competitor_research")
+    _fc_mod = _competitors_module()
+    if _cr and _fc_mod is not None:
+        L += _fc_mod.report_lines(_cr)
+    elif a.get("competitors_enabled") is not False:
+        L += ["## Competitor research", "",
+              "_Competitor research did NOT produce a result this run "
+              "(disabled, failed, or stopped at the cost cap). This is a gap in "
+              "the audit, not a finding that the program has no competitors._", ""]
+
     pg = a.get("purpose_gap")
     if pg:
         gaps = pg.get("gaps") or []
@@ -12656,13 +12887,15 @@ def main(argv=None) -> int:
                             help="How many top candidate repos to judge (default: 8).")
         parser.add_argument("--no-auto-start", action="store_false", dest="auto_start",
                             help="Don't try to auto-launch Repo Rewards if it's down.")
+        # Accepted for compatibility - both .ps1 launchers still pass it. The
+        # production fallback is ON by default since 2026-08-16, so this now
+        # only re-affirms the default; --no-remote-repo-rewards is the live knob.
         parser.add_argument("--allow-remote-repo-rewards", action="store_true",
                             dest="allow_remote_repo_rewards", default=False,
-                            help="Opt in to using FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL "
-                                 "when the local Repo Rewards URL is unreachable. "
-                                 "OFF by default — remote search sends program-derived "
-                                 "queries off-host. Env FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 "
-                                 "also enables this.")
+                            help="No-op since 2026-08-16: the production Repo Rewards "
+                                 "fallback is ON by default. Kept so existing launchers "
+                                 "and scripts keep working.")
+        _add_remote_rr_optout(parser)
         parser.add_argument("--allow-remote-program-context", action="store_true",
                             dest="allow_remote_program_context", default=False,
                             help="Opt in to sending the target program's source, README, and "
@@ -12838,6 +13071,35 @@ def main(argv=None) -> int:
                                  "the report.")
         parser.add_argument("--no-purpose-gap", action="store_false", dest="purpose_gap",
                             help="Skip the purpose-gap assessment and bridging pass.")
+        # COMPETITOR RESEARCH (owner order 2026-08-16) - ON by default, same as
+        # the purpose gap. It runs Scout's Repo Rewards search AND FlexFactor's
+        # own keyless web search, so market products with no GitHub presence are
+        # found too.
+        parser.add_argument("--competitors", action="store_true", dest="competitors",
+                            default=True,
+                            help="Research the program's real competitors (market products "
+                                 "AND open-source implementations) via Repo Rewards + web "
+                                 "search, extract each one's most valuable adoptable idea, "
+                                 "and judge it against THIS program's purpose contract "
+                                 "(default ON). A licence gate decides per candidate whether "
+                                 "source may be reused, or only its documented behaviour.")
+        parser.add_argument("--no-competitors", action="store_false", dest="competitors",
+                            help="Skip competitor research entirely.")
+        parser.add_argument("--competitor-count", type=int, default=5,
+                            dest="competitor_count",
+                            help="How many competitors to cover (default: 5). A shortfall is "
+                                 "reported as a shortfall, never padded.")
+        parser.add_argument("--competitor-fixes", type=int, default=3,
+                            dest="competitor_fixes",
+                            help="Max competitor-derived findings allowed into the FIX stream "
+                                 "(default: 3). Reference-only and unverified candidates are "
+                                 "never bridged, whatever this is set to.")
+        parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
+                            dest="repo_rewards_url",
+                            help="Base URL of the Repo Rewards service used by competitor "
+                                 "research. Local wins when up; the production deployment is "
+                                 "the default fallback.")
+        _add_remote_rr_optout(parser)
         parser.add_argument("--recheck", action="store_true", dest="recheck",
                             help="Re-review files the brain marked clean in a prior run.")
         parser.add_argument("--no-dashboard", action="store_false", dest="dashboard",

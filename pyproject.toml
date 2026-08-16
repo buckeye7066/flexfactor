@@ -30,6 +30,7 @@ flexfactor = "flexfactor:main"
 py-modules = [
   "flexfactor",
   "flexfactor_cmdpolicy",
+  "flexfactor_competitors",
   "flexfactor_dashboard",
   "flexfactor_dashboard_v2",
   "flexfactor_egress",

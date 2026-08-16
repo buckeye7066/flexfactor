@@ -71,11 +71,49 @@ if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
 # `finally` (see FreeReviewPoolTests).
 ff._auto_activate_fcc_proxy = lambda *a, **k: False
 
+# --------------------------------------------------------------------------- #
+# NEVER let a test reach the real internet.
+#
+# Competitor research (2026-08-16) added the first outbound HTTP in the audit
+# pipeline: a keyless web-search ladder, a GitHub repo search, and a Repo
+# Rewards reachability probe that now falls back to the PRODUCTION deployment by
+# default. Measured immediately: the offline AuditPipelineIntegrationTests
+# started issuing live DuckDuckGo/GitHub requests mid-suite - slow, flaky, and
+# dependent on someone else's rate limit. Same TEST HYGIENE principle as the
+# BRAIN_PATH/RUNS_PATH/STATUS_PATH redirects and the FCC-proxy no-op above:
+# neutralize it here, unconditionally, before any test runs.
+#
+# Both stubs FAIL rather than return canned data, so the code under test takes
+# its documented degradation path (a NAMED skip) instead of silently believing
+# a fixture. Every test that needs specific behaviour installs its own fake -
+# they all already do, via `opener=` or `_patched(ff, "_server_is_up", ...)`.
+# --------------------------------------------------------------------------- #
+import flexfactor_competitors as _ffc  # noqa: E402
+
+
+def _no_network_opener(*a, **k):
+    raise OSError("network disabled in the FlexFactor test suite")
+
+
+_ffc._default_opener = _no_network_opener
+ff._server_is_up = lambda url, timeout=1.5: False
+
 
 class TestSessionIsolationTests(unittest.TestCase):
     """A guard that can actually fail: if the redirection above is removed or a
     test re-points these at $HOME, this test says so before the next run eats
     the owner's project memory again."""
+
+    def test_no_test_can_reach_the_real_network(self):
+        """A guard that can actually fail. Without it, competitor research turns
+        every audit-pipeline test into a live DuckDuckGo/GitHub/Railway call."""
+        import flexfactor_competitors as _c
+        with self.assertRaises(OSError):
+            _c._default_opener("https://example.com")
+        self.assertFalse(ff._server_is_up("https://web-production-d7db7.up.railway.app"))
+        hits, backend, skipped = _c.web_search("anything")
+        self.assertEqual((hits, backend), ([], ""))
+        self.assertTrue(skipped)
 
     def test_brain_and_status_paths_are_not_the_real_ones(self):
         home_flex = os.path.join(os.path.expanduser("~"), ".flexfactor")
@@ -7917,8 +7955,16 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         self.assertEqual(ff._host_port("http://localhost:3000"), ("localhost", 3000))
         self.assertEqual(ff._host_port("http://example.com"), ("example.com", 80))
 
-    def test_production_rr_fallback_requires_explicit_opt_in(self):
-        """Silent local→remote fallback is forbidden without opt-in."""
+    def test_production_rr_fallback_is_refused_when_explicitly_opted_out(self):
+        """SUPERSEDED 2026-08-16. This test used to assert the OPPOSITE - that a
+        local->production fallback needed `--allow-remote-repo-rewards`. The
+        owner reversed that default ("allow flexfactor and factorydeck ... by
+        default also use scout and repo rewards"), because the guard was a
+        privacy measure for their own machine and, with local RR usually down,
+        it was simply turning the feature off. The invariant that SURVIVES is
+        the opt-OUT: `--no-remote-repo-rewards` (or
+        FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0) must still keep every query on
+        this host, and scout must exit 2 rather than silently search anyway."""
         import types
         seen = {"urls": [], "search_url": None}
         saved = {
@@ -7945,9 +7991,13 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
                 rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
-                              "--no-auto-start"])
+                              "--no-remote-repo-rewards", "--no-auto-start"])
             self.assertEqual(rc, 2)
             self.assertIsNone(seen["search_url"])
+            self.assertFalse([u for u in seen["urls"]
+                              if str(u).startswith("https://web-production")
+                              and seen["search_url"]],
+                             "no query may leave the host once opted out")
         finally:
             ff._server_is_up = saved["up"]
             ff._try_start_repo_rewards = saved["start"]
@@ -10868,6 +10918,36 @@ class ResumeCheckpointTests(unittest.TestCase):
         # every completed review, immediately, with no batching gap.
         self.assertEqual(len(cp.data.get("reviewed") or {}), n_files)
 
+    def test_two_runs_of_one_program_in_one_second_do_not_collide(self):
+        """PRE-EXISTING DEFECT found + fixed 2026-08-16 (bisected: OK at b04c4f5,
+        intermittent from 22bbc8b, deterministic at 2622d41).
+
+        `run_id` was program + second + pid and `updated` was second-resolution,
+        so two checkpoints started for the same program inside one second got the
+        SAME id - the second silently overwrote the first's directory - and when
+        they did get separate directories they TIED in `list_runs`' sort, which
+        handed "newest" to whatever `os.listdir` returned first. A resumed run
+        could therefore recover the WRONG checkpoint and re-review work already
+        paid for: exactly what flexfactor_runstate exists to prevent."""
+        import flexfactor_runstate as ffrs
+        with tempfile.TemporaryDirectory() as root:
+            a = ffrs.new_run(root, program="same", project_dir=root, mode="audit",
+                             policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+            b = ffrs.new_run(root, program="same", project_dir=root, mode="audit",
+                             policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+            self.assertNotEqual(a.run_id, b.run_id,
+                                "same program + same second + same pid collided")
+            a.record_reviewed("old.py", "sha-old", [])
+            b.record_reviewed("new.py", "sha-new", [])
+            a.save(force=True)
+            b.save(force=True)
+            self.assertEqual(len(ffrs.list_runs(root)), 2,
+                             "one checkpoint overwrote the other's directory")
+            latest = ffrs.latest_resumable(root, program="same", project_dir=root)
+            self.assertEqual(latest.get("run_id"), b.run_id,
+                             "the newer checkpoint must win regardless of "
+                             "os.listdir ordering")
+
     def test_interrupted_run_resumes_without_rebilling_review(self):
         # End to end THROUGH THE REAL ENTRY POINT: run 1 completes clean;
         # simulate an INTERRUPTED run's flexfactor_runstate checkpoint (not
@@ -10912,10 +10992,16 @@ class ResumeCheckpointTests(unittest.TestCase):
             cp.record_reviewed("app.py", sha, [finding])
             cp.finish(status="interrupted")  # killed mid-run: not converged
 
+            # --no-competitors for the same reason as --no-purpose-gap /
+            # --no-readiness: this test isolates the RESUME mechanism, and
+            # `stub.calls == []` below means "the recovered REVIEW was not
+            # re-billed". Competitor research is a separate, deliberate provider
+            # call, so leaving it on would make the assertion measure the wrong
+            # thing instead of catching a re-billed review.
             args = helper._args(["prodready", "--program", root, "--no-bootstrap",
                                  "--no-preflight", "--no-dashboard", "--no-tests",
                                  "--no-e2e", "--no-full-suite", "--no-purpose-gap",
-                                 "--no-readiness"])
+                                 "--no-readiness", "--no-competitors"])
             stub = _StubProvider()
             with _patched(ff, "build_audit_providers",
                           lambda a, m=None: [("stub", stub)]), \
@@ -11462,6 +11548,574 @@ class EvidenceRuntimeTests(unittest.TestCase):
                        "blocked-low-confidence"):
             self.assertIn(needle, src)
 
+
+# =========================================================================== #
+# COMPETITOR RESEARCH (owner order 2026-08-16)
+#
+# The three things that can silently go wrong here, and the tests that catch
+# each: (1) the licence gate quietly permitting a copy it must not permit,
+# (2) a thin or failed research pass being presented as "no competitors exist",
+# and (3) the Repo Rewards endpoint selection picking nothing on a machine where
+# only the production deployment is up - which is this machine, most days.
+# =========================================================================== #
+import flexfactor_competitors as fc  # noqa: E402
+
+
+class _FakeOpener:
+    """Records requested URLs and replays canned bodies keyed by substring."""
+
+    def __init__(self, routes: dict, fail: set | None = None):
+        self.routes, self.fail, self.seen = routes, set(fail or ()), []
+
+    def __call__(self, url, data=None, headers=None, timeout=None):
+        self.seen.append(url)
+        for needle in self.fail:
+            if needle in url:
+                raise OSError(f"simulated outage for {needle}")
+        for needle, body in self.routes.items():
+            if needle in url:
+                return body
+        raise urllib_error_for_tests(url)
+
+
+def urllib_error_for_tests(url):
+    import urllib.error
+    return urllib.error.URLError(f"no route in fixture for {url}")
+
+
+_DDG_FIXTURE = """<html><body>
+<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dads.example.com&amp;rut=x">Sponsored Ad</a>
+<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.logos.com%2F&amp;rut=y">Logos Bible Software</a>
+<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fsermonary.com%2F&amp;rut=z">Sermonary - Sermon Builder</a>
+</body></html>"""
+
+_WIKI_FIXTURE = json.dumps({"query": {"search": [
+    {"title": "Logos Bible Software", "snippet": "A <span>digital</span> Bible study platform."},
+]}})
+
+_GH_FIXTURE = json.dumps({"items": [
+    {"full_name": "openlp/openlp", "html_url": "https://github.com/openlp/openlp",
+     "description": "Church presentation software", "stargazers_count": 400,
+     "license": {"spdx_id": "GPL-2.0"}},
+]})
+
+
+class CompetitorLicenseGateTests(unittest.TestCase):
+    """The legal gate is mechanical: the licence, not the model, decides."""
+
+    def test_permissive_license_is_the_only_route_to_copying_source(self):
+        mode, why = fc.license_reuse_mode("MIT")
+        self.assertEqual(mode, fc.REUSE_DIRECT)
+        self.assertTrue(fc.may_copy_source(mode), why)
+
+    def test_copyleft_forces_clean_room_and_forbids_copying(self):
+        for spdx in ("GPL-3.0", "AGPL-3.0", "gpl-2.0", "LGPL-3.0", "SSPL-1.0"):
+            mode, why = fc.license_reuse_mode(spdx)
+            self.assertEqual(mode, fc.REUSE_CLEAN_ROOM, spdx)
+            self.assertFalse(fc.may_copy_source(mode), f"{spdx} must never permit copying")
+            self.assertIn("NOT", why)
+
+    def test_unknown_license_is_reference_only_never_permitted(self):
+        # The whole failure mode this exists to prevent: an absent SPDX id
+        # reading as "no restrictions" instead of "we do not know".
+        for spdx in (None, "", "NOASSERTION", "Other", "WTFPL-ish"):
+            mode, _ = fc.license_reuse_mode(spdx)
+            self.assertEqual(mode, fc.REUSE_REFERENCE, repr(spdx))
+            self.assertFalse(fc.may_copy_source(mode))
+
+    def test_closed_source_product_is_clean_room_from_documented_behavior(self):
+        mode, why = fc.license_reuse_mode(None, source_available=False)
+        self.assertEqual(mode, fc.REUSE_CLEAN_ROOM)
+        self.assertFalse(fc.may_copy_source(mode))
+        self.assertIn("documented behaviour", why)
+
+    def test_module_table_agrees_with_flexfactors_own_license_oracle(self):
+        # Two tables that disagree = the scout integrate gate and the competitor
+        # reuse gate reaching opposite conclusions about the same repo.
+        for spdx in sorted(fc._PERMISSIVE | fc._COPYLEFT | {"WTFPL", "NOASSERTION"}):
+            self.assertEqual(fc._default_compatible(spdx), ff._license_compatible(spdx),
+                             f"license table drift on {spdx}")
+
+    def test_flexfactor_installs_its_own_oracle_into_the_module(self):
+        mod = ff._competitors_module()
+        self.assertIsNotNone(mod)
+        self.assertIs(mod._COMPATIBLE_ORACLE[0], ff._license_compatible)
+
+
+class CompetitorBridgeGateTests(unittest.TestCase):
+    def test_unverified_competitor_can_never_reach_the_fix_stream(self):
+        c = {"evidence_status": "unverified", "reuse_mode": fc.REUSE_DIRECT}
+        self.assertFalse(fc.may_bridge(c))
+
+    def test_reference_only_competitor_can_never_reach_the_fix_stream(self):
+        c = {"evidence_status": "verified", "reuse_mode": fc.REUSE_REFERENCE}
+        self.assertFalse(fc.may_bridge(c))
+
+    def test_verified_permissive_and_clean_room_may_bridge(self):
+        for mode in (fc.REUSE_DIRECT, fc.REUSE_CLEAN_ROOM):
+            self.assertTrue(fc.may_bridge({"evidence_status": "verified",
+                                           "reuse_mode": mode}), mode)
+
+    def _research(self, **over):
+        base = {"competitors": [{
+            "name": "Rival", "url": "https://x/", "evidence_urls": ["https://x/"],
+            "evidence_status": "verified", "reuse_mode": fc.REUSE_DIRECT,
+            "reuse_reason": "permissive", "license": "MIT",
+            "idea": {"accept": True, "code_fixable": True, "file": "src/app.js",
+                     "severity": "high", "idea_title": "T", "what_it_does": "W",
+                     "why_valuable": "V", "purpose_reason": "P", "acceptance_ref": "3"},
+        }]}
+        base["competitors"][0].update(over.pop("competitor", {}))
+        base["competitors"][0]["idea"].update(over.pop("idea", {}))
+        return base
+
+    def test_accepted_idea_becomes_a_finding_carrying_its_reuse_mode(self):
+        out = fc.competitor_findings(self._research(), file_exists=lambda r: True)
+        self.assertEqual(len(out), 1)
+        rel, finding = out[0]
+        self.assertEqual(rel, "src/app.js")
+        self.assertIn("competitor: Rival", finding["title"])
+        self.assertIn(fc.REUSE_DIRECT, finding["detail"])
+        self.assertIn("MAY consult", finding["detail"])
+
+    def test_clean_room_finding_tells_the_author_not_to_copy(self):
+        r = self._research(competitor={"reuse_mode": fc.REUSE_CLEAN_ROOM})
+        _, finding = fc.competitor_findings(r, file_exists=lambda x: True)[0]
+        self.assertIn("MUST NOT copy", finding["detail"])
+
+    def test_rejected_idea_is_never_bridged(self):
+        self.assertEqual(fc.competitor_findings(self._research(idea={"accept": False}),
+                                                file_exists=lambda x: True), [])
+
+    def test_severity_floor_and_cap_and_missing_file_all_drop_the_finding(self):
+        r = self._research(idea={"severity": "low"})
+        self.assertEqual(fc.competitor_findings(r, severity_floor_rank=3,
+                                                severity_rank=ff.SEVERITY_RANK,
+                                                file_exists=lambda x: True), [])
+        self.assertEqual(fc.competitor_findings(self._research(), max_findings=0,
+                                                file_exists=lambda x: True), [])
+        self.assertEqual(fc.competitor_findings(self._research(),
+                                                file_exists=lambda x: False), [])
+
+
+class CompetitorCoverageHonestyTests(unittest.TestCase):
+    def test_short_coverage_says_shortfall_out_loud(self):
+        note = fc.coverage_note(2, 5, unverified=3)
+        self.assertIn("ONLY 2 of the target 5", note)
+        self.assertIn("SHORTFALL", note)
+        self.assertIn("not evidence that fewer competitors exist", note)
+        self.assertIn("3 further name(s)", note)
+
+    def test_full_coverage_makes_no_shortfall_claim(self):
+        self.assertNotIn("SHORTFALL", fc.coverage_note(5, 5))
+
+    def test_zero_competitors_report_states_the_gap_not_an_absence(self):
+        lines = "\n".join(fc.report_lines(
+            {"competitors": [], "target": 5, "sources_used": [],
+             "sources_skipped": {"web:duckduckgo": "OSError: down"},
+             "coverage_note": fc.coverage_note(0, 5), "rr_endpoint": "n/a"}))
+        self.assertIn("NOT as evidence that", lines)
+        self.assertIn("web:duckduckgo", lines)
+        self.assertIn("OSError: down", lines)
+
+
+class CompetitorSearchBackendTests(unittest.TestCase):
+    def test_duckduckgo_lite_results_are_parsed_and_ads_dropped(self):
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE})
+        hits, backend, skipped = fc.web_search("sermon software", opener=op)
+        self.assertEqual(backend, "duckduckgo")
+        urls = [h["url"] for h in hits]
+        self.assertIn("https://www.logos.com/", urls)
+        self.assertNotIn("searxng", skipped.get("duckduckgo", ""))
+        self.assertFalse([u for u in urls if "y.js" in u], "ad result leaked through")
+
+    def test_ladder_falls_through_to_wikipedia_and_names_every_skip(self):
+        op = _FakeOpener({"wikipedia.org": _WIKI_FIXTURE},
+                         fail={"lite.duckduckgo.com"})
+        hits, backend, skipped = fc.web_search("logos bible software", opener=op)
+        self.assertEqual(backend, "wikipedia")
+        self.assertEqual(hits[0]["title"], "Logos Bible Software")
+        self.assertIn("duckduckgo", skipped)
+        self.assertIn("searxng", skipped)
+
+    def test_every_backend_down_returns_empty_with_named_reasons_not_a_crash(self):
+        op = _FakeOpener({}, fail={"duckduckgo", "wikipedia", "searx"})
+        hits, backend, skipped = fc.web_search("anything", opener=op)
+        self.assertEqual((hits, backend), ([], ""))
+        self.assertIn("duckduckgo", skipped)
+        self.assertIn("wikipedia", skipped)
+
+    def test_github_search_supplies_the_spdx_id_the_license_gate_needs(self):
+        op = _FakeOpener({"api.github.com": _GH_FIXTURE})
+        repos = fc.github_repo_search("church presentation", opener=op)
+        self.assertEqual(repos[0]["license"], "GPL-2.0")
+        mode, _ = fc.license_reuse_mode(repos[0]["license"])
+        self.assertEqual(mode, fc.REUSE_CLEAN_ROOM)
+
+
+class CompetitorResearchPipelineTests(unittest.TestCase):
+    """End-to-end with fakes: no network, no provider, no keys."""
+
+    def _judge(self, competitors, idea=None, raise_on=None):
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                if raise_on == "discovery":
+                    raise RuntimeError("provider down")
+                return {"competitors": competitors}
+            if raise_on == "idea":
+                raise RuntimeError("judge down")
+            return dict({"idea_title": "Outline templates", "what_it_does": "W",
+                         "why_valuable": "V", "evidence_basis": "search result",
+                         "accept": True, "purpose_reason": "serves criterion 3",
+                         "acceptance_ref": "3", "severity": "high",
+                         "code_fixable": True, "file": "src/app.js",
+                         "confidence": "medium"}, **(idea or {}))
+        return judge
+
+    def _opener(self, **kw):
+        return _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
+                            "api.github.com": _GH_FIXTURE}, **kw)
+
+    def test_gpl_competitor_is_clean_room_and_its_idea_is_still_usable(self):
+        judge = self._judge([{"name": "openlp", "kind": "oss", "why": "w",
+                              "search_query": "openlp church presentation"}])
+        res = fc.research_competitors(judge, "SermonSmith", "purpose text",
+                                      ["node"], opener=self._opener(), target=1)
+        c = res["competitors"][0]
+        self.assertEqual(c["license"], "GPL-2.0")
+        self.assertEqual(c["reuse_mode"], fc.REUSE_CLEAN_ROOM)
+        self.assertEqual(c["evidence_status"], "verified")
+        self.assertTrue(fc.may_bridge(c))
+        self.assertFalse(fc.may_copy_source(c["reuse_mode"]))
+
+    def test_a_competitor_no_source_corroborates_is_marked_unverified_and_not_acted_on(self):
+        judge = self._judge([{"name": "GhostProduct", "kind": "market", "why": "w",
+                              "search_query": "ghostproduct"}])
+        res = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [],
+            opener=_FakeOpener({}, fail={"duckduckgo", "wikipedia", "searx",
+                                         "api.github.com"}),
+            target=1)
+        c = res["competitors"][0]
+        self.assertEqual(c["evidence_status"], "unverified")
+        self.assertFalse(c["idea"]["accept"], "an uncorroborated name must not be acted on")
+        self.assertIn("NOT ACTED ON", c["idea"]["purpose_reason"])
+        self.assertEqual(res["verified"], 0)
+        self.assertIn("SHORTFALL", res["coverage_note"])
+        self.assertEqual(fc.competitor_findings(res, file_exists=lambda x: True), [])
+
+    def test_discovery_failure_is_a_named_skip_not_a_crash(self):
+        res = fc.research_competitors(self._judge([], raise_on="discovery"),
+                                      "SermonSmith", "purpose", [],
+                                      opener=self._opener(), target=2)
+        self.assertIn("model-discovery", res["sources_skipped"])
+        self.assertIn("provider down", res["sources_skipped"]["model-discovery"])
+        # It still tried the web with a generic query rather than giving up.
+        self.assertTrue(res["queries"])
+
+    def test_idea_extraction_failure_is_a_named_skip_not_a_crash(self):
+        judge = self._judge([{"name": "openlp", "kind": "oss", "why": "w",
+                              "search_query": "openlp"}], raise_on="idea")
+        res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                      opener=self._opener(), target=1)
+        self.assertFalse(res["competitors"][0]["idea"]["accept"])
+        self.assertTrue([k for k in res["sources_skipped"] if k.startswith("idea:")])
+
+    def test_repo_rewards_results_are_merged_and_a_dead_rr_is_a_named_skip(self):
+        judge = self._judge([{"name": "openlp", "kind": "oss", "why": "w",
+                              "search_query": "openlp"}])
+        rr = lambda q: [{"repo": {"fullName": "sil/paratext",
+                                  "htmlUrl": "https://github.com/sil/paratext",
+                                  "description": "translation", "stars": 12,
+                                  "licenseSpdx": "MIT"}}]
+        res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                      rr_search=rr, rr_endpoint="http://rr",
+                                      opener=self._opener(), target=2)
+        names = {c["name"] for c in res["competitors"]}
+        self.assertIn("sil/paratext", names)
+        self.assertIn("repo-rewards", res["sources_used"])
+
+        def dead(q):
+            raise OSError("connection refused")
+        res2 = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                       rr_search=dead, rr_endpoint="http://rr",
+                                       opener=self._opener(), target=1)
+        self.assertIn("repo-rewards", res2["sources_skipped"])
+        self.assertIn("connection refused", res2["sources_skipped"]["repo-rewards"])
+        self.assertTrue(res2["competitors"], "RR outage must not empty the research")
+
+    def test_no_repo_rewards_endpoint_at_all_is_named_never_silent(self):
+        judge = self._judge([{"name": "openlp", "kind": "oss", "why": "w",
+                              "search_query": "openlp"}])
+        res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                      rr_search=None, opener=self._opener(), target=1)
+        self.assertIn("repo-rewards", res["sources_skipped"])
+
+
+class CompetitorLiveRunRegressionTests(unittest.TestCase):
+    """Three defects the FIRST LIVE run (SermonSmith, 2026-08-16) exposed. Each
+    one produced a plausible-looking report that was wrong."""
+
+    def test_an_unrelated_repo_named_after_a_product_never_donates_its_license(self):
+        # THE hazard: searching the proprietary product "Logos Bible Software"
+        # surfaced a third party's `robrawks/LogosBibleSoftwareMCP`, whose MIT
+        # licence was attributed to Logos and produced direct-code-reuse for a
+        # closed-source commercial product.
+        gh = [{"name": "robrawks/LogosBibleSoftwareMCP",
+               "url": "https://github.com/robrawks/LogosBibleSoftwareMCP",
+               "license": "MIT", "description": "", "stars": 1}]
+        self.assertIsNone(fc._attributable_repo("Logos Bible Software", gh))
+
+    def test_a_repo_owned_by_the_competitor_itself_is_attributed(self):
+        gh = [{"name": "BibleJS/BibleApp", "url": "u", "license": "MIT",
+               "description": "", "stars": 9}]
+        self.assertIsNotNone(fc._attributable_repo("bible.js", gh))
+
+    def test_unattributable_repo_leaves_the_product_in_clean_room_not_direct_reuse(self):
+        judge = CompetitorResearchPipelineTests()._judge(
+            [{"name": "Logos Bible Software", "kind": "market", "why": "w",
+              "search_query": "logos bible software"}])
+        op = _FakeOpener({
+            "lite.duckduckgo.com": _DDG_FIXTURE,
+            "api.github.com": json.dumps({"items": [
+                {"full_name": "robrawks/LogosBibleSoftwareMCP",
+                 "html_url": "https://github.com/robrawks/LogosBibleSoftwareMCP",
+                 "description": "third party wrapper", "stargazers_count": 1,
+                 "license": {"spdx_id": "MIT"}}]})})
+        res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                      opener=op, target=1)
+        c = res["competitors"][0]
+        self.assertEqual(c["reuse_mode"], fc.REUSE_CLEAN_ROOM)
+        self.assertFalse(fc.may_copy_source(c["reuse_mode"]))
+        self.assertEqual(c["license"], "UNKNOWN")
+        self.assertIn("no repository could be attributed", c["license_source"])
+        self.assertEqual(c["kind"], "market")
+        # The unattributable repo is still recorded as evidence, just not as
+        # the licence oracle.
+        self.assertIn("https://github.com/robrawks/LogosBibleSoftwareMCP",
+                      c["evidence_urls"])
+
+    def test_search_engine_chrome_is_not_recorded_as_evidence(self):
+        self.assertFalse(fc._is_evidence_url("https://duckduckgo.com/"))
+        self.assertFalse(fc._is_evidence_url(None))
+        self.assertTrue(fc._is_evidence_url("https://www.logos.com/"))
+
+    def test_an_idea_without_substance_is_never_reported_as_accepted(self):
+        # Live: the free judge tier returned {accept, evidence_basis} and
+        # nothing else, and the report rendered "ACCEPTED - (none)".
+        idea, why = fc._normalize_idea(
+            {"accept": True, "evidence_basis": "a long paragraph",
+             "confidence": 0.7}, "SomeRival")
+        self.assertFalse(idea["accept"])
+        self.assertIn("incomplete", why)
+        self.assertIn("NOT ACTED ON", idea["purpose_reason"])
+        self.assertEqual(idea["confidence"], "0.7", "float confidence must not crash")
+
+    def test_a_complete_idea_passes_normalization_untouched(self):
+        idea, why = fc._normalize_idea(
+            {"accept": True, "idea_title": "T", "why_valuable": "V",
+             "purpose_reason": "P"}, "R")
+        self.assertIsNone(why)
+        self.assertTrue(idea["accept"])
+
+    def test_incomplete_ideas_are_retried_once_then_degraded_and_named(self):
+        calls = {"n": 0}
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": [{"name": "openlp", "kind": "oss",
+                                         "why": "w", "search_query": "openlp"}]}
+            calls["n"] += 1
+            return {"accept": True, "evidence_basis": "words only"}
+
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
+                          "api.github.com": _GH_FIXTURE})
+        res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
+                                      opener=op, target=1)
+        self.assertEqual(calls["n"], 2, "exactly one bounded retry")
+        c = res["competitors"][0]
+        self.assertFalse(c["idea"]["accept"])
+        self.assertTrue([k for k in res["sources_skipped"] if k.startswith("idea:")])
+        self.assertEqual(fc.competitor_findings(res, file_exists=lambda x: True), [])
+
+    def test_sources_used_has_no_duplicate_entries(self):
+        judge = CompetitorResearchPipelineTests()._judge(
+            [{"name": "openlp", "kind": "oss", "why": "w", "search_query": "a"},
+             {"name": "openlpb", "kind": "oss", "why": "w", "search_query": "b"},
+             {"name": "openlpc", "kind": "oss", "why": "w", "search_query": "c"}])
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
+                          "api.github.com": _GH_FIXTURE})
+        res = fc.research_competitors(judge, "P", "purpose", [], opener=op, target=3)
+        self.assertEqual(len(res["sources_used"]), len(set(res["sources_used"])),
+                         res["sources_used"])
+
+
+class RepoRewardsEndpointSelectionTests(unittest.TestCase):
+    """Local when it's up, production otherwise - and SAY which was used."""
+
+    class _Args:
+        repo_rewards_url = "http://localhost:3000"
+        no_remote_repo_rewards = False
+
+    def test_local_wins_when_it_is_actually_up(self):
+        with _patched(ff, "_server_is_up", lambda url, timeout=1.5: "localhost" in url):
+            url, note = ff.resolve_repo_rewards_url(self._Args())
+        self.assertEqual(url, "http://localhost:3000")
+        self.assertIn("local Repo Rewards", note)
+
+    def test_production_is_the_default_fallback_when_local_is_down(self):
+        with _patched(ff, "_server_is_up", lambda url, timeout=1.5: "localhost" not in url):
+            url, note = ff.resolve_repo_rewards_url(self._Args())
+        self.assertEqual(url, ff.PRODUCTION_REPO_REWARDS_URL)
+        self.assertIn("production", note)
+
+    def test_opt_out_refuses_the_remote_and_names_the_reason(self):
+        class Args(self._Args):
+            no_remote_repo_rewards = True
+        with _patched(ff, "_server_is_up", lambda url, timeout=1.5: "localhost" not in url):
+            url, note = ff.resolve_repo_rewards_url(Args())
+        self.assertIsNone(url)
+        self.assertIn("--no-remote-repo-rewards", note)
+
+    def test_env_zero_opts_out_while_an_unset_env_does_not(self):
+        old = os.environ.get("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS")
+        try:
+            os.environ["FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS"] = "0"
+            self.assertFalse(ff.allow_remote_repo_rewards(self._Args()))
+            os.environ.pop("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS")
+            self.assertTrue(ff.allow_remote_repo_rewards(self._Args()),
+                            "the production fallback is ON by default since 2026-08-16")
+        finally:
+            os.environ.pop("FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS", None)
+            if old is not None:
+                os.environ["FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS"] = old
+
+    def test_an_explicitly_named_host_is_obeyed_and_never_silently_swapped(self):
+        class Args(self._Args):
+            repo_rewards_url = "http://rr.internal:9000"
+        with _patched(ff, "_server_is_up", lambda url, timeout=1.5: True):
+            url, note = ff.resolve_repo_rewards_url(Args())
+        self.assertEqual(url, "http://rr.internal:9000")
+        self.assertIn("explicitly requested", note)
+
+    def test_everything_down_returns_none_with_both_endpoints_named(self):
+        with _patched(ff, "_server_is_up", lambda url, timeout=1.5: False):
+            url, note = ff.resolve_repo_rewards_url(self._Args())
+        self.assertIsNone(url)
+        self.assertIn("localhost:3000", note)
+        self.assertIn(ff.PRODUCTION_REPO_REWARDS_URL, note)
+
+
+class CompetitorAuditWiringTests(unittest.TestCase):
+    """The wired-from-nowhere trap has bitten this repo three times. Prove the
+    call sites exist and that the flags both parsers advertise really parse."""
+
+    def test_audit_actually_calls_the_competitor_module(self):
+        src = inspect.getsource(ff.audit_one_program)
+        for needle in ("_competitors_module()", "research_competitors(",
+                       "competitor_findings(", "resolve_repo_rewards_url("):
+            self.assertIn(needle, src, f"competitor research not wired: {needle}")
+
+    @staticmethod
+    def _audit_args(argv):
+        real, cap = ff.run_audit, {}
+        ff.run_audit = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(list(argv))
+        finally:
+            ff.run_audit = real
+        return cap["args"]
+
+    def test_audit_parser_accepts_the_competitor_flags(self):
+        a = self._audit_args(["audit", "--program", "x"])
+        self.assertTrue(a.competitors, "competitor research must default ON")
+        self.assertEqual(a.competitor_count, 5)
+        self.assertFalse(a.no_remote_repo_rewards)
+        b = self._audit_args(["audit", "--program", "x", "--no-competitors",
+                              "--competitor-count", "7", "--competitor-fixes", "1",
+                              "--no-remote-repo-rewards"])
+        self.assertFalse(b.competitors)
+        self.assertEqual(b.competitor_count, 7)
+        self.assertEqual(b.competitor_fixes, 1)
+        self.assertTrue(b.no_remote_repo_rewards)
+
+    def test_prodready_gets_competitor_research_by_default_too(self):
+        self.assertTrue(self._audit_args(["prodready", "--program", "x"]).competitors)
+
+    def test_scout_still_accepts_the_flags_both_launchers_pass(self):
+        # LAUNCHER DRIFT TRAP: flexfactor_scout_launch.ps1 passes
+        # --allow-remote-repo-rewards and --repo-rewards-url; a removed flag is
+        # argparse exit 2, which kills the whole run.
+        real, cap = ff.run_scout, {}
+        ff.run_scout = lambda a: cap.setdefault("args", a) or 0
+        try:
+            ff.main(["scout", "--program", "x", "--allow-remote-program-context",
+                     "--allow-remote-repo-rewards", "--repo-rewards-url",
+                     "http://localhost:3000", "--no-auto-start"])
+        finally:
+            ff.run_scout = real
+        self.assertEqual(cap["args"].repo_rewards_url, "http://localhost:3000")
+        self.assertFalse(cap["args"].no_remote_repo_rewards)
+
+    def test_competitor_findings_are_merged_after_the_cycle_loop_not_before(self):
+        # all_findings is REASSIGNED wholesale each cycle, so an early append is
+        # silently discarded. This pins the merge to the post-loop site.
+        src = inspect.getsource(ff.audit_one_program)
+        merge = src.index("competitor_bridged_findings")
+        post = src.index("all_findings = list(all_findings) + competitor_bridged_findings")
+        cycle_reassign = src.index("all_findings = flat")
+        self.assertLess(merge, post)
+        self.assertLess(cycle_reassign, post,
+                        "the merge must happen AFTER the cycle loop reassigns all_findings")
+
+    @staticmethod
+    def _audit_dict(**over):
+        base = {"name": "demo", "dir": None, "branch": None, "files_reviewed": 0,
+                "findings": [], "file_findings": {}, "applied_files": [],
+                "unverified_files": [], "test_files": [], "test_status": None,
+                "e2e": {}, "fix_notes": [], "commit_status": "n/a",
+                "baseline_ok": True, "cycles": 1, "providers": [],
+                "converged": True, "stop_reason": "done", "suite_status": None,
+                "clean_files": [], "usd": 0.0, "fix_severity": "high",
+                "manual_review": [], "low_findings": []}
+        base.update(over)
+        return base
+
+    def _report_text(self, **over):
+        with _RepoFixture({"a.txt": "x"}) as root:
+            audit = self._audit_dict(dir=root, **over)
+            with open(ff._write_audit_report(root, audit), encoding="utf-8") as fh:
+                return fh.read()
+
+    def test_a_missing_competitor_section_is_reported_as_a_gap(self):
+        text = self._report_text(competitor_research=None, competitors_enabled=True)
+        self.assertIn("## Competitor research", text)
+        self.assertIn("not a finding that the program has no competitors", text)
+
+    def test_the_report_carries_the_license_gate_decision_and_evidence_urls(self):
+        research = {
+            "target": 5, "verified": 1, "unverified": 0, "accepted": 1, "rejected": 0,
+            "sources_used": ["web:duckduckgo", "github"],
+            "sources_skipped": {"repo-rewards": "connection refused"},
+            "rr_endpoint": "unavailable", "coverage_note": fc.coverage_note(1, 5),
+            "competitors": [{
+                "name": "openlp/openlp", "kind": "oss",
+                "url": "https://github.com/openlp/openlp",
+                "evidence_urls": ["https://github.com/openlp/openlp"],
+                "license": "GPL-2.0", "license_source": "github-api",
+                "reuse_mode": fc.REUSE_CLEAN_ROOM,
+                "reuse_reason": "copyleft", "evidence_status": "verified",
+                "idea": {"idea_title": "Service planning", "what_it_does": "W",
+                         "why_valuable": "V", "accept": True,
+                         "purpose_reason": "serves criterion 2",
+                         "evidence_basis": "readme", "confidence": "medium"}}]}
+        text = self._report_text(competitor_research=research,
+                                 competitors_enabled=True)
+        self.assertIn("clean-room-from-documented-behavior", text)
+        self.assertIn("GPL-2.0", text)
+        self.assertIn("https://github.com/openlp/openlp", text)
+        self.assertIn("connection refused", text)
+        self.assertIn("SHORTFALL", text)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
