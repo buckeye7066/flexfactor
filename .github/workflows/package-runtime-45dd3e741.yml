@@ -1,0 +1,55 @@
+name: Package exact FlexFactor v0.3.8 runtime 45dd3e741
+
+on:
+  push:
+    branches:
+      - runtime/45dd3e741
+    paths:
+      - .github/workflows/package-runtime-45dd3e741.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 45dd3e7418dc6d0146ae1f8a87637733142e186b
+          persist-credentials: false
+      - name: Build exact runtime archive
+        run: |
+          zip -X -q flexfactor-runtime-45dd3e741.zip \
+            requirements.txt \
+            flexfactor_self_audit_report.py \
+            flexfactor_egress.py \
+            docs/purpose-contract.schema.json \
+            docs/purpose-contract.md \
+            flexfactor_scout_contract.py \
+            flexfactor_competitors.py \
+            flexfactor_dashboard.py \
+            flexfactor_purpose.py \
+            flexfactor_prodready.py \
+            flexfactor_cmdpolicy.py \
+            flexfactor_web.py \
+            .flexfactor-secret-baseline.json \
+            memory/purpose_contracts.json \
+            flexfactor.py \
+            flexfactor_evidence.py \
+            flexfactor_runstate.py \
+            flexfactor_dashboard_v2.py \
+            probe_tiers.py
+          unzip -t flexfactor-runtime-45dd3e741.zip
+          sha256sum flexfactor-runtime-45dd3e741.zip > flexfactor-runtime-45dd3e741.sha256
+          unzip -p flexfactor-runtime-45dd3e741.zip flexfactor.py | grep -F 'TOOL_VERSION = "0.3.8"'
+          unzip -p flexfactor-runtime-45dd3e741.zip flexfactor.py | grep -F 'FLEXFACTOR_OPENAI_CALL_TIMEOUT'
+          unzip -p flexfactor-runtime-45dd3e741.zip flexfactor.py | grep -F 'single-provider-review-workers'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flexfactor-runtime-45dd3e741
+          path: |
+            flexfactor-runtime-45dd3e741.zip
+            flexfactor-runtime-45dd3e741.sha256
+          if-no-files-found: error
+          retention-days: 14
