@@ -43,9 +43,13 @@ paid service.
   `--until-clean`, hard `--max-cost` budget (default $50/program), live Tkinter
   dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
   Large files are reviewed in complete line-numbered chunks rather than truncated
-  or omitted. Function-test generation covers every first-party module by default,
-  and web targets are started locally and driven route-by-route/control-by-control;
-  unavailable or incomplete execution is a blocker, never a silent pass.
+  or omitted. Bounded files are grouped into semantic review batches with an exact
+  response required for every requested path; missing rows and sustained provider
+  outages fail closed instead of becoming clean results. Focused test generation
+  covers behavior changed by the run without overwriting project tests, while the
+  project's full native suite remains mandatory. Web targets are started locally
+  and driven route-by-route/control-by-control; unavailable or incomplete execution
+  is a blocker, never a silent pass.
   **Resume is automatic**: every completed per-file review is checkpointed
   (sha-keyed) as the sweep runs, and fixes commit per cycle - if a run dies
   mid-flow (crash, Ctrl-C, credits), re-running the same command picks up

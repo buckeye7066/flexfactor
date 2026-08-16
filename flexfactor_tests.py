@@ -12480,5 +12480,108 @@ class StayAnchoredOnLargeFilesTests(unittest.TestCase):
         self.assertTrue(ff._whole_file_is_plausible(Big(), "x" * 60_000))
         self.assertFalse(ff._whole_file_is_plausible(Big(), "x" * 400_000))
 
+class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
+    def test_semantic_batch_reviews_multiple_files_in_one_call(self):
+        calls = []
+        finding = {"line": 1, "severity": "high", "category": "bug",
+                   "title": "broken", "problem": "reachable wrong result",
+                   "fix": "return the correct value"}
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            calls.append(prompt)
+            return {"reviews": [
+                {"file": "a.py", "findings": [finding], "summary": "bad"},
+                {"file": "b.py", "findings": [], "summary": "clean"},
+                {"file": "c.py", "findings": [], "summary": "clean"},
+            ]}
+
+        class Provider:
+            model = "primary"
+
+        seen = {}
+        with _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: (f"value = '{rel}'\n", f"sha-{rel}")):
+            found, flat, unreadable, clean, incomplete = ff._review_all(
+                [Provider()], "/proj", ["a.py", "b.py", "c.py"], workers=3,
+                checkpoint_cb=lambda rel, sha, findings: seen.setdefault(
+                    rel, (sha, findings)), batch_semantic=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(clean), {"b.py", "c.py"})
+        self.assertEqual(set(found), {"a.py"})
+        self.assertEqual(len(flat), 1)
+        self.assertEqual(unreadable, set())
+        self.assertEqual(incomplete, set())
+        self.assertEqual(set(seen), {"a.py", "b.py", "c.py"})
+
+    def test_missing_batch_row_fails_over_without_marking_omission_clean(self):
+        calls = []
+
+        def judge(provider, system, prompt, schema, max_tokens=8000):
+            calls.append(provider.model)
+            if provider.model == "primary":
+                return {"reviews": [{"file": "a.py", "findings": [],
+                                      "summary": "clean"}]}
+            return {"reviews": [
+                {"file": "a.py", "findings": [], "summary": "clean"},
+                {"file": "b.py", "findings": [], "summary": "clean"},
+            ]}
+
+        class Provider:
+            def __init__(self, model):
+                self.model = model
+
+        with _patched(ff, "_judge", judge), \
+             _patched(ff, "_read_text_and_sha",
+                      lambda pd, rel, cap=None: ("x = 1\n", f"sha-{rel}")):
+            _, _, _, clean, incomplete = ff._review_all(
+                [Provider("primary"), Provider("fallback")], "/proj",
+                ["a.py", "b.py"], workers=1, batch_semantic=True)
+        self.assertEqual(calls, ["primary", "fallback"])
+        self.assertEqual(set(clean), {"a.py", "b.py"})
+        self.assertEqual(incomplete, set())
+
+    def test_purpose_retrieval_selects_evidence_for_each_contract_criterion(self):
+        class Contract:
+            acceptance_criteria = ["broken-link lifecycle", "duplicate handling"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "backend"))
+            os.makedirs(os.path.join(tmp, "tests"))
+            files = {
+                "backend/linkLifecycle.js": "export function retireBrokenLink() {}\n",
+                "tests/duplicateHandling.test.js": "test('duplicate handling', () => {})\n",
+                "misc.js": "export const unrelated = true\n",
+            }
+            for rel, text in files.items():
+                with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            selected, _ = ff._purpose_relevant_files(list(files), tmp, Contract())
+        self.assertIn("backend/linkLifecycle.js", selected)
+        self.assertIn("tests/duplicateHandling.test.js", selected)
+
+
+class NativeImportCoverageTests(unittest.TestCase):
+    def test_green_native_suite_proves_transitive_product_module_loading(self):
+        import flexfactor_evidence as ev
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            os.makedirs(os.path.join(tmp, "tests"))
+            with open(os.path.join(tmp, "src", "worker.js"), "w", encoding="utf-8") as fh:
+                fh.write("export function work() { return 1; }\n")
+            with open(os.path.join(tmp, "src", "api.js"), "w", encoding="utf-8") as fh:
+                fh.write("import { work } from './worker.js';\nexport function api() { return work(); }\n")
+            with open(os.path.join(tmp, "tests", "api.test.js"), "w", encoding="utf-8") as fh:
+                fh.write("import { api } from '../src/api.js';\ntest('api', () => api());\n")
+            index = ev.build_repository_index(tmp, "run")
+            ledger = ev.coverage_ledger(
+                index, run_id="run", test_command=["npm", "test"], tests_ran=True,
+                tests_passed=True, generated_test_modules=[], e2e={})
+        self.assertGreaterEqual(ledger["function_total"], 2)
+        self.assertEqual(ledger["function_module_execution_total"],
+                         ledger["function_total"])
+        self.assertNotIn("tests/api.test.js", {row["file"] for row in ledger["functions"]})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
