@@ -99,10 +99,19 @@ jobs:
         run: |
           python -m pip wheel . --no-deps --wheel-dir dist
           python -m pip install --force-reinstall --no-deps dist/*.whl
-          python - <<'PY'
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            python - <<'PY'
+          import pathlib
           import flexfactor
+
+          module_path = pathlib.Path(flexfactor.__file__).resolve()
           assert flexfactor.TOOL_VERSION == "0.4.1", flexfactor.TOOL_VERSION
+          assert "site-packages" in module_path.parts, module_path
+          print(f"installed wheel import: {module_path}")
           PY
+          )
       - name: Record SHA-256 checksums
         run: |
           python - <<'PY'
