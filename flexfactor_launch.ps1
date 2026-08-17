@@ -1,6 +1,13 @@
 # FlexFactor launcher - double-click the desktop icon, or drag a source file onto it.
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+# Python otherwise inherits the active Windows ANSI code page in some console
+# hosts. A worker printing an arrow/non-breaking hyphen then raises
+# UnicodeEncodeError and aborts that program lane. Pin both the interpreter and
+# its child-facing stream contract before any FlexFactor process is started.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 # ---- Route ALL model calls through the local FCC proxy (Free Claude Code, ----
 # ---- the same backend the "Claude Code - FREE (Ollama)" desktop shortcut  ----
@@ -352,16 +359,21 @@ if ($mode -eq "3") {
     $programArgs = @()
     foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
     # Preserve FREE-FIRST for local/auto runs, but paid mode is an explicit
-    # vendor choice. The launcher used to ask for a paid primary, validate the
-    # answer, then discard it here; choosing OpenAI could therefore launch
-    # Anthropic instead. Forward the selected provider in paid mode and keep the
-    # run single-provider so an OpenAI-only request cannot silently make paid
-    # calls to a second vendor.
+    # vendor choice. Forward the selected PRIMARY. When both paid credentials
+    # are present, keep the CLI's default dual-provider contract: the selected
+    # provider authors and the other independently cross-checks. The old code
+    # printed "both models" above, then appended --single here and silently
+    # disabled the promised cross-check.
     if ($selectedRuntimeMode -eq "paid") {
         $extraArgs += "--provider"
         $extraArgs += $primary
-        $extraArgs += "--single"
-        Write-Host "Paid audit: using only $primary, exactly as selected." -ForegroundColor Yellow
+        if ($haveAnthropic -and $haveOpenai) {
+            $secondary = if ($primary -eq "anthropic") { "openai" } else { "anthropic" }
+            Write-Host "Paid audit: $primary is primary; $secondary will independently cross-check." -ForegroundColor Yellow
+        } else {
+            $extraArgs += "--single"
+            Write-Host "Paid audit: only $primary is credentialed; running single-provider." -ForegroundColor Yellow
+        }
     }
 
     Write-Host ""
