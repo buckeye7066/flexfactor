@@ -1952,10 +1952,17 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
             incomplete={"new-pending.py"})
         self.assertEqual(pending, {"still-pending.py", "new-pending.py"})
 
-    def test_audit_requeues_persistent_incompletes_with_fixed_files(self):
+    def test_followup_scope_is_only_verified_changes_plus_incompletes(self):
+        self.assertEqual(
+            ff._next_cycle_review_paths(
+                ["src/actually-changed.py", "src/actually-changed.py"],
+                {"src/review-never-completed.py"}),
+            ["src/actually-changed.py", "src/review-never-completed.py"],
+        )
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn(
-            "list(fixable_files) + sorted(all_review_incomplete)", source)
+            "cycle_applied_files, all_review_incomplete", source)
+        self.assertNotIn("list(fixable_files) + sorted(all_review_incomplete)", source)
         self.assertIn(
             '"review_incomplete": len(all_review_incomplete)', source)
 
@@ -13235,6 +13242,59 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
         self.assertEqual(seen[0][0], "src/pages/Home.jsx")
         self.assertIn("called 1 times", seen[0][1])
         self.assertIn("do not weaken", seen[0][2].lower())
+
+    def test_default_repair_budget_follows_progress_beyond_four_failures(self):
+        with _tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "src")
+            os.makedirs(src)
+            logs = []
+            for number in range(1, 6):
+                rel = f"src/step{number}.js"
+                with open(os.path.join(td, *rel.split("/")), "w", encoding="utf-8") as fh:
+                    fh.write(f"export const step = {number};\n")
+                logs.append(
+                    f"FAIL {rel} > sequential baseline repair {number}\n"
+                    f"AssertionError: expected step {number} to pass"
+                )
+            targeted = []
+
+            def fake_fix(author, cross, project_dir, findings, *a, **k):
+                rel = next(iter(findings))
+                targeted.append(rel)
+                path = os.path.join(project_dir, *rel.split("/"))
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("// repaired\n")
+                return [rel], [], []
+
+            remaining = iter(logs[1:])
+            gates = {"count": 0}
+
+            def fake_gate(project_dir, stack):
+                gates["count"] += 1
+                if gates["count"] == 5:
+                    return True, "all green"
+                return False, next(remaining)
+
+            originals = ff._fix_files, ff._publication_gate
+            ff._fix_files = fake_fix
+            ff._publication_gate = fake_gate
+            try:
+                result = ff._repair_publication_failure(
+                    object(), object(), td, {}, True,
+                    type("Args", (), {
+                        "adversarial": True,
+                        "adversarial_rounds": 2,
+                        "adversarial_materiality": "material",
+                        "until_clean": True,
+                        "max_cycles": 3,
+                    })(),
+                    logs[0],
+                )
+            finally:
+                ff._fix_files, ff._publication_gate = originals
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(targeted, [f"src/step{number}.js" for number in range(1, 6)])
 
     def test_unresolved_repair_restores_only_its_target_files(self):
         with _tempfile.TemporaryDirectory() as td:

@@ -471,7 +471,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.3.9"
+TOOL_VERSION = "0.4.0"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -8014,6 +8014,20 @@ def _update_incomplete_review_ledger(pending: set[str], *, completed,
     pending.update(str(rel) for rel in incomplete)
 
 
+def _next_cycle_review_paths(changed_files, incomplete_files) -> list[str]:
+    """Build the only legitimate scope for a follow-up semantic pass.
+
+    Cycle 1 is the complete line-by-line sweep. A later cycle may re-read only
+    files whose verified candidate was actually applied in the immediately
+    preceding cycle. Merely finding a defect, attempting a fix, producing a
+    no-op, or rejecting/rolling back a candidate does not make that file part
+    of the next pass. The sole fail-closed exception is a review that never
+    completed: unproven files remain queued until a reviewer returns a verdict.
+    """
+    return _unique_review_paths(
+        list(changed_files) + sorted(str(rel) for rel in incomplete_files))
+
+
 def _gap_to_finding(g: dict) -> dict:
     """Map a purpose-gap item onto the audit finding shape so it flows through the
     same report/fix machinery as any other defect."""
@@ -8909,7 +8923,7 @@ def _publication_failure_finding(rel: str, gate_log: str) -> dict:
 def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
                                 baseline_ok: bool | None, args, gate_log: str,
                                 *, meter=None, oversized=None, report=None,
-                                max_rounds: int = 4) -> dict:
+                                max_rounds: int | None = None) -> dict:
     """Repair an already-red required suite before the generic defect sweep.
 
     The previous pipeline learned about a red project suite only at commit time,
@@ -8922,19 +8936,48 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
     current_log = str(gate_log or "")
     snapshots: dict[str, str] = {}
     attempts: dict[str, int] = {}
+    state_attempts: dict[tuple[str, str], int] = {}
     applied: list[str] = []
     notes: list[str] = []
     fingerprints: set[str] = set()
     last_paths: list[str] = []
 
-    for round_no in range(1, max(1, int(max_rounds)) + 1):
+    if max_rounds is None:
+        configured_cycles = (
+            getattr(args, "max_cycles", 12)
+            if getattr(args, "until_clean", True)
+            else getattr(args, "cycles", 3)
+        )
+        # A newly repaired failure can expose the next failing test. Give each
+        # configured semantic cycle room for an implementation and test target,
+        # while retaining a hard safety ceiling. Repeated identical states stop
+        # earlier through `state_attempts`; the ceiling is not the convergence
+        # signal.
+        round_cap = max(4, min(24, max(1, int(configured_cycles)) * 2))
+    else:
+        round_cap = max(1, int(max_rounds))
+
+    for round_no in range(1, round_cap + 1):
         paths = _publication_failure_paths(project_dir, current_log) or last_paths
         last_paths = paths
-        eligible = [p for p in paths if attempts.get(p, 0) < 2]
+        failure_fingerprint = hashlib.sha256(
+            "\n".join(current_log.split()).encode("utf-8", "replace")
+        ).hexdigest()
+        eligible = [
+            p for p in paths
+            if state_attempts.get((p, failure_fingerprint), 0) < 2
+        ]
         if not eligible:
-            notes.append("publication failure did not name another repairable source file")
+            notes.append(
+                "publication failure made no progress and did not name another repairable source file"
+            )
             break
-        rel = min(eligible, key=lambda p: (attempts.get(p, 0), paths.index(p)))
+        rel = min(
+            eligible,
+            key=lambda p: (state_attempts.get((p, failure_fingerprint), 0), paths.index(p)),
+        )
+        state_attempts[(rel, failure_fingerprint)] = \
+            state_attempts.get((rel, failure_fingerprint), 0) + 1
         attempts[rel] = attempts.get(rel, 0) + 1
         if rel not in snapshots:
             before = _read_contained(project_dir, rel)
@@ -8943,7 +8986,7 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
                 continue
             snapshots[rel] = before
         finding = _publication_failure_finding(rel, current_log)
-        print(f"  [baseline-repair] round {round_no}/{max_rounds}: targeting {rel} "
+        print(f"  [baseline-repair] round {round_no}/{round_cap}: targeting {rel} "
               "from the exact failing publication output")
         try:
             fixed, _unverified, fix_notes = _fix_files(
@@ -8971,7 +9014,7 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
         ).hexdigest()
         if fingerprint in fingerprints:
             notes.append(f"{rel}: identical publication failure repeated; changing target")
-            attempts[rel] = 2
+            state_attempts[(rel, fingerprint)] = 2
         fingerprints.add(fingerprint)
         current_log = str(next_log or current_log)
 
@@ -12058,7 +12101,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             unreadable: set[str] = set()
             reviewed_clean: dict[str, str] = {}
             review_incomplete: set[str] = set()
-            fixable_files: list[str] = []   # every batch's fix candidates this cycle
+            cycle_applied_files: list[str] = []  # verified byte changes in this cycle only
             any_fixable_this_cycle = False  # did ANY batch have a fixable file?
             any_applied_this_cycle = False  # did ANY batch's fix call actually apply something?
             cycle_stopped = False           # a hard-stop fired mid-cycle -> stop the whole run
@@ -12224,7 +12267,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     cycle_stopped = True
                     break
 
-                fixable_files.extend(batch_fixable)
+                cycle_applied_files = _unique_review_paths(
+                    cycle_applied_files + list(applied_c))
                 applied_set |= set(applied_c)
                 unverified_set |= set(unver_c)
                 fix_notes += notes_c
@@ -12309,11 +12353,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 stop_reason = "remaining defects not auto-fixable (see report notes)"
                 break
 
-            # Shrink to verified fixes plus every still-unproven review. A
-            # cycle-1 provider/evidence failure must not disappear when cycle 2
-            # narrows to files that were fixed.
-            files = _unique_review_paths(
-                list(fixable_files) + sorted(all_review_incomplete))
+            # Cycle 1 covered the entire codebase. Every follow-up is an exact
+            # delta pass: only verified files whose bytes changed THIS cycle.
+            # Rejected/no-op candidates are not requeued. Unproven reviews are
+            # the explicit fail-closed exception and remain until completed.
+            files = _next_cycle_review_paths(
+                cycle_applied_files, all_review_incomplete)
 
         applied_files = sorted(applied_set)
         unverified_files = sorted(unverified_set)
