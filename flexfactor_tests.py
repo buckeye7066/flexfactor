@@ -13183,5 +13183,148 @@ class DashboardNoConsoleWindowTests(unittest.TestCase):
         self.assertIn("pythonw.exe", src)
 
 
+class RedPublicationBaselineRepairTests(unittest.TestCase):
+    """Regression for the live SermonSmith loop of 2026-08-17."""
+
+    _LOG = r"""
+ FAIL  src/pages/Home.test.jsx > public Home > logs a Home view only after AuthContext resolves a signed-in user
+ AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times
+  ❯ src/pages/Home.test.jsx:81:25
+ """
+
+    def _project(self, root):
+        pages = os.path.join(root, "src", "pages")
+        os.makedirs(pages)
+        with open(os.path.join(pages, "Home.jsx"), "w", encoding="utf-8") as fh:
+            fh.write("export default function Home() { return null; }\n")
+        with open(os.path.join(pages, "Home.test.jsx"), "w", encoding="utf-8") as fh:
+            fh.write("import Home from './Home';\nexpect(Home).toBeDefined();\n")
+
+    def test_failing_test_targets_imported_product_module_before_the_test(self):
+        with _tempfile.TemporaryDirectory() as td:
+            self._project(td)
+            paths = ff._publication_failure_paths(td, self._LOG)
+        self.assertEqual(paths[:2], ["src/pages/Home.jsx", "src/pages/Home.test.jsx"])
+
+    def test_targeted_repair_receives_exact_failure_and_stops_when_green(self):
+        with _tempfile.TemporaryDirectory() as td:
+            self._project(td)
+            seen = []
+
+            def fake_fix(author, cross, project_dir, findings, *a, **k):
+                rel, rows = next(iter(findings.items()))
+                seen.append((rel, rows[0]["problem"], rows[0]["fix"]))
+                path = os.path.join(project_dir, *rel.split("/"))
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("// repaired\n")
+                return [rel], [], []
+
+            originals = ff._fix_files, ff._publication_gate
+            ff._fix_files = fake_fix
+            ff._publication_gate = lambda pd, st: (True, "all green")
+            try:
+                result = ff._repair_publication_failure(
+                    object(), object(), td, {}, True,
+                    type("Args", (), {"adversarial": True,
+                                      "adversarial_rounds": 2,
+                                      "adversarial_materiality": "material"})(),
+                    self._LOG)
+            finally:
+                ff._fix_files, ff._publication_gate = originals
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen[0][0], "src/pages/Home.jsx")
+        self.assertIn("called 1 times", seen[0][1])
+        self.assertIn("do not weaken", seen[0][2].lower())
+
+    def test_unresolved_repair_restores_only_its_target_files(self):
+        with _tempfile.TemporaryDirectory() as td:
+            self._project(td)
+            home = os.path.join(td, "src", "pages", "Home.jsx")
+            unrelated = os.path.join(td, "owner-work.txt")
+            with open(unrelated, "w", encoding="utf-8") as fh:
+                fh.write("preserve me")
+            with open(home, encoding="utf-8") as fh:
+                before = fh.read()
+
+            def fake_fix(author, cross, project_dir, findings, *a, **k):
+                rel = next(iter(findings))
+                path = os.path.join(project_dir, *rel.split("/"))
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("// still wrong\n")
+                return [rel], [], []
+
+            originals = ff._fix_files, ff._publication_gate
+            ff._fix_files = fake_fix
+            ff._publication_gate = lambda pd, st: (False, self._LOG)
+            try:
+                result = ff._repair_publication_failure(
+                    object(), object(), td, {}, True,
+                    type("Args", (), {"adversarial": True,
+                                      "adversarial_rounds": 2,
+                                      "adversarial_materiality": "material"})(),
+                    self._LOG, max_rounds=2)
+            finally:
+                ff._fix_files, ff._publication_gate = originals
+            with open(home, encoding="utf-8") as fh:
+                after = fh.read()
+            with open(unrelated, encoding="utf-8") as fh:
+                owner_work = fh.read()
+        self.assertFalse(result["ok"])
+        self.assertEqual(after, before)
+        self.assertEqual(owner_work, "preserve me")
+
+    def test_baseline_uses_full_publication_suite_not_build_only(self):
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("_publication_gate_after_build", src)
+        self.assertIn("_repair_publication_failure", src)
+        self.assertIn("unrelated review was not started", src)
+
+
+class WindowsConsoleUtf8RegressionTests(unittest.TestCase):
+    def test_cli_reconfigures_legacy_streams_before_workers_start(self):
+        class LegacyStream:
+            def __init__(self):
+                self.encoding = "cp1252"
+                self.errors = "strict"
+                self.text = ""
+
+            def reconfigure(self, *, encoding, errors):
+                self.encoding, self.errors = encoding, errors
+
+            def write(self, value):
+                value.encode(self.encoding, self.errors)
+                self.text += value
+                return len(value)
+
+            def flush(self):
+                pass
+
+        fake_out, fake_err = LegacyStream(), LegacyStream()
+        real_out, real_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout, sys.stderr = fake_out, fake_err
+            ff._configure_utf8_stdio()
+            print("repair target → complete")
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+        self.assertEqual(fake_out.encoding, "utf-8")
+        self.assertIn("→", fake_out.text)
+
+    def test_launcher_pins_utf8_and_keeps_paid_cross_check_when_both_exist(self):
+        with open(os.path.join(_HERE, "flexfactor_launch.ps1"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('$env:PYTHONUTF8 = "1"', src)
+        self.assertIn('$env:PYTHONIOENCODING = "utf-8"', src)
+        self.assertNotIn("Paid audit: using only", src)
+        self.assertIn("will independently cross-check", src)
+        # --single remains valid only in the one-credential else branch.
+        paid_start = src.index('if ($selectedRuntimeMode -eq "paid")',
+                               src.index("Build a repeatable --program list"))
+        paid = src[paid_start:]
+        both_start = paid.index('if ($haveAnthropic -and $haveOpenai)')
+        both = paid[both_start:paid.index('} else {', both_start)]
+        self.assertNotIn('--single', both)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
