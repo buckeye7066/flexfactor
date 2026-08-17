@@ -470,8 +470,8 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # Bump when the CLEAN-FILE memory semantics change (what "clean" means / how it's
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
-POLICY_VERSION = "2026-08-16"
-TOOL_VERSION = "0.4.0"
+POLICY_VERSION = "2026-08-17"
+TOOL_VERSION = "0.4.1"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -8014,6 +8014,45 @@ def _update_incomplete_review_ledger(pending: set[str], *, completed,
     pending.update(str(rel) for rel in incomplete)
 
 
+def _update_unresolved_fix_ledger(pending: dict[str, list[dict]], *,
+                                  findings: dict[str, list[dict]], clean,
+                                  min_severity: str) -> None:
+    """Keep serious findings until a later semantic review proves them gone.
+
+    Follow-up cycles deliberately review only the files changed by the immediately
+    preceding cycle. That optimization must not erase a finding in some *other*
+    file merely because its candidate was rejected, rolled back, timed out, or was
+    a no-op. A completed later review replaces the prior verdict for that file;
+    an incomplete/unreadable review is absent from both inputs and therefore cannot
+    clear anything.
+    """
+    for rel in clean:
+        pending.pop(str(rel), None)
+    for rel, rows in findings.items():
+        key = str(rel)
+        serious = [dict(row) for row in rows
+                   if should_fix_finding(row, min_severity)]
+        if serious:
+            pending[key] = serious
+        else:
+            pending.pop(key, None)
+
+
+def _flatten_unresolved_fix_ledger(pending: dict[str, list[dict]]) -> list[dict]:
+    """Return a stable, detached finding list for reports/evidence."""
+    return [dict(finding)
+            for rel in sorted(pending)
+            for finding in pending[rel]]
+
+
+def _merge_unresolved_file_findings(current: dict[str, list[dict]],
+                                     pending: dict[str, list[dict]]) -> None:
+    """Reattach serious findings without dropping the current review's lows."""
+    for rel, rows in pending.items():
+        current[rel] = _dedupe_findings(
+            list(current.get(rel) or []) + [dict(row) for row in rows])
+
+
 def _next_cycle_review_paths(changed_files, incomplete_files) -> list[str]:
     """Build the only legitimate scope for a follow-up semantic pass.
 
@@ -8957,6 +8996,13 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
     else:
         round_cap = max(1, int(max_rounds))
 
+    # A noisy test runner can put timestamps, temp paths, ports, or random ids in
+    # every log. The full-log fingerprint then changes forever even when the same
+    # repair target makes no progress. Keep the useful state-specific retry, but
+    # also impose a stable per-target ceiling and prefer the least-attempted
+    # implicated path so the first path cannot starve every later one.
+    target_attempt_cap = max(2, min(8, round_cap))
+
     for round_no in range(1, round_cap + 1):
         paths = _publication_failure_paths(project_dir, current_log) or last_paths
         last_paths = paths
@@ -8965,7 +9011,8 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
         ).hexdigest()
         eligible = [
             p for p in paths
-            if state_attempts.get((p, failure_fingerprint), 0) < 2
+            if (state_attempts.get((p, failure_fingerprint), 0) < 2
+                and attempts.get(p, 0) < target_attempt_cap)
         ]
         if not eligible:
             notes.append(
@@ -8974,7 +9021,9 @@ def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
             break
         rel = min(
             eligible,
-            key=lambda p: (state_attempts.get((p, failure_fingerprint), 0), paths.index(p)),
+            key=lambda p: (attempts.get(p, 0),
+                           state_attempts.get((p, failure_fingerprint), 0),
+                           paths.index(p)),
         )
         state_attempts[(rel, failure_fingerprint)] = \
             state_attempts.get((rel, failure_fingerprint), 0) + 1
@@ -11642,6 +11691,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # final report. This keeps every file's most-recent findings so the lows
         # inventory is complete repo-wide.
         latest_findings_by_file: dict[str, list[dict]] = {}
+        # Serious findings stay open until a later completed semantic review of
+        # that exact file returns clean/below-floor. Merely attempting a fix is
+        # not evidence that it worked, and an unrelated delta-only cycle must not
+        # make a rejected/no-op finding disappear.
+        unresolved_fix_findings: dict[str, list[dict]] = {}
         MAX_FIX_ATTEMPTS = 3
         total_to_review = len(files)
         cycles_run = 0
@@ -12157,6 +12211,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     all_review_incomplete,
                     completed=set(b_findings) | set(b_clean),
                     incomplete=b_incomplete)
+                _update_unresolved_fix_ledger(
+                    unresolved_fix_findings,
+                    findings=b_findings,
+                    clean=b_clean,
+                    min_severity=args.fix_severity)
                 if failed_review_batches >= 3:
                     stop_reason = (
                         "provider outage: three consecutive semantic review batches "
@@ -12333,6 +12392,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                    "file(s) never got a completed review "
                                    "(provider error/budget) - NOT clean")
                     converged = False
+                elif unresolved_fix_findings:
+                    # These findings came from completed reviews, but no later
+                    # completed review proved them resolved. Most commonly this
+                    # is a rejected/no-op/rolled-back candidate in a file that is
+                    # correctly outside the next changed-files-only scope.
+                    print(f"{pfx}NOT converged: {len(unresolved_fix_findings)} file(s) "
+                          "still have fixable findings without a verified clean "
+                          "follow-up review.")
+                    stop_reason = (
+                        f"unresolved fixable findings remain in "
+                        f"{len(unresolved_fix_findings)} file(s); no later semantic "
+                        "review proved them resolved - NOT clean")
+                    converged = False
                 elif manual_review:
                     print(f"{pfx}STOP: {len(manual_review)} file(s) still flag critical/high after "
                           f"{MAX_FIX_ATTEMPTS} attempts - set aside for manual review (no infinite loop)")
@@ -12350,7 +12422,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # rejected / not auto-fixable). Re-reviewing the same files would just
                 # loop, so stop.
                 print(f"{pfx}stopping: remaining defects could not be auto-fixed this cycle")
-                stop_reason = "remaining defects not auto-fixable (see report notes)"
+                stop_reason = (
+                    f"{len(unresolved_fix_findings)} file(s) retain unresolved "
+                    "fixable findings; candidates were not safely applied "
+                    "(see report notes)"
+                    if unresolved_fix_findings else
+                    "remaining defects not auto-fixable (see report notes)")
                 break
 
             # Cycle 1 covered the entire codebase. Every follow-up is an exact
@@ -12359,6 +12436,23 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # the explicit fail-closed exception and remain until completed.
             files = _next_cycle_review_paths(
                 cycle_applied_files, all_review_incomplete)
+
+        # Reattach findings that were outside a later changed-files-only pass.
+        # This happens before purpose/readiness/evidence phases so every consumer
+        # sees the truthful open-defect set instead of only the final cycle's
+        # narrow delta. Dedupe handles a finding also present in the current flat list.
+        unresolved_findings = _flatten_unresolved_fix_ledger(
+            unresolved_fix_findings)
+        if unresolved_findings:
+            all_findings = _dedupe_findings(
+                list(all_findings) + unresolved_findings)
+            _merge_unresolved_file_findings(
+                file_findings, unresolved_fix_findings)
+            converged = False
+            if stop_reason == "converged: found == fixed":
+                stop_reason = (
+                    f"unresolved fixable findings remain in "
+                    f"{len(unresolved_fix_findings)} file(s) - NOT clean")
 
         applied_files = sorted(applied_set)
         unverified_files = sorted(unverified_set)
@@ -13102,6 +13196,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
             "fix_severity": args.fix_severity, "manual_review": sorted(manual_review),
+            "unresolved_files": sorted(unresolved_fix_findings),
+            "unresolved_findings": len(unresolved_findings),
             "low_findings": low_findings, "readiness": readiness,
             "bootstrap": result.get("bootstrap") or [],
             "ecosystems": stack.get("ecosystems") or [],
@@ -13205,6 +13301,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
             review_incomplete=len(all_review_incomplete),
+            unresolved_findings=len(unresolved_findings),
             evidence_run_id=evidence_run_id,
             evidence_paths=evidence_paths,
             quality_gate_passed=((evidence or {}).get("quality_gates") or {}).get("passed"),
@@ -13226,6 +13323,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "commit_status": commit_status, "oversized_files": sorted(set(oversized)),
             "converged": converged, "stop_reason": stop_reason, "suite_status": suite_status,
             "low_open": len(low_findings),
+            "unresolved_findings": len(unresolved_findings),
             # Compact low inventory so a later run can recall what's outstanding
             # without re-reviewing (kept small: file/line/severity/title only).
             "low_findings": [{"file": f.get("file"), "line": f.get("line"),
@@ -13687,6 +13785,8 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "files_reviewed": a.get("files_reviewed"),
         "applied_files": list(a.get("applied_files") or []),
         "unverified_files": list(a.get("unverified_files") or []),
+        "unresolved_files": list(a.get("unresolved_files") or []),
+        "unresolved_findings": int(a.get("unresolved_findings") or 0),
         "test_files": list(a.get("test_files") or []),
         "commit_status": a.get("commit_status"),
         "stop_reason": a.get("stop_reason"),
@@ -14024,13 +14124,16 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     # that could not be safely fixed). This is the curated "to-review" list.
     floor = SEVERITY_RANK.get(str(a.get("fix_severity", "high")).lower(), 3)
     applied = set(a.get("applied_files") or [])
+    unresolved = set(a.get("unresolved_files") or [])
     remaining: dict[str, list[dict]] = {}
     for f in a["findings"]:
         if f.get("file") in ("(e2e)", "(unit tests)", "(full suite)", "(readiness)"):
             continue
         rank = SEVERITY_RANK.get(str(f.get("severity")).lower(), 0)
         below_floor = rank < floor
-        unfixed_serious = rank >= floor and f.get("file") not in applied
+        unfixed_serious = (rank >= floor
+                           and (f.get("file") not in applied
+                                or f.get("file") in unresolved))
         if below_floor or unfixed_serious:
             remaining.setdefault(str(f.get("severity", "?")).lower(), []).append(f)
     L += [f"## Remaining defects NOT auto-fixed (fix floor = {a.get('fix_severity', 'high')})", "",
@@ -14057,8 +14160,11 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if not a["file_findings"]:
         L += ["_No defects found in the reviewed files._", ""]
     for rel, findings in a["file_findings"].items():
-        fixed = rel in a["applied_files"]
-        L.append(f"### `{rel}` {'✅ fixed' if fixed else '⚠️ reported'}")
+        fixed = rel in a["applied_files"] and rel not in unresolved
+        label = ("✅ fixed" if fixed else
+                 "⚠️ changed; resolution unverified"
+                 if rel in a["applied_files"] else "⚠️ reported")
+        L.append(f"### `{rel}` {label}")
         for f in sorted(findings, key=lambda x: -SEVERITY_RANK.get(str(x.get('severity')).lower(), 0)):
             L.append(f"- **[{f.get('severity')}]** line {f.get('line')} "
                      f"({f.get('category')}) — **{f.get('title')}**: {f.get('problem')} "

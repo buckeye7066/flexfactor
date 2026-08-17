@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +99,13 @@ def _no_network_opener(*a, **k):
 
 _ffc._default_opener = _no_network_opener
 ff._server_is_up = lambda url, timeout=1.5: False
+
+
+class ReleaseIdentityTests(unittest.TestCase):
+    def test_packaged_and_runtime_versions_match(self):
+        with open(os.path.join(_HERE, "pyproject.toml"), "rb") as fh:
+            package_version = tomllib.load(fh)["project"]["version"]
+        self.assertEqual(package_version, ff.TOOL_VERSION)
 
 
 class TestSessionIsolationTests(unittest.TestCase):
@@ -1965,6 +1973,65 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
         self.assertNotIn("list(fixable_files) + sorted(all_review_incomplete)", source)
         self.assertIn(
             '"review_incomplete": len(all_review_incomplete)', source)
+
+    @staticmethod
+    def _finding(rel, severity="high", title="still broken"):
+        return {"file": rel, "line": 7, "severity": severity,
+                "title": title, "problem": "observable failure", "fix": "repair it"}
+
+    def test_serious_finding_survives_unrelated_delta_cycle_until_re_reviewed(self):
+        pending = {}
+        a = self._finding("src/applied.py")
+        b = self._finding("src/rejected.py")
+        ff._update_unresolved_fix_ledger(
+            pending,
+            findings={"src/applied.py": [a], "src/rejected.py": [b]},
+            clean={},
+            min_severity="high")
+        self.assertEqual(set(pending), {"src/applied.py", "src/rejected.py"})
+
+        # Cycle 2 is correctly scoped only to the actually changed file. Its
+        # clean verdict clears itself; the rejected/no-op file was not reviewed,
+        # so its serious cycle-1 finding must remain open.
+        ff._update_unresolved_fix_ledger(
+            pending,
+            findings={},
+            clean={"src/applied.py": "reviewed-sha"},
+            min_severity="high")
+        self.assertEqual(set(pending), {"src/rejected.py"})
+        self.assertEqual(
+            ff._flatten_unresolved_fix_ledger(pending)[0]["title"],
+            "still broken")
+
+    def test_completed_below_floor_verdict_clears_an_old_serious_finding(self):
+        pending = {"src/a.py": [self._finding("src/a.py")]}
+        ff._update_unresolved_fix_ledger(
+            pending,
+            findings={"src/a.py": [self._finding(
+                "src/a.py", severity="low", title="minor only")]},
+            clean={},
+            min_severity="high")
+        self.assertEqual(pending, {})
+
+    def test_reattachment_preserves_current_low_and_open_serious_findings(self):
+        low = self._finding("src/a.py", severity="low", title="minor issue")
+        serious = self._finding("src/a.py", title="still broken")
+        current = {"src/a.py": [low]}
+        ff._merge_unresolved_file_findings(
+            current, {"src/a.py": [serious, serious]})
+        self.assertEqual(
+            {(row["severity"], row["title"]) for row in current["src/a.py"]},
+            {("low", "minor issue"), ("high", "still broken")})
+
+    def test_audit_wires_unresolved_ledger_into_convergence_and_final_report(self):
+        source = inspect.getsource(ff.audit_one_program)
+        for needle in (
+                "_update_unresolved_fix_ledger(",
+                "_flatten_unresolved_fix_ledger(",
+                "_merge_unresolved_file_findings(",
+                '"unresolved_files": sorted(unresolved_fix_findings)',
+                "unresolved fixable findings remain in"):
+            self.assertIn(needle, source)
 
 
 class CommitFailureIsFatalTests(unittest.TestCase):
@@ -12456,6 +12523,24 @@ class CompetitorAuditWiringTests(unittest.TestCase):
             with open(ff._write_audit_report(root, audit), encoding="utf-8") as fh:
                 return fh.read()
 
+    def test_applied_but_not_reverified_finding_is_reported_as_unresolved(self):
+        finding = {
+            "file": "src/a.py", "line": 3, "severity": "high",
+            "category": "correctness", "title": "still open",
+            "problem": "the candidate was a no-op", "fix": "repair behavior",
+        }
+        text = self._report_text(
+            findings=[finding],
+            file_findings={"src/a.py": [finding]},
+            applied_files=["src/a.py"],
+            unresolved_files=["src/a.py"],
+            unresolved_findings=1,
+            converged=False,
+            stop_reason="unresolved fixable finding")
+        self.assertIn("changed; resolution unverified", text)
+        self.assertIn("### high (1)", text)
+        self.assertNotIn("every reported defect at or above the floor was fixed", text)
+
     def test_a_missing_competitor_section_is_reported_as_a_gap(self):
         text = self._report_text(competitor_research=None, competitors_enabled=True)
         self.assertIn("## Competitor research", text)
@@ -13295,6 +13380,87 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(targeted, [f"src/step{number}.js" for number in range(1, 6)])
+
+    def test_volatile_logs_cannot_starve_later_implicated_paths(self):
+        with _tempfile.TemporaryDirectory() as td:
+            self._project(td)
+            targeted = []
+
+            def fake_fix(author, cross, project_dir, findings, *a, **k):
+                rel = next(iter(findings))
+                targeted.append(rel)
+                path = os.path.join(project_dir, *rel.split("/"))
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write("// attempted repair\n")
+                return [rel], [], []
+
+            gates = {"count": 0}
+
+            def noisy_red_gate(project_dir, stack):
+                gates["count"] += 1
+                return False, self._LOG + f"\nrun-id={gates['count']}"
+
+            originals = ff._fix_files, ff._publication_gate
+            ff._fix_files = fake_fix
+            ff._publication_gate = noisy_red_gate
+            try:
+                result = ff._repair_publication_failure(
+                    object(), object(), td, {}, True,
+                    type("Args", (), {
+                        "adversarial": True,
+                        "adversarial_rounds": 2,
+                        "adversarial_materiality": "material",
+                    })(),
+                    self._LOG + "\nrun-id=0",
+                    max_rounds=6)
+            finally:
+                ff._fix_files, ff._publication_gate = originals
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            targeted[:4],
+            ["src/pages/Home.jsx", "src/pages/Home.test.jsx",
+             "src/pages/Home.jsx", "src/pages/Home.test.jsx"])
+
+    def test_one_volatile_target_has_a_stable_attempt_ceiling(self):
+        with _tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "src"))
+            rel = "src/solo.js"
+            with open(os.path.join(td, "src", "solo.js"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("export const solo = true;\n")
+            targeted = []
+
+            def fake_fix(author, cross, project_dir, findings, *a, **k):
+                targeted.append(next(iter(findings)))
+                return [rel], [], []
+
+            gates = {"count": 0}
+
+            def noisy_red_gate(project_dir, stack):
+                gates["count"] += 1
+                return (False, f"FAIL {rel} > still red\n"
+                               f"timestamp={gates['count']}")
+
+            originals = ff._fix_files, ff._publication_gate
+            ff._fix_files = fake_fix
+            ff._publication_gate = noisy_red_gate
+            try:
+                result = ff._repair_publication_failure(
+                    object(), object(), td, {}, True,
+                    type("Args", (), {
+                        "adversarial": True,
+                        "adversarial_rounds": 2,
+                        "adversarial_materiality": "material",
+                    })(),
+                    f"FAIL {rel} > still red\ntimestamp=0",
+                    max_rounds=24)
+            finally:
+                ff._fix_files, ff._publication_gate = originals
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(targeted, [rel] * 8)
+        self.assertEqual(result["attempted"], {rel: 8})
 
     def test_unresolved_repair_restores_only_its_target_files(self):
         with _tempfile.TemporaryDirectory() as td:

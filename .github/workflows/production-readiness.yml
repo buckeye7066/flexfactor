@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -86,3 +90,57 @@ jobs:
             flexfactor_tests.AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed \
             flexfactor_tests.AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit \
             -v
+
+  package-artifact:
+    name: package-artifact
+    needs: [windows-tests, linux-containment]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build exact-commit wheel
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            python - <<'PY'
+          import pathlib
+          from importlib.metadata import version
+          import flexfactor
+
+          module_path = pathlib.Path(flexfactor.__file__).resolve()
+          assert version("flexfactor") == "0.4.1", version("flexfactor")
+          assert flexfactor.TOOL_VERSION == "0.4.1", flexfactor.TOOL_VERSION
+          assert "site-packages" in module_path.parts, module_path
+          print(f"installed wheel import: {module_path}")
+          PY
+          )
+      - name: Record SHA-256 checksums
+        run: |
+          python - <<'PY'
+          import glob
+          import hashlib
+          from pathlib import Path
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if not wheels:
+              raise SystemExit("wheel build produced no artifact")
+          lines = []
+          for filename in wheels:
+              digest = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+              lines.append(f"{digest}  {Path(filename).name}")
+          Path("dist/SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+      - name: Upload exact-commit release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexfactor-0.4.1-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
