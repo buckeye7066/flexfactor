@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   apply:
+    if: github.event.head_commit.message == 'chore: execute exact-base FlexFactor patch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,14 +24,12 @@ jobs:
         run: |
           git apply --check flexfactor-production-ready.patch
           git apply flexfactor-production-ready.patch
-          rm flexfactor-production-ready.patch
-          rm .github/workflows/flexfactor-self-apply.yml
           git diff --check
           python -m py_compile flexfactor.py flexfactor_tests.py
       - name: Commit verified staging result
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add flexfactor.py flexfactor_tests.py
           git commit -m "fix(audit): preserve unresolved findings and bound baseline repair"
           git push origin "HEAD:${GITHUB_REF_NAME}"
