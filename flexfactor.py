@@ -64,6 +64,31 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+
+def _configure_utf8_stdio() -> None:
+    """Make every audit worker safe on legacy Windows console code pages.
+
+    PowerShell's ``[Console]::OutputEncoding`` controls the console host, not
+    necessarily Python's already-created ``sys.stdout``/``sys.stderr`` wrappers.
+    A worker printing a model/test message containing an arrow or non-breaking
+    hyphen therefore used to raise ``UnicodeEncodeError`` under cp1252 and abort
+    an otherwise recoverable program lane.  Reconfigure the process streams at
+    the CLI boundary, before any worker threads are created.  Embedders and test
+    harnesses that provide streams without ``reconfigure`` remain untouched.
+    """
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            # Closed/replaced streams are owned by the embedder.  Output safety
+            # must not make importing or embedding FlexFactor fail.
+            continue
+
 # Command classification + policy gate for the _run subprocess chokepoint.
 # Sibling module (same directory); a HARD import on purpose - silently running
 # without the policy gate would fail open.
@@ -8712,6 +8737,27 @@ def _full_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     return True, "\n\n".join(logs)
 
 
+def _publication_gate_after_build(project_dir: str, stack: dict,
+                                  build_ok: bool | None,
+                                  build_log: str) -> tuple[bool | None, str]:
+    """Finish publication verification from an already-computed build result.
+
+    Baseline diagnosis needs both the build verdict and the complete-suite
+    verdict.  Separating the second half prevents an expensive duplicate build
+    merely to learn that the repository's tests were already red.
+    """
+    if build_ok is not True:
+        return build_ok, build_log
+    suite_cmd = stack.get("full_suite_cmd") or stack.get("test_cmd")
+    if not suite_cmd:
+        return True, build_log + "\n\n(no project test suite configured)"
+    print(f"    publication verify: {' '.join(suite_cmd)}")
+    r = _run(suite_cmd, project_dir, timeout=2400)
+    suite_log = (f"$ {' '.join(suite_cmd)}\n"
+                 f"{_tail(r.stdout + chr(10) + r.stderr, 80)}")
+    return (r.returncode == 0, build_log + "\n\n" + suite_log)
+
+
 def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     """Verify the exact tree strongly enough to publish it.
 
@@ -8729,16 +8775,214 @@ def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     defined-but-red suite is a hard publication failure.
     """
     build_ok, build_log = _full_gate(project_dir, stack)
-    if build_ok is not True:
-        return build_ok, build_log
-    suite_cmd = stack.get("full_suite_cmd") or stack.get("test_cmd")
-    if not suite_cmd:
-        return True, build_log + "\n\n(no project test suite configured)"
-    print(f"    publication verify: {' '.join(suite_cmd)}")
-    r = _run(suite_cmd, project_dir, timeout=2400)
-    suite_log = (f"$ {' '.join(suite_cmd)}\n"
-                 f"{_tail(r.stdout + chr(10) + r.stderr, 80)}")
-    return (r.returncode == 0, build_log + "\n\n" + suite_log)
+    return _publication_gate_after_build(project_dir, stack, build_ok, build_log)
+
+
+_FAILURE_SOURCE_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:[\\/][^:\r\n\"'<>|]*?|"
+    r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?)"
+    # Keep longer suffixes before their prefixes (``jsx`` before ``js`` and
+    # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
+    # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and
+    # silently discarded because that non-existent path could not be opened.
+    r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h))"
+    r"(?=:\d|[\s>]|$)(?::\d+){0,2}", re.IGNORECASE)
+_TEST_FILE_RE = re.compile(r"(?:\.(?:test|spec)\.|(?:^|/)__tests__/)", re.IGNORECASE)
+_SOURCE_EXTENSIONS = (".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".py")
+
+
+def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
+    """Resolve one path printed by a test runner back into this repository."""
+    raw = str(raw_path or "").strip().replace("\\", "/")
+    if raw.lower().startswith("file:///"):
+        raw = raw[8:]
+    root = os.path.abspath(project_dir)
+    candidate = raw
+    if os.path.isabs(candidate):
+        try:
+            candidate = os.path.relpath(candidate, root)
+        except ValueError:  # different Windows drive
+            return None
+    else:
+        candidate = candidate.lstrip("./")
+    candidate = _canon_rel(candidate)
+    if _read_text_and_sha(project_dir, candidate) is not None:
+        return candidate
+
+    # Some runners print an absolute-looking path after decorating the line
+    # ("FAIL ..." / stack-frame text).  Recover from the first conventional
+    # source-root segment, but still require a contained, existing file.
+    low = candidate.lower()
+    starts = [p for marker in ("apps/", "app/", "packages/", "src/", "tests/",
+                               "test/", "lib/")
+              if (p := low.find(marker)) >= 0]
+    for pos in sorted(starts):
+        suffix = _canon_rel(candidate[pos:])
+        if _read_text_and_sha(project_dir, suffix) is not None:
+            return suffix
+    return None
+
+
+def _test_import_candidates(project_dir: str, test_rel: str) -> list[str]:
+    """Find implementation modules explicitly imported by one failing test."""
+    text = _read_contained(project_dir, test_rel)
+    if text is None:
+        return []
+    refs = re.findall(
+        r"(?:\bfrom\s+|\brequire\s*\(\s*)['\"](\.{1,2}/[^'\"]+)['\"]",
+        text)
+    out: list[str] = []
+    base_dir = os.path.dirname(test_rel)
+    for ref in refs:
+        stem = _canon_rel(os.path.normpath(os.path.join(base_dir, ref)))
+        choices = [stem] if os.path.splitext(stem)[1] else []
+        choices += [stem + ext for ext in _SOURCE_EXTENSIONS]
+        choices += [_canon_rel(os.path.join(stem, "index" + ext))
+                    for ext in _SOURCE_EXTENSIONS]
+        for rel in choices:
+            if (_TEST_FILE_RE.search(rel) is None
+                    and _read_text_and_sha(project_dir, rel) is not None
+                    and rel not in out):
+                out.append(rel)
+    return out
+
+
+def _publication_failure_paths(project_dir: str, gate_log: str) -> list[str]:
+    """Rank implementation/test files implicated by exact publication output.
+
+    Product modules imported by a failing test come first.  The test itself is
+    a fallback and may only be corrected without weakening its assertions.  This
+    ordering prevents a repair model from masking a real product defect by
+    immediately editing the red test.
+    """
+    printed: list[str] = []
+    for match in _FAILURE_SOURCE_RE.finditer(str(gate_log or "")):
+        rel = _existing_failure_path(project_dir, match.group("path"))
+        if rel and rel not in printed:
+            printed.append(rel)
+    implementations: list[str] = []
+    tests: list[str] = []
+    for rel in printed:
+        if _TEST_FILE_RE.search(rel):
+            for impl in _test_import_candidates(project_dir, rel):
+                if impl not in implementations:
+                    implementations.append(impl)
+            # Conventional sibling fallback when a test has no parseable import.
+            sibling = re.sub(r"\.(?:test|spec)(?=\.[^.]+$)", "", rel,
+                             flags=re.IGNORECASE)
+            sibling = sibling.replace("/__tests__/", "/")
+            if (_read_text_and_sha(project_dir, sibling) is not None
+                    and sibling not in implementations):
+                implementations.append(sibling)
+            if rel not in tests:
+                tests.append(rel)
+        elif rel not in implementations:
+            implementations.append(rel)
+    return implementations + tests
+
+
+def _publication_failure_finding(rel: str, gate_log: str) -> dict:
+    log = _tail(str(gate_log or ""), 80)
+    is_test = bool(_TEST_FILE_RE.search(rel))
+    instruction = (
+        "Diagnose why this exact required publication test fails and correct the "
+        "underlying product behavior. Preserve and satisfy the test; do not weaken, "
+        "delete, skip, or loosen its assertions."
+        if not is_test else
+        "Correct this test only if its timing/setup is demonstrably wrong or "
+        "nondeterministic. Do not delete, skip, or weaken the assertion; retain the "
+        "same behavioral contract and make it test the real product behavior reliably."
+    )
+    return {
+        "severity": "critical",
+        "line": 1,
+        "title": "Required publication suite is red",
+        "problem": ("The repository's required publication command fails before any "
+                    "FlexFactor changes can be safely published. Exact failure output:\n"
+                    + log),
+        "fix": instruction,
+        "trigger": "Run the repository's configured publication test suite.",
+        "failure": "The suite exits non-zero, so every otherwise-valid repair is rejected.",
+    }
+
+
+def _repair_publication_failure(author, cross, project_dir: str, stack: dict,
+                                baseline_ok: bool | None, args, gate_log: str,
+                                *, meter=None, oversized=None, report=None,
+                                max_rounds: int = 4) -> dict:
+    """Repair an already-red required suite before the generic defect sweep.
+
+    The previous pipeline learned about a red project suite only at commit time,
+    restored the candidate tree, and then re-reviewed unrelated files.  This
+    bounded phase turns the *exact failing output* into the highest-priority
+    repair target, reruns the complete gate after each candidate, and restores
+    only files touched by this phase when it cannot converge.  No unrelated
+    dirty work is discarded.
+    """
+    current_log = str(gate_log or "")
+    snapshots: dict[str, str] = {}
+    attempts: dict[str, int] = {}
+    applied: list[str] = []
+    notes: list[str] = []
+    fingerprints: set[str] = set()
+    last_paths: list[str] = []
+
+    for round_no in range(1, max(1, int(max_rounds)) + 1):
+        paths = _publication_failure_paths(project_dir, current_log) or last_paths
+        last_paths = paths
+        eligible = [p for p in paths if attempts.get(p, 0) < 2]
+        if not eligible:
+            notes.append("publication failure did not name another repairable source file")
+            break
+        rel = min(eligible, key=lambda p: (attempts.get(p, 0), paths.index(p)))
+        attempts[rel] = attempts.get(rel, 0) + 1
+        if rel not in snapshots:
+            before = _read_contained(project_dir, rel)
+            if before is None:
+                notes.append(f"{rel}: contained baseline read refused")
+                continue
+            snapshots[rel] = before
+        finding = _publication_failure_finding(rel, current_log)
+        print(f"  [baseline-repair] round {round_no}/{max_rounds}: targeting {rel} "
+              "from the exact failing publication output")
+        try:
+            fixed, _unverified, fix_notes = _fix_files(
+                author, cross, project_dir, {rel: [finding]}, stack, baseline_ok,
+                args, meter=meter, oversized=oversized, report=report,
+                done_set=set(), total_overall=max(1, len(paths)), commit_cb=None,
+                adversarial=getattr(args, "adversarial", True),
+                adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                materiality=getattr(args, "adversarial_materiality", "material"))
+        except (BudgetExceededError, DirtyTreeError) as exc:
+            notes.append(f"{rel}: baseline repair aborted: {type(exc).__name__}: {exc}")
+            break
+        notes.extend(fix_notes)
+        if rel not in fixed:
+            notes.append(f"{rel}: no verified candidate was produced")
+            continue
+        if rel not in applied:
+            applied.append(rel)
+        gate_ok, next_log = _publication_gate(project_dir, stack)
+        if gate_ok is True:
+            return {"ok": True, "log": next_log, "applied": applied,
+                    "attempted": dict(attempts), "notes": notes}
+        fingerprint = hashlib.sha256(
+            "\n".join(str(next_log or "").split()).encode("utf-8", "replace")
+        ).hexdigest()
+        if fingerprint in fingerprints:
+            notes.append(f"{rel}: identical publication failure repeated; changing target")
+            attempts[rel] = 2
+        fingerprints.add(fingerprint)
+        current_log = str(next_log or current_log)
+
+    restore_failed: list[str] = []
+    for rel, original in snapshots.items():
+        if _replace_contained(project_dir, rel, original) is None:
+            restore_failed.append(rel)
+    if restore_failed:
+        raise DirtyTreeError(restore_failed)
+    return {"ok": False, "log": current_log, "applied": [],
+            "attempted": dict(attempts), "notes": notes}
 
 
 def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
@@ -11284,11 +11528,25 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         result["bootstrap"] = [
             {"cmd": " ".join(s.cmd), "cwd": s.cwd, "ok": s.ok} for s in bootstrap_results]
 
-        report(phase="baseline build gate")
-        baseline_ok, _ = _full_gate(project_dir, stack) if (stack.get("verify_cmds") or stack.get("fast_verify")) else (None, "")
+        report(phase="baseline publication gate")
+        has_baseline_build = bool(stack.get("verify_cmds") or stack.get("fast_verify"))
+        # Preserve the tri-state contract: no runnable build is UNVERIFIED
+        # (None), never a fabricated green or red result.
+        baseline_ok, baseline_build_log = (
+            _full_gate(project_dir, stack) if has_baseline_build else (None, ""))
+        if has_baseline_build:
+            baseline_publication_ok, baseline_publication_log = \
+                _publication_gate_after_build(
+                    project_dir, stack, baseline_ok, baseline_build_log)
+        else:
+            baseline_publication_ok, baseline_publication_log = None, ""
         if baseline_ok is False:
             print(f"{pfx}note: project does NOT build at baseline — fixes will be syntax-gated "
                   "and flagged 'unverified'. The audit still runs.")
+        elif baseline_publication_ok is False:
+            print(f"{pfx}BLOCKER: the project builds, but its required publication "
+                  "suite is RED at baseline. Repairing that exact failure before "
+                  "reviewing unrelated files.", file=sys.stderr)
         if not stack.get("verification_is_real", True):
             # Say it out loud. _full_gate returns True when it has no commands,
             # which reads as a pass; without this line the run would report a
@@ -11352,6 +11610,76 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         completed_review_files: set[str] = set()
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
+
+        # ================= PHASE 0: RED BASELINE FIRST ========================
+        # A full project suite that was already red used to be discovered only
+        # inside _commit_and_sync, after semantic review had generated unrelated
+        # changes. The publication gate correctly restored those changes, but
+        # the next cycle repeated the same work against the same red baseline.
+        # Repair the exact failing command/output first. If it cannot be repaired
+        # in a bounded number of targeted attempts, stop with exit 3 instead of
+        # spending the rest of the run (or supervisor retries) on unrelated code.
+        if baseline_publication_ok is False:
+            report(phase="repairing red baseline publication suite")
+            if checkpoint is not None:
+                checkpoint.set_phase("repairing red baseline publication suite")
+            repair = _repair_publication_failure(
+                author, cross, project_dir, stack, baseline_ok, args,
+                baseline_publication_log, meter=meter, oversized=oversized,
+                report=report)
+            fix_notes.extend(repair.get("notes") or [])
+            if repair.get("ok"):
+                repaired = list(repair.get("applied") or [])
+                applied_set.update(repaired)
+                done_set.update(repaired)
+                baseline_ok = bool(repair.get("ok"))
+                baseline_publication_ok = bool(repair.get("ok"))
+                baseline_publication_log = str(repair.get("log") or "")
+                if git and repaired:
+                    status = _commit_and_sync(
+                        project_dir, branch, prev_branch, args,
+                        "baseline publication repair (phase 0)", stack)
+                    print(f"{pfx}git (baseline phase 0): {status}")
+                    if "committed" in status:
+                        committed_any = True
+                    if "REJECTED" in status:
+                        repair["ok"] = False
+                        fix_notes.append(
+                            "baseline publication repair became red during the "
+                            "commit-time verification rerun; rejected tree restored")
+                if repair.get("ok"):
+                    print(f"{pfx}PHASE 0 complete: the previously red required "
+                          "suite is GREEN; continuing with purpose and whole-repo review.")
+            if not repair.get("ok"):
+                attempted = sorted((repair.get("attempted") or {}).keys())
+                stop_reason = (
+                    "baseline publication suite remains red after bounded targeted "
+                    "repair; unrelated review was not started"
+                )
+                print(f"{pfx}STOP: {stop_reason}. Targeted: "
+                      f"{', '.join(attempted) or '(no contained source path found)'}.\n"
+                      f"{_tail(str(repair.get('log') or baseline_publication_log), 40)}",
+                      file=sys.stderr)
+                result.update({
+                    "defects": max(1, len(attempted)), "fixed": 0,
+                    "baseline_ok": baseline_ok, "suite_status": False,
+                    "converged": False, "stop_reason": stop_reason,
+                    "manual_review": attempted,
+                    "fix_notes": list(fix_notes),
+                    "providers": [f"{n}:{p.model}" for n, p in providers],
+                    "usd": round(meter.usd, 4),
+                    "blocked_publication_baseline": True,
+                })
+                if checkpoint is not None:
+                    with contextlib.suppress(Exception):
+                        checkpoint.finish(
+                            status="interrupted", defects_found=max(1, len(attempted)),
+                            defects_fixed=0, stop_reason=stop_reason)
+                report(phase="stopped - red baseline", done=True,
+                       defects=max(1, len(attempted)), fixed=0,
+                       errors=max(1, len(attempted)), cost=round(meter.usd, 4))
+                return result
+        # ================= END PHASE 0 ========================================
 
         # ================= PHASE 1: PURPOSE FIRST (owner order 2026-08-11) ====
         # "FlexFactor needs to look at the purpose of whichever program is loaded
@@ -13914,6 +14242,7 @@ def _mark_run_finished() -> None:
 
 
 def main(argv=None) -> int:
+    _configure_utf8_stdio()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
     # rewrite below would turn `flexfactor --help` into `flexfactor refactor
