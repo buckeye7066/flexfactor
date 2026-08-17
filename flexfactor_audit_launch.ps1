@@ -6,6 +6,9 @@
 # API keys are present it runs TWO models (primary + cross-check).
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $script = "C:\Users\firer\flexfactor\flexfactor.py"
 
