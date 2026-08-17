@@ -8045,6 +8045,14 @@ def _flatten_unresolved_fix_ledger(pending: dict[str, list[dict]]) -> list[dict]
             for finding in pending[rel]]
 
 
+def _merge_unresolved_file_findings(current: dict[str, list[dict]],
+                                     pending: dict[str, list[dict]]) -> None:
+    """Reattach serious findings without dropping the current review's lows."""
+    for rel, rows in pending.items():
+        current[rel] = _dedupe_findings(
+            list(current.get(rel) or []) + [dict(row) for row in rows])
+
+
 def _next_cycle_review_paths(changed_files, incomplete_files) -> list[str]:
     """Build the only legitimate scope for a follow-up semantic pass.
 
@@ -12438,8 +12446,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if unresolved_findings:
             all_findings = _dedupe_findings(
                 list(all_findings) + unresolved_findings)
-            for rel, rows in unresolved_fix_findings.items():
-                file_findings[rel] = list(rows)
+            _merge_unresolved_file_findings(
+                file_findings, unresolved_fix_findings)
             converged = False
             if stop_reason == "converged: found == fixed":
                 stop_reason = (

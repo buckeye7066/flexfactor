@@ -2013,11 +2013,22 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
             min_severity="high")
         self.assertEqual(pending, {})
 
+    def test_reattachment_preserves_current_low_and_open_serious_findings(self):
+        low = self._finding("src/a.py", severity="low", title="minor issue")
+        serious = self._finding("src/a.py", title="still broken")
+        current = {"src/a.py": [low]}
+        ff._merge_unresolved_file_findings(
+            current, {"src/a.py": [serious, serious]})
+        self.assertEqual(
+            {(row["severity"], row["title"]) for row in current["src/a.py"]},
+            {("low", "minor issue"), ("high", "still broken")})
+
     def test_audit_wires_unresolved_ledger_into_convergence_and_final_report(self):
         source = inspect.getsource(ff.audit_one_program)
         for needle in (
                 "_update_unresolved_fix_ledger(",
                 "_flatten_unresolved_fix_ledger(",
+                "_merge_unresolved_file_findings(",
                 '"unresolved_files": sorted(unresolved_fix_findings)',
                 "unresolved fixable findings remain in"):
             self.assertIn(needle, source)
