@@ -10,4 +10,43 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 
+# Provider SDKs are imported LAZILY (one key is enough to run), so they are
+# optional extras rather than hard install requirements. Version floors are
+# pinned to the tested-compatible releases; the Py3.12 SDK compat is fragile
+# (see CLAUDE.md), so do not float these upward without re-running the tests.
 dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40,<1.0"]
+openai = ["openai>=2,<3"]
+# Everything needed to run BOTH providers plus the test/dev workflow.
+all = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
+dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
+
+[project.scripts]
+flexfactor = "flexfactor:main"
+
+[tool.setuptools]
+py-modules = [
+  "flexfactor",
+  "flexfactor_cmdpolicy",
+  "flexfactor_competitors",
+  "flexfactor_dashboard",
+  "flexfactor_dashboard_v2",
+  "flexfactor_egress",
+  "flexfactor_evidence",
+  "flexfactor_prodready",
+  "flexfactor_purpose",
+  "flexfactor_runstate",
+  "flexfactor_scout_contract",
+  "flexfactor_self_audit_report",
+  "flexfactor_web",
+  "probe_tiers",
+]
+
+# Test runner: the suite is stdlib unittest and needs no API keys or network.
+#   python flexfactor_tests.py
+# or, if pytest is installed:
+#   pytest flexfactor_tests.py
+[tool.pytest.ini_options]
+python_files = ["flexfactor_tests.py"]
