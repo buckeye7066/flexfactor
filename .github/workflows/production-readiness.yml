@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -43,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -89,9 +93,12 @@ jobs:
 
   package-artifact:
     name: package-artifact
+    needs: [windows-tests, linux-containment]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -104,9 +111,11 @@ jobs:
             cd "$smoke_dir"
             python - <<'PY'
           import pathlib
+          from importlib.metadata import version
           import flexfactor
 
           module_path = pathlib.Path(flexfactor.__file__).resolve()
+          assert version("flexfactor") == "0.4.1", version("flexfactor")
           assert flexfactor.TOOL_VERSION == "0.4.1", flexfactor.TOOL_VERSION
           assert "site-packages" in module_path.parts, module_path
           print(f"installed wheel import: {module_path}")
