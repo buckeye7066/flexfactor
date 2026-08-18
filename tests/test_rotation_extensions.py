@@ -37,7 +37,7 @@ def _route_entry(rid: str, pool: str, tier: str = R.FRONTIER,
     }
 
 
-def _make_auto_catalog(path: str, entries: list) -> None:
+def _write_catalog(path: str, entries: list) -> None:
     blob = {
         "schema": 1,
         "generated_at": "2026-08-18T00:00:00+00:00",
@@ -47,14 +47,9 @@ def _make_auto_catalog(path: str, entries: list) -> None:
         json.dump(blob, fh)
 
 
-def _make_primary_catalog(path: str, entries: list) -> None:
-    blob = {
-        "schema": 1,
-        "generated_at": "2026-08-18T00:00:00+00:00",
-        "routes": entries,
-    }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(blob, fh)
+# Aliases kept for call-site readability in tests that distinguish the two roles.
+_make_auto_catalog = _write_catalog
+_make_primary_catalog = _write_catalog
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +77,7 @@ class ExtensionFlagTests(unittest.TestCase):
     def test_non_one_value_is_not_enabled(self):
         for val in ("true", "yes", "on", "1 ", " 1", "0", ""):
             os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = val
-            # Only the exact string "1" enables it.
+            # Whitespace is stripped; only '1' (after strip) enables the flag.
             expected = val.strip() == "1"
             self.assertEqual(R._rotation_extensions_enabled(), expected,
                              f"Expected {expected} for {val!r}")

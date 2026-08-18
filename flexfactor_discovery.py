@@ -368,7 +368,7 @@ def _cursor_models_from_daemon() -> List[str]:
                 errors="replace", timeout=10,
             )
             if result.returncode == 0 and result.stdout.strip():
-                lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
                 _info(f"cursor daemon: {len(lines)} model(s) via `{exe} --list-models`")
                 return lines
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
