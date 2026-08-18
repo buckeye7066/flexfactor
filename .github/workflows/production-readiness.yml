@@ -32,13 +32,19 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile(
             (Resolve-Path .\flexfactor_launch.ps1), [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Error }
-          python -c "import flexfactor, flexfactor_runstate, flexfactor_evidence, flexfactor_web"
+          python -c "import flexfactor, flexfactor_runstate, flexfactor_evidence, flexfactor_web, flexfactor_prodready, flexfactor_node_lock, flexfactor_rotation, flexfactor_prodready_persist"
           if ($LASTEXITCODE -ne 0) { throw "installed module smoke failed" }
       - name: Run FlexFactor suite
         shell: pwsh
         run: |
           python flexfactor_tests.py
           if ($LASTEXITCODE -ne 0) { throw "flexfactor_tests failed" }
+          python flexfactor_node_lock_tests.py
+          if ($LASTEXITCODE -ne 0) { throw "flexfactor_node_lock_tests failed" }
+          python flexfactor_prodready_persistence_tests.py
+          if ($LASTEXITCODE -ne 0) { throw "flexfactor_prodready_persistence_tests failed" }
+          python flexfactor_rotation_tests.py
+          if ($LASTEXITCODE -ne 0) { throw "flexfactor_rotation_tests failed" }
 
   linux-containment:
     name: linux-containment
@@ -74,6 +80,9 @@ jobs:
       - name: Run FlexFactor suite (Linux containment evidence)
         run: |
           python flexfactor_tests.py
+          python flexfactor_node_lock_tests.py
+          python flexfactor_prodready_persistence_tests.py
+          python flexfactor_rotation_tests.py
       - name: Deterministic repository-intelligence smoke
         run: |
           python - <<'PY'
