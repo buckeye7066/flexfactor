@@ -1,0 +1,525 @@
+# --------------------------------------------------------------------------- #
+# Bootstrap: make the build gate MEAN something
+# --------------------------------------------------------------------------- #
+@dataclass
+class StepResult:
+    label: str
+    cmd: list[str]
+    cwd: str
+    ok: bool
+    detail: str = ""
+    skipped: bool = False
+
+
+def bootstrap_plan(toolchains: list[Toolchain], allow_scripts: bool = False,
+                   force: bool = False) -> list[tuple[Toolchain, list[str]]]:
+    """(toolchain, argv) install steps to run, in order.
+
+    `allow_scripts=False` appends --ignore-scripts to npm/pnpm/yarn installs.
+    This mirrors the policy scout already enforces: installing a dependency tree
+    runs that tree's postinstall hooks, which is arbitrary third-party code
+    execution on the owner's machine triggered by a repo they merely pointed the
+    tool at. Some native packages genuinely need their scripts to build, so the
+    escape hatch exists - it is just not the default.
+    """
+    plan: list[tuple[Toolchain, list[str]]] = []
+    for tc in toolchains:
+        if tc.deps_installed and not force:
+            continue
+        for cmd in tc.install:
+            argv = list(cmd)
+            if not allow_scripts and argv and argv[0] in ("npm", "pnpm", "yarn", "bun"):
+                argv.append("--ignore-scripts")
+            plan.append((tc, argv))
+    return plan
+
+
+def run_bootstrap(project_dir: str, toolchains: list[Toolchain], run,
+                  allow_scripts: bool = False, force: bool = False,
+                  timeout: int = 1800, log=None) -> list[StepResult]:
+    """Execute the install plan through the caller's gated `run`.
+
+    `run(cmd, cwd, timeout=...)` must return an object with `.returncode`,
+    `.stdout`, `.stderr` - i.e. flexfactor._run, which never raises and which
+    routes through cmdpolicy + _winify. Failures are RECORDED, not raised: a
+    project whose install fails is still worth auditing (the review phase needs
+    no toolchain at all), it just cannot claim a verified build - and
+    `verification_is_real` is what enforces that distinction downstream.
+    """
+    results: list[StepResult] = []
+    for tc, cmd in bootstrap_plan(toolchains, allow_scripts, force):
+        cwd = os.path.normpath(os.path.join(project_dir, tc.root))
+        if log:
+            log(f"    bootstrap [{tc.ecosystem}:{tc.root}]: {' '.join(cmd)}")
+        r = run(cmd, cwd, timeout=timeout)
+        ok = getattr(r, "returncode", 1) == 0
+        detail = (getattr(r, "stderr", "") or getattr(r, "stdout", "") or "")[-2000:]
+        results.append(StepResult(label=f"install:{tc.ecosystem}:{tc.root}",
+                                  cmd=cmd, cwd=tc.root, ok=ok, detail=detail))
+        if ok:
+            tc.deps_installed = True
+    return results
+
+
+def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
+    """Can we actually prove a change didn't break this project?
+
+    The honesty guard for the whole mode. `_full_gate` returning True because it
+    had no commands to run is indistinguishable, at the call site, from a build
+    that genuinely passed. Callers use this to label the difference so a report
+    never claims verification that never happened.
+    """
+    if not toolchains:
+        return False, "no build system detected - changes cannot be build-verified"
+    buildable = [t for t in toolchains if t.build]
+    if not buildable:
+        eco = ", ".join(sorted({t.ecosystem for t in toolchains}))
+        return False, f"detected {eco} but no usable build command - changes are UNVERIFIED"
+    # `t.install` guards the no-installer case: a bare Makefile or meson project
+    # has no dependency step at all, so "deps not installed" is not a coherent
+    # complaint about it - there is nothing that could have installed them.
+    missing = [t for t in buildable
+               if t.build_needs_deps and t.install and not t.deps_installed]
+    if missing:
+        names = ", ".join(f"{t.ecosystem}:{t.root}" for t in missing)
+        return False, f"dependencies not installed for {names} - build gate would false-fail"
+    return True, "build verification available"
+
+
+# --------------------------------------------------------------------------- #
+# The production-readiness rubric
+# --------------------------------------------------------------------------- #
+@dataclass
+class Gate:
+    """One checkable production-readiness property.
+
+    `status` is deliberately four-valued. "unknown" is not a synonym for "fail":
+    conflating them either cries wolf (blocking a release over an undetectable
+    property) or hides a real hole. Kept distinct, the scorecard can say
+    truthfully which gates were actually evaluated.
+    """
+    id: str
+    title: str
+    status: str          # "pass" | "fail" | "na" | "unknown"
+    severity: str        # "critical" | "high" | "medium" | "low"
+    evidence: str = ""
+    remediation: str = ""
+    auto_fixable: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# Gates at or above this severity must PASS before anything may be called
+# production ready. Everything below is reported but does not block.
+#
+# ===> TUNABLE <=== This line encodes the definition of "production ready".
+# Raising it to "critical" ships faster and accepts more risk; lowering it to
+# "medium" blocks on documentation and CI gaps too. "high" is the defensible
+# middle: it blocks on anything that can break or expose the running system
+# (secrets, broken build, failing tests, unpinned deps) while letting
+# docs/CI/licence gaps be reported rather than veto a release.
+BLOCKING_SEVERITY = "high"
+_SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+_SECRET_FILE_PAT = re.compile(
+    r"(?:^|/)(?:\.env(?:\.[\w-]+)?|.*\.pem|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
+    r".*\.keystore|credentials\.json|serviceaccount\.json)$", re.I)
+# .env.example / .env.sample / .env.template are the DOCUMENTED-config pattern,
+# the opposite of a leaked secret - they must never trip the secret gate.
+_SECRET_FILE_SAFE = re.compile(r"\.(?:example|sample|template|dist)$", re.I)
+
+_CI_PATHS = (".github/workflows", ".gitlab-ci.yml", ".circleci/config.yml",
+             "azure-pipelines.yml", "Jenkinsfile", ".travis.yml",
+             "bitbucket-pipelines.yml", ".drone.yml")
+_TEST_DIR_NAMES = frozenset({"test", "tests", "spec", "specs", "__tests__",
+                             "e2e", "it", "testing"})
+# Matches test_x.py, x_test.go, x_tests.py, x.test.ts, x.spec.js - the plural and
+# dotted forms included, because requiring the singular missed real suites
+# (flexfactor's own `flexfactor_tests.py` among them). The separator before
+# "test" is required so `latest.py` and `contest.js` don't register as suites.
+_TEST_FILE_PAT = re.compile(
+    r"(?:^|[/\\])(?:tests?[_.-][^/\\]+|[^/\\]+[_.-]tests?|[^/\\]+\.(?:test|spec))"
+    r"\.[\w]+$", re.I)
+
+
+def _tracked_files(project_dir: str, run) -> list[str]:
+    """git-tracked paths, or a bounded filesystem walk when git is unavailable.
+
+    Tracked-vs-present is the distinction that matters for the secret gate: a
+    local .env is correct practice, a COMMITTED .env is the incident.
+    """
+    try:
+        r = run(["git", "ls-files"], project_dir, timeout=120)
+        if getattr(r, "returncode", 1) == 0 and getattr(r, "stdout", "").strip():
+            return [ln.strip().replace("\\", "/")
+                    for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:
+        pass
+    out: list[str] = []
+    for current, dirnames, filenames in os.walk(project_dir):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(current, name), project_dir)
+            out.append(rel.replace("\\", "/"))
+            if len(out) > 20000:
+                return out
+    return out
+
+
+# Lockfile names by package manager, for the re-check below.
+_LOCKFILES = {
+    "npm": ("package-lock.json", "npm-shrinkwrap.json"),
+    "pnpm": ("pnpm-lock.yaml",), "yarn": ("yarn.lock",),
+    "bun": ("bun.lockb", "bun.lock"), "poetry": ("poetry.lock",),
+    "uv": ("uv.lock",), "pdm": ("pdm.lock",), "pipenv": ("Pipfile.lock",),
+    "go": ("go.sum",), "cargo": ("Cargo.lock",), "bundler": ("Gemfile.lock",),
+    "composer": ("composer.lock",), "mix": ("mix.lock",), "deno": ("deno.lock",),
+    "dart": ("pubspec.lock",), "flutter": ("pubspec.lock",),
+    "swiftpm": ("Package.resolved",),
+}
+
+
+def _current_lockfile(project_dir: str, tc: Toolchain) -> str | None:
+    """Look for the lockfile ON DISK right now, rather than trusting what
+    detection saw. Bootstrap runs between the two and routinely CREATES it
+    (`npm install` writes package-lock.json), so the detect-time value reports a
+    project as unpinned moments after the tool pinned it."""
+    if tc.lockfile and _exists(project_dir, tc.root, tc.lockfile):
+        return tc.lockfile
+    root = os.path.join(project_dir, tc.root)
+    for name in _LOCKFILES.get(tc.manager, ()):
+        if _exists(root, name):
+            return name
+    # pip's pinning mechanism is a pinned requirements.txt, not a lockfile.
+    if tc.manager == "pip" and "==" in _read_text(
+            os.path.join(root, "requirements.txt")):
+        return "requirements.txt"
+    # A component that declares NO dependencies has nothing to pin, and no
+    # lockfile is generated for it. Reporting that as a pinning failure is a
+    # false blocker - go.sum is simply absent for a dependency-free module.
+    if tc.manager == "go" and "require" not in _read_text(
+            os.path.join(root, "go.mod")):
+        return "go.mod (no dependencies)"
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# JSON-LD structured-data validation (the local, offline equivalent of the
+# machine-checkable part of Google's Rich Results Test - which has no free API).
+# Google silently IGNORES an invalid application/ld+json block, so broken
+# structured data is a silent-failure class: the page ships, the rich result
+# never appears, and nothing ever errors.
+# --------------------------------------------------------------------------- #
+_JSONLD_PAT = re.compile(
+    r"<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.I | re.S)
+
+
+def _validate_jsonld(project_dir: str, files: list[str]) -> "tuple[int, list[str]]":
+    """Parse every application/ld+json block in tracked .html/.htm files.
+
+    Returns (total_blocks, problems). A block is valid when it parses as JSON
+    and every node object carries @context (top level) and @type (per node,
+    with @graph items checked individually; a bare @id reference node is
+    legal without @type). Bounded: first 200 HTML files, MAX_CONFIG_BYTES per
+    read via _read_text - a hostile repo cannot balloon the walk."""
+    problems: list[str] = []
+    total = 0
+    html_files = [f for f in files if f.lower().endswith((".html", ".htm"))]
+    for rel in html_files[:200]:
+        text = _read_text(os.path.join(project_dir, rel))
+        if not text or "ld+json" not in text.lower():
+            continue
+        for i, m in enumerate(_JSONLD_PAT.finditer(text), 1):
+            total += 1
+            where = f"{rel}#block{i}"
+            raw = m.group(1).strip()
+            if not raw:
+                problems.append(f"{where}: empty block")
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception as exc:
+                problems.append(f"{where}: invalid JSON ({exc})")
+                continue
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    problems.append(
+                        f"{where}: top-level {type(node).__name__}, expected object")
+                    continue
+                if "@context" not in node:
+                    problems.append(f"{where}: missing @context")
+                graph = node.get("@graph")
+                items = graph if isinstance(graph, list) else [node]
+                for item in items:
+                    if isinstance(item, dict) and "@type" not in item \
+                            and "@id" not in item:
+                        problems.append(f"{where}: node missing @type")
+    return total, problems
+
+
+def _has_tests(files: list[str]) -> bool:
+    for f in files:
+        parts = f.lower().split("/")
+        if any(p in _TEST_DIR_NAMES for p in parts[:-1]):
+            return True
+        if _TEST_FILE_PAT.search(f):
+            return True
+    return False
+
+
+def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
+                     build_ok: bool | None = None,
+                     tests_ok: bool | None = None) -> list[Gate]:
+    """Deterministic production-readiness rubric. No model calls, no network.
+
+    Every gate answers a question an operator would ask before putting the thing
+    in front of real users. `build_ok`/`tests_ok` are threaded in from the
+    caller's real gate runs rather than re-run here, so the scorecard reports
+    the same evidence the audit acted on instead of a second opinion.
+    """
+    files = _tracked_files(project_dir, run)
+    lower = [f.lower() for f in files]
+    gates: list[Gate] = []
+
+    def add(**kw):
+        gates.append(Gate(**kw))
+
+    # --- Buildability ------------------------------------------------------ #
+    real, why = verification_is_real(toolchains)
+    add(id="build_verifiable", title="Changes can be build-verified",
+        status="pass" if real else "fail", severity="critical", evidence=why,
+        remediation="Install dependencies and ensure a build/check command exists; "
+                    "without one no fix in this repo can be proven safe.")
+    if build_ok is None:
+        add(id="build_passes", title="Project builds", status="unknown",
+            severity="critical", evidence="build was not run",
+            remediation="Run the detected build command and fix the errors.")
+    else:
+        add(id="build_passes", title="Project builds",
+            status="pass" if build_ok else "fail", severity="critical",
+            evidence="build command exited 0" if build_ok else "build command failed",
+            remediation="Fix the compile/build errors.", auto_fixable=True)
+
+    # --- Tests ------------------------------------------------------------- #
+    have_tests = _has_tests(files)
+    add(id="tests_present", title="Automated tests exist",
+        status="pass" if have_tests else "fail", severity="high",
+        evidence="test files found" if have_tests else "no test files found",
+        remediation="Add a unit test suite covering the primary entry points.",
+        auto_fixable=True)
+    if tests_ok is None:
+        add(id="tests_pass", title="Test suite passes", status="unknown",
+            severity="high",
+            evidence="tests were not run" if have_tests else "no suite to run",
+            remediation="Run the suite and fix failures.")
+    else:
+        add(id="tests_pass", title="Test suite passes",
+            status="pass" if tests_ok else "fail", severity="high",
+            evidence="suite exited 0" if tests_ok else "suite failed",
+            remediation="Fix the failing tests.", auto_fixable=True)
+
+    # --- Secrets ----------------------------------------------------------- #
+    leaked = [f for f in files
+              if _SECRET_FILE_PAT.search(f) and not _SECRET_FILE_SAFE.search(f)]
+    add(id="no_committed_secrets", title="No secret material committed",
+        status="fail" if leaked else "pass", severity="critical",
+        evidence=("committed: " + ", ".join(leaked[:5])) if leaked
+        else "no secret-shaped files tracked",
+        remediation="Remove from the index, rotate the credentials, add to "
+                    ".gitignore. Deleting the file alone does NOT purge history.")
+
+    gitignore = _read_text(os.path.join(project_dir, ".gitignore"))
+    ignores_env = ".env" in gitignore
+    add(id="gitignore_protects", title=".gitignore covers secrets and artifacts",
+        status="pass" if ignores_env else "fail", severity="high",
+        evidence=".env ignored" if ignores_env else ".gitignore missing or does not ignore .env",
+        remediation="Ignore .env, build output, and dependency directories.",
+        auto_fixable=True)
+
+    # --- Config externalisation -------------------------------------------- #
+    has_env_example = any(re.search(r"(?:^|/)\.env\.(?:example|sample|template)$", f, re.I)
+                          for f in files)
+    uses_env = any(f.endswith((".js", ".ts", ".jsx", ".tsx", ".py", ".go",
+                               ".rb", ".php", ".rs", ".java", ".cs"))
+                   for f in files)
+    add(id="config_documented", title="Required configuration is documented",
+        status="pass" if has_env_example else ("fail" if uses_env else "na"),
+        severity="medium",
+        evidence=".env.example present" if has_env_example else "no .env.example",
+        remediation="Commit a .env.example listing every required variable "
+                    "with placeholder values.", auto_fixable=True)
+
+    # --- Dependency pinning ------------------------------------------------ #
+    unpinned = [t for t in toolchains
+                if t.install and t.ecosystem not in ("make", "cpp", "swift")
+                and _current_lockfile(project_dir, t) is None]
+    add(id="deps_pinned", title="Dependencies are lock-pinned",
+        status="fail" if unpinned else ("pass" if toolchains else "na"),
+        severity="high",
+        evidence=("no lockfile: " + ", ".join(f"{t.ecosystem}:{t.root}"
+                                              for t in unpinned[:5]))
+        if unpinned else "lockfiles present for all components",
+        remediation="Commit the lockfile so builds are reproducible.",
+        auto_fixable=True)
+
+    # --- Operational readiness --------------------------------------------- #
+    has_ci = any(any(p.lower() in f for p in _CI_PATHS) for f in lower)
+    add(id="ci_configured", title="Continuous integration is configured",
+        status="pass" if has_ci else "fail", severity="medium",
+        evidence="CI config found" if has_ci else "no CI config",
+        remediation="Add a pipeline that installs, builds, and tests on push.",
+        auto_fixable=True)
+
+    readme = next((f for f in files if f.lower().split("/")[-1].startswith("readme")), None)
+    readme_text = _read_text(os.path.join(project_dir, readme)) if readme else ""
+    runnable = bool(re.search(r"(npm|pnpm|yarn|pip|poetry|uv|go|cargo|docker|make|"
+                              r"dotnet|bundle|composer|mix)\s+\w", readme_text, re.I))
+    add(id="readme_runnable", title="README explains how to install and run",
+        status="pass" if runnable else "fail", severity="medium",
+        evidence="README contains setup commands" if runnable
+        else ("README has no run instructions" if readme else "no README"),
+        remediation="Document prerequisites, install, configure, run, and test.",
+        auto_fixable=True)
+
+    has_license = any(f.lower().split("/")[-1].startswith(("license", "licence",
+                                                           "copying"))
+                      for f in files)
+    add(id="license_present", title="License declared", status="pass" if has_license
+        else "fail", severity="low",
+        evidence="license file present" if has_license else "no license file",
+        remediation="Add a LICENSE file.", auto_fixable=True)
+
+    # A service is something that serves traffic; a library legitimately has no
+    # container or health endpoint, so this is "na" rather than a failure.
+    is_service = any(t.is_web or t.framework in
+                     ("express", "fastify", "@nestjs/core", "koa", "hapi",
+                      "next", "nuxt", "remix")
+                     for t in toolchains)
+    has_container = any(f.lower().split("/")[-1] in
+                        ("dockerfile", "containerfile", "procfile") or
+                        f.lower().endswith("dockerfile") for f in files)
+    add(id="deployable_artifact", title="Deployable artifact defined",
+        status=("pass" if has_container else "fail") if is_service else "na",
+        severity="medium",
+        evidence="Dockerfile/Procfile present" if has_container
+        else ("service with no container/Procfile" if is_service else "not a service"),
+        remediation="Add a Dockerfile or Procfile that starts the service.",
+        auto_fixable=True)
+
+    # --- Structured data (SEO markup) --------------------------------------- #
+    # "na" when the project ships no JSON-LD at all: most apps legitimately
+    # don't, and absence of SEO markup is not a readiness defect. Severity low:
+    # reported, never blocks a release - but Google silently ignores an invalid
+    # block, so when JSON-LD IS present it must at least be machine-valid.
+    jsonld_total, jsonld_problems = _validate_jsonld(project_dir, files)
+    add(id="structured_data_valid", title="JSON-LD structured data is valid",
+        status="na" if jsonld_total == 0
+        else ("pass" if not jsonld_problems else "fail"),
+        severity="low",
+        evidence=(f"{jsonld_total} JSON-LD block(s), all parse with @context/@type"
+                  if jsonld_total and not jsonld_problems
+                  else ("; ".join(jsonld_problems[:5])
+                        if jsonld_problems else "no JSON-LD blocks found")),
+        remediation="Fix the application/ld+json blocks: must parse as JSON and "
+                    "carry @context plus @type per node - Google silently "
+                    "ignores invalid blocks, so they fail without any error.",
+        auto_fixable=True)
+
+    return gates
+
+
+def is_blocking(gate: Gate, floor: str = BLOCKING_SEVERITY) -> bool:
+    """A gate whose failure must prevent a production-ready claim.
+
+    "unknown" counts as blocking at or above the floor: an unevaluated critical
+    property is not evidence of safety, and treating it as a pass is precisely
+    the overclaim this module exists to prevent.
+    """
+    if gate.status in ("pass", "na"):
+        return False
+    return _SEV_RANK.get(gate.severity, 0) >= _SEV_RANK.get(floor, 3)
+
+
+def readiness_verdict(gates: list[Gate],
+                      floor: str = BLOCKING_SEVERITY) -> tuple[bool, list[Gate]]:
+    """(production_ready, blockers). Ready only when NO blocking gate is open."""
+    blockers = [g for g in gates if is_blocking(g, floor)]
+    return (not blockers), blockers
+
+
+def readiness_score(gates: list[Gate]) -> tuple[int, int, int]:
+    """(passed, evaluated, total). Evaluated excludes 'na' and 'unknown' so the
+    ratio never flatters the project by counting checks that never ran."""
+    total = len(gates)
+    evaluated = [g for g in gates if g.status in ("pass", "fail")]
+    passed = [g for g in evaluated if g.status == "pass"]
+    return len(passed), len(evaluated), total
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+_STATUS_MARK = {"pass": "PASS", "fail": "FAIL", "na": "n/a", "unknown": "????"}
+
+
+def render_scorecard(project_name: str, toolchains: list[Toolchain],
+                     gates: list[Gate], bootstrap: list[StepResult] | None = None,
+                     floor: str = BLOCKING_SEVERITY) -> str:
+    """Markdown scorecard. Leads with the verdict and the blockers, because a
+    reader who stops after the first section must not come away with a rosier
+    picture than the evidence supports."""
+    ready, blockers = readiness_verdict(gates, floor)
+    passed, evaluated, total = readiness_score(gates)
+    out: list[str] = [f"# Production readiness — {project_name}", ""]
+    out.append(f"**Verdict: {'PRODUCTION READY' if ready else 'NOT PRODUCTION READY'}**")
+    out.append("")
+    out.append(f"- Gates passed: {passed}/{evaluated} evaluated ({total} total)")
+    out.append(f"- Blocking failures: {len(blockers)} (severity >= {floor})")
+    out.append("")
+
+    if blockers:
+        out.append("## Blockers")
+        out.append("")
+        for g in blockers:
+            out.append(f"- **{g.title}** [{g.severity}] — {g.evidence or g.status}")
+            if g.remediation:
+                out.append(f"  - Fix: {g.remediation}")
+        out.append("")
+
+    out.append("## Detected toolchains")
+    out.append("")
+    if toolchains:
+        out.append("| Component | Ecosystem | Manager | Build | Test | Deps |")
+        out.append("|---|---|---|---|---|---|")
+        for t in toolchains:
+            out.append(
+                f"| `{t.root}` | {t.ecosystem} | {t.manager} | "
+                f"{'yes' if t.build else 'NONE'} | {'yes' if t.test else 'none'} | "
+                f"{'installed' if t.deps_installed else 'MISSING'} |")
+    else:
+        out.append("_No build system detected._")
+    out.append("")
+
+    if bootstrap:
+        out.append("## Bootstrap")
+        out.append("")
+        for s in bootstrap:
+            out.append(f"- [{'ok' if s.ok else 'FAILED'}] `{' '.join(s.cmd)}` "
+                       f"in `{s.cwd}`")
+            if not s.ok and s.detail:
+                out.append(f"  - {s.detail.strip().splitlines()[-1][:200]}"
+                           if s.detail.strip() else "")
+        out.append("")
+
+    out.append("## All gates")
+    out.append("")
+    out.append("| Gate | Status | Severity | Evidence |")
+    out.append("|---|---|---|---|")
+    for g in sorted(gates, key=lambda x: (-_SEV_RANK.get(x.severity, 0), x.id)):
+        out.append(f"| {g.title} | {_STATUS_MARK.get(g.status, g.status)} | "
+                   f"{g.severity} | {g.evidence} |")
+    out.append("")
+    return "\n".join(out)
