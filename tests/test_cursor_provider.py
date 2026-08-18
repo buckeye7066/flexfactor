@@ -56,8 +56,9 @@ class CursorProviderFailClosedTests(unittest.TestCase):
         with self.assertRaises(CursorUnavailable):
             self.provider.structured("hello", schema={})
 
-    def test_ping_returns_false_when_no_base_url(self):
-        # ping should not raise — it's used as a health check by the rotator.
+    def test_ping_raises_when_no_base_url(self):
+        # ping raises CursorUnavailable when no base URL is configured so the
+        # rotator knows to roll over to the next pool.
         with self.assertRaises(CursorUnavailable):
             self.provider.ping()
 
@@ -159,9 +160,7 @@ class CursorProviderHttpTests(unittest.TestCase):
     def test_ping_false_on_network_error(self):
         import providers.cursor_provider as cp
         with patch.object(cp, "_http_get", side_effect=CursorUnavailable("down")):
-            # ping falls back to models endpoint; patch that too.
-            with patch.object(cp, "_http_get", side_effect=CursorUnavailable("down")):
-                self.assertFalse(self.provider.ping())
+            self.assertFalse(self.provider.ping())
 
 
 # --------------------------------------------------------------------------- #

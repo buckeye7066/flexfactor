@@ -19,6 +19,8 @@ jobs:
   unit-tests:
     name: unit-tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +65,8 @@ jobs:
   integration-tests:
     name: integration-tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: ${{ github.event.inputs.run_integration == '1' || env.CI_INTEGRATION == '1' }}
     env:
       CI_INTEGRATION: ${{ vars.CI_INTEGRATION || '0' }}
@@ -103,6 +107,8 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:

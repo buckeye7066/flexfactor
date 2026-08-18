@@ -271,6 +271,7 @@ class AitimeDiscoveryTests(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        os.environ.pop("FLEXFACTOR_AITIME_CONFIG", None)
         self._tmp.cleanup()
 
     def _write_config(self, data) -> str:
@@ -325,11 +326,6 @@ class AitimeDiscoveryTests(unittest.TestCase):
         os.environ["FLEXFACTOR_AITIME_CONFIG"] = path
         routes = D.discover_from_aitime()
         self.assertEqual(routes, [])
-
-    def tearDown(self):
-        os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
-        os.environ.pop("FLEXFACTOR_AITIME_CONFIG", None)
-        self._tmp.cleanup()
 
 
 class CursorDiscoveryTests(unittest.TestCase):

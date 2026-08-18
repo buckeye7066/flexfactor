@@ -80,7 +80,7 @@ def _http_post(url: str, payload: Dict[str, Any], timeout: float = 60.0) -> Any:
     }
     api_key = _cursor_api_key()
     if api_key:
-        headers["Authorization"] = f"******"
+        headers["Authorization"] = "Bearer " + api_key
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
@@ -99,7 +99,7 @@ def _http_get(url: str, timeout: float = 10.0) -> Any:
     headers: Dict[str, str] = {"Accept": "application/json"}
     api_key = _cursor_api_key()
     if api_key:
-        headers["Authorization"] = f"******"
+        headers["Authorization"] = "Bearer " + api_key
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -152,7 +152,10 @@ class CursorProvider:
             raise CursorUnavailable(
                 "Cursor HTTP endpoint not configured "
                 "(set FLEXFACTOR_CURSOR_BASE_URL)")
-        url = self._base_url.rstrip("/").rstrip("/v1") + "/health"
+        base = self._base_url
+        if base.endswith("/v1"):
+            base = base[:-3]
+        url = base.rstrip("/") + "/health"
         try:
             _http_get(url, timeout=5.0)
             return True
