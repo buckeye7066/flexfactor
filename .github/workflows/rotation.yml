@@ -68,9 +68,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    if: ${{ github.event.inputs.run_integration == '1' || env.CI_INTEGRATION == '1' }}
+    if: ${{ github.event.inputs.run_integration == '1' || vars.CI_INTEGRATION == '1' }}
     env:
-      CI_INTEGRATION: ${{ vars.CI_INTEGRATION || '0' }}
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
 
     steps:
