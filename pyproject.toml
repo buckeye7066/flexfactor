@@ -33,6 +33,7 @@ py-modules = [
   "flexfactor_competitors",
   "flexfactor_dashboard",
   "flexfactor_dashboard_v2",
+  "flexfactor_discovery",
   "flexfactor_egress",
   "flexfactor_evidence",
   "flexfactor_node_lock",
@@ -47,6 +48,10 @@ py-modules = [
   "flexfactor_web",
   "probe_tiers",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["providers*", "competitors*", "tests*"]
 
 # Test runner: the suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py

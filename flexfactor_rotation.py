@@ -166,11 +166,49 @@ class Catalog:
         return [r for r in self.routes if r.enabled]
 
 
+def _rotation_extensions_enabled() -> bool:
+    """Return True when `FLEXFACTOR_ROTATION_EXTENSIONS=1` is set."""
+    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() == "1"
+
+
+def _merge_auto_routes(routes: List[Route]) -> List[Route]:
+    """Append auto-discovered Cursor/ai-time routes when extensions are on.
+
+    Safe to call unconditionally: returns *routes* unchanged when the feature
+    flag is absent or when the discovery module cannot be imported.
+    """
+    if not _rotation_extensions_enabled():
+        return routes
+    try:
+        import flexfactor_discovery as _disc  # noqa: PLC0415
+        extra_dicts = _disc.load_auto_catalog()
+        if not extra_dicts:
+            return routes
+        existing_ids = {r.id for r in routes}
+        merged = list(routes)
+        for entry in extra_dicts:
+            try:
+                r = Route.from_json(entry)
+            except (KeyError, TypeError):
+                continue
+            if r.id not in existing_ids:
+                merged.append(r)
+                existing_ids.add(r.id)
+        return merged
+    except ImportError:
+        return routes
+
+
 def load_catalog(path: Optional[str] = None) -> Optional[Catalog]:
     """Read the catalog, or None when it is missing or unreadable.
 
     None is a normal answer, not an error: the caller falls back to its existing
     provider chain. Rotation is an optimisation, never a dependency.
+
+    When `FLEXFACTOR_ROTATION_EXTENSIONS=1` is set, routes from the
+    auto-discovered `catalog.auto.json` (written by `flexfactor_discovery`) are
+    merged in after the primary catalog so Cursor and ai-time models participate
+    in pool-first rotation.
     """
     target = path or catalog_path()
     try:
@@ -187,6 +225,7 @@ def load_catalog(path: Optional[str] = None) -> Optional[Catalog]:
             routes.append(Route.from_json(entry))
         except (KeyError, TypeError):
             continue  # one malformed row must not void the catalog
+    routes = _merge_auto_routes(routes)
     return Catalog(routes=routes, generated_at=raw.get("generated_at", ""),
                    age_seconds=max(0.0, time.time() - stat.st_mtime), path=target)
 
