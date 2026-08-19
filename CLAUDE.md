@@ -344,6 +344,34 @@ Two ranking defects rode along, both Python/Go blind spots:
   code appended the TEST to `implementations`, listing it as its own
   implementation and duplicating it in the returned ranking.
 
+### Same day, second miss: the path had to START with a magic directory
+
+The boundary fix above was necessary and not sufficient. The next live IPlay run
+printed `[4/5 Iplay] STOP: ... Targeted: (no contained source path found)` while
+pytest had printed `FAILED iplay/test_production_bridge.py::...`. Measured
+against that exact line, `_FAILURE_SOURCE_RE` returned
+**`/test_production_bridge.py`** — a WRONG absolute path — and
+`FAILED test_motionsync.py::test_a` returned **`[]`**.
+
+Cause: the relative alternative only accepted a first segment of
+`apps|packages|src|tests?|lib`. `iplay/` is none of those, so the **POSIX-absolute**
+alternative won and matched from the slash onward; a bare repo-root filename had
+no alternative at all. Note the shape — the earlier POSIX fix made the failure
+*silently wrong* instead of merely empty, which is worse.
+
+There is now a fourth, general relative alternative (any path, including a bare
+filename). **It is LAST on purpose** — a magic-directory path keeps the older
+branch, which tolerates spaces inside a path. It excludes whitespace so the
+match cannot swallow the runner's own `FAILED `/` FAIL  ` prefix, and excludes
+comma/paren/bracket — the characters the boundary lookahead already treats as
+terminators — so `(motionsync.py:3)` yields `motionsync.py`, not `(motionsync.py`.
+**Over-matching is SAFE and under-matching is FATAL**: `_existing_failure_path`
+drops every hit that is not a readable file inside the repo, which is what
+discards the site-packages frames that dominate a pytest traceback
+(`test_frames_outside_the_repository_are_discarded` pins it). Do not "tighten"
+this regex without re-running `RedPublicationBaselineRepairTests` — the
+`.jsx`-not-clipped-to-`.js` guard and the runner-prefix guard both live there.
+
 ## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
 
 `build_audit_providers`' free-first path now tries rotation FIRST: when the
@@ -389,6 +417,61 @@ catalog's `strong` author tier; judging rides `light`.
   would otherwise flip every `build_audit_providers` test into rotation mode
   and stamp the owner's shared rotation state. `TestSessionIsolationTests`
   guards it.
+
+### "stale catalog" was printed on EVERY rotated route (2026-08-19)
+
+A live 5-program run emitted ~30 lines of
+`[rotation] openrouter/... [free-tier/light] stale catalog`, burying everything
+else. `Selection.describe()` appended the note per ROUTE while staleness is a
+fact about the catalog **FILE**, and `_announce` prints once per distinct route —
+so the more work a run did, the more it repeated itself.
+
+- `describe()` no longer renders `catalog_stale`. The FIELD stays (consumers
+  need the answer); only the per-route rendering is gone.
+- `flexfactor_rotation.catalog_staleness_note()` is the one-per-run replacement
+  and is **actionable**: it names the file, its age in hours, the limit, and the
+  exact command — `python -m aitime.catalog`. `_build_rotating_provider` prints
+  it once, guarded by `_ROTATION_STALE_PRINTED` keyed on the catalog PATH so a
+  batch run says it once, not once per program.
+- **Neither dishonest fix is allowed.** FlexFactor must never RUN that refresh
+  (AI Time owns the catalog; silently regenerating another program's state is
+  not this tool's call), and the warning must never be SUPPRESSED (a stale
+  catalog can still be offering a route whose quota died hours ago, which
+  otherwise becomes an unexplained error tour). Both are pinned by tests.
+
+## Dismissing a panel from the dashboard (owner request 2026-08-19)
+
+> "give me an 'x' to delete a program out of flexfactor, like in the situation
+> of Iplay just now, to leave room for the graphics of the other programs."
+
+Five programs ran concurrently; IPlay STOPPED early on a red baseline and its
+dead panel kept a fifth of the window. The "x" lives in
+**`flexfactor_dashboard.py`** — the surface `_launch_dashboard` actually starts,
+and the only one with graphics to free. `ConsoleMeter` deliberately did NOT get
+it: a one-line console meter has nothing to click and no space to reclaim.
+(`flexfactor_dashboard_v2.py` / `flexfactor_web.py` are hand-run only and were
+left alone; adding it there needs a different click model.)
+
+- **VIEW ACTION, AND THE ARCHITECTURE IS WHY.** This file is a pure READER of
+  `status.json` — it never opens it for writing, holds no handle on any audit,
+  and the end-of-run summary comes from flexfactor.py's own in-process totals
+  without consulting this module. So dismissing cannot kill a run, cannot mutate
+  state, and cannot make a stopped program's outcome unreportable.
+  `test_dismissing_never_mutates_or_drops_the_runs_own_state` pins it.
+- `_DISMISSED` is **in memory only** — per dashboard session, nothing persisted.
+- **A dismissed program that starts working again REAPPEARS.** Dismissal is
+  recorded against the program's *activity signature* and holds only while that
+  signature does. A finished/stopped program never moves again, so it stays gone
+  (the point of the request); one that resumes comes straight back, because this
+  panel is the owner's only live view and hiding a working program would make
+  the display lie. `activity_signature` deliberately EXCLUDES heartbeat fields
+  (`updated`) — a re-serialized status entry is not activity, or the dismissal
+  would bounce back on the next poll.
+- Never a silent disappearance: the header always shows
+  `N dismissed - click to show`, which restores everything.
+- Covered headless by `DashboardDismissTests` and by
+  `python flexfactor_dashboard.py --selftest`; the per-panel lambda must keep
+  `p=p` binding or every "x" dismisses the last panel drawn.
 
 ## Version-aware review (2026-08-14) — never recommend an API that isn't installed
 

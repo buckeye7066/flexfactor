@@ -391,8 +391,29 @@ class CatalogTests(RotationTestCase):
         rot = self.rotator(catalog(route("a/one", "pool-a"),
                                    age=R.CATALOG_MAX_AGE_S + 60))
         pick = rot.next_route()
-        self.assertTrue(pick.catalog_stale)
-        self.assertIn("stale catalog", pick.describe())
+        self.assertTrue(pick.catalog_stale,
+                        "a stale catalog must still route AND still say so")
+        # ...but NOT on the per-route line. `describe()` used to append
+        # "stale catalog", and the caller prints one line per distinct route, so
+        # a live 5-program run on 2026-08-19 emitted ~30 copies of one fact
+        # about one FILE. The flag above is the machine-readable answer; the
+        # human-readable one is `catalog_staleness_note()`, said once per run.
+        self.assertNotIn("stale", pick.describe().lower())
+        self.assertIn("a/one", pick.describe())
+
+    def test_the_stale_catalog_warning_is_actionable_and_said_once(self):
+        """Neither suppress it nor repeat it: name the file, its age, and the
+        exact refresh command. FlexFactor never runs that command itself --
+        AI Time owns the catalog."""
+        fresh = catalog(route("a/one", "pool-a"), age=60.0)
+        self.assertIsNone(R.catalog_staleness_note(fresh))
+        self.assertIsNone(R.catalog_staleness_note(None))
+        stale = catalog(route("a/one", "pool-a"), age=R.CATALOG_MAX_AGE_S + 3600)
+        stale.path = "X:/routes.json"
+        note = R.catalog_staleness_note(stale)
+        self.assertIn("X:/routes.json", note)
+        self.assertIn("4.0h", note)
+        self.assertIn("python -m aitime.catalog", note)
 
     def test_all_routes_disabled_yields_no_rotator(self):
         path = self._write({"schema": 1, "routes": [

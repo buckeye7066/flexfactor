@@ -2907,6 +2907,9 @@ def _rotation_route_provider(route):
 # Printed-once guards so an absent catalog explains itself exactly once per
 # process instead of once per program in a batch run.
 _ROTATION_REASON_PRINTED: set[str] = set()
+# Same guard for the catalog-staleness warning, keyed by catalog PATH: the fact
+# is about the file, so it is worth saying once and worthless said per route.
+_ROTATION_STALE_PRINTED: set[str] = set()
 
 # Where this machine's provider keys actually live. Groq / Cerebras /
 # OpenRouter / NVIDIA NIM credentials are provisioned for the FCC proxy in its
@@ -2996,6 +2999,16 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     if catalog is None or not catalog.enabled():
         _say(fr.unavailable_reason() or "route catalog is empty")
         return None
+    # Catalog staleness is a fact about ONE FILE, so it is said ONCE per process
+    # (keyed by path), not once per rotated route. `Selection.describe()` used to
+    # append it, and the caller prints one line per distinct route: a live
+    # 5-program run on 2026-08-19 emitted ~30 `... stale catalog` lines. The note
+    # is actionable now -- file, age, and the exact refresh command -- and
+    # FlexFactor never runs that command itself (AI Time owns the catalog).
+    stale_note = fr.catalog_staleness_note(catalog)
+    if stale_note and catalog.path not in _ROTATION_STALE_PRINTED:
+        _ROTATION_STALE_PRINTED.add(catalog.path)
+        print(f"  [rotation] {stale_note}", file=sys.stderr)
     hydrated = _hydrate_route_credentials(catalog.enabled())
     if hydrated:
         print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
@@ -9124,7 +9137,24 @@ _FAILURE_SOURCE_RE = re.compile(
     # and drops anything outside the repo, which is what discards the
     # site-packages frames that dominate a pytest traceback.
     r"/[^:\r\n\"'<>|]*?|"
-    r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?)"
+    r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?|"
+    # ANY other relative path, including a bare repo-root filename. Measured
+    # 2026-08-19 on the live IPlay run: pytest printed
+    # `FAILED iplay/test_production_bridge.py::...` and this regex returned
+    # `/test_production_bridge.py` -- a WRONG absolute path -- because no
+    # alternative accepted a first segment of `iplay`, so the POSIX-absolute
+    # branch matched from the slash onward instead. `FAILED test_x.py::test_a`
+    # (repo root) returned nothing at all. Both make phase 0 print
+    # "(no contained source path found)" while the failing file is on screen.
+    # Whitespace is excluded so the match cannot swallow the runner's own
+    # `FAILED `/`FAIL  ` prefix, and the characters the boundary below already
+    # treats as path terminators (comma, paren, bracket) are excluded too, so
+    # `(motionsync.py:3)` yields `motionsync.py`, not `(motionsync.py`. This
+    # alternative is LAST: a magic-directory path keeps the older branch, which
+    # tolerates spaces inside the path. Over-matching stays safe --
+    # `_existing_failure_path` resolves every hit against project_dir and drops
+    # anything that is not a readable file inside the repository.
+    r"[^\s:\r\n\"'<>|,()\[\]]*?)"
     # Keep longer suffixes before their prefixes (``jsx`` before ``js`` and
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
     # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and

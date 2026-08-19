@@ -647,6 +647,81 @@ class RotationDefaultProviderTests(unittest.TestCase):
         providers = self._providers_with_stubbed_backends(Args)
         self.assertNotIn("rotation", [n for n, _ in providers])
 
+    # -- Stale catalog: SAY IT ONCE, and say something actionable ------------
+    # Live 5-program run 2026-08-19 flooded the log with ~30 lines of
+    # `[rotation] openrouter/... [free-tier/light] stale catalog`.
+    # `Selection.describe()` appended the note per ROUTE while the fact is about
+    # the catalog FILE, and flexfactor's `_announce` prints once per distinct
+    # route - so the more work a run did, the more it repeated itself, and the
+    # note never said which file, how old, or what to run.
+
+    def _write_stale_catalog(self, routes, age_hours=9.0):
+        self._write_catalog(routes)
+        old = time.time() - age_hours * 3600.0
+        os.utime(self._cat_path, (old, old))
+
+    def test_stale_catalog_is_announced_exactly_once_per_run_not_per_route(self):
+        import io, contextlib, flexfactor_rotation as fr
+        self._write_stale_catalog([self._route("groq/llama-x", tier="frontier"),
+                                   self._route("cerebras/qwen-y", tier="light"),
+                                   self._route("openrouter/z", tier="light",
+                                               pool="openrouter:free-tier")])
+        ff._ROTATION_STALE_PRINTED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            providers = ff.build_audit_providers(self.Args)
+            provider = dict(providers)["rotation"]
+            # Drive the per-route announcement for EVERY route, exactly as a
+            # long run does. Before the fix each of these carried the suffix.
+            for route in provider.rotator.catalog.routes:
+                provider._on_route(fr.Selection(
+                    route=route, pool=route.pool, tier=route.tier,
+                    requested_tier=route.tier, catalog_stale=True))
+        out = err.getvalue()
+        self.assertEqual(out.lower().count("stale"), 1,
+                         "the catalog's staleness is ONE fact about ONE file; "
+                         "repeating it per rotated route is the log flood the "
+                         "owner reported\n" + out)
+        # ...and every route still gets its own line, so the fix cannot have
+        # been "print less about rotation".
+        for rid in ("groq/llama-x", "cerebras/qwen-y", "openrouter/z"):
+            self.assertIn(rid, out)
+
+    def test_the_stale_warning_is_actionable_and_never_auto_refreshes(self):
+        import io, contextlib
+        self._write_stale_catalog([self._route("groq/llama-x")], age_hours=9.0)
+        ff._ROTATION_STALE_PRINTED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ff.build_audit_providers(self.Args)
+        out = err.getvalue()
+        self.assertIn(self._cat_path, out, "name the file that is stale")
+        self.assertIn("9.0h", out, "say how old it is")
+        self.assertIn("python -m aitime.catalog", out, "give the exact command")
+        # FlexFactor must never run it: AI Time owns that catalog, and silently
+        # regenerating another program's state is not this tool's call.
+        self.assertNotIn("aitime.catalog", inspect.getsource(ff._build_rotating_provider)
+                         .replace("`python -m aitime.catalog`", ""))
+
+    def test_a_stale_catalog_still_warns_it_is_never_suppressed(self):
+        """Suppression would be the other dishonest fix: a stale catalog can
+        still be offering a route whose quota died hours ago."""
+        import flexfactor_rotation as fr
+        self.assertIsNone(fr.catalog_staleness_note(
+            fr.Catalog(routes=[], age_seconds=60.0, path="x")))
+        note = fr.catalog_staleness_note(
+            fr.Catalog(routes=[], age_seconds=fr.CATALOG_MAX_AGE_S + 1.0, path="x"))
+        self.assertIsNotNone(note)
+        self.assertIn("STALE", note)
+        # The per-route renderer must stay clean of it.
+        route = fr.Route.from_json(self._route("groq/llama-x"))
+        described = fr.Selection(route=route, pool=route.pool, tier=route.tier,
+                                 requested_tier=route.tier,
+                                 catalog_stale=True).describe()
+        self.assertNotIn("stale", described.lower(),
+                         "staleness must not ride on a per-route line")
+        self.assertIn("groq/llama-x", described)
+
     def test_rotation_unavailable_prints_a_reason_never_silent(self):
         # No catalog file exists at the redirected path.
         import io, contextlib
@@ -13738,6 +13813,107 @@ class DashboardNoConsoleWindowTests(unittest.TestCase):
         self.assertIn("pythonw.exe", src)
 
 
+class DashboardDismissTests(unittest.TestCase):
+    """Owner request 2026-08-19: "give me an 'x' to delete a program out of
+    flexfactor, like in the situation of Iplay just now, to leave room for the
+    graphics of the other programs."
+
+    IPlay STOPPED early on a red baseline while four siblings kept working, and
+    its dead panel kept holding a fifth of the window. Dismissing is a VIEW
+    action: it must never touch the run, and the audit's own reporting must stay
+    complete. These run headless - no display, no tkinter."""
+
+    @staticmethod
+    def _load():
+        path = os.path.join(_HERE, "flexfactor_dashboard.py")
+        spec = importlib.util.spec_from_file_location("flexfactor_dashboard", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def setUp(self):
+        self.dash = self._load()
+        self.dash.restore_all()
+        self.working = {"name": "GrantFlow", "dir": "C:/g", "phase": "reviewing",
+                        "reviewed": 12, "files_total": 40, "cost": 1.5}
+        self.stopped = {"name": "IPlay", "dir": "C:/i", "done": True,
+                        "phase": "STOPPED: baseline red", "reviewed": 0}
+
+    def test_dismissing_hides_only_that_program(self):
+        both = [self.working, self.stopped]
+        self.assertEqual(len(self.dash.visible_programs(both)), 2)
+        self.dash.dismiss(self.stopped)
+        self.assertEqual([p["name"] for p in self.dash.visible_programs(both)],
+                         ["GrantFlow"])
+
+    def test_dismissing_never_mutates_or_drops_the_runs_own_state(self):
+        """The dashboard is a READER. A dismissed program must still be there in
+        full, so the audit's own summary can still count it."""
+        both = [self.working, self.stopped]
+        before = json.dumps(both, sort_keys=True)
+        self.dash.dismiss(self.stopped)
+        self.dash.visible_programs(both)
+        self.assertEqual(json.dumps(both, sort_keys=True), before,
+                         "dismissing must not edit the program records")
+        self.assertEqual(len(both), 2, "the source list must keep every program")
+        # And nothing was written anywhere: the module opens status.json read-only.
+        src = inspect.getsource(self.dash)
+        self.assertNotIn('open(path, "w"', src)
+        self.assertNotIn("STATUS_PATH, \"w\"", src)
+
+    def test_a_stopped_program_stays_dismissed_across_polls(self):
+        """A finished/stopped program never moves again, so the panel it freed
+        stays free - which is the entire point of the request."""
+        self.dash.dismiss(self.stopped)
+        for _ in range(200):  # eight seconds of 25fps redraws
+            self.assertEqual(self.dash.visible_programs([self.stopped]), [])
+
+    def test_a_heartbeat_only_update_does_not_resurrect_the_panel(self):
+        self.dash.dismiss(self.stopped)
+        ticked = dict(self.stopped, updated=time.time() + 99)
+        self.assertTrue(self.dash.is_dismissed(ticked),
+                        "a re-serialized status entry is not new activity")
+
+    def test_new_activity_brings_a_dismissed_program_back(self):
+        """This panel is the owner's only live view of what is running; hiding a
+        program that resumed working would make the display lie."""
+        self.dash.dismiss(self.stopped)
+        revived = dict(self.stopped, done=False, phase="reviewing", reviewed=3)
+        self.assertFalse(self.dash.is_dismissed(revived))
+        self.assertEqual([p["name"] for p in self.dash.visible_programs([revived])],
+                         ["IPlay"])
+        # ...and it can be dismissed again against its new signature.
+        self.dash.dismiss(revived)
+        self.assertTrue(self.dash.is_dismissed(revived))
+
+    def test_restore_all_brings_everything_back(self):
+        both = [self.working, self.stopped]
+        self.dash.dismiss(self.stopped)
+        self.dash.dismiss(self.working)
+        self.assertEqual(self.dash.visible_programs(both), [])
+        self.dash.restore_all()
+        self.assertEqual(len(self.dash.visible_programs(both)), 2)
+
+    def test_two_programs_sharing_a_name_are_dismissed_independently(self):
+        a = {"name": "app", "dir": "C:/one", "done": True}
+        b = {"name": "app", "dir": "C:/two", "done": True}
+        self.dash.dismiss(a)
+        self.assertEqual([p["dir"] for p in self.dash.visible_programs([a, b])],
+                         ["C:/two"])
+
+    def test_the_control_is_wired_into_the_render_loop(self):
+        """The logic above is only reachable because redraw() filters through
+        visible_programs and registers a clickable region per panel."""
+        src = inspect.getsource(self.dash._main)
+        self.assertIn("visible_programs(", src)
+        self.assertIn("dismiss(p)", src)
+        self.assertIn("restore_all", src)
+        self.assertIn('canvas.bind("<Button-1>"', src)
+        # The per-panel lambda must bind the loop variable, or every "x" would
+        # dismiss whichever panel was drawn last.
+        self.assertIn("lambda p=p:", src)
+
+
 class RedPublicationBaselineRepairTests(unittest.TestCase):
     """Regression for the live SermonSmith loop of 2026-08-17."""
 
@@ -13817,6 +13993,61 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)))
         finding = ff._publication_failure_finding(paths[0], log)
         self.assertIn("Correct this test only if", finding["fix"])
+
+    # -- Relative paths with an ORDINARY first segment (live IPlay, 2026-08-19)
+    # `[4/5 Iplay] STOP: ... Targeted: (no contained source path found)` while
+    # pytest had printed `FAILED iplay/test_production_bridge.py::...`. The
+    # relative alternative only accepted a first segment of
+    # apps|packages|src|tests?|lib, so the POSIX-ABSOLUTE alternative matched
+    # from the slash onward and produced `/test_production_bridge.py` - a wrong
+    # absolute path that can never resolve. A bare repo-root filename matched
+    # nothing at all.
+
+    def test_a_relative_path_whose_first_segment_is_not_a_magic_directory(self):
+        line = ("FAILED iplay/test_production_bridge.py::TransferContractTests"
+                "::test_sidecar_cache_rejects_unrelated_identity")
+        hits = [m.group("path") for m in ff._FAILURE_SOURCE_RE.finditer(line)]
+        self.assertEqual(hits, ["iplay/test_production_bridge.py"],
+                         "the POSIX-absolute alternative must not steal a "
+                         "relative path and turn it into '/<basename>'")
+        with _tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "iplay"))
+            with open(os.path.join(td, "iplay", "production_bridge.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("def transfer():\n    return None\n")
+            with open(os.path.join(td, "iplay", "test_production_bridge.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("def test_x():\n    assert False\n")
+            paths = ff._publication_failure_paths(td, line)
+        self.assertEqual(paths, ["iplay/production_bridge.py",
+                                 "iplay/test_production_bridge.py"])
+
+    def test_a_bare_repo_root_filename_is_extracted(self):
+        hits = [m.group("path") for m in
+                ff._FAILURE_SOURCE_RE.finditer("FAILED test_motionsync.py::test_a")]
+        self.assertEqual(hits, ["test_motionsync.py"],
+                         "a repo-root test file has no directory segment at "
+                         "all and previously matched nothing")
+        with _tempfile.TemporaryDirectory() as td:
+            self._py_project(td)
+            paths = ff._publication_failure_paths(
+                td, "FAILED test_motionsync.py::test_a - AssertionError")
+        self.assertEqual(paths, ["motionsync.py", "test_motionsync.py"])
+
+    def test_the_widened_relative_branch_does_not_swallow_the_runner_prefix(self):
+        """`FAILED `/` FAIL  ` must never become part of the path, and a
+        parenthesised frame must yield the path without its bracket."""
+        for line, want in (
+                ("FAILED tests/test_thing.py::test_a", ["tests/test_thing.py"]),
+                (" FAIL  src/pages/Home.test.jsx > public Home",
+                 ["src/pages/Home.test.jsx"]),
+                ("src/pkg/thing_test.go:44", ["src/pkg/thing_test.go"]),
+                ("  at Object.<anonymous> (motionsync.py:3:1)",
+                 ["motionsync.py"]),
+                ('  File "C:\\proj\\x.py", line 3', ["C:\\proj\\x.py"]),
+                ('  File "/home/u/p/x.py", line 3', ["/home/u/p/x.py"])):
+            hits = [m.group("path") for m in ff._FAILURE_SOURCE_RE.finditer(line)]
+            self.assertEqual(hits, want, line)
 
     def test_frames_outside_the_repository_are_discarded(self):
         """The POSIX-absolute alternative deliberately over-matches (a pytest
