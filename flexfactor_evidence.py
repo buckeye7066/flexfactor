@@ -197,6 +197,25 @@ def _safe_file(root: str, rel: str) -> Path | None:
 
 
 def _read_bytes(root: str, rel: str, cap: int = 4_000_000) -> tuple[bytes, bool] | None:
+    got = _read_bytes_full(root, rel, cap)
+    if got is None:
+        return None
+    raw, truncated, _path, _size = got
+    return raw, truncated
+
+
+def _read_bytes_full(root: str, rel: str, cap: int = 4_000_000
+                     ) -> tuple[bytes, bool, Path, int] | None:
+    """One containment resolve, one stat, one read - and hand all of it back.
+
+    The index used to call `_safe_file` twice, `stat` twice and read every file
+    TWICE (once here for content, once inside `_sha256_file` for the digest).
+    On this machine each filesystem op costs 11-70ms under AV scanning, so on a
+    ~4k-file repository that duplicated work is minutes of pure overhead before
+    the audit prints anything. Callers that need the digest hash the bytes they
+    already hold; only a TRUNCATED file still needs a streaming pass, because
+    the bytes in memory are not the whole file.
+    """
     path = _safe_file(root, rel)
     if path is None:
         return None
@@ -204,7 +223,7 @@ def _read_bytes(root: str, rel: str, cap: int = 4_000_000) -> tuple[bytes, bool]
         size = path.stat().st_size
         with path.open("rb") as fh:
             raw = fh.read(cap + 1)
-        return raw[:cap], size > cap
+        return raw[:cap], size > cap, path, size
     except OSError:
         return None
 
@@ -348,10 +367,19 @@ def _parse_generic(rel: str, text: str) -> dict:
     return result
 
 
-def build_repository_index(root: str, run_id: str) -> dict:
-    """Build a content-addressed, measurable repository-wide index."""
+def build_repository_index(root: str, run_id: str, progress=None) -> dict:
+    """Build a content-addressed, measurable repository-wide index.
+
+    `progress(done, total, rel)` is called per file when supplied. It exists
+    because this runs BEFORE the audit's first phase transition: without it a
+    large repository shows "starting" and prints nothing for minutes, which is
+    indistinguishable from a hang (live 2026-08-19: GrantFlow, ~4k files, sat
+    at phase "starting" while smaller programs in the same batch had reached
+    the baseline gate).
+    """
     root = os.path.abspath(root)
     paths, discovery = _git_files(root)
+    total_paths = len(paths)
     files: list[dict] = []
     symbols: list[dict] = []
     imports: list[dict] = []
@@ -363,18 +391,24 @@ def build_repository_index(root: str, run_id: str) -> dict:
         category = ("source" if ext in SOURCE_EXTENSIONS else
                     "text" if ext in TEXT_CONFIG_EXTENSIONS or Path(rel).name in {
                         "Dockerfile", "Makefile", "LICENSE", "README"} else "asset")
-        got = _read_bytes(root, rel)
+        got = _read_bytes_full(root, rel)
         if got is None:
             files.append({"path": rel, "category": category, "status": "refused",
                           "sha256": None, "size": None, "analysis_run_id": run_id})
             continue
-        raw, truncated = got
-        safe_path = _safe_file(root, rel)
+        raw, truncated, safe_path, size = got
+        # Digest the bytes already in memory. Identical result to the old
+        # streaming hash for every whole file; a truncated one still streams,
+        # since `raw` is only the first `cap` bytes and hashing it would
+        # silently publish a digest that is NOT the file's.
         record = {"path": rel, "category": category, "status": "inventoried",
-                  "sha256": _sha256_file(safe_path) if safe_path else None,
-                  "size": safe_path.stat().st_size if safe_path else None,
+                  "sha256": (_sha256_file(safe_path) if truncated
+                             else hashlib.sha256(raw).hexdigest()),
+                  "size": size,
                   "analysis_run_id": run_id, "test": _is_test(rel),
                   "content_truncated": truncated}
+        if progress is not None:
+            progress(len(files) + 1, total_paths, rel)
         if category == "source":
             if truncated:
                 record["status"] = "too-large-for-structural-parser"

@@ -282,6 +282,39 @@ not an opt-out). The chosen endpoint is always printed and lands in the report;
 `--allow-remote-repo-rewards`, so the flag is KEPT as an accepted no-op — deleting
 it is argparse exit 2 and a dead run.
 
+## "GrantFlow never opened": 265s of SILENT indexing before phase 0 (2026-08-19)
+
+Live 10-program run: GrantFlow's checkpoint sat at `phase="starting"` with
+`updated == started` while smaller programs in the same batch had reached the
+baseline gate. Nothing was wrong with name resolution (`_find_local_project`
+resolves `grantflow` -> `C:\Users\firer\GrantFlow` correctly) — the run was
+inside `build_repository_index`, which is called immediately after the
+checkpoint is created and **before any `set_phase`**, so a big repo prints
+nothing and looks dead.
+
+- **Two full reads per file.** `_read_bytes` read the content, then
+  `_sha256_file` opened and read the *same file again* for the digest, plus a
+  second `_safe_file` resolve and a second `stat`. That is exactly the
+  anti-pattern this machine punishes hardest (measured 11-70ms per filesystem
+  op under AV scanning). `_read_bytes_full` now returns
+  `(raw, truncated, path, size)` from ONE resolve + ONE stat + ONE read, and
+  the digest is taken from the bytes already in memory.
+- **MEASURED on GrantFlow (3,935 files): 265.2s -> 37.0s**, byte-identical
+  index (same 3,935 files / 17,735 symbols / 1,197 routes / 3,676 controls),
+  and a 250-file sample verified digest-for-digest against an independent
+  streaming hash (0 mismatches).
+- **The one case the in-memory digest would be WRONG is a TRUNCATED file**
+  (over the 4MB cap): `raw` holds only the prefix, so hashing it would publish
+  a digest that is not the file's. Truncated files still stream. GrantFlow
+  happens to contain zero of them, so the live measurement could not have
+  caught a regression here — `test_a_truncated_file_hashes_the_WHOLE_file...`
+  is the only guard, and it fails when the branch is removed.
+- **Observability is the other half of the fix**: the phase is now named
+  (`indexing repository (baseline evidence)`) BEFORE the walk starts, and a
+  progress callback ticks the dashboard + console every 10s. A long job that
+  says what it is doing is not a hang; a silent one is indistinguishable from
+  one.
+
 ## Phase 0 could not read a PYTHON failure at all (2026-08-19, live IPlay audit)
 
 `[4/10 iplay] STOP: baseline publication suite remains red after bounded

@@ -11953,6 +11953,94 @@ class EvidenceRuntimeTests(unittest.TestCase):
         self.assertTrue(idx["complete_source_inventory"])
         self.assertTrue(all(f["sha256"] for f in idx["files"]))
 
+    # -- indexing cost + observability (live GrantFlow, 2026-08-19) ----------
+    # build_repository_index runs BEFORE the audit's first phase transition and
+    # read every file TWICE (content, then again inside _sha256_file). Measured
+    # on GrantFlow (~3.9k files): 265.2s of total silence at phase "starting",
+    # which read as "GrantFlow never opened". Single-read + in-memory digest:
+    # 37.0s, byte-identical index.
+
+    def test_digest_matches_a_streaming_hash_of_the_real_file(self):
+        """The digest now comes from bytes already in memory - it must still
+        equal an independent streaming hash of the file on disk."""
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            body = "def work():\n    return 1\n" * 40
+            path = os.path.join(tmp, "src", "worker.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            idx = ev.build_repository_index(tmp, "digest-run")
+            expected = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    expected.update(chunk)
+            # On-disk size, NOT len(body): Windows text mode expands \n to \r\n,
+            # so the string length is not the file length. `size` must come from
+            # the real stat the single read already took.
+            on_disk = os.path.getsize(path)
+        record = next(f for f in idx["files"] if f["path"].endswith("worker.py"))
+        self.assertEqual(record["sha256"], expected.hexdigest())
+        self.assertEqual(record["size"], on_disk)
+
+    def test_a_truncated_file_hashes_the_WHOLE_file_not_the_read_prefix(self):
+        """The one case where the in-memory digest would be WRONG: a file past
+        the read cap holds only its prefix in memory, so hashing `raw` would
+        publish a digest that is not the file's. That must still stream."""
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.py")
+            with open(path, "wb") as fh:
+                fh.write(b"# padding\n" * 450_000)      # ~4.5 MB, over the cap
+            idx = ev.build_repository_index(tmp, "trunc-run")
+            whole = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    whole.update(chunk)
+            with open(path, "rb") as fh:
+                prefix_only = hashlib.sha256(fh.read(4_000_000)).hexdigest()
+        record = next(f for f in idx["files"] if f["path"].endswith("big.py"))
+        self.assertTrue(record["content_truncated"], "fixture must exceed the cap")
+        self.assertEqual(record["sha256"], whole.hexdigest())
+        self.assertNotEqual(record["sha256"], prefix_only,
+                            "digest is of the read PREFIX, not the file")
+
+    def test_indexing_reports_progress_so_a_big_repo_is_not_silent(self):
+        ev = self._ev()
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(5):
+                with open(os.path.join(tmp, f"m{i}.py"), "w", encoding="utf-8") as fh:
+                    fh.write(f"def f{i}():\n    return {i}\n")
+            ev.build_repository_index(tmp, "progress-run",
+                                      progress=lambda d, t, rel: seen.append((d, t)))
+        self.assertEqual(len(seen), 5, "every file must report progress")
+        self.assertEqual([d for d, _ in seen], [1, 2, 3, 4, 5])
+        self.assertTrue(all(t == 5 for _, t in seen), "total must be the file count")
+
+    def test_each_file_is_opened_once_not_twice(self):
+        """Pins the cost fix itself: two reads per file is what made a ~4k-file
+        repo take 265s before the audit printed anything."""
+        import io
+        from unittest import mock
+        ev = self._ev()
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(4):
+                with open(os.path.join(tmp, f"m{i}.py"), "w", encoding="utf-8") as fh:
+                    fh.write(f"def f{i}():\n    return {i}\n")
+            opens = {"n": 0}
+            real_open = io.open
+
+            def counting_open(file, mode="r", *a, **k):
+                if "b" in str(mode) and str(file).endswith(".py"):
+                    opens["n"] += 1
+                return real_open(file, mode, *a, **k)
+
+            with mock.patch("io.open", counting_open):
+                ev.build_repository_index(tmp, "open-count-run")
+        self.assertEqual(opens["n"], 4,
+                         f"expected one binary open per file, got {opens['n']}")
+
     def test_changed_files_are_rescanned_and_reverse_dependencies_expand(self):
         ev = self._ev()
         with tempfile.TemporaryDirectory() as tmp:
