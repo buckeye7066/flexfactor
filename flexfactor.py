@@ -11425,10 +11425,21 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             raise BranchStateError(
                 f"{label}: verification failed and rollback failed: "
                 f"{_tail(reset.stderr, 3)}")
-        print(f"    publication verification FAILED; rejected tree restored:\n"
-              f"{_gate_log}", file=sys.stderr)
+        # The tri-state must survive to the CONSOLE, not just the return value.
+        # This print said "FAILED" unconditionally, so a repo with no runnable
+        # build produced (live 2026-08-19):
+        #     publication verification FAILED; rejected tree restored:
+        #     (no build/verify command available - NOTHING WAS VERIFIED)
+        # - the word FAILED contradicted by the very next line. The two states
+        # have DIFFERENT remedies: fix the code, versus configure a build
+        # command. `status` below was already honest, and the existing test
+        # only asserted on `status`, which is why the lie survived.
         verdict = ("FAILED" if final_ok is False else
                    "did not run (no build/verify command exists)")
+        headline = ("publication verification FAILED" if final_ok is False else
+                    "publication verification DID NOT RUN - nothing was verified")
+        print(f"    {headline}; rejected tree restored:\n"
+              f"{_gate_log}", file=sys.stderr)
         return (f"{label}: REJECTED; final verification {verdict}; "
                 "pre-change tree restored; no local commit or push")
     gate_word = (("passed (build + project test suite)" if has_suite else
