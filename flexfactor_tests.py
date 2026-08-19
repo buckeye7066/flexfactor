@@ -13696,6 +13696,20 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
         finding = ff._publication_failure_finding(paths[0], log)
         self.assertIn("Correct this test only if", finding["fix"])
 
+    def test_frames_outside_the_repository_are_discarded(self):
+        """The POSIX-absolute alternative deliberately over-matches (a pytest
+        traceback is mostly site-packages frames); `_existing_failure_path`'s
+        containment check is what keeps only this repo's files, so pin it."""
+        with _tempfile.TemporaryDirectory() as td:
+            self._py_project(td)
+            log = ('  File "/usr/lib/python3/site-packages/_pytest/runner.py", line 353\n'
+                   '  File "C:\\Python312\\Lib\\site-packages\\_pytest\\python.py", line 507\n'
+                   '  File "%s", line 81, in <module>'
+                   % os.path.join(td, "test_motionsync.py"))
+            paths = ff._publication_failure_paths(td, log)
+        self.assertEqual(paths, ["motionsync.py", "test_motionsync.py"],
+                         "third-party frames must not become repair targets")
+
     def test_jsx_suffix_is_still_not_truncated_to_js(self):
         """The boundary widening must not reopen the Vitest truncation bug."""
         hits = [m.group("path") for m in

@@ -9116,6 +9116,14 @@ def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
 
 _FAILURE_SOURCE_RE = re.compile(
     r"(?P<path>(?:[A-Za-z]:[\\/][^:\r\n\"'<>|]*?|"
+    # POSIX absolute. Only a Windows drive or one of the magic directory names
+    # below was accepted, so on Linux/macOS a traceback frame for a file in the
+    # repo ROOT (`/home/me/proj/test_x.py`) matched nothing at all -- the same
+    # blind spot as the quote boundary, one platform over. Over-matching is
+    # harmless: `_existing_failure_path` resolves every hit against project_dir
+    # and drops anything outside the repo, which is what discards the
+    # site-packages frames that dominate a pytest traceback.
+    r"/[^:\r\n\"'<>|]*?|"
     r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?)"
     # Keep longer suffixes before their prefixes (``jsx`` before ``js`` and
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
