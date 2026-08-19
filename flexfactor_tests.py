@@ -74,6 +74,28 @@ if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
 ff._auto_activate_fcc_proxy = lambda *a, **k: False
 
 # --------------------------------------------------------------------------- #
+# NEVER let a test see the machine's REAL rotation catalog or state.
+#
+# Pool-first rotation (2026-08-19) made rotation the DEFAULT on the free-first
+# path whenever %LOCALAPPDATA%\AITime\routes.json exists — which on this dev
+# machine it genuinely does (654 live routes). Without this redirect, every
+# existing build_audit_providers test would silently take the rotation branch
+# instead of the fixed-provider/pool behaviour it was written to pin, and any
+# test that DID rotate would stamp selections into the owner's real shared
+# rotation-state.json (the file other apps' rotators coordinate through). Same
+# TEST HYGIENE principle as everything above: point both at the tempdir, where
+# no catalog exists, so rotation reports "unavailable" and every test sees
+# prior behaviour unless it writes its own fixture catalog.
+# --------------------------------------------------------------------------- #
+os.environ["AI_ROTATE_CATALOG"] = os.path.join(_TEST_STATE_DIR, "routes.json")
+os.environ["AI_ROTATE_STATE"] = os.path.join(_TEST_STATE_DIR, "rotation-state.json")
+# And never let a test hydrate REAL provider keys from ~/.fcc/.env into this
+# process's environment (same hazard class as the FCC-proxy activation above:
+# a fixture catalog route naming GROQ_API_KEY would inject the real key
+# mid-suite). Tests that exercise hydration point _FCC_ENV_FILE at a fixture.
+ff._FCC_ENV_FILE = os.path.join(_TEST_STATE_DIR, "fcc-env-absent")
+
+# --------------------------------------------------------------------------- #
 # NEVER let a test reach the real internet.
 #
 # Competitor research (2026-08-16) added the first outbound HTTP in the audit
@@ -134,6 +156,17 @@ class TestSessionIsolationTests(unittest.TestCase):
                 f"{name} points at the owner's real state ({path}); a test run "
                 "would evict real projects from brain.json or write resume "
                 "checkpoints into the owner's real ~/.flexfactor/runs")
+
+    def test_rotation_catalog_and_state_are_not_the_real_ones(self):
+        """Without the env redirect above, this dev machine's REAL 654-route
+        catalog silently flips every build_audit_providers test into rotation
+        mode, and a rotating test stamps the owner's shared rotation state."""
+        import flexfactor_rotation as fr
+        for name, path in (("catalog", fr.catalog_path()),
+                           ("state", fr.rotation_state_path())):
+            self.assertTrue(
+                os.path.abspath(path).startswith(os.path.abspath(_TEST_STATE_DIR)),
+                f"rotation {name} path points outside the test tempdir: {path}")
 
     def test_the_real_brain_is_untouched_by_a_write(self):
         real = os.path.join(os.path.expanduser("~"), ".flexfactor", "brain.json")
@@ -517,6 +550,207 @@ class PricingAndEconomyTests(unittest.TestCase):
         finally:
             ff._provider_key_present = real_key
             ff._provider_health = real_health
+
+
+class RotationDefaultProviderTests(unittest.TestCase):
+    """Pool-first rotation as the DEFAULT provider (owner order 2026-08-18).
+
+    The rotator itself is proven in flexfactor_rotation_tests.py; these tests
+    pin the flexfactor-side HOOK: rotation wins the free-first path when a
+    usable catalog exists, prior behaviour survives untouched when it does not
+    (or when the owner switched it off / named a model), the judge-tier
+    sentinel never reaches a wire call, and catalog-free models bill $0
+    without opening a --max-cost dodge for priced models."""
+
+    class Args:
+        provider = "anthropic"       # argparse default, not an owner choice
+        explicit_provider = False    # free-first applies
+        model = None
+        economy = False
+        use_both = False
+        secondary_model = None
+        judge_model = None
+        no_preflight = False
+
+    @staticmethod
+    def _catalog(routes):
+        return {"schema": 1, "generated_at": "2026-08-19T00:00:00Z",
+                "routes": routes}
+
+    @staticmethod
+    def _route(rid, tier="frontier", cost="free-tier", api="openai",
+               auth_env="FLEXROT_TEST_KEY", pool=None):
+        return {"id": rid, "backend": rid.split("/")[0], "backend_label": rid,
+                "model": rid.split("/", 1)[1], "wire_model": rid.split("/", 1)[1],
+                "api": api, "base_url": "http://127.0.0.1:9", "pool": pool or
+                f"{rid.split('/')[0]}:{cost}", "auth_env": auth_env,
+                "cost_class": cost, "tier": tier, "enabled": True}
+
+    def setUp(self):
+        self._cat_path = os.environ["AI_ROTATE_CATALOG"]
+        ff._ROTATION_REASON_PRINTED.clear()
+        os.environ["FLEXROT_TEST_KEY"] = "test-key"
+
+    def tearDown(self):
+        if os.path.exists(self._cat_path):
+            os.remove(self._cat_path)
+        os.environ.pop("FLEXROT_TEST_KEY", None)
+        os.environ.pop("AI_ROTATE", None)
+        ff._FREE_ROUTE_MODELS.clear()
+
+    def _write_catalog(self, routes):
+        with open(self._cat_path, "w", encoding="utf-8") as fh:
+            json.dump(self._catalog(routes), fh)
+
+    def test_free_first_rotates_by_default_when_a_catalog_exists(self):
+        self._write_catalog([self._route("groq/llama-x", tier="frontier"),
+                             self._route("cerebras/qwen-y", tier="light")])
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            providers = ff.build_audit_providers(self.Args)
+        self.assertEqual([n for n, _ in providers], ["rotation"])
+        import flexfactor_rotation as fr
+        self.assertIsInstance(providers[0][1], fr.RotatingProvider)
+        self.assertEqual(ff._LAST_FREE_REVIEW_POOL, [],
+                         "rotation must not leave a stale free pool behind")
+        self.assertIn("[rotation] ON:", err.getvalue())
+
+    def _providers_with_stubbed_backends(self, args):
+        """Run build_audit_providers with key/health/factory stubbed so the
+        fall-through (non-rotation) path never touches a real backend."""
+        real_key = ff._provider_key_present
+        real_health = ff._provider_health
+        real_make = ff.make_provider
+        ff._provider_key_present = lambda name: name == "anthropic"
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            return ff.build_audit_providers(args)
+        finally:
+            ff._provider_key_present = real_key
+            ff._provider_health = real_health
+            ff.make_provider = real_make
+
+    def test_ai_rotate_off_restores_prior_behaviour(self):
+        self._write_catalog([self._route("groq/llama-x")])
+        os.environ["AI_ROTATE"] = "off"
+        providers = self._providers_with_stubbed_backends(self.Args)
+        self.assertNotIn("rotation", [n for n, _ in providers])
+        self.assertTrue(providers, "prior behaviour must still yield a provider")
+
+    def test_an_explicit_model_bypasses_rotation(self):
+        self._write_catalog([self._route("groq/llama-x")])
+
+        class Args(self.Args):
+            model = "gpt-4o"
+        providers = self._providers_with_stubbed_backends(Args)
+        self.assertNotIn("rotation", [n for n, _ in providers])
+
+    def test_rotation_unavailable_prints_a_reason_never_silent(self):
+        # No catalog file exists at the redirected path.
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._providers_with_stubbed_backends(self.Args)
+        self.assertIn("[rotation] not rotating:", err.getvalue())
+
+    def test_judge_sentinel_routes_to_light_tier_and_never_reaches_the_wire(self):
+        import flexfactor_rotation as fr
+        routes = [fr.Route.from_json(self._route("groq/llama-x", tier="frontier")),
+                  fr.Route.from_json(self._route("groq/llama-cheap", tier="light",
+                                                 pool="groq:free-tier-b"))]
+        rotator = fr.Rotator(
+            catalog=fr.Catalog(routes=routes),
+            store=fr.StateStore(os.path.join(_TEST_STATE_DIR, "rot-judge-state.json")))
+        seen = {}
+
+        class Stub:
+            def __init__(self, route):
+                self.route = route
+
+            def structured(self, system, prompt, schema, **kwargs):
+                seen["kwargs"] = dict(kwargs)
+                seen["route"] = self.route
+                return {"ok": True}
+
+        prov = fr.RotatingProvider(rotator, Stub)
+        result = ff._judge(prov, "sys", "prompt", {"type": "object"})
+        self.assertEqual(result, {"ok": True})
+        self.assertNotIn("model", seen["kwargs"],
+                         "the rotating judge sentinel reached a wire call")
+        self.assertEqual(seen["route"].tier, "light",
+                         "_judge through rotation must ride the light tier")
+
+    def test_catalog_free_models_bill_zero_without_a_max_cost_dodge(self):
+        import flexfactor_rotation as fr
+        free = fr.Route.from_json(self._route("groq/llama-free"))
+        prov = ff._rotation_route_provider(free)
+        self.assertEqual(prov.model, "llama-free")
+        self.assertEqual(ff._price_for("llama-free"), (0.0, 0.0))
+        # A model with a KNOWN price keeps it even when registered free — the
+        # table wins, so no adapter can dodge --max-cost via the registry.
+        priced = next(iter(ff.MODEL_PRICING))
+        ff._FREE_ROUTE_MODELS.add(priced)
+        self.assertNotEqual(ff._price_for(priced), (0.0, 0.0))
+        # A genuinely unknown, unregistered id still bills fail-closed premium.
+        self.assertEqual(ff._price_for("some-unknown-model-id"), ff._DEFAULT_PRICE)
+
+    def test_unusable_routes_are_dropped_with_named_reasons(self):
+        import flexfactor_rotation as fr
+        cases = [
+            (self._route("gemini/pro", api="gemini"), "unsupported api"),
+            (self._route("groq/llama-x", auth_env="FLEXROT_UNSET_ENV"), "missing FLEXROT_UNSET_ENV"),
+            (self._route("openai_api/gpt-4o", cost="paid-metered"), "paid"),
+        ]
+        for raw, expected in cases:
+            reason = ff._route_unusable_reason(fr.Route.from_json(raw), "auto")
+            self.assertIn(expected, reason, f"route {raw['id']}")
+        good = ff._route_unusable_reason(
+            fr.Route.from_json(self._route("groq/llama-x")), "auto")
+        self.assertEqual(good, "")
+
+    def test_credential_hydration_fills_missing_keys_and_never_overwrites(self):
+        import flexfactor_rotation as fr
+        env_file = os.path.join(_TEST_STATE_DIR, "fcc-env-fixture")
+        with open(env_file, "w", encoding="utf-8") as fh:
+            fh.write("# comment\nFLEXROT_HYDRATE_A=from-file\n"
+                     'FLEXROT_HYDRATE_B="quoted"\nFLEXROT_PRESENT=stomped\n')
+        routes = [fr.Route.from_json(self._route("groq/a", auth_env="FLEXROT_HYDRATE_A")),
+                  fr.Route.from_json(self._route("groq/b", auth_env="FLEXROT_HYDRATE_B")),
+                  fr.Route.from_json(self._route("groq/c", auth_env="FLEXROT_PRESENT"))]
+        real_file = ff._FCC_ENV_FILE
+        os.environ["FLEXROT_PRESENT"] = "live-env-wins"
+        try:
+            ff._FCC_ENV_FILE = env_file
+            loaded = ff._hydrate_route_credentials(routes)
+            self.assertEqual(loaded, ["FLEXROT_HYDRATE_A", "FLEXROT_HYDRATE_B"])
+            self.assertEqual(os.environ["FLEXROT_HYDRATE_A"], "from-file")
+            self.assertEqual(os.environ["FLEXROT_HYDRATE_B"], "quoted")
+            self.assertEqual(os.environ["FLEXROT_PRESENT"], "live-env-wins",
+                             "hydration must never overwrite the live environment")
+        finally:
+            ff._FCC_ENV_FILE = real_file
+            for var in ("FLEXROT_HYDRATE_A", "FLEXROT_HYDRATE_B", "FLEXROT_PRESENT"):
+                os.environ.pop(var, None)
+
+    def test_hydration_is_neutralized_for_the_test_session(self):
+        """The import-time redirect above must hold: the real ~/.fcc/.env is
+        never readable through the module default during a test run."""
+        self.assertTrue(os.path.abspath(ff._FCC_ENV_FILE).startswith(
+            os.path.abspath(_TEST_STATE_DIR)))
+        self.assertFalse(os.path.exists(ff._FCC_ENV_FILE))
+
+    def test_local_mode_excludes_non_local_routes(self):
+        import flexfactor_rotation as fr
+        remote = dict(self._route("groq/llama-x"))
+        remote["base_url"] = "https://api.groq.com/openai/v1"
+        self.assertIn("local", ff._route_unusable_reason(
+            fr.Route.from_json(remote), "local"))
+        local = self._route("ollama/qwen", api="ollama", auth_env="",
+                            cost="local-unlimited")
+        self.assertEqual(ff._route_unusable_reason(
+            fr.Route.from_json(local), "local"), "")
 
 
 class FreeReviewPoolTests(unittest.TestCase):

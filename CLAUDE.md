@@ -282,6 +282,52 @@ not an opt-out). The chosen endpoint is always printed and lands in the report;
 `--allow-remote-repo-rewards`, so the flag is KEPT as an accepted no-op — deleting
 it is argparse exit 2 and a dead run.
 
+## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
+
+`build_audit_providers`' free-first path now tries rotation FIRST: when the
+owner named neither `--provider` nor `--model`/`--judge-model` and AI Time's
+route catalog (`%LOCALAPPDATA%\AITime\routes.json`, `python -m aitime.catalog`)
+has usable routes, the run gets ONE `RotatingProvider` (`flexfactor_rotation.py`)
+that picks a different free route per call, walking QUOTA POOLS
+least-recently-used (654 routes drain only ~24 ledgers — rotating model NAMES
+spreads nothing). The FCC/ollama free pool is the fallback when no catalog is
+usable, and `_build_rotating_provider` PRINTS why (`[rotation] not rotating:
+...`) — never a silent fallback. `AI_ROTATE=off` restores prior behaviour
+outright; pinning one route is `AI_ROTATE_PIN` / the state-file pin —
+deliberately NO new CLI flag (launcher-drift trap). `--economy` maps to the
+catalog's `strong` author tier; judging rides `light`.
+
+- **Routes are filtered BEFORE the Rotator sees them** (`_route_unusable_reason`):
+  unsupported api (gemini — no provider class), missing `auth_env` credential,
+  paid cost class (rotation stays FREE-ONLY, `allow_paid=False` — never
+  auto-promote), non-loopback in `--model-mode local`. An unbuildable route
+  left in would be selected, fail, and burn a cooldown — across 600+ routes
+  the first sweep becomes an error tour. Exclusions are counted and printed.
+- **The judge sentinel must never reach the wire.** `_judge()` passes
+  `model=provider.judge_model`; on a RotatingProvider that is
+  `ROTATING_JUDGE_MODEL` ("rotating-judge"), a TIER REQUEST, not a model id.
+  `RotatingProvider.structured()` translates it to the judge tier and strips
+  the kwarg. `judge_model` stays FIXED at the sentinel (`.model` mutates to the
+  last route's real id) so the translation cannot collide with a real id.
+- **Catalog-free models bill $0 via `_FREE_ROUTE_MODELS`**, populated only by
+  `_rotation_route_provider` from the catalog's `cost_class`. The branch sits
+  AFTER the pricing table (a priced model can never dodge `--max-cost` by also
+  appearing in a catalog — Sol-finding shape) and BEFORE the fail-closed
+  premium default, which otherwise let a $0 run exhaust the budget on phantom
+  spend and REFUSE free work.
+- **Route providers are the REAL provider classes** (`OpenAIProvider` via the
+  same `object.__new__` client-injection pattern as `_openai_rescue_provider`,
+  `OllamaProvider`, env-configured `AnthropicProvider` for the FCC route —
+  never a direct api.anthropic.com client), so the egress gate, budget guard
+  and output ceilings all apply to rotated calls. Cloudflare at Groq/Cerebras
+  blocks default-library UAs (1010, looks like a revoked key) — the injected
+  client sends a real product UA.
+- **Test hygiene:** `flexfactor_tests.py` redirects `AI_ROTATE_CATALOG` /
+  `AI_ROTATE_STATE` to the tempdir at import — this dev machine's REAL catalog
+  would otherwise flip every `build_audit_providers` test into rotation mode
+  and stamp the owner's shared rotation state. `TestSessionIsolationTests`
+  guards it.
+
 ## Version-aware review (2026-08-14) — never recommend an API that isn't installed
 
 The one class where FlexFactor actively **damages** the program it exists to

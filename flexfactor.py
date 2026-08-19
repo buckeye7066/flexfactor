@@ -184,6 +184,12 @@ _DEFAULT_PRICE = (max(p[0] for p in MODEL_PRICING.values()),
                   max(p[1] for p in MODEL_PRICING.values()))
 _WARNED_UNKNOWN_MODELS: set[str] = set()
 
+# Wire-model ids of CATALOG-FREE rotation routes, priced $0 by _price_for.
+# Populated EXCLUSIVELY by _rotation_route_provider() from the AI Time catalog's
+# cost_class — never from a model's own claim or a CLI argument. See the
+# ordering comment inside _price_for for why the pricing table still wins.
+_FREE_ROUTE_MODELS: set[str] = set()
+
 # Per-model OUTPUT ceilings for the OpenAI provider. Was a hardcoded 16384 -
 # gpt-4o's limit - applied to EVERY model, so a newer model was silently capped
 # at a fraction of what it can emit and large files came back
@@ -235,6 +241,22 @@ def _price_for(model: str) -> tuple[float, float]:
         if model == key or model.startswith(key + "-") or model.startswith(key + ":") \
                 or model.startswith(key + "@"):
             return price
+    # CATALOG-FREE routes (pool-first rotation, 2026-08-19). The rotation
+    # factory registers the exact wire ids of routes whose AI Time catalog
+    # cost_class is free (free-tier / local-unlimited / subscription) — Groq,
+    # Cerebras, OpenRouter, NVIDIA NIM free models the pricing table will never
+    # enumerate. Without this branch every such id fell through to the
+    # fail-closed premium default below, so a run that spent $0 real dollars
+    # exhausted --max-cost on phantom spend and free work was REFUSED by the
+    # budget guard — the exact "free silently becomes unusable" failure the
+    # rotation exists to prevent. Placement is deliberate: AFTER the pricing
+    # table, so an id with a KNOWN price always keeps it (a paid model can never
+    # dodge --max-cost by also appearing in a catalog — the Sol-finding shape),
+    # and BEFORE the premium default, which remains for genuinely unknown ids.
+    # The registry's trust root is the owner's own catalog cost_class — the same
+    # source the rotator uses to enforce free-only selection.
+    if model in _FREE_ROUTE_MODELS:
+        return (0.0, 0.0)
     # Unknown model id: warn once, then bill at the highest known rate so the
     # cost meter can NEVER under-count and blow past --max-cost (fail closed).
     if model and model not in _WARNED_UNKNOWN_MODELS:
@@ -2827,6 +2849,204 @@ def _provider_free_routed(name: str) -> bool:
             and bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")))
 
 
+# --------------------------------------------------------------------------- #
+# Pool-first rotation (owner order 2026-08-18): every callable model, one per
+# call, rotating across QUOTA POOLS so no allowance runs dry. The catalog and
+# selection algorithm live in flexfactor_rotation.py (AI Time writes the
+# catalog; the shared contract is AITime/docs/rotation-contract.md). This block
+# is the flexfactor-side hook: a Route -> provider factory plus the builder
+# that build_audit_providers calls on the free-first path. Pin surface is the
+# contract's env one (AI_ROTATE_PIN / state-file pins) — deliberately NO new
+# CLI flag, so both .ps1 launchers stay untouched (launcher-drift trap).
+# --------------------------------------------------------------------------- #
+
+def _rotation_route_provider(route):
+    """Build a provider object pointed at one catalog route.
+
+    Injected into RotatingProvider as the factory (the rotation module never
+    imports flexfactor). Reuses the REAL provider classes so every existing
+    protection — egress gate, budget guard, output ceilings — applies to
+    rotated calls exactly as to fixed-provider calls.
+    """
+    wire = route.wire_model or route.model
+    if route.is_free and wire:
+        _FREE_ROUTE_MODELS.add(wire)   # $0 pricing; see _price_for
+    if route.api == "ollama":
+        return OllamaProvider(wire, judge_model=wire)
+    if route.api == "anthropic":
+        # Env-configured on purpose: the free/subscription Anthropic route IS
+        # the FCC proxy, whose base URL + token _auto_activate_fcc_proxy has
+        # already placed in the environment. Never construct a direct
+        # api.anthropic.com client here — that converts flat-rate work into
+        # metered billing (the FCC proxy is treated as ONE route).
+        return AnthropicProvider(wire, judge_model=wire)
+    if route.api == "openai":
+        import openai
+        # NOT OpenAIProvider(...): its __init__ builds openai.OpenAI() from
+        # OPENAI_API_KEY, which is unset/blank when the credential lives in
+        # GROQ_API_KEY / OPENROUTER_API_KEY / NVIDIA_NIM_API_KEY etc., and the
+        # SDK raises on a missing env key at construction (same reason
+        # _openai_rescue_provider bypasses __init__). Inject the route's client.
+        prov = object.__new__(OpenAIProvider)
+        prov.model = wire
+        prov.judge_model = wire   # tiering happens at the rotation layer
+        prov.meter = None         # RotatingProvider attaches the shared meter
+        prov.client = openai.OpenAI(
+            base_url=route.base_url or None,
+            api_key=(os.environ.get(route.auth_env) or "unused")
+                    if route.auth_env else "unused",
+            timeout=_openai_call_timeout_seconds(), max_retries=0,
+            # Cloudflare at Groq/Cerebras blocks default-library User-Agents
+            # with error 1010, indistinguishable from a revoked key (measured
+            # 2026-08-18). Send a real product UA.
+            default_headers={"User-Agent": "FlexFactor/1.0 (+local code tool)"})
+        return prov
+    raise ValueError(f"route '{route.id}': unsupported api '{route.api}'")
+
+
+# Printed-once guards so an absent catalog explains itself exactly once per
+# process instead of once per program in a batch run.
+_ROTATION_REASON_PRINTED: set[str] = set()
+
+# Where this machine's provider keys actually live. Groq / Cerebras /
+# OpenRouter / NVIDIA NIM credentials are provisioned for the FCC proxy in its
+# env file, NOT as persisted user environment variables (measured 2026-08-19:
+# all four exist in ~/.fcc/.env, none in user/machine env). Without hydration,
+# rotation on this machine sees only the 11 local ollama routes in one pool —
+# the owner's "use every AI version available" order never engages.
+_FCC_ENV_FILE = os.path.join(os.path.expanduser("~"), ".fcc", ".env")
+
+
+def _hydrate_route_credentials(routes) -> list[str]:
+    """Fill MISSING catalog auth_env vars from the FCC env file, read-only.
+
+    Never overwrites a variable that is already set (the live environment is
+    authoritative — a deliberately blanked key stays blanked only if it is
+    truly absent; an empty-string value is treated as unset, matching
+    _provider_key_present's bool() test). Returns the names it loaded so the
+    caller can say so out loud.
+    """
+    wanted = {r.auth_env for r in routes
+              if r.auth_env and not os.environ.get(r.auth_env)}
+    if not wanted:
+        return []
+    loaded: list[str] = []
+    try:
+        with open(_FCC_ENV_FILE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key in wanted and value and not os.environ.get(key):
+                    os.environ[key] = value
+                    loaded.append(key)
+    except OSError:
+        return []
+    return sorted(loaded)
+
+
+def _route_unusable_reason(route, model_mode: str) -> str:
+    """Why this catalog route cannot be served here, or '' when it can.
+
+    Filtering happens BEFORE the Rotator sees the catalog: an unbuildable route
+    left in would be selected, fail at call time, and burn a cooldown cycle —
+    across 600+ routes that turns the first sweep into an error tour.
+    """
+    if route.api not in ("openai", "anthropic", "ollama"):
+        return f"unsupported api '{route.api}'"
+    if not route.is_free:
+        return "paid (rotation stays free-only)"
+    if route.auth_env and not os.environ.get(route.auth_env):
+        return f"missing {route.auth_env}"
+    if route.api == "anthropic" and not _provider_key_present("anthropic"):
+        return "no anthropic credential in this environment"
+    if model_mode == "local":
+        try:
+            import urllib.parse
+            host = urllib.parse.urlsplit(route.base_url).hostname or ""
+        except ValueError:
+            host = ""
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return "model mode 'local' excludes non-local routes"
+    return ""
+
+
+def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
+    """Return a RotatingProvider, or None with the reason PRINTED (never silent).
+
+    None means "keep the existing provider selection" — rotation is the default
+    when a usable catalog exists, and exactly the prior behaviour when not.
+    """
+    def _say(reason: str) -> None:
+        if reason and reason not in _ROTATION_REASON_PRINTED:
+            _ROTATION_REASON_PRINTED.add(reason)
+            print(f"  [rotation] not rotating: {reason}", file=sys.stderr)
+
+    try:
+        import flexfactor_rotation as fr
+    except ImportError as ex:
+        _say(f"flexfactor_rotation unavailable ({ex})")
+        return None
+    if not fr.rotation_enabled():
+        _say("AI_ROTATE=off")
+        return None
+    catalog = fr.load_catalog()
+    if catalog is None or not catalog.enabled():
+        _say(fr.unavailable_reason() or "route catalog is empty")
+        return None
+    hydrated = _hydrate_route_credentials(catalog.enabled())
+    if hydrated:
+        print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
+              + ", ".join(hydrated), file=sys.stderr)
+    usable, dropped = [], {}
+    for route in catalog.enabled():
+        why = _route_unusable_reason(route, model_mode)
+        if why:
+            dropped[why] = dropped.get(why, 0) + 1
+        else:
+            usable.append(route)
+    if not usable:
+        detail = "; ".join(f"{n}x {w}" for w, n in sorted(dropped.items()))
+        _say(f"catalog has {len(catalog.enabled())} enabled routes but none are "
+             f"usable here ({detail})")
+        return None
+    filtered = fr.Catalog(routes=usable, generated_at=catalog.generated_at,
+                          age_seconds=catalog.age_seconds, path=catalog.path)
+    rotator = fr.Rotator(catalog=filtered, store=fr.StateStore(), app="flexfactor")
+    # --economy maps to the catalog's cheaper author tier, same intent as
+    # ECONOMY_MODELS for fixed providers. Judging always rides the light tier.
+    author_tier = fr.STRONG if getattr(args, "economy", False) else fr.FRONTIER
+    if not any(r.tier == author_tier for r in usable):
+        # A catalog with no route in the requested author tier would make every
+        # authoring call fail; fall back to whichever author-capable tier exists.
+        author_tier = fr.FRONTIER if author_tier != fr.FRONTIER else fr.STRONG
+        if not any(r.tier == author_tier for r in usable):
+            author_tier = fr.LIGHT
+    announced: set[str] = set()
+
+    def _announce(selection) -> None:
+        # One line per distinct route per run — shows which backends actually
+        # participated without a line of noise on every single call.
+        if selection.route.id not in announced:
+            announced.add(selection.route.id)
+            print(f"  [rotation] {selection.describe()}", file=sys.stderr)
+
+    pools = len({r.pool for r in usable})
+    pin = fr.StateStore().get_pin("flexfactor") or fr.StateStore().get_pin() \
+        or os.environ.get("AI_ROTATE_PIN") or ""
+    drop_note = ("; excluded " + ", ".join(
+        f"{n}x {w}" for w, n in sorted(dropped.items()))) if dropped else ""
+    print(f"  [rotation] ON: {len(usable)} free routes over {pools} pools, "
+          f"author tier '{author_tier}'"
+          + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
+    return fr.RotatingProvider(rotator, _rotation_route_provider,
+                               tier=author_tier, judge_tier=fr.LIGHT,
+                               allow_paid=False, meter=meter,
+                               on_route=_announce)
+
+
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
 # _provider_health() so a batch / --parallel run pings each provider at most once.
 # Lock-guarded AND single-flight: the first caller pings while the rest wait on an
@@ -3027,6 +3247,18 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # is fastest, exactly as a single free-first primary always has.
     if _free_first_applies:
         _auto_activate_fcc_proxy()  # zero-setup: give the fast free tier a chance too
+        # POOL-FIRST ROTATION (owner order 2026-08-18): when the owner named
+        # neither a provider nor a model, the default is to rotate every free
+        # catalog route — the FCC/ollama pool below is the fallback when no
+        # catalog is usable (_build_rotating_provider prints why). An explicit
+        # --model / --judge-model is a fixed-model request, which rotation by
+        # definition cannot honor — prior behaviour applies, no new CLI flag
+        # needed (pinning one route is AI_ROTATE_PIN / the state-file pin, and
+        # AI_ROTATE=off restores prior behaviour outright).
+        if not args.model and not getattr(args, "judge_model", None):
+            rotating = _build_rotating_provider(args, meter, model_mode)
+            if rotating is not None:
+                return [("rotation", rotating)]
         fcc_usable = _usable("anthropic") and _provider_free_routed("anthropic")
         ollama_usable = _usable("ollama")
         if fcc_usable or ollama_usable:

@@ -31,6 +31,7 @@ import json
 import os
 import random
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -734,6 +735,17 @@ def build_rotator(app: str = "flexfactor",
     return Rotator(catalog=catalog, store=StateStore(state_file), app=app)
 
 
+# Sentinels callers may read from `.model` / `.judge_model` and hand back as a
+# `model=` keyword (flexfactor's `_judge` does exactly that). They are TIER
+# REQUESTS, not model ids: `structured()` translates them into a tier choice and
+# strips them so the literal string can never reach a provider's wire call.
+# `judge_model` stays FIXED at its sentinel (unlike `model`, which mutates to
+# the last route's real id for logging/pricing) so the translation is
+# unambiguous — a mutating judge sentinel could collide with a real model id.
+ROTATING_MODEL = "rotating"
+ROTATING_JUDGE_MODEL = "rotating-judge"
+
+
 class RotatingProvider:
     """A FlexFactor provider whose backing model changes on every call.
 
@@ -759,21 +771,26 @@ class RotatingProvider:
         self.meter = meter
         self._on_route = on_route
         self._cache: Dict[str, Any] = {}
+        self._cache_lock = threading.Lock()
         # Callers read `.model` for logging and pricing. It reflects the LAST
         # route used, and is seeded with something truthful rather than a
         # hardcoded guess that would misprice the first call.
-        self.model = "rotating"
-        self.judge_model = "rotating"
+        self.model = ROTATING_MODEL
+        self.judge_model = ROTATING_JUDGE_MODEL
 
     # -- plumbing ----------------------------------------------------------
     def _provider_for(self, route: Route) -> Any:
-        provider = self._cache.get(route.id)
-        if provider is None:
-            provider = self._factory(route)
-            if hasattr(provider, "meter"):
-                provider.meter = self.meter
-            self._cache[route.id] = provider
-        return provider
+        # Locked: parallel reviews call through one RotatingProvider, and an
+        # unlocked check-then-build would construct the same route's provider
+        # twice (harmless for stateless clients, wasteful for heavy ones).
+        with self._cache_lock:
+            provider = self._cache.get(route.id)
+            if provider is None:
+                provider = self._factory(route)
+                if hasattr(provider, "meter"):
+                    provider.meter = self.meter
+                self._cache[route.id] = provider
+            return provider
 
     def _run(self, method: str, tier: str, *args, **kwargs) -> Any:
         """One rotated attempt per healthy pool, then give up honestly.
@@ -815,7 +832,18 @@ class RotatingProvider:
         return self._run("complete", self._tier, *args, **kwargs)
 
     def structured(self, *args, **kwargs):
-        return self._run("structured", self._tier, *args, **kwargs)
+        # flexfactor's `_judge()` requests the cheap tier by passing
+        # `model=provider.judge_model` — for a fixed provider that is a real
+        # model id, for this one it is the ROTATING_JUDGE_MODEL sentinel. Honor
+        # the intent (route the CALL to the judge tier) and strip the sentinel:
+        # the literal string "rotating-judge" must never reach a wire call.
+        tier = self._tier
+        requested = kwargs.get("model")
+        if requested in (ROTATING_MODEL, ROTATING_JUDGE_MODEL):
+            kwargs.pop("model")
+            if requested == ROTATING_JUDGE_MODEL:
+                tier = self._judge_tier
+        return self._run("structured", tier, *args, **kwargs)
 
     def grade(self, *args, **kwargs):
         # Grading is classification, not authoring: it belongs on the cheap
