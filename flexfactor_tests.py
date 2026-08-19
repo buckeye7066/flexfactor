@@ -10475,6 +10475,40 @@ class VacuousGateTests(unittest.TestCase):
         self.assertIs(ok, False)
         self.assertEqual(ran, [], "a red build still spent the suite's runtime")
 
+    def test_the_CONSOLE_also_says_unverified_not_failed(self):
+        """The tri-state must survive to the console, not just the return value.
+
+        Live 2026-08-19 the operator read:
+            publication verification FAILED; rejected tree restored:
+            (no build/verify command available - NOTHING WAS VERIFIED)
+        The printed word FAILED was contradicted by the very next line. The
+        sibling test below only ever asserted on `status`, so the print was
+        free to lie - a check that cannot fail proves nothing.
+        """
+        import contextlib
+        import io as _io
+        err = _io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _calls, status = _drive_commit_and_sync(None, want_status=True)
+        printed = err.getvalue()
+        self.assertIn("DID NOT RUN", printed)
+        self.assertNotIn("verification FAILED", printed,
+                         "an unrunnable build must never be PRINTED as FAILED - "
+                         "the remedy is to configure a build command, not to fix code")
+        self.assertIn("did not run", status)
+
+    def test_a_genuinely_red_build_is_still_PRINTED_as_failed(self):
+        """The other half: widening the wording must not blunt a real failure."""
+        import contextlib
+        import io as _io
+        err = _io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _calls, status = _drive_commit_and_sync(False, want_status=True)
+        printed = err.getvalue()
+        self.assertIn("publication verification FAILED", printed)
+        self.assertNotIn("DID NOT RUN", printed)
+        self.assertIn("FAILED", status)
+
     def test_no_build_command_is_still_None_not_False(self):
         # Load-bearing distinction (CLAUDE.md): a repo with no runnable build is
         # UNVERIFIED, not FAILED. Refusing to publish must not be achieved by
