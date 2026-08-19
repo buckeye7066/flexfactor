@@ -84,12 +84,14 @@ against the program's OWN purpose contract.
   only, never the source). Unknown or unverifiable licence => `reference-only`.
   Source is never copied from an unknown or incompatible licence, and the mode
   plus the evidence URLs are recorded in the report and in the fix instructions.
-- **Bounded action.** Only accepted, corroborated, licence-permitted,
-  code-fixable ideas enter the fix stream, capped by `--competitor-fixes`
-  (default 3) and still subject to `--fix-severity`, the build gate and the
-  adversarial verifier like any other change.
+- **Bounded action.** The top five competitors are considered by default, one
+  strongest idea each. Only accepted, corroborated, licence-permitted,
+  code-fixable ideas that map back to this program's purpose/acceptance
+  contract enter the fix stream, capped by `--competitor-fixes` (default 5)
+  and still subject to `--fix-severity`, the build gate and the adversarial
+  verifier like any other change.
 - Flags: `--no-competitors`, `--competitor-count N` (default 5),
-  `--competitor-fixes N` (default 3).
+  `--competitor-fixes N` (default 5).
 
 **Repo Rewards endpoint (changed 2026-08-16):** local `localhost:3000` wins when
 it is actually up; otherwise the production deployment is used automatically.

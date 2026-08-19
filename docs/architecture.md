@@ -8,7 +8,7 @@ FlexFactor is one fail-closed pipeline with four entry modes. `flexfactor.py` ow
 2. Recover a SHA-verified checkpoint and build the pre-change repository index.
 3. Load authored purpose evidence or label the result inferred.
 4. Select free/local or configured provider adapters; every payload crosses the egress and budget chokepoints.
-5. Measure and repair purpose gaps, then run batched whole-source review and build-gated repair cycles.
+5. Load the authored purpose contract when available (otherwise label the purpose inferred), assess it before changes, research the top five competitors for purpose-serving ideas, prioritize purpose-critical files/gaps, run build-gated repair cycles, then reassess the final tree before claiming purpose progress.
 6. Generate function tests, execute the repository suite, and drive live web routes and controls when applicable.
 7. Re-index the resulting tree, rescan every changed file, compute reverse-dependency blast radius, and build file/function/workflow coverage ledgers.
 8. Run normalized build, tests, secret, inventory, rescan, blast-radius, function-coverage, behavior, and exact-commit independent-review gates.

@@ -59,10 +59,11 @@ __all__ = [
     "license_reuse_mode", "may_copy_source", "may_bridge",
     "coverage_note", "web_search", "github_repo_search",
     "research_competitors", "competitor_findings", "report_lines",
-    "DEFAULT_TARGET",
+    "DEFAULT_TARGET", "DEFAULT_FIX_STREAM_CAP",
 ]
 
 DEFAULT_TARGET = 5
+DEFAULT_FIX_STREAM_CAP = 5
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlexFactor-competitor-research"
 _HTTP_TIMEOUT = 25.0
 
@@ -710,7 +711,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # Corroborated competitors first; then best-known (stars) first.
     competitors.sort(key=lambda c: (c["evidence_status"] != "verified",
                                     -(c.get("stars") or 0)))
-    competitors = competitors[:target + 3]
+    competitors = competitors[:target]
 
     if not competitors:
         research["coverage_note"] = coverage_note(0, target, 0)
@@ -804,10 +805,11 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
 # --------------------------------------------------------------------------- #
 # 5. Bridging accepted ideas into the audit's finding stream.
 # --------------------------------------------------------------------------- #
-def competitor_findings(research: dict, max_findings: int = 3,
+def competitor_findings(research: dict, max_findings: int = DEFAULT_FIX_STREAM_CAP,
                         severity_floor_rank: int = 0,
                         severity_rank=None,
-                        file_exists=None) -> list[tuple[str, dict]]:
+                        file_exists=None,
+                        acceptance_total: int = 0) -> list[tuple[str, dict]]:
     """[(rel, finding)] for the accepted, bridgeable, code-fixable ideas.
 
     Deliberately capped and filtered: a competitor idea is an OPINION about the
@@ -836,7 +838,13 @@ def competitor_findings(research: dict, max_findings: int = 3,
     dropped: dict[str, list[str]] = {}
     candidates = list(research.get("competitors") or [])
 
+    def _mark(c: dict, status: str, reason: str, *, bridged: bool = False) -> None:
+        c["bridge_status"] = status
+        c["bridge_reason"] = reason
+        c["entered_fix_stream"] = bool(bridged)
+
     def _drop(reason: str, c: dict) -> None:
+        _mark(c, "rejected", reason)
         dropped.setdefault(reason, []).append(str(c.get("name") or "(unnamed)"))
 
     def _seal() -> None:
@@ -884,6 +892,15 @@ def competitor_findings(research: dict, max_findings: int = 3,
         if not rel:
             _drop("no target file named for the idea", c)
             continue
+        ref_txt = str(idea.get("acceptance_ref") or "").strip()
+        if acceptance_total > 0:
+            try:
+                ref_num = int(ref_txt)
+            except (TypeError, ValueError):
+                ref_num = 0
+            if not (1 <= ref_num <= int(acceptance_total)):
+                _drop("accepted idea did not map to a valid acceptance criterion", c)
+                continue
         if rank.get(str(idea.get("severity", "")).lower(), 0) < severity_floor_rank:
             _drop(f"severity {idea.get('severity') or '(missing)'!r} is below "
                   f"the --fix-severity floor", c)
@@ -901,6 +918,7 @@ def competitor_findings(research: dict, max_findings: int = 3,
                            "source; implement independently from the described "
                            "behaviour only.")
                    + f"\n\nEvidence: {', '.join(c.get('evidence_urls') or []) or '(none)'}")
+        _mark(c, "bridged", "entered the gated fix stream", bridged=True)
         out.append((rel, {
             "line": 0,
             "severity": str(idea.get("severity") or "medium").lower(),
@@ -958,17 +976,25 @@ def report_lines(research: dict) -> list[str]:
               "This is reported as a gap in the research, NOT as evidence that "
               "the program has no competitors._", ""]
         return L
-    L += ["| Competitor | Kind | Licence | Reuse mode | Verdict | Adoptable idea |",
-          "|---|---|---|---|---|---|"]
+    L += ["| Competitor | Kind | Licence | Reuse mode | Purpose mapping | Verdict | Fix stream | Adoptable idea |",
+          "|---|---|---|---|---|---|---|---|"]
     for c in research["competitors"]:
         idea = c.get("idea") or {}
         verdict = ("ACCEPT" if idea.get("accept") else "reject")
         if c.get("evidence_status") != "verified":
             verdict = "UNVERIFIED"
         name = f"[{c['name']}]({c['url']})" if c.get("url") else c["name"]
+        mapping = (f"acceptance #{idea.get('acceptance_ref')}"
+                   if str(idea.get("acceptance_ref") or "").strip() else "purpose-only")
+        if "bridge_status" in c or "entered_fix_stream" in c:
+            bridge = ("ENTERED"
+                      if c.get("entered_fix_stream") else
+                      f"NOT entered - {c.get('bridge_reason', 'not bridged')}")
+        else:
+            bridge = "not evaluated for fix-stream entry"
         L.append(f"| {name} | {c.get('kind')} | `{c.get('license')}` "
-                 f"| `{c.get('reuse_mode')}` | {verdict} "
-                 f"| {idea.get('idea_title', '(none)')} |")
+                 f"| `{c.get('reuse_mode')}` | {mapping} | {verdict} "
+                 f"| {bridge} | {idea.get('idea_title', '(none)')} |")
     L.append("")
     for c in research["competitors"]:
         idea = c.get("idea") or {}
@@ -979,8 +1005,17 @@ def report_lines(research: dict) -> list[str]:
               f"- **Reuse mode:** `{c.get('reuse_mode')}` - {c.get('reuse_reason')}",
               f"- **Idea:** {idea.get('idea_title', '(none)')} - {idea.get('what_it_does', '')}",
               f"- **Value here:** {idea.get('why_valuable', '')}",
+              f"- **Purpose / criterion mapping:** "
+              + (f"acceptance #{idea.get('acceptance_ref')}"
+                 if str(idea.get('acceptance_ref') or '').strip() else "purpose-only")
+              + f" - {idea.get('purpose_reason', '')}",
               f"- **Purpose verdict:** {'ACCEPTED' if idea.get('accept') else 'REJECTED'} - "
               f"{idea.get('purpose_reason', '')}",
+              f"- **Fix-stream decision:** "
+              + ((f"{'ENTERED the gated fix stream' if c.get('entered_fix_stream') else 'DID NOT enter the fix stream'}"
+                  + (f" - {c.get('bridge_reason')}" if c.get('bridge_reason') else ""))
+                 if ("bridge_status" in c or "entered_fix_stream" in c)
+                 else "not evaluated for fix-stream entry on this report path"),
               f"- **Evidence basis:** {idea.get('evidence_basis', '')} "
               f"(confidence {idea.get('confidence', '?')})", ""]
     return L

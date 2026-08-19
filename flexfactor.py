@@ -8086,6 +8086,57 @@ def _gap_to_finding(g: dict) -> dict:
     }
 
 
+def _gap_title_key(title: str) -> str:
+    return " ".join(str(title or "").lower().split())
+
+
+def _closed_gap_titles(before_gaps: list[dict], after_gaps: list[dict]) -> list[str]:
+    after_keys = {_gap_title_key(g.get("title") or "") for g in (after_gaps or [])}
+    out: list[str] = []
+    seen: set[str] = set()
+    for g in before_gaps or []:
+        title = str(g.get("title") or "").strip()
+        key = _gap_title_key(title)
+        if key and key not in after_keys and key not in seen:
+            out.append(title)
+            seen.add(key)
+    return out
+
+
+def _criteria_now_met(before_rows: list[dict], after_rows: list[dict]) -> list[dict]:
+    before_by_index: dict[int, dict] = {}
+    for row in before_rows or []:
+        try:
+            before_by_index[int(row.get("index"))] = row
+        except (TypeError, ValueError):
+            continue
+    out: list[dict] = []
+    for row in after_rows or []:
+        try:
+            idx = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if row.get("met") is True and before_by_index.get(idx, {}).get("met") is not True:
+            out.append({"index": idx, "criterion": row.get("criterion", "")})
+    return out
+
+
+def _summarize_purpose_progress(before: dict | None, after: dict | None,
+                                purpose_mod=None) -> dict:
+    before_gaps = list((before or {}).get("gaps") or [])
+    after_gaps = list((after or {}).get("gaps") or [])
+    closed_titles = _closed_gap_titles(before_gaps, after_gaps)
+    out = {
+        "closed_gap_titles": closed_titles,
+        "criteria_now_met": _criteria_now_met(
+            (before or {}).get("acceptance_coverage") or [],
+            (after or {}).get("acceptance_coverage") or []),
+    }
+    if purpose_mod is not None:
+        out["progress"] = purpose_mod.gap_progress(before_gaps, closed_titles)
+    return out
+
+
 PURPOSE_GAP_SOURCE_CAP = 48000       # total chars of source shown to the assessor
 PURPOSE_GAP_PER_FILE_CAP = 8000      # chars per file (head of file carries intent)
 # How many independent assessments of the SAME tree to fold into one verdict.
@@ -12000,11 +12051,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # defect. Everything filtered out still appears in the report.
                 comp_pairs = _fc.competitor_findings(
                     competitor_research,
-                    max_findings=max(0, int(getattr(args, "competitor_fixes", 3) or 0)),
+                    max_findings=max(0, int(getattr(args, "competitor_fixes", 5) or 0)),
                     severity_floor_rank=SEVERITY_RANK.get(
                         str(args.fix_severity).lower(), 3),
                     severity_rank=SEVERITY_RANK,
-                    file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None)
+                    file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
+                    acceptance_total=(len(getattr(purpose_contract, "acceptance_criteria", []) or [])
+                                      if getattr(purpose_contract, "authored", False) else 0))
                 # NOT appended to all_findings here: the cycle loop REPLACES
                 # all_findings wholesale with each cycle's review output, so an
                 # early append would be silently dropped. They are merged in
@@ -12518,7 +12571,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if purpose_gap:
             gaps = purpose_gap.get("gaps") or []
             pct = purpose_gap.get("fulfillment_pct")
-            gaps_before = [dict(g) for g in gaps]
             if purpose_gap.get("criteria_total"):
                 unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
@@ -12669,15 +12721,41 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
             # THE HEADLINE NUMBER. The owner asked for "closed N gaps toward the
             # app's purpose", not "scored X" - so the run's own summary is
-            # movement against the contract, computed from what actually landed.
+            # movement against the contract, computed from BEFORE vs AFTER
+            # assessments of the exact tree, not from "a file changed".
+            if bridged_files and not dirty_abort and not infrastructure_abort:
+                report(phase="purpose-gap reassessment")
+                print(f"{pfx}Reassessing purpose after purpose-bridge changes...")
+                try:
+                    refreshed = assess_purpose_gap(
+                        purpose_reviewer_final, purpose_blob, all_files, all_findings,
+                        project_dir=project_dir, contract=purpose_contract)
+                except BudgetExceededError:
+                    refreshed = None
+                    purpose_assessment_errors.append(
+                        "post-bridge purpose reassessment skipped: cost cap reached")
+                except Exception as ex:
+                    refreshed = None
+                    purpose_assessment_errors.append(
+                        f"post-bridge purpose reassessment failed: {type(ex).__name__}: {ex}")
+                if refreshed:
+                    _got = int(refreshed.get("assessment_samples") or 0)
+                    _want = int(refreshed.get("assessment_expected_samples") or _got)
+                    _sample_errors = list(refreshed.get("assessment_errors") or [])
+                    if _got < _want or _sample_errors:
+                        purpose_assessment_errors.append(
+                            f"post-bridge purpose reassessment incomplete: {_got}/{_want} "
+                            f"sample(s) usable"
+                            + (f"; {'; '.join(_sample_errors[:3])}"
+                               if _sample_errors else ""))
+                    purpose_gap = refreshed
             _fp = _purpose_module()
             if _fp is not None:
-                # A gap is only "closed" when the fix for its file APPLIED and
-                # was VERIFIED - an [unverified] apply (verifier down / build
-                # not runnable) is not evidence the gap is gone.
-                closed = [g.get("title") for rel, g in bridgeable
-                          if rel in verified_bridged]
-                purpose_gap["progress"] = _fp.gap_progress(gaps_before, closed)
+                summary = _summarize_purpose_progress(
+                    purpose_before, purpose_gap, purpose_mod=_fp)
+                purpose_gap["progress"] = summary["progress"]
+                purpose_gap["closed_gap_titles"] = summary.get("closed_gap_titles") or []
+                purpose_gap["criteria_now_met"] = summary.get("criteria_now_met") or []
                 prog = purpose_gap["progress"]
                 print(f"{pfx}Purpose progress: closed {prog['gaps_closed']}/"
                       f"{prog['gaps_before']} gap(s); "
@@ -13802,8 +13880,11 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         # Purpose awareness + the owner's status vocabulary, as evidence.
         "purpose_authored": bool((a.get("purpose_gap") or {}).get("authored")),
         "purpose_contract": a.get("purpose_contract"),
+        "purpose_before": a.get("purpose_before"),
         "purpose_acceptance_coverage": (a.get("purpose_gap") or {}).get("acceptance_coverage"),
         "purpose_progress": (a.get("purpose_gap") or {}).get("progress"),
+        "purpose_closed_gap_titles": (a.get("purpose_gap") or {}).get("closed_gap_titles"),
+        "purpose_criteria_now_met": (a.get("purpose_gap") or {}).get("criteria_now_met"),
         # The criteria figure is an ASSESSMENT, not a measurement. Ship its
         # provenance with it so no downstream consumer can read a swing inside
         # the sampling band as progress.
@@ -13978,17 +14059,29 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if pg:
         gaps = pg.get("gaps") or []
         bridged = set(a.get("bridged_files") or [])
+        pb = a.get("purpose_before") or {}
         pct = pg.get("fulfillment_pct")
         authored = bool(pg.get("authored"))
         origin = ((f"owner-authored contract "
-                   f"(`{(pg.get('contract_source') or {}).get('doc', '?')}`)")
+                  f"(`{(pg.get('contract_source') or {}).get('doc', '?')}`)")
                   if authored else
                   "**INFERRED by FlexFactor from the repository — a hypothesis, "
                   "not the owner's stated requirement**")
+        def _state_line(label: str, state: dict | None) -> str:
+            state = state or {}
+            if state.get("criteria_total"):
+                return (f"**{label}:** {state.get('criteria_met', '?')} of "
+                       f"{state.get('criteria_total', '?')} criteria met "
+                       f"({state.get('fulfillment_pct', '?')}%; "
+                       f"{_purpose_label(state)})")
+            return (f"**{label}:** inferred fulfillment "
+                   f"{state.get('fulfillment_pct', '?')}%")
         prog = pg.get("progress") or {}
         L += ["## Purpose gap", "",
               f"**Source of purpose:** {origin}", "",
-              f"**Purpose:** {pg.get('purpose', '(not inferred)')}", ""]
+              f"**Purpose:** {pg.get('purpose', '(not inferred)')}", "",
+              _state_line("Purpose state before changes", pb),
+              _state_line("Purpose state after verified changes", pg), ""]
         if prog:
             # The owner asked for "closed N gaps toward the app's purpose", not
             # "scored X". Lead with the movement.
@@ -13997,6 +14090,16 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                   f"unblocking {prog.get('criteria_unblocked', 0)} acceptance "
                   f"criterion(s); {prog.get('criteria_blocked_after', 0)} "
                   "criterion(s) remain blocked.", ""]
+        closed_titles = list(pg.get("closed_gap_titles") or [])
+        if closed_titles:
+            L += ["**Purpose gaps closed by post-change assessment:** "
+                  + "; ".join(closed_titles[:12]), ""]
+        criteria_now_met = list(pg.get("criteria_now_met") or [])
+        if criteria_now_met:
+            L += ["**Acceptance criteria newly met on the final assessed tree:**"]
+            for row in criteria_now_met[:12]:
+                L.append(f"- acceptance #{row.get('index')}: {row.get('criterion')}")
+            L.append("")
         if pg.get("criteria_total"):
             L += [f"**Acceptance:** {pg.get('criteria_met')} of "
                   f"{pg.get('criteria_total')} owner criteria met ({pct}%) — "
@@ -14649,10 +14752,10 @@ def main(argv=None) -> int:
                             dest="competitor_count",
                             help="How many competitors to cover (default: 5). A shortfall is "
                                  "reported as a shortfall, never padded.")
-        parser.add_argument("--competitor-fixes", type=int, default=3,
+        parser.add_argument("--competitor-fixes", type=int, default=5,
                             dest="competitor_fixes",
                             help="Max competitor-derived findings allowed into the FIX stream "
-                                 "(default: 3). Reference-only and unverified candidates are "
+                                 "(default: 5). Reference-only and unverified candidates are "
                                  "never bridged, whatever this is set to.")
         parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
                             dest="repo_rewards_url",
