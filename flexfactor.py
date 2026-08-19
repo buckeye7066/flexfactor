@@ -9116,14 +9116,40 @@ def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
 
 _FAILURE_SOURCE_RE = re.compile(
     r"(?P<path>(?:[A-Za-z]:[\\/][^:\r\n\"'<>|]*?|"
+    # POSIX absolute. Only a Windows drive or one of the magic directory names
+    # below was accepted, so on Linux/macOS a traceback frame for a file in the
+    # repo ROOT (`/home/me/proj/test_x.py`) matched nothing at all -- the same
+    # blind spot as the quote boundary, one platform over. Over-matching is
+    # harmless: `_existing_failure_path` resolves every hit against project_dir
+    # and drops anything outside the repo, which is what discards the
+    # site-packages frames that dominate a pytest traceback.
+    r"/[^:\r\n\"'<>|]*?|"
     r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?)"
     # Keep longer suffixes before their prefixes (``jsx`` before ``js`` and
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
     # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and
     # silently discarded because that non-existent path could not be opened.
     r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h))"
-    r"(?=:\d|[\s>]|$)(?::\d+){0,2}", re.IGNORECASE)
-_TEST_FILE_RE = re.compile(r"(?:\.(?:test|spec)\.|(?:^|/)__tests__/)", re.IGNORECASE)
+    # The boundary must cover how each runner DELIMITS a path, not just how
+    # Vitest does. Measured 2026-08-19 (live IPlay audit): a Python traceback
+    # prints `File "C:\...\test_motionsync.py", line 81` and pytest prints
+    # `FAILED tests/test_thing.py::test_a` - a closing QUOTE and a DOUBLE
+    # COLON. Neither is `:\d`, whitespace or `>`, so this regex matched
+    # NOTHING on any Python failure, `_publication_failure_paths` returned [],
+    # and phase 0 stopped every Python repo with "(no contained source path
+    # found)" while the failing file was named on screen. Adding quote/comma/
+    # bracket/`::` keeps the truncation guard intact: `Home.test.js` followed
+    # by `x` still fails the boundary, so `.jsx` cannot be clipped to `.js`.
+    r"(?=:\d|::|[\s>\"',)\]]|$)(?::\d+){0,2}", re.IGNORECASE)
+# Test-file conventions. The `.test.`/`.spec.`/`__tests__/` set is JS-only;
+# pytest's own default discovery is `test_*.py` / `*_test.py` and Go's is
+# `*_test.go`, so on those stacks a red TEST was classified as an
+# IMPLEMENTATION - which both defeated the implementation-first ordering this
+# module exists to enforce and handed the repair model the "fix the product,
+# preserve the test" instruction while pointing it AT the test.
+_TEST_FILE_RE = re.compile(
+    r"(?:\.(?:test|spec)\.|(?:^|/)__tests__/|(?:^|/)tests?/"
+    r"|(?:^|/)test_[^/]*\.py$|_test\.(?:py|go)$)", re.IGNORECASE)
 _SOURCE_EXTENSIONS = (".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".py")
 
 
@@ -9204,12 +9230,23 @@ def _publication_failure_paths(project_dir: str, gate_log: str) -> list[str]:
                 if impl not in implementations:
                     implementations.append(impl)
             # Conventional sibling fallback when a test has no parseable import.
-            sibling = re.sub(r"\.(?:test|spec)(?=\.[^.]+$)", "", rel,
-                             flags=re.IGNORECASE)
-            sibling = sibling.replace("/__tests__/", "/")
-            if (_read_text_and_sha(project_dir, sibling) is not None
-                    and sibling not in implementations):
-                implementations.append(sibling)
+            # `_test_import_candidates` only understands JS relative imports, so
+            # for Python this fallback is the ONLY route to the implementation:
+            # `test_motionsync.py` -> `motionsync.py`, `foo_test.py` -> `foo.py`.
+            for pattern, repl in (
+                    (r"\.(?:test|spec)(?=\.[^.]+$)", ""),        # foo.test.js
+                    (r"(^|/)test_(?=[^/]+\.(?:py)$)", r"\1"),    # test_foo.py
+                    (r"_test(?=\.(?:py|go)$)", ""),              # foo_test.py
+            ):
+                sibling = re.sub(pattern, repl, rel, flags=re.IGNORECASE)
+                sibling = sibling.replace("/__tests__/", "/")
+                # `sibling == rel` means no convention applied; appending it
+                # would file the TEST as its own implementation - the exact
+                # misordering this function exists to prevent.
+                if (sibling != rel
+                        and _read_text_and_sha(project_dir, sibling) is not None
+                        and sibling not in implementations):
+                    implementations.append(sibling)
             if rel not in tests:
                 tests.append(rel)
         elif rel not in implementations:

@@ -282,6 +282,35 @@ not an opt-out). The chosen endpoint is always printed and lands in the report;
 `--allow-remote-repo-rewards`, so the flag is KEPT as an accepted no-op — deleting
 it is argparse exit 2 and a dead run.
 
+## Phase 0 could not read a PYTHON failure at all (2026-08-19, live IPlay audit)
+
+`[4/10 iplay] STOP: baseline publication suite remains red after bounded
+targeted repair; unrelated review was not started. Targeted: (no contained
+source path found).` — while the failing file was printed on screen three lines
+above. `_FAILURE_SOURCE_RE`'s boundary accepted only `:\d`, whitespace or `>`,
+but **Python delimits paths differently**: a traceback prints
+`File "….py", line 81` (closing QUOTE) and pytest prints
+`FAILED tests/test_thing.py::test_a` (DOUBLE COLON). Neither matched, so
+`_publication_failure_paths` returned `[]` and phase 0 stopped **every Python
+repo** on its first round. The boundary now also accepts quote / comma /
+bracket / `::`; the `.jsx`-not-clipped-to-`.js` guard is unaffected (`x` is
+still not a boundary char) and has its own test.
+
+Two ranking defects rode along, both Python/Go blind spots:
+- **`_TEST_FILE_RE` was JS-only** (`.test.` / `.spec.` / `__tests__/`), so
+  pytest's own `test_*.py` / `*_test.py` and Go's `*_test.go` were classified
+  as IMPLEMENTATIONS. That inverted the implementation-first ordering this
+  module exists to enforce AND handed the repair model the "fix the product,
+  preserve the test" instruction *while pointing it at the test* — an
+  invitation to rewrite a red test as if it were product code.
+- **The sibling fallback only understood the JS `.test.` infix.**
+  `_test_import_candidates` parses JS relative imports only, so for Python this
+  fallback is the ONLY route to the implementation; it now maps
+  `test_foo.py`→`foo.py` and `foo_test.py`/`foo_test.go`→`foo.py`/`foo.go`.
+  It also now requires `sibling != rel`: with no convention applied the old
+  code appended the TEST to `implementations`, listing it as its own
+  implementation and duplicating it in the returned ranking.
+
 ## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
 
 `build_audit_providers`' free-first path now tries rotation FIRST: when the

@@ -13639,6 +13639,83 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
             paths = ff._publication_failure_paths(td, self._LOG)
         self.assertEqual(paths[:2], ["src/pages/Home.jsx", "src/pages/Home.test.jsx"])
 
+    # -- Python/Go runner formats (live IPlay audit, 2026-08-19) -------------
+    # Phase 0 stopped EVERY Python repo with "(no contained source path
+    # found)" while the failing file was printed on screen: the path regex
+    # only accepted `:\d`, whitespace or `>` as a boundary, and Python
+    # delimits with a closing QUOTE (traceback) or `::` (pytest FAILED line).
+
+    def _py_project(self, root):
+        with open(os.path.join(root, "motionsync.py"), "w", encoding="utf-8") as fh:
+            fh.write("def analyze_audio(path):\n    return {}\n")
+        with open(os.path.join(root, "test_motionsync.py"), "w", encoding="utf-8") as fh:
+            fh.write("import sys\nsys.exit(0)\n")
+
+    def test_python_traceback_path_is_extracted_despite_the_closing_quote(self):
+        with _tempfile.TemporaryDirectory() as td:
+            self._py_project(td)
+            log = ('INTERNALERROR>   File "%s", line 81, in <module>\n'
+                   'INTERNALERROR> SystemExit: 0'
+                   % os.path.join(td, "test_motionsync.py"))
+            paths = ff._publication_failure_paths(td, log)
+        self.assertTrue(paths, "a Python traceback named the file but no target "
+                               "was extracted - phase 0 would stop immediately")
+        self.assertEqual(paths, ["motionsync.py", "test_motionsync.py"],
+                         "the imported implementation must be targeted BEFORE "
+                         "the red test")
+
+    def test_pytest_failed_line_double_colon_is_a_path_boundary(self):
+        with _tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "tests"))
+            with open(os.path.join(td, "tests", "test_thing.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("def test_a():\n    assert False\n")
+            paths = ff._publication_failure_paths(
+                td, "FAILED tests/test_thing.py::test_a - AssertionError")
+        self.assertIn("tests/test_thing.py", paths)
+
+    def test_python_and_go_test_files_are_classified_as_tests(self):
+        for rel in ("test_motionsync.py", "tests/test_thing.py",
+                    "foo_test.py", "pkg/thing_test.go", "Home.test.jsx"):
+            self.assertTrue(ff._TEST_FILE_RE.search(rel), rel)
+        for rel in ("src/app.py", "src/pages/Home.jsx", "motionsync.py"):
+            self.assertIsNone(ff._TEST_FILE_RE.search(rel), rel)
+
+    def test_a_test_is_never_listed_as_its_own_implementation(self):
+        """`sibling == rel` (no naming convention applied) must not file the
+        test under implementations - that inverts the ordering and hands the
+        model the 'fix the product, preserve the test' instruction while
+        pointing it at the test."""
+        with _tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "test_orphan.py"), "w", encoding="utf-8") as fh:
+                fh.write("def test_a():\n    assert False\n")
+            log = '  File "%s", line 2, in test_a' % os.path.join(td, "test_orphan.py")
+            paths = ff._publication_failure_paths(td, log)
+        self.assertEqual(paths, ["test_orphan.py"])
+        self.assertEqual(len(paths), len(set(paths)))
+        finding = ff._publication_failure_finding(paths[0], log)
+        self.assertIn("Correct this test only if", finding["fix"])
+
+    def test_frames_outside_the_repository_are_discarded(self):
+        """The POSIX-absolute alternative deliberately over-matches (a pytest
+        traceback is mostly site-packages frames); `_existing_failure_path`'s
+        containment check is what keeps only this repo's files, so pin it."""
+        with _tempfile.TemporaryDirectory() as td:
+            self._py_project(td)
+            log = ('  File "/usr/lib/python3/site-packages/_pytest/runner.py", line 353\n'
+                   '  File "C:\\Python312\\Lib\\site-packages\\_pytest\\python.py", line 507\n'
+                   '  File "%s", line 81, in <module>'
+                   % os.path.join(td, "test_motionsync.py"))
+            paths = ff._publication_failure_paths(td, log)
+        self.assertEqual(paths, ["motionsync.py", "test_motionsync.py"],
+                         "third-party frames must not become repair targets")
+
+    def test_jsx_suffix_is_still_not_truncated_to_js(self):
+        """The boundary widening must not reopen the Vitest truncation bug."""
+        hits = [m.group("path") for m in
+                ff._FAILURE_SOURCE_RE.finditer("  FAIL  src/pages/Home.test.jsx")]
+        self.assertEqual(hits, ["src/pages/Home.test.jsx"])
+
     def test_targeted_repair_receives_exact_failure_and_stops_when_green(self):
         with _tempfile.TemporaryDirectory() as td:
             self._project(td)
