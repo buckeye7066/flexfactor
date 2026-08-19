@@ -986,9 +986,12 @@ def report_lines(research: dict) -> list[str]:
         name = f"[{c['name']}]({c['url']})" if c.get("url") else c["name"]
         mapping = (f"acceptance #{idea.get('acceptance_ref')}"
                    if str(idea.get("acceptance_ref") or "").strip() else "purpose-only")
-        bridge = ("ENTERED"
-                  if c.get("entered_fix_stream") else
-                  f"NOT entered - {c.get('bridge_reason', 'not bridged')}")
+        if "bridge_status" in c or "entered_fix_stream" in c:
+            bridge = ("ENTERED"
+                      if c.get("entered_fix_stream") else
+                      f"NOT entered - {c.get('bridge_reason', 'not bridged')}")
+        else:
+            bridge = "not evaluated for fix-stream entry"
         L.append(f"| {name} | {c.get('kind')} | `{c.get('license')}` "
                  f"| `{c.get('reuse_mode')}` | {mapping} | {verdict} "
                  f"| {bridge} | {idea.get('idea_title', '(none)')} |")
@@ -1009,8 +1012,10 @@ def report_lines(research: dict) -> list[str]:
               f"- **Purpose verdict:** {'ACCEPTED' if idea.get('accept') else 'REJECTED'} - "
               f"{idea.get('purpose_reason', '')}",
               f"- **Fix-stream decision:** "
-              f"{'ENTERED the gated fix stream' if c.get('entered_fix_stream') else 'DID NOT enter the fix stream'}"
-              + (f" - {c.get('bridge_reason')}" if c.get('bridge_reason') else ""),
+              + ((f"{'ENTERED the gated fix stream' if c.get('entered_fix_stream') else 'DID NOT enter the fix stream'}"
+                  + (f" - {c.get('bridge_reason')}" if c.get('bridge_reason') else ""))
+                 if ("bridge_status" in c or "entered_fix_stream" in c)
+                 else "not evaluated for fix-stream entry on this report path"),
               f"- **Evidence basis:** {idea.get('evidence_basis', '')} "
               f"(confidence {idea.get('confidence', '?')})", ""]
     return L

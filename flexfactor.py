@@ -8121,7 +8121,8 @@ def _criteria_now_met(before_rows: list[dict], after_rows: list[dict]) -> list[d
     return out
 
 
-def _summarize_purpose_progress(before: dict | None, after: dict | None) -> dict:
+def _summarize_purpose_progress(before: dict | None, after: dict | None,
+                                purpose_mod=None) -> dict:
     before_gaps = list((before or {}).get("gaps") or [])
     after_gaps = list((after or {}).get("gaps") or [])
     closed_titles = _closed_gap_titles(before_gaps, after_gaps)
@@ -8131,9 +8132,8 @@ def _summarize_purpose_progress(before: dict | None, after: dict | None) -> dict
             (before or {}).get("acceptance_coverage") or [],
             (after or {}).get("acceptance_coverage") or []),
     }
-    _fp = _purpose_module()
-    if _fp is not None:
-        out["progress"] = _fp.gap_progress(before_gaps, closed_titles)
+    if purpose_mod is not None:
+        out["progress"] = purpose_mod.gap_progress(before_gaps, closed_titles)
     return out
 
 
@@ -12571,7 +12571,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if purpose_gap:
             gaps = purpose_gap.get("gaps") or []
             pct = purpose_gap.get("fulfillment_pct")
-            gaps_before = [dict(g) for g in ((purpose_before or {}).get("gaps") or gaps)]
             if purpose_gap.get("criteria_total"):
                 unk = purpose_gap.get("criteria_unknown") or 0
                 print(f"{pfx}Purpose fulfillment: {purpose_gap['criteria_met']}/"
@@ -12752,9 +12751,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     purpose_gap = refreshed
             _fp = _purpose_module()
             if _fp is not None:
-                summary = _summarize_purpose_progress(purpose_before, purpose_gap)
-                purpose_gap["progress"] = summary.get("progress") or \
-                    _fp.gap_progress(gaps_before, [])
+                summary = _summarize_purpose_progress(
+                    purpose_before, purpose_gap, purpose_mod=_fp)
+                purpose_gap["progress"] = summary["progress"]
                 purpose_gap["closed_gap_titles"] = summary.get("closed_gap_titles") or []
                 purpose_gap["criteria_now_met"] = summary.get("criteria_now_met") or []
                 prog = purpose_gap["progress"]

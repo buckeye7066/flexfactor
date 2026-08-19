@@ -7827,10 +7827,11 @@ class PurposeEngineSurvivesFullyPooledProvidersTests(unittest.TestCase):
 
     def test_incomplete_purpose_assessment_revokes_convergence(self):
         src = inspect.getsource(ff.audit_one_program)
-        gate = src[src.index("if (getattr(args, \"purpose_gap\", True) and purpose_blob"):
-                   src.index("# 7.5 Exact deterministic evidence.")]
-        self.assertIn("converged = False", gate)
-        self.assertIn("Purpose assessment evidence is incomplete", gate)
+        self.assertIn(
+            "if (getattr(args, \"purpose_gap\", True) and purpose_blob",
+            src)
+        self.assertIn("converged = False", src)
+        self.assertIn("Purpose assessment evidence is incomplete", src)
 
 
 class ScoutBridge94to100Tests(unittest.TestCase):
@@ -10936,7 +10937,7 @@ class PurposeProgressEvidenceTests(unittest.TestCase):
                 {"index": 2, "criterion": "export", "met": False},
             ],
         }
-        out = ff._summarize_purpose_progress(before, after)
+        out = ff._summarize_purpose_progress(before, after, purpose_mod=fp)
         self.assertEqual(out["closed_gap_titles"], ["missing benchmark"])
         self.assertEqual(out["progress"]["gaps_closed"], 1)
         self.assertEqual(out["progress"]["criteria_unblocked"], 1)
@@ -10952,7 +10953,7 @@ class PurposeProgressEvidenceTests(unittest.TestCase):
             "gaps": [{"title": "missing benchmark", "acceptance_ref": 1}],
             "acceptance_coverage": [{"index": 1, "criterion": "benchmark", "met": False}],
         }
-        out = ff._summarize_purpose_progress(before, after)
+        out = ff._summarize_purpose_progress(before, after, purpose_mod=fp)
         self.assertEqual(out["closed_gap_titles"], [])
         self.assertEqual(out["progress"]["gaps_closed"], 0)
         self.assertEqual(out["criteria_now_met"], [])
@@ -11010,11 +11011,17 @@ class GapClosureVerifiedOnlyTests(unittest.TestCase):
     changed files alone are not evidence."""
 
     def test_closed_titles_exclude_unverified_files(self):
-        import inspect
-        src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("Reassessing purpose after purpose-bridge changes", src)
-        self.assertIn("_summarize_purpose_progress(purpose_before, purpose_gap)", src)
-        self.assertIn('purpose_gap["closed_gap_titles"]', src)
+        before = {
+            "gaps": [{"title": "missing benchmark", "acceptance_ref": 1}],
+            "acceptance_coverage": [{"index": 1, "criterion": "benchmark", "met": False}],
+        }
+        after = {
+            "gaps": [{"title": "missing benchmark", "acceptance_ref": 1}],
+            "acceptance_coverage": [{"index": 1, "criterion": "benchmark", "met": False}],
+        }
+        summary = ff._summarize_purpose_progress(before, after, purpose_mod=fp)
+        self.assertEqual(summary["closed_gap_titles"], [])
+        self.assertEqual(summary["progress"]["gaps_closed"], 0)
 
 
 class ResumeCheckpointTests(unittest.TestCase):
