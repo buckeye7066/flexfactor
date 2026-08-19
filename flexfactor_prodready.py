@@ -26,6 +26,7 @@ from flexfactor_prodready_engine import (
 _detect_node = _eng._detect_node
 _current_lockfile = _eng._current_lockfile
 _DETECTORS = _eng._DETECTORS
+_validate_jsonld = _eng._validate_jsonld
 
 
 def assess_readiness(project_dir, toolchains, run,

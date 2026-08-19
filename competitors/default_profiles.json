@@ -1,0 +1,126 @@
+[
+  {
+    "name": "Aider",
+    "url": "https://github.com/paul-gauthier/aider",
+    "license": "Apache-2.0",
+    "category": "autonomous-code-repair",
+    "description": "Pair-programming tool that edits code in local git repos via LLM; supports whole-file and diff-based edits, multi-model rotation, and Git commit automation.",
+    "notable_features": [
+      "architect+editor dual-model mode (strong model plans, weak model edits)",
+      "repo-map to give the LLM context about the entire codebase",
+      "search/replace edit blocks (same edit-block format FlexFactor adopted)",
+      "multi-provider rotation: OpenAI, Anthropic, Ollama, Azure, Bedrock, Vertex",
+      "voice input support",
+      "built-in linter integration and auto-fix loop"
+    ],
+    "ideas": [
+      {
+        "idea_title": "Dual-model architect/editor split",
+        "why_valuable": "Using a frontier model to plan changes and a cheaper model to apply them reduces cost while preserving output quality.",
+        "accept": true,
+        "code_fixable": false,
+        "acceptance_ref": "cost-efficiency"
+      },
+      {
+        "idea_title": "Repo-map context injection",
+        "why_valuable": "Giving the LLM a summarised map of the whole repo (function signatures, class hierarchy) before per-file review reduces hallucinations about cross-file dependencies.",
+        "accept": true,
+        "code_fixable": false,
+        "acceptance_ref": "review-accuracy"
+      }
+    ]
+  },
+  {
+    "name": "SWE-agent",
+    "url": "https://github.com/princeton-nlp/SWE-agent",
+    "license": "MIT",
+    "category": "autonomous-code-repair",
+    "description": "Autonomous agent that applies LLMs to resolve GitHub issues end-to-end; uses ACI (agent-computer interface) to read/write/run code in a container.",
+    "notable_features": [
+      "structured action space (view, scroll, edit, run) prevents free-text hallucinations",
+      "dockerised sandbox for safe execution of arbitrary commands",
+      "scored against SWE-bench; highest open-source resolution rate at release",
+      "multi-file patch generation",
+      "configurable LLM backend"
+    ],
+    "ideas": [
+      {
+        "idea_title": "Containerised execution sandbox",
+        "why_valuable": "Running untrusted generated code in an isolated container prevents host-system side-effects and enables safe test execution.",
+        "accept": false,
+        "code_fixable": false,
+        "acceptance_ref": "safety",
+        "purpose_reason": "FlexFactor targets Windows desktop repos where Docker is not always present; the existing subprocess policy gate is the safety boundary."
+      }
+    ]
+  },
+  {
+    "name": "Cursor",
+    "url": "https://cursor.sh",
+    "license": "Proprietary/subscription",
+    "category": "ide-integrated-ai-coding",
+    "description": "AI-first fork of VS Code with native multi-model support, Composer agent mode, and inline chat; integrates Cursor Tab (autocomplete) alongside larger models.",
+    "notable_features": [
+      "Composer: multi-step agentic code generation across multiple files",
+      "pool-first model rotation: uses the best available model from subscription",
+      ".cursor/rules for project-specific system-prompt injection",
+      "background agents running in isolated machines",
+      "YOLO mode: auto-run terminal commands without confirmation"
+    ],
+    "ideas": [
+      {
+        "idea_title": ".cursor/rules-style per-project system prompt injection",
+        "why_valuable": "A project-local rules file that is automatically prepended to every review/fix prompt would let owners customise FlexFactor's behaviour per-repo without modifying the tool.",
+        "accept": true,
+        "code_fixable": false,
+        "acceptance_ref": "customisability"
+      }
+    ]
+  },
+  {
+    "name": "Devin (Cognition)",
+    "url": "https://www.cognition.ai/devin",
+    "license": "Proprietary/SaaS",
+    "category": "autonomous-software-engineer",
+    "description": "Fully autonomous software engineer agent; plans multi-step tasks, runs a terminal, writes and tests code, and reports back; SaaS model with web UI.",
+    "notable_features": [
+      "long-horizon planning with sub-task decomposition",
+      "integrated browser for research",
+      "snapshot/restore of agent state for resumable sessions",
+      "PR creation and review response built-in",
+      "parallel task execution across multiple machines"
+    ],
+    "ideas": [
+      {
+        "idea_title": "Sub-task decomposition for large repair runs",
+        "why_valuable": "Breaking a multi-hundred-file audit into goal-aligned sub-tasks lets the LLM maintain coherent intent across more files than a single context window allows.",
+        "accept": true,
+        "code_fixable": false,
+        "acceptance_ref": "scalability"
+      }
+    ]
+  },
+  {
+    "name": "OpenHands (formerly OpenDevin)",
+    "url": "https://github.com/All-Hands-AI/OpenHands",
+    "license": "MIT",
+    "category": "autonomous-code-repair",
+    "description": "Open-source autonomous coding agent with a browser UI, sandboxed runtime, and a pluggable agent framework; competes with Devin on open benchmarks.",
+    "notable_features": [
+      "pluggable agent backends (CodeAct, SWE-agent, monologue, etc.)",
+      "sandboxed execution via Docker microVM",
+      "GitHub issue → PR pipeline",
+      "multi-LLM backend support via LiteLLM",
+      "evaluation harness against SWE-bench, WebArena"
+    ],
+    "ideas": [
+      {
+        "idea_title": "LiteLLM-style unified provider abstraction",
+        "why_valuable": "A single thin adapter layer that translates any provider's API to the OpenAI chat-completion format lets FlexFactor add new providers (Gemini, Bedrock, Mistral) without per-provider code.",
+        "accept": true,
+        "code_fixable": false,
+        "acceptance_ref": "extensibility"
+      }
+    ]
+  }
+]
