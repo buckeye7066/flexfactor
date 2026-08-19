@@ -11741,8 +11741,27 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     event_path, evidence_run_id)
                 evidence_ledger.emit("run.started", program=display_name,
                                      project_dir=project_dir, mode=_resume_mode_for(args))
+                # This walk reads and hashes EVERY tracked file, and it runs
+                # before any other phase is set. On a large repo that is
+                # minutes of silence at phase "starting" - live 2026-08-19,
+                # GrantFlow (~4k files) looked like it never opened at all
+                # while smaller programs in the same batch were already at the
+                # baseline gate. Name the phase FIRST so the dashboard and the
+                # console both show real work, and tick progress as it goes.
+                checkpoint.set_phase("indexing repository (baseline evidence)")
+                report(phase="indexing repository (baseline evidence)")
+                _idx_last = [0.0]
+
+                def _idx_progress(done: int, total: int, rel: str) -> None:
+                    now = time.time()
+                    if done == 1 or now - _idx_last[0] >= 10.0 or done == total:
+                        _idx_last[0] = now
+                        report(phase=f"indexing repository {done}/{total}")
+                        print(f"{pfx}indexing baseline evidence: {done}/{total} files",
+                              file=sys.stderr)
+
                 baseline_code_index = evidence_mod.build_repository_index(
-                    project_dir, evidence_run_id)
+                    project_dir, evidence_run_id, progress=_idx_progress)
                 evidence_ledger.emit("repository.indexed.before",
                                      totals=baseline_code_index.get("totals"))
             except Exception as ex:
