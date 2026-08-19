@@ -706,5 +706,235 @@ class ClassificationTests(unittest.TestCase):
         self.assertIsNone(R._retry_after(exc))
 
 
+# --------------------------------------------------------------------------- #
+# PR 1: Verification fail-closed — every failure mode blocks coverage assignment
+# --------------------------------------------------------------------------- #
+
+class VerificationFailClosedTests(RotationTestCase):
+    """Prove that every provider verification failure blocks coverage assignment.
+
+    "Verification" is any call that confirms a backing route is healthy —
+    complete(), structured(), ping(), etc.  "Coverage assignment" is a
+    successful return from one of those calls, routing work to that provider.
+
+    Fail-closed means: a verification failure always raises.  It never
+    silently returns a result as if the call succeeded through a broken route,
+    and it never returns None as a stand-in for "no provider available".
+
+    Every test here is written so that removing or relaxing the fail-closed
+    invariants in _run() or _is_retryable() would cause it to fail.
+    """
+
+    # -- Helpers -----------------------------------------------------------
+
+    def _provider(self, cat: R.Catalog, failures=None, **kw) -> R.RotatingProvider:
+        failures = failures or {}
+        rot = self.rotator(cat)
+        return R.RotatingProvider(
+            rot, lambda rt: FakeProvider(rt, failures.get(rt.id)), **kw)
+
+    def _all_fail(self, failure: BaseException, n_pools: int = 2) -> R.RotatingProvider:
+        """Return a RotatingProvider whose every route raises *failure*."""
+        routes = [route(f"{chr(ord('a') + i)}/m",
+                        f"pool-{chr(ord('a') + i)}")
+                  for i in range(n_pools)]
+        cat = catalog(*routes)
+        return self._provider(cat, failures={r.id: failure for r in cat.routes})
+
+    def _tracked_provider(self, cat: R.Catalog,
+                          failure: BaseException,
+                          call_log: list) -> R.RotatingProvider:
+        """Provider that records which route id was attempted in *call_log*."""
+        def factory(rt: R.Route) -> FakeProvider:
+            fp = FakeProvider(rt, fail_with=failure)
+            orig = fp.complete
+            def logged(*a, **k):
+                call_log.append(rt.id)
+                return orig(*a, **k)
+            fp.complete = logged
+            return fp
+        return R.RotatingProvider(self.rotator(cat), factory)
+
+    # -- Network timeout ---------------------------------------------------
+
+    def test_network_timeout_on_single_provider_routes_to_healthy_backup(self):
+        """A transient 503/timeout on pool-a causes rotation to pool-b.
+
+        The route that timed out is marked cooling so it is not reused
+        immediately — the failure is recorded, never silently discarded.
+        """
+        prov = self._provider(
+            catalog(route("a/m", "pool-a"), route("b/m", "pool-b")),
+            failures={"a/m": Boom("timed out", status_code=503)})
+        result = prov.complete("assign")
+        self.assertIn("b/m", result,
+                      "rotation must deliver the call to a live pool, not silently fail")
+        cooldowns = self.store.read().get("cooldowns", {})
+        self.assertIn("route:a/m", cooldowns,
+                      "the timed-out route must enter cooldown, not be silently reused")
+
+    def test_network_timeout_on_all_providers_raises_rotation_error(self):
+        """All pools timing out must raise RotationError — never return None."""
+        prov = self._all_fail(Boom("timed out", status_code=503))
+        with self.assertRaises(R.RotationError):
+            prov.complete("assign provider coverage")
+
+    def test_network_timeout_never_returns_none(self):
+        """complete() must raise when all pools time out, not silently return None."""
+        prov = self._all_fail(Boom("gateway timeout", status_code=504))
+        raised: list = []
+        returned: list = []
+        try:
+            returned.append(prov.complete("x"))
+        except Exception as exc:
+            raised.append(exc)
+        self.assertEqual(returned, [],
+                         f"complete() returned a value through a timing-out provider: "
+                         f"{returned}")
+        self.assertTrue(raised, "complete() must raise on total timeout, not return None")
+
+    # -- Invalid provider response -----------------------------------------
+
+    def test_invalid_response_raises_immediately_not_silently_swallowed(self):
+        """A parse/value error from the provider is never swallowed.
+
+        ValueError is non-retryable: it must propagate immediately rather than
+        rotating through all pools and returning a RotationError that hides the
+        real cause.
+        """
+        prov = self._all_fail(ValueError("unexpected token in response"))
+        with self.assertRaises(ValueError):
+            prov.complete("assign provider coverage")
+
+    def test_invalid_response_is_not_rotated_to_a_second_pool(self):
+        """A non-transient parse error must not trigger pool rotation.
+
+        If _is_retryable ever returned True for ValueError, two pools would be
+        tried and this assertion on call_log length would fail.
+        """
+        call_log: list = []
+        cat = catalog(route("a/m", "pool-a"), route("b/m", "pool-b"))
+        prov = self._tracked_provider(
+            cat, ValueError("response schema mismatch"), call_log)
+        with self.assertRaises(ValueError):
+            prov.complete("x")
+        self.assertEqual(len(call_log), 1,
+                         f"ValueError must not rotate to a second pool; "
+                         f"attempted: {call_log}")
+
+    def test_structured_call_fails_closed_on_parse_error(self):
+        """structured(), used for typed verification calls, is equally fail-closed."""
+        prov = self._all_fail(ValueError("unexpected token in JSON response"))
+        with self.assertRaises(ValueError):
+            prov.structured(schema={}, prompt="verify coverage")
+
+    # -- Verification service unreachable ----------------------------------
+
+    def test_service_unreachable_on_all_pools_raises(self):
+        """All pools unreachable → an exception is raised, not a None return."""
+        prov = self._all_fail(OSError("Connection refused"))
+        with self.assertRaises((OSError, R.RotationError)):
+            prov.complete("assign provider coverage")
+
+    def test_service_unreachable_single_pool_rotates_to_backup(self):
+        """One unreachable pool causes rotation to a healthy backup.
+
+        A connection error is retryable (another pool may be reachable), but
+        the work is still assigned to a real, live provider — it is never
+        fabricated or returned empty.
+        """
+        prov = self._provider(
+            catalog(route("a/m", "pool-a"), route("b/m", "pool-b")),
+            failures={"a/m": OSError("Connection refused")})
+        result = prov.complete("x")
+        self.assertIn("b/m", result,
+                      "work must arrive at a live pool after the unreachable one is skipped")
+
+    def test_ping_failure_on_all_routes_raises_not_returns_false(self):
+        """A verification ping that fails must raise — never return None or False."""
+        prov = self._all_fail(Boom("service unavailable", status_code=503))
+        with self.assertRaises((Boom, R.RotationError)):
+            prov.ping()
+
+    def test_unreachable_route_is_cooled_off_not_silently_retried(self):
+        """After a connection error the route enters cooldown.
+
+        This proves the failure was recorded: a route that returns immediately
+        from cooldown would be eligible for re-selection, but one properly
+        cooled off is skipped on the next call.
+        """
+        prov = self._provider(
+            catalog(route("a/m", "pool-a"), route("b/m", "pool-b")),
+            failures={"a/m": OSError("Connection refused")})
+        prov.complete("first call")          # a/m fails → b/m serves
+        prov.complete("second call")         # a/m cooling → b/m serves again
+        state = self.store.read()
+        self.assertIn("route:a/m", state.get("cooldowns", {}),
+                      "the unreachable route must remain in cooldown, not be recycled")
+
+    # -- Credential mismatch -----------------------------------------------
+
+    def test_credential_mismatch_blocks_assignment(self):
+        """A 401 on the provider propagates as-is — it is never swallowed."""
+        prov = self._all_fail(Boom("invalid API key", status_code=401), n_pools=1)
+        with self.assertRaises(Boom) as ctx:
+            prov.complete("assign provider coverage")
+        self.assertIn("invalid API key", str(ctx.exception))
+
+    def test_credential_mismatch_is_not_retried_across_pools(self):
+        """A 401 must raise immediately — rotating through all pools is wrong.
+
+        A bad API key is bad on every backend.  If _is_retryable ever returned
+        True for a 401, both pools would be attempted and call_log would contain
+        two entries; this assertion catches that regression.
+        """
+        call_log: list = []
+        cat = catalog(route("a/m", "pool-a"), route("b/m", "pool-b"))
+        prov = self._tracked_provider(
+            cat, Boom("unauthorized", status_code=401), call_log)
+        with self.assertRaises(Boom):
+            prov.complete("x")
+        self.assertEqual(len(call_log), 1,
+                         f"a 401 must not rotate to a second pool; "
+                         f"attempted: {call_log}")
+
+    def test_forbidden_response_also_blocks_without_rotation(self):
+        """A 403 (Forbidden) is treated identically to 401 — not retried."""
+        call_log: list = []
+        cat = catalog(route("a/m", "pool-a"), route("b/m", "pool-b"))
+        prov = self._tracked_provider(
+            cat, Boom("forbidden", status_code=403), call_log)
+        with self.assertRaises(Boom):
+            prov.complete("x")
+        self.assertEqual(len(call_log), 1,
+                         f"a 403 must not rotate to a second pool; "
+                         f"attempted: {call_log}")
+
+    # -- General fail-closed invariant -------------------------------------
+
+    def test_failed_call_never_silently_returns_a_result(self):
+        """complete() must raise on total failure — it must not return a value.
+
+        The only safe outcomes are "a result from a live provider" or "an
+        exception explaining what failed".  Returning None would look like
+        success to callers that do not check the return type.
+        """
+        prov = self._all_fail(Boom("overloaded", status_code=503))
+        with self.assertRaises(R.RotationError):
+            result = prov.complete("x")
+            self.fail(f"expected RotationError but got: {result!r}")
+
+    def test_rotation_error_message_names_the_failure(self):
+        """RotationError on total failure must carry the last error message.
+
+        A RotationError that swallows the real cause is nearly as bad as
+        not raising at all — the operator needs to know what broke.
+        """
+        prov = self._all_fail(Boom("service overloaded", status_code=503))
+        with self.assertRaises(R.RotationError) as ctx:
+            prov.complete("x")
+        self.assertIn("overloaded", str(ctx.exception).lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
