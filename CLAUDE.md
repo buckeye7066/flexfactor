@@ -362,15 +362,23 @@ no alternative at all. Note the shape — the earlier POSIX fix made the failure
 There is now a fourth, general relative alternative (any path, including a bare
 filename). **It is LAST on purpose** — a magic-directory path keeps the older
 branch, which tolerates spaces inside a path. It excludes whitespace so the
-match cannot swallow the runner's own `FAILED `/` FAIL  ` prefix, and excludes
-comma/paren/bracket — the characters the boundary lookahead already treats as
-terminators — so `(motionsync.py:3)` yields `motionsync.py`, not `(motionsync.py`.
+match cannot swallow the runner's own `FAILED` / `FAIL` prefix *and the spaces
+after it*, and excludes comma/paren/bracket — the characters the boundary
+lookahead already treats as terminators — so `(motionsync.py:3)` yields
+`motionsync.py`, not `(motionsync.py`.
 **Over-matching is SAFE and under-matching is FATAL**: `_existing_failure_path`
 drops every hit that is not a readable file inside the repo, which is what
 discards the site-packages frames that dominate a pytest traceback
 (`test_frames_outside_the_repository_are_discarded` pins it). Do not "tighten"
 this regex without re-running `RedPublicationBaselineRepairTests` — the
 `.jsx`-not-clipped-to-`.js` guard and the runner-prefix guard both live there.
+
+Widening the regex made a **latent** bug reachable, now closed:
+`_existing_failure_path` called `candidate.lstrip("./")`, and `lstrip` strips a
+character SET — so `.github/workflows/x.py` became `github/workflows/x.py`,
+failed the contained read, and came back as "(no contained source path found)".
+That call is deleted; `_canon_rel` (whose own docstring forbids it, from the
+2026-08-14 file-identity work) already strips whole leading `./` segments.
 
 ## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
 
@@ -431,8 +439,15 @@ so the more work a run did, the more it repeated itself.
 - `flexfactor_rotation.catalog_staleness_note()` is the one-per-run replacement
   and is **actionable**: it names the file, its age in hours, the limit, and the
   exact command — `python -m aitime.catalog`. `_build_rotating_provider` prints
-  it once, guarded by `_ROTATION_STALE_PRINTED` keyed on the catalog PATH so a
-  batch run says it once, not once per program.
+  it once, guarded by `_claim_stale_warning()` / `_ROTATION_STALE_PRINTED` keyed
+  on the catalog PATH so a batch run says it once, not once per program. That
+  claim is **LOCKED** (unlike the older `_ROTATION_REASON_PRINTED` beside it): a
+  `--parallel` batch builds providers from several threads, and an
+  unsynchronized check-then-add reintroduces duplicate warnings in miniature.
+- **It is printed BELOW the "no usable route" bail-out**, because the sentence
+  says a stale route "can still be selected" — said above the bail-out it would
+  describe a rotation that never happens.
+  `test_the_warning_is_not_claimed_when_no_route_is_usable` pins the placement.
 - **Neither dishonest fix is allowed.** FlexFactor must never RUN that refresh
   (AI Time owns the catalog; silently regenerating another program's state is
   not this tool's call), and the warning must never be SUPPRESSED (a stale

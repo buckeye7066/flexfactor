@@ -184,8 +184,8 @@ def catalog_staleness_note(catalog: Optional[Catalog]) -> Optional[str]:
         return None
     hours = catalog.age_seconds / 3600.0
     return (f"route catalog is STALE: {catalog.path} is {hours:.1f}h old "
-            f"(limit {CATALOG_MAX_AGE_S / 3600.0:.0f}h). Rotation continues on "
-            f"it, so a route whose quota has since died can still be selected. "
+            f"(limit {CATALOG_MAX_AGE_S / 3600.0:.0f}h), so a route whose quota "
+            f"has since died can still be selected. "
             f"Refresh with: python -m aitime.catalog")
 
 

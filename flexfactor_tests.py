@@ -703,6 +703,53 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertNotIn("aitime.catalog", inspect.getsource(ff._build_rotating_provider)
                          .replace("`python -m aitime.catalog`", ""))
 
+    def test_a_batch_run_warns_once_not_once_per_program(self):
+        """`_build_rotating_provider` runs per PROGRAM. A 5-program batch that
+        printed the warning five times would be the same defect one level up."""
+        import io, contextlib
+        self._write_stale_catalog([self._route("groq/llama-x")])
+        ff._ROTATION_STALE_PRINTED.clear()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(5):
+                ff.build_audit_providers(self.Args)
+        self.assertEqual(err.getvalue().lower().count("stale"), 1,
+                         "five programs, one catalog, one warning\n" + err.getvalue())
+
+    def test_the_stale_claim_is_race_free_under_a_parallel_batch(self):
+        """`--parallel` builds providers from several threads at once. An
+        unsynchronized check-then-add would let two of them both print."""
+        ff._ROTATION_STALE_PRINTED.clear()
+        start = threading.Barrier(8)
+        won = []
+
+        def claim():
+            start.wait()
+            if ff._claim_stale_warning("X:/routes.json"):
+                won.append(1)
+
+        threads = [threading.Thread(target=claim) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(won), 1, "exactly one thread may print the warning")
+        ff._ROTATION_STALE_PRINTED.clear()
+
+    def test_the_warning_is_not_claimed_when_no_route_is_usable(self):
+        """The note says a stale route "can still be selected", so it must be
+        printed BELOW the no-usable-route bail-out - otherwise it describes a
+        rotation that never happens."""
+        self._write_stale_catalog([self._route("groq/llama-x",
+                                               auth_env="FLEXROT_ABSENT_KEY")])
+        ff._ROTATION_STALE_PRINTED.clear()
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._providers_with_stubbed_backends(self.Args)
+        self.assertNotIn("STALE", err.getvalue())
+        self.assertEqual(ff._ROTATION_STALE_PRINTED, set())
+
     def test_a_stale_catalog_still_warns_it_is_never_suppressed(self):
         """Suppression would be the other dishonest fix: a stale catalog can
         still be offering a route whose quota died hours ago."""
@@ -13913,6 +13960,24 @@ class DashboardDismissTests(unittest.TestCase):
         # dismiss whichever panel was drawn last.
         self.assertIn("lambda p=p:", src)
 
+    def test_bar_animation_is_keyed_by_program_not_by_column_index(self):
+        """Dismissing a panel shifts every later program one column left. Keyed
+        by the loop INDEX, each of them would inherit the dismissed panel's
+        eased bar values and glide from a percentage that was never theirs."""
+        src = inspect.getsource(self.dash._main)
+        self.assertIn("ease((program_key(p), key), target)", src)
+        self.assertNotIn("ease((i, key)", src)
+
+    def test_the_dismiss_control_is_drawn_after_the_panel_title(self):
+        """A long centred program name drawn AFTER the "x" would paint over the
+        only way to reclaim the column."""
+        src = inspect.getsource(self.dash._main)
+        title = src.index('text=name[:34]')
+        control = src.index('text="x"')
+        self.assertGreater(control, title,
+                           "the dismiss control must be drawn last so the "
+                           "title cannot bury it")
+
 
 class RedPublicationBaselineRepairTests(unittest.TestCase):
     """Regression for the live SermonSmith loop of 2026-08-17."""
@@ -14033,6 +14098,29 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
             paths = ff._publication_failure_paths(
                 td, "FAILED test_motionsync.py::test_a - AssertionError")
         self.assertEqual(paths, ["motionsync.py", "test_motionsync.py"])
+
+    def test_a_dot_prefixed_relative_path_survives_resolution(self):
+        """`_existing_failure_path` used to call `candidate.lstrip("./")`, and
+        `lstrip` strips a character SET - so `.github/workflows/x.py` became
+        `github/workflows/x.py`, failed the contained read, and came back as
+        "(no contained source path found)". `_canon_rel` (whose docstring
+        forbids exactly that call) already handles a leading `./`. The widened
+        relative branch routes many more dot-prefixed paths through here, which
+        is what made this latent bug reachable."""
+        with _tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, ".github", "workflows"))
+            target = os.path.join(td, ".github", "workflows", "build.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("def main():\n    return 1\n")
+            self.assertEqual(
+                ff._existing_failure_path(td, ".github/workflows/build.py"),
+                ".github/workflows/build.py")
+            # ...and end to end from a runner line.
+            paths = ff._publication_failure_paths(
+                td, "FAILED .github/workflows/build.py::test_a")
+        self.assertEqual(paths, [".github/workflows/build.py"])
+        # A leading './' must still be normalized away (that is _canon_rel's job).
+        self.assertEqual(ff._canon_rel("./src/x.py"), "src/x.py")
 
     def test_the_widened_relative_branch_does_not_swallow_the_runner_prefix(self):
         """`FAILED `/` FAIL  ` must never become part of the path, and a

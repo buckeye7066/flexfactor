@@ -334,12 +334,6 @@ def _main() -> int:
             # Panel.
             canvas.create_rectangle(cx, top, cx + col_w, bottom, outline=EDGE,
                                     fill=PANEL, width=1)
-            # Dismiss control. `p=p` binds THIS program - a bare closure over the
-            # loop variable would hand every "x" the last panel drawn.
-            canvas.create_text(cx + col_w - 12, top + 12, text="x", fill=DIM,
-                               font=("Segoe UI", 11, "bold"))
-            hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
-                         lambda p=p: dismiss(p)))
             name = str(p.get("name") or f"program {p.get('index', i + 1)}")
             phase = str(p.get("phase") or "")
             done = bool(p.get("done"))
@@ -353,6 +347,15 @@ def _main() -> int:
                 if cyc and cycles and not done and "cycle" not in phase else "")
             canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
                                font=("Segoe UI", 8))
+            # Dismiss control, drawn AFTER the title and subtitle so a long
+            # centred program name paints under it and can never bury the only
+            # way to reclaim the column. `p=p` binds THIS program - a bare
+            # closure over the loop variable would hand every "x" the last
+            # panel drawn.
+            canvas.create_text(cx + col_w - 12, top + 12, text="x", fill=DIM,
+                               font=("Segoe UI", 11, "bold"))
+            hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
+                         lambda p=p: dismiss(p)))
             # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
             # process, so it resets to 1 on every restart - after five restarts the
             # panel still read "cycle 1/12" while four earlier attempts had produced
@@ -405,7 +408,12 @@ def _main() -> int:
 
             for j, (key, target, color, label, vtxt) in enumerate(bars):
                 bx = cx + gap + j * (bw + gap)
-                frac = ease((i, key), target)
+                # Keyed by program IDENTITY, not by loop index: dismissing a
+                # panel shifts every later program one column left, and an
+                # index key would hand each of them the DISMISSED panel's eased
+                # bar values to glide down from - a visibly wrong percentage on
+                # panels that never changed.
+                frac = ease((program_key(p), key), target)
                 draw_bar(bx, base_y, bw, bh, frac, color, label, vtxt)
 
             # Stat row. Labels spell out units: "defects" are individual findings;
