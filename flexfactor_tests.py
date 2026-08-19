@@ -7816,6 +7816,22 @@ class PurposeEngineSurvivesFullyPooledProvidersTests(unittest.TestCase):
         self.assertIs(seen[0], stub,
                       "the fallback must be the live author provider (pool[0])")
 
+    def test_audit_assesses_purpose_before_and_after(self):
+        _res, seen, _stub = self._run_fully_pooled({
+            "package.json": '{"name":"x","scripts":{"build":"tsc"}}',
+            "README.md": "# Widget\n\nTurns widgets into gadgets for the owner.\n",
+            "src/app.js": "console.log(1);\n"})
+        self.assertGreaterEqual(
+            len(seen), 2,
+            "audit_one_program must assess purpose before edits and again on the final tree")
+
+    def test_incomplete_purpose_assessment_revokes_convergence(self):
+        src = inspect.getsource(ff.audit_one_program)
+        gate = src[src.index("if (getattr(args, \"purpose_gap\", True) and purpose_blob"):
+                   src.index("# 7.5 Exact deterministic evidence.")]
+        self.assertIn("converged = False", gate)
+        self.assertIn("Purpose assessment evidence is incomplete", gate)
+
 
 class ScoutBridge94to100Tests(unittest.TestCase):
     """Production exit criteria 98-100 (+ bridge 94-97 invariants)."""
@@ -10508,6 +10524,22 @@ class GapAnalysisTests(unittest.TestCase):
                  "suite_status": None, "clean_files": [], "usd": 0.0,
                  "fix_severity": "high", "manual_review": [], "low_findings": [],
                  "bridged_files": ["src/a.js"],
+                 "purpose_before": {
+                     "purpose": "find real funding sources",
+                     "authored": True,
+                     "fulfillment_pct": 33, "criteria_met": 1, "criteria_total": 3,
+                     "acceptance_coverage": [
+                        {"index": 1, "criterion": "current-source validation",
+                         "met": True, "blocking_gaps": 0, "worst_severity": None,
+                         "gap_titles": []},
+                        {"index": 2, "criterion": "broken-link lifecycle",
+                         "met": False, "blocking_gaps": 1, "worst_severity": "high",
+                         "gap_titles": ["no link checker"]},
+                        {"index": 3, "criterion": "real output comparison against manual search",
+                         "met": False, "blocking_gaps": 1, "worst_severity": "critical",
+                         "gap_titles": ["no benchmark"]}],
+                     "gaps": [{"title": "no link checker", "acceptance_ref": 2},
+                             {"title": "no benchmark", "acceptance_ref": 3}]},
                  "purpose_gap": {
                      "purpose": "find real funding sources",
                      "authored": True,
@@ -10526,6 +10558,9 @@ class GapAnalysisTests(unittest.TestCase):
                      "progress": {"gaps_before": 3, "gaps_closed": 1, "gaps_remaining": 2,
                                   "criteria_blocked_before": 3, "criteria_unblocked": 1,
                                   "criteria_blocked_after": 2},
+                     "closed_gap_titles": ["no link checker"],
+                     "criteria_now_met": [{"index": 2,
+                                            "criterion": "broken-link lifecycle"}],
                      "gaps": [{"title": "no benchmark", "severity": "critical",
                                "description": "d", "evidence": "e", "next_step": "n",
                                "code_fixable": True, "file": "src/a.js",
@@ -10536,6 +10571,10 @@ class GapAnalysisTests(unittest.TestCase):
                 body = fh.read()
         self.assertIn("closed 1 of 3 gap(s) toward that purpose", body)
         self.assertIn("owner-authored contract", body)
+        self.assertIn("Purpose state before changes", body)
+        self.assertIn("Purpose state after verified changes", body)
+        self.assertIn("Purpose gaps closed by post-change assessment", body)
+        self.assertIn("Acceptance criteria newly met on the final assessed tree", body)
         self.assertIn("### Acceptance criteria (the owner's, verbatim)", body)
         self.assertIn("real output comparison against manual search", body)
         self.assertIn("[acceptance #3]", body)
@@ -10880,6 +10919,45 @@ class PurposeAssessmentStabilityTests(unittest.TestCase):
         self.assertNotIn("WITHIN MEASUREMENT NOISE", text)
 
 
+class PurposeProgressEvidenceTests(unittest.TestCase):
+    def test_progress_comes_from_before_vs_after_assessments(self):
+        before = {
+            "gaps": [{"title": "missing benchmark", "acceptance_ref": 1},
+                      {"title": "missing export", "acceptance_ref": 2}],
+            "acceptance_coverage": [
+                {"index": 1, "criterion": "benchmark", "met": False},
+                {"index": 2, "criterion": "export", "met": False},
+            ],
+        }
+        after = {
+            "gaps": [{"title": "missing export", "acceptance_ref": 2}],
+            "acceptance_coverage": [
+                {"index": 1, "criterion": "benchmark", "met": True},
+                {"index": 2, "criterion": "export", "met": False},
+            ],
+        }
+        out = ff._summarize_purpose_progress(before, after)
+        self.assertEqual(out["closed_gap_titles"], ["missing benchmark"])
+        self.assertEqual(out["progress"]["gaps_closed"], 1)
+        self.assertEqual(out["progress"]["criteria_unblocked"], 1)
+        self.assertEqual(out["criteria_now_met"],
+                         [{"index": 1, "criterion": "benchmark"}])
+
+    def test_applied_but_unverified_changes_do_not_close_gaps_without_after_evidence(self):
+        before = {
+            "gaps": [{"title": "missing benchmark", "acceptance_ref": 1}],
+            "acceptance_coverage": [{"index": 1, "criterion": "benchmark", "met": False}],
+        }
+        after = {
+            "gaps": [{"title": "missing benchmark", "acceptance_ref": 1}],
+            "acceptance_coverage": [{"index": 1, "criterion": "benchmark", "met": False}],
+        }
+        out = ff._summarize_purpose_progress(before, after)
+        self.assertEqual(out["closed_gap_titles"], [])
+        self.assertEqual(out["progress"]["gaps_closed"], 0)
+        self.assertEqual(out["criteria_now_met"], [])
+
+
 class ReviewIncompleteHonestyTests(unittest.TestCase):
     """Defect: _review_all tracked files whose review ERRORED but never
     returned them, so a sweep where every review failed converged as CLEAN and
@@ -10927,18 +11005,16 @@ class ReviewIncompleteHonestyTests(unittest.TestCase):
 
 
 class GapClosureVerifiedOnlyTests(unittest.TestCase):
-    """Defect: gap closure counted every gap on an APPLIED file, including
-    [unverified] applies (verifier down). A fix only closes a gap after it is
-    both build-verified and clean on a post-change source rescan."""
+    """Defect: gap closure used file-level apply state as proof. A purpose gap
+    only closes once the AFTER assessment of the final tree no longer reports it;
+    changed files alone are not evidence."""
 
     def test_closed_titles_exclude_unverified_files(self):
         import inspect
         src = inspect.getsource(ff.audit_one_program)
-        self.assertIn("verified_bridged: set[str] = set()", src)
-        self.assertIn("pending_bridge = set(bridged_files) - set(unverified_set)",
-                      src)
-        self.assertIn("verified_bridged |= set(rclean)", src)
-        self.assertIn("if rel in verified_bridged", src)
+        self.assertIn("Reassessing purpose after purpose-bridge changes", src)
+        self.assertIn("_summarize_purpose_progress(purpose_before, purpose_gap)", src)
+        self.assertIn('purpose_gap["closed_gap_titles"]', src)
 
 
 class ResumeCheckpointTests(unittest.TestCase):
@@ -12011,6 +12087,14 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
         self.assertTrue(any("cap" in r for r in ledger["dropped"]),
                         "over-the-cap candidates must be named, not vanish")
 
+    def test_default_fix_stream_cap_is_five(self):
+        research = {"competitors": [self._comp(f"c{i}") for i in range(6)]}
+        out = fc.competitor_findings(research, file_exists=lambda r: True)
+        ledger = research["bridge_ledger"]
+        self.assertEqual(len(out), 5)
+        self.assertEqual(ledger["bridged"], 5)
+        self.assertTrue(any("cap of 5" in r for r in ledger["dropped"]))
+
     def test_cap_zero_records_every_candidate_as_disabled_not_dropped_silently(self):
         research = {"competitors": [self._comp("a"), self._comp("b")]}
         self.assertEqual(fc.competitor_findings(research, max_findings=0,
@@ -12020,6 +12104,15 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
         self.assertEqual(ledger["dropped_total"], 2)
         self.assertTrue(ledger["accounted"])
         self.assertTrue(any("disabled" in r for r in ledger["dropped"]))
+
+    def test_invalid_acceptance_mapping_is_rejected_and_accounted(self):
+        research = {"competitors": [self._comp("badref", idea={"acceptance_ref": "99"})]}
+        self.assertEqual(
+            fc.competitor_findings(research, file_exists=lambda r: True, acceptance_total=3),
+            [])
+        ledger = research["bridge_ledger"]
+        self.assertEqual(ledger["bridged"], 0)
+        self.assertTrue(any("valid acceptance criterion" in r for r in ledger["dropped"]))
 
     def test_report_renders_the_ledger_with_reasons(self):
         research = {"competitors": [self._comp("ok"),
@@ -12034,6 +12127,8 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
         self.assertIn("Bridged into the fix stream:", text)
         self.assertIn("1 of 2 candidate(s)", text)
         self.assertIn("NOT bridged (1): nofix", text)
+        self.assertIn("Fix stream", text)
+        self.assertIn("acceptance #3", text)
         self.assertNotIn("ACCOUNTING GAP", text)
 
     def test_phase1_purpose_gap_bridging_keeps_the_same_ledger(self):
@@ -12466,6 +12561,7 @@ class CompetitorAuditWiringTests(unittest.TestCase):
         a = self._audit_args(["audit", "--program", "x"])
         self.assertTrue(a.competitors, "competitor research must default ON")
         self.assertEqual(a.competitor_count, 5)
+        self.assertEqual(a.competitor_fixes, 5)
         self.assertFalse(a.no_remote_repo_rewards)
         b = self._audit_args(["audit", "--program", "x", "--no-competitors",
                               "--competitor-count", "7", "--competitor-fixes", "1",
@@ -12561,8 +12657,10 @@ class CompetitorAuditWiringTests(unittest.TestCase):
                 "reuse_reason": "copyleft", "evidence_status": "verified",
                 "idea": {"idea_title": "Service planning", "what_it_does": "W",
                          "why_valuable": "V", "accept": True,
-                         "purpose_reason": "serves criterion 2",
+                         "purpose_reason": "serves criterion 2", "acceptance_ref": "2",
+                         "code_fixable": True, "file": "README.md", "severity": "high",
                          "evidence_basis": "readme", "confidence": "medium"}}]}
+        fc.competitor_findings(research, file_exists=lambda r: True)
         text = self._report_text(competitor_research=research,
                                  competitors_enabled=True)
         self.assertIn("clean-room-from-documented-behavior", text)
@@ -12570,6 +12668,8 @@ class CompetitorAuditWiringTests(unittest.TestCase):
         self.assertIn("https://github.com/openlp/openlp", text)
         self.assertIn("connection refused", text)
         self.assertIn("SHORTFALL", text)
+        self.assertIn("acceptance #2", text)
+        self.assertIn("ENTERED the gated fix stream", text)
 
 class OutputBudgetShrinkTests(unittest.TestCase):
     """Live GrantFlow 2026-08-16: `[skip] src/pages/SmartMatcher.jsx: fix
