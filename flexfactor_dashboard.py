@@ -164,6 +164,84 @@ def bar_targets(p: dict) -> dict:
     return {"review": review, "fix": fix, "budget": budget, "cap": cap, "cost": cost}
 
 
+# --------------------------------------------------------------------------- #
+# Dismiss ("x") - owner request 2026-08-19
+# --------------------------------------------------------------------------- #
+# > "give me an 'x' to delete a program out of flexfactor, like in the situation
+# >  of Iplay just now, to leave room for the graphics of the other programs."
+#
+# Five programs ran concurrently; IPlay STOPPED early on a red baseline and its
+# dead panel kept holding a fifth of the window while the other four worked.
+#
+# THIS IS A VIEW ACTION AND NOTHING ELSE, and the architecture is what makes
+# that true rather than a promise: this file is a pure READER of status.json. It
+# has never opened that file for writing and still does not, it holds no handle
+# on any audit process, and the end-of-run summary is produced by flexfactor.py
+# from its own in-process totals without ever consulting this module. So
+# dismissing cannot kill an audit, cannot mutate a run's state, and cannot make
+# a stopped program's outcome unreportable. `_DISMISSED` lives in memory only -
+# nothing is persisted, so a fresh dashboard starts with every panel shown.
+#
+# WHAT HAPPENS IF A DISMISSED PROGRAM COMES BACK TO LIFE: it REAPPEARS. The
+# dismissal is recorded against the program's activity signature at the moment
+# it was hidden and holds only while that signature does. A finished or stopped
+# program never moves again, so it stays gone for the session - which is the
+# whole point of the request. A program that resumes reviewing, fixing, spending
+# or changing phase changes its signature and comes straight back. That is the
+# honest choice: this panel is the owner's only live view of what is running,
+# and a display that silently hides working programs would be lying about the
+# run. Clicking "x" again re-hides it against the new signature.
+_DISMISSED: dict[str, tuple] = {}  # program key -> activity signature when hidden
+
+
+def program_key(p: dict) -> str:
+    """Identity of one panel. Name+dir, falling back to the batch index."""
+    name = str(p.get("name") or "")
+    proj = str(p.get("dir") or "")
+    if name or proj:
+        return f"{name}|{proj}"
+    return f"#{p.get('index')}"
+
+
+def activity_signature(p: dict) -> tuple:
+    """Everything that changes when a program does real work.
+
+    Deliberately excludes heartbeat-only fields (`updated`, timestamps): a
+    stopped program whose status entry is merely re-serialized must NOT count as
+    activity, or the dismissal would bounce back on the next poll.
+    """
+    return tuple(p.get(k) for k in (
+        "phase", "done", "reviewed", "files_total", "fixed", "fix_done",
+        "fix_total", "defects", "defects_fixed", "errors", "cost",
+        "current_file", "cycle", "cycles"))
+
+
+def dismiss(p: dict) -> None:
+    """Hide one program's panel for this dashboard session."""
+    _DISMISSED[program_key(p)] = activity_signature(p)
+
+
+def restore_all() -> None:
+    """Show every dismissed panel again."""
+    _DISMISSED.clear()
+
+
+def is_dismissed(p: dict) -> bool:
+    """True while this program is hidden AND has not moved since it was hidden."""
+    key = program_key(p)
+    if key not in _DISMISSED:
+        return False
+    if _DISMISSED[key] != activity_signature(p):
+        del _DISMISSED[key]  # new activity un-hides it, permanently until re-x'd
+        return False
+    return True
+
+
+def visible_programs(progs: list[dict]) -> list[dict]:
+    """The panels to draw. Never mutates or drops anything from status.json."""
+    return [p for p in progs if not is_dismissed(p)]
+
+
 def _main() -> int:
     import tkinter as tk
 
@@ -178,6 +256,17 @@ def _main() -> int:
 
     # Per-(program, bar) eased display value so bars glide instead of jumping.
     shown: dict[tuple, float] = {}
+
+    # Clickable regions, rebuilt every frame: (x0, y0, x1, y1, action).
+    hits: list[tuple[float, float, float, float, object]] = []
+
+    def on_click(event) -> None:
+        for x0, y0, x1, y1, action in hits:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                action()
+                return
+
+    canvas.bind("<Button-1>", on_click)
 
     def ease(key: tuple, target: float) -> float:
         cur = shown.get(key, 0.0)
@@ -201,7 +290,10 @@ def _main() -> int:
 
     def redraw() -> None:
         canvas.delete("all")
-        progs = read_status(STATUS_PATH)
+        hits.clear()
+        all_progs = read_status(STATUS_PATH)
+        progs = visible_programs(all_progs)
+        hidden = len(all_progs) - len(progs)
         W = canvas.winfo_width() or 960
         H = canvas.winfo_height() or 620
 
@@ -210,9 +302,22 @@ def _main() -> int:
         canvas.create_text(W - 14, 16, anchor="e",
                            text=f"watching {os.path.basename(STATUS_PATH)}",
                            fill=DIM, font=("Segoe UI", 8))
+        # A dismissed panel is never a silent disappearance: the count and the
+        # way back are always on screen. The run itself still reports it.
+        if hidden:
+            canvas.create_text(W / 2, 16, text=f"{hidden} dismissed - click to "
+                                               f"show (they are still audited)",
+                               fill=DIM, font=("Segoe UI", 8))
+            hits.append((W / 2 - 140, 8, W / 2 + 140, 24, restore_all))
 
-        if not progs:
+        if not all_progs:
             canvas.create_text(W / 2, H / 2, text="waiting for an audit to start...",
+                               fill=DIM, font=("Segoe UI", 12))
+            root.after(40, redraw)
+            return
+        if not progs:
+            canvas.create_text(W / 2, H / 2, text="all panels dismissed - click "
+                                                  "the line above to show them",
                                fill=DIM, font=("Segoe UI", 12))
             root.after(40, redraw)
             return
@@ -242,6 +347,15 @@ def _main() -> int:
                 if cyc and cycles and not done and "cycle" not in phase else "")
             canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
                                font=("Segoe UI", 8))
+            # Dismiss control, drawn AFTER the title and subtitle so a long
+            # centred program name paints under it and can never bury the only
+            # way to reclaim the column. `p=p` binds THIS program - a bare
+            # closure over the loop variable would hand every "x" the last
+            # panel drawn.
+            canvas.create_text(cx + col_w - 12, top + 12, text="x", fill=DIM,
+                               font=("Segoe UI", 11, "bold"))
+            hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
+                         lambda p=p: dismiss(p)))
             # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
             # process, so it resets to 1 on every restart - after five restarts the
             # panel still read "cycle 1/12" while four earlier attempts had produced
@@ -294,7 +408,12 @@ def _main() -> int:
 
             for j, (key, target, color, label, vtxt) in enumerate(bars):
                 bx = cx + gap + j * (bw + gap)
-                frac = ease((i, key), target)
+                # Keyed by program IDENTITY, not by loop index: dismissing a
+                # panel shifts every later program one column left, and an
+                # index key would hand each of them the DISMISSED panel's eased
+                # bar values to glide down from - a visibly wrong percentage on
+                # panels that never changed.
+                frac = ease((program_key(p), key), target)
                 draw_bar(bx, base_y, bw, bh, frac, color, label, vtxt)
 
             # Stat row. Labels spell out units: "defects" are individual findings;
@@ -371,5 +490,21 @@ if __name__ == "__main__":
         chips = [(s, sample["severity"].get(s)) for s in SEV_ORDER if sample["severity"].get(s)]
         print("severity chips:", chips)
         print("read_status (missing file):", read_status("/no/such/file"))
+        # Dismiss logic, headless (no display needed).
+        stopped = {"name": "IPlay", "dir": "C:/Users/firer/Iplay", "done": True,
+                   "phase": "STOPPED: baseline red", "reviewed": 0}
+        both = [sample, stopped]
+        assert len(visible_programs(both)) == 2, "nothing dismissed yet"
+        dismiss(stopped)
+        assert [p["name"] for p in visible_programs(both)] == ["GrantFlow"], \
+            "dismissing must hide exactly one panel"
+        assert len(both) == 2 and stopped["done"] is True, \
+            "dismissing must not mutate or drop the run's own status data"
+        print("dismiss (stopped program):", [p["name"] for p in visible_programs(both)])
+        revived = dict(stopped, done=False, phase="reviewing", reviewed=3)
+        assert not is_dismissed(revived), "new activity must un-hide a panel"
+        restore_all()
+        assert len(visible_programs(both)) == 2
+        print("restore_all:", [p["name"] for p in visible_programs(both)])
         sys.exit(0)
     sys.exit(_main())

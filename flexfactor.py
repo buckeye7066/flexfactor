@@ -2907,6 +2907,23 @@ def _rotation_route_provider(route):
 # Printed-once guards so an absent catalog explains itself exactly once per
 # process instead of once per program in a batch run.
 _ROTATION_REASON_PRINTED: set[str] = set()
+# Same guard for the catalog-staleness warning, keyed by catalog PATH: the fact
+# is about the file, so it is worth saying once and worthless said per route.
+# LOCKED, unlike its sibling above: a `--parallel` batch builds providers from
+# several threads at once, and an unsynchronized check-then-add would let two of
+# them both see "not printed" and both print -- reintroducing, in miniature, the
+# duplicate-warning defect this whole change exists to remove.
+_ROTATION_STALE_PRINTED: set[str] = set()
+_ROTATION_STALE_LOCK = threading.Lock()
+
+
+def _claim_stale_warning(path: str) -> bool:
+    """True for exactly ONE caller per catalog path, however many race for it."""
+    with _ROTATION_STALE_LOCK:
+        if path in _ROTATION_STALE_PRINTED:
+            return False
+        _ROTATION_STALE_PRINTED.add(path)
+        return True
 
 # Where this machine's provider keys actually live. Groq / Cerebras /
 # OpenRouter / NVIDIA NIM credentials are provisioned for the FCC proxy in its
@@ -3038,6 +3055,17 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
         or os.environ.get("AI_ROTATE_PIN") or ""
     drop_note = ("; excluded " + ", ".join(
         f"{n}x {w}" for w, n in sorted(dropped.items()))) if dropped else ""
+    # Catalog staleness is a fact about ONE FILE, so it is said ONCE per process
+    # (keyed by path), not once per rotated route. `Selection.describe()` used to
+    # append it, and the caller prints one line per distinct route: a live
+    # 5-program run on 2026-08-19 emitted ~30 `... stale catalog` lines. The note
+    # is actionable now -- file, age, and the exact refresh command -- and
+    # FlexFactor never runs that command itself (AI Time owns the catalog).
+    # It is printed HERE, below the "no usable route" bail-out above, so it is
+    # only ever said about a catalog this run is actually going to rotate on.
+    stale_note = fr.catalog_staleness_note(catalog)
+    if stale_note and _claim_stale_warning(catalog.path):
+        print(f"  [rotation] {stale_note}", file=sys.stderr)
     print(f"  [rotation] ON: {len(usable)} free routes over {pools} pools, "
           f"author tier '{author_tier}'"
           + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
@@ -9124,7 +9152,24 @@ _FAILURE_SOURCE_RE = re.compile(
     # and drops anything outside the repo, which is what discards the
     # site-packages frames that dominate a pytest traceback.
     r"/[^:\r\n\"'<>|]*?|"
-    r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?)"
+    r"(?:(?:apps?|packages|src|tests?|lib)[\\/])[^:\r\n\"'<>|]*?|"
+    # ANY other relative path, including a bare repo-root filename. Measured
+    # 2026-08-19 on the live IPlay run: pytest printed
+    # `FAILED iplay/test_production_bridge.py::...` and this regex returned
+    # `/test_production_bridge.py` -- a WRONG absolute path -- because no
+    # alternative accepted a first segment of `iplay`, so the POSIX-absolute
+    # branch matched from the slash onward instead. `FAILED test_x.py::test_a`
+    # (repo root) returned nothing at all. Both make phase 0 print
+    # "(no contained source path found)" while the failing file is on screen.
+    # Whitespace is excluded so the match cannot swallow the runner's own
+    # `FAILED `/`FAIL  ` prefix, and the characters the boundary below already
+    # treats as path terminators (comma, paren, bracket) are excluded too, so
+    # `(motionsync.py:3)` yields `motionsync.py`, not `(motionsync.py`. This
+    # alternative is LAST: a magic-directory path keeps the older branch, which
+    # tolerates spaces inside the path. Over-matching stays safe --
+    # `_existing_failure_path` resolves every hit against project_dir and drops
+    # anything that is not a readable file inside the repository.
+    r"[^\s:\r\n\"'<>|,()\[\]]*?)"
     # Keep longer suffixes before their prefixes (``jsx`` before ``js`` and
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
     # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and
@@ -9165,8 +9210,13 @@ def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
             candidate = os.path.relpath(candidate, root)
         except ValueError:  # different Windows drive
             return None
-    else:
-        candidate = candidate.lstrip("./")
+    # NOTE the deleted `candidate.lstrip("./")` that used to sit here: `lstrip`
+    # strips a character SET, so it turned `.github/workflows/x.py` into
+    # `github/workflows/x.py`, which then failed the contained read and came
+    # back as "(no contained source path found)". `_canon_rel` below already
+    # strips whole leading `./` segments and its docstring forbids exactly this
+    # call - the widened relative branch above simply routes many more
+    # dot-prefixed paths through here, so the latent bug became reachable.
     candidate = _canon_rel(candidate)
     if _read_text_and_sha(project_dir, candidate) is not None:
         return candidate

@@ -167,6 +167,28 @@ class Catalog:
         return [r for r in self.routes if r.enabled]
 
 
+def catalog_staleness_note(catalog: Optional[Catalog]) -> Optional[str]:
+    """One actionable sentence when the route catalog is stale, else None.
+
+    The warning is deliberately NOT suppressed and deliberately NOT acted on.
+    Not suppressed, because a stale catalog can still be offering a route whose
+    quota died hours ago -- silence would turn that into an unexplained error
+    tour. Not acted on, because the catalog belongs to AI Time: regenerating
+    another program's state behind the owner's back is not FlexFactor's call, so
+    this names the exact command and stops there.
+
+    Says WHICH file, HOW old, and WHAT to run -- "stale catalog" on its own told
+    the reader nothing they could do.
+    """
+    if catalog is None or not catalog.is_stale:
+        return None
+    hours = catalog.age_seconds / 3600.0
+    return (f"route catalog is STALE: {catalog.path} is {hours:.1f}h old "
+            f"(limit {CATALOG_MAX_AGE_S / 3600.0:.0f}h), so a route whose quota "
+            f"has since died can still be selected. "
+            f"Refresh with: python -m aitime.catalog")
+
+
 def _rotation_extensions_enabled() -> bool:
     """Return True when `FLEXFACTOR_ROTATION_EXTENSIONS=1` is set."""
     return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() == "1"
@@ -411,8 +433,13 @@ class Selection:
             bits.append("pinned")
         if self.demoted:
             bits.append(f"demoted from {self.demoted_from}")
-        if self.catalog_stale:
-            bits.append("stale catalog")
+        # `catalog_stale` is DELIBERATELY not rendered here. Staleness is a fact
+        # about the CATALOG FILE, not about this route, and the caller prints one
+        # line per distinct route -- so a long run repeated "stale catalog" once
+        # per rotated route (measured 2026-08-19: ~30 lines in a single live
+        # run), burying everything else in the log. The field stays on the
+        # Selection because consumers still need the answer; the one-per-run
+        # warning is `catalog_staleness_note()` below.
         return " ".join(bits)
 
 
