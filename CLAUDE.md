@@ -208,7 +208,7 @@ search function and (in tests) the URL opener.
   are filtered — a sponsored link is not a competitor finding.
 - **Bridging is bounded.** Only accepted + corroborated + licence-permitted +
   `code_fixable` ideas with a real file enter `_fix_files`, capped by
-  `--competitor-fixes` (default 3) and still under `--fix-severity`, the build
+  `--competitor-fixes` (default 5) and still under `--fix-severity`, the build
   gate and the adversarial verifier. The cap is checked BEFORE the append — a
   post-append check let `--competitor-fixes 0` still emit one finding.
 - **TRAP the tests pin:** `all_findings` is REASSIGNED wholesale by every cycle
@@ -803,7 +803,7 @@ python flexfactor_dashboard.py --selftest
 ```
 Key flags: `--economy` (cheap author tier), `--whole-file-fixes` (legacy, edit
 blocks are default), `--repo-rewards-url` (scout backend), `--max-cost` (USD
-budget, default 50), `--fix-prefetch N` (parallel first-attempt fixes, default 3),
+budget, default 150), `--fix-prefetch N` (parallel first-attempt fixes, default 3),
 `--adversarial`/`--no-adversarial` (adversarial fable<->sol fix-verify loop, default
 ON), `--adversarial-rounds N` (re-fix rounds before reject, default 2),
 `--adversarial-materiality {material,all}` (default material: don't burn rounds on
@@ -847,8 +847,10 @@ Closes two silent-failure holes the audit had:
   branch prefix `flexfactor/prodready-`. There is no review-only override:
   `--report-only`/`--dry-run` were removed from audit/prodready outright.
 - **Dirty-tree walk-away (2026-08-10).** Prodready no longer faceplants on a
-  dirty tree (the GrantFlow failure): `--snapshot-dirty` (default ON in prodready,
-  OFF in audit) commits the pre-existing changes verbatim as the sandbox branch's
+  dirty tree (the GrantFlow failure). NOTE: `--snapshot-dirty` is NO LONGER A CLI
+  FLAG - passing it is argparse exit 2. What follows describes the MECHANISM
+  (`_snapshot_dirty_tree`, default ON in prodready, OFF in audit), not a switch you
+  can set. It commits the pre-existing changes verbatim as the sandbox branch's
   FIRST commit (`_snapshot_dirty_tree`, `--no-verify`, files on disk untouched) so
   the per-cycle `git add -A` commits contain only FlexFactor's changes. Every
   cleanup path is fail-closed: the empty-branch drop paths call
@@ -883,7 +885,7 @@ still the guard.
   mode): author = claude-sonnet-5 at $3/$15 vs Opus 4.8's $5/$25, near-Opus
   code quality; launcher defaults economy ON),
   `MODEL_PRICING` (incl. Claude 5 family), `CostMeter` (hard `--max-cost`
-  budget, default $50/program)
+  budget, default $150/program)
 - Providers: `AnthropicProvider` / `OpenAIProvider` / `OllamaProvider`
   (`complete`/`grade`/`structured`/`ping`). Ollama (2026-07-25, ULTRAPLAN
   1.2) = LOCAL-ONLY: refuses non-loopback `OLLAMA_BASE_URL` (fail closed),

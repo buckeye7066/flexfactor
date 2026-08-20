@@ -5096,9 +5096,11 @@ def _valid_npm_spec(spec) -> bool:
 def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> ApplyResult:
     """Apply a generated patch with a build-gated, reversible workflow.
 
-    git repo:  work on branch flexfactor/adopt-<repo>; commit + push only if the
-               project's build passes; on any failure hard-reset and delete the
-               branch so the repo is untouched.
+    git repo:  work on the branch the repo is ALREADY on - there is no
+               flexfactor/adopt-* branch and nothing here runs `checkout -b`
+               (sandbox branches were removed 2026-08-11). Commit + push only
+               if the project's build passes; on any failure restore the
+               snapshotted files so the repo is untouched.
     no git:    write with .bak backups; restore them on failure.
     """
     files = [f for f in (patch.get("files") or [])
@@ -5279,17 +5281,45 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                     status, detail = "applied-pushed", f"pushed branch {branch} to origin"
                 else:
                     detail += f"; push failed: {_tail(pr.stderr, 3)}"
-            if opts.merge and prev_branch:
-                _git(["checkout", prev_branch], project_dir)
-                mr = _git(["merge", "--no-ff", "-m", f"Merge {branch}", branch], project_dir)
-                if mr.returncode == 0:
-                    detail += f"; merged into {prev_branch}"
-                    if opts.push and _git_has_remote(project_dir):
-                        _git(["push", "origin", prev_branch], project_dir)
+            # `branch IS prev_branch` here - there is no apply branch (see the
+            # assignment above). Two defects lived in this block until
+            # 2026-08-19, both of the same family as the audit-path holes:
+            #
+            #  1. A SELF-MERGE REPORTED AS A MERGE. `git merge --no-ff X` while
+            #     already on X prints "Already up to date." and exits 0
+            #     (measured), so `detail` gained "; merged into main" on every
+            #     --merge run while nothing whatsoever was merged.
+            #     `_commit_and_sync` guards the identical case with
+            #     `prev_branch != branch` and calls the alternative "faked".
+            #  2. A DISCARDED PUSH RESULT. The push below had its return code
+            #     thrown away, so a protected trunk rejecting it left the line
+            #     reading "merged into main" with no failure anywhere - the
+            #     exact silent half-success the audit path was fixed for.
+            if opts.merge and prev_branch and prev_branch == branch:
+                detail += ("; no merge step - the work is already on "
+                           f"{prev_branch} (there is no separate apply branch)")
+            elif opts.merge and prev_branch:
+                co = _git(["checkout", prev_branch], project_dir)
+                if co.returncode != 0:
+                    # Never merge from the wrong ref: without this the merge
+                    # below ran on whatever branch we were still on.
+                    detail += (f"; merge skipped (could not checkout "
+                               f"{prev_branch}: {_tail(co.stderr, 2)})")
                 else:
-                    _git(["merge", "--abort"], project_dir)
-                    _git(["checkout", branch], project_dir)
-                    detail += f"; auto-merge into {prev_branch} skipped (conflicts)"
+                    mr = _git(["merge", "--no-ff", "-m", f"Merge {branch}", branch],
+                              project_dir)
+                    if mr.returncode == 0:
+                        detail += f"; merged into {prev_branch}"
+                        if opts.push and _git_has_remote(project_dir):
+                            mp = _git(["push", "origin", prev_branch], project_dir)
+                            detail += (" (pushed)" if mp.returncode == 0 else
+                                       f" (push of {prev_branch} REJECTED: "
+                                       f"{_tail(mp.stderr, 2)} - the merge is "
+                                       "local only, origin does NOT have it)")
+                    else:
+                        _git(["merge", "--abort"], project_dir)
+                        _git(["checkout", branch], project_dir)
+                        detail += f"; auto-merge into {prev_branch} skipped (conflicts)"
             return ApplyResult(repo_name, status, detail, branch=branch, files=file_list,
                                packages=packages, commit_message=msg,
                                post_steps=patch.get("post_steps") or [],
@@ -5537,9 +5567,16 @@ def build_evidence_matrix(evaluation: dict) -> dict:
         "network_behavior": "unknown until inspected",
         "native_build": "unknown until inspected",
         "dependency_burden": "unknown until inspected",
-        "rollback_plan": "dedicated flexfactor/adopt-* branch; build-gated; "
-                         "hard rollback on any failure; proposal-only until "
-                         "separate FlexFactor apply approval",
+        # NO BRANCH. This said "dedicated flexfactor/adopt-* branch" - a
+        # disposable safety buffer that has not existed since sandbox branches
+        # were removed (2026-08-11); an inline apply commits onto the branch
+        # the repo is already on. The rollback that DOES exist is the per-file
+        # snapshot/restore in `_rollback`, so name that instead. This string is
+        # printed on the approval card AND written into the scout report.
+        "rollback_plan": "commits onto the branch the repo is already on (no "
+                         "apply branch); build-gated, with every touched file "
+                         "snapshotted and restored on any failure; "
+                         "proposal-only until separate FlexFactor apply approval",
         # Bridge 95: metadata is never install proof; SHA filled/confirmed later.
         "metadata_screened_only": True,
         "safe_to_install": False,
@@ -6101,13 +6138,22 @@ def _confirm_scout_apply(args, evaluations: list[dict],
             return True
     print("\n" + "!" * 70)
     if getattr(args, "legacy_inline_apply", False):
+        # This banner used to promise the commits land "onto a
+        # '<branch_prefix>*' branch". NOTHING in this codebase runs
+        # `git checkout -b`: `apply_integration` sets `branch = prev_branch`,
+        # i.e. the branch the repo is ALREADY on. So the banner described a
+        # disposable safety buffer the run does not have - the same defect
+        # that was fixed on the audit `--apply` banner (2026-08-19), surviving
+        # on this one. There is no separate branch to MERGE from either; a
+        # "merge" here would be a self-merge, which `apply_integration` now
+        # names as skipped rather than reporting as done. Say what happens.
         print(f"  --legacy-inline-apply will MODIFY the program's repository: "
               f"generate and commit {n} integration(s)")
-        print(f"  onto a '{args.branch_prefix}*' branch"
-              + (", and PUSH to origin" if getattr(args, "push", False)
-                 else " (local commit only, no push)")
-              + (", then MERGE into the current branch"
-                 if getattr(args, "merge", False) else "") + ".")
+        print("  directly onto the branch the repo is already on (there is no"
+              " apply branch)"
+              + (", and PUSH to origin - on a trunk that means the work is IN"
+                 " PRODUCTION" if getattr(args, "push", False)
+                 else " (local commit only, no push)") + ".")
     else:
         print(f"  --apply will emit {n} integration PROPOSAL(s) "
               "(dependency delta, conflict analysis, rollback).")
@@ -14718,12 +14764,16 @@ modes:
   scout      Profile a program and search Repo Rewards for repos that would
              benefit it (report-only by default; --apply to integrate).
   audit      Aggressive line-by-line defect hunt + auto-fix across a whole
-             project (report-only by default; --apply to fix).
+             project. EVERY RUN IS REAL: fixes are written and committed onto
+             the branch the repo is already on, and pushed + merged to origin
+             by default (green build + the project's own suite gate the push).
+             There is no report-only mode; --no-push/--no-merge keep it local.
   prodready  Point it at any program and walk away: detect every toolchain,
              install its dependencies, hunt and fix defects (down to medium),
              then score it against a production-readiness rubric and write a
-             scorecard naming whatever still blocks release. Applies fixes by
-             default; --report-only or --dry-run to just look.
+             scorecard naming whatever still blocks release. Applies, commits
+             and pushes exactly like audit; there is no look-without-changing
+             mode (owner order 2026-08-11: every run is for real).
   policy     Inspect (`show`) or initialize (`init`) the owner policy file
              ~/.flexfactor/policy.json that unlocks high-risk command
              classes and secret/PII egress categories (deny-by-default).
@@ -15002,7 +15052,11 @@ def main(argv=None) -> int:
         parser.add_argument("--merge", action="store_true", dest="merge",
                             help="After a verified commit, also merge the branch into the current branch.")
         parser.add_argument("--branch-prefix", default="flexfactor/adopt-", dest="branch_prefix",
-                            help="Prefix for the per-repo apply branch (default: flexfactor/adopt-).")
+                            help="ACCEPTED BUT INERT: it does NOT name a branch. Sandbox "
+                                 "branches were removed 2026-08-11 and nothing runs "
+                                 "'git checkout -b', so an applied integration commits "
+                                 "onto the branch the repo is already on. Kept so existing "
+                                 "launchers and scripts keep working.")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Apply even if the git working tree isn't clean.")
         parser.add_argument("--no-clone-inspect", action="store_false", dest="clone_inspect",
@@ -15242,7 +15296,10 @@ def main(argv=None) -> int:
                                  "both default merge ON, gated on a green final build; "
                                  "this turns it off).")
         parser.add_argument("--branch-prefix", default="flexfactor/audit-", dest="branch_prefix",
-                            help="Prefix for the audit branch (default: flexfactor/audit-).")
+                            help="Does NOT name a branch: sandbox branches were removed "
+                                 "2026-08-11 and fixes commit onto the branch the repo is "
+                                 "already on. The value survives only as the audit-vs-"
+                                 "prodready marker in reports, and launchers still pass it.")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Audit even if the git working tree isn't clean "
                                  "(pre-existing changes get swept into the cycle commits).")

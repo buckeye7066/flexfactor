@@ -14470,5 +14470,219 @@ class WindowsConsoleUtf8RegressionTests(unittest.TestCase):
         self.assertNotIn('--single', both)
 
 
+class UsageTextMatchesTheRealCLITests(unittest.TestCase):
+    """`flexfactor --help` is the first thing anyone reads, and its audit line
+    said "report-only by default; --apply to fix" while `--apply` has been
+    `default=True` (and push+merge default ON) since 2026-08-11 - so the one
+    surface that promised the run would only LOOK described a run that writes,
+    commits, pushes and merges. The prodready line advertised `--report-only`
+    and `--dry-run`, both of which argparse rejects outright (exit 2).
+
+    Same defect family as the `--apply` banner that promised a
+    `flexfactor/audit-*` branch nothing creates. Both checks below are
+    behavioural: they compare the usage text against what the mode parsers
+    ACTUALLY accept and what an unflagged invocation ACTUALLY parses to."""
+
+    _MODES = ("scout", "audit", "prodready", "policy")
+    _ALL = ("refactor", "scout", "audit", "prodready", "policy")
+
+    def _mode_help(self, mode):
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                ff.main([mode, "--help"])
+        self.assertEqual(cm.exception.code, 0, mode + " --help must exit 0")
+        return buf.getvalue()
+
+    def _usage_block(self, mode):
+        """The lines of _TOP_LEVEL_USAGE describing exactly this mode."""
+        lines = ff._TOP_LEVEL_USAGE.splitlines()
+        starts = [i for i, ln in enumerate(lines)
+                  if ln.startswith("  ") and not ln.startswith("   ")
+                  and ln.strip().split(" ")[0] in self._ALL]
+        for idx, i in enumerate(starts):
+            if lines[i].strip().split(" ")[0] != mode:
+                continue
+            end = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+            return "\n".join(lines[i:end])
+        self.fail("_TOP_LEVEL_USAGE has no block for mode " + repr(mode))
+
+    def test_every_flag_the_usage_advertises_is_accepted_by_that_mode(self):
+        import re
+        checked = 0
+        for mode in self._MODES:
+            helptext = self._mode_help(mode)
+            for flag in sorted(set(re.findall(r"--[a-z][a-z0-9-]+",
+                                              self._usage_block(mode)))):
+                if flag == "--help":
+                    continue
+                checked += 1
+                self.assertIn(
+                    flag, helptext,
+                    "`flexfactor --help` tells the user to run `" + mode + " "
+                    + flag + "`, but that mode's parser does not accept it - "
+                    "the invocation dies with argparse exit 2")
+        self.assertGreater(checked, 0, "the flag sweep found nothing to check")
+
+    def test_the_usage_does_not_call_an_applying_mode_report_only(self):
+        # What an UNFLAGGED `flexfactor audit --program X` really parses to.
+        captured = {}
+        real = ff.run_audit
+
+        def _capture(a):
+            captured["args"] = a
+            return 0
+
+        ff.run_audit = _capture
+        try:
+            ff.main(["audit", "--program", "x"])
+        finally:
+            ff.run_audit = real
+        args = captured["args"]
+        self.assertTrue(args.apply, "audit applies by default")
+        self.assertTrue(args.push, "audit pushes by default")
+        self.assertTrue(args.merge, "audit merges by default")
+        for mode in ("audit", "prodready"):
+            block = self._usage_block(mode).lower()
+            self.assertNotIn(
+                "report-only by default", block,
+                "the " + mode + " usage line claims a safety property (looks "
+                "only, changes nothing) that the parsed defaults contradict")
+
+
+class ScoutApplyBannerNamesNoBranchTests(unittest.TestCase):
+    """The `--legacy-inline-apply` confirmation banner promised the commits
+    land "onto a '<branch_prefix>*' branch". Nothing in the codebase runs
+    `git checkout -b`: `apply_integration` sets `branch = prev_branch`, the
+    branch the repo is ALREADY on. The banner therefore described a disposable
+    safety buffer the run does not have - the same defect that was fixed on the
+    audit `--apply` banner and survived here."""
+
+    def test_no_code_path_creates_a_branch(self):
+        import re
+        for name in ("flexfactor.py", "flexfactor_scout_contract.py"):
+            with open(os.path.join(_HERE, name), encoding="utf-8") as fh:
+                src = fh.read()
+            hits = re.findall(r'"checkout"\s*,\s*"-[bB]"', src)
+            self.assertEqual(hits, [], name + " creates a branch: " + repr(hits))
+
+    def test_the_banner_does_not_promise_a_branch(self):
+        import contextlib
+        import io as _io
+        import types
+        args = types.SimpleNamespace(
+            dry_run=False, assume_yes=False, apply_tier="adopt",
+            legacy_inline_apply=True, branch_prefix="flexfactor/adopt-",
+            push=True, merge=True)
+        real_q = ff._qualifies_for_apply
+        ff._qualifies_for_apply = lambda e, tier: True
+        buf = _io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                with contextlib.redirect_stderr(_io.StringIO()):
+                    ff._confirm_scout_apply(args, [{"x": 1}], None)
+        finally:
+            ff._qualifies_for_apply = real_q
+        out = buf.getvalue()
+        self.assertIn("--legacy-inline-apply", out)
+        self.assertNotIn("flexfactor/adopt-", out,
+                         "the banner names a branch nothing creates")
+        self.assertNotIn("' branch", out,
+                         "the banner still promises a '<prefix>*' branch: " + repr(out))
+        self.assertIn("already on", out,
+                      "the banner must say where the commits actually go")
+
+
+class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
+    """`apply_integration`'s git tail claimed a merge it never performed.
+
+    LIVE DEFECT, fixed 2026-08-19 and pinned by the first test below:
+    `branch IS prev_branch` (no apply branch exists - nothing runs
+    `checkout -b`), so `git merge --no-ff <branch>` while already on it prints
+    "Already up to date." and exits 0. The result line therefore gained
+    "; merged into main" on every `--merge` run while nothing was merged.
+    `_commit_and_sync` guards the identical case with `prev_branch != branch`
+    and its own comment calls the alternative "faked".
+
+    A second hole was fixed in the same pass but is NOT claimed as proven here:
+    the follow-up `git push origin <prev_branch>` had its return code
+    DISCARDED. It lives inside the `prev_branch != branch` arm, which is
+    unreachable in the current topology, so it is defence-in-depth against the
+    branch coming back - not a defect any run can hit today, and no test here
+    exercises it.
+
+    The second test pins what IS reachable: against a REAL local bare remote
+    whose `main` is protected by a pre-receive hook, a refused push must be
+    reported and must never read as pushed."""
+
+    class _Opts:
+        dry_run = False
+        allow_dirty = True
+        verify = False
+        push = True
+        merge = True
+        branch_prefix = "flexfactor/adopt-"
+
+    def _repo_with_remote(self, tmp, protect):
+        import subprocess
+        remote = os.path.join(tmp, "remote.git")
+        proj = os.path.join(tmp, "proj")
+        subprocess.run(["git", "init", "--bare", "-q", "-b", "main", remote], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", proj], check=True)
+        for kv in (["user.email", "t@example.com"], ["user.name", "T"]):
+            subprocess.run(["git", "-C", proj, "config"] + kv, check=True)
+        with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"name":"x","version":"1.0.0"}')
+        subprocess.run(["git", "-C", proj, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", proj, "commit", "-qm", "seed"], check=True)
+        subprocess.run(["git", "-C", proj, "remote", "add", "origin", remote], check=True)
+        subprocess.run(["git", "-C", proj, "push", "-q", "origin", "main"], check=True)
+        # The hook goes on AFTER seeding, or the seed push is refused too.
+        if protect:
+            hook = os.path.join(remote, "hooks", "pre-receive")
+            with open(hook, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("#!/bin/sh\nwhile read o n r; do\n"
+                         '  if [ "$r" = "refs/heads/main" ]; then\n'
+                         '    echo "remote: error: GH006: Protected branch update failed" >&2\n'
+                         "    exit 1\n  fi\ndone\nexit 0\n")
+            os.chmod(hook, 0o755)
+        return proj, remote
+
+    def _apply(self, proj):
+        patch = {"files": [{"path": "added.js", "contents": "export const a = 1;\n"}],
+                 "packages": [], "commit_message": "Integrate demo"}
+        return ff.apply_integration(proj, "demo", patch, self._Opts)
+
+    def test_a_self_merge_is_never_reported_as_a_merge(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, _remote = self._repo_with_remote(tmp, protect=False)
+            res = self._apply(proj)
+            self.assertTrue(res.status.startswith("applied"),
+                            "expected an applied status, got " + res.status
+                            + ": " + str(res.detail))
+            self.assertNotIn("merged into", res.detail,
+                             "claimed a merge that never happened: " + repr(res.detail))
+            self.assertIn("no merge step", res.detail)
+
+    def test_a_rejected_push_is_reported_not_swallowed(self):
+        import tempfile
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, remote = self._repo_with_remote(tmp, protect=True)
+            before = subprocess.run(["git", "-C", remote, "rev-parse", "main"],
+                                    capture_output=True, text=True).stdout.strip()
+            res = self._apply(proj)
+            self.assertIn("push failed", res.detail,
+                          "a rejected push vanished from the result: " + repr(res.detail))
+            self.assertNotEqual(res.status, "applied-pushed",
+                                "a refused push must not read as pushed")
+            after = subprocess.run(["git", "-C", remote, "rev-parse", "main"],
+                                   capture_output=True, text=True).stdout.strip()
+            self.assertEqual(after, before, "the protected trunk must not have moved")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
