@@ -6,7 +6,8 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$script = "C:\Users\firer\flexfactor\flexfactor.py"
+# Directed entry: same orchestration rule as Factory Deck / Purpose Foundry.
+$script = "C:\Users\firer\flexfactor\flexfactor_run.py"
 $productionRr = if (-not [string]::IsNullOrWhiteSpace($env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL)) {
     $env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL.TrimEnd("/")
 } else {
@@ -23,7 +24,7 @@ if ($args.Count -ge 1 -and $args[0]) {
     $program = $args[0]
     Write-Host "Program (dropped): $program" -ForegroundColor Green
 } else {
-    $program = (Read-Host "Program to scout (folder, .lnk, URL, or description)").Trim('"')
+    $program = (Read-Host "Program to scout (folder, .lnk, URL, or description)").Trim('\"')
 }
 if ([string]::IsNullOrWhiteSpace($program)) {
     Write-Host "No program given." -ForegroundColor Red
@@ -95,7 +96,6 @@ if ($provider -eq "ollama") {
 }
 
 function Test-RepoRewardsLocal {
-    # Contract probe: /api/version (not /api/health - not required by RR).
     try {
         $null = Invoke-WebRequest -Uri "http://localhost:3000/api/version" -UseBasicParsing -TimeoutSec 2
         return $true
@@ -104,7 +104,6 @@ function Test-RepoRewardsLocal {
     }
 }
 
-# Repo Rewards URL: explicit env wins; else local when up; remote only with opt-in.
 $rrUrl = $env:FLEXFACTOR_REPO_REWARDS_URL
 $remoteArgs = @()
 if ([string]::IsNullOrWhiteSpace($rrUrl)) {
