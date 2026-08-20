@@ -10537,6 +10537,65 @@ class VacuousGateTests(unittest.TestCase):
         self.assertIn("; pushed", status)
         self.assertNotIn("REFUSED", status)
 
+    def test_a_rejected_protected_trunk_still_lands_through_a_PR(self):
+        """A protected main REJECTS a direct push. Before 2026-08-19 that ended
+        the story: verified work sat local and unmerged with no PR and nothing
+        asking anyone to finish it. The owner's rule is that work reaches
+        production, so the rejection must fall back to a PR with auto-merge."""
+        import types
+        calls = []
+        gh_calls = []
+
+        def fake_git(argv, project_dir, *a, **k):
+            calls.append(list(argv))
+            rc = 0
+            stdout = ""
+            if argv[:1] == ["diff"]:
+                rc = 1  # 1 = there ARE staged changes
+            elif argv[:2] == ["rev-parse", "HEAD"]:
+                stdout = "abcdef1234567890\n"
+            elif argv[:1] == ["push"] and argv[1:2] == ["-u"]:
+                # The protected trunk refuses the direct push.
+                rc = 1
+                return types.SimpleNamespace(
+                    returncode=rc, stdout="",
+                    stderr="remote: error: GH006: Protected branch update failed")
+            return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+
+        args = types.SimpleNamespace(push=True, merge=True)
+        orig = {}
+        stubs = {"_git": fake_git,
+                 "_git_has_remote": lambda pd: True,
+                 "_git_current_branch": lambda pd: "main",
+                 "_full_gate": lambda pd, st: (True, "log"),
+                 "_gh_pr_automerge": lambda pd, br, base: (
+                     gh_calls.append((br, base)) or
+                     f"PR opened with auto-merge - lands on {base} when checks pass")}
+        for name, fn in stubs.items():
+            orig[name] = getattr(ff, name)
+            setattr(ff, name, fn)
+        try:
+            status = ff._commit_and_sync("/proj", "main", "main", args, "cycle 1", {})
+        finally:
+            for name, o in orig.items():
+                setattr(ff, name, o)
+
+        # The landing branch really was published, from HEAD, without --force.
+        landing = [c for c in calls
+                   if c[:1] == ["push"] and any("refs/heads/flexfactor/land-" in p
+                                                for p in c)]
+        self.assertEqual(len(landing), 1,
+                         f"a rejected trunk push must publish a landing branch: {calls}")
+        self.assertEqual(landing[0],
+                         ["push", "origin", "HEAD:refs/heads/flexfactor/land-abcdef12"])
+        self.assertFalse(any("--force" in p or "--force-with-lease" in p
+                             for c in calls for p in c),
+                         "the fallback must never force-push")
+        # And a PR onto the trunk was actually requested.
+        self.assertEqual(gh_calls, [("flexfactor/land-abcdef12", "main")])
+        self.assertIn("rejected", status)
+        self.assertIn("auto-merge", status)
+
     def test_green_build_but_red_project_suite_is_committed_locally_not_published(self):
         """FCC built successfully while its own ESM mechanics test crashed.
         A build-only publication gate pushed that red tree to main."""

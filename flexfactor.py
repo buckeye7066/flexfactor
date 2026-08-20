@@ -11540,7 +11540,41 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             # diverges - a --force-with-lease here could discard commits pushed from
             # another machine. A fast-forward push or an honest rejection, nothing else.
             pr = _git(["push", "-u", "origin", branch], project_dir)
-            status += "; pushed" if pr.returncode == 0 else f"; branch push failed: {_tail(pr.stderr, 2)}"
+            if pr.returncode == 0:
+                status += "; pushed"
+            else:
+                # A PROTECTED trunk (required checks / enforce_admins - any
+                # production main) REJECTS a direct push. Until 2026-08-19 that
+                # ended the story right here: verified, cross-model-reviewed
+                # work sat committed LOCALLY, unmerged, with no PR and nothing
+                # asking a human to finish it, while the status line said only
+                # "branch push failed". The merge block further down already
+                # had the correct recovery (_gh_pr_automerge) but it is dead in
+                # this topology - prev_branch == branch, so it never runs.
+                #
+                # Owner rule: all work must be pushed and MERGED into
+                # production. So land the same commits through the repo's own
+                # gate instead of around it: publish them on a side branch and
+                # open a PR with auto-merge onto the trunk. Never a force-push,
+                # and the trunk still decides via its own required checks.
+                #
+                # No `_git_has_remote` re-check here on purpose: this whole
+                # block already sits under `args.push and _git_has_remote(...)`,
+                # so a second test could never fail and would only read like a
+                # guard that does something.
+                status += f"; direct push to {branch} rejected: {_tail(pr.stderr, 2)}"
+                head = (_git(["rev-parse", "HEAD"], project_dir).stdout or "").strip()
+                if not head:
+                    status += ("; could not resolve HEAD, so no landing branch was "
+                               f"published - the work is committed locally on {branch}")
+                else:
+                    land = f"flexfactor/land-{head[:8]}"
+                    lp = _git(["push", "origin", f"HEAD:refs/heads/{land}"], project_dir)
+                    if lp.returncode == 0:
+                        status += f"; {_gh_pr_automerge(project_dir, land, branch)}"
+                    else:
+                        status += (f"; could not publish {land}: {_tail(lp.stderr, 2)}"
+                                   f" - the work is committed locally on {branch}")
         else:
             status += ("; PUSH REFUSED - the final verification gate "
                        + ("FAILED" if final_ok is False else
@@ -13892,10 +13926,21 @@ def _confirm_audit_apply(args, programs) -> bool:
         return True
     n = len(programs)
     print("\n" + "!" * 70)
-    print(f"  --apply will MODIFY {n} program(s): create a '{args.branch_prefix}*' branch,")
-    print("  write + commit fixes"
-          + (", and PUSH to origin" if getattr(args, "push", False) else " (local commit only, no push)")
-          + (", then MERGE into the current branch" if getattr(args, "merge", False) else "") + ".")
+    # This banner used to promise "create a '<branch_prefix>*' branch" - a branch
+    # that has not existed since sandbox branches were removed (owner order
+    # 2026-08-11). It described a safety buffer the run does not have, which is
+    # worse than saying nothing: the owner was told the work went somewhere
+    # disposable when it goes onto the branch the repo is already on, and
+    # straight to origin from there. Say what actually happens.
+    print(f"  --apply will MODIFY {n} program(s): write + commit fixes directly onto")
+    print("  the branch each repo is already on (no sandbox branch)"
+          + (", and PUSH them to origin - on a trunk that means the work is IN PRODUCTION"
+             if getattr(args, "push", False)
+             else " (local commit only, no push)")
+          + ".")
+    if getattr(args, "push", False):
+        print("  If the trunk is protected, the same commits are landed through a PR")
+        print("  with auto-merge instead. Nothing is ever force-pushed.")
     print("!" * 70)
     if not sys.stdin or not sys.stdin.isatty():
         print("Non-interactive session (no TTY): proceeding with APPLY. FlexFactor "

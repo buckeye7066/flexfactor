@@ -1116,13 +1116,33 @@ still the guard.
   stop); redirected -> `[progress]` heartbeat lines every 30s. Best-effort
   (never breaks an audit), ASCII-only, one drawing meter per process
   (parallel runs: extras are no-ops). Started/stopped in `audit_one_program`.
-- SHIP TO MAIN (owner order 2026-08-10, extended to audit 2026-08-11): push+
-  merge default ON for BOTH audit --apply and prodready — verified results go
-  back to main automatically. Still gated: merge only on a green final build,
-  push `--force-with-lease` for the sandbox branch, protected mains fall back
-  to a PR with auto-merge, conflicts abort cleanly. `--no-push`/`--no-merge`
-  (raw-argv checked) opt out. Every audit/prodready run applies (review-only
-  removed 2026-08-11), so push+merge defaults are live on every run.
+- SHIP TO MAIN (owner order 2026-08-10, extended to audit 2026-08-11, protected-
+  trunk hole closed 2026-08-19): push+merge default ON for BOTH audit --apply and
+  prodready — verified results go back to main automatically. Since sandbox
+  branches were removed, "merge to main" is literally a commit on the branch the
+  repo is already on plus `git push -u origin <branch>`; **nothing is ever
+  force-pushed** (the old `--force-with-lease` note described the deleted sandbox
+  topology, and `test_push_is_never_forced` pins its absence).
+  **This doc claimed "protected mains fall back to a PR with auto-merge" for
+  nine days while that was FALSE on the live path.** The fallback existed only
+  inside the `prev_branch != branch` merge block, which is dead in the current
+  topology — so a protected `main` that rejected the direct push left verified,
+  cross-model-reviewed work committed LOCALLY, unmerged, with no PR and nothing
+  asking anyone to finish it, under the single status fragment "branch push
+  failed". Now the live push path does it: on rejection it publishes the same
+  commits as `flexfactor/land-<sha8>` and calls `_gh_pr_automerge` to open a PR
+  with auto-merge onto the trunk, so the work still reaches production through
+  the repo's own required checks instead of around them.
+  `test_a_rejected_protected_trunk_still_lands_through_a_PR` drives the real
+  `_commit_and_sync` and asserts the landing-branch argv, the PR target and the
+  absence of any force flag — verified to FAIL when the fallback is removed.
+  `--no-push`/`--no-merge` (raw-argv checked) opt out. Every audit/prodready run
+  applies (review-only removed 2026-08-11), so push+merge defaults are live on
+  every run.
+  The `--apply` confirmation banner was corrected in the same pass: it promised
+  to "create a '<branch_prefix>*' branch", a safety buffer that has not existed
+  since 2026-08-11. It now says the fixes are committed onto the branch each repo
+  is already on and pushed to origin — which on a trunk means in production.
 
 ## Gotchas
 - **Launchers must stay ASCII** (PS 5.1 + no-BOM = CP1252; em-dashes break strings).
