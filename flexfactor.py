@@ -2975,6 +2975,14 @@ def _route_unusable_reason(route, model_mode: str) -> str:
         return f"unsupported api '{route.api}'"
     if not route.is_free:
         return "paid (rotation stays free-only)"
+    # NON-CODING free routes (owner 2026-08-20): prompt-guards, TTS, vision-
+    # only, content-safety, etc. land in the catalog as free-tier/light and
+    # were selected for semantic CODE review. Batches completed zero files and
+    # the run fail-closed as a fake "provider outage". Filter them here —
+    # process-local, never written into shared rotation state.
+    unfit = _unfit_for_code_reason(getattr(route, "id", "") or getattr(route, "model", ""))
+    if unfit:
+        return unfit
     if route.auth_env and not os.environ.get(route.auth_env):
         return f"missing {route.auth_env}"
     if route.api == "anthropic" and not _provider_key_present("anthropic"):
@@ -2987,6 +2995,26 @@ def _route_unusable_reason(route, model_mode: str) -> str:
             host = ""
         if host not in ("127.0.0.1", "localhost", "::1"):
             return "model mode 'local' excludes non-local routes"
+    return ""
+
+
+_UNFIT_CODE_PATTERNS = (
+    r"prompt-?guard", r"llama-guard", r"nemoguard", r"moderation", r"rerank",
+    r"content-?safety", r"topic-control", r"safety-guard",
+    r"orpheus", r"\btts\b", r"whisper",
+    r"moondream", r"kosmos", r"deplot", r"vila", r"nvclip", r"fuyu",
+    r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
+    r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
+    r"vision-only", r"synthetic-video", r"ai-synthetic-video",
+)
+
+
+def _unfit_for_code_reason(model_or_route_id: str) -> str:
+    """Why a catalog route cannot do code review/authoring, or '' when it can."""
+    low = str(model_or_route_id or "").lower()
+    for pat in _UNFIT_CODE_PATTERNS:
+        if re.search(pat, low):
+            return f"non-coding model ({pat})"
     return ""
 
 
@@ -4677,6 +4705,28 @@ def _is_git_repo(path: str) -> bool:
 def _git_has_remote(path: str) -> bool:
     r = _git(["remote"], path)
     return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def _github_slug(path: str) -> "str | None":
+    """`owner/repo` for this checkout's origin, or None when it isn't GitHub.
+
+    Used only to scope `gh` calls during pre-work cleanup. Returning None is a
+    REPORTED skip reason in flexfactor_autoclean, never a silent "repo is
+    clean" - a program with no GitHub remote genuinely has no PRs to land, and
+    the cleanup report says exactly that.
+    """
+    r = _git(["remote", "get-url", "origin"], path)
+    if r.returncode != 0:
+        return None
+    url = (r.stdout or "").strip()
+    if not url or "github.com" not in url:
+        return None
+    # git@github.com:owner/repo.git  |  https://github.com/owner/repo(.git)
+    tail = url.split("github.com", 1)[1].lstrip(":/")
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    parts = [p for p in tail.split("/") if p]
+    return "/".join(parts[:2]) if len(parts) >= 2 else None
 
 
 def _git_current_branch(path: str) -> str:
@@ -9244,6 +9294,25 @@ _TEST_FILE_RE = re.compile(
 _SOURCE_EXTENSIONS = (".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".py")
 
 
+def _directed_work_theme_block(theme: str, issue: str) -> str:
+    """Stamp one shared theme+issue onto every model call for this program.
+
+    Owner order 2026-08-20: concurrent/rotated free backends must not wander.
+    Every review/fix prompt carries the same open issue so prompt-guards,
+    vision models, and unrelated polish cannot hijack the run.
+    """
+    theme_s = " ".join(str(theme or "fulfill the program purpose").split())[:400]
+    issue_s = " ".join(str(issue or "resolve the current verified failure").split())[:500]
+    return (
+        "DIRECTED WORK THEME (shared across every model on this run):\n"
+        f"Theme: {theme_s}\n"
+        f"Open issue (attack this — do not wander): {issue_s}\n"
+        "Never treat node_modules/, dist/, build/, .next/, out/, or coverage/ "
+        "as the fix target — edit the source that produced them.\n"
+        "Every answer must advance THAT issue. Ignore unrelated polish.\n"
+    )
+
+
 def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
     """Resolve one path printed by a test runner back into this repository."""
     raw = str(raw_path or "").strip().replace("\\", "/")
@@ -9264,6 +9333,14 @@ def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
     # call - the widened relative branch above simply routes many more
     # dot-prefixed paths through here, so the latent bug became reachable.
     candidate = _canon_rel(candidate)
+    # GENERATED / VENDORED trees are readable files inside the repo, but they
+    # are never the repair target. Measured 2026-08-20: GrantFlow phase-0
+    # "targeted" dist/assets/*.js and SermonSmith targeted
+    # node_modules/vite/... because Vite/Rollup stack frames matched
+    # _FAILURE_SOURCE_RE and _read_text_and_sha succeeded. Bounded repair then
+    # spent cycles on built assets while the source failure stayed red.
+    if _is_skip_dir_path(candidate):
+        return None
     if _read_text_and_sha(project_dir, candidate) is not None:
         return candidate
 
@@ -9276,9 +9353,18 @@ def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
               if (p := low.find(marker)) >= 0]
     for pos in sorted(starts):
         suffix = _canon_rel(candidate[pos:])
+        if _is_skip_dir_path(suffix):
+            continue
         if _read_text_and_sha(project_dir, suffix) is not None:
             return suffix
     return None
+
+
+def _is_skip_dir_path(rel: str) -> bool:
+    """True when a repo-relative path sits under a generated/vendored skip dir."""
+    parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p and p != "."]
+    skip = {d.lower() for d in _SKIP_DIRS}
+    return any(p.lower() in skip for p in parts)
 
 
 def _test_import_candidates(project_dir: str, test_rel: str) -> list[str]:
@@ -11970,6 +12056,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 print(f"{pfx}No authored purpose contract for '{display_name}' - "
                       "the purpose will be INFERRED from the repository and "
                       "labelled as a guess.")
+        # DIRECTED multi-model focus (owner 2026-08-20): every rotating /
+        # concurrent free backend must attack the SAME theme + open issue.
+        # Without this, pool-first rotation selected prompt-guards / TTS /
+        # vision models that wandered while the publication suite stayed red.
+        # (Baseline status is measured later; phase 0 re-stamps the open issue
+        # when the suite is red — see below.)
+        purpose_blob = (
+            _directed_work_theme_block(
+                theme=f"{display_name}: fulfill the program's authored purpose",
+                issue="close the gap between the program's current state and "
+                      "its authored purpose; then clear proven defects",
+            )
+            + ("\n\n" + purpose_blob if purpose_blob else "")
+        )
         result["purpose_contract"] = (purpose_contract.to_dict()
                                       if purpose_contract is not None else None)
 
@@ -12038,6 +12138,41 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    state) preserves it verbatim as the branch's first commit; otherwise
         #    hard-stop, because `git add -A` below would silently commit owner WIP
         #    as FlexFactor's work.
+        # ============== PRE-WORK REPO CLEANUP (owner order 2026-08-20) ========
+        # The launcher no longer ASKS whether to deal with what is already left
+        # in the repo - it always does, before any new work starts. Commit
+        # pre-existing changes, land every green open PR, account for every
+        # Dependabot alert and open issue, then fast-forward so the new work is
+        # built on the union that just landed.
+        #
+        # This runs BEFORE the dirty-tree gate below on purpose: cleaning is
+        # what makes the tree clean, so gating the cleanup on a clean tree would
+        # be circular. It is also LOUD - the accounting identity in
+        # flexfactor_autoclean (candidates == acted + skipped + failed) means a
+        # cleanup that did nothing says so, with a reason per item.
+        if git and getattr(args, "auto_clean", True):
+            try:
+                import flexfactor_autoclean as _autoclean
+                _slug = _github_slug(project_dir)
+                report(phase="cleaning repo before new work")
+                if checkpoint is not None:
+                    checkpoint.set_phase("cleaning repo before new work")
+                _clean = _autoclean.clean_repo(
+                    project_dir, repo=_slug,
+                    report=lambda m: print(f"{pfx}{m}"))
+                print(f"{pfx}" + _autoclean.format_summary(_clean).replace(
+                    "\n", f"\n{pfx}"))
+                result["autoclean"] = {
+                    "candidates": _clean["candidates"],
+                    "acted_on": _clean["acted_on"],
+                    "skipped": _clean["skipped"],
+                    "failed": _clean["failed"],
+                }
+            except Exception as exc:
+                # A cleanup that BLEW UP must never read as a clean repo.
+                print(f"{pfx}autoclean FAILED: {exc}", file=sys.stderr)
+                result["autoclean"] = {"error": str(exc)}
+
         tree_dirty = git and not _git_tree_clean(project_dir)
         if tree_dirty and not args.allow_dirty:
             print(f"{pfx}error: working tree isn't clean. Commit or stash first, or pass "
@@ -12119,6 +12254,18 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}BLOCKER: the project builds, but its required publication "
                   "suite is RED at baseline. Repairing that exact failure before "
                   "reviewing unrelated files.", file=sys.stderr)
+            # Re-stamp the shared open issue so every later model call attacks
+            # the red publication suite — not unrelated files.
+            purpose_blob = (
+                _directed_work_theme_block(
+                    theme=f"{display_name}: fulfill the program's authored purpose",
+                    issue="repair the red required publication suite first; do "
+                          "not start unrelated review until that suite is green. "
+                          "Never target node_modules/ or dist/ — edit source.",
+                )
+                + "\n\n"
+                + purpose_blob
+            )
         if not stack.get("verification_is_real", True):
             # Say it out loud. _full_gate returns True when it has no commands,
             # which reads as a pass; without this line the run would report a
@@ -15059,6 +15206,17 @@ def main(argv=None) -> int:
                                  "launchers and scripts keep working.")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Apply even if the git working tree isn't clean.")
+        # Repo cleanup runs BEFORE new work and is ON by default (owner order
+        # 2026-08-20). The launcher question that used to gate this is GONE.
+        # --auto-clean is accepted so launchers stay explicit; --no-auto-clean
+        # is the only escape hatch and exists for debugging, not for runs.
+        parser.add_argument("--auto-clean", action="store_true", dest="auto_clean",
+                            default=True,
+                            help="Clean the repo before new work: commit pre-existing "
+                                 "changes, land open PRs, apply Dependabot security "
+                                 "updates, and triage open issues. ON by default.")
+        parser.add_argument("--no-auto-clean", action="store_false", dest="auto_clean",
+                            help="Debug escape hatch: skip the pre-work repo cleanup.")
         parser.add_argument("--no-clone-inspect", action="store_false", dest="clone_inspect",
                             default=True,
                             help="Skip the pre-approval shallow-clone inspection that fills "
@@ -15303,6 +15461,17 @@ def main(argv=None) -> int:
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
                             help="Audit even if the git working tree isn't clean "
                                  "(pre-existing changes get swept into the cycle commits).")
+        # Repo cleanup runs BEFORE new work and is ON by default (owner order
+        # 2026-08-20). The launcher question that used to gate this is GONE.
+        # --auto-clean is accepted so launchers stay explicit; --no-auto-clean
+        # is the only escape hatch and exists for debugging, not for runs.
+        parser.add_argument("--auto-clean", action="store_true", dest="auto_clean",
+                            default=True,
+                            help="Clean the repo before new work: commit pre-existing "
+                                 "changes, land open PRs, apply Dependabot security "
+                                 "updates, and triage open issues. ON by default.")
+        parser.add_argument("--no-auto-clean", action="store_false", dest="auto_clean",
+                            help="Debug escape hatch: skip the pre-work repo cleanup.")
         # NO --dry-run / --report-only here. EVERY RUN IS REAL (owner order
         # 2026-08-11): the flags are absent so argparse refuses the whole
         # invocation (exit 2) before anything runs or spends.

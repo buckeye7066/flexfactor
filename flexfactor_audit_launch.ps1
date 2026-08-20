@@ -121,24 +121,17 @@ if ($econ -match '^(n|no)$') {
 # Merge+push into the current branch are automatic now (CLI defaults ON,
 # owner order 2026-08-11); pass --no-merge/--no-push at the CLI to opt out.
 
-# Dirty tree handling. Sandbox branches AND the snapshot commit were REMOVED
-# from the CLI (owner order 2026-08-11 evening) - audit works directly on the
-# repo's current branch, and passing the deleted --snapshot-dirty flag killed
-# a whole 5-program run at argparse (exit 2, 2026-08-11 22:26). The only
-# continue-anyway option left is --allow-dirty: pre-existing uncommitted
-# changes get committed on the current branch together with FlexFactor's
-# fixes (visible in history, pushed with the rest - nothing is silently
-# lost). Default yes: a walk-away run must not faceplant on the most common
-# real-world repo state.
-$dirtyDefault = "yes"
-$dirty = Read-Host "On a dirty working tree, commit the pre-existing changes along with the fixes and continue instead of stopping? [Y/n] (Enter = $dirtyDefault)"
-if ([string]::IsNullOrWhiteSpace($dirty)) { $dirty = $dirtyDefault }
-if ($dirty -match '^(y|yes)$') {
-    $extraArgs += "--allow-dirty"
-    Write-Host "Dirty trees: pre-existing changes are committed on your current branch together with FlexFactor's fixes; the audit continues." -ForegroundColor DarkGray
-} else {
-    Write-Host "Dirty trees: a program with uncommitted changes will hard-stop (commit or stash it, then rerun)." -ForegroundColor DarkGray
-}
+# Repo cleanup is AUTOMATIC and unconditional (owner order 2026-08-20).
+# There is no question here any more. The old prompt asked whether to continue
+# on a dirty working tree; the owner read it as "take care of whatever is left
+# red in the repo first", answered yes, and the run still refused sermonsmith.
+# So the intent is now the implementation: every run cleans the repo BEFORE it
+# starts new work - pre-existing uncommitted changes, open PRs, Dependabot
+# alerts and open issues - then does the new work, then pushes and MERGES to
+# main. Nothing is left dangling and nothing is silently skipped.
+$extraArgs += "--allow-dirty"
+$extraArgs += "--auto-clean"
+Write-Host "Repo cleanup: automatic. Pre-existing changes, open PRs, Dependabot alerts and open issues are cleared FIRST, then the new work runs, then it is pushed and merged to main." -ForegroundColor DarkGray
 
 # 2+ programs always run at the same time now, no question asked (owner order
 # 2026-08-13: "I want all programs to run at the same time"). Real concurrency -
