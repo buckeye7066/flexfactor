@@ -114,8 +114,7 @@ function Invoke-FlexFactorJob {
     return 1
 }
 
-# flexfactor_run.py installs directed orchestration (coding routes + one open
-# issue + skip-dir failure paths) before main — same rule as Factory Deck.
+# flexfactor_run.py installs directed orchestration (coding routes + one open issue + skip-dir failure paths) before main — same rule as Factory Deck.
 $script = "C:\Users\firer\flexfactor\flexfactor_run.py"
 $selectedRuntimeMode = "local"
 
