@@ -126,18 +126,32 @@ Write-Host " |_|   |_|\___/_/\_\_| \_\__,_|  \__\___/|_|  FlexFactor" -Foregroun
 Write-Host "  It does reps on your code until the grade is swole." -ForegroundColor DarkGray
 Write-Host ""
 
-# Two modes:
-#   refactor - do reps on ONE source file until it meets a goal (the original).
-#   scout    - search Repo Rewards for repos that would benefit a whole program.
+# Four modes. Keep these descriptions matched to what the CLI actually does -
+# a prompt that overstates the mode is how a report-only run gets read as work.
+#   refactor - rewrite/grade reps on ONE file until it meets a numeric threshold.
+#   scout    - Repo Rewards search for ONE program; PROPOSES, never applies here.
+#   audit    - review + fix + publish, up to 10 programs.
+#   prodready- audit plus dependency bootstrap and a readiness scorecard.
 # A dropped file/folder skips straight to that target; otherwise we ask.
 $dropped = if ($args.Count -ge 1) { $args[0] } else { $null }
 
 Write-Host "What do you want to do?" -ForegroundColor Yellow
-Write-Host "  1) refactor  - improve a single source file until it's swole"
-Write-Host "  2) scout     - find Repo Rewards repos that would benefit a program"
-Write-Host "  3) audit     - aggressively find+fix every defect, test every function & button"
-Write-Host "  4) prodready - hand it any program and walk away: detect the toolchains,"
-Write-Host "                 install the deps, fix the defects, score it production ready"
+Write-Host "  1) refactor  - ONE source file + a plain-English goal. Rewrites it, grades the"
+Write-Host "                 result, repeats until it scores your threshold (default 90) or"
+Write-Host "                 5 reps run out. Writes the file in place."
+Write-Host "  2) scout     - ONE program. Searches Repo Rewards for repos that would help it,"
+Write-Host "                 judges each against that program's purpose, and REPORTS what is"
+Write-Host "                 worth adopting. Proposal only - it changes nothing."
+Write-Host "  3) audit     - UP TO 10 programs. Reviews every file against the program's"
+Write-Host "                 purpose, researches competitors, exercises its functions, and"
+Write-Host "                 fixes what it finds - a second model has to agree each fix is"
+Write-Host "                 sound. Commits, and pushes only what builds AND passes the"
+Write-Host "                 project's own test suite. Every run is real; no review mode."
+Write-Host "  4) prodready - UP TO 10 programs, nothing else to answer. Detects the toolchains"
+Write-Host "                 and installs the dependencies first, does everything audit does,"
+Write-Host "                 then scores the result against a production-readiness rubric"
+Write-Host "                 (unproven gates block; they never pass by default). All programs"
+Write-Host "                 run at the same time."
 $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
 
 # Audit/prodready expose the cost/privacy boundary directly. Local is the
