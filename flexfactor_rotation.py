@@ -186,7 +186,10 @@ def catalog_staleness_note(catalog: Optional[Catalog]) -> Optional[str]:
     return (f"route catalog is STALE: {catalog.path} is {hours:.1f}h old "
             f"(limit {CATALOG_MAX_AGE_S / 3600.0:.0f}h), so a route whose quota "
             f"has since died can still be selected. "
-            f"Refresh with: python -m aitime.catalog")
+            f"Refresh with: python -m aitime.catalog  (run it from the "
+            f"AITime checkout -- the bare module name does NOT resolve from "
+            f"another directory, it exits ModuleNotFoundError: No module "
+            f"named 'aitime')")
 
 
 def _rotation_extensions_enabled() -> bool:
@@ -531,7 +534,9 @@ class Rotator:
             raise PinUnavailable(
                 f"pinned target {pin!r} matches no route in the catalog "
                 f"({len(self.catalog.routes)} routes known). Refresh with "
-                f"`python -m aitime.catalog`, or clear the pin.")
+                f"`python -m aitime.catalog` run FROM the AITime checkout "
+                f"(the bare module name does not resolve elsewhere), or "
+                f"clear the pin.")
 
         usable = [r for r in matches if r.enabled
                   and not _cooling(state, r.pool, now)
