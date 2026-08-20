@@ -27,8 +27,11 @@ produces reproducible evidence, and offers deterministic rollback.
    `--adversarial-rounds` (default 2) before rollback.
 5. **Publication gate** — build gate first, then the strongest test suite the
    project exposes; a defined-but-red suite is a hard publication failure.
-6. **Commit and sync** — verified commits are pushed with `--force-with-lease`;
-   protected mains fall back to a PR with auto-merge.
+6. **Commit and sync** — verified commits are pushed with a plain
+   fast-forward `git push`; **nothing is ever force-pushed** (`--force-with-lease`
+   described the deleted sandbox topology and `test_push_is_never_forced` pins
+   its absence). A protected main that rejects the direct push falls back to
+   publishing `flexfactor/land-<sha8>` and opening a PR with auto-merge.
 
 ### Scheduling and Resource Allocation
 
@@ -51,7 +54,7 @@ produces reproducible evidence, and offers deterministic rollback.
 | Budget cap | `--max-cost` hard-stops per-program spend |
 | Egress gate | High-confidence secrets/PII refused before any cloud call |
 | Command policy | Destructive/credentialed/deploy commands refused (rc 126) |
-| Version-aware review | Findings recommending removed APIs are dropped silently |
+| Version-aware review | Findings recommending removed APIs are dropped, and the drop is printed (`[version] <file>: dropped finding ...`) |
 
 ### Scenario Analysis
 
@@ -59,17 +62,17 @@ produces reproducible evidence, and offers deterministic rollback.
   `--fix-severity` and receive up to 12 fix attempts each.
 - **Competitor research** — Phase 1b scrapes corroborated competitors, applies
   the licence gate, and bridges accepted ideas into the fix queue (capped by
-  `--competitor-fixes`, default 3).
+  `--competitor-fixes`, default 5).
 - **Production-readiness rubric** — 13 deterministic gates (no model calls)
   including structured-data validity, dependency pinning, and test-suite presence.
 
 ## Supported Constraints
 
 - `--fix-severity` — minimum severity level that triggers a fix attempt
-- `--max-cost` — maximum USD budget per program (default $50)
+- `--max-cost` — maximum USD budget per program (default $150)
 - `--adversarial-rounds` — re-fix rounds before reject (default 2)
 - `--fix-prefetch` — parallel first-attempt generations (default 3)
-- `--competitor-fixes` — max bridged competitor findings per run (default 3)
+- `--competitor-fixes` — max bridged competitor findings per run (default 5)
 - `--no-bootstrap` — skip dependency installation before build gate
 - `--no-push` / `--no-merge` — opt out of automatic publication
 - `--economy` — use cheaper author tier (claude-sonnet-5) across all modes
