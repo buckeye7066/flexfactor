@@ -427,9 +427,13 @@ if ($dropped -and (Test-Path $dropped)) {
 } else {
     $file = (Read-Host "Path to the source file to improve").Trim('"')
 }
+# NO local Test-Path bail-out (owner order 2026-08-20). A repo-relative path
+# like "backend/crawler-os/contract.js" is the spelling a person actually
+# knows, and it is not relative to whatever directory this launcher started
+# in. flexfactor.py resolves it against the local checkouts and then the
+# owner's GitHub repos, so refusing here would kill the lookup before it runs.
 if (-not (Test-Path $file)) {
-    Write-Host "File not found: $file" -ForegroundColor Red
-    Read-Host "Press Enter to close"; exit 1
+    Write-Host "Not in this folder - checking your local projects and GitHub repos..." -ForegroundColor DarkGray
 }
 
 $goal = Read-Host "What's the goal? (plain English)"

@@ -3705,6 +3705,26 @@ def _load_source_text(file_arg: str) -> tuple[str, str]:
 
 
 def run(args) -> int:
+    # A path the owner typed is usually the REPO-RELATIVE one they can see in
+    # the editor ("backend/crawler-os/contract.js"), not one relative to
+    # whatever directory the launcher happens to start in. Resolve it against
+    # the local checkouts first and then the owner's GitHub repos (owner order
+    # 2026-08-20) instead of dying with "File not found" on a path that exists.
+    if args.file and not os.path.isfile(str(args.file)):
+        try:
+            import flexfactor_locate as _locate
+            _res = _locate.resolve_source_file(
+                args.file, roots=_PROJECT_ROOTS,
+                owner=os.environ.get("FLEXFACTOR_GITHUB_OWNER",
+                                     _locate.DEFAULT_OWNER))
+            print(_locate.format_resolution(args.file, _res))
+            if _res.get("path"):
+                args.file = _res["path"]
+        except Exception as exc:
+            # A failed lookup must never masquerade as "no such file".
+            print(f"warning: repo lookup for {args.file!r} failed: {exc}",
+                  file=sys.stderr)
+
     try:
         resolved_path, original = _load_source_text(args.file)
     except SourceInputError as e:
@@ -4705,6 +4725,34 @@ def _is_git_repo(path: str) -> bool:
 def _git_has_remote(path: str) -> bool:
     r = _git(["remote"], path)
     return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def _persist_baseline_failure(checkpoint, program: str, log_text: str) -> "str | None":
+    """Write the red-baseline evidence next to the run's checkpoint.
+
+    Why: "baseline publication suite remains red" was printed to stderr and
+    then LOST. Three separate investigations of the same SermonSmith stop had
+    no artifact to read, so each one had to re-run the suite by hand to learn
+    what the run had already seen. A verdict the tool refuses to act on must
+    at least be recoverable. Best-effort - never breaks a run.
+    """
+    try:
+        run_dir = getattr(checkpoint, "run_dir", None) or getattr(
+            checkpoint, "path", None)
+        if run_dir and os.path.isfile(str(run_dir)):
+            run_dir = os.path.dirname(str(run_dir))
+        if not run_dir or not os.path.isdir(str(run_dir)):
+            run_dir = os.path.join(RUNS_PATH, "baseline-failures")
+            os.makedirs(run_dir, exist_ok=True)
+        dest = os.path.join(str(run_dir), "baseline-publication-failure.log")
+        with open(dest, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"program: {program}\n")
+            fh.write(f"written: {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+            fh.write("=" * 72 + "\n")
+            fh.write(str(log_text or "(no log captured)"))
+        return dest
+    except Exception:
+        return None
 
 
 def _github_slug(path: str) -> "str | None":
@@ -12376,33 +12424,71 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                           "suite is GREEN; continuing with purpose and whole-repo review.")
             if not repair.get("ok"):
                 attempted = sorted((repair.get("attempted") or {}).keys())
+                failing_log = str(repair.get("log") or baseline_publication_log)
+
+                # RE-VERIFY ONCE, SERIALLY, BEFORE BELIEVING "RED".
+                # Measured 2026-08-20: a 5-program `--parallel 5` run declared
+                # SermonSmith's baseline red at 18:56, and the identical gate on
+                # the identical unchanged tree returned True in 106s when run
+                # alone minutes later (build exit 0, api 416 + web 360 + node 23
+                # all passing). Five concurrent `npm`/vitest gates contend for
+                # the npm cache, temp files and CPU, so a red verdict under fan-
+                # out is not by itself evidence that the repository is broken -
+                # and throwing the program out of the run on that evidence is
+                # what the owner has now hit three times.
+                print(f"{pfx}baseline still red after repair - re-verifying "
+                      "once on its own before deciding (guards against "
+                      "parallel-run contention)...")
+                recheck_ok, recheck_log = _publication_gate(project_dir, stack)
+                if recheck_ok is True:
+                    # Derived from the gate verdict, never asserted: a `None`
+                    # (unrunnable) or falsy result can not become a pass here.
+                    baseline_ok = recheck_ok is True
+                    baseline_publication_ok = recheck_ok is True
+                    baseline_publication_log = recheck_log
+                    repair["ok"] = True
+                    fix_notes.append(
+                        "baseline publication suite passed on a serial re-check "
+                        "after failing under parallel execution; no repository "
+                        "defect was involved")
+                    print(f"{pfx}PHASE 0 complete: the baseline is GREEN on "
+                          "re-check - the earlier red was execution contention, "
+                          "not the repository. Continuing.")
+                else:
+                    failing_log = str(recheck_log or failing_log)
+
+                # PRESERVE THE EVIDENCE. The reason a baseline was called red
+                # was previously printed to stderr and then lost, so three
+                # separate investigations had nothing to read. Write it next to
+                # the checkpoint, and say where it went.
+                if not repair.get("ok"):
+                    log_path = _persist_baseline_failure(
+                        checkpoint, display_name, failing_log)
+                    if log_path:
+                        print(f"{pfx}baseline failure log: {log_path}")
+
+            if not repair.get("ok"):
+                attempted = sorted((repair.get("attempted") or {}).keys())
+                # DO NOT THROW THE PROGRAM OUT (owner order 2026-08-20:
+                # "make it automatically clean the repo first ... then start
+                # the new work"). A baseline this run could not repair is a
+                # reason to withhold PUBLICATION, not a reason to skip the
+                # review the owner asked for. The run continues; every commit
+                # still has to pass the publication gate before it can be
+                # pushed or merged, so a red repository can never ship.
                 stop_reason = (
-                    "baseline publication suite remains red after bounded targeted "
-                    "repair; unrelated review was not started"
+                    "baseline publication suite is red and bounded repair did "
+                    "not fix it; review continued, publication stays blocked"
                 )
-                print(f"{pfx}STOP: {stop_reason}. Targeted: "
+                print(f"{pfx}WARNING: {stop_reason}. Targeted: "
                       f"{', '.join(attempted) or '(no contained source path found)'}.\n"
-                      f"{_tail(str(repair.get('log') or baseline_publication_log), 40)}",
-                      file=sys.stderr)
-                result.update({
-                    "defects": max(1, len(attempted)), "fixed": 0,
-                    "baseline_ok": baseline_ok, "suite_status": False,
-                    "converged": False, "stop_reason": stop_reason,
-                    "manual_review": attempted,
-                    "fix_notes": list(fix_notes),
-                    "providers": [f"{n}:{p.model}" for n, p in providers],
-                    "usd": round(meter.usd, 4),
-                    "blocked_publication_baseline": True,
-                })
+                      f"{_tail(failing_log, 40)}", file=sys.stderr)
+                result["blocked_publication_baseline"] = True
+                result["baseline_repair_attempted"] = attempted
+                fix_notes.append(stop_reason)
                 if checkpoint is not None:
                     with contextlib.suppress(Exception):
-                        checkpoint.finish(
-                            status="interrupted", defects_found=max(1, len(attempted)),
-                            defects_fixed=0, stop_reason=stop_reason)
-                report(phase="stopped - red baseline", done=True,
-                       defects=max(1, len(attempted)), fixed=0,
-                       errors=max(1, len(attempted)), cost=round(meter.usd, 4))
-                return result
+                        checkpoint.set_phase("red baseline - reviewing anyway")
         # ================= END PHASE 0 ========================================
 
         # ================= PHASE 1: PURPOSE FIRST (owner order 2026-08-11) ====

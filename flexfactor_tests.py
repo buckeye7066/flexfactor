@@ -14421,7 +14421,57 @@ class RedPublicationBaselineRepairTests(unittest.TestCase):
         src = inspect.getsource(ff.audit_one_program)
         self.assertIn("_publication_gate_after_build", src)
         self.assertIn("_repair_publication_failure", src)
-        self.assertIn("unrelated review was not started", src)
+
+    def test_an_unrepaired_red_baseline_no_longer_throws_the_program_out(self):
+        """Owner order 2026-08-20, after SermonSmith was rejected three times.
+
+        A red baseline withholds PUBLICATION; it is not a reason to skip the
+        review the owner asked for. The old contract ("unrelated review was not
+        started") is deliberately gone.
+        """
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertNotIn("unrelated review was not started", src)
+        self.assertIn("review continued, publication stays blocked", src)
+        self.assertIn("blocked_publication_baseline", src)
+
+    def test_a_red_baseline_is_re_verified_serially_before_being_believed(self):
+        """Measured: a --parallel 5 run called SermonSmith red while the same
+        gate on the same unchanged tree returned True in 106s run alone."""
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("_publication_gate(project_dir, stack)", src)
+        self.assertIn("contention", src)
+
+    def test_the_red_baseline_evidence_is_persisted_not_only_printed(self):
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("_persist_baseline_failure", src)
+
+    def test_persist_baseline_failure_actually_writes_the_log(self):
+        """Behavioral, not a grep: three investigations of the same stop had no
+        artifact to read because the reason was only ever printed."""
+        import tempfile as _tf
+
+        class FakeCheckpoint:
+            def __init__(self, d):
+                self.run_dir = d
+
+        d = _tf.mkdtemp()
+        dest = ff._persist_baseline_failure(
+            FakeCheckpoint(d), "SermonSmith", "vitest: 3 failed\nnpm ERR! code 1")
+        self.assertIsNotNone(dest)
+        self.assertTrue(os.path.isfile(dest))
+        with open(dest, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("SermonSmith", body)
+        self.assertIn("npm ERR! code 1", body)
+
+    def test_persisting_never_raises_when_the_run_dir_is_unusable(self):
+        """Best-effort: evidence capture must never be able to kill a run."""
+        class Broken:
+            @property
+            def run_dir(self):
+                raise RuntimeError("no run dir")
+
+        self.assertIsNone(ff._persist_baseline_failure(Broken(), "X", "log"))
 
 
 class WindowsConsoleUtf8RegressionTests(unittest.TestCase):
