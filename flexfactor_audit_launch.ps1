@@ -10,7 +10,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-$script = "C:\Users\firer\flexfactor\flexfactor.py"
+# Directed entry: unfit-route filter + theme stamp + skip-dir (same rule as Factory Deck).
+$script = "C:\Users\firer\flexfactor\flexfactor_run.py"
 
 Write-Host ""
 Write-Host "  [##]  FlexFactor Audit" -ForegroundColor Cyan
@@ -24,7 +25,7 @@ $programs = @()
 $dropped = @($args | Where-Object { $_ })
 if ($dropped.Count -ge 1) {
     # Multiple dropped paths: use them all (capped at 10), no prompting.
-    $programs = @($dropped | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
+    $programs = @($dropped | Select-Object -First 10 | ForEach-Object { $_.Trim('\"') })
     Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
 } else {
     # Ask how many, then read each one. Bad input falls back to 1.
@@ -32,7 +33,7 @@ if ($dropped.Count -ge 1) {
     $count = 1
     if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
     for ($i = 1; $i -le $count; $i++) {
-        $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
+        $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('\"')
         if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
     }
     # Cap at 10 collected entries.
@@ -117,18 +118,7 @@ if ($econ -match '^(n|no)$') {
     Write-Host "Economy mode: Sonnet 5 authors fixes; review stays on the cheap judge tier." -ForegroundColor DarkGray
 }
 
-# Merge+push into the current branch are automatic now (CLI defaults ON,
-# owner order 2026-08-11); pass --no-merge/--no-push at the CLI to opt out.
-
-# Dirty tree handling. Sandbox branches AND the snapshot commit were REMOVED
-# from the CLI (owner order 2026-08-11 evening) - audit works directly on the
-# repo's current branch, and passing the deleted --snapshot-dirty flag killed
-# a whole 5-program run at argparse (exit 2, 2026-08-11 22:26). The only
-# continue-anyway option left is --allow-dirty: pre-existing uncommitted
-# changes get committed on the current branch together with FlexFactor's
-# fixes (visible in history, pushed with the rest - nothing is silently
-# lost). Default yes: a walk-away run must not faceplant on the most common
-# real-world repo state.
+# Dirty tree handling.
 $dirtyDefault = "yes"
 $dirty = Read-Host "On a dirty working tree, commit the pre-existing changes along with the fixes and continue instead of stopping? [Y/n] (Enter = $dirtyDefault)"
 if ([string]::IsNullOrWhiteSpace($dirty)) { $dirty = $dirtyDefault }
@@ -139,22 +129,18 @@ if ($dirty -match '^(y|yes)$') {
     Write-Host "Dirty trees: a program with uncommitted changes will hard-stop (commit or stash it, then rerun)." -ForegroundColor DarkGray
 }
 
-# 2+ programs always run at the same time now, no question asked (owner order
-# 2026-08-13: "I want all programs to run at the same time"). Real concurrency -
-# run_audit() fans these out onto a ThreadPoolExecutor of this width.
+# 2+ programs always run at the same time now.
 if ($programs.Count -ge 2) {
     $extraArgs += "--parallel"
     $extraArgs += "$($programs.Count)"
     Write-Host "Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
 }
 
-# Build a repeatable --program list, one flag per program.
 $programArgs = @()
 foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
 $providerArgs = @('--provider', $primary)
 
 Write-Host ""
-# audit auto-detects keys; when both are set it cross-checks with both models.
 python $script audit @providerArgs @programArgs @extraArgs
 Write-Host ""
 Read-Host "Done. Press Enter to close"
