@@ -3241,6 +3241,9 @@ _UNFIT_CODE_PATTERNS = (
     # omni is audio. Filtering them is what stops a code review being handed to
     # an image model — the same class the existing patterns above address.
     r"robotics-er", r"computer-use", r"nano-banana", r"omni-flash",
+    # Catalog variants suffixed `:batch` are asynchronous Batch-API products.
+    # Sending them through the synchronous review client returns a permanent 404.
+    r":batch$",
 )
 
 

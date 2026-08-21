@@ -26,6 +26,8 @@ _UNFIT_CODE_PATTERNS = (
     r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
     r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
     r"vision-only", r"synthetic-video", r"ai-synthetic-video",
+    r"deep-research", r"antigravity", r"robotics-er", r"computer-use",
+    r"nano-banana", r"omni-flash", r":batch$",
 )
 
 _DEFAULT_SKIP_DIRS = {
@@ -69,8 +71,13 @@ def install(module_globals: dict) -> None:
     """Install directed helpers into a flexfactor module globals dict."""
     skip_dirs = module_globals.get("_SKIP_DIRS", _DEFAULT_SKIP_DIRS)
 
-    module_globals["_UNFIT_CODE_PATTERNS"] = _UNFIT_CODE_PATTERNS
-    module_globals["_unfit_for_code_reason"] = unfit_for_code_reason
+    # flexfactor.py owns the richer live filter. Do not replace it with this
+    # sidecar's fallback list: doing so re-admitted Gemini robotics/research and
+    # batch-only routes whenever launchers used flexfactor_run.py.
+    existing_unfit = module_globals.get("_unfit_for_code_reason")
+    chosen_unfit = existing_unfit if callable(existing_unfit) else unfit_for_code_reason
+    module_globals.setdefault("_UNFIT_CODE_PATTERNS", _UNFIT_CODE_PATTERNS)
+    module_globals["_unfit_for_code_reason"] = chosen_unfit
     module_globals["_directed_work_theme_block"] = directed_work_theme_block
 
     def _is_skip(rel: str) -> bool:
@@ -85,7 +92,7 @@ def install(module_globals: dict) -> None:
             why = prior_route(route, model_mode)
             if why:
                 return why
-            unfit = unfit_for_code_reason(
+            unfit = chosen_unfit(
                 getattr(route, "id", "") or getattr(route, "model", "")
             )
             return unfit
@@ -93,7 +100,7 @@ def install(module_globals: dict) -> None:
         module_globals["_route_unusable_reason"] = _route_unusable_reason
     else:
         module_globals["_route_unusable_reason"] = (
-            lambda route, model_mode: unfit_for_code_reason(
+            lambda route, model_mode: chosen_unfit(
                 getattr(route, "id", "") or getattr(route, "model", "")
             )
         )

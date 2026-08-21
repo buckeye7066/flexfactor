@@ -916,13 +916,27 @@ class RotationDefaultProviderTests(unittest.TestCase):
         400 that cools the shared gemini pool and retires the 12 that DO work."""
         for bad in ("deep-research-max-preview-04-2026", "antigravity-preview-05-2026",
                     "gemini-robotics-er-2-preview", "nano-banana-pro-preview",
-                    "gemini-2.5-computer-use-preview-10-2025"):
+                    "gemini-2.5-computer-use-preview-10-2025",
+                    "anthropic/claude-haiku-4.5:batch"):
             self.assertNotEqual(ff._unfit_for_code_reason(bad), "",
                                 f"{bad} must be refused")
         for good in ("gemini-2.5-flash", "gemini-3.5-flash", "gemma-4-31b-it",
                      "gemini-flash-lite-latest"):
             self.assertEqual(ff._unfit_for_code_reason(good), "",
                              f"{good} verified working live; must NOT be refused")
+
+    def test_directed_installer_does_not_replace_the_live_route_filter(self):
+        """The real launcher installs the sidecar before every audit."""
+        import flexfactor_directed as directed
+        sentinel = lambda value: "live-filter" if value == "sentinel" else ""
+        namespace = {"_unfit_for_code_reason": sentinel,
+                     "_route_unusable_reason": lambda route, mode: ""}
+        directed.install(namespace)
+        self.assertIs(namespace["_unfit_for_code_reason"], sentinel)
+        self.assertEqual(namespace["_unfit_for_code_reason"]("sentinel"),
+                         "live-filter")
+        route = type("Route", (), {"id": "anthropic/model:batch", "model": ""})()
+        self.assertNotEqual(namespace["_route_unusable_reason"](route, "auto"), "")
 
     def test_all_four_extension_flag_readers_AGREE(self):
         """`FLEXFACTOR_ROTATION_EXTENSIONS` was read in four places with three
