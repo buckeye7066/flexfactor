@@ -331,9 +331,12 @@ if ($mode -eq "3") {
 
     # Every run is REAL (owner order 2026-08-11, stronger form: "I do not want
     # test runs as part of the app's functions. Each run must be for real.").
-    # The CLI no longer has --report-only/--dry-run for audit/prodready, so this
+    # The CLI has no --report-only/--dry-run in ANY mode as of 2026-08-21 (the
+    # last survivor, scout's --dry-run, was removed outright that day), so this
     # launcher no longer offers a report choice either. --apply --yes keeps the
     # invocation unambiguous for the non-TTY confirmation path.
+    # LAUNCHER-DRIFT RULE: both .ps1 launchers must be swept in the SAME commit
+    # as any CLI flag change - a stale flag is argparse exit 2 and a dead run.
     if ($true) {
         $extraArgs += "--apply"
         $extraArgs += "--yes"

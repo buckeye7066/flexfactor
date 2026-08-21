@@ -380,6 +380,107 @@ failed the contained read, and came back as "(no contained source path found)".
 That call is deleted; `_canon_rel` (whose own docstring forbids it, from the
 2026-08-14 file-identity work) already strips whole leading `./` segments.
 
+## The 8-hour zero-work night: a 400 that named its own fix (2026-08-20/21)
+
+FlexFactor ran roughly eight hours across five repos overnight and produced
+**one one-line code change** (`iplay/performance_transfer.py`, 1+/1-). Every
+program ended `PROVIDER-OUTAGE ABORT`. **There was no provider outage.**
+
+Measured, from the runs' own manifests — note the denominators, which the
+reports did not print:
+
+| program | reviewed | candidates | provider recorded | spend |
+|---|---:|---:|---|---:|
+| FutureU | 1 | 57 | `rotation:google/recurrentgemma-2b` | — |
+| Iplay | 9 | 43 | `rotation:groq/compound` | $0.69 |
+| PromoPilot | 2 | 82 | rotation | $1.55 |
+
+Iplay's `stop_reason` carried the answer verbatim:
+`BadRequestError: Error code: 400 - '`max_tokens` must be less than or equal to
+`4096`'`. **The route's output ceiling was 4096 and FlexFactor asks for
+`REVIEW_MAX_TOKENS = 16000`.** Re-probed live 2026-08-21 against the real
+`groq/groq/compound` route: same 400, ceiling now 8192.
+
+Four defects, in the order they compounded:
+
+1. **`_openai_output_ceiling` only knows `gpt-*` ids.** Rotation serves **641**
+   catalog routes from a dozen backends; every non-OpenAI id inherited the
+   16384 default. The static table cannot enumerate the catalog and never will.
+   Fix: `_LEARNED_OUTPUT_CEILINGS` — the provider's own 400 NAMES its ceiling
+   (`_parse_max_output_limit`, four message shapes), so learn it, clamp, and
+   retry once inside `OpenAIProvider.structured`. Learned ceilings only ever
+   move DOWN. Below `MIN_USABLE_OUTPUT_TOKENS` (512) the route cannot answer at
+   all and raises the typed `RouteCapabilityError` instead.
+2. **`flexfactor_rotation._is_retryable` blanket-rejected status 400** with the
+   comment *"a bad request stays bad on every backend"*. For a max_tokens /
+   context-window / unsupported-parameter 400 that is exactly backwards: it is
+   the strongest possible evidence that a DIFFERENT route would work.
+   `_run` therefore re-raised **without giving any of the other 640 routes a
+   turn**. `is_route_capability_error()` now splits the two, so a capability
+   4xx rotates and a malformed request still fails fast (as do 401/403 — a
+   wrong credential is not worth a 641-route tour).
+3. **The circuit breaker lied about the cause.** Three consecutive
+   zero-completion batches printed `provider outage`. The backends were up and
+   answering. A confidently wrong diagnosis is worse than none — it points the
+   owner at provider status pages for eight hours. The message now names what
+   was actually observed, with the reviewed/candidate ratio in it.
+4. **Its rollback could have eaten owner work.** The abort ran
+   `git reset --hard HEAD` + `git clean -fd` on the strength of a comment
+   claiming *"the run began from a required-clean tree"* — false under
+   `--allow-dirty`, which **every** overnight launcher invocation passes. On
+   2026-08-21 that reset happened to FAIL, which is luck, not a guard. It is
+   now gated on `not args.allow_dirty` and says so when it declines.
+
+**The name-pattern blocklist was not enough and could not have been.**
+`_UNFIT_CODE_PATTERNS` (added 2026-08-20 for prompt-guards / TTS / vision)
+filters by NAME. `google/recurrentgemma-2b` and `groq/compound` are text models
+with unremarkable names, so they sailed through and reproduced the identical
+fake-outage. **Gate on measured CAPABILITY, not on a name you thought of.**
+
+### `Files reviewed: 1` — a numerator with no denominator
+
+FutureU's audit report said, in full, *"Files reviewed: 1"*. FutureU has 57
+candidate source files. Nothing in the report, the console, or the manifest
+carried the other 56, so a 98% miss read like a small clean repo. That is the
+same shape as the 6-hour $17.75 run the exit-code-3 rule exists to prevent.
+
+`build_review_ledger()` now enforces the owner's standing identity —
+**`candidates == acted_on + skipped_by_reason + failed`** — with per-reason
+counts (`review_incomplete`, `unreadable`, `oversized`, `skipped_known_clean`,
+`never_attempted`). `review_ledger_lines()` renders it to stderr, the console
+summary, the markdown report and the run manifest, and escalates: `ZERO WORK`
+when nothing was reviewed, `MOSTLY SKIPPED` under 50%, `ACCOUNTING GAP` when
+the ledger itself does not balance (a reconciliation that silently balances
+itself is a check that cannot fail).
+
+**The exit-code hole this closes:** `_audit_exit_code`'s `barren` test keys on
+DEFECTS, and *a repo nobody looked at has no defects to report*. FutureU
+reviewed 1 of 57 and could still have exited 0. `candidates > 0 and
+acted_on == 0` is now its own `EXIT_APPLIED_NOTHING` verdict, checked before
+the apply test and independent of it.
+
+### Verified 2026-08-21
+- 857/857 unit tests OK (was 838 — 19 new in `ZeroWorkOvernightRunTests`).
+- Reverting `_is_retryable` alone reddens the two rotation tests; the fix is
+  load-bearing, not decorative.
+- **Live** against the real `groq/groq/compound`: `max_tokens=16000` → the same
+  400; `_parse_max_output_limit` → 8192; `_is_retryable` → True;
+  `OpenAIProvider.structured(max_tokens=16000)` clamped and returned
+  `{'summary': 'ok'}`.
+
+### What this was NOT (checked, so nobody re-checks)
+- **Not the `--yes` trap.** Every overnight `crash-<pid>.log` records
+  `--apply --yes --allow-dirty --auto-clean`. Flags were correct.
+- **Not launcher drift.** `--report-only`/`--dry-run` appear in both `.ps1`
+  launchers only inside COMMENTS; no invocation passes them.
+- **Not an empty `brain.json`** and not the missing-interpreter `None`/`False`
+  gate.
+- **Not AI Time.** The catalog was fresh (641 routes) and the runs spent real
+  money getting real answers back.
+- The final run's death at 08:19 was a **user-initiated reboot at 08:28**
+  (System event 1074), which is why `status.json` holds live phases instead of
+  the atexit obituary's `DIED ...`.
+
 ## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
 
 `build_audit_providers`' free-first path now tries rotation FIRST: when the

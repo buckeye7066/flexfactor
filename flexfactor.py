@@ -226,14 +226,89 @@ OPENAI_OUTPUT_CEILINGS = {
 }
 
 
-def _openai_output_ceiling(model: str) -> int:
-    """Max output tokens this OpenAI model accepts. Unknown ids fail SMALL."""
+# Ceilings LEARNED at runtime from a provider's own 400, keyed by model id.
+# WHY (live overnight run 2026-08-20/21, the whole reason this exists): rotation
+# now serves 641 catalog routes from a dozen backends, and OPENAI_OUTPUT_CEILINGS
+# only knows `gpt-*` ids. Every other id inherited the 16384 default. Groq's
+# `groq/compound` caps at 4096, so EVERY review call returned
+#   400 `max_tokens` must be less than or equal to `4096`
+# and `flexfactor_rotation._is_retryable` classified 400 as "a bad request stays
+# bad on every backend" and re-raised WITHOUT trying another pool. Every file in
+# every batch came back INCOMPLETE, three consecutive zero-completion batches
+# tripped the provider-outage circuit breaker, the run `git reset --hard`ed and
+# aborted -- 8 hours, 5 repos, ONE one-line fix. The 400 is not a bad request; it
+# is THIS ROUTE's capability, and it names the number. Learn it, clamp, retry.
+_LEARNED_OUTPUT_CEILINGS: dict[str, int] = {}
+_LEARNED_CEILING_LOCK = threading.Lock()
+
+#: Below this, a route cannot emit a usable structured review/fix at all, so
+#: clamping is pointless and the route must be rotated past instead.
+MIN_USABLE_OUTPUT_TOKENS = 512
+
+# Provider 400s that name a per-route output limit. Deliberately several shapes:
+# every backend words it differently and the number is the only part we need.
+_MAX_TOKEN_LIMIT_PATTERNS = (
+    # OpenAI/Groq: "`max_tokens` must be less than or equal to `4096`"
+    r"max_tokens[^0-9]{0,80}?less than or equal to[^0-9]{0,10}(\d{2,7})",
+    # OpenAI legacy: "max_tokens is too large: 16384. This model supports at most 4096"
+    r"supports at most[^0-9]{0,10}(\d{2,7})",
+    # Generic: "max_tokens must be <= 4096" / "max_tokens <= 4096"
+    r"max_tokens[^0-9]{0,40}<=\s*(\d{2,7})",
+    # Together/Fireworks style: "max_new_tokens must be at most 4096"
+    r"max_(?:new_)?tokens[^0-9]{0,40}at most[^0-9]{0,10}(\d{2,7})",
+)
+
+
+class RouteCapabilityError(RuntimeError):
+    """This ROUTE cannot serve this call (its output ceiling is too small) --
+    another route can. Distinct from OutputBudgetError (the model ran out of
+    room mid-answer) and from a genuine bad request (bad on every backend).
+    Rotation treats it as retryable so the next pool gets a turn."""
+
+
+def _parse_max_output_limit(message: str) -> int | None:
+    """Extract the output-token ceiling a provider 400 just told us about.
+
+    Returns None when the message is some other 400 -- those really are bad on
+    every backend and must keep failing fast.
+    """
+    blob = str(message or "").lower()
+    for pat in _MAX_TOKEN_LIMIT_PATTERNS:
+        m = re.search(pat, blob)
+        if m:
+            with contextlib.suppress(ValueError):
+                value = int(m.group(1))
+                if 0 < value <= 1_000_000:
+                    return value
+    return None
+
+
+def _learn_output_ceiling(model: str, limit: int) -> None:
+    """Remember a ceiling a provider stated, so the NEXT call clamps up front."""
     name = str(model or "").strip().lower()
+    if not name or limit <= 0:
+        return
+    with _LEARNED_CEILING_LOCK:
+        prior = _LEARNED_OUTPUT_CEILINGS.get(name)
+        if prior is None or limit < prior:
+            _LEARNED_OUTPUT_CEILINGS[name] = limit
+
+
+def _openai_output_ceiling(model: str) -> int:
+    """Max output tokens this OpenAI model accepts. Unknown ids fail SMALL.
+
+    A ceiling LEARNED from the provider's own 400 always wins over the static
+    table: the provider is the authority on its own limit, and the table cannot
+    enumerate 641 rotation routes.
+    """
+    name = str(model or "").strip().lower()
+    learned = _LEARNED_OUTPUT_CEILINGS.get(name)
     best = ""
     for known in OPENAI_OUTPUT_CEILINGS:
         if name.startswith(known) and len(known) > len(best):
             best = known
-    return OPENAI_OUTPUT_CEILINGS.get(best, OPENAI_OUTPUT_CEILING_DEFAULT)
+    static = OPENAI_OUTPUT_CEILINGS.get(best, OPENAI_OUTPUT_CEILING_DEFAULT)
+    return min(static, learned) if learned else static
 
 
 def _price_for(model: str) -> tuple[float, float]:
@@ -2249,19 +2324,43 @@ class OpenAIProvider:
         # 16384, because over-requesting is a hard API rejection while
         # under-requesting only costs one shrink-and-retry.
         out_cap = min(max_tokens, _openai_output_ceiling(use_model))
-        with _budget_guard(self.meter, use_model, len(prompt) + len(system), out_cap):
-            resp = self.client.chat.completions.create(
-                model=use_model,
-                response_format={"type": "json_object"},
-                max_tokens=out_cap,
-                messages=[
-                    {"role": "system",
-                     "content": system + " Respond with JSON only matching this schema: "
-                     + json.dumps(schema)},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            self._meter(resp, use_model)
+        messages = [
+            {"role": "system",
+             "content": system + " Respond with JSON only matching this schema: "
+             + json.dumps(schema)},
+            {"role": "user", "content": prompt},
+        ]
+        # CLAMP-AND-RETRY on a capability 400 (see _LEARNED_OUTPUT_CEILINGS).
+        # Two attempts at most: the provider's 400 NAMES its ceiling, so the
+        # second attempt either fits or the route is genuinely unusable here.
+        for _attempt in range(2):
+            try:
+                with _budget_guard(self.meter, use_model,
+                                   len(prompt) + len(system), out_cap):
+                    resp = self.client.chat.completions.create(
+                        model=use_model,
+                        response_format={"type": "json_object"},
+                        max_tokens=out_cap,
+                        messages=messages,
+                    )
+                    self._meter(resp, use_model)
+                break
+            except (BudgetExceededError, OutputBudgetError, RouteCapabilityError):
+                raise
+            except Exception as ex:  # noqa: BLE001 - re-raised unless it names a ceiling
+                limit = _parse_max_output_limit(str(ex))
+                if limit is None or limit >= out_cap:
+                    raise
+                _learn_output_ceiling(use_model, limit)
+                if limit < MIN_USABLE_OUTPUT_TOKENS:
+                    raise RouteCapabilityError(
+                        f"route '{use_model}' caps output at {limit} token(s), "
+                        f"below the {MIN_USABLE_OUTPUT_TOKENS} needed for a usable "
+                        "structured answer; rotate to another route") from ex
+                out_cap = limit
+        else:  # pragma: no cover - the loop always breaks or raises
+            raise RouteCapabilityError(
+                f"route '{use_model}' rejected every output budget we offered")
         choice = resp.choices[0]
         if choice.finish_reason == "length":
             # Same guard AnthropicProvider.structured has, and it raises the
@@ -4736,7 +4835,9 @@ class BranchStateError(Exception):
 @dataclass
 class ApplyResult:
     repo: str
-    status: str          # applied-pushed | applied | applied-local | verify-failed | infeasible | skipped-dirty | error | dry-run
+    # No "dry-run" status any longer: the mode that produced it was removed
+    # outright 2026-08-21 (owner: "I don't want dry runs, I want work").
+    status: str          # applied-pushed | applied | applied-local | verify-failed | infeasible | skipped-dirty | error
     detail: str
     branch: str | None = None
     files: list[str] | None = None
@@ -5348,8 +5449,8 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
     files = [f for f in (patch.get("files") or [])
              if f.get("path") and f.get("contents") is not None]
     # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
-    # mutation (before dry-run reporting too), so a malformed or option-like
-    # entry can never write a file, raise past the rollback, or reach npm.
+    # mutation, so a malformed or option-like entry can never write a file,
+    # raise past the rollback, or reach npm.
     packages = patch.get("packages") or []
     if not isinstance(packages, list):
         return ApplyResult(repo_name, "refused-unsafe-packages",
@@ -5371,13 +5472,7 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                            "refusing to apply without a trustworthy build-verify gate.")
     git = _is_git_repo(project_dir)
 
-    if opts.dry_run:
-        return ApplyResult(repo_name, "dry-run",
-                           f"Would install {packages or '(none)'} and write {file_list or '(none)'}.",
-                           files=file_list, packages=packages,
-                           commit_message=patch.get("commit_message"),
-                           post_steps=patch.get("post_steps") or [])
-
+    # NO dry-run branch. Reaching apply_integration means the work happens.
     if git and not opts.allow_dirty and not _git_tree_clean(project_dir):
         return ApplyResult(repo_name, "skipped-dirty",
                            "Working tree is not clean - commit/stash changes or pass --allow-dirty.")
@@ -6358,10 +6453,11 @@ def _profile_blob(profile_name: str, profile: dict) -> str:
 def _confirm_scout_apply(args, evaluations: list[dict],
                          project_dir: str | None = None) -> bool:
     """Require an explicit yes before scout mutates a repository. --yes (or a
-    reviewed project policy file with auto_approve) proceeds without prompting;
-    a dry-run never needs it. Returns True to proceed with the apply phase."""
-    if getattr(args, "dry_run", False):
-        return True  # dry-run changes nothing; no confirmation needed
+    reviewed project policy file with auto_approve) proceeds without prompting.
+    Returns True to proceed with the apply phase.
+
+    There is no dry-run escape hatch here any more (removed 2026-08-21).
+    """
     targets = [e for e in evaluations if _qualifies_for_apply(e, args.apply_tier)]
     n = len(targets)
     if n == 0:
@@ -6500,12 +6596,14 @@ def _candidate_approval_summary(evaluation: dict, args, verify_note: str) -> str
 
 def _approve_candidate(args, evaluation: dict, project_dir: str) -> bool:
     """PER-CANDIDATE approval, on top of the blanket _confirm_scout_apply gate.
-    Approval paths, in order: dry-run (changes nothing), --yes (explicit blanket
-    consent for automation), a reviewed project policy file that matches this
-    candidate, or an interactive per-candidate prompt. No TTY and none of the
-    above -> refuse (fail closed)."""
-    if getattr(args, "dry_run", False):
-        return True
+    Approval paths, in order: --yes (explicit blanket consent for automation), a
+    reviewed project policy file that matches this candidate, or an interactive
+    per-candidate prompt. No TTY and none of the above -> refuse (fail closed).
+
+    The dry-run bypass that used to sit at the top of this function is GONE
+    (2026-08-21). It returned True for EVERY candidate, so the mode that
+    advertised itself as "changes nothing" was in fact the one path that
+    approved everything without asking."""
     print("\n" + "-" * 70)
     print(_candidate_approval_summary(evaluation, args,
                                       _verify_disclosure(args, project_dir)))
@@ -6543,8 +6641,7 @@ def _apply_phase(args, profile_name: str, profile: dict,
         return []
 
     print("\n" + "=" * 70)
-    print(f"  Scout apply phase for {project_dir}"
-          + ("  [dry run]" if args.dry_run else ""))
+    print(f"  Scout apply phase for {project_dir}")
     print("  Proposals always; mutation gated by FlexFactor apply approval.")
     print("=" * 70)
 
@@ -12520,6 +12617,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         cycles_run = 0
         errors_total = 0
         all_review_incomplete: set[str] = set()  # unproven files carried across cycles
+        # Run-level accumulator. The per-cycle `unreadable` is declared INSIDE the
+        # cycle loop, so it does not exist at all when the loop never runs (an
+        # infrastructure abort in cycle 1) - exactly the run the file-accounting
+        # ledger exists to describe. Accumulate at run level instead.
+        all_unreadable: set[str] = set()       # contained read REFUSED, across cycles
         converged = False
         dirty_abort = False  # a refused rollback left an unverified candidate on disk
         infrastructure_abort = False  # provider outage: stop expensive downstream phases
@@ -13062,6 +13164,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 file_findings.update(b_findings)
                 flat.extend(b_flat)
                 unreadable |= b_unreadable
+                all_unreadable |= b_unreadable   # run-level, for the file ledger
                 reviewed_clean.update(b_clean)
                 review_incomplete |= b_incomplete
                 completed_review_files.update(b_findings)
@@ -13076,25 +13179,47 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     clean=b_clean,
                     min_severity=args.fix_severity)
                 if failed_review_batches >= 3:
+                    # NAME THE ACTUAL FAILURE. Until 2026-08-21 this said
+                    # "provider outage" unconditionally, and the owner's 8-hour
+                    # overnight run reported an outage that never happened: the
+                    # backends were up and answering, one ROUTE's output ceiling
+                    # was 4096 against a 16000-token ask, and rotation refused to
+                    # try any of the other 640 routes. A wrong diagnosis printed
+                    # confidently is worse than no diagnosis - it sent the owner
+                    # looking at provider status pages for eight hours.
+                    _reviewed_so_far = len(completed_review_files)
                     stop_reason = (
-                        "provider outage: three consecutive semantic review batches "
-                        "completed zero files - stopped fail-closed for resumable retry")
+                        "review made no progress: three consecutive semantic review "
+                        f"batches completed ZERO files ({_reviewed_so_far} of "
+                        f"{total_to_review} candidate file(s) reviewed all run). "
+                        "This is a provider/route fault, NOT evidence the repo is "
+                        "clean - stopped fail-closed for resumable retry")
                     print(f"{pfx}STOP: {stop_reason}", file=sys.stderr)
                     # This is a resumable infrastructure abort, not an invitation
                     # to spend more time on purpose/UI/native-suite phases against
                     # a mostly unreviewed tree.  The checkpoint is already flushed.
                     infrastructure_abort = True
                     fix_notes.append(stop_reason)
-                    if git:
-                        # The run began from a required-clean tree and verified
-                        # batches are already committed. Remove uncommitted
-                        # bootstrap/tool side effects before a resumable retry.
+                    # ONLY reset a tree this run was allowed to own. The old
+                    # comment claimed "the run began from a required-clean tree",
+                    # which is FALSE under --allow-dirty (every overnight launcher
+                    # invocation passes it): `reset --hard` + `clean -fd` there
+                    # would delete the owner's uncommitted work over a route that
+                    # answered 400. It happened to fail on 2026-08-21 - luck, not
+                    # a guard. A dirty run keeps its tree and says so.
+                    if git and not getattr(args, "allow_dirty", False):
+                        # Remove uncommitted bootstrap/tool side effects before a
+                        # resumable retry. Verified batches are already committed.
                         restored = _git(["reset", "--hard", "HEAD"], project_dir)
                         cleaned = _git(["clean", "-fd"], project_dir)
                         if restored.returncode != 0 or cleaned.returncode != 0:
                             dirty_abort = True
                             fix_notes.append(
-                                "provider-outage rollback failed; working tree requires inspection")
+                                "rollback failed; working tree requires inspection")
+                    elif git:
+                        fix_notes.append(
+                            "tree NOT rolled back: --allow-dirty means uncommitted "
+                            "content here may be the owner's, not this run's")
                     cycle_stopped = True
                     break
                 # A file the contained read REFUSED is never clean and never auto-fixed:
@@ -14068,8 +14193,21 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                   "skipped so the next run is smaller.")
 
         # 8. Report.
+        # THE ACCOUNTING IDENTITY, computed before anything can round it off:
+        # candidates == acted_on + skipped_by_reason + failed. Printed to the
+        # console, carried in the audit dict, the report and the run manifest.
+        review_ledger = build_review_ledger(
+            candidates=total_to_review,
+            reviewed=completed_review_files,
+            incomplete=all_review_incomplete,
+            unreadable=all_unreadable,
+            oversized=set(oversized),
+            skipped_clean=set(brain_clean or ()) - set(files))
+        for _line in review_ledger_lines(review_ledger):
+            print(f"{pfx}{_line}", file=sys.stderr)
         audit = {
             "name": display_name, "dir": project_dir, "branch": branch,
+            "review_ledger": review_ledger,
             "files_reviewed": len(completed_review_files), "findings": all_findings,
             "file_findings": file_findings, "applied_files": applied_files,
             "unverified_files": unverified_files, "test_files": test_files,
@@ -14185,6 +14323,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
             review_incomplete=len(all_review_incomplete),
+            # The accounting identity travels with the RESULT, not just the
+            # report, because `_audit_exit_code` is the layer supervisors read.
+            review_ledger=review_ledger,
             unresolved_findings=len(unresolved_findings),
             evidence_run_id=evidence_run_id,
             evidence_paths=evidence_paths,
@@ -14446,6 +14587,77 @@ def run_audit(args) -> int:
 EXIT_APPLIED_NOTHING = 3
 
 
+def build_review_ledger(*, candidates: int, reviewed: set | dict,
+                        incomplete: set, unreadable: set, oversized: set,
+                        skipped_clean: set) -> dict:
+    """Reconcile EVERY candidate file: candidates == acted_on + skipped + failed.
+
+    THE RULE THIS ENFORCES (owner, standing): *a silent no-op reported as
+    success is THE recurring defect; enforce candidates == acted_on +
+    skipped_by_reason + failed; zero-work runs must be LOUD.*
+
+    THE RUN THAT PROVED IT WAS STILL MISSING (2026-08-20/21): FutureU's audit
+    report said, in full, "Files reviewed: 1". FutureU has 57 candidate source
+    files. The other 56 were never attempted at all -- and nothing in the
+    report, the console or the manifest carried a denominator, so "1" read like
+    a small clean repo instead of a 98% miss. `reviewed` alone is not
+    accounting; a number without its denominator and its by-reason remainder is
+    exactly the shape that hid the 6-hour $17.75 run.
+
+    `unaccounted` is the residual. It is a DEFECT in this ledger whenever it is
+    non-zero, and it is reported rather than absorbed, because a reconciliation
+    that silently balances itself is a check that cannot fail.
+    """
+    reviewed_set = set(reviewed)
+    incomplete_set = set(incomplete) - reviewed_set
+    unreadable_set = set(unreadable) - reviewed_set - incomplete_set
+    oversized_set = set(oversized) - reviewed_set - incomplete_set - unreadable_set
+    skipped_set = (set(skipped_clean) - reviewed_set - incomplete_set
+                   - unreadable_set - oversized_set)
+    acted_on = len(reviewed_set)
+    by_reason = {
+        "review_incomplete": len(incomplete_set),
+        "unreadable": len(unreadable_set),
+        "oversized": len(oversized_set),
+        "skipped_known_clean": len(skipped_set),
+    }
+    named = acted_on + sum(by_reason.values())
+    never_attempted = max(0, int(candidates) - named)
+    if never_attempted:
+        by_reason["never_attempted"] = never_attempted
+    accounted = acted_on + sum(by_reason.values())
+    return {
+        "candidates": int(candidates),
+        "acted_on": acted_on,
+        "skipped_by_reason": {k: v for k, v in by_reason.items() if v},
+        "failed": len(incomplete_set) + len(unreadable_set),
+        "accounted": accounted,
+        "unaccounted": int(candidates) - accounted,
+        "balances": accounted == int(candidates),
+    }
+
+
+def review_ledger_lines(ledger: dict | None) -> list[str]:
+    """Render the ledger LOUDLY. A zero-work run must be impossible to skim past."""
+    if not ledger:
+        return []
+    cand = ledger.get("candidates") or 0
+    acted = ledger.get("acted_on") or 0
+    reasons = ledger.get("skipped_by_reason") or {}
+    lines = [f"FILE ACCOUNTING: {cand} candidate(s) = {acted} reviewed"
+             + "".join(f" + {v} {k}" for k, v in sorted(reasons.items()))]
+    if not ledger.get("balances"):
+        lines.append(f"ACCOUNTING GAP: {ledger.get('unaccounted')} candidate file(s) "
+                     "are in NO category - this ledger is wrong, not the repo.")
+    if cand and acted == 0:
+        lines.append(f"ZERO WORK: not one of {cand} candidate file(s) was reviewed. "
+                     "This run did nothing; treat it as a FAILURE, not a clean repo.")
+    elif cand and acted * 2 < cand:
+        lines.append(f"MOSTLY SKIPPED: only {acted} of {cand} candidate file(s) "
+                     f"({acted * 100 // cand}%) were reviewed.")
+    return lines
+
+
 def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     """0 only when every program succeeded AND apply mode actually applied.
 
@@ -14471,6 +14683,25 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
               "verified complete state (review convergence, project suite, or "
               "production-readiness gate is still red).", file=sys.stderr)
         return 1
+    # A run that REVIEWED NOTHING is a failure whether or not apply was asked
+    # for, and regardless of how many defects it "found". This is the hole the
+    # 2026-08-20/21 overnight run fell through: FutureU reviewed 1 of 57 files
+    # and PromoPilot 2 of 82, and nothing above `_audit_exit_code` could see it
+    # because the old barren test keys on DEFECTS, and a repo nobody looked at
+    # has no defects to report. `candidates > 0 and acted_on == 0` is the
+    # accounting identity's own verdict, so it cannot be argued with.
+    unreviewed = []
+    for r in results:
+        ledger = r.get("review_ledger") or {}
+        if (ledger.get("candidates") or 0) > 0 and not ledger.get("acted_on"):
+            unreviewed.append(r)
+    if unreviewed:
+        names = ", ".join(str(r.get("name")) for r in unreviewed)
+        print(f"\nFAILED: {len(unreviewed)} program(s) ({names}) reviewed ZERO of "
+              "their candidate files. Nothing was examined, so nothing was proven "
+              "- exiting non-zero so supervisors and scheduled tasks can see it.",
+              file=sys.stderr)
+        return EXIT_APPLIED_NOTHING
     if not apply_requested:
         return 0
     # "Applied nothing" means no file fixed AND no defects were found to fix.
@@ -14601,7 +14832,13 @@ def _print_audit_summary(a: dict) -> None:
         by_sev[s] = by_sev.get(s, 0) + 1
     order = ["critical", "high", "medium", "low", "info"]
     counts = ", ".join(f"{by_sev[s]} {s}" for s in order if s in by_sev) or "0"
-    print(f"  files reviewed:   {a['files_reviewed']}")
+    _ledger = a.get("review_ledger") or {}
+    print(f"  files reviewed:   {a['files_reviewed']}"
+          + (f" of {_ledger['candidates']} candidate(s)"
+             if _ledger.get("candidates") else ""))
+    # The accounting identity, on the summary the owner actually reads.
+    for _line in review_ledger_lines(_ledger):
+        print(f"  {_line}")
     print(f"  defects found:    {len(a['findings'])}  ({counts})")
     print(f"  files fixed:      {len(a['applied_files'])}"
           + (f"  ({len(a['unverified_files'])} unverified)" if a['unverified_files'] else ""))
@@ -14678,6 +14915,8 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "providers": list(a.get("providers") or []),
         "cycles": a.get("cycles"),
         "files_reviewed": a.get("files_reviewed"),
+        # candidates == acted_on + skipped_by_reason + failed, immutably recorded.
+        "review_ledger": a.get("review_ledger") or {},
         "applied_files": list(a.get("applied_files") or []),
         "unverified_files": list(a.get("unverified_files") or []),
         "unresolved_files": list(a.get("unresolved_files") or []),
@@ -14768,7 +15007,13 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     L = [f"# FlexFactor audit — {a['name']}", "",
          f"- **Project:** `{a['dir']}`",
          f"- **Branch:** `{a['branch']}`" if a["branch"] else "- **Branch:** (not a git repo)",
-         f"- **Files reviewed:** {a['files_reviewed']}",
+         f"- **Files reviewed:** {a['files_reviewed']}"
+         + (f" of {(a.get('review_ledger') or {})['candidates']} candidate(s)"
+            if (a.get("review_ledger") or {}).get("candidates") else ""),
+         # `Files reviewed: 1` with no denominator is how a 98% miss read as a
+         # small clean repo (FutureU, live 2026-08-21). Never print the numerator
+         # without the reconciliation.
+         *[f"- **{ln}**" for ln in review_ledger_lines(a.get("review_ledger"))],
          f"- **Defects found:** {len(a['findings'])}",
          f"- **Files fixed:** {len(a['applied_files'])}"
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
@@ -15454,8 +15699,18 @@ def main(argv=None) -> int:
                                  "scripts, native build, dependency burden, LICENSE-vs-"
                                  "metadata agreement). Inspection is read-only, runs no "
                                  "repo code, and can only demote a candidate.")
-        parser.add_argument("--dry-run", action="store_true", dest="dry_run",
-                            help="Show what would be installed/written without changing anything.")
+        # NO --dry-run. REMOVED OUTRIGHT 2026-08-21 (owner standing order: "I
+        # don't want dry runs, I want work"; a dry-run mode that has crept back
+        # into any repo is a DEFECT to fix, not a feature to respect). An
+        # invocation naming it now FAILS argparse (exit 2) before anything runs,
+        # which is the point - it must never silently proceed, and it must never
+        # be replaced by a confirmation gate (same guardrail, different hat).
+        # Scout's SANCTIONED exemption is different and survives untouched:
+        # `scout` without `--apply` is proposal-only, which produces a real
+        # artifact the owner acts on. `--dry-run` was a SECOND no-op mode
+        # layered on top of `--apply`, and it also auto-approved every candidate
+        # (`_approve_candidate` returned True for it), so the only thing it ever
+        # bypassed was the approval gate itself.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
         _set_egress_mode(args)
@@ -15724,8 +15979,10 @@ def main(argv=None) -> int:
             return False
 
         # Review-only cannot be requested any more, so it is never explicit.
+        # `dry_run` is not set here either: the attribute is GONE portfolio-wide
+        # (2026-08-21), and leaving a False default alive is how the mode crept
+        # back last time.
         args.explicit_report_only = False
-        args.dry_run = False
         # Did the owner NAME a provider, or is "anthropic" just the argparse default?
         args.explicit_provider = _asked("--provider")
         if args.readiness is None:

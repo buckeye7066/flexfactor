@@ -100,8 +100,11 @@ $primary = $provider
 
 # Every run is REAL (owner order 2026-08-11, stronger form: "I do not want test
 # runs as part of the app's functions. Each run must be for real."). The CLI no
-# longer has --report-only/--dry-run for audit/prodready, so the old
+# longer has --report-only/--dry-run in ANY mode as of 2026-08-21 (scout's
+# --dry-run, the last survivor, was removed outright that day), so the old
 # apply-vs-report prompt is gone. Merge+push are CLI defaults, green-build gated.
+# LAUNCHER-DRIFT RULE: both .ps1 launchers must be swept in the SAME commit as
+# any CLI flag change - a stale flag is argparse exit 2 and a dead run.
 $extraArgs += "--apply"
 $extraArgs += "--yes"
 Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow

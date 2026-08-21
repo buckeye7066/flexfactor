@@ -900,6 +900,53 @@ _RETRYABLE_MARKERS = (
     "insufficient", "quota", "credit", "billing", "connection",
 )
 
+# A 400 that describes THIS ROUTE'S CAPABILITY, not a malformed request.
+#
+# WHY THIS EXISTS (live overnight run 2026-08-20/21, 8 hours, 5 repos, ONE
+# one-line fix): `groq/compound` caps output at 4096 tokens. FlexFactor asked
+# for 16000, so every semantic review call came back
+#   400 `max_tokens` must be less than or equal to `4096`
+# `_is_retryable` blanket-rejected status 400 as "a bad request stays bad on
+# every backend", so `_run` re-raised WITHOUT giving any other pool a turn.
+# Every file returned INCOMPLETE, three consecutive zero-completion batches
+# tripped flexfactor's provider-outage circuit breaker, the run rolled the tree
+# back and aborted -- and the owner's log said "provider outage" when the truth
+# was "this one route is too small and we never tried the other 640".
+#
+# These messages are the OPPOSITE of universal: they are the strongest possible
+# evidence that a DIFFERENT route would work. They are retryable.
+_ROUTE_CAPABILITY_MARKERS = (
+    "max_tokens", "max_new_tokens", "maxtokens",
+    "context length", "context_length", "context window", "context_window",
+    "too many tokens", "reduce the length", "input is too long",
+    "string too long", "maximum context",
+    "unsupported model", "model_not_found", "model not found",
+    "does not exist or you do not have access",
+    "does not support", "unsupported parameter", "unsupported value",
+    "response_format", "json_object", "json mode",
+    # OBSERVED LIVE 2026-08-21 on the espectre proof run, both 404s, both
+    # per-route and both previously fatal to the call:
+    #   openai_api/babbage-002 -> "This is not a chat model and thus not
+    #       supported in the v1/chat/completions endpoint" (a completions-only
+    #       base model that the NAME blocklist has no way to recognise)
+    #   cloudflare              -> "Function '<uuid>': Not found for account
+    #       '<acct>'" (the route exists in the catalog, not on the account)
+    "not a chat model", "v1/completions", "not supported in the v1",
+    "not found for account", "no such model", "no endpoints found",
+)
+
+
+def is_route_capability_error(exc: BaseException) -> bool:
+    """True when a 4xx names a limit/capability of THIS route specifically.
+
+    Such a call is worth retrying on a different route; a genuinely malformed
+    request (and an auth failure) is not.
+    """
+    blob = f"{type(exc).__name__} {exc}".lower()
+    if type(exc).__name__ == "RouteCapabilityError":
+        return True
+    return any(m in blob for m in _ROUTE_CAPABILITY_MARKERS)
+
 
 def _classify(exc: BaseException) -> str:
     """Map a provider exception onto a rotation outcome."""
@@ -941,9 +988,18 @@ def _is_retryable(exc: BaseException) -> bool:
                         SyntaxError, IndentationError, AssertionError)):
         return False
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-    if isinstance(status, int) and status in (400, 401, 403, 404, 422):
-        return False   # a bad request stays bad on every backend
+    if isinstance(status, int) and status in (400, 404, 422):
+        # A ROUTE-CAPABILITY 400/404 (output ceiling, context window, an
+        # unsupported parameter, a model this backend does not serve) is bad on
+        # THIS route and fine on the next one -- see _ROUTE_CAPABILITY_MARKERS
+        # for the 8-hour zero-work run that proved it. Anything else really is a
+        # malformed request and stays malformed everywhere.
+        return is_route_capability_error(exc)
+    if isinstance(status, int) and status in (401, 403):
+        return False   # this route's credential is wrong; retrying it is noise
     blob = f"{type(exc).__name__} {exc}".lower()
+    if is_route_capability_error(exc):
+        return True
     return bool(status) or any(m in blob for m in _RETRYABLE_MARKERS)
 
 
