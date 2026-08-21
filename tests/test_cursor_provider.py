@@ -137,6 +137,18 @@ class CursorProviderHttpTests(unittest.TestCase):
             result = self.provider.structured("question", schema={})
         self.assertEqual(result, {"answer": 42})
 
+    def test_structured_accepts_the_core_provider_call_shape(self):
+        fake_resp = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        import providers.cursor_provider as cp
+        with patch.object(cp, "_http_post", return_value=fake_resp) as request:
+            result = self.provider.structured(
+                "SYSTEM RULE", "make the fix", {"type": "object"},
+                max_tokens=123, model="ignored", salvage_truncated=True)
+        self.assertEqual(result, {"ok": True})
+        payload = request.call_args.args[1]
+        self.assertEqual(payload["messages"][-1]["content"], "make the fix")
+        self.assertIn("SYSTEM RULE", payload["messages"][0]["content"])
+
     def test_structured_strips_markdown_fence(self):
         fenced = "```json\n{\"answer\": 42}\n```"
         fake_resp = {"choices": [{"message": {"content": fenced}}]}

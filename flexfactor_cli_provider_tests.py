@@ -211,6 +211,25 @@ class CliProviderBehaviourTests(unittest.TestCase):
         finally:
             subprocess.run = real
 
+    def test_structured_accepts_the_core_provider_call_shape(self):
+        """Fix generation passes system, prompt, schema as three positionals."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}', stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            out = cp.CliProvider("codex-cli", "m", "codex").structured(
+                "SYSTEM RULE", "make the fix", {"type": "object"},
+                max_tokens=123, model="ignored", salvage_truncated=True)
+        finally:
+            subprocess.run = real
+        self.assertEqual(out, {"ok": True})
+        self.assertIn("SYSTEM RULE", seen["input"])
+        self.assertIn("make the fix", seen["input"])
+
     def test_the_work_theme_reaches_the_cli(self):
         """Owner requirement: rotated calls stay ON TASK. The theme must be
         carried, or a rotated provider wanders off the run's purpose."""

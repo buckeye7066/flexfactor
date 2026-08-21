@@ -243,16 +243,26 @@ class CliProvider:
               max_tokens: int = 4096, **_: Any) -> str:
         return self.complete(prompt, system=system, max_tokens=max_tokens)
 
-    def structured(self, prompt: str, schema: Dict[str, Any], *,
-                   system: Optional[str] = None, max_tokens: int = 4096,
-                   **_: Any) -> Any:
+    def structured(self, system: str, prompt: Optional[str] = None,
+                   schema: Optional[Dict[str, Any]] = None,
+                   max_tokens: int = 4096, model: Optional[str] = None,
+                   salvage_truncated: bool = False, **_: Any) -> Any:
+        """Match FlexFactor's provider contract while accepting legacy forms."""
+        if isinstance(prompt, dict) and schema is None:
+            schema = prompt
+            prompt = system
+            system = ""
+        elif prompt is None:
+            prompt = system
+            system = ""
+        schema = schema or {}
         instruction = (
             "Reply with a single JSON value that satisfies this schema. "
             "Output JSON only - no prose, no code fence, no commentary.\n"
             f"SCHEMA: {json.dumps(schema)}\n\n{prompt}"
         )
         return _extract_json(
-            _run_cli(self.api, self._binary, instruction, system=system,
+            _run_cli(self.api, self._binary, instruction, system=system or None,
                      timeout=self._timeout))
 
 

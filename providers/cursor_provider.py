@@ -233,14 +233,23 @@ class CursorProvider:
 
     def structured(
         self,
-        prompt: str,
-        schema: Dict[str, Any],
-        *,
-        system: Optional[str] = None,
+        system: str,
+        prompt: Optional[str] = None,
+        schema: Optional[Dict[str, Any]] = None,
         max_tokens: int = 4096,
+        model: Optional[str] = None,
+        salvage_truncated: bool = False,
         **kwargs: Any,
     ) -> Any:
-        """Return parsed JSON matching `schema` (best-effort)."""
+        """Return JSON using the common provider call shape (plus legacy forms)."""
+        if isinstance(prompt, dict) and schema is None:
+            schema = prompt
+            prompt = system
+            system = ""
+        elif prompt is None:
+            prompt = system
+            system = ""
+        schema = schema or {}
         schema_hint = json.dumps(schema, indent=2)
         augmented_system = (
             (system + "\n\n" if system else "")
