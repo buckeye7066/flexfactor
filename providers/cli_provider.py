@@ -200,10 +200,28 @@ class CliProvider:
         self._binary = binary
         self._timeout = float(timeout or DEFAULT_TIMEOUT_S)
 
+    #: Cost label. Both CLIs are flat-rate, so rotated calls bill $0.
+    #:
+    #: THIS WAS NAMED `meter` AND IT KNOCKED THE STRONGEST POOLS OUT OF ROTATION.
+    #: Everywhere else in FlexFactor `provider.meter` is the shared CostMeter
+    #: OBJECT, and `RotatingProvider._provider_for` assigns it on first use:
+    #:     if hasattr(provider, "meter"): provider.meter = self.meter
+    #: Against a read-only PROPERTY that raises
+    #:     AttributeError: property 'meter' of 'CliProvider' object has no setter
+    #: so every claude-code / codex-cli / cursor route - the FRONTIER subscription
+    #: pools, the ones that would have done the work - died on selection. Measured
+    #: in the owner's 2026-08-20/21 overnight manifests: that exact message is the
+    #: `not judged:` reason on Iplay and PromoPilot, and the run fell through to
+    #: `google/recurrentgemma-2b` and `groq/compound`, which then 400'd on
+    #: max_tokens. A cost LABEL and a cost METER are different things and must
+    #: never share a name.
     @property
-    def meter(self) -> str:
-        """Cost label. Both CLIs are flat-rate, so rotated calls bill $0."""
+    def cost_label(self) -> str:
+        """Flat-rate billing label for reporting (NOT a CostMeter)."""
         return f"{self.api}:subscription"
+
+    #: Assignable, because RotatingProvider shares one CostMeter across routes.
+    meter: Any = None
 
     def ping(self, **_: Any) -> bool:
         """Is the CLI actually runnable? A PATH hit is not proof."""

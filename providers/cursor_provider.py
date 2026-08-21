@@ -145,10 +145,17 @@ class CursorProvider:
 
     # -- provider identity surface (mirrors flexfactor's convention) ----------
 
+    #: See the long note on CliProvider.cost_label: naming this `meter` collided
+    #: with the shared CostMeter every other provider carries, so
+    #: RotatingProvider's `provider.meter = self.meter` raised AttributeError and
+    #: eliminated every cursor route on selection.
     @property
-    def meter(self) -> str:
-        """Cost label for reporting.  Cursor is subscription-billed."""
+    def cost_label(self) -> str:
+        """Flat-rate billing label for reporting (NOT a CostMeter)."""
         return "cursor:subscription"
+
+    #: Assignable, because RotatingProvider shares one CostMeter across routes.
+    meter: Any = None
 
     # -- capability surface ---------------------------------------------------
 

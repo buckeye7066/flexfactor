@@ -91,10 +91,10 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
             self.assertNotIn("unsupported api",
                              ff._route_unusable_reason(Route(api), "auto"))
 
-    def test_a_paid_extended_route_is_still_refused(self):
-        """Rotation stays FREE-ONLY; a new transport must not smuggle paid in."""
-        self.assertIn("paid", ff._route_unusable_reason(
-            Route("claude-code", is_free=False), "auto"))
+    def test_a_paid_extended_route_is_allowed_in_auto_mode(self):
+        """Auto rotation may use paid capacity under the shared cost budget."""
+        self.assertEqual(ff._route_unusable_reason(
+            Route("claude-code", is_free=False), "auto"), "")
 
     def test_extensions_off_disables_the_cli_routes(self):
         os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
@@ -238,7 +238,7 @@ class CliProviderBehaviourTests(unittest.TestCase):
         self.assertIn("THEME_MARKER", seen["input"])
 
     def test_billing_label_marks_these_flat_rate(self):
-        self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").meter)
+        self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)
 
 
 if __name__ == "__main__":

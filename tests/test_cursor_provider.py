@@ -63,7 +63,7 @@ class CursorProviderFailClosedTests(unittest.TestCase):
             self.provider.ping()
 
     def test_meter_label(self):
-        self.assertEqual(self.provider.meter, "cursor:subscription")
+        self.assertEqual(self.provider.cost_label, "cursor:subscription")
 
     def test_judge_model_defaults_to_model(self):
         p = CursorProvider(model="gpt-4o")
@@ -177,6 +177,11 @@ class MakeCursorProviderTests(unittest.TestCase):
         os.environ.pop("FLEXFACTOR_CURSOR_BASE_URL", None)
 
     def test_raises_when_extensions_disabled(self):
+        # EXPLICITLY off. FLEXFACTOR_ROTATION_EXTENSIONS defaults to ON as of
+        # 2026-08-21 (flexfactor_flags.rotation_extensions_enabled), so merely
+        # unsetting the variable no longer disables anything - that stale
+        # assumption is what left `rotation-extensions` red on main.
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
         with self.assertRaises(CursorUnavailable):
             make_cursor_provider(_fake_route())
 

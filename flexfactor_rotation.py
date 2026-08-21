@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import tempfile
 import threading
 import time
@@ -827,8 +828,23 @@ class RotatingProvider:
             provider = self._cache.get(route.id)
             if provider is None:
                 provider = self._factory(route)
+                # Sharing the meter must never COST US THE ROUTE. CliProvider and
+                # CursorProvider exposed a read-only `meter` property (a cost
+                # LABEL, not a CostMeter), so this line raised
+                #   AttributeError: property 'meter' ... has no setter
+                # and every frontier subscription route died the moment it was
+                # selected - silently, inside the caller's error handling. The
+                # name collision is fixed at the source (`cost_label`); this is
+                # the belt: an un-attachable meter is a LOUD warning, not a
+                # disqualification. Worst case that route bills at the
+                # fail-closed default instead of not running at all.
                 if hasattr(provider, "meter"):
-                    provider.meter = self.meter
+                    try:
+                        provider.meter = self.meter
+                    except AttributeError as exc:
+                        print(f"  [rotation] WARNING {route.id}: could not attach "
+                              f"the shared cost meter ({exc}); the route still "
+                              "runs, its spend is not metered here", file=sys.stderr)
                 self._cache[route.id] = provider
             return provider
 

@@ -44,11 +44,20 @@ class RotationTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_path = os.path.join(self._tmp.name, "rotation-state.json")
         self.store = R.StateStore(self.state_path)
+        self._prior_extensions = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
+        # These core catalog tests supply their own fixtures. Keep the default-on
+        # discovered catalog from being merged into them; extension discovery has
+        # its own dedicated suite.
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
         for var in ("AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
                     "AI_ROTATE_STATE", "AITIME_STATE_DIR"):
             os.environ.pop(var, None)
 
     def tearDown(self) -> None:
+        if self._prior_extensions is None:
+            os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        else:
+            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prior_extensions
         self._tmp.cleanup()
 
     def rotator(self, cat: R.Catalog, app: str = "flexfactor") -> R.Rotator:

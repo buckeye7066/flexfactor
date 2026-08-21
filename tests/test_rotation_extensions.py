@@ -57,38 +57,101 @@ _make_primary_catalog = _write_catalog
 # --------------------------------------------------------------------------- #
 
 class ExtensionFlagTests(unittest.TestCase):
-    """The feature flag must gate everything; nothing must change by default."""
+    """The flag has ONE resolver and it DEFAULTS ON.
+
+    This class pinned the opposite contract until 2026-08-21 and was the sole
+    reason `rotation-extensions` was red on main. The code is right and the
+    tests were stale: commit 28efa99 landed the owner's order ("make the CLI and
+    Cursor pools visable and usable") through `flexfactor_flags.py`, where an
+    UNSET variable means ON and opting out is explicit ("0"/"false"/"no"/"off").
+
+    `flexfactor_flags` exists because this flag was read in FOUR places with
+    THREE different meanings, so `FLEXFACTOR_ROTATION_EXTENSIONS=true` enabled
+    the CLI adapter and left the discovery lane that emits its routes OFF - a
+    half-on state that looks enabled and produces nothing. Every assertion below
+    therefore checks BOTH readers agree, which is the property that matters.
+    """
+
+    OFF_VALUES = ("0", "false", "no", "off", "OFF", " false ")
+    ON_VALUES = ("1", "true", "yes", "on", "anything-else", " 1 ")
 
     def setUp(self):
-        os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        self._prior = os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
 
     def tearDown(self):
         os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        if self._prior is not None:
+            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prior
 
-    def test_extensions_disabled_by_default(self):
-        self.assertFalse(R._rotation_extensions_enabled())
-        self.assertFalse(D.extensions_enabled())
-
-    def test_extensions_enabled_by_env(self):
-        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "1"
+    def test_extensions_are_ENABLED_by_default(self):
+        """UNSET means ON (owner order 2026-08-21). Opting out is explicit."""
         self.assertTrue(R._rotation_extensions_enabled())
         self.assertTrue(D.extensions_enabled())
 
-    def test_non_one_value_is_not_enabled(self):
-        for val in ("true", "yes", "on", "1 ", " 1", "0", ""):
+    def test_explicit_off_values_disable_it(self):
+        for val in self.OFF_VALUES:
             os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = val
-            # Whitespace is stripped; only '1' (after strip) enables the flag.
-            expected = val.strip() == "1"
-            self.assertEqual(R._rotation_extensions_enabled(), expected,
-                             f"Expected {expected} for {val!r}")
+            self.assertFalse(R._rotation_extensions_enabled(), repr(val))
+            self.assertFalse(D.extensions_enabled(), repr(val))
+
+    def test_anything_not_an_off_value_enables_it(self):
+        for val in self.ON_VALUES:
+            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = val
+            self.assertTrue(R._rotation_extensions_enabled(), repr(val))
+            self.assertTrue(D.extensions_enabled(), repr(val))
+
+    def test_both_readers_never_disagree(self):
+        """The exact drift flexfactor_flags was written to make impossible."""
+        for val in (None,) + self.OFF_VALUES + self.ON_VALUES:
+            if val is None:
+                os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+            else:
+                os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = val
+            self.assertEqual(R._rotation_extensions_enabled(),
+                             D.extensions_enabled(),
+                             f"half-on state for {val!r}")
 
     def test_discover_routes_returns_empty_when_flag_off(self):
-        routes = D.discover_routes()
-        self.assertEqual(routes, [])
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
+        self.assertEqual(D.discover_routes(), [])
 
     def test_write_auto_catalog_is_noop_when_flag_off(self):
-        result = D.write_auto_catalog(routes=[{"id": "x"}])
-        self.assertIsNone(result)
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
+        self.assertIsNone(D.write_auto_catalog(routes=[{"id": "x"}]))
+
+    def test_write_auto_catalog_writes_when_the_flag_is_ON(self):
+        """TEST HYGIENE: with the flag now ON by default this call would write
+        `catalog.auto.json` into the REPO. Redirect the path, always."""
+        real = D._auto_catalog_path
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "catalog.auto.json")
+            D._auto_catalog_path = lambda: target
+            try:
+                written = D.write_auto_catalog(routes=[{"id": "x"}])
+            finally:
+                D._auto_catalog_path = real
+            self.assertEqual(written, target)
+            self.assertTrue(os.path.exists(target))
+
+    def test_the_suite_never_writes_catalog_auto_json_into_the_repo(self):
+        """The stale off-by-default test wrote a real file into the checkout on
+        every CI run once the default flipped. Nothing here may do that again."""
+        repo_copy = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "catalog.auto.json")
+        before = os.path.exists(repo_copy)
+        stamp = os.path.getmtime(repo_copy) if before else None
+        os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        real = D._auto_catalog_path
+        with tempfile.TemporaryDirectory() as tmp:
+            D._auto_catalog_path = lambda: os.path.join(tmp, "catalog.auto.json")
+            try:
+                D.write_auto_catalog(routes=[{"id": "x"}])
+            finally:
+                D._auto_catalog_path = real
+        self.assertEqual(os.path.exists(repo_copy), before)
+        if before:
+            self.assertEqual(os.path.getmtime(repo_copy), stamp)
 
 
 # --------------------------------------------------------------------------- #
@@ -157,7 +220,9 @@ class AutoCatalogMergeTests(unittest.TestCase):
         self.assertEqual(len(cat.routes), 1)
 
     def test_flag_off_skips_auto_routes(self):
-        os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        # EXPLICIT off. Popping the variable now means ON (default flipped
+        # 2026-08-21) - which is exactly what made this assertion fire on main.
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
         _make_primary_catalog(self._primary_path(), [
             _route_entry("openai/gpt-4o", "openai:paid", cost=R.PAID_METERED),
         ])
