@@ -200,8 +200,19 @@ _FREE_ROUTE_MODELS: set[str] = set()
 # The default is DELIBERATELY the small one: asking for more output than a model
 # allows is a hard API rejection (the whole call dies), while asking for too
 # little costs one shrink-and-retry. Unknown id -> conservative.
+#
+# The default being 16384 is only "conservative" relative to NEWER models. Since
+# paid rotation was turned on, OLDER ids reach this table for the first time and
+# they cap LOWER than the default: a live call on `openai_api/gpt-4-turbo`
+# returned `400 max_tokens is too large: 16384. This model supports at most 4096`
+# — a hard rejection that kills the call and, through the rotator, cools the
+# whole `openai_api:paid-metered` pool. So the pre-4o families are enumerated
+# explicitly rather than inheriting a default that is too big for them.
 OPENAI_OUTPUT_CEILING_DEFAULT = 16384
 OPENAI_OUTPUT_CEILINGS = {
+    "gpt-3.5-turbo": 4096,
+    "gpt-4": 4096,          # plain gpt-4 and gpt-4-32k
+    "gpt-4-turbo": 4096,    # longest-prefix wins over "gpt-4"
     "gpt-4o": 16384,
     "gpt-4o-mini": 16384,
     "gpt-4.1": 32768,
@@ -2885,9 +2896,64 @@ def _rotation_route_provider(route):
         # Env-configured on purpose: the free/subscription Anthropic route IS
         # the FCC proxy, whose base URL + token _auto_activate_fcc_proxy has
         # already placed in the environment. Never construct a direct
-        # api.anthropic.com client here — that converts flat-rate work into
+        # api.anthropic.com client for THOSE — that converts flat-rate work into
         # metered billing (the FCC proxy is treated as ONE route).
+        #
+        # A genuinely metered route is the opposite case and needs the opposite
+        # handling. Since paid rotation was turned on, `anthropic_api:paid-metered`
+        # routes reach here too, and serving them through the proxy env would bill
+        # the owner's flat-rate plan for work the catalog says is metered — the
+        # same misattribution in mirror image, and invisible in the cost meter.
+        # The cost_class the catalog already carries is the discriminator.
+        if not route.is_free:
+            import anthropic
+            prov = object.__new__(AnthropicProvider)
+            prov.model = wire
+            prov.judge_model = wire
+            prov.meter = None      # RotatingProvider attaches the shared meter
+            prov.client = anthropic.Anthropic(
+                base_url=route.base_url or None,
+                api_key=(os.environ.get(route.auth_env) if route.auth_env else "")
+                        or os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY")
+                        or os.environ.get("ANTHROPIC_API_KEY") or "")
+            # __init__ is bypassed, so the lazy-rescue slots it would have
+            # created must be set here. Without them the FIRST rescue attempt
+            # raises AttributeError deep inside a failover path — i.e. it breaks
+            # only when something has already gone wrong, which is the worst
+            # time to discover it and the least likely to be covered by a run
+            # that succeeded.
+            prov._paid_client_obj = None
+            prov._oai_rescue = None
+            return prov
         return AnthropicProvider(wire, judge_model=wire)
+    if route.api == "gemini":
+        import openai
+        # Google serves an OpenAI-compatible surface, so the existing
+        # OpenAIProvider carries Gemini with no new provider class — and with it
+        # the egress gate, budget guard and output ceilings, which a bespoke
+        # client would each have had to re-earn.
+        #
+        # TRAP, measured against the live catalog: the routes carry the NATIVE
+        # base url ('.../v1beta'), and the OpenAI-compatible surface is one path
+        # segment deeper ('.../v1beta/openai'). Handing the raw value to an
+        # OpenAI client 404s every call — which the rotator would read as a bad
+        # route and cool the whole pool down, retiring all 26 for the run. The
+        # catalog is AI Time's to write, so the suffix is applied HERE rather
+        # than by editing routes another program owns.
+        base = (route.base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+        if not base.endswith("/openai"):
+            base += "/openai"
+        prov = object.__new__(OpenAIProvider)
+        prov.model = wire
+        prov.judge_model = wire
+        prov.meter = None
+        prov.client = openai.OpenAI(
+            base_url=base,
+            api_key=(os.environ.get(route.auth_env) or "unused")
+                    if route.auth_env else "unused",
+            timeout=_openai_call_timeout_seconds(), max_retries=0,
+            default_headers={"User-Agent": "FlexFactor/1.0 (+local code tool)"})
+        return prov
     if route.api == "openai":
         import openai
         # NOT OpenAIProvider(...): its __init__ builds openai.OpenAI() from
@@ -2979,11 +3045,21 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     left in would be selected, fail at call time, and burn a cooldown cycle —
     across 600+ routes that turns the first sweep into an error tour.
     """
-    if route.api not in ("openai", "anthropic", "ollama", "cursor",
+    if route.api not in ("openai", "anthropic", "gemini", "ollama", "cursor",
                          "codex-cli", "claude-code"):
         return f"unsupported api '{route.api}'"
-    if not route.is_free:
-        return "paid (rotation stays free-only)"
+    # PAID ROUTES ROTATE (owner order 2026-08-21: "Paid can be rotated in until
+    # exhausted. Leave no routes blocked."). This filter no longer excludes them;
+    # the bound is the one that can actually measure spend:
+    #   - per-program dollars: CostMeter / --max-cost (default $150), which every
+    #     rotated call already passes through, and which bills an unknown model id
+    #     at the highest known rate rather than guessing low;
+    #   - per-pool depletion: the rotator's own `quota_exhausted` outcome puts the
+    #     POOL on cooldown and moves to the next one, which is what "until
+    #     exhausted" means mechanically.
+    # Free routes are still PREFERRED, not by filtering here but by COST_ORDER in
+    # _pick_in_tier — so the cheapest usable pool is still tried first and paid
+    # capacity is what the run falls through to, never what it reaches for.
     # NON-CODING free routes (owner 2026-08-20): prompt-guards, TTS, vision-
     # only, content-safety, etc. land in the catalog as free-tier/light and
     # were selected for semantic CODE review. Batches completed zero files and
@@ -3053,6 +3129,19 @@ _UNFIT_CODE_PATTERNS = (
     r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
     r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
     r"vision-only", r"synthetic-video", r"ai-synthetic-video",
+    # Gemini families that are NOT chat-completion coding models. Each was
+    # measured against the live API on 2026-08-21 rather than assumed:
+    #   deep-research-*        -> 400 "This model only supports Interactions API"
+    #   antigravity-preview-*  -> 400 "Developer instruction is not enabled"
+    # Both are permanent properties of the model, so leaving them selectable
+    # means a guaranteed 400 that cools the shared `gemini:free-tier` pool and
+    # retires the 12 routes that DO work.
+    r"deep-research", r"antigravity",
+    # Answered the ping, but are not code models: robotics-er is embodied
+    # reasoning, computer-use drives a GUI, nano-banana is image generation and
+    # omni is audio. Filtering them is what stops a code review being handed to
+    # an image model — the same class the existing patterns above address.
+    r"robotics-er", r"computer-use", r"nano-banana", r"omni-flash",
 )
 
 
@@ -3141,12 +3230,20 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     stale_note = fr.catalog_staleness_note(catalog)
     if stale_note and _claim_stale_warning(catalog.path):
         print(f"  [rotation] {stale_note}", file=sys.stderr)
-    print(f"  [rotation] ON: {len(usable)} free routes over {pools} pools, "
+    # Say free-vs-paid out loud. The line used to read "N free routes" and was
+    # printed by the same code whether or not that was true, so once paid routes
+    # were admitted it would have kept asserting the run was free while metering
+    # dollars — the exact class of claim this repo's honesty rule exists to stop.
+    n_free = sum(1 for r in usable if r.is_free)
+    n_paid = len(usable) - n_free
+    mix = f"{n_free} free" + (f" + {n_paid} paid (billed against --max-cost "
+                              f"${getattr(args, 'max_cost', 0) or 0:g})" if n_paid else "")
+    print(f"  [rotation] ON: {mix} routes over {pools} pools, "
           f"author tier '{author_tier}'"
           + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
     return fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=fr.LIGHT,
-                               allow_paid=False, meter=meter,
+                               allow_paid=True, meter=meter,
                                on_route=_announce)
 
 

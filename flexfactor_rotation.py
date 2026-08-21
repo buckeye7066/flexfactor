@@ -193,8 +193,16 @@ def catalog_staleness_note(catalog: Optional[Catalog]) -> Optional[str]:
 
 
 def _rotation_extensions_enabled() -> bool:
-    """Return True when `FLEXFACTOR_ROTATION_EXTENSIONS=1` is set."""
-    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() == "1"
+    """True unless extensions are explicitly disabled. See flexfactor_flags."""
+    try:
+        from flexfactor_flags import rotation_extensions_enabled
+        return rotation_extensions_enabled()
+    except ImportError:
+        # Standalone use (this module never hard-depends on the rest of the
+        # tool). Mirror the shared default rather than the old exact-"1" rule,
+        # or the fallback silently reintroduces the drift it replaced.
+        return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip().lower() \
+            not in ("0", "false", "no", "off")
 
 
 def _merge_auto_routes(routes: List[Route]) -> List[Route]:

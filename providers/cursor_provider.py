@@ -51,7 +51,13 @@ class CursorUnavailable(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 def _extensions_enabled() -> bool:
-    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() == "1"
+    """True unless extensions are explicitly disabled. See flexfactor_flags."""
+    try:
+        from flexfactor_flags import rotation_extensions_enabled
+        return rotation_extensions_enabled()
+    except ImportError:
+        return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip().lower() \
+            not in ("0", "false", "no", "off")
 
 
 def _cursor_base_url() -> Optional[str]:

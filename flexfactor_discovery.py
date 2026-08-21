@@ -77,8 +77,13 @@ def _info(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def extensions_enabled() -> bool:
-    """Return True only when the caller explicitly opts in."""
-    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() == "1"
+    """True unless extensions are explicitly disabled. See flexfactor_flags."""
+    try:
+        from flexfactor_flags import rotation_extensions_enabled
+        return rotation_extensions_enabled()
+    except ImportError:
+        return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip().lower() \
+            not in ("0", "false", "no", "off")
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +492,57 @@ def discover_from_obsidian() -> List[Dict[str, Any]]:
 # Public API
 # --------------------------------------------------------------------------- #
 
+# Flat-rate local coding CLIs. Both are served by providers/cli_provider.py over
+# a bounded stdin subprocess, so a route here needs no base_url and no auth_env.
+#
+# The tier is what the CLI's own default model can do, not a guess: `claude` runs
+# an Opus-class model and `codex` a GPT-5-class one, so both are FRONTIER. Cost
+# class is "subscription" — flat-rate, which _price_for reads as $0, correctly:
+# these calls do not bill per token, so pricing them like metered API traffic
+# would make the cost meter refuse free capacity (the exact failure the
+# _FREE_ROUTE_MODELS branch exists to prevent, one door over).
+_CLI_ROUTES = (
+    ("claude-code", "claude", "claude-code", "frontier"),
+    ("codex-cli", "codex", "codex", "frontier"),
+)
+
+
+def discover_from_cli() -> List[Dict[str, Any]]:
+    """Route dicts for locally installed coding CLIs.
+
+    This lane did not exist, which is why turning FLEXFACTOR_ROTATION_EXTENSIONS
+    on changed nothing: `claude` and `codex` are both installed on this machine
+    and cli_provider.py has served them since a4a02e0, but nothing ever emitted a
+    ROUTE for either, so there was no catalog entry for the rotator to select and
+    the CLI pools were invisible rather than merely disabled.
+
+    Presence is decided by cli_provider's own resolver, so discovery and the
+    usability filter can never disagree about whether a binary is available.
+    """
+    try:
+        from providers.cli_provider import cli_binary_for
+    except ImportError as exc:
+        _warn(f"cli: adapter unavailable ({exc}); no CLI routes discovered")
+        return []
+    out: List[Dict[str, Any]] = []
+    for api, _binary, model, tier in _CLI_ROUTES:
+        resolved = cli_binary_for(api)
+        if not resolved:
+            _info(f"cli: {api} not installed or not on PATH - skipped")
+            continue
+        out.append(_route_entry(
+            rid=f"cli/{model}", backend=api, model=model,
+            # One pool PER CLI: the pool is the quota ledger, and these are
+            # separate subscriptions that deplete independently. Collapsing them
+            # into one "cli:subscription" pool would make a cooldown on either
+            # retire both — the "rotate pools, not model names" rule.
+            pool=f"{api}:subscription", cost_class="subscription", tier=tier,
+            api=api, base_url="", source="cli"))
+    if out:
+        _info(f"cli: {len(out)} route(s) discovered")
+    return out
+
+
 def discover_routes() -> List[Dict[str, Any]]:
     """Aggregate routes from all discovery sources.
 
@@ -498,6 +554,7 @@ def discover_routes() -> List[Dict[str, Any]]:
     routes: List[Dict[str, Any]] = []
     routes.extend(discover_from_aitime())
     routes.extend(discover_from_cursor())
+    routes.extend(discover_from_cli())
     routes.extend(discover_from_obsidian())
 
     # Deduplicate by route id, preferring later entries (more specific source).

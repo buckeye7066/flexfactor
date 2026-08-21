@@ -70,8 +70,18 @@ CLI_BINARIES = {
 
 
 def _extensions_enabled() -> bool:
-    """Same switch the Cursor adapter honours, so one flag governs both."""
-    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() not in ("", "0", "false", "no")
+    """Same switch the Cursor adapter honours, so one flag governs both.
+
+    It did NOT govern both: this accepted any non-empty value outside a small
+    off-list while the other three call sites demanded the exact string "1".
+    See flexfactor_flags for the drift that caused and the shared resolver.
+    """
+    try:
+        from flexfactor_flags import rotation_extensions_enabled
+        return rotation_extensions_enabled()
+    except ImportError:
+        return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip().lower() \
+            not in ("0", "false", "no", "off")
 
 
 def cli_binary_for(api: str) -> Optional[str]:

@@ -94,6 +94,16 @@ os.environ["AI_ROTATE_STATE"] = os.path.join(_TEST_STATE_DIR, "rotation-state.js
 # a fixture catalog route naming GROQ_API_KEY would inject the real key
 # mid-suite). Tests that exercise hydration point _FCC_ENV_FILE at a fixture.
 ff._FCC_ENV_FILE = os.path.join(_TEST_STATE_DIR, "fcc-env-absent")
+# Extensions default ON in production since 2026-08-21, and `_merge_auto_routes`
+# reads `catalog.auto.json` from the SOURCE DIRECTORY — a path AI_ROTATE_CATALOG
+# above does not cover. So on any machine where discovery has been run, that real
+# file was silently merged into every fixture catalog: a test that wrote one
+# deliberately-unusable route suddenly had usable Cursor/CLI routes beside it, and
+# `test_the_warning_is_not_claimed_when_no_route_is_usable` failed because a route
+# WAS usable. Same hazard class as everything above — a test outcome that depends
+# on this developer's machine state — reached through a different door. Tests that
+# exercise extensions turn this back on for their own scope.
+os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
 
 # --------------------------------------------------------------------------- #
 # NEVER let a test reach the real internet.
@@ -821,9 +831,12 @@ class RotationDefaultProviderTests(unittest.TestCase):
     def test_unusable_routes_are_dropped_with_named_reasons(self):
         import flexfactor_rotation as fr
         cases = [
-            (self._route("gemini/pro", api="gemini"), "unsupported api"),
             (self._route("groq/llama-x", auth_env="FLEXROT_UNSET_ENV"), "missing FLEXROT_UNSET_ENV"),
-            (self._route("openai_api/gpt-4o", cost="paid-metered"), "paid"),
+            # A genuinely unservable api must still be named. `gemini` no longer
+            # belongs here (it has a provider now), so this pins the RULE rather
+            # than one example of it -- otherwise removing the last case would
+            # leave the branch untested.
+            (self._route("mystery/model", api="not-a-real-api"), "unsupported api"),
         ]
         for raw, expected in cases:
             reason = ff._route_unusable_reason(fr.Route.from_json(raw), "auto")
@@ -831,6 +844,123 @@ class RotationDefaultProviderTests(unittest.TestCase):
         good = ff._route_unusable_reason(
             fr.Route.from_json(self._route("groq/llama-x")), "auto")
         self.assertEqual(good, "")
+
+    def test_paid_and_gemini_routes_are_ROTATED_not_filtered(self):
+        """Owner order 2026-08-21: "Paid can be rotated in until exhausted.
+        Leave no routes blocked."
+
+        Both of these were previously dropped by name, and the free-only rule in
+        particular was load-bearing enough that removing it silently would be
+        indistinguishable from a bug. Pin the new contract explicitly.
+        """
+        import flexfactor_rotation as fr
+        paid = fr.Route.from_json(self._route("openai_api/gpt-4o", cost="paid-metered"))
+        self.assertEqual(ff._route_unusable_reason(paid, "auto"), "",
+                         "paid routes must reach the rotator; the BOUND is "
+                         "--max-cost plus the pool's quota_exhausted cooldown, "
+                         "not this filter")
+        gem = self._route("gemini/gemini-2.5-flash", api="gemini")
+        gem["auth_env"] = "FLEXROT_GEMINI_KEY"
+        os.environ["FLEXROT_GEMINI_KEY"] = "test-key"
+        try:
+            self.assertEqual(
+                ff._route_unusable_reason(fr.Route.from_json(gem), "auto"), "")
+        finally:
+            os.environ.pop("FLEXROT_GEMINI_KEY", None)
+
+    def test_a_gemini_route_targets_the_OPENAI_COMPATIBLE_path(self):
+        """The catalog carries Google's NATIVE base url ('.../v1beta'); the
+        OpenAI-compatible surface is one segment deeper. Handing the raw value to
+        an OpenAI client 404s every call, which the rotator reads as a bad route
+        and cools the whole gemini pool down -- retiring all 26 for the run.
+        """
+        import flexfactor_rotation as fr
+        raw = self._route("gemini/gemini-2.5-flash", api="gemini")
+        raw["base_url"] = "https://generativelanguage.googleapis.com/v1beta"
+        raw["auth_env"] = "FLEXROT_GEMINI_KEY"
+        os.environ["FLEXROT_GEMINI_KEY"] = "test-key"
+        try:
+            prov = ff._rotation_route_provider(fr.Route.from_json(raw))
+        finally:
+            os.environ.pop("FLEXROT_GEMINI_KEY", None)
+        self.assertTrue(str(prov.client.base_url).rstrip("/").endswith("/v1beta/openai"),
+                        f"got {prov.client.base_url!r}")
+        # Idempotent: a catalog later corrected upstream must not become
+        # '.../openai/openai'.
+        raw["base_url"] = "https://generativelanguage.googleapis.com/v1beta/openai"
+        os.environ["FLEXROT_GEMINI_KEY"] = "test-key"
+        try:
+            prov2 = ff._rotation_route_provider(fr.Route.from_json(raw))
+        finally:
+            os.environ.pop("FLEXROT_GEMINI_KEY", None)
+        self.assertTrue(str(prov2.client.base_url).rstrip("/").endswith("/v1beta/openai"),
+                        f"got {prov2.client.base_url!r}")
+
+    def test_an_older_openai_model_gets_its_REAL_output_ceiling(self):
+        """Live: `openai_api/gpt-4-turbo` returned `400 max_tokens is too large:
+        16384. This model supports at most 4096`. A hard rejection kills the call
+        AND cools the shared paid pool, so the pre-4o families cannot inherit a
+        default that is larger than they accept."""
+        self.assertEqual(ff._openai_output_ceiling("gpt-4-turbo"), 4096)
+        self.assertEqual(ff._openai_output_ceiling("gpt-4-turbo-2024-04-09"), 4096)
+        self.assertEqual(ff._openai_output_ceiling("gpt-3.5-turbo"), 4096)
+        # Longest-prefix must still keep the newer families at their own limits.
+        self.assertEqual(ff._openai_output_ceiling("gpt-4o"), 16384)
+        self.assertEqual(ff._openai_output_ceiling("gpt-4.1"), 32768)
+
+    def test_non_chat_gemini_families_are_refused_before_they_burn_a_pool(self):
+        """Measured live 2026-08-21: deep-research-* answers `400 This model only
+        supports Interactions API` and antigravity-* `400 Developer instruction is
+        not enabled`. Both are permanent, so leaving them selectable guarantees a
+        400 that cools the shared gemini pool and retires the 12 that DO work."""
+        for bad in ("deep-research-max-preview-04-2026", "antigravity-preview-05-2026",
+                    "gemini-robotics-er-2-preview", "nano-banana-pro-preview",
+                    "gemini-2.5-computer-use-preview-10-2025"):
+            self.assertNotEqual(ff._unfit_for_code_reason(bad), "",
+                                f"{bad} must be refused")
+        for good in ("gemini-2.5-flash", "gemini-3.5-flash", "gemma-4-31b-it",
+                     "gemini-flash-lite-latest"):
+            self.assertEqual(ff._unfit_for_code_reason(good), "",
+                             f"{good} verified working live; must NOT be refused")
+
+    def test_all_four_extension_flag_readers_AGREE(self):
+        """`FLEXFACTOR_ROTATION_EXTENSIONS` was read in four places with three
+        different meanings: cli_provider accepted anything outside a small
+        off-list, while rotation/discovery/cursor_provider demanded the exact
+        string "1". So `=true` enabled the CLI ADAPTER and left the discovery
+        lane that emits its ROUTES switched off -- a half-on state where the
+        feature looks enabled and produces nothing.
+
+        This is the registry-drift class this repo documents: one value held as a
+        literal in several modules, silently disagreeing while all of them
+        "work". Assert agreement over the values that actually differed.
+        """
+        import importlib
+        import flexfactor_rotation as fr
+        import flexfactor_discovery as fd
+        from providers import cli_provider, cursor_provider
+        readers = {
+            "flexfactor_rotation": fr._rotation_extensions_enabled,
+            "flexfactor_discovery": fd.extensions_enabled,
+            "providers.cli_provider": cli_provider._extensions_enabled,
+            "providers.cursor_provider": cursor_provider._extensions_enabled,
+        }
+        prior = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
+        try:
+            for value, expected in (("1", True), ("true", True), ("yes", True),
+                                    ("0", False), ("false", False), ("off", False),
+                                    ("", True)):    # UNSET/empty => ON by default
+                os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = value
+                got = {name: fn() for name, fn in readers.items()}
+                self.assertEqual(
+                    set(got.values()), {expected},
+                    f"readers disagree for {value!r}: {got}")
+        finally:
+            if prior is None:
+                os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+            else:
+                os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = prior
+            importlib.invalidate_caches()
 
     def test_credential_hydration_fills_missing_keys_and_never_overwrites(self):
         import flexfactor_rotation as fr
