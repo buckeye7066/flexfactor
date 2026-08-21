@@ -1,0 +1,243 @@
+"""CLI-backed provider adapter for flexfactor_rotation.
+
+Implements the same surface as AnthropicProvider / OpenAIProvider / the Cursor
+adapter so RotatingProvider can call it transparently, but the transport is a
+LOCAL CLI subprocess rather than an HTTP endpoint:
+
+    api="claude-code"  -> the `claude` CLI   (flat-rate subscription)
+    api="codex-cli"    -> the `codex` CLI    (flat-rate subscription)
+
+WHY THIS EXISTS
+---------------
+Both CLIs are already installed and flat-rate on this machine, so every call
+routed through them is capacity the catalog otherwise cannot see. Adding them
+as rotation POOLS spreads work off the metered/quota'd HTTP routes.
+
+WHY IT IS WRITTEN THIS WAY
+--------------------------
+1. PROMPTS GO OVER STDIN, NEVER argv. This machine's launchers run under
+   Windows PowerShell 5.1, which mangles embedded quotes in native arguments -
+   a review prompt full of source code and JSON braces on a command line is a
+   guaranteed corruption. stdin has no such problem and no length limit.
+
+2. EVERY CALL IS BOUNDED. An unbounded subprocess wait is the exact shape that
+   froze a live run for 25+ minutes with a static cost meter. `timeout` is
+   always passed, expiry kills the child, and the error is raised as
+   `CliUnavailable` so the rotator rolls over to the next pool instead of
+   hanging the sweep.
+
+3. IT FAILS CLOSED, LOUDLY. A missing binary, a non-zero exit, an empty answer
+   or unparseable JSON all raise `CliUnavailable` (a RuntimeError subclass).
+   Nothing here can return a plausible-looking empty result that a caller would
+   record as a completed review.
+
+4. IT REFUSES TO RECURSE. `claude` invoked from inside a Claude Code session
+   would spawn a nested agent, and a rotation sweep could fan out into dozens.
+   `_recursion_guard_env` stamps a marker into the child's environment and the
+   provider refuses when it sees its own marker already set.
+
+SECRETS
+-------
+No API keys are read, stored, or logged - both CLIs carry their own
+authentication. The prompt is passed to the child process only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from typing import Any, Dict, Optional
+
+
+class CliUnavailable(RuntimeError):
+    """Raised when the CLI cannot serve a call; the rotator handles this."""
+
+
+#: Marker used to detect (and refuse) a nested invocation.
+_RECURSION_MARKER = "FLEXFACTOR_CLI_PROVIDER_ACTIVE"
+
+#: Per-call ceiling. Generous because these are flat-rate and a real code
+#: review legitimately takes minutes - but never unbounded.
+DEFAULT_TIMEOUT_S = float(os.environ.get("FLEXFACTOR_CLI_TIMEOUT", "600") or 600)
+
+#: Which executable serves which catalog api id.
+CLI_BINARIES = {
+    "claude-code": "claude",
+    "codex-cli": "codex",
+}
+
+
+def _extensions_enabled() -> bool:
+    """Same switch the Cursor adapter honours, so one flag governs both."""
+    return os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS", "").strip() not in ("", "0", "false", "no")
+
+
+def cli_binary_for(api: str) -> Optional[str]:
+    """Resolved path of the CLI serving `api`, or None when unavailable."""
+    name = CLI_BINARIES.get(str(api or "").strip().lower())
+    return shutil.which(name) if name else None
+
+
+def _recursion_guard_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    env[_RECURSION_MARKER] = "1"
+    # Keep the child non-interactive no matter how it is configured.
+    env.setdefault("CI", "1")
+    env.setdefault("NO_COLOR", "1")
+    return env
+
+
+def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
+    """Non-interactive argv for one CLI. The PROMPT is never included here."""
+    api = str(api or "").lower()
+    if api == "claude-code":
+        # `-p` is print/non-interactive mode; it reads the prompt from stdin
+        # when one is piped in.
+        argv = [binary, "-p", "--output-format", "text"]
+        if system:
+            # Carries the run's DIRECTED WORK THEME through to the CLI, so a
+            # rotated call stays on the same task as every other provider.
+            argv += ["--append-system-prompt", system]
+        return argv
+    if api == "codex-cli":
+        # `exec` is codex's non-interactive one-shot mode.
+        return [binary, "exec", "--skip-git-repo-check", "-"]
+    raise CliUnavailable(f"no CLI argv defined for api '{api}'")
+
+
+def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
+             timeout: float) -> str:
+    if os.environ.get(_RECURSION_MARKER):
+        raise CliUnavailable(
+            f"refusing to invoke {binary}: already running inside a "
+            "CLI-provider call (nested agents would fan out per rotation step)")
+    argv = _argv_for(api, binary, system)
+    # `codex exec` takes no --append-system-prompt, so the theme is prepended
+    # to the prompt instead. Losing it would let a rotated call wander off the
+    # run's task, which is the whole reason the theme block exists.
+    body = prompt if (api != "codex-cli" or not system) else f"{system}\n\n{prompt}"
+    try:
+        proc = subprocess.run(
+            argv,
+            input=body,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=_recursion_guard_env(),
+            shell=False,
+        )
+    except FileNotFoundError:
+        raise CliUnavailable(f"{binary}: not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise CliUnavailable(f"{binary}: exceeded {timeout:.0f}s and was killed")
+    except Exception as exc:                                  # pragma: no cover
+        raise CliUnavailable(f"{binary}: {exc}")
+
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "") or out)[-400:]
+        raise CliUnavailable(f"{binary}: exited {proc.returncode}: {tail}")
+    if not out:
+        # An empty answer must never read as a successful empty review.
+        raise CliUnavailable(f"{binary}: returned no output")
+    return out
+
+
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def _extract_json(text: str) -> Any:
+    """Parse JSON out of CLI prose. Raises CliUnavailable when there is none.
+
+    A CLI answers in prose by default, so the object is usually fenced or
+    embedded. Never returns a partial object: the caller's schema check is
+    downstream, and handing it half a payload turns a transport problem into a
+    phantom review defect.
+    """
+    candidates = [text]
+    m = _FENCE.search(text)
+    if m:
+        candidates.insert(0, m.group(1))
+    # Widest balanced span, both object and array shapes.
+    for opener, closer in (("{", "}"), ("[", "]")):
+        i, j = text.find(opener), text.rfind(closer)
+        if 0 <= i < j:
+            candidates.append(text[i:j + 1])
+    for c in candidates:
+        c = (c or "").strip()
+        if not c:
+            continue
+        try:
+            return json.loads(c)
+        except json.JSONDecodeError:
+            continue
+    raise CliUnavailable("CLI output contained no parseable JSON")
+
+
+class CliProvider:
+    """Provider adapter backed by a local, flat-rate CLI."""
+
+    def __init__(self, api: str, model: str, binary: str,
+                 judge_model: Optional[str] = None,
+                 timeout: float = DEFAULT_TIMEOUT_S) -> None:
+        self.api = api
+        self.model = model
+        self.judge_model = judge_model or model
+        self._binary = binary
+        self._timeout = float(timeout or DEFAULT_TIMEOUT_S)
+
+    @property
+    def meter(self) -> str:
+        """Cost label. Both CLIs are flat-rate, so rotated calls bill $0."""
+        return f"{self.api}:subscription"
+
+    def ping(self, **_: Any) -> bool:
+        """Is the CLI actually runnable? A PATH hit is not proof."""
+        try:
+            proc = subprocess.run(
+                [self._binary, "--version"], capture_output=True, text=True,
+                timeout=30, env=_recursion_guard_env(), shell=False,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def complete(self, prompt: str, *, system: Optional[str] = None,
+                 max_tokens: int = 4096, **_: Any) -> str:
+        return _run_cli(self.api, self._binary, prompt, system=system,
+                        timeout=self._timeout)
+
+    def grade(self, prompt: str, *, system: Optional[str] = None,
+              max_tokens: int = 4096, **_: Any) -> str:
+        return self.complete(prompt, system=system, max_tokens=max_tokens)
+
+    def structured(self, prompt: str, schema: Dict[str, Any], *,
+                   system: Optional[str] = None, max_tokens: int = 4096,
+                   **_: Any) -> Any:
+        instruction = (
+            "Reply with a single JSON value that satisfies this schema. "
+            "Output JSON only - no prose, no code fence, no commentary.\n"
+            f"SCHEMA: {json.dumps(schema)}\n\n{prompt}"
+        )
+        return _extract_json(
+            _run_cli(self.api, self._binary, instruction, system=system,
+                     timeout=self._timeout))
+
+
+def make_cli_provider(route: Any) -> CliProvider:
+    """Build a provider for one catalog route, or raise CliUnavailable."""
+    if not _extensions_enabled():
+        raise CliUnavailable(
+            "CLI providers are off (set FLEXFACTOR_ROTATION_EXTENSIONS=1)")
+    api = str(getattr(route, "api", "") or "").strip().lower()
+    binary = cli_binary_for(api)
+    if not binary:
+        want = CLI_BINARIES.get(api, api)
+        raise CliUnavailable(f"{want}: not installed or not on PATH")
+    wire = getattr(route, "wire_model", None) or getattr(route, "model", "") or api
+    return CliProvider(api=api, model=wire, binary=binary,
+                       judge_model=wire)

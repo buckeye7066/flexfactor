@@ -2871,6 +2871,14 @@ def _rotation_route_provider(route):
     wire = route.wire_model or route.model
     if route.is_free and wire:
         _FREE_ROUTE_MODELS.add(wire)   # $0 pricing; see _price_for
+    if route.api in ("codex-cli", "claude-code"):
+        # Flat-rate local CLIs. Transport is a bounded subprocess, not HTTP;
+        # see providers/cli_provider.py for the stdin/recursion/timeout rules.
+        from providers.cli_provider import make_cli_provider
+        return make_cli_provider(route)
+    if route.api == "cursor":
+        from providers.cursor_provider import make_cursor_provider
+        return make_cursor_provider(route)
     if route.api == "ollama":
         return OllamaProvider(wire, judge_model=wire)
     if route.api == "anthropic":
@@ -2971,7 +2979,8 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     left in would be selected, fail at call time, and burn a cooldown cycle —
     across 600+ routes that turns the first sweep into an error tour.
     """
-    if route.api not in ("openai", "anthropic", "ollama"):
+    if route.api not in ("openai", "anthropic", "ollama", "cursor",
+                         "codex-cli", "claude-code"):
         return f"unsupported api '{route.api}'"
     if not route.is_free:
         return "paid (rotation stays free-only)"
@@ -2983,6 +2992,17 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     unfit = _unfit_for_code_reason(getattr(route, "id", "") or getattr(route, "model", ""))
     if unfit:
         return unfit
+    # EXTENDED TRANSPORTS must prove they are BUILDABLE here, not merely that
+    # a binary exists on PATH. This filter's whole job is that an unbuildable
+    # route never reaches the Rotator - one that does gets selected, fails at
+    # call time and burns a cooldown, which across 600+ routes turns the first
+    # sweep into an error tour. A PATH hit is not proof: `claude` and `codex`
+    # are both installed on this machine, so a missing adapter module would
+    # have been admitted and then raised ModuleNotFoundError on selection.
+    if route.api in ("codex-cli", "claude-code", "cursor"):
+        reason = _extended_route_unusable(route)
+        if reason:
+            return reason
     if route.auth_env and not os.environ.get(route.auth_env):
         return f"missing {route.auth_env}"
     if route.api == "anthropic" and not _provider_key_present("anthropic"):
@@ -2995,6 +3015,33 @@ def _route_unusable_reason(route, model_mode: str) -> str:
             host = ""
         if host not in ("127.0.0.1", "localhost", "::1"):
             return "model mode 'local' excludes non-local routes"
+    return ""
+
+
+def _extended_route_unusable(route) -> str:
+    """Why an extended-transport route cannot be served, or '' when it can.
+
+    IMPORTS the adapter rather than probing PATH, because importability is the
+    thing that actually fails. Every failure is returned as a REASON string -
+    never raised - so one broken adapter can never abort the whole catalog
+    filter and take rotation down with it.
+    """
+    api = getattr(route, "api", "")
+    try:
+        if api in ("codex-cli", "claude-code"):
+            from providers.cli_provider import cli_binary_for, _extensions_enabled
+            if not _extensions_enabled():
+                return "extended providers off (FLEXFACTOR_ROTATION_EXTENSIONS)"
+            if not cli_binary_for(api):
+                return f"{api}: CLI not installed or not on PATH"
+            return ""
+        if api == "cursor":
+            from providers.cursor_provider import _cursor_base_url
+            if not _cursor_base_url() and not getattr(route, "base_url", ""):
+                return "Cursor HTTP endpoint is not configured"
+            return ""
+    except Exception as exc:
+        return f"{api}: adapter unavailable ({exc.__class__.__name__}: {exc})"
     return ""
 
 

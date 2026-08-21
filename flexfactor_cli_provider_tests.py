@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""CLI-backed rotation providers (`claude-code`, `codex-cli`) and the filter.
+
+THE DEFECT THESE EXIST TO PREVENT
+---------------------------------
+A proposed change added `codex-cli` / `claude-code` branches whose factory did
+`from providers.cli_provider import make_cli_provider` while that module DID
+NOT EXIST, and guarded the routes with nothing but `shutil.which()`. On this
+machine both binaries ARE on PATH, so the filter would have ADMITTED the routes
+and the factory would have raised ModuleNotFoundError the moment one was
+selected — precisely the "unbuildable route reaches the Rotator, fails at call
+time, burns a cooldown" failure the filter exists to stop.
+
+So the load-bearing property is not "the provider works". It is: an adapter
+that cannot be imported must be EXCLUDED WITH A REASON, and must never take
+the rest of the catalog down with it.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import flexfactor as ff
+from providers import cli_provider as cp
+
+
+class Route:
+    def __init__(self, api, model="m", is_free=True, base_url=""):
+        self.api = api
+        self.model = model
+        self.wire_model = model
+        self.is_free = is_free
+        self.auth_env = None
+        self.base_url = base_url
+        self.id = model
+
+
+def _ext_on():
+    os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "1"
+
+
+class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
+    def setUp(self):
+        self._prev = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
+        _ext_on()
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
+        else:
+            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prev
+
+    def test_a_missing_adapter_is_a_REASON_not_an_exception(self):
+        """The whole point. A PATH hit must not admit an unimportable route."""
+        real = cp.cli_binary_for
+        try:
+            # Simulate the module being absent by making the helper raise the
+            # same way an absent import does.
+            def boom(_api):
+                raise ModuleNotFoundError("No module named 'providers.cli_provider'")
+            cp.cli_binary_for = boom
+            reason = ff._extended_route_unusable(Route("claude-code"))
+        finally:
+            cp.cli_binary_for = real
+        self.assertIn("adapter unavailable", reason)
+        self.assertIn("ModuleNotFoundError", reason)
+
+    def test_one_broken_adapter_never_breaks_the_REST_of_the_catalog(self):
+        """A filter that raises takes rotation down entirely."""
+        real = cp.cli_binary_for
+        try:
+            cp.cli_binary_for = lambda _api: (_ for _ in ()).throw(RuntimeError("boom"))
+            self.assertNotEqual(ff._route_unusable_reason(Route("claude-code"), "auto"), "")
+            # An ordinary route is still evaluated normally.
+            self.assertEqual(ff._route_unusable_reason(Route("openai"), "auto"), "")
+        finally:
+            cp.cli_binary_for = real
+
+    def test_an_unknown_api_is_still_rejected(self):
+        self.assertIn("unsupported api",
+                      ff._route_unusable_reason(Route("bogus-api"), "auto"))
+
+    def test_extended_apis_are_accepted_by_the_api_allowlist(self):
+        # Regression: the allowlist must actually name them, or they are
+        # rejected before the buildability check is ever consulted.
+        for api in ("cursor", "codex-cli", "claude-code"):
+            self.assertNotIn("unsupported api",
+                             ff._route_unusable_reason(Route(api), "auto"))
+
+    def test_a_paid_extended_route_is_still_refused(self):
+        """Rotation stays FREE-ONLY; a new transport must not smuggle paid in."""
+        self.assertIn("paid", ff._route_unusable_reason(
+            Route("claude-code", is_free=False), "auto"))
+
+    def test_extensions_off_disables_the_cli_routes(self):
+        os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
+        self.assertIn("extended providers off",
+                      ff._route_unusable_reason(Route("claude-code"), "auto"))
+
+
+class CliProviderBehaviourTests(unittest.TestCase):
+    def setUp(self):
+        _ext_on()
+
+    def test_the_prompt_travels_on_STDIN_never_argv(self):
+        """WinPS 5.1 mangles quotes in native args; a review prompt is full of
+        braces and quotes, so argv would corrupt it."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            p = cp.CliProvider("claude-code", "m", "claude")
+            p.complete("SECRET_PROMPT_TEXT {\"a\": 1}")
+        finally:
+            subprocess.run = real
+        self.assertIn("SECRET_PROMPT_TEXT", seen["input"])
+        self.assertNotIn("SECRET_PROMPT_TEXT", " ".join(seen["argv"]))
+
+    def test_a_nonzero_exit_raises_rather_than_returning_empty(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="boom")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            with self.assertRaises(cp.CliUnavailable):
+                cp.CliProvider("claude-code", "m", "claude").complete("x")
+        finally:
+            subprocess.run = real
+
+    def test_an_EMPTY_answer_is_a_failure_not_a_clean_review(self):
+        """An empty result recorded as success is the silent-no-op class."""
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout="   ", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            with self.assertRaises(cp.CliUnavailable):
+                cp.CliProvider("claude-code", "m", "claude").complete("x")
+        finally:
+            subprocess.run = real
+
+    def test_a_timeout_is_bounded_and_reported(self):
+        def fake_run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 1))
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            with self.assertRaises(cp.CliUnavailable):
+                cp.CliProvider("claude-code", "m", "claude", timeout=1).complete("x")
+        finally:
+            subprocess.run = real
+
+    def test_every_call_passes_a_timeout(self):
+        """An unbounded wait is what froze a live run for 25+ minutes."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["timeout"] = kw.get("timeout")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            cp.CliProvider("claude-code", "m", "claude").complete("x")
+        finally:
+            subprocess.run = real
+        self.assertIsNotNone(seen["timeout"])
+        self.assertGreater(seen["timeout"], 0)
+
+    def test_it_REFUSES_to_recurse(self):
+        """`claude` called from inside a CLI-provider call would fan out one
+        nested agent per rotation step."""
+        os.environ[cp._RECURSION_MARKER] = "1"
+        try:
+            with self.assertRaises(cp.CliUnavailable):
+                cp.CliProvider("claude-code", "m", "claude").complete("x")
+        finally:
+            os.environ.pop(cp._RECURSION_MARKER, None)
+
+    def test_structured_extracts_json_from_prose_and_fences(self):
+        for payload in ('{"ok": 1}',
+                        'Sure!\n```json\n{"ok": 1}\n```\n',
+                        'Here you go: {"ok": 1} — done'):
+            def fake_run(argv, **kw):
+                return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+            real = subprocess.run
+            subprocess.run = fake_run
+            try:
+                out = cp.CliProvider("claude-code", "m", "claude").structured("x", {})
+            finally:
+                subprocess.run = real
+            self.assertEqual(out, {"ok": 1})
+
+    def test_unparseable_json_raises_instead_of_returning_junk(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout="no json here", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            with self.assertRaises(cp.CliUnavailable):
+                cp.CliProvider("claude-code", "m", "claude").structured("x", {})
+        finally:
+            subprocess.run = real
+
+    def test_the_work_theme_reaches_the_cli(self):
+        """Owner requirement: rotated calls stay ON TASK. The theme must be
+        carried, or a rotated provider wanders off the run's purpose."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        real = subprocess.run
+
+        subprocess.run = fake_run
+        try:
+            cp.CliProvider("claude-code", "m", "claude").complete("p", system="THEME_MARKER")
+        finally:
+            subprocess.run = real
+        self.assertIn("THEME_MARKER", " ".join(seen["argv"]) + (seen["input"] or ""))
+
+        subprocess.run = fake_run
+        try:
+            cp.CliProvider("codex-cli", "m", "codex").complete("p", system="THEME_MARKER")
+        finally:
+            subprocess.run = real
+        # codex exec takes no --append-system-prompt, so it must ride the prompt.
+        self.assertIn("THEME_MARKER", seen["input"])
+
+    def test_billing_label_marks_these_flat_rate(self):
+        self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").meter)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
