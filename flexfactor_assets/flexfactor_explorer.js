@@ -37,8 +37,21 @@ const DANGEROUS = /delete|remove|destroy|purchase|pay\b|send|publish|deploy|logo
 const PROTECTED_PATH = /\/admin|\/settings|\/dashboard|\/account/i;
 const LOGIN_PATH = /login|signin|sign-in|auth/i;
 const DENIED_TEXT = /\bforbidden\b|not authori[sz]ed|access denied|unauthori[sz]ed|please (log|sign) in|permission denied/i;
-const NAV_TIMEOUT = 30000;
+const ACTION_TIMEOUT_MS = Math.max(1000, parseInt(process.env.FLEXFACTOR_E2E_ACTION_TIMEOUT_MS || '15000', 10) || 15000);
+const PAGE_TIMEOUT_MS = Math.max(ACTION_TIMEOUT_MS, parseInt(process.env.FLEXFACTOR_E2E_PAGE_TIMEOUT_MS || '60000', 10) || 60000);
+const RUN_TIMEOUT_MS = Math.max(5000, parseInt(process.env.FLEXFACTOR_E2E_RUN_TIMEOUT_MS || '600000', 10) || 600000);
+const NAV_TIMEOUT = Math.min(30000, ACTION_TIMEOUT_MS);
 const SETTLE_MS = 1500;
+const T0 = Date.now();
+const progress = (msg) => { try { process.stderr.write(`[explorer +${((Date.now() - T0) / 1000).toFixed(1)}s] ${msg}\n`); } catch {} };
+let emitted = false;
+function emit(line, code) {
+  if (emitted) return;
+  emitted = true;
+  const done = () => process.exit(code);
+  const fallback = setTimeout(done, 2000);
+  try { process.stdout.write(line + '\n', () => { clearTimeout(fallback); done(); }); } catch { done(); }
+}
 const EXPECTED_4XX_CONSOLE = /Failed to load resource: the server responded with a status of 4\d\d/;
 
 function parseViewports(raw) {
@@ -110,11 +123,23 @@ function sampleValue(kind, field) {
   const pendingDestructiveControls = [];
   let controls = 0, journeyId = 0, shotId = 0;
   if (roleError) incomplete.push(roleError);
+  const timeouts = [];
+  // every awaited browser action races a deadline: a hang becomes a named `timeout` finding, never a stall
+  function withDeadline(promise, ms, label) {
+    let timer;
+    const gate = new Promise((_, reject) => { timer = setTimeout(() => {
+      findings.push({ kind: 'timeout', label, ms });
+      timeouts.push(label);
+      reject(new Error(`timeout after ${ms}ms: ${label}`));
+    }, ms); });
+    return Promise.race([Promise.resolve(promise), gate]).finally(() => clearTimeout(timer));
+  }
+  const act = (promise, label) => withDeadline(promise, ACTION_TIMEOUT_MS, label);
 
   const addJourney = (row) => { const j = { id: `j${++journeyId}`, ...row }; journeys.push(j); return j; };
   const shot = async (page, name) => {
     const file = `${name}-${++shotId}.png`;
-    try { await page.screenshot({ path: path.join(artifactDir, file), fullPage: true }); artifacts.push(file); return file; }
+    try { await act(page.screenshot({ path: path.join(artifactDir, file), fullPage: true, timeout: ACTION_TIMEOUT_MS }), `screenshot ${name}`); artifacts.push(file); return file; }
     catch (e) { errors.push(`screenshot ${name}: ${e.message}`); return null; }
   };
   const normalize = (href) => { try { const u = new URL(href, base); u.hash = ''; return u.href; } catch { return null; } };
@@ -127,13 +152,39 @@ function sampleValue(kind, field) {
   };
   addRoute(base.href);
 
-  const browser = await chromium.launch({ headless: true });
+  let browser = null;
+  const buildResult = () => {
+    if (unvisitedByCap.size && !incomplete.some((x) => x.startsWith('page cap '))) incomplete.push(`page cap ${maxPages} reached; ${unvisitedByCap.size} discovered routes unvisited`);
+    if (!routes.length && !incomplete.includes('no routes discovered')) incomplete.push('no routes discovered');
+    const summary = { passed: 0, failed: 0, skipped: 0, total: journeys.length };
+    for (const j of journeys) summary[j.status] = (summary[j.status] || 0) + 1;
+    const complete = errors.length === 0 && skipped.length === 0 && incomplete.length === 0 && summary.failed === 0
+      && accessibility.violations.length === 0 && performance.slow.length === 0 && routes.length > 0 && timeouts.length === 0;
+    return {
+      pages: routes.length, controls, errors, skipped, routeEvidence, controlEvidence, formEvidence, accessibility, performance,
+      artifacts, roles: roles.map((r) => r.name), viewports: viewports.map((v) => v.label), isolated, maxPages,
+      authorization_matrix: authz.map(({ route, role, outcome, signal, httpStatus }) => ({ route, role, outcome, signal, httpStatus })),
+      findings, journeys, summary, timeouts, incomplete_reasons: incomplete, complete,
+      elapsedMs: Date.now() - T0, runTimeoutMs: RUN_TIMEOUT_MS,
+    };
+  };
+  // whole-run watchdog: emit whatever evidence exists, then leave - the browser is closed on a best-effort deadline
+  const watchdog = setTimeout(async () => {
+    progress(`RUN TIMEOUT after ${RUN_TIMEOUT_MS}ms - emitting partial result`);
+    incomplete.push('run timeout');
+    incomplete.push(`run timeout: FLEXFACTOR_E2E_RUN_TIMEOUT_MS=${RUN_TIMEOUT_MS} elapsed before the engine finished`);
+    emit('FLEXFACTOR_E2E_RESULT=' + JSON.stringify(buildResult()), 1);
+    try { if (browser) await withDeadline(browser.close(), 1500, 'browser.close (watchdog)'); } catch {}
+    process.exit(1);
+  }, RUN_TIMEOUT_MS);
+  progress(`start base=${base.href} isolated=${isolated} roles=${roles.map((r) => r.name).join(',')} viewports=${viewports.map((v) => v.label).join(',')} maxPages=${maxPages} runTimeout=${RUN_TIMEOUT_MS}ms`);
+  browser = await withDeadline(chromium.launch({ headless: true }), Math.max(ACTION_TIMEOUT_MS, 60000), 'chromium.launch');
 
   // ---- per-role context setup -------------------------------------------------------------
   async function openContext(role, viewport) {
     const ctx = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height }, ignoreHTTPSErrors: true });
-    ctx.on('dialog', (d) => d.accept().catch(() => {}));
-    ctx.on('page', (p) => p.on('dialog', (d) => d.accept().catch(() => {})));
+    ctx.on('dialog', (d) => d.dismiss().catch(() => {}));
+    ctx.on('page', (p) => { if (p.listenerCount('dialog') === 0) p.on('dialog', (d) => d.dismiss().catch(() => {})); });
     if (Array.isArray(role.cookies) && role.cookies.length) {
       await ctx.addCookies(role.cookies.map((c) => (c.url || c.domain) ? c : { ...c, url: base.origin }));
     }
@@ -148,6 +199,8 @@ function sampleValue(kind, field) {
     const login = role.login;
     if (!login || !login.url) return true;
     const page = await ctx.newPage();
+    page.removeAllListeners('dialog');
+    page.on('dialog', (d) => d.dismiss().catch(() => {}));
     const target = normalize(login.url);
     const started = Date.now();
     let ok = true, reason = null;
@@ -171,7 +224,10 @@ function sampleValue(kind, field) {
     return ok;
   }
 
-  function attachListeners(page, state) {
+  function attachListeners(page, state, { acceptDialogs = false } = {}) {
+    state.dialogs = state.dialogs || [];
+    page.removeAllListeners('dialog');
+    page.on('dialog', (d) => { state.dialogs.push({ type: d.type(), message: d.message(), action: acceptDialogs ? 'accept' : 'dismiss' }); (acceptDialogs ? d.accept() : d.dismiss()).catch(() => {}); });
     page.on('pageerror', (e) => state.errors.push(`pageerror: ${e.message}`));
     page.on('console', (m) => {
       if (m.type() !== 'error') return;
@@ -245,7 +301,7 @@ function sampleValue(kind, field) {
     try { resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }); }
     catch (e) { state.errors.push(`navigation: ${e.message}`); }
     const durationMs = Date.now() - started;
-    const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+    const bodyText = await act(page.evaluate(() => document.body ? document.body.innerText : ''), `bodyText ${url}`).catch(() => '');
     const { outcome, signal } = classify(resp, page.url(), bodyText);
     if (outcome === 'error') state.errors.push(`${signal}`);
     const httpStatus = resp ? resp.status() : null;
@@ -263,18 +319,18 @@ function sampleValue(kind, field) {
       if (durationMs > 5000) performance.slow.push({ url, role: role.name, durationMs, thresholdMs: 5000 });
       const contentType = resp ? String((resp.headers() || {})['content-type'] || '') : '';
       if (outcome === 'permitted' && /text\/html|xhtml/i.test(contentType)) {
-        const a11y = await a11yCheck(page);
+        const a11y = await act(a11yCheck(page), `a11y ${url}`).catch(() => []);
         accessibility.checked++;
         for (const v of a11y) accessibility.violations.push({ url, role: role.name, message: v });
       } else if (outcome === 'permitted') {
         accessibility.notApplicable = (accessibility.notApplicable || []).concat([{ url, role: role.name, contentType }]);
       }
       screenshot = await shot(page, `page-${role.name}`);
-      const links = await page.locator('a[href]').evaluateAll((els) => els.map((e) => e.href)).catch(() => []);
+      const links = await act(page.locator('a[href]').evaluateAll((els) => els.map((e) => e.href)), `links ${url}`).catch(() => []);
       for (const href of links) if (!/^(mailto|tel|javascript):/i.test(href)) addRoute(href);
       // forms: discover (dedupe by signature); executed in a later phase
       if (outcome === 'permitted') {
-        for (const f of await describeForms(page)) {
+        for (const f of await act(describeForms(page), `describeForms ${url}`).catch(() => [])) {
           const key = `${normalize(f.action || url)}|${f.method}|${f.fields.map((x) => x.name || x.id || x.type).join(',')}`;
           if (!formsSeen.has(key)) {
             const destructive = DANGEROUS.test(f.submitLabel) || DANGEROUS.test(new URL(f.action || url, base).pathname);
@@ -283,13 +339,23 @@ function sampleValue(kind, field) {
         }
         await exerciseControls(role, page, url, state);
       }
-      try { await page.keyboard.press('Tab'); } catch (e) { state.errors.push(`keyboard navigation: ${e.message}`); }
+      try { await act(page.keyboard.press('Tab'), `tab ${url}`); } catch (e) { state.errors.push(`keyboard navigation: ${e.message}`); }
     }
     for (const e of state.errors) errors.push(`${url} [${role.name}]: ${e}`);
     const row = { url, role: role.name, status: state.errors.length ? 'failed' : 'passed', outcome, signal, httpStatus, durationMs, screenshot, errors: state.errors, denied4xxConsole: state.denied4xx };
+    if (state.dialogs && state.dialogs.length) row.dialogs = state.dialogs;
     routeEvidence.push(row);
     addJourney({ kind: crawl ? 'route' : 'authz', role: role.name, viewport: viewports[0].label, target: url, status: row.status, reason: state.errors[0] || null, screenshot, outcome, httpStatus });
-    await page.close();
+    await act(page.close(), `close ${url}`).catch(() => {});
+  }
+  // per-page deadline: a hung page becomes a failed journey + timeout finding, the run moves on
+  async function guardedVisit(role, ctx, url, opts) {
+    try { await withDeadline(visitRoute(role, ctx, url, opts), PAGE_TIMEOUT_MS, `page ${url} [${role.name}]`); }
+    catch (e) {
+      errors.push(`${url} [${role.name}]: ${e.message}`);
+      if (!authz.some((a) => a.route === url && a.role === role.name)) authz.push({ route: url, role: role.name, outcome: 'error', signal: 'page timeout', httpStatus: null, finalUrl: null });
+      addJourney({ kind: opts.crawl ? 'route' : 'authz', role: role.name, viewport: viewports[0].label, target: url, status: 'failed', reason: e.message });
+    }
   }
 
   // controls outside forms (form submit buttons are covered by the form journeys)
@@ -325,7 +391,7 @@ function sampleValue(kind, field) {
       const responses = [];
       const onResp = (r) => responses.push({ url: r.url(), status: r.status(), method: r.request().method() });
       page.on('response', onResp);
-      try { await control.click({ timeout: 5000 }); await page.waitForTimeout(150); }
+      try { await act(control.click({ timeout: 5000 }).then(() => page.waitForTimeout(150)), `click "${label}" on ${url}`); }
       catch (e) { status = 'failed'; error = e.message; state.errors.push(`control "${label}": ${e.message}`); }
       page.off('response', onResp);
       if (normalize(page.url()) !== normalize(url)) {
@@ -466,7 +532,7 @@ function sampleValue(kind, field) {
       row.status = 'submitted';
       const modes = ['valid', 'empty', 'oversized', 'malformed-email'];
       for (const mode of modes) {
-        const c = await runFormCase(role, ctx, form, mode);
+        const c = await withDeadline(runFormCase(role, ctx, form, mode), PAGE_TIMEOUT_MS, `form ${form.action || form.url} [${mode}]`).catch((e) => ({ mode, status: 'failed', reason: e.message }));
         row.cases.push(c);
         if (c.status === 'not-applicable') continue;
         addJourney({ kind: mode === 'valid' ? 'form' : 'form-case', role: role.name, viewport: viewports[0].label, target: `${form.method} ${form.action || form.url} [${mode}]`, status: c.status, reason: c.reason || null, screenshot: c.screenshot || null, httpStatus: c.httpStatus ?? null });
@@ -476,7 +542,7 @@ function sampleValue(kind, field) {
       const valid = row.cases.find((c) => c.mode === 'valid');
       if (!duplicateDone && valid && valid.backendAccepted) {
         duplicateDone = true;
-        const c = await runDuplicate(role, ctx, { ...form, replayData: valid.data });
+        const c = await withDeadline(runDuplicate(role, ctx, { ...form, replayData: valid.data }), PAGE_TIMEOUT_MS, `form ${form.action || form.url} [duplicate]`).catch((e) => ({ mode: 'duplicate', status: 'failed', reason: e.message }));
         row.cases.push(c);
         addJourney({ kind: 'duplicate', role: role.name, viewport: viewports[0].label, target: `${form.method} ${form.action || form.url} [duplicate]`, status: c.status, reason: c.reason || null, screenshot: c.screenshot || null, httpStatus: c.httpStatus ?? null });
       }
@@ -496,8 +562,8 @@ function sampleValue(kind, field) {
         formEvidence.push(row); continue;
       }
       const fresh = await openContext(role, viewports[0]);
-      const ok = await performLoginQuiet(role, fresh);
-      const c = ok ? await runFormCase(role, fresh, form, 'valid') : { mode: 'valid', status: 'failed', reason: `could not re-login role ${role.name} in fresh context` };
+      const ok = await withDeadline(performLoginQuiet(role, fresh), PAGE_TIMEOUT_MS, `re-login ${role.name}`).catch(() => false);
+      const c = ok ? await withDeadline(runFormCase(role, fresh, form, 'valid'), PAGE_TIMEOUT_MS, `destructive form ${form.action || form.url}`).catch((e) => ({ mode: 'valid', status: 'failed', reason: e.message })) : { mode: 'valid', status: 'failed', reason: `could not re-login role ${role.name} in fresh context` };
       if (!ok) errors.push(c.reason);
       await fresh.close().catch(() => {});
       row.status = 'submitted-destructive'; row.cases.push(c);
@@ -510,7 +576,9 @@ function sampleValue(kind, field) {
     if (!role.login) return true;
     try {
       const page = await ctx.newPage();
-      await page.goto(normalize(role.login.url), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+      page.removeAllListeners('dialog');
+      page.on('dialog', (d) => d.dismiss().catch(() => {}));
+      await act(page.goto(normalize(role.login.url), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }), 'login goto');
       for (const [sel, val] of Object.entries(role.login.fields || {})) await page.fill(sel, String(val), { timeout: 10000 });
       const settle = page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
       if (role.login.submit) await page.click(role.login.submit, { timeout: 10000 }); else await page.keyboard.press('Enter');
@@ -553,24 +621,27 @@ function sampleValue(kind, field) {
       const fresh = await openContext(item.role, viewports[0]);
       const page = await fresh.newPage();
       const state = { errors: [], denied4xx: [] };
-      attachListeners(page, state);
+      attachListeners(page, state, { acceptDialogs: true });
       const responses = [];
       fresh.on('response', (r) => responses.push({ url: r.url(), status: r.status(), method: r.request().method() }));
       let status = 'passed', error = null, before = null, after = null;
       try {
-        const ok = await performLoginQuiet(item.role, fresh);
+        const ok = await withDeadline(performLoginQuiet(item.role, fresh), PAGE_TIMEOUT_MS, `re-login ${item.role.name}`).catch(() => false);
         if (!ok) throw new Error(`could not re-login role ${item.role.name} in fresh context`);
-        await page.goto(item.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-        before = await shot(page, `destructive-before`);
-        await page.locator(item.selector).nth(item.index).click({ timeout: 5000 });
-        await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
-        await page.waitForTimeout(SETTLE_MS);
-        after = await shot(page, `destructive-after`);
+        await withDeadline((async () => {
+          await page.goto(item.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+          before = await shot(page, `destructive-before`);
+          await page.locator(item.selector).nth(item.index).click({ timeout: 5000 });
+          await page.waitForLoadState('load', { timeout: 8000 }).catch(() => {});
+          await page.waitForTimeout(SETTLE_MS);
+          after = await shot(page, `destructive-after`);
+        })(), PAGE_TIMEOUT_MS, `destructive control "${item.label}" on ${item.url}`);
       } catch (e) { status = 'failed'; error = e.message; errors.push(`${item.url}: destructive control "${item.label}": ${e.message}`); }
       controls++;
       controlEvidence.push({ ...item.target, status: status === 'passed' ? 'executed-destructive' : 'failed', error, responses: responses.slice(0, 20), screenshotBefore: before, screenshotAfter: after });
       addJourney({ kind: 'destructive', role: item.role.name, viewport: viewports[0].label, target: `${item.url} "${item.label}"`, status, reason: error, screenshot: after || before, responses: responses.slice(0, 10) });
-      await fresh.close().catch(() => {});
+      if (state.dialogs.length) controlEvidence[controlEvidence.length - 1].dialogs = state.dialogs;
+      await act(fresh.close(), 'close destructive context').catch(() => {});
     }
   }
 
@@ -581,21 +652,23 @@ function sampleValue(kind, field) {
         const permittedRow = authz.find((a) => a.route === url && a.outcome === 'permitted');
         const role = permittedRow ? roles.find((r) => r.name === permittedRow.role) : roles[0];
         const ctx = await openContext(role, vp);
-        if (role.login) await performLoginQuiet(role, ctx);
+        if (role.login) await withDeadline(performLoginQuiet(role, ctx), PAGE_TIMEOUT_MS, `re-login ${role.name} @${vp.label}`).catch(() => {});
         const page = await ctx.newPage();
         const state = { errors: [], denied4xx: [] };
         attachListeners(page, state);
         let status = 'passed', reason = null, overflow = null, screenshot = null;
         try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-          overflow = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth, overflow: document.documentElement.scrollWidth > window.innerWidth }));
-          screenshot = await shot(page, `vp-${vp.label}`);
-          if (overflow.overflow) findings.push({ kind: 'horizontal-overflow', route: url, role: role.name, viewport: vp.label, scrollWidth: overflow.scrollWidth, innerWidth: overflow.innerWidth });
+          await withDeadline((async () => {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+            overflow = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth, overflow: document.documentElement.scrollWidth > window.innerWidth }));
+            screenshot = await shot(page, `vp-${vp.label}`);
+            if (overflow.overflow) findings.push({ kind: 'horizontal-overflow', route: url, role: role.name, viewport: vp.label, scrollWidth: overflow.scrollWidth, innerWidth: overflow.innerWidth });
+          })(), PAGE_TIMEOUT_MS, `viewport ${vp.label} ${url}`);
         } catch (e) { status = 'failed'; reason = e.message; errors.push(`${url} @${vp.label}: ${e.message}`); }
         for (const e of state.errors) errors.push(`${url} @${vp.label} [${role.name}]: ${e}`);
         if (state.errors.length && status === 'passed') { status = 'failed'; reason = state.errors[0]; }
         addJourney({ kind: 'viewport', role: role.name, viewport: vp.label, target: url, status, reason, screenshot, overflow });
-        await page.close(); await ctx.close().catch(() => {});
+        await act(page.close(), 'close viewport page').catch(() => {}); await act(ctx.close(), 'close viewport context').catch(() => {});
       }
     }
   }
@@ -608,7 +681,8 @@ function sampleValue(kind, field) {
       const ctx = await openContext(role, viewports[0]);
       await ctx.tracing.start({ screenshots: true, snapshots: true, sources: false }).catch(() => {});
       contexts.set(role.name, ctx);
-      const loggedIn = await performLogin(role, ctx);
+      progress(`phase1 crawl role=${role.name}`);
+      const loggedIn = await withDeadline(performLogin(role, ctx), PAGE_TIMEOUT_MS, `login ${role.name}`).catch((e) => { errors.push(`login ${role.name}: ${e.message}`); return false; });
       if (!loggedIn) { incomplete.push(`role ${role.name} could not log in; its matrix rows are unverified`); }
       const visited = new Set();
       let cursor = 0;
@@ -616,46 +690,49 @@ function sampleValue(kind, field) {
         const url = routes[cursor++];
         if (visited.has(url)) continue;
         visited.add(url);
-        await visitRoute(role, ctx, url, { crawl: true });
+        progress(`visit ${url} [${role.name}]`);
+        await guardedVisit(role, ctx, url, { crawl: true });
       }
     }
     // phase 2: fill the authorization matrix for routes a role never reached during its own crawl
+    progress('phase2 authorization matrix fill');
     for (const role of roles) {
       const ctx = contexts.get(role.name);
       for (const url of routes) {
-        if (!authz.some((a) => a.route === url && a.role === role.name)) await visitRoute(role, ctx, url, { crawl: false });
+        if (!authz.some((a) => a.route === url && a.role === role.name)) await guardedVisit(role, ctx, url, { crawl: false });
       }
     }
     // phase 3: forms (non-destructive first, duplicate check, then destructive in fresh contexts)
+    progress(`phase3 forms (${formsSeen.size} discovered, isolated=${isolated})`);
     await runForms(contexts);
     // phase 4: viewports
+    progress(`phase4 viewports (${routes.length} routes x ${viewports.length})`);
     await runViewports();
     // phase 5: destructive controls last, each in a fresh context
+    progress(`phase5 destructive controls (${pendingDestructiveControls.length} pending)`);
     await runDestructiveControls();
+    progress('phases done');
   } catch (e) {
     errors.push(`explorer crashed: ${e.stack || e.message}`);
     incomplete.push(`explorer crashed before finishing: ${e.message}`);
   } finally {
+    // teardown runs on EVERY path (cap reached, crash, normal) and is itself deadline-bounded
+    progress('teardown: traces + contexts + browser');
     for (const [name, ctx] of contexts) {
       const file = `playwright-trace-${name}.zip`;
-      await ctx.tracing.stop({ path: path.join(artifactDir, file) }).then(() => artifacts.push(file)).catch(() => {});
-      await ctx.close().catch(() => {});
+      await withDeadline(ctx.tracing.stop({ path: path.join(artifactDir, file) }), Math.max(ACTION_TIMEOUT_MS, 30000), `tracing.stop ${name}`).then(() => artifacts.push(file)).catch((e) => errors.push(`trace ${name}: ${e.message}`));
+      await act(ctx.close(), `context.close ${name}`).catch(() => {});
     }
-    await browser.close().catch(() => {});
+    if (browser) await act(browser.close(), 'browser.close').catch((e) => { errors.push(`browser.close: ${e.message}`); });
+    clearTimeout(watchdog);
   }
 
-  if (unvisitedByCap.size) incomplete.push(`page cap ${maxPages} reached; ${unvisitedByCap.size} discovered routes unvisited`);
-  if (!routes.length) incomplete.push('no routes discovered');
-  const summary = { passed: 0, failed: 0, skipped: 0, total: journeys.length };
-  for (const j of journeys) summary[j.status] = (summary[j.status] || 0) + 1;
-  const complete = errors.length === 0 && skipped.length === 0 && incomplete.length === 0 && summary.failed === 0
-    && accessibility.violations.length === 0 && performance.slow.length === 0 && routes.length > 0;
-  const result = {
-    pages: routes.length, controls, errors, skipped, routeEvidence, controlEvidence, formEvidence, accessibility, performance,
-    artifacts, roles: roles.map((r) => r.name), viewports: viewports.map((v) => v.label), isolated, maxPages,
-    authorization_matrix: authz.map(({ route, role, outcome, signal, httpStatus }) => ({ route, role, outcome, signal, httpStatus })),
-    findings, journeys, summary, incomplete_reasons: incomplete, complete,
-  };
-  console.log('FLEXFACTOR_E2E_RESULT=' + JSON.stringify(result));
-  process.exit(complete ? 0 : 1);
-})().catch((e) => { console.error(e.stack || String(e)); process.exit(2); });
+  const result = buildResult();
+  progress(`done complete=${result.complete} journeys=${result.summary.total} errors=${errors.length} skipped=${skipped.length} timeouts=${timeouts.length}`);
+  emit('FLEXFACTOR_E2E_RESULT=' + JSON.stringify(result), result.complete ? 0 : 1);
+})().catch((e) => {
+  console.error(e.stack || String(e));
+  // even a crash before the engine body emits a machine-readable, complete=false result
+  if (!emitted) emit('FLEXFACTOR_E2E_RESULT=' + JSON.stringify({ pages: 0, controls: 0, errors: [`explorer crashed: ${e.message}`], skipped: [], routeEvidence: [], controlEvidence: [], formEvidence: [], accessibility: { checked: 0, violations: [] }, performance: { pages: [], slow: [] }, artifacts: [], journeys: [], authorization_matrix: [], findings: [], summary: { passed: 0, failed: 0, skipped: 0, total: 0 }, incomplete_reasons: [`explorer crashed: ${e.message}`], complete: false }), 2);
+  else process.exit(2);
+});

@@ -10,6 +10,8 @@
  *   GET  /contact/list  JSON {submissions, received, deletes} (backend state for tests)
  *   GET  /delete-all    page with a destructive POST form; POST /delete-all wipes submissions
  *   GET  /wide          page with a 1400px-wide table (overflows at 390px)
+ *   GET  /hang-index    NOT linked from /: links to /hang (a route that never responds) - watchdog test
+ *   GET  /hang          never responds (socket held open until the server exits)
  */
 'use strict';
 const http = require('http');
@@ -101,6 +103,14 @@ const server = http.createServer(async (req, res) => {
     }
     state.deletes++; state.submissions = [];
     return send(res, 200, page('Deleted', '<h1>All submissions deleted</h1>'));
+  }
+  if (p === '/hang-index' && req.method === 'GET') {
+    return send(res, 200, page('Hang index', '<h1>Hang index</h1><p><a href="/hang">Hanging route</a></p>'));
+  }
+  if (p === '/hang') {
+    state.hanging = (state.hanging || 0) + 1;
+    req.socket.setTimeout(0);
+    return; // deliberately never responds
   }
   if (p === '/wide' && req.method === 'GET') {
     const cells = Array.from({ length: 14 }, (_, i) => `<td>col ${i + 1}</td>`).join('');

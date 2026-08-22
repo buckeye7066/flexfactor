@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import flexfactor_journeys as fj  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "eval_fixtures", "journeys", "app.js")
-EXPLORER_TIMEOUT_S = 120
+EXPLORER_TIMEOUT_S = 300
 PLAYWRIGHT_NODE_MODULES_CANDIDATES = [
     os.path.join(HERE, "node_modules"),
     r"C:\Users\firer\GrantFlow\node_modules",
@@ -237,12 +237,17 @@ class ExplorerIntegrationTests(unittest.TestCase):
         self.artifacts = tempfile.mkdtemp(prefix="flexfactor-journeys-")
         self.addCleanup(shutil.rmtree, self.artifacts, True)
 
-    def _run_explorer(self, roles, isolated, max_pages=None):
-        env = {**os.environ, "NODE_PATH": self.node_modules, **fj.journey_env(roles, isolated, None, max_pages)}
+    def _run_explorer(self, roles, isolated, max_pages=None, base=None, extra_env=None, timeout=EXPLORER_TIMEOUT_S):
+        env = {**os.environ, "NODE_PATH": self.node_modules, **fj.journey_env(roles, isolated, None, max_pages), **(extra_env or {})}
         started = time.time()
-        cp = subprocess.run([self.node, fj.explorer_script_path(), self.fixture.base, self.artifacts],
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=EXPLORER_TIMEOUT_S, env=env)
+        try:
+            cp = subprocess.run([self.node, fj.explorer_script_path(), base or self.fixture.base, self.artifacts],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
+        except subprocess.TimeoutExpired as ex:
+            err = ex.stderr.decode("utf-8", "replace") if isinstance(ex.stderr, bytes) else (ex.stderr or "")
+            self.fail(f"explorer exceeded {timeout}s (isolated={isolated}); last progress lines:\n{err[-3000:]}")
         elapsed = time.time() - started
+        print(f"\n[explorer run] isolated={isolated} max_pages={max_pages} rc={cp.returncode} elapsed={elapsed:.1f}s", flush=True)
         result = fj.parse_result((cp.stdout or "") + "\n" + (cp.stderr or ""))
         self.assertIsNotNone(result, f"no FLEXFACTOR_E2E_RESULT line; rc={cp.returncode}\nstderr tail: {(cp.stderr or '')[-1500:]}")
         return cp, result, elapsed
@@ -371,6 +376,23 @@ class ExplorerIntegrationTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("page cap" in x for x in reasons), reasons)
         self.assertTrue(any("FLEXFACTOR_E2E_ISOLATED not set" in x for x in reasons), reasons)
+
+    def test_run_watchdog_emits_result_on_hanging_route(self):
+        # /hang never answers (fixture holds the socket); the whole-run watchdog must still produce a result
+        cp, r, elapsed = self._run_explorer([], isolated=False, base=self.fixture.base + "hang-index",
+                                            extra_env={"FLEXFACTOR_E2E_RUN_TIMEOUT_MS": "20000"}, timeout=90)
+        self.assertLess(elapsed, 45, f"watchdog did not bound the run: {elapsed:.1f}s")
+        self.assertEqual(cp.returncode, 1)
+        self.assertFalse(r["complete"])
+        self.assertIn("run timeout", r["incomplete_reasons"], r["incomplete_reasons"])
+        self.assertEqual(r["runTimeoutMs"], 20000)
+        self.assertGreaterEqual(r["elapsedMs"], 20000)
+        # evidence gathered before the hang survives: the index page was visited
+        self.assertTrue(any(j["kind"] == "route" and j["target"].endswith("/hang-index") for j in r["journeys"]), r["journeys"])
+        ok, reasons = fj.completeness(r)
+        self.assertFalse(ok)
+        self.assertIn("run timeout", reasons)
+        self.assertEqual(self.fixture.get_json("/contact/list")["hanging"], 1)
 
 
 if __name__ == "__main__":
