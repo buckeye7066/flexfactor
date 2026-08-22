@@ -58,7 +58,6 @@ py-modules = [
   "flexfactor_trust",
   "flexfactor_web",
   "flexfactor_wip",
-  "probe_tiers",
 ]
 
 [tool.setuptools.package-data]
