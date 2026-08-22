@@ -5045,10 +5045,7 @@ def _tool_authored_syntax_check(cmd: list[str]) -> bool:
     call 'build'; this is the only carve-out, and it is by ARGUMENT SHAPE."""
     if not cmd:
         return False
-    exe = os.path.basename(str(cmd[0])).lower()
-    for suffix in (".exe", ".cmd", ".bat"):
-        if exe.endswith(suffix):
-            exe = exe[: -len(suffix)]
+    exe = _cmd_policy._exe_name(cmd)  # one normaliser for both gates
     if exe not in _INTERPRETERS:
         return False
     args = [str(a) for a in cmd[1:]]

@@ -15410,6 +15410,9 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
                           # (network on), python -m pytest a TEST
                           (["python", "-m", "pip", "install", "-r", "r.txt"], "install"),
                           ([r"C:\\Python314\\python.exe", "-m", "pip", "install", "x"], "install"),
+                          (["/usr/bin/python3.12", "-m", "pip", "install", "x"], "install"),
+                          (["python3.12", "-m", "pytest"], "test"),
+                          ([sys.executable, "-m", "pytest"], "test"),
                           (["python", "-m", "pytest", "-q"], "test"),
                           (["python", "-m", "coverage", "run", "-m", "pytest"], "test")):
             self.assertIn(want, cp.classify_command(cmd), cmd)

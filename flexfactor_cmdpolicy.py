@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 # The full class vocabulary (for reports/telemetry).
 ALL_CLASSES = frozenset({
@@ -78,11 +79,23 @@ _SHELL_INLINE_FLAGS = {"-command", "-c", "/c", "/k", "-encodedcommand", "-e",
                        "-enc", "-ec"}
 
 
+_VERSIONED_PYTHON = re.compile(r"^python(w?)(\d+(\.\d+)?)?$")
+
+
 def _exe_name(cmd: list[str]) -> str:
+    """Normalised executable name: any path separator, no extension, and a
+    versioned interpreter (`python3.12`, `python3`, `pythonw3.11`) collapses
+    to `python`/`pythonw` so the interpreter rules cannot be bypassed by the
+    spelling a venv or a Linux distro happens to use (CI caught `python3.12`
+    falling through to 'unknown' - an uncontained execution path)."""
     if not cmd or not cmd[0]:
         return ""
-    base = os.path.basename(str(cmd[0]))
-    return os.path.splitext(base)[0].lower()
+    base = str(cmd[0]).replace("\\", "/").rsplit("/", 1)[-1]
+    name = os.path.splitext(base)[0].lower()
+    m = _VERSIONED_PYTHON.match(name)
+    if m:
+        return "pythonw" if m.group(1) else "python"
+    return name
 
 
 def _positionals(args: list[str], value_opts: set[str] = frozenset()) -> list[str]:
