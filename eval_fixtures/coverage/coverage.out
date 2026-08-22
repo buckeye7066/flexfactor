@@ -1,0 +1,4 @@
+mode: atomic
+example.com/proj/pkg/calc.go:5.24,7.2 1 3
+example.com/proj/pkg/calc.go:9.24,11.2 1 0
+example.com/proj/pkg/calc.go:13.20,15.2 1 1

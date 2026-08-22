@@ -76,12 +76,16 @@ def scan_tree_for_secrets(git: GitRunner, project_dir: str, treeish: str,
                           *, max_files: int = 200, max_bytes: int = 200_000
                           ) -> list[dict]:
     """Scan blob contents of a commit/tree for high-confidence secrets."""
-    ls = git(["ls-tree", "-r", "--name-only", treeish], project_dir)
+    # -z: raw NUL-separated names. Without it git octal-quotes any non-ASCII
+    # path (core.quotePath), `git show sha:"\303\274..."` then fails, and a
+    # secret inside a Unicode-named file is silently never scanned.
+    ls = git(["ls-tree", "-r", "--name-only", "-z", treeish], project_dir)
     if not _ok(ls):
         return [{"category": "scan_error", "path": None,
                  "detail": "ls-tree failed; treat as unscanned"}]
     findings: list[dict] = []
-    names = [n for n in _out(ls).splitlines() if n.strip()][:max_files]
+    raw_names = getattr(ls, "stdout", None) or ""
+    names = [n for n in raw_names.split("\0") if n.strip()][:max_files]
     for path in names:
         # Skip obvious binary/vendor paths
         low = path.lower()
@@ -159,13 +163,26 @@ def capture_orphan_wip_snapshot(git: GitRunner, project_dir: str
     only tool changes.
 
     Returns (ok, ref_name_or_none, secret_findings).
-    On failure the worktree is left as close to the original dirty state as
-    possible (reset of the staging area only).
+    On failure before the ref exists the worktree is left in the original
+    dirty state (only the staging area is reset) and ref is None. If the ref
+    was written but the worktree could not be returned to HEAD, ok is False
+    and ref is STILL returned: the snapshot is safe and recoverable, the tree
+    is simply not clean, and the caller must not proceed as if it were.
+
+    IGNORED FILES ARE NOT CAPTURED. `git add -A` honours .gitignore, and the
+    matching `git clean -fd` (no -x) leaves ignored files on disk untouched,
+    so they survive the run in place rather than in the snapshot.
     """
     # Record porcelain fingerprint for restore verification callers.
     before = git(["status", "--porcelain", "-uall"], project_dir)
     if not _ok(before):
         return False, None, []
+    # Untracked paths captured into the snapshot. After the orphan commit they
+    # are removed INDIVIDUALLY (never `git clean`, which FlexFactor's command
+    # policy classifies destructive because it would also nuke unrelated
+    # untracked files - only what this snapshot holds is touched).
+    untracked = [line[3:] for line in _out(before).splitlines()
+                 if line.startswith("?? ")]
 
     add = git(["add", "-A"], project_dir)
     if not _ok(add):
@@ -195,9 +212,62 @@ def capture_orphan_wip_snapshot(git: GitRunner, project_dir: str
     # Return worktree to HEAD (sandbox base) so later commits are tool-only.
     # Mixed reset unstages; hard reset restores tracked files; clean removes
     # untracked that we captured into the orphan tree.
-    git(["reset", "--hard", "HEAD"], project_dir)
-    git(["clean", "-fd"], project_dir)
+    hard = git(["reset", "--hard", "HEAD"], project_dir)
+    if not _ok(hard):
+        return False, ref, secrets  # ref kept: the work is recoverable
+    failed = _remove_captured_untracked(project_dir, untracked)
+    if failed:
+        return False, ref, secrets  # ref kept; worktree still holds the leftovers
     return True, ref, secrets
+
+
+def _unquote_porcelain_path(raw: str) -> str:
+    """git quotes paths with special/non-ASCII characters as C strings."""
+    rel = raw.strip()
+    if rel.startswith('"') and rel.endswith('"') and len(rel) >= 2:
+        body = rel[1:-1]
+        try:
+            rel = body.encode("latin-1", "backslashreplace").decode(
+                "unicode_escape").encode("latin-1").decode("utf-8")
+        except Exception:
+            rel = body
+    return rel[:-1] if rel.endswith("/") else rel
+
+
+def _remove_captured_untracked(project_dir: str, untracked: list[str]) -> list[str]:
+    """Unlink exactly the untracked paths the snapshot captured, then prune
+    directories that became empty. Returns the paths that could not be removed."""
+    failed: list[str] = []
+    dirs: set[str] = set()
+    for raw in untracked:
+        rel = _unquote_porcelain_path(raw)
+        if not rel:
+            continue
+        full = os.path.join(project_dir, rel.replace("/", os.sep))
+        try:
+            if os.path.islink(full) or os.path.isfile(full):
+                os.unlink(full)
+            elif os.path.isdir(full):
+                for root, ds, fs in os.walk(full, topdown=False):
+                    for f in fs:
+                        os.unlink(os.path.join(root, f))
+                    for d in ds:
+                        os.rmdir(os.path.join(root, d))
+                os.rmdir(full)
+        except OSError:
+            failed.append(rel)
+            continue
+        parent = os.path.dirname(full)
+        while parent and os.path.abspath(parent) != os.path.abspath(project_dir):
+            dirs.add(parent)
+            parent = os.path.dirname(parent)
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            if os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+        except OSError:
+            pass
+    return failed
 
 
 def restore_orphan_wip_snapshot(git: GitRunner, project_dir: str,
@@ -209,10 +279,16 @@ def restore_orphan_wip_snapshot(git: GitRunner, project_dir: str,
     # Materialize orphan tree into index+worktree, then unstage so the dirty
     # state matches a pre-run porcelain snapshot (modified + untracked).
     # First: remove tracked files that the WIP deleted (present in HEAD, absent
-    # in orphan).
-    deleted = git(["diff", "--name-only", "--diff-filter=D", sha, "HEAD"], project_dir)
+    # in orphan). `git diff A B` lists changes going FROM A TO B, so "deleted
+    # in the WIP" is `diff HEAD <snapshot> --diff-filter=D`. (The original
+    # `diff <snapshot> HEAD` listed the WIP's NEW files instead, so a deletion
+    # was never re-applied and the file came back after restore.) -z keeps
+    # non-ASCII paths raw instead of octal-quoted. --no-renames: a `git mv`
+    # is otherwise reported as R, not D, and the old name is never removed.
+    deleted = git(["diff", "--name-only", "-z", "--no-renames",
+                   "--diff-filter=D", "HEAD", sha], project_dir)
     if _ok(deleted):
-        for path in _out(deleted).splitlines():
+        for path in (getattr(deleted, "stdout", None) or "").split("\0"):
             path = path.strip()
             if not path:
                 continue
@@ -244,7 +320,10 @@ def drop_wip_ref(git: GitRunner, project_dir: str, snapshot_id: str) -> bool:
 
 def porcelain_fingerprint(git: GitRunner, project_dir: str) -> str:
     """Stable fingerprint of dirty state for byte-for-byte restore proofs."""
-    st = git(["status", "--porcelain", "-uall"], project_dir)
+    # quotePath=false: otherwise non-ASCII paths arrive octal-escaped and hash
+    # as "missing" even though the file is right there.
+    st = git(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"],
+             project_dir)
     text = _out(st) if _ok(st) else ""
     lines = sorted(l for l in text.splitlines() if l.strip())
     # Include content hashes for each dirty path so "same names" isn't enough.

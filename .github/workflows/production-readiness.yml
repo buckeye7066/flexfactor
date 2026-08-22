@@ -53,6 +53,13 @@ jobs:
           assert not bad, bad
           print("imported", len(mods), "modules")
           PY
+      - name: Playwright for the real browser-journey integration test (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund playwright@1.62.1
+          npx playwright install --with-deps chromium
       - name: Unit + integration suites (every test module; zero collected = failure)
         shell: bash
         run: |
@@ -69,6 +76,10 @@ jobs:
                    test_flexfactor_partial.py \
                    test_flexfactor_wip.py \
                    test_flexfactor_sandbox.py \
+                   test_flexfactor_ledger.py \
+                   test_flexfactor_coverage.py \
+                   test_flexfactor_purpose.py \
+                   test_flexfactor_journeys.py \
                    tests/test_cursor_provider.py; do
             if [ ! -f "$t" ]; then echo "MISSING required test module: $t"; exit 1; fi
             echo "=== $t"

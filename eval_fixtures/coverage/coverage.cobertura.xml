@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<coverage line-rate="0.6" branch-rate="0" version="1.9" timestamp="1756000000" lines-covered="3" lines-valid="5" branches-covered="0" branches-valid="0">
+  <sources>
+    <source>/abs/proj</source>
+  </sources>
+  <packages>
+    <package name="Proj.Core" line-rate="0.6" branch-rate="0" complexity="2">
+      <classes>
+        <class name="Proj.Core.Calc" filename="src/Calc.cs" line-rate="0.6" branch-rate="0" complexity="2">
+          <methods>
+            <method name="Add" signature="(System.Int32,System.Int32)" line-rate="1" branch-rate="1" complexity="1">
+              <lines>
+                <line number="6" hits="3" branch="False" />
+                <line number="7" hits="3" branch="False" />
+              </lines>
+            </method>
+            <method name="Sub" signature="(System.Int32,System.Int32)" line-rate="0" branch-rate="1" complexity="1">
+              <lines>
+                <line number="10" hits="0" branch="False" />
+                <line number="11" hits="0" branch="False" />
+              </lines>
+            </method>
+          </methods>
+          <lines>
+            <line number="6" hits="3" branch="False" />
+            <line number="7" hits="3" branch="False" />
+            <line number="10" hits="0" branch="False" />
+            <line number="11" hits="0" branch="False" />
+            <line number="14" hits="1" branch="False" />
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>

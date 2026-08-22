@@ -114,6 +114,37 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_directed as _ff_directed
 
+# Partial structured-output evidence (truncation/malformed-tail salvage). Hard
+# import: a salvaged, incomplete answer must never pass as a complete one.
+try:
+    import flexfactor_partial as _ff_partial
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_partial as _ff_partial
+
+# Execution containment: the trusted-repo gate + the OS execution broker.
+# Hard imports. Every install/build/test of TARGET-controlled code crosses
+# _run/_spawn below; without these two the tool would fail OPEN.
+try:
+    import flexfactor_trust as _ff_trust
+    import flexfactor_sandbox as _ff_sandbox
+    import flexfactor_wip as _ff_wip
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_trust as _ff_trust
+    import flexfactor_sandbox as _ff_sandbox
+    import flexfactor_wip as _ff_wip
+
+# Content-addressed chunk ledger (exact final review, large files) and direct
+# function-coverage evidence. Hard imports: both are evidence producers.
+try:
+    import flexfactor_ledger as _ff_ledger
+    import flexfactor_coverage as _ff_coverage
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_ledger as _ff_ledger
+    import flexfactor_coverage as _ff_coverage
+
 # Scout production bridge (94-100): separate risk model / report schema,
 # metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
 # Hard import - scout must not run without the bridge invariants.
@@ -466,6 +497,38 @@ class OutputBudgetError(RuntimeError):
 
     The message still contains the words "token budget" so older string-matching
     call sites keep working, but nothing NEW should match on the text."""
+
+
+class PartialOutputError(RuntimeError):
+    """A judging call's structured output was TRUNCATED/MALFORMED and only the
+    complete leading elements were salvaged. The salvage may inform follow-up
+    work, but an EMPTY salvaged review is not a clean review - it is a provider
+    failure. Raised where 'no findings' would otherwise be read as CLEAN."""
+
+
+# Process-wide ledger of every partial salvage (provider, size, cut point,
+# correlation id). Rides into the run manifest so a run whose verdicts leaned
+# on salvaged output is visibly marked.
+_PARTIAL_OUTPUT_EVENTS: list[dict] = []
+
+
+def _mark_partial(data, text: str, provider: str):
+    """Stamp first-class partial=True evidence on a SALVAGED structured value.
+
+    THE provider chokepoint rule (every provider calls this right after
+    `_check_structured_type` on a salvaged value): partial status must survive
+    every later transformation, so it is carried IN the value, not in a side
+    channel."""
+    ev = _ff_partial.PartialSalvageEvidence(
+        provider=provider, raw_len=len(text or ""),
+        correlation_id=_ff_partial.new_correlation_id())
+    _PARTIAL_OUTPUT_EVENTS.append({"provider": provider, "raw_len": ev.raw_len,
+                                   "correlation_id": ev.correlation_id,
+                                   "when": time.time()})
+    return _ff_partial.attach_partial_meta(data, ev)
+
+
+_WIRED_PARTIAL_OUTPUT = True  # reported by runtime_manifest()
 
 
 class DirtyTreeError(RuntimeError):
@@ -836,9 +899,29 @@ def _resume_recover(rs_module, project_dir: str, program: str, recheck: bool):
     if data is None:
         return None, {}, {}, 0
     hasher = lambda rel: _file_sha_contained(project_dir, rel)  # noqa: E731
-    clean, findings, dropped = rs_module.verify_reviewed(data, hasher, POLICY_VERSION)
+    clean, findings, dropped = rs_module.verify_reviewed(
+        data, hasher, _effective_policy_version(program, project_dir))
     cache = {rel: {"sha": sha, "findings": list(fl)} for rel, (sha, fl) in findings.items()}
     return data, dict(clean), cache, len(dropped)
+
+
+def _effective_policy_version(program: str, project_dir: str) -> str:
+    """POLICY_VERSION + a hash of the purpose contract this program resolves to.
+
+    A checkpoint written under one purpose contract must never be resumed
+    under another (section 17): the acceptance criteria the reviews were
+    judged against would have changed. No authored contract -> 'inferred'."""
+    fp = _purpose_module()
+    tag = "inferred"
+    if fp is not None:
+        try:
+            c = fp.find_contract(program, project_dir)
+            if c is not None:
+                blob = json.dumps(c.to_dict(), sort_keys=True, default=str)
+                tag = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+        except Exception:  # noqa: BLE001 - a broken contract file is a fresh policy, not a crash
+            tag = "unreadable"
+    return f"{POLICY_VERSION}|purpose:{tag}"
 
 
 def _resume_checkpoint_for(rs_module, recovered: dict | None, *, program: str,
@@ -861,15 +944,16 @@ def _resume_checkpoint_for(rs_module, recovered: dict | None, *, program: str,
     if rs_module is None:
         return None
     try:
+        policy = _effective_policy_version(program, project_dir)
         if (recovered is not None and rs_module.is_resumable(recovered)
-                and recovered.get("policy") == POLICY_VERSION):
+                and recovered.get("policy") == policy):
             cp = rs_module.RunCheckpoint(RUNS_PATH, dict(recovered))
             cp.data["resume_count"] = int(cp.data.get("resume_count") or 0) + 1
             cp.data["status"] = "running"
             cp.save(force=True)
             return cp
         return rs_module.new_run(RUNS_PATH, program=program, project_dir=project_dir,
-                                 mode=mode, policy=POLICY_VERSION, tool=TOOL_VERSION)
+                                 mode=mode, policy=policy, tool=TOOL_VERSION)
     except Exception:
         return None  # checkpointing is protection, never a new failure mode
 
@@ -2055,6 +2139,7 @@ class AnthropicProvider:
         text = next((b.text for b in message.content if b.type == "text"), None)
         if not text:
             raise RuntimeError("Model returned no text content to parse.")
+        _salvaged = False
         data, _ = _extract_json_object(text)
         if data is None and salvage_truncated:
             # Judging-only truncation repair (see _salvage_truncated_json): the FCC
@@ -2064,6 +2149,7 @@ class AnthropicProvider:
             # the until-clean loop still re-reviews it.
             data = _salvage_truncated_json(text)
             if data is not None:
+                _salvaged = True
                 print("  [salvage] structured output was truncated mid-stream; "
                       "recovered the complete leading elements (partial tail dropped)")
         if data is None:
@@ -2073,6 +2159,8 @@ class AnthropicProvider:
             raise RuntimeError(f"Structured output was not JSON; len={len(text)} "
                                f"head={text[:200]!r} tail={text[-120:]!r}")
         data = _check_structured_type(data, schema, text)
+        if _salvaged:
+            data = _mark_partial(data, text, "anthropic")
         return data
 
     def _stream_structured(self, *, model, max_tokens, system, messages, fmt) -> "Message":
@@ -2538,6 +2626,7 @@ class OllamaProvider:
                 data = _salvage_truncated_json(text)
                 if data is not None:
                     data = _check_structured_type(data, schema, text)
+                    return _mark_partial(data, text, "ollama")
                     return data
             raise
         data = _check_structured_type(data, schema, text)
@@ -2926,9 +3015,13 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     on the strong author model. Judging calls opt into truncation salvage: a
     partial findings/verdict list is safe here (fail-safe .get() defaults +
     the until-clean loop re-reviews), whereas generation must fail loudly."""
-    return provider.structured(system, prompt, schema, max_tokens=max_tokens,
+    data = provider.structured(system, prompt, schema, max_tokens=max_tokens,
                                model=getattr(provider, "judge_model", None),
                                salvage_truncated=True)
+    # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
+    # clean/keep/approve/ready/pass is downgraded HERE, at the one judging
+    # chokepoint, so no caller can read a truncated answer as authorization.
+    return _ff_partial.refuse_clean_if_partial(data)
 
 
 def _provider_key_present(name: str) -> bool:
@@ -4569,6 +4662,22 @@ def _repository_history_context(folder: str) -> str:
     return "\n\n".join(sections)
 
 
+# normcase(folder) -> deterministic purpose evidence dict from the last
+# _gather_from_folder call (consumed by audit_one_program for confidence).
+_PURPOSE_EVIDENCE_CACHE: dict[str, dict] = {}
+
+
+def _purpose_confidence_for(project_dir: str, contract) -> tuple[str, bool, str]:
+    """(confidence, mutation_authorized, reason) for this program's purpose."""
+    fp = _purpose_module()
+    if fp is None or not hasattr(fp, "purpose_confidence"):
+        return "unresolved", False, "purpose module unavailable"
+    evidence = _PURPOSE_EVIDENCE_CACHE.get(os.path.normcase(os.path.abspath(project_dir))) or {}
+    conf = fp.purpose_confidence(contract, evidence)
+    ok, why = fp.mutation_authorized_by_purpose(conf)
+    return conf, bool(ok), str(why or "")
+
+
 def _gather_from_folder(folder: str) -> tuple[str, str]:
     """Build purpose evidence from metadata, structure, history, branches, and PRs."""
     name = os.path.basename(folder.rstrip("\\/")) or folder
@@ -4614,6 +4723,20 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     if tree:
         parts.append("File tree (shallow):\n  " + "\n  ".join(tree))
     parts.append(_repository_history_context(folder))
+    # COMPLETE purpose evidence (section 8): manifests, docs, tests, schemas,
+    # routes, integrations, deploy configs, commit/tag/branch history, PRs and
+    # issues - each item CITED with path:line or ref, with contradictions and
+    # unknowns named. Deterministic (no model call); cached so the audit can
+    # grade purpose CONFIDENCE from the same evidence the model saw.
+    fp = _purpose_module()
+    if fp is not None and hasattr(fp, "gather_purpose_evidence"):
+        try:
+            evidence = fp.gather_purpose_evidence(
+                folder, git_runner=lambda a, cwd: _git(a, cwd))
+            _PURPOSE_EVIDENCE_CACHE[os.path.normcase(os.path.abspath(folder))] = evidence
+            parts.append(fp.render_purpose_evidence_block(evidence))
+        except Exception as ex:  # noqa: BLE001 - evidence gathering must not abort profiling
+            parts.append(f"[purpose evidence gathering failed: {type(ex).__name__}: {ex}]")
     return name, "\n\n".join(parts)
 
 
@@ -4850,6 +4973,95 @@ def _winify(cmd: list[str]) -> list[str]:
     return [resolved, *cmd[1:]] if resolved else cmd
 
 
+# Command classes whose process executes code the TARGET repository controls
+# (package lifecycle scripts, build tools, test runners). These are the only
+# classes routed through the broker; vcs/read_only/unknown stay direct.
+_TARGET_CODE_CLASSES = frozenset({"install", "build", "test"})
+
+# Every broker decision, for the run manifest: what ran, under which mechanism,
+# on what basis (os-sandbox vs trusted-repo), or why it was refused.
+_EXECUTION_LEDGER: list[dict] = []
+
+# Per-run authorization (--trust-repo). Recorded, never the default.
+_RUN_TRUST_OVERRIDE: dict[str, bool] = {}
+
+
+def _execution_authorization(cwd: str) -> tuple[dict | None, str]:
+    """(basis_dict, refusal_reason). basis_dict is None when execution is refused."""
+    root = os.path.normcase(os.path.abspath(cwd))
+    decision = _ff_trust.trust_decision(
+        cwd, allow_untrusted=bool(_RUN_TRUST_OVERRIDE.get(root)))
+    try:
+        basis = _ff_sandbox.require_containment_or_trust(cwd, trust_decision=decision)
+    except _ff_sandbox.ContainmentUnavailable as ex:
+        return None, str(ex)
+    basis["trust"] = decision.to_dict()
+    return basis, ""
+
+
+def _run_target_code(cmd: list[str], cwd: str, timeout: int, env: dict | None,
+                     classes: set, _fail) -> subprocess.CompletedProcess:
+    """The broker path of `_run`. Same never-raises contract; a refusal is
+    rc 126 + launch-error marker + `flexfactor_containment_blocked=True` and a
+    message naming exactly how to authorize the repository."""
+    basis, why = _execution_authorization(cwd)
+    entry = {"cmd": [str(c) for c in cmd][:6], "cwd": cwd,
+             "classes": sorted(classes), "when": time.time()}
+    if basis is None:
+        entry.update({"refused": True, "reason": why})
+        _EXECUTION_LEDGER.append(entry)
+        cp = _fail(126, "", "[flexfactor-containment] REFUSED: " + why)
+        cp.flexfactor_containment_blocked = True
+        return cp
+    # Installs need the registry; builds and tests of an audited tree do not.
+    limits = _ff_sandbox.Limits(timeout_s=int(timeout), network=("install" in classes))
+    cp = _ff_sandbox.run_contained(_winify(cmd), cwd, limits=limits, env=env,
+                                   source_root=cwd)
+    cont = getattr(cp, "flexfactor_containment", None) or {}
+    entry.update({"refused": False, "basis": basis.get("basis"),
+                  "mechanism": cont.get("mechanism"), "level": cont.get("level"),
+                  "network": limits.network, "rc": cp.returncode})
+    _EXECUTION_LEDGER.append(entry)
+    if getattr(cp, "flexfactor_launch_error", False) and cp.returncode != 124:
+        # Keep `_run`'s launch-error semantics identical for callers.
+        cp.flexfactor_launch_error = True
+    cp.flexfactor_execution_basis = basis
+    return cp
+
+
+_INTERPRETERS = {"python", "python3", "pythonw", "py", "node"}
+_SYNTAX_ONLY_MODULES = {"py_compile", "compileall", "ast", "tokenize"}
+
+
+def _tool_authored_syntax_check(cmd: list[str]) -> bool:
+    """True for the interpreter invocations FlexFactor itself authors that do
+    NOT execute target code: `python -c <tool code>`, `node -e <tool code>`,
+    `node --check <file>` and `python -m py_compile/compileall <file>`. A
+    script path or any other `-m` module executes target-controlled code and
+    stays behind the broker. The policy classifier marks every interpreter
+    call 'build'; this is the only carve-out, and it is by ARGUMENT SHAPE."""
+    if not cmd:
+        return False
+    exe = os.path.basename(str(cmd[0])).lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if exe.endswith(suffix):
+            exe = exe[: -len(suffix)]
+    if exe not in _INTERPRETERS:
+        return False
+    args = [str(a) for a in cmd[1:]]
+    if not args:
+        return False
+    if args[0] in ("-c", "-e", "--check", "-p", "--eval", "--print"):
+        return True
+    if args[0] == "-m" and len(args) > 1 and args[1] in _SYNTAX_ONLY_MODULES:
+        return True
+    return False
+
+
+_WIRED_TRUST_GATE = True
+_WIRED_EXECUTION_BROKER = True
+
+
 def _run(cmd: list[str], cwd: str, timeout: int = 900,
          env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a subprocess robustly - NEVER raises. A missing executable, OS error, bad
@@ -4878,6 +5090,12 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
         cp = _fail(126, "", f"[flexfactor-policy] {reason}")
         cp.flexfactor_policy_blocked = True
         return cp
+    # TARGET-CONTROLLED CODE (dependency install, build, test, lifecycle) goes
+    # through the execution broker: OS containment where the host can enforce
+    # it, otherwise ONLY an owner trust decision for this repository. Git,
+    # read-only and unknown tool invocations keep the plain path.
+    if _classes & _TARGET_CODE_CLASSES and not _tool_authored_syntax_check(cmd):
+        return _run_target_code(cmd, cwd, timeout, env, _classes, _fail)
     try:
         # encoding/errors are LOAD-BEARING on Windows (live GrantFlow crash,
         # 2026-08-16). `text=True` with no encoding decodes child output with the
@@ -4924,21 +5142,37 @@ def _spawn(cmd: list[str], cwd: str, env: dict | None = None
     ok, reason, _classes = _cmd_policy.command_allowed(cmd)
     if not ok:
         return None, f"[flexfactor-policy] {reason}"
-    try:
-        proc = subprocess.Popen(_winify(cmd), cwd=cwd, env=env,
-                                stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                                               if os.name == "nt" else 0),
-                                start_new_session=(os.name != "nt"))
-        return proc, ""
-    except Exception as ex:
-        return None, f"could not start {(cmd or ['?'])[0]}: {type(ex).__name__}: {ex}"
+    # A dev server IS target-controlled code. Same broker, same authorization.
+    basis, why = _execution_authorization(cwd)
+    if basis is None:
+        _EXECUTION_LEDGER.append({"cmd": [str(c) for c in cmd][:6], "cwd": cwd,
+                                  "classes": sorted(_classes), "refused": True,
+                                  "reason": why, "when": time.time(), "spawn": True})
+        return None, "[flexfactor-containment] REFUSED: " + why
+    limits = _ff_sandbox.Limits(timeout_s=0, network=True)  # a server serves on loopback
+    proc, err, kill_tree = _ff_sandbox.spawn_contained(_winify(cmd), cwd, limits=limits,
+                                                       env=env)
+    _EXECUTION_LEDGER.append({"cmd": [str(c) for c in cmd][:6], "cwd": cwd,
+                              "classes": sorted(_classes), "refused": False,
+                              "basis": basis.get("basis"), "spawn": True,
+                              "when": time.time(), "error": err or None})
+    if proc is None:
+        return None, err
+    proc.flexfactor_kill_tree = kill_tree
+    return proc, ""
 
 
 def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
     return _run(["git", *args], cwd, timeout=300)
+
+
+def _git_argv(argv: list[str], cwd: str) -> subprocess.CompletedProcess:
+    """Runner for helpers that hand over a COMPLETE argv (["git", ...]) - the
+    flexfactor_ledger/flexfactor_wip GitRunner contract. Same chokepoint."""
+    argv = list(argv)
+    if argv and argv[0] == "git":
+        argv = argv[1:]
+    return _git(argv, cwd)
 
 
 def _is_git_repo(path: str) -> bool:
@@ -8413,6 +8647,7 @@ def review_file(provider, rel_path: str, text: str,
     the packages this file imports are shown to the reviewer, and any finding
     that recommends an API removed in the installed major is dropped before it
     can reach the author model."""
+    partial_seen = False
     ctx = ""
     if context:
         ctx = ("PROGRAM CONTEXT (untrusted background on what this program is for - "
@@ -8442,11 +8677,20 @@ def review_file(provider, rel_path: str, text: str,
         # The proxy/NIM upstream sometimes emits the findings array directly.
         if isinstance(data, list):
             data = {"findings": data, "summary": ""}
+        if _ff_partial.is_partial_structured(data):
+            partial_seen = True
         findings.extend(data.get("findings") or [])
         if data.get("summary"):
             summaries.append(str(data["summary"]))
     findings = _dedupe_findings(findings)
     findings = _postprocess_review_findings(findings, rel_path, project_dir)
+    if partial_seen and not findings:
+        # An empty SALVAGED review is not a clean file: the unreviewed remainder
+        # is exactly where the defects may be. Surface it as a provider failure
+        # so the sweep records the file INCOMPLETE (never in reviewed_clean).
+        raise PartialOutputError(
+            f"{rel_path}: review output was truncated/malformed and the salvaged "
+            "prefix contained no findings - the remainder is UNREVIEWED, not clean")
     return findings, " | ".join(summaries)
 
 
@@ -9005,6 +9249,7 @@ def _purpose_gap_sample(provider, purpose_blob: str, files: list[str],
                   max_tokens=8000)
     if not isinstance(data, dict):
         return None
+    partial_sample = _ff_partial.is_partial_structured(data)
     gaps = data.get("gaps")
     if not isinstance(gaps, list):
         gaps = []
@@ -9035,6 +9280,13 @@ def _purpose_gap_sample(provider, purpose_blob: str, files: list[str],
         out["contract_source"] = getattr(contract, "source", None)
         if fp is not None:
             out["acceptance_coverage"] = fp.acceptance_coverage(contract, norm_gaps)
+            if partial_sample:
+                # A truncated assessment cannot vouch for ANY criterion: the
+                # gaps it did not get to emit are the ones that would have
+                # unmet them. Every criterion in this sample is UNKNOWN.
+                for r in out["acceptance_coverage"]:
+                    r["met"] = None
+                out["partial_output"] = True
             # Only met-is-True counts: met=None means UNKNOWN (an unattributed
             # whole-purpose gap is open), and unknown is never evidence of met.
             met = sum(1 for r in out["acceptance_coverage"] if r["met"] is True)
@@ -9961,104 +10213,8 @@ def _wait_http_ready(url: str, proc: subprocess.Popen | None,
     return False, f"dev server was not reachable at {url}: {last or 'timeout'}"
 
 
-_UI_EXPLORER_JS = r'''const { chromium } = require('playwright');
-(async () => {
-  const base = new URL(process.argv[2]);
-  const artifactDir = process.argv[3] || process.cwd();
-  const allowDestructive = process.env.FLEXFACTOR_E2E_ISOLATED === '1';
-  const browser = await chromium.launch({headless: true});
-  const context = await browser.newContext();
-  await context.tracing.start({screenshots: true, snapshots: true, sources: true});
-  const queue = [base.href], seen = new Set(), errors = [], skipped = [];
-  const routeEvidence = [], controlEvidence = [], formEvidence = [];
-  const accessibility = {checked: 0, violations: []};
-  const performance = {pages: [], slow: []};
-  let controls = 0;
-  const dangerous = /delete|remove|destroy|purchase|pay|send|publish|deploy|logout|sign out/i;
-  while (queue.length && seen.size < 100) {
-    const url = queue.shift();
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const page = await context.newPage();
-    const started = Date.now();
-    const routeErrors = [];
-    page.on('pageerror', e => errors.push(`${url}: pageerror: ${e.message}`));
-    page.on('console', m => { if (m.type() === 'error') errors.push(`${url}: console: ${m.text()}`); });
-    page.on('requestfailed', r => errors.push(`${url}: request failed: ${r.url()} ${r.failure()?.errorText || ''}`));
-    const response = await page.goto(url, {waitUntil: 'domcontentloaded', timeout: 30000});
-    if (!response || response.status() >= 500) {
-      const msg = `${url}: HTTP ${response ? response.status() : 'no response'}`;
-      errors.push(msg); routeErrors.push(msg);
-    }
-    const durationMs = Date.now() - started;
-    const perf = await page.evaluate(() => {
-      const n = performance.getEntriesByType('navigation')[0];
-      return n ? {domContentLoaded: Math.round(n.domContentLoadedEventEnd), load: Math.round(n.loadEventEnd)} : {};
-    }).catch(() => ({}));
-    performance.pages.push({url, durationMs, ...perf});
-    if (durationMs > 5000) performance.slow.push({url, durationMs, thresholdMs: 5000});
-    const a11y = await page.evaluate(() => {
-      const out = [];
-      if (!document.title.trim()) out.push('document has no title');
-      if (!document.documentElement.lang) out.push('html has no lang attribute');
-      for (const el of document.querySelectorAll('img:not([alt])')) out.push('image missing alt');
-      for (const el of document.querySelectorAll('button, [role="button"]')) {
-        if (!(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim()) out.push('button missing accessible name');
-      }
-      for (const el of document.querySelectorAll('input:not([type="hidden"]), select, textarea')) {
-        const id = el.id && CSS.escape(el.id);
-        const labelled = el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || (id && document.querySelector(`label[for="${id}"]`));
-        if (!labelled) out.push(`${el.tagName.toLowerCase()} missing accessible label`);
-      }
-      return [...new Set(out)];
-    });
-    accessibility.checked++;
-    for (const v of a11y) accessibility.violations.push({url, message: v});
-    const shot = `page-${seen.size}.png`;
-    await page.screenshot({path: require('path').join(artifactDir, shot), fullPage: true}).catch(e => routeErrors.push(`screenshot: ${e.message}`));
-    const links = await page.locator('a[href]').evaluateAll((els, origin) => els.map(e => e.href).filter(h => h.startsWith(origin)), base.origin);
-    for (const href of links) if (!seen.has(href) && !queue.includes(href)) queue.push(href);
-    const forms = await page.locator('form').count();
-    for (let fi = 0; fi < Math.min(forms, 100); fi++) {
-      const form = page.locator('form').nth(fi);
-      const validity = await form.evaluate(el => ({validEmpty: el.checkValidity(), action: el.getAttribute('action') || '', method: (el.getAttribute('method') || 'get').toUpperCase()}));
-      formEvidence.push({url, index: fi, status: 'constraints-executed', ...validity});
-    }
-    const selector = 'button, [role="button"], [role="tab"], [role="menuitem"], input[type="submit"], input[type="button"]';
-    const count = Math.min(await page.locator(selector).count(), 200);
-    for (let i = 0; i < count; i++) {
-      const control = page.locator(selector).nth(i);
-      if (!await control.isVisible().catch(() => false) || await control.isDisabled().catch(() => true)) continue;
-      const label = ((await control.innerText().catch(() => '')) || (await control.getAttribute('aria-label')) || (await control.getAttribute('value')) || '').trim();
-      const role = (await control.getAttribute('role')) || (await control.evaluate(el => el.tagName.toLowerCase()));
-      const target = {url, role, label, index: i, targeting: 'semantic-role-and-name'};
-      if (!label) {
-        const reason = `${url}: unnamed ${role} control ${i} has low-confidence targeting`;
-        skipped.push(reason); controlEvidence.push({...target, status: 'blocked-low-confidence', reason}); continue;
-      }
-      if (!allowDestructive && dangerous.test(label)) {
-        const reason = `${url}: ${label}`;
-        skipped.push(reason); controlEvidence.push({...target, status: 'blocked-destructive', reason}); continue;
-      }
-      controls++;
-      let status = 'passed', error = null;
-      await control.click({timeout: 5000}).catch(e => { status = 'failed'; error = e.message; errors.push(`${url}: control ${label}: ${e.message}`); });
-      controlEvidence.push({...target, status, error});
-      await page.waitForTimeout(100);
-    }
-    await page.keyboard.press('Tab').catch(e => routeErrors.push(`keyboard navigation: ${e.message}`));
-    routeEvidence.push({url, status: routeErrors.length ? 'failed' : 'passed', httpStatus: response ? response.status() : null, durationMs, screenshot: shot, errors: routeErrors});
-    await page.close();
-  }
-  await context.tracing.stop({path: require('path').join(artifactDir, 'playwright-trace.zip')});
-  await browser.close();
-  const result = {pages: seen.size, controls, errors, skipped, routeEvidence, controlEvidence, formEvidence, accessibility, performance,
-    artifacts: ['playwright-trace.zip', ...routeEvidence.map(r => r.screenshot)],
-    complete: errors.length === 0 && skipped.length === 0 && accessibility.violations.length === 0 && performance.slow.length === 0 && seen.size > 0};
-  console.log('FLEXFACTOR_E2E_RESULT=' + JSON.stringify(result));
-  process.exit(result.complete ? 0 : 1);
-})().catch(e => { console.error(e.stack || String(e)); process.exit(2); });
-'''
+# The browser journey engine lives in flexfactor_assets/flexfactor_explorer.js
+# (single source, shipped as package data) and is driven via flexfactor_journeys.
 
 
 def _run_live_ui_exploration(project_dir: str, stack: dict, base_url: str,
@@ -10086,15 +10242,29 @@ def _run_live_ui_exploration(project_dir: str, stack: dict, base_url: str,
     tmp = tempfile.mkdtemp(prefix="flexfactor-e2e-")
     artifacts = os.path.abspath(artifact_dir or tmp)
     os.makedirs(artifacts, exist_ok=True)
-    script_path = os.path.join(tmp, "explore.cjs")
     try:
-        with open(script_path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(_UI_EXPLORER_JS)
+        import flexfactor_journeys as _fj
+        script_path = _fj.explorer_script_path()
         ready, why = _wait_http_ready(base_url, server)
         if not ready:
             result["log"] = why
             return result
-        run_env = env.copy()
+        # JOURNEY MATRIX (section 11): roles/viewports/page cap/isolation come
+        # from the environment so launchers and CI can declare them; anything
+        # the engine could not exercise is NAMED and makes the run incomplete.
+        isolated = os.environ.get("FLEXFACTOR_E2E_ISOLATED") == "1"
+        roles = None
+        if os.environ.get("FLEXFACTOR_E2E_ROLES"):
+            try:
+                roles = json.loads(os.environ["FLEXFACTOR_E2E_ROLES"])
+            except ValueError:
+                result["log"] = "FLEXFACTOR_E2E_ROLES is not valid JSON"
+                return result
+        viewports = [v.strip() for v in os.environ.get("FLEXFACTOR_E2E_VIEWPORTS", "").split(",")
+                     if v.strip()] or None
+        max_pages = int(os.environ["FLEXFACTOR_E2E_MAX_PAGES"]) \
+            if os.environ.get("FLEXFACTOR_E2E_MAX_PAGES", "").isdigit() else None
+        run_env = {**env, **_fj.journey_env(roles, isolated, viewports, max_pages)}
         node_modules = os.path.join(project_dir, "node_modules")
         run_env["NODE_PATH"] = (node_modules + os.pathsep + run_env.get("NODE_PATH", "")).rstrip(os.pathsep)
         explorer = _run(["node", script_path, base_url, artifacts], project_dir,
@@ -10102,13 +10272,14 @@ def _run_live_ui_exploration(project_dir: str, stack: dict, base_url: str,
         result["ran"] = True
         output = (explorer.stdout or "") + "\n" + (explorer.stderr or "")
         result["log"] = _tail(output, 80)
-        marker = "FLEXFACTOR_E2E_RESULT="
-        payload = next((line.split(marker, 1)[1] for line in output.splitlines()
-                        if marker in line), "")
-        try:
-            parsed = json.loads(payload) if payload else {}
-        except ValueError:
-            parsed = {}
+        parsed = _fj.parse_result(output) or {}
+        result["journeys"] = list(parsed.get("journeys") or [])
+        result["journey_summary"] = dict(parsed.get("summary") or {})
+        result["authorization_matrix"] = list(parsed.get("authorization_matrix") or [])
+        result["findings"] = list(parsed.get("findings") or [])
+        result["incomplete_reasons"] = list(parsed.get("incomplete_reasons") or [])
+        result["isolated"] = isolated
+        result["roles"] = [r.get("name") for r in (roles or []) if isinstance(r, dict)] + ["anonymous"]
         result["pages"] = int(parsed.get("pages") or 0)
         result["controls"] = int(parsed.get("controls") or 0)
         result["skipped_controls"] = list(parsed.get("skipped") or [])
@@ -10120,11 +10291,17 @@ def _run_live_ui_exploration(project_dir: str, stack: dict, base_url: str,
         result["performance"] = dict(parsed.get("performance") or {})
         result["artifacts"] = [os.path.join(artifacts, str(p))
                                for p in (parsed.get("artifacts") or [])]
-        result["ok"] = bool(explorer.returncode == 0 and parsed.get("complete") is True)
+        complete, reasons = _fj.completeness(parsed)
+        if not complete:
+            result["incomplete_reasons"] = sorted(set(result["incomplete_reasons"]) | set(reasons))
+        result["ok"] = bool(explorer.returncode == 0 and complete)
         return result
     finally:
         try:
             if server.poll() is None:
+                _kt = getattr(server, "flexfactor_kill_tree", None)
+                if callable(_kt):
+                    _kt()
                 server.terminate()
                 try:
                     server.wait(timeout=10)
@@ -10196,8 +10373,17 @@ FINAL_REVIEW_SYSTEM = (
 
 
 def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | None,
-                              final_sha: str | None, evidence_summary: dict) -> dict:
-    """Fresh, non-authoring reviewer context over the exact candidate commit."""
+                              final_sha: str | None, evidence_summary: dict,
+                              *, max_chunk_chars: int = 60_000) -> dict:
+    """Fresh, non-authoring reviewer context over the EXACT candidate commit.
+
+    NO SILENT TRUNCATION: the complete patch is split into stable,
+    content-addressed chunks (per file, at hunk boundaries), every chunk is
+    sent with the baseline/candidate SHAs, file hash and line range, and a
+    completeness ledger must account for every chunk (clean / findings /
+    blocked) before any verdict is synthesized. A missing or blocked chunk
+    blocks approval; a reviewer naming a different commit blocks approval;
+    partial (salvaged) output blocks that chunk."""
     if not final_sha:
         return {"verdict": "reject", "commit": "", "findings": [],
                 "evidence_consistent": False,
@@ -10213,28 +10399,91 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
                 "evidence_consistent": False,
                 "reason": f"could not read exact candidate diff: {_tail(shown.stderr, 4)}"}
     patch = shown.stdout or ""
-    truncated = len(patch) > 180_000
-    patch = patch[:180_000]
-    prompt = (
-        f"EXPECTED FINAL COMMIT: {final_sha}\n"
-        f"BASELINE COMMIT: {baseline_sha or '(none)'}\n"
-        f"PATCH TRUNCATED: {truncated}\n\n"
-        "RAW EXECUTION EVIDENCE:\n" + _fence_untrusted(
-            "evidence", json.dumps(evidence_summary, sort_keys=True)[:80_000])
-        + "\n\nEXACT CANDIDATE PATCH:\n" + _fence_untrusted("patch", patch)
-        + "\n\nApprove only if the exact commit and executable evidence support every claim."
-    )
-    data = _judge(reviewer, FINAL_REVIEW_SYSTEM, prompt, FINAL_REVIEW_SCHEMA,
-                  max_tokens=12_000)
-    data["reviewer_model"] = getattr(reviewer, "judge_model", None) or getattr(reviewer, "model", None)
-    data["fresh_context"] = True
-    data["patch_truncated"] = truncated
-    if data.get("commit") != final_sha:
-        data["verdict"] = "reject"
-        data["evidence_consistent"] = False
-        data["reason"] = (str(data.get("reason") or "")
-                          + f"; reviewer named {data.get('commit')!r}, expected {final_sha}")
-    return data
+    chunks = _ff_ledger.chunk_patch(patch, max_chars=max_chunk_chars) if patch.strip() else []
+    if not chunks:
+        chunks = _ff_ledger.chunk_text(patch or "(empty patch)", file="<patch>",
+                                       max_chars=max_chunk_chars)
+    ledger = _ff_ledger.ReviewLedger(baseline_sha=baseline_sha or "", candidate_sha=final_sha,
+                                     chunks=chunks)
+    ev_json = json.dumps(evidence_summary, sort_keys=True)
+    evidence_truncated = len(ev_json) > 80_000
+    ev_text = ev_json[:80_000]
+    reviewer_model = (getattr(reviewer, "judge_model", None)
+                      or getattr(reviewer, "model", None) or "reviewer")
+    consistent_votes: list[bool] = []
+    commit_mismatch: list[str] = []
+    chunk_rejects = 0
+    for ch in chunks:
+        header = (
+            f"EXPECTED FINAL COMMIT: {final_sha}\n"
+            f"BASELINE COMMIT: {baseline_sha or '(none)'}\n"
+            f"PATCH CHUNK: {ch.index + 1}/{ch.count} of {ch.file} "
+            f"(lines {ch.line_start}-{ch.line_end}; file sha256 {ch.file_sha256[:16]}; "
+            f"chunk sha256 {ch.sha256[:16]}; chunk id {ch.id})\n"
+            f"EVIDENCE TRUNCATED: {evidence_truncated}\n\n"
+        )
+        prompt = (header
+                  + "RAW EXECUTION EVIDENCE:\n" + _fence_untrusted("evidence", ev_text)
+                  + "\n\nEXACT CANDIDATE PATCH CHUNK:\n" + _fence_untrusted("patch", ch.text)
+                  + "\n\nReview ONLY this chunk. Approve only if this chunk's changes are "
+                    "correct and the executable evidence supports every claim they rely on. "
+                    "Name the expected final commit in `commit`.")
+        try:
+            data = _judge(reviewer, FINAL_REVIEW_SYSTEM, prompt, FINAL_REVIEW_SCHEMA,
+                          max_tokens=12_000)
+        except BudgetExceededError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - a failed chunk is BLOCKED, never clean
+            ledger.record(ch.id, status="blocked", reviewer=str(reviewer_model),
+                          reason=f"reviewer call failed: {type(ex).__name__}: {ex}")
+            continue
+        if _ff_partial.is_partial_structured(data):
+            ledger.record(ch.id, status="blocked", reviewer=str(reviewer_model),
+                          reason="reviewer output truncated/malformed (partial salvage)")
+            continue
+        findings = [f for f in (data.get("findings") or []) if isinstance(f, dict)]
+        if str(data.get("commit") or "") != final_sha:
+            commit_mismatch.append(str(data.get("commit")))
+            findings.append({"severity": "high", "title": "reviewer named a different commit",
+                             "problem": f"expected {final_sha}, reviewer said {data.get('commit')!r}"})
+        consistent_votes.append(bool(data.get("evidence_consistent") is True))
+        verdict = str(data.get("verdict") or "")
+        if verdict != "approve":
+            chunk_rejects += 1
+            if not findings:
+                findings.append({"severity": "high", "title": "chunk rejected",
+                                 "problem": str(data.get("reason") or "no reason given")})
+        ledger.record(ch.id, status="findings" if findings else "clean",
+                      reviewer=str(reviewer_model), findings=findings,
+                      reason=str(data.get("reason") or ""),
+                      response_sha256=_ff_ledger.sha256_text(json.dumps(data, sort_keys=True)))
+    allowed, why = ledger.verdict_allowed()
+    summary = ledger.summary()
+    approve = (allowed and chunk_rejects == 0 and not commit_mismatch
+               and consistent_votes and all(consistent_votes))
+    reasons = []
+    if not allowed:
+        reasons.append(f"ledger incomplete: {why}")
+    if chunk_rejects:
+        reasons.append(f"{chunk_rejects} chunk(s) rejected")
+    if commit_mismatch:
+        reasons.append(f"reviewer named {commit_mismatch[0]!r}, expected {final_sha}")
+    if consistent_votes and not all(consistent_votes):
+        reasons.append("evidence inconsistent in at least one chunk")
+    return {
+        "verdict": "approve" if approve else "reject",
+        "commit": final_sha,
+        "findings": ledger.all_findings(),
+        "evidence_consistent": bool(approve),
+        "reason": "; ".join(reasons) if reasons else
+                  f"all {summary['expected']} chunk(s) reviewed clean against the exact commit",
+        "reviewer_model": reviewer_model,
+        "fresh_context": True,
+        "patch_truncated": False,
+        "evidence_truncated": evidence_truncated,
+        "chunk_count": summary["expected"],
+        "review_ledger": summary,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -11925,7 +12174,10 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         # cycle still builds on it; only PUBLICATION waits for evidence. When a
         # later cycle's gate does pass, that push carries these commits with it,
         # so nothing is stranded and the branch tip origin ever sees is green.
-        if final_ok is True:
+        wip_ok, wip_why = _wip_publish_guard(project_dir)
+        if final_ok is True and not wip_ok:
+            status += f"; PUSH REFUSED - owner WIP snapshot: {wip_why}"
+        elif final_ok is True:
             # NEVER force-push (owner order 2026-08-11 removed sandbox branches). This is
             # now the owner's REAL branch, not a disposable sandbox that legitimately
             # diverges - a --force-with-lease here could discard commits pushed from
@@ -11999,7 +12251,10 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             mr = _git(["merge", "--no-ff", "-m", f"Merge {branch}", branch], project_dir)
             if mr.returncode == 0:
                 status += f"; merged into {prev_branch}"
-                if args.push and _git_has_remote(project_dir):
+                wip_ok2, wip_why2 = _wip_publish_guard(project_dir)
+                if args.push and not wip_ok2:
+                    status += f" (PUSH REFUSED - owner WIP snapshot: {wip_why2})"
+                elif args.push and _git_has_remote(project_dir):
                     mp = _git(["push", "origin", prev_branch], project_dir)
                     if mp.returncode == 0:
                         status += " (pushed)"
@@ -12103,6 +12358,117 @@ def _release_audit_lock(lock_path: str | None) -> None:
         pass
 
 
+def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
+                              pfx: str = "") -> dict:
+    """Run the project's tests under a grounded coverage tool (when one exists)
+    and turn the artifact into per-function DIRECT evidence rows.
+
+    Returns {"rows": [...], "blocked": {}, "meta": {...}}. No tool -> every
+    first-party function stays UNPROVEN with the reason recorded; nothing is
+    invented and nothing passes by default."""
+    eco = ("node" if stack.get("is_node") else "python" if stack.get("is_python")
+           else ((stack.get("ecosystems") or [None])[0] or "unknown"))
+    spec = {"ecosystem": eco, "test_cmd": stack.get("full_suite_cmd") or stack.get("test_cmd"),
+            "package_manager": stack.get("package_manager")}
+    meta = {"ecosystem": eco, "commands": [], "artifacts": [], "available": False}
+    try:
+        cmds = _ff_coverage.coverage_commands(project_dir, spec)
+    except Exception as ex:  # noqa: BLE001 - evidence, never a crash
+        cmds = []
+        meta["error"] = f"coverage_commands: {type(ex).__name__}: {ex}"
+    runnable = [c for c in cmds if c.get("available")]
+    meta["candidates"] = [{k: v for k, v in c.items() if k != "argv"} | {"argv": list(c.get("argv") or [])}
+                          for c in cmds]
+    if runnable and spec["test_cmd"]:
+        meta["available"] = True
+        for c in runnable:
+            argv = list(c.get("argv") or [])
+            if not argv:
+                continue
+            print(f"{pfx}coverage: {' '.join(argv)[:120]}")
+            cp = _run(argv, project_dir, timeout=1800)
+            meta["commands"].append({"argv": argv, "rc": cp.returncode,
+                                     "refused": bool(getattr(cp, "flexfactor_containment_blocked", False)),
+                                     "tail": _tail((cp.stdout or "") + (cp.stderr or ""), 12)})
+            if getattr(cp, "flexfactor_containment_blocked", False):
+                meta["blocked_reason"] = cp.stderr.strip()
+                break
+    parsed = []
+    try:
+        for art in _ff_coverage.detect_coverage_artifacts(project_dir):
+            entry = dict(art)
+            if art.get("parse"):
+                try:
+                    parsed.append(_ff_coverage.parse_coverage(art["path"], art["format"], project_dir))
+                    entry["parsed"] = True
+                except Exception as ex:  # noqa: BLE001
+                    entry["parsed"] = False
+                    entry["error"] = f"{type(ex).__name__}: {ex}"
+            meta["artifacts"].append(entry)
+    except Exception as ex:  # noqa: BLE001
+        meta["error"] = f"detect_coverage_artifacts: {type(ex).__name__}: {ex}"
+    merged = _ff_coverage.merge_coverage(parsed) if parsed else {"format": None, "files": {},
+                                                                  "has_function_records": False}
+    rows = _ff_coverage.direct_function_rows(index, merged)
+    if not runnable:
+        meta["reason"] = ("no grounded coverage tool for this stack (nothing was invented); "
+                          "every first-party function remains UNPROVEN")
+    return {"rows": rows, "blocked": {}, "meta": meta}
+
+
+# Orphan-WIP snapshots attached to running programs: normcase(project_dir) ->
+# {ref, secrets, fingerprint, prev_branch}. Consulted by the publication path.
+_WIP_ACTIVE: dict[str, dict] = {}
+_WIRED_WIP_SNAPSHOT = True
+
+
+def _wip_publish_guard(project_dir: str) -> tuple[bool, str]:
+    """(allowed, reason). Publication is refused while an owner WIP snapshot is
+    attached unless it is PROVEN not to be an ancestor of HEAD and carries no
+    secret-shaped content. Unknown separation fails closed."""
+    info = _WIP_ACTIVE.get(os.path.normcase(os.path.abspath(project_dir)))
+    if not info:
+        return True, ""
+    return _ff_wip.publish_allowed(_git, project_dir, snapshot_id=info["ref"],
+                                   branch="HEAD", secret_findings=info.get("secrets"))
+
+
+def _restore_wip_if_active(project_dir: str | None, result: dict, pfx: str = "") -> None:
+    """Put the owner's pre-run uncommitted work back, byte-for-byte, on every
+    exit path. The ref is dropped ONLY after the restored tree's porcelain
+    fingerprint matches the pre-capture one; otherwise the ref is retained and
+    the run says so loudly (the work is never lost, only left under the ref)."""
+    if not project_dir:
+        return
+    key = os.path.normcase(os.path.abspath(project_dir))
+    info = _WIP_ACTIVE.pop(key, None)
+    if not info:
+        return
+    ref = info["ref"]
+    try:
+        if not _git_tree_clean(project_dir):
+            result["wip_restore"] = (f"NOT restored: FlexFactor left uncommitted changes; "
+                                     f"your WIP is retained under {ref}")
+            print(f"{pfx}WARNING: {result['wip_restore']}", file=sys.stderr)
+            return
+        if not _ff_wip.restore_orphan_wip_snapshot(_git, project_dir, ref):
+            result["wip_restore"] = f"FAILED; ref {ref} RETAINED (git show-ref to inspect)"
+            print(f"{pfx}WARNING: WIP restore {result['wip_restore']}", file=sys.stderr)
+            return
+        after = _ff_wip.porcelain_fingerprint(_git, project_dir)
+        if after == info.get("fingerprint"):
+            _ff_wip.drop_wip_ref(_git, project_dir, ref)
+            result["wip_restore"] = "restored byte-for-byte; ref dropped"
+            print(f"{pfx}pre-run uncommitted work restored (fingerprint verified)")
+        else:
+            result["wip_restore"] = (f"restored but fingerprint differs from pre-run; "
+                                     f"ref {ref} RETAINED for inspection")
+            print(f"{pfx}WARNING: {result['wip_restore']}", file=sys.stderr)
+    except Exception as ex:  # noqa: BLE001 - restoration must never hide its failure
+        result["wip_restore"] = f"ERROR {type(ex).__name__}: {ex}; ref {ref} RETAINED"
+        print(f"{pfx}WARNING: {result['wip_restore']}", file=sys.stderr)
+
+
 def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) -> dict:
     """Audit a SINGLE program end-to-end, fully isolated from any sibling program:
     its own resolved dir, its own rebuilt provider instances (never shared across
@@ -12144,6 +12510,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
 
         # Refuse to run two audits of the same program at once (double launcher
         # click) - they'd share one sandbox branch + status slot and double-spend.
+        if getattr(args, "trust_repo", False):
+            # Run-level execution authorization for THIS repository (recorded).
+            _RUN_TRUST_OVERRIDE[os.path.normcase(os.path.abspath(project_dir))] = True
+            result["trust_repo_override"] = True
         lock_path = _acquire_audit_lock(project_dir)
         if lock_path is None:
             msg = (f"another FlexFactor audit of {display_name} is already running; "
@@ -12331,6 +12701,26 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         )
         result["purpose_contract"] = (purpose_contract.to_dict()
                                       if purpose_contract is not None else None)
+        # PURPOSE CONFIDENCE gates purpose-driven mutation (section 8): owner-
+        # authored or strongly-inferred purpose may drive gap-bridging fixes;
+        # a weakly-inferred or unresolved purpose still gets the defect sweep
+        # (correctness is not a guess) but NO gap-driven rewrites - a guess
+        # must not drive a rewrite spree toward a purpose nobody confirmed.
+        (purpose_confidence, purpose_mutation_authorized,
+         purpose_auth_reason) = _purpose_confidence_for(project_dir, purpose_contract)
+        result["purpose_confidence"] = purpose_confidence
+        result["purpose_mutation_authorized"] = purpose_mutation_authorized
+        result["purpose_mutation_reason"] = purpose_auth_reason
+        _pev = _PURPOSE_EVIDENCE_CACHE.get(os.path.normcase(os.path.abspath(project_dir))) or {}
+        result["purpose_evidence_summary"] = {
+            "sources": len(_pev.get("sources") or []),
+            "contradictions": len(_pev.get("contradictions") or []),
+            "unknowns": len(_pev.get("unknowns") or []),
+            "integrations": len(_pev.get("integrations") or []),
+        }
+        print(f"{pfx}Purpose confidence: {purpose_confidence} - gap-driven fixes "
+              f"{'AUTHORIZED' if purpose_mutation_authorized else 'NOT authorized'}"
+              + (f" ({purpose_auth_reason})" if purpose_auth_reason else ""))
 
         # Dual-provider setup, REBUILT per program so no provider instance is shared
         # across programs/threads: author writes fixes, every provider reviews, the
@@ -12357,7 +12747,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if reviewer_pool is not None:
             pool_names = {n for n, _, _ in _LAST_FREE_REVIEW_POOL}
             reviewers = [p for n, p in providers if n not in pool_names]
-            active = " + ".join(f"{n}(pool):{p.model}" for n, p, _ in _LAST_FREE_REVIEW_POOL)
+            active = " + ".join(f"{n}(pool):{getattr(p, 'model', p)}"
+                                for n, p, _ in _LAST_FREE_REVIEW_POOL)
             if reviewers:
                 active += ", " + ", ".join(f"{n}(cross):{p.model}"
                                            for n, p in providers if n not in pool_names)
@@ -12435,9 +12826,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         tree_dirty = git and not _git_tree_clean(project_dir)
         if tree_dirty and not args.allow_dirty:
             print(f"{pfx}error: working tree isn't clean. Commit or stash first, or pass "
-                  "--allow-dirty to sweep the changes into FlexFactor's commits. "
-                  "(Sandbox branches were REMOVED by owner order 2026-08-11, so there is "
-                  "no separate branch to quarantine your WIP onto.)",
+                  "--allow-dirty to have FlexFactor snapshot your uncommitted work to an "
+                  "ORPHAN ref (refs/flexfactor-wip/*) for the run and restore it "
+                  "byte-for-byte at the end. Your WIP never becomes part of "
+                  "FlexFactor's commits and is never pushed.",
                   file=sys.stderr)
             result["error"] = "working tree isn't clean"
             return result
@@ -12454,6 +12846,30 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Working directly on your branch: {branch} (no sandbox branch)")
 
         dirty_snapshot = None  # snapshot-to-sandbox-branch REMOVED (owner order)
+        if tree_dirty:
+            # OWNER WIP MUST NEVER ENTER AUTOMATED BRANCH HISTORY. The dirty tree
+            # is captured as an ORPHAN commit under refs/flexfactor-wip/<sha>
+            # (no parent -> never an ancestor of anything FlexFactor pushes),
+            # secret-scanned, and the worktree is reset to HEAD so every commit
+            # this run makes is tool-only. It is restored in the `finally` below
+            # on EVERY exit path; if restoration cannot be proven the ref is kept.
+            fp_before = _ff_wip.porcelain_fingerprint(_git, project_dir)
+            ok_wip, wip_ref, wip_secrets = _ff_wip.capture_orphan_wip_snapshot(_git, project_dir)
+            if not ok_wip:
+                print(f"{pfx}error: could not snapshot the dirty working tree "
+                      f"(ref={wip_ref or 'none'}); refusing to run on top of your WIP",
+                      file=sys.stderr)
+                result["error"] = "could not snapshot dirty working tree"
+                result["wip_snapshot_ref"] = wip_ref
+                return result
+            _WIP_ACTIVE[os.path.normcase(os.path.abspath(project_dir))] = {
+                "ref": wip_ref, "secrets": wip_secrets, "fingerprint": fp_before,
+                "prev_branch": prev_branch}
+            result["wip_snapshot_ref"] = wip_ref
+            result["wip_secret_findings"] = len(wip_secrets)
+            print(f"{pfx}pre-run uncommitted work snapshotted to ORPHAN {wip_ref} "
+                  f"({len(wip_secrets)} secret-shaped item(s) found); worktree at HEAD "
+                  "for the run; restored at the end")
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
@@ -12795,6 +13211,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             bridgeable_b.sort(key=lambda rg: -SEVERITY_RANK.get(
                 str(rg[1].get("severity", "")).lower(), 0))
             cap_b = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored_b else MAX_PURPOSE_GAP_FIXES
+            if not purpose_mutation_authorized:
+                cap_b = 0  # weakly-inferred/unresolved purpose: report only
             for _rel, _g in bridgeable_b[cap_b:]:
                 # The cap truncation was the silent half: a top-N cut has no
                 # filter reason of its own, so its tail vanished entirely.
@@ -13509,6 +13927,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             bridgeable.sort(key=lambda rg: -SEVERITY_RANK.get(
                 str(rg[1].get("severity", "")).lower(), 0))
             cap = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored else MAX_PURPOSE_GAP_FIXES
+            if not purpose_mutation_authorized:
+                cap = 0  # weakly-inferred/unresolved purpose: gaps are reported, not bridged
+                print(f"{pfx}purpose gaps reported but NOT bridged: purpose confidence is "
+                      f"{purpose_confidence} ({purpose_auth_reason})")
             bridgeable = bridgeable[:cap]
             verified_bridged: set[str] = set()
             if bridgeable:
@@ -14038,6 +14460,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     tests_ran=(test_status is not None or suite_status is not None),
                     tests_passed=(suite_status if suite_status is not None else test_status),
                     generated_test_modules=test_files, e2e=e2e)
+                # DIRECT function evidence: run the project's own suite under a
+                # real coverage tool when one is present, parse the artifact, and
+                # overlay per-symbol direct-invocation rows. Module execution is
+                # kept for context but can no longer satisfy the gate.
+                coverage_run = _direct_coverage_evidence(project_dir, stack, final_index, pfx)
+                coverage_evidence = _ff_coverage.merge_into_function_coverage(
+                    coverage_evidence, coverage_run["rows"], blocked=coverage_run["blocked"])
+                coverage_evidence["coverage_run"] = coverage_run["meta"]
                 graph_evidence = evidence_mod.purpose_graph(
                     result.get("purpose_contract"), purpose_gap,
                     final_index, evidence_run_id)
@@ -14083,6 +14513,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "reason": f"independent reviewer unavailable: {ex}",
                         "fresh_context": True,
                     }
+                if independent_review.get("verdict") == "approve" and git:
+                    # COMMIT RACE: the approval is for ONE exact SHA. If HEAD
+                    # moved between review and this claim, the approval is void.
+                    same, why_head = _ff_ledger.head_matches(_git_argv, project_dir, final_sha)
+                    if not same:
+                        independent_review["verdict"] = "reject"
+                        independent_review["evidence_consistent"] = False
+                        independent_review["reason"] = ("approval REVOKED - HEAD moved after "
+                                                        f"review: {why_head}")
                 review_passed = bool(
                     independent_review.get("verdict") == "approve"
                     and independent_review.get("evidence_consistent") is True
@@ -14393,11 +14832,23 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 "gates": {**(_gates.get("totals") or {}),
                           "passed": _gates.get("passed")},
                 "coverage": {"functions": _cov.get("function_total", 0),
-                             "functions_executed": _cov.get("function_module_execution_total", 0),
+                             # DIRECT invocation evidence is the number that
+                             # counts; module execution is context only.
+                             "functions_direct": _cov.get("function_direct_coverage_total", 0),
+                             "functions_module_executed": _cov.get("function_module_execution_total", 0),
+                             "functions_executed": _cov.get("function_direct_coverage_total", 0),
+                             "coverage_basis": _cov.get("function_coverage_basis",
+                                                        "module-execution-only (NOT direct)"),
                              "routes": _cov.get("discovered_route_total", 0),
                              "routes_executed": _cov.get("executed_route_total", 0),
                              "controls": _cov.get("discovered_control_total", 0),
                              "controls_executed": _cov.get("executed_control_total", 0)},
+                "purpose_confidence": result.get("purpose_confidence"),
+                "purpose_mutation_authorized": result.get("purpose_mutation_authorized"),
+                "containment": (_ff_sandbox.capability_report().get("claim") or "")[:160],
+                "wip": {"snapshot_ref": result.get("wip_snapshot_ref"),
+                        "restore": result.get("wip_restore")},
+                "blocked_reason": (result.get("error") or result.get("stop_reason") or "")[:200],
                 "impact": {"affected_files": _blast.get("affected_count", 0),
                            "tests": len(_blast.get("test_impact") or [])},
                 "artifacts": evidence_paths or {},
@@ -14408,8 +14859,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                evidence=dashboard_evidence)
         return result
     except Exception as ex:  # one program must never abort the batch
+        import traceback as _tb
         print(f"{pfx}FATAL (recovered): {ex}", file=sys.stderr)
         result["error"] = str(ex)
+        result["error_traceback"] = _tb.format_exc()[-6000:]
+        print(result["error_traceback"], file=sys.stderr)
         if checkpoint is not None:
             with contextlib.suppress(Exception):
                 checkpoint.finish(status="interrupted", error=str(ex)[:200])
@@ -14419,6 +14873,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             pass
         return result
     finally:
+        _restore_wip_if_active(project_dir if "project_dir" in dir() else None, result, pfx)
         console_meter.stop()  # erase the meter line + restore builtins.print
         _release_audit_lock(lock_path)
 
@@ -14898,6 +15353,20 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "baseline_ok": a.get("baseline_ok"),
         "fix_notes": list(a.get("fix_notes") or [])[:200],
         "verification_is_real": a.get("verification_is_real"),
+        # Every salvaged (truncated/malformed) structured answer this process
+        # saw. Non-empty means some judging call was incomplete; the guards
+        # refused clean/keep/approve on those, and this is the receipt.
+        "partial_output_events": list(_PARTIAL_OUTPUT_EVENTS)[:500],
+        # Every target-code execution the broker saw: mechanism, basis, or refusal.
+        "execution_ledger": list(_EXECUTION_LEDGER)[:1000],
+        "containment": _ff_sandbox.capability_report(),
+        "wip_snapshot_ref": a.get("wip_snapshot_ref"),
+        "purpose_confidence": a.get("purpose_confidence"),
+        "purpose_mutation_authorized": a.get("purpose_mutation_authorized"),
+        "purpose_evidence_summary": a.get("purpose_evidence_summary"),
+        "trust_repo_override": bool(a.get("trust_repo_override")),
+        "wip_restore": a.get("wip_restore"),
+        "partial_output_event_count": len(_PARTIAL_OUTPUT_EVENTS),
         "verification_note": a.get("verification_note"),
         "purpose_fulfillment_pct": (a.get("purpose_gap") or {}).get("fulfillment_pct"),
         "purpose_gaps": len((a.get("purpose_gap") or {}).get("gaps") or []),
@@ -15386,6 +15855,11 @@ _POLICY_TEMPLATE = {
                            "allowed set. High-risk values: destructive, "
                            "credentialed, deploy. Example: [\"deploy\"] lets "
                            "audited projects run their deploy tooling.",
+    # Repositories whose install/build/test code may run UNATTENDED on a host
+    # without an OS sandbox (path prefixes). Empty = no repository is trusted;
+    # runs refuse target-code execution until you list the repo here, set
+    # FLEXFACTOR_TRUSTED_REPOS, or pass --trust-repo for one run.
+    "trusted_repos": [],
     "allow_classes": [],
     "_allow_egress_help": "Secret/PII finding categories permitted to reach "
                           "cloud models without --redact/--allow-sensitive: "
@@ -15650,7 +16124,16 @@ def main(argv=None) -> int:
                                  "onto the branch the repo is already on. Kept so existing "
                                  "launchers and scripts keep working.")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
-                            help="Apply even if the git working tree isn't clean.")
+                            help="Run even if the git working tree isn't clean: your "
+                                 "uncommitted work is snapshotted to an orphan ref "
+                                 "(never part of FlexFactor's commits) and restored "
+                                 "byte-for-byte at the end.")
+        parser.add_argument("--trust-repo", action="store_true", dest="trust_repo",
+                            help="RUN-LEVEL authorization to execute this repository's "
+                                 "install/build/test code on a host with no OS sandbox. "
+                                 "Recorded in the run manifest. Persistent trust: "
+                                 "FLEXFACTOR_TRUSTED_REPOS or ~/.flexfactor/policy.json "
+                                 "{\"trusted_repos\": [...]}.")
         # Repo cleanup runs BEFORE new work and is ON by default (owner order
         # 2026-08-20). The launcher question that used to gate this is GONE.
         # --auto-clean is accepted so launchers stay explicit; --no-auto-clean
@@ -15914,8 +16397,16 @@ def main(argv=None) -> int:
                                  "already on. The value survives only as the audit-vs-"
                                  "prodready marker in reports, and launchers still pass it.")
         parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty",
-                            help="Audit even if the git working tree isn't clean "
-                                 "(pre-existing changes get swept into the cycle commits).")
+                            help="Audit even if the git working tree isn't clean: your "
+                                 "uncommitted work is snapshotted to an orphan ref "
+                                 "(never part of FlexFactor's commits, never pushed) and "
+                                 "restored byte-for-byte at the end.")
+        parser.add_argument("--trust-repo", action="store_true", dest="trust_repo",
+                            help="RUN-LEVEL authorization to execute this repository's "
+                                 "install/build/test code on a host with no OS sandbox. "
+                                 "Recorded in the run manifest. Persistent trust: "
+                                 "FLEXFACTOR_TRUSTED_REPOS or ~/.flexfactor/policy.json "
+                                 "{\"trusted_repos\": [...]}.")
         # Repo cleanup runs BEFORE new work and is ON by default (owner order
         # 2026-08-20). The launcher question that used to gate this is GONE.
         # --auto-clean is accepted so launchers stay explicit; --no-auto-clean
@@ -16035,7 +16526,9 @@ def runtime_manifest() -> dict:
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
                  "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
-                 "flexfactor_autoclean", "flexfactor_web", "flexfactor_dashboard",
+                 "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
+                 "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",
+                 "flexfactor_web", "flexfactor_dashboard",
                  "flexfactor_dashboard_v2", "flexfactor_self_audit_report"):
         try:
             mod = importlib.import_module(name)

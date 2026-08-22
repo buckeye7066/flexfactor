@@ -32,6 +32,7 @@ py-modules = [
   "flexfactor_autoclean",
   "flexfactor_cmdpolicy",
   "flexfactor_competitors",
+  "flexfactor_coverage",
   "flexfactor_dashboard",
   "flexfactor_dashboard_v2",
   "flexfactor_directed",
@@ -39,6 +40,8 @@ py-modules = [
   "flexfactor_egress",
   "flexfactor_evidence",
   "flexfactor_flags",
+  "flexfactor_journeys",
+  "flexfactor_ledger",
   "flexfactor_locate",
   "flexfactor_node_lock",
   "flexfactor_partial",
@@ -49,6 +52,7 @@ py-modules = [
   "flexfactor_rotation",
   "flexfactor_run",
   "flexfactor_runstate",
+  "flexfactor_sandbox",
   "flexfactor_scout_contract",
   "flexfactor_self_audit_report",
   "flexfactor_trust",
@@ -57,9 +61,12 @@ py-modules = [
   "probe_tiers",
 ]
 
+[tool.setuptools.package-data]
+flexfactor_assets = ["*.js"]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["providers*", "competitors*", "tests*"]
+include = ["providers*", "competitors*", "tests*", "flexfactor_assets*"]
 
 # Test runner: the suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py

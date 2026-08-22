@@ -1,0 +1,445 @@
+"""Tests for purpose-discovery evidence in flexfactor_purpose.py.
+
+Stdlib unittest; builds a real temp repo (git init + commits + tag) and drives
+`gather_purpose_evidence` / `purpose_confidence` / `mutation_authorized_by_purpose`
+/ `render_purpose_evidence_block` / `inferred_contract(evidence=...)`.
+The `gh` CLI is never invoked: every test injects a fake `gh_runner`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import unittest
+
+import flexfactor_purpose as fp
+
+
+def _w(root: str, rel: str, body: str) -> None:
+    path = os.path.join(root, *rel.split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(textwrap.dedent(body).lstrip("\n"))
+
+
+def _git(root: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+
+
+GIT_AVAILABLE = shutil.which("git") is not None
+
+
+def _fake_gh(args, cwd):
+    if args[0] == "pr":
+        return json.dumps([{"number": 7, "title": "Add checkout flow", "state": "MERGED"},
+                           {"number": 9, "title": "Stripe webhook retries", "state": "OPEN"}])
+    if args[0] == "issue":
+        return json.dumps([{"number": 3, "title": "Invoices not emailed", "state": "OPEN"}])
+    return None
+
+
+def _absent_gh(args, cwd):
+    return None
+
+
+def build_full_fixture(root: str, *, readme_kind: str = "web app") -> None:
+    """A small but complete Express+Prisma+Stripe web app repo."""
+    _w(root, "package.json", """
+    {
+      "name": "invoicer",
+      "description": "A web app that lets small businesses send invoices and collect card payments",
+      "scripts": {"build": "tsc", "test": "vitest run", "start": "node dist/server.js"},
+      "dependencies": {"express": "^4.19.0", "@prisma/client": "^5.0.0", "stripe": "^14.0.0"},
+      "devDependencies": {"vitest": "^1.0.0", "prisma": "^5.0.0"}
+    }
+    """)
+    _w(root, "README.md", f"""
+    # Invoicer
+
+    Invoicer is a {readme_kind} that lets small businesses send invoices and collect
+    card payments through Stripe. It automatically emails reminders for overdue invoices.
+
+    ## Features
+
+    - Generates PDF invoices
+    - Tracks payment status
+
+    ```bash
+    npm start
+    ```
+    """)
+    _w(root, "docs/architecture.md", """
+    # Architecture
+
+    The server provides a REST API consumed by the dashboard.
+    """)
+    _w(root, "tests/invoices.test.ts", """
+    import { describe, it, expect } from "vitest";
+    describe("invoice lifecycle", () => {
+      it("creates an invoice and marks it paid after a Stripe webhook", () => {
+        expect(1).toBe(1);
+      });
+    });
+    """)
+    _w(root, "prisma/schema.prisma", """
+    datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+    model Invoice {
+      id     Int    @id @default(autoincrement())
+      amount Int
+    }
+    model Customer {
+      id   Int    @id
+      name String
+    }
+    """)
+    _w(root, "src/routes.ts", """
+    import express from "express";
+    const router = express.Router();
+    router.get("/invoices", list);
+    router.post("/invoices", create);
+    router.post("/webhooks/stripe", webhook);
+    export default router;
+    """)
+    _w(root, ".env.example", """
+    DATABASE_URL=postgres://localhost/invoicer
+    STRIPE_SECRET_KEY=sk_test_placeholder
+    SENDGRID_API_KEY=
+    """)
+    _w(root, "Dockerfile", """
+    FROM node:20
+    CMD ["node", "dist/server.js"]
+    """)
+    _w(root, ".github/workflows/ci.yml", """
+    name: CI
+    on: [push]
+    jobs: {}
+    """)
+    # node_modules must be skipped entirely.
+    _w(root, "node_modules/leftpad/package.json",
+       '{"name": "leftpad", "description": "a library for padding"}')
+    _w(root, "node_modules/leftpad/README.md", "# leftpad\n\nA library that pads.\n")
+
+
+def git_init_with_history(root: str) -> None:
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "t")
+    _git(root, "config", "commit.gpgsign", "false")
+    for i, msg in enumerate(("initial invoicer scaffold", "add stripe webhook route",
+                             "email overdue reminders")):
+        _w(root, f"notes{i}.txt", f"{i}\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", msg)
+    _git(root, "tag", "v0.1.0")
+
+
+class _TempRepo(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ffpurpose-")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class GatherEvidenceFullFixtureTests(_TempRepo):
+    def setUp(self):
+        super().setUp()
+        build_full_fixture(self.root)
+        if GIT_AVAILABLE:
+            git_init_with_history(self.root)
+        self.ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh)
+
+    def _kinds(self):
+        return {s["kind"] for s in self.ev["sources"]}
+
+    def test_every_section_is_populated_with_citations(self):
+        ev = self.ev
+        for key in ("sources", "contradictions", "unknowns", "integrations", "schemas",
+                    "routes", "history", "deploy", "product_claims"):
+            self.assertIn(key, ev)
+        self.assertTrue(ev["sources"])
+        for s in ev["sources"]:
+            self.assertTrue(s["path_or_ref"], s)
+            self.assertIn(s["confidence"], ("high", "medium", "low"), s)
+            self.assertTrue(s["why"], s)
+            self.assertLessEqual(len(s["excerpt"]), 600)
+            # file-backed citations carry a line; git/gh refs carry their ref
+            self.assertTrue(":" in s["path_or_ref"], s["path_or_ref"])
+        kinds = self._kinds()
+        for want in ("manifest", "readme", "doc", "test", "schema", "route", "env",
+                     "deploy", "ci", "pr", "issue"):
+            self.assertIn(want, kinds)
+        self.assertTrue(ev["integrations"])
+        self.assertTrue(ev["schemas"])
+        self.assertTrue(ev["routes"])
+        self.assertTrue(ev["product_claims"])
+        self.assertTrue(ev["deploy"]["targets"])
+        self.assertTrue(ev["deploy"]["ci"])
+        for item in ev["integrations"] + ev["schemas"] + ev["routes"] + ev["product_claims"] \
+                + ev["deploy"]["targets"] + ev["deploy"]["ci"]:
+            self.assertIn("path_or_ref", item)
+            self.assertTrue(item["path_or_ref"])
+
+    def test_manifest_description_is_cited_with_its_line(self):
+        m = [s for s in self.ev["sources"] if s["kind"] == "manifest"
+             and "send invoices" in s["excerpt"]]
+        self.assertEqual(len(m), 1)
+        self.assertEqual(m[0]["confidence"], "high")
+        path, line = m[0]["path_or_ref"].rsplit(":", 1)
+        self.assertEqual(path, "package.json")
+        self.assertEqual(int(line), 3)
+
+    def test_readme_paragraph_skips_code_and_is_high(self):
+        r = [s for s in self.ev["sources"] if s["kind"] == "readme"]
+        self.assertEqual(len(r), 1)
+        self.assertEqual(r[0]["confidence"], "high")
+        self.assertIn("Invoicer is a web app", r[0]["excerpt"])
+        self.assertNotIn("npm start", r[0]["excerpt"])
+        self.assertEqual(r[0]["path_or_ref"], "README.md:3")
+
+    def test_tests_cite_describe_titles(self):
+        t = [s for s in self.ev["sources"] if s["kind"] == "test"]
+        self.assertEqual(len(t), 1)
+        self.assertIn("invoice lifecycle", t[0]["excerpt"])
+        self.assertIn("marks it paid after a Stripe webhook", t[0]["excerpt"])
+        self.assertEqual(t[0]["confidence"], "high")
+        self.assertTrue(t[0]["path_or_ref"].startswith("tests/invoices.test.ts:"))
+
+    def test_prisma_models_and_express_routes(self):
+        names = {s["name"] for s in self.ev["schemas"]}
+        self.assertEqual(names, {"Invoice", "Customer"})
+        self.assertTrue(all(s["path_or_ref"].startswith("prisma/schema.prisma:")
+                            for s in self.ev["schemas"]))
+        routes = {(r["method"], r["path"]) for r in self.ev["routes"]}
+        self.assertEqual(routes, {("GET", "/invoices"), ("POST", "/invoices"),
+                                  ("POST", "/webhooks/stripe")})
+        self.assertTrue(all(r["path_or_ref"].startswith("src/routes.ts:")
+                            for r in self.ev["routes"]))
+
+    def test_env_keys_and_deps_become_integrations(self):
+        names = {i["name"] for i in self.ev["integrations"]}
+        self.assertIn("Stripe", names)
+        self.assertIn("SendGrid", names)
+        self.assertIn("Express", names)
+        self.assertIn("Prisma ORM", names)
+        via_env = [i for i in self.ev["integrations"] if i["via"] == "env key STRIPE_SECRET_KEY"]
+        self.assertEqual(len(via_env), 1)
+        self.assertEqual(via_env[0]["path_or_ref"], ".env.example:2")
+
+    def test_deploy_and_ci_detected(self):
+        targets = {t["target"] for t in self.ev["deploy"]["targets"]}
+        self.assertIn("Docker", targets)
+        self.assertEqual(self.ev["deploy"]["ci"][0]["workflow"], "CI")
+
+    def test_node_modules_is_skipped(self):
+        for s in self.ev["sources"]:
+            self.assertNotIn("node_modules", s["path_or_ref"])
+        self.assertFalse(any("leftpad" in s["excerpt"] for s in self.ev["sources"]))
+
+    @unittest.skipUnless(GIT_AVAILABLE, "git not installed")
+    def test_git_history_commits_tags_branches(self):
+        h = self.ev["history"]
+        self.assertEqual(h["commits"][0], "email overdue reminders")
+        self.assertEqual(len(h["commits"]), 3)
+        self.assertEqual(h["tags"], ["v0.1.0"])
+        self.assertTrue(h["branches"])
+        kinds = self._kinds()
+        self.assertIn("git-commit", kinds)
+        self.assertIn("git-tag", kinds)
+        refs = {s["path_or_ref"] for s in self.ev["sources"] if s["kind"].startswith("git-")}
+        self.assertIn("git:log -50", refs)
+        self.assertIn("git:tag", refs)
+
+    def test_fake_gh_prs_and_issues_are_cited(self):
+        h = self.ev["history"]
+        self.assertEqual([p["number"] for p in h["prs"]], [7, 9])
+        self.assertEqual([i["number"] for i in h["issues"]], [3])
+        refs = {s["path_or_ref"] for s in self.ev["sources"] if s["kind"] in ("pr", "issue")}
+        self.assertEqual(refs, {"gh:pr #7", "gh:pr #9", "gh:issue #3"})
+        self.assertFalse(any("GitHub pull requests unavailable" in u for u in self.ev["unknowns"]))
+
+    def test_no_contradiction_when_manifest_and_readme_agree(self):
+        self.assertEqual(self.ev["contradictions"], [])
+
+    def test_confidence_is_strongly_inferred_and_authorizes_mutation(self):
+        conf = fp.purpose_confidence(None, self.ev)
+        self.assertEqual(conf, "strongly-inferred")
+        ok, why = fp.mutation_authorized_by_purpose(conf)
+        self.assertTrue(ok, why)
+
+    def test_unknowns_always_name_the_unobservable(self):
+        self.assertTrue(any("not observable offline" in u for u in self.ev["unknowns"]))
+
+
+class GhAbsentTests(_TempRepo):
+    def test_gh_absent_records_unknowns_and_never_crashes(self):
+        build_full_fixture(self.root)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
+                                        git_runner=lambda a, c: None)
+        self.assertEqual(ev["history"]["prs"], [])
+        self.assertEqual(ev["history"]["issues"], [])
+        self.assertTrue(any("GitHub pull requests unavailable" in u for u in ev["unknowns"]))
+        self.assertTrue(any("GitHub issues unavailable" in u for u in ev["unknowns"]))
+        # Not a git repo at all -> history is an unknown, not a crash.
+        self.assertTrue(any("not a git repository" in u for u in ev["unknowns"]))
+
+    def test_default_gh_runner_returns_none_when_gh_is_missing(self):
+        old = os.environ.get("PATH")
+        os.environ["PATH"] = self.root  # nothing on PATH
+        try:
+            self.assertIsNone(fp._default_gh_runner(["pr", "list"], self.root))
+        finally:
+            if old is None:
+                del os.environ["PATH"]
+            else:
+                os.environ["PATH"] = old
+
+
+class ContradictionTests(_TempRepo):
+    def test_cli_manifest_vs_web_app_readme_is_a_contradiction(self):
+        build_full_fixture(self.root)
+        _w(self.root, "package.json", """
+        {"name": "invoicer",
+         "description": "A command-line tool that prints invoices",
+         "dependencies": {"express": "^4.19.0"}}
+        """)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
+                                        git_runner=lambda a, c: None)
+        kinds = [c for c in ev["contradictions"] if c["kind"] == "program-kind"]
+        self.assertEqual(len(kinds), 1)
+        c = kinds[0]
+        self.assertEqual(c["a"]["path_or_ref"], "package.json:description")
+        self.assertEqual(c["a"]["says"], ["cli"])
+        self.assertEqual(c["b"]["path_or_ref"], "README.md:1")
+        self.assertEqual(c["b"]["says"], ["web app"])
+        # A contradiction caps confidence below strongly-inferred.
+        self.assertEqual(fp.purpose_confidence(None, ev), "weakly-inferred")
+        self.assertFalse(fp.mutation_authorized_by_purpose(fp.purpose_confidence(None, ev))[0])
+
+    def test_claimed_integration_not_wired(self):
+        build_full_fixture(self.root)
+        _w(self.root, "README.md", """
+        # Invoicer
+
+        Invoicer is a web app that lets businesses send invoices and texts reminders via Twilio.
+        """)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
+                                        git_runner=lambda a, c: None)
+        hits = [c for c in ev["contradictions"] if c["kind"] == "claimed-integration-not-wired"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["a"]["says"], ["Twilio"])
+
+
+class ConfidenceLadderTests(_TempRepo):
+    def test_readme_only_is_weakly_inferred(self):
+        _w(self.root, "README.md", "# Thing\n\nThing is a web app that does a thing.\n")
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
+                                        git_runner=lambda a, c: None)
+        self.assertEqual(fp.purpose_confidence(None, ev), "weakly-inferred")
+        ok, why = fp.mutation_authorized_by_purpose("weakly-inferred")
+        self.assertFalse(ok)
+        self.assertIn("weakly", why)
+
+    def test_empty_dir_is_unresolved(self):
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
+                                        git_runner=lambda a, c: None)
+        self.assertEqual(ev["sources"], [])
+        self.assertEqual(fp.purpose_confidence(None, ev), "unresolved")
+        self.assertTrue(any("no README prose" in u for u in ev["unknowns"]))
+        self.assertTrue(any("no package manifest" in u for u in ev["unknowns"]))
+        ok, why = fp.mutation_authorized_by_purpose("unresolved")
+        self.assertFalse(ok)
+        self.assertIn("unresolved", why)
+
+    def test_missing_dir_is_unresolved_not_a_crash(self):
+        ev = fp.gather_purpose_evidence(os.path.join(self.root, "nope"), gh_runner=_absent_gh)
+        self.assertEqual(fp.purpose_confidence(None, ev), "unresolved")
+        self.assertTrue(any("does not exist" in u for u in ev["unknowns"]))
+
+    def test_authored_contract_wins_regardless_of_evidence(self):
+        c = fp.PurposeContract(name="X", purpose="p", authored=True)
+        self.assertEqual(fp.purpose_confidence(c, {}), "owner-authored")
+        self.assertTrue(fp.mutation_authorized_by_purpose("owner-authored")[0])
+
+    def test_mutation_mapping_is_exhaustive(self):
+        self.assertEqual(
+            {lvl: fp.mutation_authorized_by_purpose(lvl)[0] for lvl in fp.PURPOSE_CONFIDENCE_LEVELS},
+            {"owner-authored": True, "strongly-inferred": True,
+             "weakly-inferred": False, "unresolved": False})
+        self.assertFalse(fp.mutation_authorized_by_purpose("DONE")[0])
+        self.assertFalse(fp.mutation_authorized_by_purpose("")[0])
+
+
+class RenderBlockTests(_TempRepo):
+    def test_render_cites_paths_and_respects_limit(self):
+        build_full_fixture(self.root)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
+                                        git_runner=lambda a, c: None)
+        block = fp.render_purpose_evidence_block(ev)
+        self.assertTrue(block.startswith("```purpose-evidence"))
+        self.assertTrue(block.endswith("\n```"))
+        self.assertLessEqual(len(block), 12000)
+        for cite in ("package.json:3", "README.md:3", "prisma/schema.prisma:", "src/routes.ts:",
+                     ".env.example:2", "gh:pr #7", "gh:issue #3", "Dockerfile:1"):
+            self.assertIn(cite, block, cite)
+        self.assertIn("UNKNOWNS", block)
+        self.assertIn("UNTRUSTED", block)
+
+    def test_render_truncates_but_keeps_fence(self):
+        build_full_fixture(self.root)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
+                                        git_runner=lambda a, c: None)
+        block = fp.render_purpose_evidence_block(ev, limit_chars=400)
+        self.assertLessEqual(len(block), 400)
+        self.assertTrue(block.endswith("\n```"))
+        self.assertIn("[...truncated]", block)
+
+    def test_render_empty_evidence(self):
+        block = fp.render_purpose_evidence_block({})
+        self.assertTrue(block.startswith("```purpose-evidence"))
+        self.assertTrue(block.endswith("```"))
+
+
+class InferredRecordTests(_TempRepo):
+    def test_inferred_contract_without_evidence_is_unchanged(self):
+        c = fp.inferred_contract("X", "does a thing", ["c1"])
+        self.assertFalse(c.authored)
+        self.assertEqual(c.evidence_ledger, [])
+        self.assertEqual(c.confidence, "")
+        self.assertEqual(c.source["authored_by"], "flexfactor")
+        d = c.to_dict()
+        for k in ("name", "slug", "purpose", "acceptance_criteria", "authored", "source"):
+            self.assertIn(k, d)
+
+    def test_inferred_contract_with_evidence_carries_ledger_and_confidence(self):
+        build_full_fixture(self.root)
+        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
+                                        git_runner=lambda a, c: None)
+        c = fp.inferred_contract("invoicer", "send invoices", ["c1"], evidence=ev)
+        self.assertFalse(c.authored)
+        self.assertEqual(c.confidence, "strongly-inferred")
+        self.assertEqual(len(c.evidence_ledger), len(ev["sources"]))
+        self.assertEqual(c.contradictions, [])
+        self.assertTrue(c.unknowns)
+        self.assertEqual(c.false_substitutes, fp.false_substitutes_default())
+        d = c.to_dict()
+        for k in ("evidence_ledger", "contradictions", "unknowns", "confidence"):
+            self.assertIn(k, d)
+        self.assertIn("INFERRED", c.prompt_block())
+        rec = fp.infer_purpose_record("invoicer", "send invoices", ["c1"], evidence=ev)
+        self.assertTrue(rec["mutation_authorized"])
+        self.assertEqual(rec["confidence"], "strongly-inferred")
+
+    def test_false_substitutes_default_names_the_usual_suspects(self):
+        subs = " ".join(fp.false_substitutes_default()).lower()
+        for phrase in ("build passes", "page loads", "merged", "200", "tests exist"):
+            self.assertIn(phrase, subs)
+
+
+if __name__ == "__main__":
+    unittest.main()

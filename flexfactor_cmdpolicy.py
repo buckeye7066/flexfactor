@@ -247,8 +247,30 @@ def classify_command(cmd: list[str]) -> set[str]:
                                        value_opts={"-p", "--package"},
                                        inline_opts={"-c", "--call"})
 
-    if exe in ("pytest", "unittest", "vitest", "jest"):
+    if exe in ("pytest", "unittest", "vitest", "jest", "mocha", "playwright", "cypress"):
         return {"test"}
+    # Other package managers / build systems (2026-08-21): these used to fall
+    # through to 'unknown' and so BYPASSED the execution broker entirely.
+    if exe in ("pip", "pip3", "pipenv", "poetry", "uv", "conda", "mamba"):
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
+        if sub in ("install", "sync", "add", "update", "lock", "download"):
+            return {"install", "network"}
+        if sub == "run":
+            script = pos[1] if len(pos) > 1 else ""
+            return {"test"} if "test" in script or script in ("pytest", "unittest") else {"build"}
+        return {"unknown"}
+    if exe in ("cargo", "go", "dotnet", "mvn", "mvnw", "gradle", "gradlew", "make",
+               "cmake", "ninja", "msbuild", "swift", "mix", "bundle", "rake", "composer"):
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
+        if sub in ("test", "check", "vet", "bench", "verify"):
+            return {"test"}
+        if sub in ("install", "restore", "fetch", "get", "download", "mod", "update", "add"):
+            return {"install", "network"}
+        if sub in ("publish", "deploy", "push", "release"):
+            return {"deploy", "network"}
+        return {"build"}
     if exe in ("node", "python", "python3", "pythonw", "py"):
         return {"build"}  # project/tool script execution (the pre-gate norm)
     if exe in ("curl", "wget", "irm", "iwr", "invoke-webrequest"):

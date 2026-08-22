@@ -8,8 +8,15 @@ purpose, applies verified fixes, and publishes only when a green build and test
 suite confirm the work.
 
 It never retains unverified changes, never leaks sensitive source outside the
-machine, fails closed on verifier loss, contains untrusted installs/builds,
-produces reproducible evidence, and offers deterministic rollback.
+machine, fails closed on verifier loss, produces reproducible evidence, and
+offers deterministic rollback. Target-controlled code (dependency install,
+build, test, dev server) runs only through the execution broker
+(`flexfactor_sandbox`): OS-enforced containment where the host provides it
+(Linux bwrap/unshare + rlimits; Windows Job Objects for process-tree, memory,
+process-count and CPU time), otherwise ONLY for repositories the owner has
+explicitly trusted. Windows has no OS network isolation today; that limit is
+recorded in every run manifest rather than described as containment
+(docs/EXECUTION_CONTAINMENT.md).
 
 ## Algorithm Methodology
 

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!DOCTYPE report PUBLIC "-//JACOCO//DTD Report 1.1//EN" "report.dtd">
+<report name="proj">
+  <sessioninfo id="host-1" start="1756000000000" dump="1756000001000"/>
+  <package name="com/example/core">
+    <class name="com/example/core/Calc" sourcefilename="Calc.java">
+      <method name="&lt;init&gt;" desc="()V" line="5">
+        <counter type="INSTRUCTION" missed="0" covered="3"/>
+        <counter type="METHOD" missed="0" covered="1"/>
+      </method>
+      <method name="add" desc="(II)I" line="8">
+        <counter type="INSTRUCTION" missed="0" covered="4"/>
+        <counter type="LINE" missed="0" covered="1"/>
+        <counter type="METHOD" missed="0" covered="1"/>
+      </method>
+      <method name="sub" desc="(II)I" line="12">
+        <counter type="INSTRUCTION" missed="4" covered="0"/>
+        <counter type="LINE" missed="1" covered="0"/>
+        <counter type="METHOD" missed="1" covered="0"/>
+      </method>
+      <counter type="METHOD" missed="1" covered="2"/>
+    </class>
+    <sourcefile name="Calc.java">
+      <line nr="5" mi="0" ci="3" mb="0" cb="0"/>
+      <line nr="8" mi="0" ci="2" mb="0" cb="0"/>
+      <line nr="9" mi="0" ci="2" mb="0" cb="0"/>
+      <line nr="12" mi="2" ci="0" mb="0" cb="0"/>
+      <line nr="13" mi="2" ci="0" mb="0" cb="0"/>
+      <counter type="LINE" missed="2" covered="3"/>
+    </sourcefile>
+  </package>
+</report>
