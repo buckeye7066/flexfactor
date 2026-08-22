@@ -650,7 +650,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.4.1"
+TOOL_VERSION = "0.5.0"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -4731,8 +4731,11 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     fp = _purpose_module()
     if fp is not None and hasattr(fp, "gather_purpose_evidence"):
         try:
+            def _gh_runner(a, cwd):
+                cp = _run(list(a), cwd, timeout=60)  # same policy chokepoint as every tool call
+                return cp.stdout if cp.returncode == 0 else None
             evidence = fp.gather_purpose_evidence(
-                folder, git_runner=lambda a, cwd: _git(a, cwd))
+                folder, git_runner=lambda a, cwd: _git_argv(a, cwd), gh_runner=_gh_runner)
             _PURPOSE_EVIDENCE_CACHE[os.path.normcase(os.path.abspath(folder))] = evidence
             parts.append(fp.render_purpose_evidence_block(evidence))
         except Exception as ex:  # noqa: BLE001 - evidence gathering must not abort profiling
@@ -5290,26 +5293,9 @@ def _git_tree_clean(path: str) -> bool:
     return True
 
 
-DIRTY_SNAPSHOT_MSG = (
-    "[FlexFactor] snapshot: pre-existing uncommitted changes\n\n"
-    "These changes were already in the working tree when the run started. They are\n"
-    "preserved verbatim as this sandbox branch's FIRST commit so FlexFactor's own\n"
-    "fix commits stay separate from your work. Your files on disk were not touched.\n"
-    "To put them back on your original branch as uncommitted changes:\n"
-    "  git cherry-pick --no-commit <this-commit> && git reset")
-
-
-def _restore_dirty_snapshot(project_dir: str, snapshot_sha: str) -> bool:
-    """Re-apply a pre-run dirty-tree snapshot as plain uncommitted working-tree
-    changes. Called after the ORIGINAL branch is checked back out; that branch tip
-    is the snapshot's parent (the sandbox branch was created from it), so the
-    apply is conflict-free by construction. True on success."""
-    cp = _git(["cherry-pick", "--no-commit", snapshot_sha], project_dir)
-    if cp.returncode != 0:
-        _git(["cherry-pick", "--abort"], project_dir)
-        return False
-    _git(["reset"], project_dir)  # unstage: exactly the pre-run dirty state
-    return True
+# The pre-2026-08-21 "snapshot the dirty tree as the sandbox branch's first
+# commit" mechanism is GONE: owner WIP now lives under refs/flexfactor-wip/*
+# (flexfactor_wip), never in any branch history. See _restore_wip_if_active.
 
 
 def _tail(text: str, lines: int = 25) -> str:
@@ -5653,6 +5639,35 @@ def _valid_npm_spec(spec) -> bool:
 
 
 def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> ApplyResult:
+    """Scout mutation entry. With --allow-dirty on a dirty tree the owner's
+    uncommitted work is held under an ORPHAN ref for the duration (never part
+    of the apply commit, never pushed) and restored byte-for-byte afterwards -
+    the same transaction audit uses (section 15)."""
+    key = os.path.normcase(os.path.abspath(project_dir))
+    snapshotted = False
+    if (_is_git_repo(project_dir) and getattr(opts, "allow_dirty", False)
+            and not _git_tree_clean(project_dir) and key not in _WIP_ACTIVE):
+        fp_before = _ff_wip.porcelain_fingerprint(_git, project_dir)
+        ok_wip, wip_ref, wip_secrets = _ff_wip.capture_orphan_wip_snapshot(_git, project_dir)
+        if not ok_wip:
+            return ApplyResult(repo_name, "skipped-dirty",
+                               f"could not snapshot the dirty working tree (ref={wip_ref or 'none'}); "
+                               "refusing to apply on top of your uncommitted work")
+        _WIP_ACTIVE[key] = {"ref": wip_ref, "secrets": wip_secrets,
+                            "fingerprint": fp_before, "prev_branch": None}
+        snapshotted = True
+    note: dict = {}
+    try:
+        result = _apply_integration_impl(project_dir, repo_name, patch, opts)
+    finally:
+        if snapshotted:
+            _restore_wip_if_active(project_dir, note, pfx="[scout] ")
+    if snapshotted and note.get("wip_restore"):
+        result.detail = f"{result.detail}; owner WIP: {note['wip_restore']}"
+    return result
+
+
+def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts) -> ApplyResult:
     """Apply a generated patch with a build-gated, reversible workflow.
 
     git repo:  work on the branch the repo is ALREADY on - there is no
@@ -5828,7 +5843,10 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
                 raise ApplyError("nothing committed: " + _tail(rc.stdout + rc.stderr, 5))
 
             status, detail = "applied", f"committed on branch {branch}"
-            if opts.push and _git_has_remote(project_dir):
+            wip_ok, wip_why = _wip_publish_guard(project_dir)
+            if opts.push and not wip_ok:
+                detail += f"; PUSH REFUSED - owner WIP snapshot: {wip_why}"
+            elif opts.push and _git_has_remote(project_dir):
                 pr = _git(["push", "-u", "origin", branch], project_dir)
                 if pr.returncode == 0:
                     status, detail = "applied-pushed", f"pushed branch {branch} to origin"
@@ -12410,10 +12428,26 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     merged = _ff_coverage.merge_coverage(parsed) if parsed else {"format": None, "files": {},
                                                                   "has_function_records": False}
     rows = _ff_coverage.direct_function_rows(index, merged)
+    # Functions the OWNER declares unexecutable (destructive against production
+    # resources, hardware-bound, ...) WITH a reason: .flexfactor-coverage-blocked.json
+    # {"<symbol id>": "<reason>"}. A reason-less entry does not count (the gate
+    # ignores it), so nothing can be blocked silently.
+    blocked: dict[str, str] = {}
+    try:
+        with open(os.path.join(project_dir, ".flexfactor-coverage-blocked.json"),
+                  encoding="utf-8") as fh:
+            raw_blocked = json.load(fh)
+        if isinstance(raw_blocked, dict):
+            blocked = {str(k): str(v) for k, v in raw_blocked.items() if str(v).strip()}
+            meta["blocked_declared"] = len(raw_blocked)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as ex:
+        meta["blocked_file_error"] = f"{type(ex).__name__}: {ex}"
     if not runnable:
         meta["reason"] = ("no grounded coverage tool for this stack (nothing was invented); "
                           "every first-party function remains UNPROVEN")
-    return {"rows": rows, "blocked": {}, "meta": meta}
+    return {"rows": rows, "blocked": blocked, "meta": meta}
 
 
 # Orphan-WIP snapshots attached to running programs: normcase(project_dir) ->
@@ -12845,7 +12879,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if git:
             print(f"{pfx}Working directly on your branch: {branch} (no sandbox branch)")
 
-        dirty_snapshot = None  # snapshot-to-sandbox-branch REMOVED (owner order)
         if tree_dirty:
             # OWNER WIP MUST NEVER ENTER AUTOMATED BRANCH HISTORY. The dirty tree
             # is captured as an ORPHAN commit under refs/flexfactor-wip/<sha>
@@ -14333,19 +14366,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #    report and clean up an empty branch if the whole run changed nothing.
         def _drop_branch_restoring_wip() -> str:
             """Return to the original branch and delete the (fix-empty) sandbox
-            branch - but if a dirty-tree snapshot exists, FIRST re-apply it as plain
-            uncommitted changes; if that restore fails, the sandbox branch is the
-            only ref holding the owner's WIP, so keep it (never branch -D it away).
-            Returns a status suffix describing what happened to the WIP."""
+            branch. Owner WIP is never on that branch any more (it lives under
+            refs/flexfactor-wip/* and is restored by _restore_wip_if_active in
+            the `finally`), so there is nothing to cherry-pick back here."""
             _git(["checkout", "--force", prev_branch], project_dir)
-            if dirty_snapshot and not _restore_dirty_snapshot(project_dir, dirty_snapshot):
-                _git(["checkout", branch], project_dir)
-                return (f"; WARNING branch {branch} PRESERVED - it holds your pre-run "
-                        f"uncommitted changes (snapshot {dirty_snapshot[:9]}); "
-                        "automatic restore failed")
             _git(["branch", "-D", branch], project_dir)
-            return ("; pre-run uncommitted changes restored to the working tree"
-                    if dirty_snapshot else "")
+            return ""
 
         if not git:
             commit_status = "no-git"
@@ -14395,9 +14421,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             commit_status = "nothing-to-commit"
 
         # On every path that KEEPS the branch, say where the owner's pre-run WIP is.
-        if dirty_snapshot and "pre-run uncommitted changes" not in commit_status:
-            commit_status += (f"; NOTE your pre-run uncommitted changes are preserved as "
-                              f"snapshot commit {dirty_snapshot[:9]} (first commit on {branch})")
+        if result.get("wip_snapshot_ref"):
+            commit_status += (f"; NOTE your pre-run uncommitted work is held under "
+                              f"{result['wip_snapshot_ref']} and restored at the end")
 
         # Purpose is the product contract, not optional decoration. A provider
         # timeout used to disappear behind a "non-fatal" log and the audit could
@@ -14622,7 +14648,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "unverified_files": unverified_files, "test_files": test_files,
             "test_status": test_status, "e2e": e2e, "fix_notes": fix_notes,
             "commit_status": commit_status, "baseline_ok": baseline_ok,
-            "dirty_snapshot": dirty_snapshot,
+            "wip_snapshot_ref": result.get("wip_snapshot_ref"),
             "cycles": cycles_run, "providers": [f"{n}:{p.model}" for n, p in providers],
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),

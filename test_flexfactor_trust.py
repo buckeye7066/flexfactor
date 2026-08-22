@@ -52,7 +52,7 @@ class TrustBoundaryTests(unittest.TestCase):
             os.environ.pop("FLEXFACTOR_TRUSTED_REPOS", None)
             d = trust.trust_decision(tmp, allow_untrusted=True)
             self.assertTrue(d.allowed)
-            self.assertIn("allow-untrusted-exec", d.reason)
+            self.assertIn("trust-repo", d.reason)
 
     def test_frozen_npm_ci_when_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,9 +25,12 @@ paid service.
 - **scout** - profiles a program (folder / .lnk / URL / description), searches the
   local Repo Rewards service for useful open-source repos, LLM-judges each repo's
   benefit, and writes a report. Proposal-only by default: `--apply` emits
-  integration PROPOSALS on a `flexfactor/adopt-<repo>` branch, verified by the
-  project's own build with hard rollback; actually mutating the target needs the
-  separate FlexFactor apply approval (`.flexfactor-apply-approval.json`).
+  integration PROPOSALS onto the branch the repo is already on (no adopt branch),
+  verified by the project's own build with hard rollback; actually mutating the
+  target needs the separate FlexFactor apply approval
+  (`.flexfactor-apply-approval.json`). Builds/tests of target code run through
+  the execution broker (see docs/EXECUTION_CONTAINMENT.md) and require a
+  trusted repository on hosts without an OS sandbox.
 - **prodready** - point it at any program and walk away. Detects every toolchain
   in the tree (13 ecosystems, monorepo-aware), installs the project's own
   dependencies so the build gate measures the CODE rather than a missing

@@ -7334,7 +7334,9 @@ class NoNetworkVerifyEnvTests(unittest.TestCase):
 
     def test_apply_verify_wiring_pins_isolation(self):
         import inspect
-        src = inspect.getsource(ff.apply_integration)
+        # apply_integration is the WIP-transaction wrapper; the verify wiring
+        # lives in the implementation it delegates to.
+        src = inspect.getsource(ff._apply_integration_impl)
         self.assertIn("_no_network_env", src)
         self.assertIn("isolate_verify", src)
 
@@ -15546,6 +15548,35 @@ class OrphanWipWiringTests(unittest.TestCase):
         ff._restore_wip_if_active(d, result, "")
         self.assertIn("NOT restored", result["wip_restore"])
         self.assertIn("flexfactor-wip", g("show-ref").stdout)
+
+    def test_scout_apply_path_uses_the_same_orphan_wip_transaction(self):
+        """Section 15: EVERY mutation path. Scout's apply_integration must hold
+        the owner's dirty work under the orphan ref while the impl runs and put
+        it back afterwards - the impl never sees the owner's edits."""
+        import types
+        d, g = self._repo()
+        with open(os.path.join(d, "a.py"), "a", encoding="utf-8") as fh:
+            fh.write("y = 2  # owner wip\n")
+        seen = {}
+
+        def impl(project_dir, repo_name, patch, opts):
+            with open(os.path.join(project_dir, "a.py"), encoding="utf-8") as fh:
+                seen["during"] = fh.read()
+            seen["refs"] = g("show-ref").stdout
+            return ff.ApplyResult(repo_name, "applied-local", "stubbed impl")
+
+        orig = ff._apply_integration_impl
+        ff._apply_integration_impl = impl
+        try:
+            res = ff.apply_integration(d, "r", {}, types.SimpleNamespace(allow_dirty=True, push=False))
+        finally:
+            ff._apply_integration_impl = orig
+        self.assertNotIn("owner wip", seen["during"])
+        self.assertIn("flexfactor-wip", seen["refs"])
+        self.assertIn("owner wip", open(os.path.join(d, "a.py"), encoding="utf-8").read())
+        self.assertIn("restored", res.detail)
+        self.assertEqual(g("show-ref").stdout.count("flexfactor-wip"), 0)
+        self.assertEqual(ff._WIP_ACTIVE, {})
 
     def test_audit_pipeline_snapshots_dirty_tree_and_restores_it(self):
         """Drive audit_one_program with the heavy surface stubbed but the REAL
