@@ -3,16 +3,10 @@
 Owner order 2026-08-20: concurrent/rotated free backends must not wander.
 Also filter non-coding catalog routes and skip generated/vendored failure paths.
 
-Install into flexfactor.py with:
-
-    try:
-        import flexfactor_directed as _ff_directed
-        _ff_directed.install(globals())
-    except Exception:
-        pass
-
-Placed after imports so _route_unusable_reason / _existing_failure_path that
-already exist get wrapped; missing symbols are defined fresh.
+This module is the SINGLE OWNER of the unfit-route patterns, the skip-dir
+test and the directed work-theme block. flexfactor.py imports them directly
+(hard import, part of the canonical runtime). `install()` remains only as an
+idempotent compatibility hook for embedders that hold a foreign namespace.
 """
 from __future__ import annotations
 
@@ -23,6 +17,7 @@ _UNFIT_CODE_PATTERNS = (
     r"content-?safety", r"topic-control", r"safety-guard",
     r"orpheus", r"\btts\b", r"whisper",
     r"moondream", r"kosmos", r"deplot", r"vila", r"nvclip", r"fuyu",
+    r"llava", r"bakllava", r"minicpm-v", r"qwen.*-vl", r"pixtral",  # vision models (dogfood 2026-08-21: llava:7b was rotated in for code review)
     r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
     r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
     r"vision-only", r"synthetic-video", r"ai-synthetic-video",
@@ -74,10 +69,25 @@ def install(module_globals: dict) -> None:
     # flexfactor.py owns the richer live filter. Do not replace it with this
     # sidecar's fallback list: doing so re-admitted Gemini robotics/research and
     # batch-only routes whenever launchers used flexfactor_run.py.
+    if module_globals.get("_FLEXFACTOR_DIRECTED_INSTALLED"):
+        return  # idempotent: a second install must not double-wrap the hooks
+    module_globals["_FLEXFACTOR_DIRECTED_INSTALLED"] = True
     existing_unfit = module_globals.get("_unfit_for_code_reason")
-    chosen_unfit = existing_unfit if callable(existing_unfit) else unfit_for_code_reason
+    live_unfit = existing_unfit if callable(existing_unfit) else None
+
+    def chosen_unfit(model_or_route_id: str) -> str:
+        """UNION of the live filter and this sidecar's patterns. The live filter
+        is never replaced (it may be richer), but a route the sidecar knows is
+        unfit (e.g. `:batch`) is refused even when the live filter is silent."""
+        if live_unfit is not None:
+            why = live_unfit(model_or_route_id)
+            if why:
+                return why
+        return unfit_for_code_reason(model_or_route_id)
+
+    if live_unfit is None:
+        module_globals["_unfit_for_code_reason"] = unfit_for_code_reason
     module_globals.setdefault("_UNFIT_CODE_PATTERNS", _UNFIT_CODE_PATTERNS)
-    module_globals["_unfit_for_code_reason"] = chosen_unfit
     module_globals["_directed_work_theme_block"] = directed_work_theme_block
 
     def _is_skip(rel: str) -> bool:

@@ -28,6 +28,14 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    import flexfactor_ledger as _ff_ledger
+except ImportError:  # running as a spec-loaded module: try the file's own dir
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_ledger as _ff_ledger
+
+
 
 SCHEMA = "flexfactor.evidence.v1"
 INDEX_SCHEMA = "flexfactor.code_index.v1"
@@ -367,6 +375,62 @@ def _parse_generic(rel: str, text: str) -> dict:
     return result
 
 
+_LARGE_FILE_HARD_CAP = 64 * 1024 * 1024  # beyond this, content is hashed but not scanned
+
+
+def _index_large_file_in_chunks(root: str, rel: str, safe_path: str, *, cap: int) -> dict:
+    """Chunk-ledger analysis for a source file above the structural-parser cap.
+
+    Returns {"record": {...status/chunks...}, "symbols": [...], "routes": [...]}.
+    Every chunk is hashed and scanned with the generic (regex) structural
+    scanner at a line offset, so symbol lines are file-absolute. Completion:
+    expected chunks == scanned chunks, or the record says BLOCKED with why."""
+    try:
+        size = os.path.getsize(safe_path)
+    except OSError as ex:
+        return {"record": {"status": "blocked", "chunk_error": f"stat failed: {ex}"},
+                "symbols": [], "routes": []}
+    if size > _LARGE_FILE_HARD_CAP:
+        return {"record": {"status": "blocked",
+                           "chunk_error": f"{size} bytes exceeds the {_LARGE_FILE_HARD_CAP}-byte "
+                                          "hard cap; content hashed, not scanned"},
+                "symbols": [], "routes": []}
+    try:
+        with open(safe_path, "rb") as fh:
+            text = fh.read().decode("utf-8", "replace")
+    except OSError as ex:
+        return {"record": {"status": "blocked", "chunk_error": f"read failed: {ex}"},
+                "symbols": [], "routes": []}
+    chunks = _ff_ledger.chunk_text(text, file=rel, max_chars=cap // 4)
+    symbols: list[dict] = []
+    routes: list[dict] = []
+    ledger = []
+    for ch in chunks:
+        parsed = _parse_generic(rel, ch.text)
+        offset = ch.line_start - 1
+        for sym in parsed["symbols"]:
+            sym = dict(sym)
+            sym["line"] = int(sym.get("line", 1)) + offset
+            if "end_line" in sym and sym["end_line"] is not None:
+                sym["end_line"] = int(sym["end_line"]) + offset
+            sym["id"] = f"{rel}::{sym['name']}@{sym['line']}"
+            sym["chunk_id"] = ch.id
+            symbols.append(sym)
+        for rt in parsed["routes"]:
+            rt = dict(rt); rt["line"] = int(rt.get("line", 1)) + offset
+            rt["id"] = f"{rel}:{rt['line']}:{rt['path']}"
+            routes.append(rt)
+        row = ch.to_dict(); row["status"] = "scanned"; row["symbols"] = len(parsed["symbols"])
+        ledger.append(row)
+    expected = len(chunks)
+    scanned = sum(1 for r in ledger if r["status"] == "scanned")
+    return {"record": {"status": "analyzed-in-chunks" if scanned == expected else "blocked",
+                       "parser": "generic-chunked", "chunk_total": expected,
+                       "chunk_scanned": scanned, "chunks": ledger,
+                       "chunk_ledger_complete": scanned == expected},
+            "symbols": symbols, "routes": routes}
+
+
 def build_repository_index(root: str, run_id: str, progress=None) -> dict:
     """Build a content-addressed, measurable repository-wide index.
 
@@ -411,7 +475,14 @@ def build_repository_index(root: str, run_id: str, progress=None) -> dict:
             progress(len(files) + 1, total_paths, rel)
         if category == "source":
             if truncated:
-                record["status"] = "too-large-for-structural-parser"
+                # NO SILENT TRUNCATION: a source file above the in-memory cap is
+                # divided into complete, content-addressed line-range chunks,
+                # each structurally scanned, with a ledger that accounts for
+                # every chunk. The file never disappears into a label.
+                chunk_info = _index_large_file_in_chunks(root, rel, safe_path, cap=4_000_000)
+                record.update(chunk_info["record"])
+                symbols.extend(chunk_info["symbols"])
+                routes.extend(chunk_info["routes"])
             else:
                 text = raw.decode("utf-8", "replace")
                 if ext in {".py", ".pyi"}:
@@ -438,7 +509,9 @@ def build_repository_index(root: str, run_id: str, progress=None) -> dict:
         "totals": {
             "files": len(files),
             "tracked_or_relevant_source_files": sum(f["category"] == "source" for f in files),
-            "analyzed_source_files": sum(f["status"] == "analyzed" for f in files),
+            "analyzed_source_files": sum(f["status"] in ("analyzed", "analyzed-in-chunks")
+                                         for f in files),
+            "chunk_analyzed_source_files": sum(f["status"] == "analyzed-in-chunks" for f in files),
             "refused_files": sum(f["status"] == "refused" for f in files),
             "symbols": len(symbols), "functions": sum(s["kind"].endswith("function") for s in symbols),
             "routes": len(routes), "controls": len(controls),
@@ -738,8 +811,13 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
         return {"id": gid, "name": name, "category": category, "ran": ran,
                 "passed": passed if ran else None, "status": status, "evidence": evidence}
     e2e = e2e or {}
-    functions_proven = (coverage.get("function_module_execution_total", 0)
-                        >= coverage.get("function_total", 0))
+    # DIRECT execution evidence only. Module-level execution (an import
+    # succeeded) is recorded for context but NEVER satisfies this gate. The
+    # gate is complete only when every first-party function is directly
+    # covered or explicitly BLOCKED with a reason (flexfactor_coverage gate).
+    direct_gate = coverage.get("direct_gate") or {}
+    functions_proven = bool(direct_gate.get("complete")) if direct_gate else (
+        coverage.get("function_total", 0) == 0)
     behavior_applicable = bool(index.get("routes") or index.get("controls") or e2e.get("ran"))
     behavior_complete = bool(
         e2e.get("ok")
@@ -764,9 +842,14 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
         gate("rescan", "Changed-file rescan", True, bool(rescan.get("complete")), rescan),
         gate("blast-radius", "Dependency blast-radius analysis", bool(blast.get("ran")),
              bool(blast.get("ran")), blast),
-        gate("function-coverage", "Executable function invocation evidence", True,
+        gate("function-coverage", "Direct function invocation evidence", True,
              functions_proven, {"functions": coverage.get("function_total", 0),
-                                 "proven": coverage.get("function_module_execution_total", 0)}),
+                                 "direct": coverage.get("function_direct_coverage_total", 0),
+                                 "module_executed_only": coverage.get("function_module_execution_total", 0),
+                                 "blocked": direct_gate.get("blocked", 0),
+                                 "basis": coverage.get("function_coverage_basis",
+                                                       "module-execution-only (NOT direct)"),
+                                 "unproven_ids": list(direct_gate.get("unproven_ids") or [])[:200]}),
         gate("behavior", "Route/control behavioral execution",
              bool(e2e.get("ran")) or not behavior_applicable,
              behavior_complete if behavior_applicable else True,

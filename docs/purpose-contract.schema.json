@@ -19,7 +19,11 @@
     "acceptance_criteria": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
     "contradictions": { "type": "array", "items": { "$ref": "#/$defs/claim" } },
     "gaps": { "type": "array", "items": { "$ref": "#/$defs/claim" } },
-    "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evidence" } }
+    "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evidence" } },
+    "false_substitutes": { "type": "array", "items": { "type": "string", "minLength": 1 },
+                           "description": "Observations that must NEVER be read as completion (build passes, page loads, merged, HTTP 200, ...)." },
+    "slug": { "type": "string", "minLength": 1 },
+    "aliases": { "type": "array", "items": { "type": "string", "minLength": 1 } }
   },
   "$defs": {
     "evidence": {

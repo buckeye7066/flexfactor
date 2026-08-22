@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 # The full class vocabulary (for reports/telemetry).
 ALL_CLASSES = frozenset({
@@ -78,11 +79,23 @@ _SHELL_INLINE_FLAGS = {"-command", "-c", "/c", "/k", "-encodedcommand", "-e",
                        "-enc", "-ec"}
 
 
+_VERSIONED_PYTHON = re.compile(r"^python(w?)(\d+(\.\d+)?)?$")
+
+
 def _exe_name(cmd: list[str]) -> str:
+    """Normalised executable name: any path separator, no extension, and a
+    versioned interpreter (`python3.12`, `python3`, `pythonw3.11`) collapses
+    to `python`/`pythonw` so the interpreter rules cannot be bypassed by the
+    spelling a venv or a Linux distro happens to use (CI caught `python3.12`
+    falling through to 'unknown' - an uncontained execution path)."""
     if not cmd or not cmd[0]:
         return ""
-    base = os.path.basename(str(cmd[0]))
-    return os.path.splitext(base)[0].lower()
+    base = str(cmd[0]).replace("\\", "/").rsplit("/", 1)[-1]
+    name = os.path.splitext(base)[0].lower()
+    m = _VERSIONED_PYTHON.match(name)
+    if m:
+        return "pythonw" if m.group(1) else "python"
+    return name
 
 
 def _positionals(args: list[str], value_opts: set[str] = frozenset()) -> list[str]:
@@ -247,9 +260,43 @@ def classify_command(cmd: list[str]) -> set[str]:
                                        value_opts={"-p", "--package"},
                                        inline_opts={"-c", "--call"})
 
-    if exe in ("pytest", "unittest", "vitest", "jest"):
+    if exe in ("pytest", "unittest", "vitest", "jest", "mocha", "playwright", "cypress"):
         return {"test"}
+    # Other package managers / build systems (2026-08-21): these used to fall
+    # through to 'unknown' and so BYPASSED the execution broker entirely.
+    if exe in ("pip", "pip3", "pipenv", "poetry", "uv", "conda", "mamba"):
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
+        if sub in ("install", "sync", "add", "update", "lock", "download"):
+            return {"install", "network"}
+        if sub == "run":
+            script = pos[1] if len(pos) > 1 else ""
+            return {"test"} if "test" in script or script in ("pytest", "unittest") else {"build"}
+        return {"unknown"}
+    if exe in ("cargo", "go", "dotnet", "mvn", "mvnw", "gradle", "gradlew", "make",
+               "cmake", "ninja", "msbuild", "swift", "mix", "bundle", "rake", "composer"):
+        pos = [p.lower() for p in _positionals(args)]
+        sub = pos[0] if pos else ""
+        if sub in ("test", "check", "vet", "bench", "verify"):
+            return {"test"}
+        if sub in ("install", "restore", "fetch", "get", "download", "mod", "update", "add"):
+            return {"install", "network"}
+        if sub in ("publish", "deploy", "push", "release"):
+            return {"deploy", "network"}
+        return {"build"}
     if exe in ("node", "python", "python3", "pythonw", "py"):
+        # `python -m <tool>` IS that tool (dogfood 2026-08-21: `python -m pip
+        # install` was classed 'build', so the broker ran it with the network
+        # poisoned and pip could not reach PyPI - a silent bootstrap failure).
+        low = [a.lower() for a in args]
+        if len(low) >= 2 and low[0] == "-m":
+            mod = low[1]
+            if mod in ("pip", "pipenv", "poetry", "uv", "conda"):
+                return classify_command([mod, *args[2:]])
+            if mod in ("pytest", "unittest", "nose", "tox", "coverage"):
+                return {"test"}
+            if mod in ("build", "pip._internal"):
+                return {"install", "network"} if mod != "build" else {"build"}
         return {"build"}  # project/tool script execution (the pre-gate norm)
     if exe in ("curl", "wget", "irm", "iwr", "invoke-webrequest"):
         return {"network"}

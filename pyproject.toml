@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flexfactor"
-version = "0.4.1"
+version = "0.5.0"
 description = "Purpose-driven autonomous code audit, repair, behavioral verification, and evidence tool."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,34 +24,48 @@ all = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
-flexfactor = "flexfactor:main"
+flexfactor = "flexfactor:run_cli"
 
 [tool.setuptools]
 py-modules = [
   "flexfactor",
+  "flexfactor_autoclean",
   "flexfactor_cmdpolicy",
   "flexfactor_competitors",
+  "flexfactor_coverage",
   "flexfactor_dashboard",
   "flexfactor_dashboard_v2",
+  "flexfactor_directed",
   "flexfactor_discovery",
   "flexfactor_egress",
   "flexfactor_evidence",
+  "flexfactor_flags",
+  "flexfactor_journeys",
+  "flexfactor_ledger",
+  "flexfactor_locate",
   "flexfactor_node_lock",
+  "flexfactor_partial",
   "flexfactor_prodready",
   "flexfactor_prodready_engine",
   "flexfactor_prodready_persist",
   "flexfactor_purpose",
   "flexfactor_rotation",
+  "flexfactor_run",
   "flexfactor_runstate",
+  "flexfactor_sandbox",
   "flexfactor_scout_contract",
   "flexfactor_self_audit_report",
+  "flexfactor_trust",
   "flexfactor_web",
-  "probe_tiers",
+  "flexfactor_wip",
 ]
+
+[tool.setuptools.package-data]
+flexfactor_assets = ["*.js"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["providers*", "competitors*", "tests*"]
+include = ["providers*", "competitors*", "tests*", "flexfactor_assets*"]
 
 # Test runner: the suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py

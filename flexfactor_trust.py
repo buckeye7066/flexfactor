@@ -89,10 +89,10 @@ def trust_decision(project_dir: str, *,
     if allow_untrusted:
         return TrustDecision(
             allowed=True,
-            reason="owner passed --allow-untrusted-exec for this run "
+            reason="owner passed --trust-repo for this run "
                    "(NOT an OS sandbox; third-party code may run)",
             normalized_root=root,
-            matched_rule="--allow-untrusted-exec",
+            matched_rule="--trust-repo",
             policy_source="cli",
         )
     rules, source = load_trusted_repo_rules()
@@ -102,8 +102,8 @@ def trust_decision(project_dir: str, *,
             reason=("no trusted_repos configured — refusing unattended "
                     "install/build/test on an unknown tree. Add the path to "
                     f"~/.flexfactor/policy.json trusted_repos, set "
-                    "FLEXFACTOR_TRUSTED_REPOS, or pass --allow-untrusted-exec "
-                    "(explicit; not a sandbox)."),
+                    "FLEXFACTOR_TRUSTED_REPOS, or pass --trust-repo "
+                    "(run-level; recorded in the manifest; not a sandbox)."),
             normalized_root=root,
             policy_source=source,
         )
@@ -196,14 +196,15 @@ def frozen_install_argv(ecosystem: str, manager: str, lockfile: str | None,
 
 
 def containment_claim() -> str:
-    """Single honest product statement for docs/reports."""
-    return (
-        "FlexFactor does not provide an OS sandbox. Command policy and egress "
-        "filtering reduce risk but do not contain filesystem, network, process "
-        "tree, credentials, or resources. Unattended install/build/test runs only "
-        "on owner-approved trusted_repos (or with explicit --allow-untrusted-exec). "
-        "Dependency lifecycle scripts stay off unless --allow-scripts."
-    )
+    """Single honest product statement, delegated to the execution broker's
+    measured capability report so docs/reports never drift from the code."""
+    try:
+        import flexfactor_sandbox as _sb
+        return str(_sb.capability_report().get("claim") or "")
+    except Exception:  # noqa: BLE001 - the fallback must still be truthful
+        return ("FlexFactor could not probe an OS sandbox on this host. Command policy "
+                "and egress filtering reduce risk but do not contain filesystem, "
+                "network, process tree, credentials, time, CPU, or memory.")
 
 
 if __name__ == "__main__":

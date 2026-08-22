@@ -8,8 +8,15 @@ purpose, applies verified fixes, and publishes only when a green build and test
 suite confirm the work.
 
 It never retains unverified changes, never leaks sensitive source outside the
-machine, fails closed on verifier loss, contains untrusted installs/builds,
-produces reproducible evidence, and offers deterministic rollback.
+machine, fails closed on verifier loss, produces reproducible evidence, and
+offers deterministic rollback. Target-controlled code (dependency install,
+build, test, dev server) runs only through the execution broker
+(`flexfactor_sandbox`): OS-enforced containment where the host provides it
+(Linux bwrap/unshare + rlimits; Windows Job Objects for process-tree, memory,
+process-count and CPU time), otherwise ONLY for repositories the owner has
+explicitly trusted. Windows has no OS network isolation today; that limit is
+recorded in every run manifest rather than described as containment
+(docs/EXECUTION_CONTAINMENT.md).
 
 ## Algorithm Methodology
 
@@ -109,5 +116,13 @@ python flexfactor_tests.py          # unit tests, no API keys needed
 python flexfactor_rotation_tests.py
 python flexfactor_node_lock_tests.py
 python flexfactor_prodready_persistence_tests.py
+python flexfactor_entrypoint_tests.py   # entry-point parity + clean wheel install outside the checkout
+python test_flexfactor_sandbox.py       # execution broker (Job Object / bwrap / rlimits)
+python test_flexfactor_wip.py           # orphan WIP transaction (real git repos)
+python test_flexfactor_partial.py       # partial structured output is failure evidence
+python test_flexfactor_ledger.py        # content-addressed chunk ledger
+python test_flexfactor_coverage.py      # direct function coverage evidence
+python test_flexfactor_purpose.py       # purpose evidence gathering + confidence
+python test_flexfactor_journeys.py      # browser journey engine (real Playwright when available)
 python flexfactor_dashboard.py --selftest
 ```

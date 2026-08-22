@@ -103,7 +103,11 @@ def salvage_truncated_json_ex(
     if not text:
         return None, None
     s = text.strip()
-    fence = re.match(r"```(?:json|JSON)?\s*(.*)", s, re.S)
+    # Strip BOTH fence markers. Keeping the trailing ``` made a COMPLETE
+    # fenced payload fail json.loads, fall into salvage, and come back stamped
+    # partial=True (cut_point before the trailer) - a false partial that
+    # would block a legitimately clean verdict.
+    fence = re.match(r"```(?:json|JSON)?\s*(.*?)\s*(?:```)?\s*$", s, re.S)
     if fence:
         s = fence.group(1).strip()
     # Try a clean full parse first — not partial.
@@ -187,10 +191,18 @@ def merge_continuation_fragments(
     *,
     list_keys: tuple[str, ...] = ("findings", "residual", "issues"),
     correlation_id: str | None = None,
+    mark_complete: bool = False,
 ) -> Any:
     """Duplicate-safe merge of a continuation fragment onto a partial prefix.
 
     Correlation: elements already present (by coarse key) are not duplicated.
+
+    Contract (fail closed): the result is partial=True UNLESS BOTH hold:
+      - the caller passes mark_complete=True (an explicit assertion that the
+        continuation brought the response to its end), AND
+      - the continuation fragment is not itself stamped partial (a fragment
+        that was itself salvaged from a truncation cannot complete anything).
+    A caller that forgets the flag gets a partial result, never a clean one.
     """
     if prefix is None:
         return continuation
@@ -225,9 +237,11 @@ def merge_continuation_fragments(
             left.append(item)
             seen.add(k)
         out[key] = left
-    # Continuation that itself is complete still cannot clear partial: we only
-    # ever merge onto a partial prefix, so the result stays partial unless the
-    # caller explicitly replaces with a fresh full parse.
+    # Completion is an explicit caller assertion AND requires a non-partial
+    # fragment; anything less stays partial.
+    if mark_complete and not is_partial_structured(continuation):
+        out.pop(PARTIAL_META_KEY, None)
+        return out
     evidence = PartialSalvageEvidence(
         partial=True,
         cut_point=meta.get("cut_point"),

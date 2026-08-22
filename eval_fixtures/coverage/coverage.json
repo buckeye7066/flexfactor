@@ -1,0 +1,19 @@
+{
+  "meta": {"format": 3, "version": "7.6.1", "timestamp": "2026-08-21T10:00:00", "branch_coverage": true, "show_contexts": false},
+  "files": {
+    "pkg\\calc.py": {
+      "executed_lines": [1, 4, 5, 8, 12],
+      "summary": {"covered_lines": 5, "num_statements": 7, "percent_covered": 71.4, "missing_lines": 2, "excluded_lines": 0},
+      "missing_lines": [9, 13],
+      "excluded_lines": [],
+      "functions": {
+        "": {"executed_lines": [1, 4, 8, 12], "summary": {}, "missing_lines": [], "excluded_lines": []},
+        "add": {"executed_lines": [5], "summary": {}, "missing_lines": [], "excluded_lines": []},
+        "sub": {"executed_lines": [], "summary": {}, "missing_lines": [9], "excluded_lines": []},
+        "Calc.mul": {"executed_lines": [], "summary": {}, "missing_lines": [13], "excluded_lines": []}
+      },
+      "classes": {}
+    }
+  },
+  "totals": {"covered_lines": 5, "num_statements": 7, "percent_covered": 71.4, "missing_lines": 2, "excluded_lines": 0}
+}

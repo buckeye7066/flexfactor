@@ -1255,3 +1255,70 @@ still the guard.
 - Keys come from env (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`) — never hardcode.
 - Tests use the hermetic load pattern: `sys.modules["flexfactor"] = module`
   BEFORE `exec_module`, or dataclasses with future annotations die.
+
+## 0.5.0 (2026-08-21): one runtime, every guard on a real call path
+
+Read `docs/PURPOSE.md`, `docs/CURRENT_STATE_GAP.md`, `docs/ARCHITECTURE.md`,
+`docs/THREAT_MODEL.md`, `docs/EXECUTION_CONTAINMENT.md`, `docs/EVIDENCE_MODEL.md`,
+`docs/RECOVERY_AND_ROLLBACK.md` and `docs/migration-notes-0.5.0.md` before
+touching any of this. The one-paragraph map:
+
+- **Entry:** `flexfactor.run_cli()` is THE process entry (console script,
+  `python -m flexfactor`, `flexfactor_run.py` shim, launchers via
+  `$PSScriptRoot`). `--runtime-manifest` prints version/modes/module
+  importability and the `wired` guard table; `flexfactor_entrypoint_tests.py`
+  compares it across every entry AND a fresh-venv wheel install run from outside
+  the checkout. `flexfactor_directed` is the single owner of the unfit-route
+  patterns, skip-dir test and work-theme block (no launcher monkey-patching).
+- **Execution broker (`flexfactor_sandbox`) behind `_run`/`_spawn`** for
+  cmdpolicy classes `install`/`build`/`test` (pip/uv/poetry/cargo/go/dotnet/
+  mvn/gradle/make are classified now - they used to fall through to `unknown`
+  and bypass every gate). Windows = Job Object (process tree, memory, process
+  count, CPU time - all verified live); **network is best-effort env poisoning
+  only and is reported as such**. Untrusted repo on a host without an OS
+  sandbox => rc 126 + `flexfactor_containment_blocked`, BEFORE anything runs.
+  Authorize with `FLEXFACTOR_TRUSTED_REPOS`, `~/.flexfactor/policy.json`
+  `trusted_repos`, or `--trust-repo` (run-level, recorded). The test suite
+  trusts `gettempdir()` + this checkout at import. `python -c` / `node -e` /
+  `--check` / `-m py_compile` are the only interpreter carve-outs, by argument
+  shape (`_tool_authored_syntax_check`).
+- **Owner WIP (`flexfactor_wip`)**: `--allow-dirty` snapshots uncommitted work
+  to an ORPHAN ref `refs/flexfactor-wip/<sha>`, resets the tree to HEAD for
+  the run, restores byte-for-byte in `audit_one_program`'s `finally`
+  (fingerprint-verified; ref retained when restoration cannot be proven), and
+  `_wip_publish_guard` fronts every push (audit AND scout `apply_integration`).
+  TRAP: never `git clean` here - cmdpolicy marks it destructive; captured
+  untracked paths are unlinked individually. The old "first commit on the
+  sandbox branch" snapshot is deleted.
+- **Partial output is failure evidence (`flexfactor_partial`)**: salvaged JSON
+  is stamped at the provider sites (`_mark_partial`); `_judge` refuses
+  clean/keep/approve; `review_file` raises `PartialOutputError` on an empty
+  salvaged review (file stays INCOMPLETE); purpose criteria become UNKNOWN;
+  the manifest carries `partial_output_events`.
+- **Exact final review (`flexfactor_ledger`)**: the complete patch is reviewed
+  in content-addressed chunks with a completeness ledger; any missing/blocked/
+  partial chunk or a reviewer naming another commit blocks approval; HEAD
+  moving after review revokes it. TRAP: the ledger's GitRunner takes a FULL
+  argv - pass `_git_argv`, never `_git` (that produced `git git rev-parse` and
+  would have revoked every approval; a test caught it).
+- **Direct coverage (`flexfactor_coverage`)**: the `function-coverage` gate
+  passes ONLY on direct tool evidence (coverage.py / c8 / lcov / go / jacoco /
+  cobertura) or owner-declared blocked functions
+  (`.flexfactor-coverage-blocked.json` {id: reason}); module execution never
+  counts. Files above the parser cap get `analyzed-in-chunks` ledgers.
+- **Journeys**: the Playwright engine lives in
+  `flexfactor_assets/flexfactor_explorer.js` (package data, via
+  `flexfactor_journeys`). `FLEXFACTOR_E2E_ROLES` (JSON), `_VIEWPORTS`,
+  `_MAX_PAGES`; real submissions + failure cases only with
+  `FLEXFACTOR_E2E_ISOLATED=1`, otherwise every skip is NAMED and the run is
+  incomplete.
+- **Purpose**: `gather_purpose_evidence` (manifests, docs, tests, schemas,
+  routes, integrations, deploy, git history, PRs/issues) is cited in the
+  inference prompt; `purpose_confidence` gates gap-driven fixes
+  (weakly-inferred/unresolved => gaps reported, not bridged); the resume
+  policy key is `POLICY_VERSION|purpose:<hash>`.
+- **Tests:** `flexfactor_tests.py` (888) + `flexfactor_entrypoint_tests.py` +
+  `test_flexfactor_{sandbox,wip,partial,ledger,coverage,purpose,journeys,trust}.py`
+  - CI runs all of them on Windows + Linux and installs Playwright on Linux.
+  Bash-tool TRAP for agents: large heredocs with backslashes/quotes get
+  mangled - write patch scripts with the Write tool and run them.

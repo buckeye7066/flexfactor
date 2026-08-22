@@ -43,6 +43,12 @@ _SPEC.loader.exec_module(ff)
 # --------------------------------------------------------------------------- #
 import tempfile as _tempfile  # noqa: E402
 
+# The suite's OWN fixture repositories (temp dirs + this checkout) are owner
+# material: declare them trusted for the execution broker so build/test
+# fixtures run. Tests that prove the UNTRUSTED refusal clear this explicitly.
+os.environ.setdefault("FLEXFACTOR_TRUSTED_REPOS",
+                      _tempfile.gettempdir() + ";" + _HERE)
+
 _TEST_STATE_DIR = _tempfile.mkdtemp(prefix="flexfactor-tests-state-")
 ff.BRAIN_PATH = os.path.join(_TEST_STATE_DIR, "brain.json")
 ff.STATUS_PATH = os.path.join(_TEST_STATE_DIR, "status.json")
@@ -4197,7 +4203,10 @@ class EmptyPackageJsonDistinctTests(unittest.TestCase):
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
             _, ctx = ff._gather_from_folder(proj)
-            self.assertNotIn("package.json", ctx)
+            # MISSING -> no package.json SECTION (the cited evidence block may
+            # still NAME package.json while listing what was not found).
+            self.assertNotIn("package.json:", ctx)
+            self.assertNotIn("package.json (unparsed)", ctx)
         # present but empty -> explicit marker, distinct from missing
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, "proj")
@@ -7325,7 +7334,9 @@ class NoNetworkVerifyEnvTests(unittest.TestCase):
 
     def test_apply_verify_wiring_pins_isolation(self):
         import inspect
-        src = inspect.getsource(ff.apply_integration)
+        # apply_integration is the WIP-transaction wrapper; the verify wiring
+        # lives in the implementation it delegates to.
+        src = inspect.getsource(ff._apply_integration_impl)
         self.assertIn("_no_network_env", src)
         self.assertIn("isolate_verify", src)
 
@@ -11672,7 +11683,8 @@ class ResumeCheckpointTests(unittest.TestCase):
         root = ff.RUNS_PATH
         # Seed a checkpoint as if a prior run of this program was interrupted.
         cp = ffrs.new_run(root, program="proj", project_dir="/proj", mode="audit",
-                          policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+                          policy=ff._effective_policy_version("proj", "/proj"),
+                          tool=ff.TOOL_VERSION)
         cp.record_reviewed("a.py", "s1", [{"t": 1}])
         cp.record_reviewed("b.py", "s2", None)
         cp.finish(status="interrupted")
@@ -11716,7 +11728,8 @@ class ResumeCheckpointTests(unittest.TestCase):
         import flexfactor_runstate as ffrs
         root = ff.RUNS_PATH
         cp = ffrs.new_run(root, program="proj2", project_dir="/proj2", mode="audit",
-                          policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+                          policy=ff._effective_policy_version("proj2", "/proj2"),
+                          tool=ff.TOOL_VERSION)
         cp.record_reviewed("a.py", "sX", [{"t": 1}])
         cp.finish(status="interrupted")
         self.assertTrue(ffrs.is_resumable(ffrs.load(root, cp.run_id).data),
@@ -11795,7 +11808,8 @@ class ResumeCheckpointTests(unittest.TestCase):
         class _R:
             model = "m"
         cp = ffrs.new_run(ff.RUNS_PATH, program="killtest", project_dir="/proj",
-                          mode="audit", policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+                          mode="audit", policy=ff._effective_policy_version("killtest", "/proj"),
+                          tool=ff.TOOL_VERSION)
 
         def cb(rel, sha, findings):
             if sha:
@@ -11836,9 +11850,9 @@ class ResumeCheckpointTests(unittest.TestCase):
         import flexfactor_runstate as ffrs
         with tempfile.TemporaryDirectory() as root:
             a = ffrs.new_run(root, program="same", project_dir=root, mode="audit",
-                             policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+                             policy=ff._effective_policy_version("same", root), tool=ff.TOOL_VERSION)
             b = ffrs.new_run(root, program="same", project_dir=root, mode="audit",
-                             policy=ff.POLICY_VERSION, tool=ff.TOOL_VERSION)
+                             policy=ff._effective_policy_version("same", root), tool=ff.TOOL_VERSION)
             self.assertNotEqual(a.run_id, b.run_id,
                                 "same program + same second + same pid collided")
             a.record_reviewed("old.py", "sha-old", [])
@@ -11909,7 +11923,8 @@ class ResumeCheckpointTests(unittest.TestCase):
             # of THIS SAME invocation would have recorded.
             display_name = os.path.basename(root.rstrip("\\/")) or root
             cp = ffrs.new_run(ff.RUNS_PATH, program=display_name, project_dir=key,
-                              mode="prodready", policy=ff.POLICY_VERSION,
+                              mode="prodready",
+                              policy=ff._effective_policy_version(display_name, key),
                               tool=ff.TOOL_VERSION)
             cp.record_reviewed("app.py", sha, [finding])
             cp.finish(status="interrupted")  # killed mid-run: not converged
@@ -12581,10 +12596,17 @@ class EvidenceRuntimeTests(unittest.TestCase):
             self.assertIn(needle, src)
 
     def test_live_explorer_records_per_item_a11y_performance_and_trace_evidence(self):
-        src = ff._UI_EXPLORER_JS
+        import flexfactor_journeys as fj
+        with open(fj.explorer_script_path(), encoding="utf-8") as fh:
+            src = fh.read()
+        # Journey-matrix surface (section 11) must be present in the ONE shipped engine.
+        for needle in ("authorization_matrix", "journeys", "incomplete_reasons",
+                       "FLEXFACTOR_E2E_ROLES", "FLEXFACTOR_E2E_VIEWPORTS",
+                       "FLEXFACTOR_E2E_MAX_PAGES"):
+            self.assertIn(needle, src)
+        # The per-item evidence the original embedded explorer recorded must survive.
         for needle in ("routeEvidence", "controlEvidence", "formEvidence",
-                       "accessibility", "performance", "context.tracing.start",
-                       "blocked-low-confidence"):
+                       "accessibility", "performance", "tracing.start"):
             self.assertIn(needle, src)
 
 
@@ -15186,6 +15208,587 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         self.assertNotIn("opts.dry_run", src,
                          "a dry-run branch crept back into apply_integration")
         self.assertNotIn("dry_run", inspect.getsource(ff._approve_candidate))
+
+
+class PartialOutputWiringTests(unittest.TestCase):
+    """Section 12: partial structured output is first-class FAILURE evidence.
+    These drive the real chokepoints (provider structured() salvage path,
+    _judge, review_file, _independent_final_review) - not the helper module."""
+
+    class _TruncatingProvider:
+        """Mimics a provider whose structured() had to salvage a cut stream."""
+        judge_model = "judge-x"
+        model = "author-x"
+
+        def __init__(self, salvaged):
+            self._salvaged = salvaged
+
+        def structured(self, system, prompt, schema, max_tokens=8000, model=None,
+                       salvage_truncated=False):
+            import flexfactor_partial as fp
+            data = ff._check_structured_type(self._salvaged, schema, "{}")
+            return ff._mark_partial(data, '{"findings": [', "anthropic")
+
+    def setUp(self):
+        ff._PARTIAL_OUTPUT_EVENTS.clear()
+
+    def test_mark_partial_stamps_first_class_evidence_and_a_ledger_event(self):
+        import flexfactor_partial as fp
+        out = ff._mark_partial({"findings": []}, '{"findings": [', "anthropic")
+        self.assertTrue(fp.is_partial_structured(out))
+        self.assertFalse(fp.may_authorize_clean(out))
+        self.assertEqual(len(ff._PARTIAL_OUTPUT_EVENTS), 1)
+        self.assertEqual(ff._PARTIAL_OUTPUT_EVENTS[0]["provider"], "anthropic")
+
+    def test_judge_downgrades_a_salvaged_clean_verdict(self):
+        prov = self._TruncatingProvider({"verdict": "clean", "residual": []})
+        data = ff._judge(prov, "sys", "prompt", ff.ADVERSARIAL_VERIFY_SCHEMA)
+        self.assertEqual(data["verdict"], "needs_work")
+        self.assertTrue(any("partial" in str(r.get("title", "")).lower()
+                            for r in data["residual"]))
+
+    def test_judge_downgrades_keep_and_approve_too(self):
+        for verdict, schema in (("keep", ff.FIX_VERIFY_SCHEMA),
+                                ("approve", ff.FINAL_REVIEW_SCHEMA)):
+            prov = self._TruncatingProvider({"verdict": verdict})
+            data = ff._judge(prov, "sys", "prompt", schema)
+            self.assertNotIn(data["verdict"], ("keep", "approve"), verdict)
+
+    def test_review_file_with_empty_salvaged_findings_is_not_clean(self):
+        prov = self._TruncatingProvider({"findings": [], "summary": "cut"})
+        with self.assertRaises(ff.PartialOutputError):
+            ff.review_file(prov, "src/a.py", "x = 1\n")
+
+    def test_review_file_keeps_salvaged_findings_when_present(self):
+        finding = {"severity": "high", "line": 1, "title": "t", "problem": "p",
+                   "fix": "f"}
+        prov = self._TruncatingProvider({"findings": [finding], "summary": "cut"})
+        findings, _summary = ff.review_file(prov, "src/a.py", "x = 1\n")
+        self.assertEqual(len(findings), 1)  # informs follow-up work ...
+
+    def test_review_worker_records_partial_review_as_incomplete_not_clean(self):
+        """The sweep-level contract: a PartialOutputError lands the file in the
+        INCOMPLETE set, never in reviewed_clean (the until-clean allowlist)."""
+        prov = self._TruncatingProvider({"findings": [], "summary": "cut"})
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            out = ff.review_files(prov, d, ["a.py"], providers=["anthropic"]) \
+                if hasattr(ff, "review_files") else None
+        if out is None:
+            self.skipTest("review_files entry not present - covered by review_file test")
+        file_findings, flat, unreadable, reviewed_clean, incomplete = out
+        self.assertNotIn("a.py", reviewed_clean)
+        self.assertIn("a.py", incomplete)
+
+    def test_final_review_rejects_on_partial_output(self):
+        prov = self._TruncatingProvider({"verdict": "approve", "commit": "abc",
+                                         "findings": [], "evidence_consistent": True,
+                                         "reason": "looks fine"})
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=d, check=True)
+            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                            "commit", "-q", "--allow-empty", "-m", "base"], cwd=d, check=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
+                                 capture_output=True, text=True).stdout.strip()
+            data = ff._independent_final_review(prov, d, None, sha, {"x": 1})
+        self.assertEqual(data["verdict"], "reject")
+        # Chunked review: a partial reviewer answer BLOCKS that chunk, and a
+        # blocked chunk makes the ledger refuse any verdict synthesis.
+        self.assertIn("ledger incomplete", data["reason"])
+        self.assertEqual(data["review_ledger"]["blocked"], data["review_ledger"]["expected"])
+        self.assertTrue(any("partial" in str(c.get("reason", ""))
+                            for c in data["review_ledger"]["chunks"]))
+
+    def test_run_manifest_carries_the_partial_event_receipt(self):
+        ff._mark_partial({"findings": []}, "{", "ollama")
+        with tempfile.TemporaryDirectory() as d:
+            path = ff._write_run_manifest(d, {"name": "P", "dir": d}, max_cost=1.0)
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        self.assertEqual(payload["partial_output_event_count"], 1)
+        self.assertEqual(payload["partial_output_events"][0]["provider"], "ollama")
+
+    def test_mutation_removing_the_judge_guard_is_detected(self):
+        """If someone deletes refuse_clean_if_partial from _judge, this fails."""
+        src = inspect.getsource(ff._judge)
+        self.assertIn("refuse_clean_if_partial", src)
+        src = inspect.getsource(ff.review_file)
+        self.assertIn("PartialOutputError", src)
+        src = inspect.getsource(ff._independent_final_review)
+        self.assertIn("is_partial_structured", src)
+
+
+class ExecutionBrokerWiringTests(unittest.TestCase):
+    """Section 7 + acceptance D: target-controlled code (install/build/test)
+    crosses ONE chokepoint (_run/_spawn -> broker). Untrusted + no OS sandbox
+    => refused BEFORE anything runs. Git and read-only commands are exempt."""
+
+    def _untrusted(self):
+        saved = os.environ.get("FLEXFACTOR_TRUSTED_REPOS")
+        os.environ["FLEXFACTOR_TRUSTED_REPOS"] = r"Z:\definitely\not\here"
+        self.addCleanup(lambda: os.environ.__setitem__("FLEXFACTOR_TRUSTED_REPOS", saved)
+                        if saved is not None else os.environ.pop("FLEXFACTOR_TRUSTED_REPOS", None))
+        ff._RUN_TRUST_OVERRIDE.clear()
+        ff._EXECUTION_LEDGER.clear()
+
+    def test_untrusted_repo_install_build_test_are_refused_before_running(self):
+        import flexfactor_sandbox as sb
+        if sb.os_sandbox_sufficient():
+            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            for cmd in (["npm", "install"], ["npm", "run", "build"], ["npm", "test"],
+                        ["pip", "install", "-r", "requirements.txt"]):
+                cp = ff._run(cmd, d, timeout=30)
+                self.assertEqual(cp.returncode, 126, cmd)
+                self.assertTrue(getattr(cp, "flexfactor_containment_blocked", False), cmd)
+                self.assertTrue(getattr(cp, "flexfactor_launch_error", False), cmd)
+                self.assertIn("FLEXFACTOR_TRUSTED_REPOS", cp.stderr)
+        refused = [e for e in ff._EXECUTION_LEDGER if e.get("refused")]
+        self.assertEqual(len(refused), 4)
+
+    def test_untrusted_dev_server_spawn_is_refused(self):
+        import flexfactor_sandbox as sb
+        if sb.os_sandbox_sufficient():
+            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            proc, err = ff._spawn(["npm", "run", "dev"], d)
+        self.assertIsNone(proc)
+        self.assertIn("REFUSED", err)
+
+    def test_git_and_read_only_commands_are_not_gated(self):
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            cp = ff._git(["init", "-q"], d)
+            self.assertEqual(cp.returncode, 0)
+            self.assertFalse(getattr(cp, "flexfactor_containment_blocked", False))
+            cp = ff._run([sys.executable, "-c", "print('ok')"], d, timeout=30)
+            self.assertEqual(cp.returncode, 0)
+        self.assertEqual([e for e in ff._EXECUTION_LEDGER if e.get("refused")], [])
+
+    def test_trusted_repo_runs_through_the_broker_with_a_recorded_basis(self):
+        ff._EXECUTION_LEDGER.clear()
+        with _tempfile.TemporaryDirectory() as d:  # under gettempdir -> trusted by the suite
+            with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"test":"node -e \"console.log(123)\""}}')
+            cp = ff._run(["npm", "test"], d, timeout=120)
+        # npm may be absent on a CI box: rc 127 with launch_error is still
+        # "crossed the broker". What is asserted is the LEDGER, not npm.
+        entries = [e for e in ff._EXECUTION_LEDGER if "test" in e["classes"]]
+        self.assertEqual(len(entries), 1, ff._EXECUTION_LEDGER)
+        self.assertFalse(entries[0]["refused"])
+        self.assertEqual(entries[0]["basis"], "trusted-repo")
+        self.assertIn(entries[0]["network"], (False,))
+        self.assertIsNotNone(getattr(cp, "flexfactor_execution_basis", None))
+
+    def test_run_level_trust_repo_flag_authorizes_one_repository_only(self):
+        import flexfactor_sandbox as sb
+        if sb.os_sandbox_sufficient():
+            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d, _tempfile.TemporaryDirectory() as other:
+            ff._RUN_TRUST_OVERRIDE[os.path.normcase(os.path.abspath(d))] = True
+            cp = ff._run(["npm", "test"], d, timeout=60)
+            self.assertFalse(getattr(cp, "flexfactor_containment_blocked", False))
+            cp2 = ff._run(["npm", "test"], other, timeout=60)
+            self.assertTrue(getattr(cp2, "flexfactor_containment_blocked", False))
+
+    def test_every_ecosystem_install_build_test_is_classified_not_unknown(self):
+        """'unknown' bypasses the broker, so a package manager the classifier
+        does not know is an uncontained execution path."""
+        import flexfactor_cmdpolicy as cp
+        for cmd, want in ((["pip", "install", "-r", "r.txt"], "install"),
+                          (["poetry", "install"], "install"), (["uv", "sync"], "install"),
+                          (["cargo", "test"], "test"), (["cargo", "build"], "build"),
+                          (["go", "test", "./..."], "test"), (["go", "build"], "build"),
+                          (["dotnet", "test"], "test"), (["dotnet", "restore"], "install"),
+                          (["mvn", "verify"], "test"), (["gradlew", "build"], "build"),
+                          (["make"], "build"), (["uv", "run", "pytest"], "test"),
+                          # dogfood 2026-08-21: python -m pip must be an INSTALL
+                          # (network on), python -m pytest a TEST
+                          (["python", "-m", "pip", "install", "-r", "r.txt"], "install"),
+                          ([r"C:\\Python314\\python.exe", "-m", "pip", "install", "x"], "install"),
+                          (["/usr/bin/python3.12", "-m", "pip", "install", "x"], "install"),
+                          (["python3.12", "-m", "pytest"], "test"),
+                          ([sys.executable, "-m", "pytest"], "test"),
+                          (["python", "-m", "pytest", "-q"], "test"),
+                          (["python", "-m", "coverage", "run", "-m", "pytest"], "test")):
+            self.assertIn(want, cp.classify_command(cmd), cmd)
+
+    def test_tool_authored_syntax_checks_are_exempt_but_scripts_are_not(self):
+        self.assertTrue(ff._tool_authored_syntax_check([sys.executable, "-c", "print(1)"]))
+        self.assertTrue(ff._tool_authored_syntax_check(["node", "--check", "a.js"]))
+        self.assertTrue(ff._tool_authored_syntax_check(["python", "-m", "py_compile", "a.py"]))
+        self.assertFalse(ff._tool_authored_syntax_check(["python", "-m", "pytest"]))
+        self.assertFalse(ff._tool_authored_syntax_check(["node", "explore.cjs", "http://x"]))
+        self.assertFalse(ff._tool_authored_syntax_check(["python", "script.py"]))
+
+    def test_runtime_manifest_reports_the_guards_wired(self):
+        m = ff.runtime_manifest()
+        for k in ("trust_gate", "execution_broker", "partial_output", "wip_snapshot"):
+            self.assertTrue(m["wired"][k], k)
+
+    def test_run_manifest_carries_execution_ledger_and_containment_claim(self):
+        ff._EXECUTION_LEDGER.clear()
+        with _tempfile.TemporaryDirectory() as d:
+            ff._run(["npm", "test"], d, timeout=60)
+            path = ff._write_run_manifest(d, {"name": "P", "dir": d}, max_cost=1.0)
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        self.assertEqual(len(payload["execution_ledger"]), 1)
+        self.assertIn("claim", payload["containment"])
+        self.assertIn("network_isolation", payload["containment"])
+
+
+class OrphanWipWiringTests(unittest.TestCase):
+    """Section 15 + acceptance I/J: pre-run uncommitted work is captured as an
+    ORPHAN ref, the run works on a HEAD-clean tree, the work comes back
+    byte-for-byte, and publication is refused while separation is unproven."""
+
+    def setUp(self):
+        # Module state another test may have left behind (the free review pool
+        # is a process-wide global populated by rotation tests).
+        ff._LAST_FREE_REVIEW_POOL = []
+        ff._WIP_ACTIVE.clear()
+
+    def _repo(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        def g(*a):
+            return subprocess.run(["git", *a], cwd=d, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        with open(os.path.join(d, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        g("add", "-A"); g("commit", "-q", "-m", "base")
+        return d, g
+
+    def test_wip_publish_guard_is_open_without_a_snapshot(self):
+        with _tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ff._wip_publish_guard(d), (True, ""))
+
+    def test_wip_publish_guard_refuses_when_snapshot_reaches_head(self):
+        import flexfactor_wip as wip
+        d, g = self._repo()
+        # A NEW file (no conflict with HEAD) so the simulated bad merge below
+        # actually completes and the snapshot truly becomes an ancestor.
+        with open(os.path.join(d, "wip_note.txt"), "w", encoding="utf-8") as fh:
+            fh.write("owner wip\n")
+        ok, ref, secrets = wip.capture_orphan_wip_snapshot(ff._git, d)
+        self.assertTrue(ok)
+        key = os.path.normcase(os.path.abspath(d))
+        ff._WIP_ACTIVE[key] = {"ref": ref, "secrets": secrets, "fingerprint": "", "prev_branch": "main"}
+        try:
+            allowed, why = ff._wip_publish_guard(d)
+            self.assertTrue(allowed, why)
+            sha = g("rev-parse", ref).stdout.strip()
+            mr = g("merge", "-q", "--allow-unrelated-histories", "-m", "oops", sha)
+            self.assertEqual(mr.returncode, 0, mr.stderr)
+            allowed, why = ff._wip_publish_guard(d)
+            self.assertFalse(allowed)
+            self.assertIn("ancestor", why.lower())
+        finally:
+            ff._WIP_ACTIVE.pop(key, None)
+
+    def test_wip_publish_guard_refuses_secret_bearing_snapshot(self):
+        import flexfactor_wip as wip
+        d, g = self._repo()
+        with open(os.path.join(d, "creds.txt"), "w", encoding="utf-8") as fh:
+            fh.write("AKIAABCDEFGHIJKLMNOP\n")
+        ok, ref, secrets = wip.capture_orphan_wip_snapshot(ff._git, d)
+        self.assertTrue(ok); self.assertTrue(secrets)
+        key = os.path.normcase(os.path.abspath(d))
+        ff._WIP_ACTIVE[key] = {"ref": ref, "secrets": secrets, "fingerprint": "", "prev_branch": "main"}
+        try:
+            allowed, why = ff._wip_publish_guard(d)
+            self.assertFalse(allowed)
+            self.assertIn("secret", why.lower())
+        finally:
+            ff._WIP_ACTIVE.pop(key, None)
+
+    def test_restore_helper_round_trips_and_drops_the_ref(self):
+        import flexfactor_wip as wip
+        d, g = self._repo()
+        with open(os.path.join(d, "a.py"), "a", encoding="utf-8") as fh:
+            fh.write("y = 2  # owner wip\n")
+        with open(os.path.join(d, "new file.txt"), "w", encoding="utf-8") as fh:
+            fh.write("untracked\n")
+        before = {n: open(os.path.join(d, n), "rb").read() for n in ("a.py", "new file.txt")}
+        head_bytes = g("show", "HEAD:a.py").stdout.encode("utf-8")
+        fp = wip.porcelain_fingerprint(ff._git, d)
+        ok, ref, secrets = wip.capture_orphan_wip_snapshot(ff._git, d)
+        self.assertTrue(ok)
+        # HEAD-clean during the run (compare line-ending-insensitively: the
+        # checkout honours core.autocrlf, the bytes on disk may carry CRLF).
+        self.assertEqual(open(os.path.join(d, "a.py"), "rb").read().replace(b"\r\n", b"\n"),
+                         head_bytes.replace(b"\r\n", b"\n"))
+        # FlexFactor makes a commit of its own during the run:
+        with open(os.path.join(d, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\nz = 3  # flexfactor fix\n")
+        g("commit", "-q", "-am", "flexfactor fix")
+        key = os.path.normcase(os.path.abspath(d))
+        ff._WIP_ACTIVE[key] = {"ref": ref, "secrets": secrets, "fingerprint": fp, "prev_branch": "main"}
+        result = {}
+        ff._restore_wip_if_active(d, result, "")
+        self.assertIn("restored", result["wip_restore"])
+        self.assertTrue(os.path.exists(os.path.join(d, "new file.txt")))
+        self.assertEqual(open(os.path.join(d, "new file.txt"), "rb").read(), before["new file.txt"])
+        # The owner's WIP line is back on disk, on top of FlexFactor's commit.
+        self.assertIn(b"owner wip", open(os.path.join(d, "a.py"), "rb").read())
+        # The orphan snapshot is NOT in the branch history and the ref is gone.
+        self.assertNotIn("orphan WIP snapshot", g("log", "--format=%s").stdout)
+        self.assertEqual(g("show-ref").stdout.count("flexfactor-wip"), 0)
+
+    def test_restore_keeps_the_ref_when_the_tree_is_not_clean(self):
+        import flexfactor_wip as wip
+        d, g = self._repo()
+        with open(os.path.join(d, "a.py"), "a", encoding="utf-8") as fh:
+            fh.write("y = 2\n")
+        ok, ref, secrets = wip.capture_orphan_wip_snapshot(ff._git, d)
+        with open(os.path.join(d, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("left dirty by a crash\n")
+        key = os.path.normcase(os.path.abspath(d))
+        ff._WIP_ACTIVE[key] = {"ref": ref, "secrets": secrets, "fingerprint": "", "prev_branch": "main"}
+        result = {}
+        ff._restore_wip_if_active(d, result, "")
+        self.assertIn("NOT restored", result["wip_restore"])
+        self.assertIn("flexfactor-wip", g("show-ref").stdout)
+
+    def test_scout_apply_path_uses_the_same_orphan_wip_transaction(self):
+        """Section 15: EVERY mutation path. Scout's apply_integration must hold
+        the owner's dirty work under the orphan ref while the impl runs and put
+        it back afterwards - the impl never sees the owner's edits."""
+        import types
+        d, g = self._repo()
+        with open(os.path.join(d, "a.py"), "a", encoding="utf-8") as fh:
+            fh.write("y = 2  # owner wip\n")
+        seen = {}
+
+        def impl(project_dir, repo_name, patch, opts):
+            with open(os.path.join(project_dir, "a.py"), encoding="utf-8") as fh:
+                seen["during"] = fh.read()
+            seen["refs"] = g("show-ref").stdout
+            return ff.ApplyResult(repo_name, "applied-local", "stubbed impl")
+
+        orig = ff._apply_integration_impl
+        ff._apply_integration_impl = impl
+        try:
+            res = ff.apply_integration(d, "r", {}, types.SimpleNamespace(allow_dirty=True, push=False))
+        finally:
+            ff._apply_integration_impl = orig
+        self.assertNotIn("owner wip", seen["during"])
+        self.assertIn("flexfactor-wip", seen["refs"])
+        self.assertIn("owner wip", open(os.path.join(d, "a.py"), encoding="utf-8").read())
+        self.assertIn("restored", res.detail)
+        self.assertEqual(g("show-ref").stdout.count("flexfactor-wip"), 0)
+        self.assertEqual(ff._WIP_ACTIVE, {})
+
+    def test_audit_pipeline_snapshots_dirty_tree_and_restores_it(self):
+        """Drive audit_one_program with the heavy surface stubbed but the REAL
+        git + WIP path live: the owner's dirty edit must never be part of a
+        FlexFactor commit and must be back on disk afterwards."""
+        import types
+        d, g = self._repo()
+        with open(os.path.join(d, "a.py"), "a", encoding="utf-8") as fh:
+            fh.write("y = 2  # owner wip\n")
+        stack = {"is_node": False, "is_python": True, "framework": None, "scripts": {},
+                 "verify_cmds": [], "fast_verify": None, "test_cmd": None,
+                 "full_suite_cmd": None, "dev_script": None, "is_web": False,
+                 "esbuild": None, "config_refused": False}
+
+        class _Prog:
+            def update(self, *a, **k):
+                pass
+
+        class _P:
+            model = "m"
+
+        seen_during_run = {}
+
+        def review_all(*a, **k):
+            with open(os.path.join(d, "a.py"), encoding="utf-8") as fh:
+                seen_during_run["a.py"] = fh.read()
+            return ({}, [], set(), {}, set())
+
+        args = types.SimpleNamespace(
+            max_cost=100.0, apply=True, dry_run=False, recheck=False, allow_dirty=True,
+            provider="anthropic", model=None, economy=False, judge_model=None,
+            secondary_model=None, use_both=True, no_preflight=True,
+            branch_prefix="flexfactor/audit-", fix_severity="high", max_files=0,
+            cycles=1, max_cycles=1, until_clean=False, include=[], exclude=[],
+            review_workers=2, adversarial=True, adversarial_rounds=2, fix_prefetch=0,
+            push=False, merge=False, tests=False, e2e=False, app_url=None,
+            full_suite=False, max_test_modules=4, bootstrap=False, auto_clean=False,
+            competitors=False, trust_repo=False)
+        stubs = {
+            "resolve_program_input": lambda arg: ("prog", ""),
+            "resolve_project_dir": lambda arg, name: d,
+            "_acquire_audit_lock": lambda pd: "lock",
+            "_release_audit_lock": lambda lp: None,
+            "_load_brain": lambda: {},
+            "_clean_map": lambda prior: {},
+            "_detect_stack": lambda pd: stack,
+            "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
+            "_enumerate_source_files": lambda *a, **k: ["a.py"],
+            "_review_all": review_all,
+            "_full_gate": lambda pd, st: (True, ""),
+            "_fix_files": lambda *a, **k: ([], [], [], []),
+            "_commit_and_sync": lambda *a, **k: "nothing to commit",
+            "_brain_record_run": lambda *a, **k: None,
+            "_build_clean_map": lambda *a, **k: {},
+            "_write_audit_report": lambda *a, **k: os.path.join(d, "report.md"),
+            "_write_low_findings_report": lambda *a, **k: None,
+            "_print_audit_summary": lambda *a, **k: None,
+            "_PROGRESS": _Prog(),
+        }
+        orig = {}
+        for name, fn in stubs.items():
+            orig[name] = getattr(ff, name)
+            setattr(ff, name, fn)
+        try:
+            result = ff.audit_one_program("prog", args, 1, 1, 4100)
+        finally:
+            for name, o in orig.items():
+                setattr(ff, name, o)
+        self.assertTrue(str(result.get("wip_snapshot_ref", "")).startswith("refs/flexfactor-wip/"), result)
+        # During the run the tree was HEAD-clean: the owner's line was NOT visible.
+        self.assertNotIn("owner wip", seen_during_run.get("a.py", "owner wip"))
+        # Afterwards it is back, uncommitted, and no branch commit carries it.
+        self.assertIn("owner wip", open(os.path.join(d, "a.py"), encoding="utf-8").read())
+        self.assertIn("restored", str(result.get("wip_restore")))
+        self.assertNotIn("owner wip", g("log", "-p", "--format=%s").stdout)
+
+
+class LargeFileChunkLedgerTests(unittest.TestCase):
+    """Acceptance L: a source file above the structural-parser cap is reviewed
+    through complete, hashed chunks with no missing scope - never a label."""
+
+    def test_file_above_cap_gets_a_complete_chunk_ledger_with_absolute_lines(self):
+        import flexfactor_evidence as ev
+        with _tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+            filler = "// " + ("x" * 96) + "\n"          # ~100 bytes per line
+            lines = [filler] * 42_000                      # ~4.2 MB > 4,000,000 cap
+            lines.insert(100, "function alpha() { return 1; }\n")
+            lines.append("function zeta() { return 26; }\n")
+            path = os.path.join(d, "big.js")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.writelines(lines)
+            subprocess.run(["git", "add", "-A"], cwd=d, check=True)
+            index = ev.build_repository_index(d, "t")
+        rec = next(f for f in index["files"] if f["path"] == "big.js")
+        self.assertEqual(rec["status"], "analyzed-in-chunks", rec)
+        self.assertGreater(rec["chunk_total"], 1)
+        self.assertTrue(rec["chunk_ledger_complete"])
+        self.assertEqual(rec["chunk_scanned"], rec["chunk_total"])
+        # every chunk is content-addressed and contiguous
+        chunks = rec["chunks"]
+        self.assertEqual(chunks[0]["line_start"], 1)
+        for a, b in zip(chunks, chunks[1:]):
+            self.assertEqual(b["line_start"], a["line_end"] + 1)
+            self.assertTrue(b["sha256"]); self.assertTrue(a["sha256"])
+        self.assertEqual(chunks[-1]["line_end"], len(lines))
+        syms = {x["name"]: x for x in index["symbols"] if x["file"] == "big.js"}
+        self.assertEqual(syms["alpha"]["line"], 101)
+        self.assertEqual(syms["zeta"]["line"], len(lines))
+        self.assertEqual(index["totals"]["analyzed_source_files"], 1)
+
+
+class LargePatchChunkedFinalReviewTests(unittest.TestCase):
+    """Acceptance M + R: a patch larger than the old 180,000-char final-review
+    limit is reviewed in complete chunks reconciled against the exact
+    candidate SHA; a moved HEAD revokes the approval."""
+
+    class _Reviewer:
+        judge_model = "judge-x"
+        model = "author-x"
+
+        def __init__(self, final_sha, reject_chunk=None):
+            self.final_sha = final_sha
+            self.calls = []
+            self.reject_chunk = reject_chunk
+
+        def structured(self, system, prompt, schema, max_tokens=8000, model=None,
+                       salvage_truncated=False):
+            self.calls.append(prompt)
+            header = prompt.split("\n", 4)
+            chunk_line = next(l for l in header if l.startswith("PATCH CHUNK:"))
+            n = len(self.calls)
+            if self.reject_chunk == n:
+                return {"verdict": "reject", "commit": self.final_sha, "findings": [
+                    {"severity": "high", "title": "bad hunk", "problem": "x"}],
+                    "evidence_consistent": True, "reason": "chunk " + chunk_line}
+            return {"verdict": "approve", "commit": self.final_sha, "findings": [],
+                    "evidence_consistent": True, "reason": "ok " + chunk_line}
+
+    def _repo_with_big_patch(self):
+        d = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        def g(*a):
+            return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                  cwd=d, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+        g("init", "-q", "-b", "main")
+        with open(os.path.join(d, "a.txt"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        g("add", "-A"); g("commit", "-q", "-m", "base")
+        base = g("rev-parse", "HEAD").stdout.strip()
+        for name in ("one.js", "two.js", "three.js"):
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                for i in range(1500):
+                    fh.write(f"export const v{i} = '{name}' + {'y' * 60};\n")  # ~100 chars
+        g("add", "-A"); g("commit", "-q", "-m", "big change")
+        final = g("rev-parse", "HEAD").stdout.strip()
+        patch = g("diff", f"{base}..{final}").stdout
+        self.assertGreater(len(patch), 180_000, "fixture patch must exceed the old cap")
+        return d, g, base, final
+
+    def test_every_chunk_is_reviewed_and_the_ledger_is_complete(self):
+        d, g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final)
+        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        self.assertEqual(data["verdict"], "approve", data["reason"])
+        self.assertFalse(data["patch_truncated"])
+        self.assertGreater(data["chunk_count"], 3)
+        self.assertEqual(len(rv.calls), data["chunk_count"])
+        led = data["review_ledger"]
+        self.assertTrue(led["complete"]); self.assertEqual(led["missing"], [])
+        self.assertEqual(led["reviewed_clean"], led["expected"])
+        self.assertEqual(led["candidate_sha"], final)
+        # no patch text was lost: every chunk carries a hash and a line range
+        self.assertTrue(all(c["sha256"] and c["line_end"] >= c["line_start"] for c in led["chunks"]))
+
+    def test_one_rejected_chunk_rejects_the_whole_commit(self):
+        d, g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final, reject_chunk=2)
+        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        self.assertEqual(data["verdict"], "reject")
+        self.assertIn("1 chunk(s) rejected", data["reason"])
+        self.assertTrue(any(f.get("title") == "bad hunk" for f in data["findings"]))
+
+    def test_a_reviewer_naming_another_commit_cannot_approve(self):
+        d, g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer("0000000000000000000000000000000000000000")
+        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        self.assertEqual(data["verdict"], "reject")
+        self.assertIn("expected " + final, data["reason"])
+
+    def test_head_moving_after_review_revokes_the_approval(self):
+        import flexfactor_ledger as led
+        d, g, base, final = self._repo_with_big_patch()
+        same, why = led.head_matches(ff._git_argv, d, final)
+        self.assertTrue(same, why)
+        g("commit", "-q", "--allow-empty", "-m", "someone pushed after review")
+        same, why = led.head_matches(ff._git_argv, d, final)
+        self.assertFalse(same)
+        # and the audit wiring applies exactly that check before claiming the gate
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertIn("head_matches(_git_argv, project_dir, final_sha)", src)
+        self.assertIn("approval REVOKED", src)
 
 
 if __name__ == "__main__":

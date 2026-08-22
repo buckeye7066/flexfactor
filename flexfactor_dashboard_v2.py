@@ -372,13 +372,38 @@ def main() -> None:
                                          f"{gates.get('blocked', 0)} blocked"),
                                    fill=TEXT, font=("Segoe UI", 9))
                 canvas.create_text(L, y + 34, anchor="w",
-                                   text=(f"functions {cov.get('functions_executed', 0)}/"
+                                   text=(f"functions DIRECT {cov.get('functions_direct', cov.get('functions_executed', 0))}/"
                                          f"{cov.get('functions', 0)}  routes "
                                          f"{cov.get('routes_executed', 0)}/{cov.get('routes', 0)}  "
                                          f"controls {cov.get('controls_executed', 0)}/"
                                          f"{cov.get('controls', 0)}  impact "
                                          f"{impact.get('affected_files', 0)} files"),
                                    fill=DIM, font=("Segoe UI", 8))
+                y += 16
+                canvas.create_text(L, y + 34, anchor="w",
+                                   text=(f"purpose: {evidence.get('purpose_confidence') or '?'}"
+                                         + ("" if evidence.get('purpose_mutation_authorized') is None else
+                                            ("  gap-fixes AUTHORIZED" if evidence.get('purpose_mutation_authorized')
+                                             else "  gap-fixes NOT authorized"))),
+                                   fill=TEXT, font=("Segoe UI", 9))
+                y += 16
+                canvas.create_text(L, y + 34, anchor="w",
+                                   text=("containment: " + str(evidence.get("containment") or "unknown"))[:110],
+                                   fill=WARN if "NOT" in str(evidence.get("containment") or "") else TEXT,
+                                   font=("Segoe UI", 9))
+                wip = evidence.get("wip") or {}
+                if wip.get("snapshot_ref"):
+                    y += 16
+                    canvas.create_text(L, y + 34, anchor="w",
+                                       text=(f"owner WIP: {wip.get('snapshot_ref')}  "
+                                             f"{wip.get('restore') or 'attached'}")[:110],
+                                       fill=WARN if "RETAINED" in str(wip.get("restore") or "") else TEXT,
+                                       font=("Segoe UI", 9))
+                if evidence.get("blocked_reason"):
+                    y += 16
+                    canvas.create_text(L, y + 34, anchor="w",
+                                       text=("BLOCKED: " + str(evidence.get("blocked_reason")))[:110],
+                                       fill=BAD, font=("Segoe UI", 9, "bold"))
                 y += 46
 
             # ---- 8. CURRENT FILE + how long it has been stuck on it
