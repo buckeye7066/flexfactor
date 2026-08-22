@@ -272,6 +272,18 @@ def classify_command(cmd: list[str]) -> set[str]:
             return {"deploy", "network"}
         return {"build"}
     if exe in ("node", "python", "python3", "pythonw", "py"):
+        # `python -m <tool>` IS that tool (dogfood 2026-08-21: `python -m pip
+        # install` was classed 'build', so the broker ran it with the network
+        # poisoned and pip could not reach PyPI - a silent bootstrap failure).
+        low = [a.lower() for a in args]
+        if len(low) >= 2 and low[0] == "-m":
+            mod = low[1]
+            if mod in ("pip", "pipenv", "poetry", "uv", "conda"):
+                return classify_command([mod, *args[2:]])
+            if mod in ("pytest", "unittest", "nose", "tox", "coverage"):
+                return {"test"}
+            if mod in ("build", "pip._internal"):
+                return {"install", "network"} if mod != "build" else {"build"}
         return {"build"}  # project/tool script execution (the pre-gate norm)
     if exe in ("curl", "wget", "irm", "iwr", "invoke-webrequest"):
         return {"network"}

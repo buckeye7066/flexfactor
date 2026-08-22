@@ -17,6 +17,7 @@ _UNFIT_CODE_PATTERNS = (
     r"content-?safety", r"topic-control", r"safety-guard",
     r"orpheus", r"\btts\b", r"whisper",
     r"moondream", r"kosmos", r"deplot", r"vila", r"nvclip", r"fuyu",
+    r"llava", r"bakllava", r"minicpm-v", r"qwen.*-vl", r"pixtral",  # vision models (dogfood 2026-08-21: llava:7b was rotated in for code review)
     r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
     r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
     r"vision-only", r"synthetic-video", r"ai-synthetic-video",

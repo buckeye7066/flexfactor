@@ -15405,7 +15405,13 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
                           (["go", "test", "./..."], "test"), (["go", "build"], "build"),
                           (["dotnet", "test"], "test"), (["dotnet", "restore"], "install"),
                           (["mvn", "verify"], "test"), (["gradlew", "build"], "build"),
-                          (["make"], "build"), (["uv", "run", "pytest"], "test")):
+                          (["make"], "build"), (["uv", "run", "pytest"], "test"),
+                          # dogfood 2026-08-21: python -m pip must be an INSTALL
+                          # (network on), python -m pytest a TEST
+                          (["python", "-m", "pip", "install", "-r", "r.txt"], "install"),
+                          ([r"C:\\Python314\\python.exe", "-m", "pip", "install", "x"], "install"),
+                          (["python", "-m", "pytest", "-q"], "test"),
+                          (["python", "-m", "coverage", "run", "-m", "pytest"], "test")):
             self.assertIn(want, cp.classify_command(cmd), cmd)
 
     def test_tool_authored_syntax_checks_are_exempt_but_scripts_are_not(self):
