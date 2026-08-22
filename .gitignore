@@ -32,3 +32,6 @@ _scout_report.json
 # cool its pool. Regenerate locally with:
 #   python -c "import flexfactor_discovery as d; d.write_auto_catalog()"
 catalog.auto.json
+
+# Run evidence written into the audited repo by FlexFactor itself (never committed)
+*_run_manifest_*.json
