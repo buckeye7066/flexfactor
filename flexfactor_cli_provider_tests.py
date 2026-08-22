@@ -93,6 +93,11 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
 
     def test_a_paid_extended_route_is_allowed_in_auto_mode(self):
         """Auto rotation may use paid capacity under the shared cost budget."""
+        import shutil
+        if not shutil.which("claude"):
+            # Buildability is a real PATH probe; without the CLI the route is
+            # correctly refused, which is not what this test measures.
+            self.skipTest("BLOCKED: `claude` CLI not on PATH on this host")
         self.assertEqual(ff._route_unusable_reason(
             Route("claude-code", is_free=False), "auto"), "")
 
