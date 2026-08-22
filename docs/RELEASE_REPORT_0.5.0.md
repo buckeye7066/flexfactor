@@ -116,3 +116,16 @@ Anthropic call was refused for billing). GrantFlow: `$0.00 at report time ($3 ca
 7. Scheduled runs on the owner's machine will refuse install/build/test until the
    repositories are trusted (`FLEXFACTOR_TRUSTED_REPOS` or policy.json).
 8. Paid Anthropic credits are exhausted (owner billing action).
+
+## Owner decisions (2026-08-22)
+1. Windows OS network isolation: accepted as a follow-up.
+2. Scheduled audits: NONE - FlexFactor runs are MANUAL only (no scheduled task
+   exists on the owner's machine; `amy_weekly_scout.ps1` removed from the repo
+   so none is recreated). Trust is therefore granted per run (`--trust-repo`)
+   or persistently via policy.json/FLEXFACTOR_TRUSTED_REPOS when the owner
+   chooses.
+3. Anthropic credits: the route rotator covers authoring; no action.
+4. pytest is now pinned in requirements.txt (FIXED; 880 passed / 8 skipped
+   under `python -m pytest -q`).
+5. GrantFlow evidence: accepted as BLOCKED for this release.
+

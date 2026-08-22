@@ -8,3 +8,7 @@
 # after ANY bump before trusting a live audit with it.
 anthropic==0.116.0
 openai==2.44.0
+# The DECLARED test runner ([tool.pytest.ini_options] in pyproject). Without it
+# FlexFactor's own publication gate ("python -m pytest -q") is red on a fresh
+# host - found by the 0.5.0 self-dogfood. Verified: 880 passed, 8 skipped.
+pytest==9.1.1

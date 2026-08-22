@@ -75,3 +75,6 @@ The journey engine lives in `flexfactor_assets/flexfactor_explorer.js`
 Bump `pyproject.toml` version, `TOOL_VERSION`, and the CI parity assertion
 (done: asserts 0.5.0); `head_matches` argv fixed (`_git_argv`); decide
 whether audit/prodready get `--trust-repo`; see docs/CURRENT_STATE_GAP.md.
+
+## Runs are manual (owner decision 2026-08-22)
+Do not create scheduled tasks for audit/prodready/scout. Launch from the desktop shortcuts or the CLI; pass `--trust-repo` (or set persistent trust) for repositories whose install/build/test may run.
