@@ -932,6 +932,12 @@ _RETRYABLE_MARKERS = (
 # These messages are the OPPOSITE of universal: they are the strongest possible
 # evidence that a DIFFERENT route would work. They are retryable.
 _ROUTE_CAPABILITY_MARKERS = (
+    # OBSERVED LIVE 2026-08-22 (FlexFactor self-dogfood): OpenRouter answers
+    # 403 "<model> is only available on agentic harnesses. Try plugging it into
+    # a coding agent ..." for inkling:free. That is a property of the ROUTE,
+    # not of the credential - it burned all three purpose samples because 403
+    # was read as "wrong key, stop".
+    "only available on agentic harnesses", "not available on this endpoint",
     "max_tokens", "max_new_tokens", "maxtokens",
     "context length", "context_length", "context window", "context_window",
     "too many tokens", "reduce the length", "input is too long",
@@ -1012,7 +1018,9 @@ def _is_retryable(exc: BaseException) -> bool:
         # malformed request and stays malformed everywhere.
         return is_route_capability_error(exc)
     if isinstance(status, int) and status in (401, 403):
-        return False   # this route's credential is wrong; retrying it is noise
+        # A credential failure is not worth a 641-route tour - unless the body
+        # names a per-route capability refusal (see the 403 marker above).
+        return is_route_capability_error(exc)
     blob = f"{type(exc).__name__} {exc}".lower()
     if is_route_capability_error(exc):
         return True

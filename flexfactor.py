@@ -11176,6 +11176,21 @@ def _review_all(reviewers: list, project_dir: str,
                     return [(rel, "incomplete") for rel, _text, _sha in unit]
                 except Exception as ex:
                     last_error = ex
+                    # A recovered review failure must stay DIAGNOSABLE: the
+                    # self-dogfood (2026-08-22) logged "'NoneType' object is not
+                    # subscriptable" for flexfactor.py with no frame at all.
+                    # Name the innermost FlexFactor frame in the skip line.
+                    try:
+                        import traceback as _tb
+                        _frames = [f for f in _tb.extract_tb(ex.__traceback__)
+                                   if "flexfactor" in (f.filename or "")]
+                        if _frames:
+                            _f = _frames[-1]
+                            last_error = RuntimeError(
+                                f"{ex} (at {os.path.basename(_f.filename)}:{_f.lineno} "
+                                f"in {_f.name}: {str(_f.line or '')[:80]})")
+                    except Exception:  # noqa: BLE001 - diagnostics never mask the error
+                        pass
                     # With one route, a file-specific/schema failure does not
                     # prove a provider outage. Leave it available for the next
                     # semantic unit; the outer three-zero-batch circuit still

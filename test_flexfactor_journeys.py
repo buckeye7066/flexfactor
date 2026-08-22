@@ -26,6 +26,7 @@ import flexfactor_journeys as fj  # noqa: E402
 FIXTURE = os.path.join(HERE, "eval_fixtures", "journeys", "app.js")
 EXPLORER_TIMEOUT_S = 300
 PLAYWRIGHT_NODE_MODULES_CANDIDATES = [
+    *([os.environ["FLEXFACTOR_PLAYWRIGHT_NODE_MODULES"]] if os.environ.get("FLEXFACTOR_PLAYWRIGHT_NODE_MODULES") else []),
     os.path.join(HERE, "node_modules"),
     r"C:\Users\firer\GrantFlow\node_modules",
     os.path.join(os.path.expanduser("~"), ".eva-playwright", "node_modules"),
@@ -248,6 +249,10 @@ class ExplorerIntegrationTests(unittest.TestCase):
             self.fail(f"explorer exceeded {timeout}s (isolated={isolated}); last progress lines:\n{err[-3000:]}")
         elapsed = time.time() - started
         print(f"\n[explorer run] isolated={isolated} max_pages={max_pages} rc={cp.returncode} elapsed={elapsed:.1f}s", flush=True)
+        if os.environ.get("FLEXFACTOR_E2E_DEBUG_LOG"):  # keep the explorer progress log for CI forensics
+            with open(os.environ["FLEXFACTOR_E2E_DEBUG_LOG"], "a", encoding="utf-8") as fh:
+                header = "===== isolated=%s max_pages=%s rc=%s elapsed=%.1fs" % (isolated, max_pages, cp.returncode, elapsed)
+                fh.write(chr(10) + header + chr(10) + (cp.stderr or ""))
         result = fj.parse_result((cp.stdout or "") + "\n" + (cp.stderr or ""))
         self.assertIsNotNone(result, f"no FLEXFACTOR_E2E_RESULT line; rc={cp.returncode}\nstderr tail: {(cp.stderr or '')[-1500:]}")
         return cp, result, elapsed

@@ -966,5 +966,26 @@ class VerificationFailClosedTests(RotationTestCase):
         self.assertIn("overloaded", str(ctx.exception).lower())
 
 
+class RouteRefusal403Tests(unittest.TestCase):
+    """A 403 that names a per-route capability refusal must rotate; a plain
+    403 (wrong key) must still fail fast."""
+
+    class _Exc(Exception):
+        def __init__(self, msg, status):
+            super().__init__(msg)
+            self.status_code = status
+
+    def test_agentic_harness_403_rotates(self):
+        exc = self._Exc("Error code: 403 - {'error': {'message': 'thinkingmachines/inkling:free "
+                        "is only available on agentic harnesses. Try plugging it into a coding "
+                        "agent', 'code': 403}}", 403)
+        self.assertTrue(R.is_route_capability_error(exc))
+        self.assertTrue(R._is_retryable(exc))
+
+    def test_plain_403_still_fails_fast(self):
+        exc = self._Exc("Error code: 403 - {'error': {'message': 'Forbidden'}}", 403)
+        self.assertFalse(R._is_retryable(exc))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
