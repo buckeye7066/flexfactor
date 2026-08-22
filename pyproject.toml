@@ -24,28 +24,36 @@ all = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
-flexfactor = "flexfactor:main"
+flexfactor = "flexfactor:run_cli"
 
 [tool.setuptools]
 py-modules = [
   "flexfactor",
+  "flexfactor_autoclean",
   "flexfactor_cmdpolicy",
   "flexfactor_competitors",
   "flexfactor_dashboard",
   "flexfactor_dashboard_v2",
+  "flexfactor_directed",
   "flexfactor_discovery",
   "flexfactor_egress",
   "flexfactor_evidence",
+  "flexfactor_flags",
+  "flexfactor_locate",
   "flexfactor_node_lock",
+  "flexfactor_partial",
   "flexfactor_prodready",
   "flexfactor_prodready_engine",
   "flexfactor_prodready_persist",
   "flexfactor_purpose",
   "flexfactor_rotation",
+  "flexfactor_run",
   "flexfactor_runstate",
   "flexfactor_scout_contract",
   "flexfactor_self_audit_report",
+  "flexfactor_trust",
   "flexfactor_web",
+  "flexfactor_wip",
   "probe_tiers",
 ]
 

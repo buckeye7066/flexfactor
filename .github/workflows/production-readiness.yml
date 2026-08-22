@@ -1,5 +1,11 @@
 name: production-readiness
 
+# The binding gate for FlexFactor itself. Every production-relevant test module
+# runs on BOTH platforms; the wheel is installed into a fresh environment and
+# exercised from OUTSIDE the checkout; entry-point parity is proven by running
+# the real processes. Zero tests collected is a failure. A missing required
+# tool is a failure, never a pass.
+
 on:
   push:
     branches: [main, "cursor/production-ready/**", "production-ready/**"]
@@ -7,48 +13,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
-jobs:
-  windows-tests:
-    name: windows-tests
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install pinned provider SDKs (PaidFallbackRescueTests import them)
-        shell: pwsh
-        run: |
-          python -m pip install -r requirements.txt
-          python -m pip install .
-          python -m pip check
-          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
-      - name: Launcher parse and installed-module smoke
-        shell: pwsh
-        run: |
-          $tokens = $null; $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path .\flexfactor_launch.ps1), [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors.Count -ne 0) { $errors | Format-List | Out-String | Write-Error }
-          python -c "import flexfactor, flexfactor_runstate, flexfactor_evidence, flexfactor_web, flexfactor_prodready, flexfactor_node_lock, flexfactor_rotation, flexfactor_prodready_persist"
-          if ($LASTEXITCODE -ne 0) { throw "installed module smoke failed" }
-      - name: Run FlexFactor suite
-        shell: pwsh
-        run: |
-          python flexfactor_tests.py
-          if ($LASTEXITCODE -ne 0) { throw "flexfactor_tests failed" }
-          python flexfactor_node_lock_tests.py
-          if ($LASTEXITCODE -ne 0) { throw "flexfactor_node_lock_tests failed" }
-          python flexfactor_prodready_persistence_tests.py
-          if ($LASTEXITCODE -ne 0) { throw "flexfactor_prodready_persistence_tests failed" }
-          python flexfactor_rotation_tests.py
-          if ($LASTEXITCODE -ne 0) { throw "flexfactor_rotation_tests failed" }
+permissions:
+  contents: read
 
-  linux-containment:
-    name: linux-containment
-    runs-on: ubuntu-latest
+jobs:
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,34 +31,68 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install pinned provider SDKs (PaidFallbackRescueTests import them)
+      - name: Install pinned provider SDKs + the package
+        shell: bash
         run: |
           python -m pip install -r requirements.txt
           python -m pip install .
           python -m pip check
+      - name: Static compile + import of every runtime module
+        shell: bash
+        run: |
           python -m compileall -q .
-      - name: Containment capability probe
-        run: |
           python - <<'PY'
-          import os, flexfactor as ff
-          print("platform", os.name)
-          print("O_NOFOLLOW", ff._HAS_O_NOFOLLOW)
-          print("HAS_DIR_FD", ff._HAS_DIR_FD)
-          print("HAS_REPLACE_DIR_FD", ff._HAS_REPLACE_DIR_FD)
-          print("POSIX_NOFOLLOW", ff._POSIX_NOFOLLOW)
-          print("FALLBACK_OK", ff._CONTAINMENT_FALLBACK_OK)
-          s = getattr(os, "supports_dir_fd", set())
-          for name in ("open", "unlink", "mkdir", "stat", "lstat", "replace", "rename"):
-              fn = getattr(os, name, None)
-              print(f"  {name} in supports_dir_fd:", fn in s if fn else None)
+          import tomllib, importlib
+          mods = tomllib.load(open("pyproject.toml", "rb"))["tool"]["setuptools"]["py-modules"]
+          bad = []
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+              except Exception as ex:
+                  bad.append((m, repr(ex)))
+          assert not bad, bad
+          print("imported", len(mods), "modules")
           PY
-      - name: Run FlexFactor suite (Linux containment evidence)
+      - name: Unit + integration suites (every test module; zero collected = failure)
+        shell: bash
         run: |
-          python flexfactor_tests.py
-          python flexfactor_node_lock_tests.py
-          python flexfactor_prodready_persistence_tests.py
-          python flexfactor_rotation_tests.py
+          set -e
+          for t in flexfactor_tests.py \
+                   flexfactor_entrypoint_tests.py \
+                   flexfactor_node_lock_tests.py \
+                   flexfactor_prodready_persistence_tests.py \
+                   flexfactor_rotation_tests.py \
+                   flexfactor_locate_tests.py \
+                   flexfactor_autoclean_tests.py \
+                   flexfactor_cli_provider_tests.py \
+                   test_flexfactor_trust.py \
+                   test_flexfactor_partial.py \
+                   test_flexfactor_wip.py \
+                   test_flexfactor_sandbox.py \
+                   tests/test_cursor_provider.py; do
+            if [ ! -f "$t" ]; then echo "MISSING required test module: $t"; exit 1; fi
+            echo "=== $t"
+            python "$t" 2>&1 | tee "/tmp/$(basename "$t").log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then echo "FAILED: $t (rc=$rc)"; exit "$rc"; fi
+            if grep -q "^Ran 0 tests" "/tmp/$(basename "$t").log"; then echo "ZERO TESTS COLLECTED: $t"; exit 1; fi
+          done
+        env:
+          FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+      - name: Rotation-extension tests
+        shell: bash
+        env:
+          FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+        run: python tests/test_rotation_extensions.py
+      - name: Forced verifier-outage regression (fail-closed proof)
+        shell: bash
+        run: |
+          python -m unittest \
+            flexfactor_tests.AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed \
+            flexfactor_tests.AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit \
+            -v
       - name: Deterministic repository-intelligence smoke
+        shell: bash
         run: |
           python - <<'PY'
           import flexfactor_evidence as ev
@@ -93,16 +102,17 @@ jobs:
           assert index['totals']['analyzed_source_files'] > 0
           assert all(f.get('sha256') for f in index['files'] if f['category'] == 'source')
           PY
-      - name: Forced verifier-outage regression
+      - name: Containment capability probe (recorded, never a pass by itself)
+        shell: bash
         run: |
-          python -m unittest \
-            flexfactor_tests.AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed \
-            flexfactor_tests.AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit \
-            -v
+          python - <<'PY'
+          import json, flexfactor_sandbox as sb
+          print(json.dumps(sb.capability_report(), indent=2))
+          PY
 
   package-artifact:
     name: package-artifact
-    needs: [windows-tests, linux-containment]
+    needs: [tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,39 +122,39 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build exact-commit wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist
+      - name: Installed-wheel smoke OUTSIDE the checkout (entry-point parity)
         run: |
-          python -m pip wheel . --no-deps --wheel-dir dist
-          python -m pip install --force-reinstall --no-deps dist/*.whl
-          smoke_dir="$(mktemp -d)"
-          (
-            cd "$smoke_dir"
-            python - <<'PY'
-          import pathlib
-          from importlib.metadata import version
-          import flexfactor
-
-          module_path = pathlib.Path(flexfactor.__file__).resolve()
-          assert version("flexfactor") == "0.4.1", version("flexfactor")
-          assert flexfactor.TOOL_VERSION == "0.4.1", flexfactor.TOOL_VERSION
-          assert "site-packages" in module_path.parts, module_path
-          print(f"installed wheel import: {module_path}")
+          python -m venv /tmp/ffvenv
+          /tmp/ffvenv/bin/python -m pip install -q --no-deps dist/*.whl
+          src_manifest="$(python flexfactor.py --runtime-manifest)"
+          cd "$(mktemp -d)"
+          inst_manifest="$(/tmp/ffvenv/bin/flexfactor --runtime-manifest)"
+          python - "$src_manifest" "$inst_manifest" <<'PY'
+          import json, sys
+          src, inst = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+          assert inst["tool_version"] == "0.4.1" == src["tool_version"], (inst["tool_version"], src["tool_version"])
+          for key in ("modes", "wired", "exit_codes"):
+              assert inst[key] == src[key], (key, inst[key], src[key])
+          missing = [k for k, v in inst["modules"].items() if not v["importable"]]
+          assert not missing, missing
+          assert "site-packages" in inst["module_file"], inst["module_file"]
+          print("installed runtime == source runtime:", inst["module_file"])
           PY
-          )
+          for mode in refactor scout audit prodready policy; do
+            /tmp/ffvenv/bin/flexfactor "$mode" --help > /dev/null
+          done
       - name: Record SHA-256 checksums
         run: |
           python - <<'PY'
-          import glob
-          import hashlib
+          import glob, hashlib
           from pathlib import Path
-
           wheels = sorted(glob.glob("dist/*.whl"))
           if not wheels:
               raise SystemExit("wheel build produced no artifact")
-          lines = []
-          for filename in wheels:
-              digest = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
-              lines.append(f"{digest}  {Path(filename).name}")
+          lines = [f"{hashlib.sha256(Path(w).read_bytes()).hexdigest()}  {Path(w).name}" for w in wheels]
           Path("dist/SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
       - name: Upload exact-commit release candidate
         uses: actions/upload-artifact@v4

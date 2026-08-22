@@ -106,6 +106,14 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_egress as _egress
 
+# Directed orchestration (route fitness, skip dirs, shared work theme). Part
+# of the CANONICAL runtime now - no launcher-side monkey-patching. Hard import.
+try:
+    import flexfactor_directed as _ff_directed
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_directed as _ff_directed
+
 # Scout production bridge (94-100): separate risk model / report schema,
 # metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
 # Hard import - scout must not run without the bridge invariants.
@@ -3220,40 +3228,11 @@ def _extended_route_unusable(route) -> str:
     return ""
 
 
-_UNFIT_CODE_PATTERNS = (
-    r"prompt-?guard", r"llama-guard", r"nemoguard", r"moderation", r"rerank",
-    r"content-?safety", r"topic-control", r"safety-guard",
-    r"orpheus", r"\btts\b", r"whisper",
-    r"moondream", r"kosmos", r"deplot", r"vila", r"nvclip", r"fuyu",
-    r"clip-preview", r"stable-diffusion", r"imagen", r"flux", r"lyria",
-    r"veo", r"riffusion", r"embed", r"retrieval", r"nomic-embed",
-    r"vision-only", r"synthetic-video", r"ai-synthetic-video",
-    # Gemini families that are NOT chat-completion coding models. Each was
-    # measured against the live API on 2026-08-21 rather than assumed:
-    #   deep-research-*        -> 400 "This model only supports Interactions API"
-    #   antigravity-preview-*  -> 400 "Developer instruction is not enabled"
-    # Both are permanent properties of the model, so leaving them selectable
-    # means a guaranteed 400 that cools the shared `gemini:free-tier` pool and
-    # retires the 12 routes that DO work.
-    r"deep-research", r"antigravity",
-    # Answered the ping, but are not code models: robotics-er is embodied
-    # reasoning, computer-use drives a GUI, nano-banana is image generation and
-    # omni is audio. Filtering them is what stops a code review being handed to
-    # an image model — the same class the existing patterns above address.
-    r"robotics-er", r"computer-use", r"nano-banana", r"omni-flash",
-    # Catalog variants suffixed `:batch` are asynchronous Batch-API products.
-    # Sending them through the synchronous review client returns a permanent 404.
-    r":batch$",
-)
-
-
-def _unfit_for_code_reason(model_or_route_id: str) -> str:
-    """Why a catalog route cannot do code review/authoring, or '' when it can."""
-    low = str(model_or_route_id or "").lower()
-    for pat in _UNFIT_CODE_PATTERNS:
-        if re.search(pat, low):
-            return f"non-coding model ({pat})"
-    return ""
+# Route fitness, skip-dir and directed-theme helpers are OWNED by the
+# flexfactor_directed sidecar (single source of truth, packaged in the wheel).
+# The tuple below stays importable under its old name for callers/tests.
+_UNFIT_CODE_PATTERNS = _ff_directed._UNFIT_CODE_PATTERNS
+_unfit_for_code_reason = _ff_directed.unfit_for_code_reason
 
 
 def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
@@ -9590,19 +9569,9 @@ def _directed_work_theme_block(theme: str, issue: str) -> str:
     """Stamp one shared theme+issue onto every model call for this program.
 
     Owner order 2026-08-20: concurrent/rotated free backends must not wander.
-    Every review/fix prompt carries the same open issue so prompt-guards,
-    vision models, and unrelated polish cannot hijack the run.
+    Body lives in flexfactor_directed (single source of truth).
     """
-    theme_s = " ".join(str(theme or "fulfill the program purpose").split())[:400]
-    issue_s = " ".join(str(issue or "resolve the current verified failure").split())[:500]
-    return (
-        "DIRECTED WORK THEME (shared across every model on this run):\n"
-        f"Theme: {theme_s}\n"
-        f"Open issue (attack this — do not wander): {issue_s}\n"
-        "Never treat node_modules/, dist/, build/, .next/, out/, or coverage/ "
-        "as the fix target — edit the source that produced them.\n"
-        "Every answer must advance THAT issue. Ignore unrelated polish.\n"
-    )
+    return _ff_directed.directed_work_theme_block(theme, issue)
 
 
 def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
@@ -9654,9 +9623,7 @@ def _existing_failure_path(project_dir: str, raw_path: str) -> str | None:
 
 def _is_skip_dir_path(rel: str) -> bool:
     """True when a repo-relative path sits under a generated/vendored skip dir."""
-    parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p and p != "."]
-    skip = {d.lower() for d in _SKIP_DIRS}
-    return any(p.lower() in skip for p in parts)
+    return _ff_directed.is_skip_dir_path(rel, _SKIP_DIRS)
 
 
 def _test_import_candidates(project_dir: str, test_rel: str) -> list[str]:
@@ -16052,15 +16019,73 @@ def main(argv=None) -> int:
     return run(args)
 
 
-if __name__ == "__main__":
-    # Armed ONLY for the real CLI process: embedders/tests calling main() must
-    # not have a crash-log filehandle pinned open in their working dirs
-    # (Windows rmtree fails on open files).
+def runtime_manifest() -> dict:
+    """What THIS runtime is: version, modes, and which safety modules are live.
+
+    Every supported entry point (python flexfactor.py, python -m flexfactor, the
+    installed `flexfactor` console script, flexfactor_run.py, the .ps1 launchers)
+    must report the SAME manifest - the entry-point parity tests compare them.
+    A safety module that is importable but not wired is reported as such, so a
+    guard can never be presumed live because its file exists."""
+    import importlib
+    modules = {}
+    for name in ("flexfactor_cmdpolicy", "flexfactor_egress", "flexfactor_directed",
+                 "flexfactor_trust", "flexfactor_partial", "flexfactor_wip",
+                 "flexfactor_runstate", "flexfactor_evidence", "flexfactor_purpose",
+                 "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
+                 "flexfactor_prodready", "flexfactor_prodready_persist",
+                 "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
+                 "flexfactor_autoclean", "flexfactor_web", "flexfactor_dashboard",
+                 "flexfactor_dashboard_v2", "flexfactor_self_audit_report"):
+        try:
+            mod = importlib.import_module(name)
+            modules[name] = {"importable": True,
+                             "path": os.path.abspath(getattr(mod, "__file__", "") or "")}
+        except Exception as ex:  # noqa: BLE001 - reported, never hidden
+            modules[name] = {"importable": False, "error": f"{type(ex).__name__}: {ex}"}
+    wired = {
+        "command_policy": _cmd_policy.__name__ == "flexfactor_cmdpolicy",
+        "egress": _egress.__name__ == "flexfactor_egress",
+        "directed": _ff_directed.__name__ == "flexfactor_directed"
+                    and _unfit_for_code_reason is _ff_directed.unfit_for_code_reason,
+    }
+    for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
+        fn = globals().get("_WIRED_" + hook.upper())
+        wired[hook] = bool(fn)
+    return {
+        "tool_version": TOOL_VERSION,
+        "modes": ["refactor", "scout", "audit", "prodready", "policy"],
+        "module_file": os.path.abspath(__file__),
+        "modules": modules,
+        "wired": wired,
+        "exit_codes": {"ok": 0, "error": 1, "usage_or_cancel": 2,
+                       "applied_nothing": EXIT_APPLIED_NOTHING},
+    }
+
+
+def run_cli(argv=None) -> int:
+    """THE single process entry point. Arms the death-obituary instrumentation
+    (a crash must never be silent), runs main(), and marks the finish.
+
+    Used by: `python flexfactor.py`, `python -m flexfactor`, the installed
+    `flexfactor` console script (pyproject), and flexfactor_run.py (shim).
+    Embedders/tests call main() directly so no crash-log handle is pinned open
+    in their working dirs (Windows rmtree fails on open files)."""
+    if argv is not None and len(argv) == 1 and argv[0] == "--runtime-manifest":
+        print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))
+        return 0
+    if argv is None and sys.argv[1:] == ["--runtime-manifest"]:
+        print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))
+        return 0
     _arm_death_instrumentation()
     try:
-        rc = main()
+        rc = main(argv)
         _mark_run_finished()  # intentional exit (any code) - not a silent death
-        raise SystemExit(rc)
+        return int(rc or 0)
     except SystemExit:
         _mark_run_finished()  # argparse exit-2 etc. are intentional too
         raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())

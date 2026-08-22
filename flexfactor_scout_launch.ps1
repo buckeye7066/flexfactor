@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Directed entry: same orchestration rule as Factory Deck / Purpose Foundry.
-$script = "C:\Users\firer\flexfactor\flexfactor_run.py"
+$script = Join-Path $PSScriptRoot "flexfactor_run.py"
 $productionRr = if (-not [string]::IsNullOrWhiteSpace($env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL)) {
     $env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL.TrimEnd("/")
 } else {

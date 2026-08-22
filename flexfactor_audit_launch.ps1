@@ -11,7 +11,7 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
 # Directed entry: unfit-route filter + theme stamp + skip-dir (same rule as Factory Deck).
-$script = "C:\Users\firer\flexfactor\flexfactor_run.py"
+$script = Join-Path $PSScriptRoot "flexfactor_run.py"
 
 Write-Host ""
 Write-Host "  [##]  FlexFactor Audit" -ForegroundColor Cyan
