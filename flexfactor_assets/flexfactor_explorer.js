@@ -158,8 +158,10 @@ function sampleValue(kind, field) {
     if (!routes.length && !incomplete.includes('no routes discovered')) incomplete.push('no routes discovered');
     const summary = { passed: 0, failed: 0, skipped: 0, total: journeys.length };
     for (const j of journeys) summary[j.status] = (summary[j.status] || 0) + 1;
+    // complete = every discovered route/control/form/journey was exercised and nothing was skipped, capped,
+    // errored or timed out. Slow pages and accessibility violations are EVIDENCE (findings), not blockers.
     const complete = errors.length === 0 && skipped.length === 0 && incomplete.length === 0 && summary.failed === 0
-      && accessibility.violations.length === 0 && performance.slow.length === 0 && routes.length > 0 && timeouts.length === 0;
+      && routes.length > 0 && timeouts.length === 0;
     return {
       pages: routes.length, controls, errors, skipped, routeEvidence, controlEvidence, formEvidence, accessibility, performance,
       artifacts, roles: roles.map((r) => r.name), viewports: viewports.map((v) => v.label), isolated, maxPages,
@@ -316,12 +318,15 @@ function sampleValue(kind, field) {
         return n ? { domContentLoaded: Math.round(n.domContentLoadedEventEnd), load: Math.round(n.loadEventEnd) } : {};
       }).catch(() => ({}));
       performance.pages.push({ url, role: role.name, durationMs, ...perf });
-      if (durationMs > 5000) performance.slow.push({ url, role: role.name, durationMs, thresholdMs: 5000 });
+      if (durationMs > 5000) {
+        performance.slow.push({ url, role: role.name, durationMs, thresholdMs: 5000 });
+        findings.push({ kind: 'performance', route: url, role: role.name, durationMs, thresholdMs: 5000, detail: `page took ${durationMs}ms (> 5000ms)` });
+      }
       const contentType = resp ? String((resp.headers() || {})['content-type'] || '') : '';
       if (outcome === 'permitted' && /text\/html|xhtml/i.test(contentType)) {
         const a11y = await act(a11yCheck(page), `a11y ${url}`).catch(() => []);
         accessibility.checked++;
-        for (const v of a11y) accessibility.violations.push({ url, role: role.name, message: v });
+        for (const v of a11y) { accessibility.violations.push({ url, role: role.name, message: v }); findings.push({ kind: 'accessibility', route: url, role: role.name, detail: v }); }
       } else if (outcome === 'permitted') {
         accessibility.notApplicable = (accessibility.notApplicable || []).concat([{ url, role: role.name, contentType }]);
       }

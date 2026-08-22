@@ -144,6 +144,18 @@ class SummaryAndCompletenessTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("without a named reason" in x for x in reasons), reasons)
 
+    def test_slow_pages_and_a11y_are_findings_not_gaps(self):
+        r = self._result(findings=[{"kind": "performance", "durationMs": 9000}, {"kind": "accessibility", "detail": "image missing alt"}],
+                         performance={"slow": [{"url": "/x", "durationMs": 9000}]}, accessibility={"violations": [{"url": "/x"}]})
+        ok, reasons = fj.completeness(r)
+        self.assertTrue(ok, reasons)
+
+    def test_action_timeouts_break_completeness(self):
+        r = self._result(timeouts=["re-login admin @390x844"], complete=False)
+        ok, reasons = fj.completeness(r)
+        self.assertFalse(ok)
+        self.assertIn("timeout: re-login admin @390x844", reasons)
+
     def test_no_payload(self):
         ok, reasons = fj.completeness(None)
         self.assertFalse(ok)
@@ -211,6 +223,21 @@ class _Fixture:
                 pass
         if self.proc.stdout:
             self.proc.stdout.close()
+
+
+def _diagnose(r: dict) -> str:
+    """Everything CI needs to see when a completeness assertion fails."""
+    kinds = {}
+    for f in r.get("findings") or []:
+        kinds[f.get("kind")] = kinds.get(f.get("kind"), 0) + 1
+    failed = [j for j in r.get("journeys") or [] if j.get("status") != "passed"]
+    return json.dumps({
+        "complete": r.get("complete"), "incomplete_reasons": r.get("incomplete_reasons"), "skipped": r.get("skipped"),
+        "summary": r.get("summary"), "timeouts": r.get("timeouts"), "errors": (r.get("errors") or [])[:20],
+        "finding_kinds": kinds, "performance_slow": (r.get("performance") or {}).get("slow"),
+        "accessibility_violations": (r.get("accessibility") or {}).get("violations"),
+        "non_passed_journeys": failed[:20], "elapsedMs": r.get("elapsedMs"),
+    }, indent=1, default=str)
 
 
 class ExplorerIntegrationTests(unittest.TestCase):
@@ -339,14 +366,24 @@ class ExplorerIntegrationTests(unittest.TestCase):
             for k in ("id", "kind", "role", "viewport", "target", "status"):
                 self.assertIn(k, j, j)
             self.assertIn(j["status"], ("passed", "failed", "skipped"))
-        self.assertEqual(r["summary"]["total"], len(r["journeys"]))
-        self.assertEqual(r["summary"]["failed"], 0, [j for j in r["journeys"] if j["status"] == "failed"])
-        self.assertEqual(r["summary"]["skipped"], 0, [j for j in r["journeys"] if j["status"] == "skipped"])
-        self.assertEqual(r["errors"], [])
-        self.assertEqual(r["skipped"], [])
-        self.assertEqual(r["incomplete_reasons"], [])
-        self.assertTrue(r["complete"])
-        self.assertEqual(cp.returncode, 0)
+        diag = _diagnose(r)
+        if not r.get("complete"):
+            print(chr(10) + "[explorer diagnostics]" + chr(10) + diag, flush=True)
+        self.assertEqual(r["summary"]["total"], len(r["journeys"]), diag)
+        self.assertEqual(r["summary"]["failed"], 0, diag)
+        self.assertEqual(r["summary"]["skipped"], 0, diag)
+        self.assertEqual(r.get("timeouts"), [], diag)
+        self.assertEqual(r["errors"], [], diag)
+        self.assertEqual(r["skipped"], [], diag)
+        self.assertEqual(r["incomplete_reasons"], [], diag)
+        self.assertTrue(r["complete"], diag)
+        self.assertEqual(cp.returncode, 0, diag)
+        expected_kinds = {"login", "route", "control", "form", "form-case", "duplicate", "destructive", "viewport"}
+        present_kinds = {j["kind"] for j in r["journeys"]}
+        self.assertTrue(expected_kinds <= present_kinds, "missing journey kinds: %s %s %s" % (sorted(expected_kinds - present_kinds), chr(10), diag))
+        # slow pages / a11y violations (host speed, heuristics) are findings, never completeness blockers
+        for f in r["findings"]:
+            self.assertIn(f["kind"], {"authz-suspect", "validation-gap", "duplicate-submission", "horizontal-overflow", "performance", "accessibility", "timeout"}, f)
         ok, reasons = fj.completeness(r)
         self.assertTrue(ok, reasons)
         # artifacts exist on disk: screenshots + one trace per role

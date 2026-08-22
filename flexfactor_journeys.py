@@ -119,13 +119,15 @@ def journey_matrix_summary(result: dict) -> dict:
 
 
 def completeness(result: dict | None) -> tuple[bool, list[str]]:
-    """``(True, [])`` only when every journey executed and nothing was capped,
-    skipped, left unsubmitted or errored. Otherwise ``(False, reasons)`` where
-    each reason is a human-readable, named gap (never silent)."""
+    """``(True, [])`` only when every discovered route/control/form/journey was
+    exercised and nothing was skipped, capped, timed out or errored.
+    Slow pages and accessibility violations are findings (evidence), NOT gaps.
+    Otherwise ``(False, reasons)`` with every gap named (never silent)."""
     reasons: list[str] = []
     if not result:
         return False, ["no FLEXFACTOR_E2E_RESULT payload from explorer"]
     reasons.extend(str(r) for r in (result.get("incomplete_reasons") or []))
+    reasons.extend(f"timeout: {t}" for t in (result.get("timeouts") or []))
     reasons.extend(f"skipped: {s}" for s in (result.get("skipped") or []))
     for j in result.get("journeys") or []:
         if j.get("status") == "failed":
