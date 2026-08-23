@@ -1065,7 +1065,14 @@ class RotatingProvider:
             if not self._purpose:
                 return None
             intent = CallIntent()
-        intent = intent.with_purpose(self._purpose, self._purpose_needs)
+        # Purpose-derived needs attach to the VISION role only. The first live
+        # run (IPlay, 2026-08-23) showed why: a program that PRODUCES video
+        # said "needs vision", and that need was stamped onto every code
+        # author and reviewer call -- narrowing the authoring pool to
+        # image-capable models for work that never looks at an image. A UI
+        # reviewer that must see screenshots asks with ROLE_VISION.
+        intent = intent.with_purpose(
+            self._purpose, self._purpose_needs if intent.role == ROLE_VISION else ())
         if intent.role == ROLE_REVIEWER and intent.avoid_family is None:
             with self._family_lock:
                 author_fam = self._last_family.get(ROLE_AUTHOR)

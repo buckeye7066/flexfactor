@@ -122,16 +122,23 @@ class ProviderWrapperCarriesPurpose(_Base):
         self.assertEqual(seen[-1].purpose, "sermonsmith: exact scripture text")
         self.assertEqual(seen[-1].intent_role, R.ROLE_AUTHOR)
 
-    def test_purpose_needs_are_merged_into_the_intent(self):
-        # A UI-heavy purpose demands vision; the text-only coder cannot serve it.
+    def test_purpose_needs_attach_to_the_vision_role_only(self):
+        # Live IPlay run 2026-08-23: a program that PRODUCES video said
+        # "needs vision" and every code author call was narrowed to
+        # image-capable models. Purpose needs now bind only to ROLE_VISION.
         p, seen = self._prov([
             route("a/text-coder", "pool-a", caps=(R.CAP_CODE_AUTHOR,)),
             route("b/vision-coder", "pool-b", caps=(R.CAP_CODE_AUTHOR, R.CAP_VISION)),
         ])
         p.set_purpose("ui-app", needs=(R.CAP_VISION,))
-        for _ in range(3):
+        authors = set()
+        for _ in range(4):
             p.structured("s", "u", {}, intent=R.CallIntent(R.ROLE_AUTHOR, (R.CAP_CODE_AUTHOR,)))
-            self.assertEqual(seen[-1].route.id, "b/vision-coder")
+            authors.add(seen[-1].route.id)
+        self.assertEqual(authors, {"a/text-coder", "b/vision-coder"})   # both rotate
+        for _ in range(3):
+            p.structured("s", "u", {}, intent=R.CallIntent(R.ROLE_VISION, ()))
+            self.assertEqual(seen[-1].route.id, "b/vision-coder")        # only the seeing one
 
     def test_intent_kwarg_never_reaches_the_wire_provider(self):
         p, _ = self._prov([route("a/coder", "pool-a")])
