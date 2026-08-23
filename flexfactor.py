@@ -3388,9 +3388,12 @@ def _rotation_excluded_reason(model_or_route_id: str) -> str:
                         % (entry.get("exclusion_reason") or "failed"))
             rate = entry.get("gen_tok_per_s")
             floor = bench.get("_slow_tok_per_s", 5.0)
-            if not entry.get("answered"):
-                return (f"excluded from rotation (measured: produced no answer "
-                        f"{'- reasoning-only reply' if entry.get('reasoning_only') else ''})")
+            # The speed prompt allows 48 tokens. A thinking model spends all of
+            # them reasoning, which says nothing about whether it answers -- the
+            # battery decides that (rotation_eligible above). Only a TRULY
+            # empty reply (no answer, no reasoning) is evidence here.
+            if not entry.get("answered") and not entry.get("reasoning_only"):
+                return "excluded from rotation (measured: produced no answer at all)"
             if rate is not None and float(rate) < floor:
                 return (f"excluded from rotation (measured {rate} tok/s on this CPU, "
                         f"below the {floor:g} tok/s floor for a rotated job) - run it "

@@ -55,12 +55,17 @@ class MeasuredLocalGate(unittest.TestCase):
                                  "gen_tok_per_s": 40.0, "answered": True}])
         self.assertEqual(F._rotation_excluded_reason("ollama/muse-glimmer:30b"), "")
 
-    def test_no_answer_excludes_even_if_fast(self):
+    def test_reasoning_only_speed_prompt_is_not_a_no_answer(self):
+        # 48 tokens all spent thinking says nothing about answering; the
+        # battery decides that. Rate is fine, so it rotates.
         _write_bench(self.dir, [{"tag": "thinker:8b", "ok": True, "gen_tok_per_s": 30.0,
                                  "answered": False, "reasoning_only": True}])
-        why = F._rotation_excluded_reason("ollama/thinker:8b")
-        self.assertIn("no answer", why)
-        self.assertIn("reasoning-only", why)
+        self.assertEqual(F._rotation_excluded_reason("ollama/thinker:8b"), "")
+
+    def test_truly_empty_reply_excludes_even_if_fast(self):
+        _write_bench(self.dir, [{"tag": "mute:8b", "ok": True, "gen_tok_per_s": 30.0,
+                                 "answered": False, "reasoning_only": False}])
+        self.assertIn("no answer", F._rotation_excluded_reason("ollama/mute:8b"))
 
     def test_unmeasured_local_route_falls_back_to_name_list(self):
         _write_bench(self.dir, [{"tag": "something-else:1b", "ok": True,
