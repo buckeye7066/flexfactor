@@ -17,13 +17,21 @@ Runs offline. No credentials, no network, no tokens spent.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
 import unittest
 
+import tempfile
+
 sys.argv = sys.argv[:1]          # flexfactor parses argv at import time
+# Isolate the measured-speed gate: without this the tests read the REAL
+# %LOCALAPPDATA%\AITime\local-bench.json and every verdict below depends
+# on whatever was benched on this machine last night.
+os.environ["AITIME_STATE_DIR"] = tempfile.mkdtemp(prefix="ff-glimmer-tests-")
 import flexfactor as F           # noqa: E402
+F._LOCAL_BENCH_CACHE = None
 
 
 def route(rid: str, model: str, api: str = "ollama",
@@ -145,6 +153,52 @@ class ReasoningBudgetIsNotAnEmptyReply(unittest.TestCase):
     def test_no_choices_is_unchanged(self):
         self.assertEqual(
             F._openai_message_text(types.SimpleNamespace(choices=[]), "x"), "")
+
+
+class OllamaProviderThinkingChannel(unittest.TestCase):
+    """Local calls run with think=false, and a reasoning-only reply raises
+    instead of collapsing to ''. Measured 2026-08-23: gemma4:26b could not fix
+    a planted off-by-one in 551 s of reasoning and fixed it in 7 s without."""
+
+    class _Resp:
+        def __init__(self, payload): self._b = json.dumps(payload).encode()
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _provider(self, reply):
+        captured = {}
+        class Opener:
+            def open(self_inner, req, timeout=None):
+                captured["payload"] = json.loads(req.data.decode())
+                return OllamaProviderThinkingChannel._Resp(reply)
+        p = object.__new__(F.OllamaProvider)
+        p.base_url = "http://127.0.0.1:11434"; p._opener = Opener(); p.meter = None
+        return p, captured
+
+    def setUp(self): os.environ.pop("FLEXFACTOR_OLLAMA_THINK", None)
+    tearDown = setUp
+
+    def test_think_is_off_by_default(self):
+        p, cap = self._provider({"message": {"content": "ok"}})
+        self.assertEqual(p._chat("m", "s", "u", 32), "ok")
+        self.assertIs(cap["payload"]["think"], False)
+
+    def test_owner_can_turn_thinking_back_on(self):
+        os.environ["FLEXFACTOR_OLLAMA_THINK"] = "1"
+        p, cap = self._provider({"message": {"content": "ok"}})
+        p._chat("m", "s", "u", 32)
+        self.assertIs(cap["payload"]["think"], True)
+
+    def test_reasoning_only_reply_raises_not_empty(self):
+        p, _ = self._provider({"message": {"content": "", "thinking": "let me see..."},
+                               "done_reason": "length"})
+        with self.assertRaises(F.ReasoningBudgetExhausted):
+            p._chat("m", "s", "u", 32)
+
+    def test_truly_empty_reply_is_still_empty(self):
+        p, _ = self._provider({"message": {"content": ""}, "done_reason": "stop"})
+        self.assertEqual(p._chat("m", "s", "u", 32), "")
 
 
 if __name__ == "__main__":

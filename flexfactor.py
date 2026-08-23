@@ -2634,7 +2634,15 @@ class OllamaProvider:
         payload = {"model": model, "stream": False,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "options": {"num_predict": max_tokens}}
+                   "options": {"num_predict": max_tokens},
+                   # Reasoning channel OFF for local calls unless the owner opts
+                   # in. Measured 2026-08-23 on this CPU-only box: gemma4:26b
+                   # never finished a planted off-by-one in 551 s of thinking
+                   # and fixed it in 7 s without. Ollama honours this on the
+                   # native endpoint for most thinking models (not all:
+                   # deepseek-r1 distills reason regardless), and non-thinking
+                   # models ignore it. Cloud routes are untouched.
+                   "think": os.environ.get("FLEXFACTOR_OLLAMA_THINK") == "1"}
         if schema is not None:
             payload["format"] = schema  # Ollama structured outputs
         # Billed under the $0 'ollama:' pricing prefix; the guard still runs so
@@ -2655,7 +2663,21 @@ class OllamaProvider:
                 self.meter.record(f"ollama:{model}",
                                   input_tokens=int(data.get("prompt_eval_count") or 0),
                                   output_tokens=int(data.get("eval_count") or 0))
-        return str((data.get("message") or {}).get("content") or "")
+        message = data.get("message") or {}
+        content = str(message.get("content") or "")
+        thinking = str(message.get("thinking") or "")
+        if not content.strip() and thinking.strip():
+            # Same defect as the OpenAI path (see _openai_message_text): a
+            # reasoning-only reply collapsed to "" and was scored as an empty
+            # answer -- or, on the grade path, as a DEFAULT grade. Raise the
+            # same typed error so callers treat it as a budget problem.
+            raise ReasoningBudgetExhausted(
+                f"ollama:{model}: the model spent its entire token budget "
+                f"reasoning and never produced an answer "
+                f"(done_reason={data.get('done_reason')!r}, {len(thinking)} chars "
+                f"of reasoning). Raise the budget or shorten the prompt -- this is "
+                f"not an empty reply.")
+        return content
 
     def complete(self, instruction: str) -> str:
         return self._chat(self.model, REWRITE_SYSTEM, instruction, 16384).strip()
@@ -3381,11 +3403,20 @@ def _rotation_excluded_reason(model_or_route_id: str) -> str:
             # The functional battery (bench_battery.py) is the stronger verdict
             # when it has run: speed AND valid JSON AND a real planted-defect
             # repair AND a real review. Its reason is carried through verbatim.
-            if "rotation_eligible" in entry:
-                if entry.get("rotation_eligible"):
+            # Local calls run with the reasoning channel OFF (OllamaProvider
+            # sends think=false) unless FLEXFACTOR_OLLAMA_THINK=1, so the
+            # no-think battery verdict is the one that matches the call mode.
+            think_on = os.environ.get("FLEXFACTOR_OLLAMA_THINK") == "1"
+            key = "rotation_eligible" if think_on else "rotation_eligible_nothink"
+            why_key = "exclusion_reason" if think_on else "exclusion_reason_nothink"
+            if key not in entry:           # no mode-specific run yet: use what exists
+                key, why_key = "rotation_eligible", "exclusion_reason"
+            if key in entry:
+                if entry.get(key):
                     return ""
-                return ("excluded from rotation (battery: %s)"
-                        % (entry.get("exclusion_reason") or "failed"))
+                return ("excluded from rotation (battery%s: %s)"
+                        % ("" if key == "rotation_eligible" else " no-think",
+                           entry.get(why_key) or "failed"))
             rate = entry.get("gen_tok_per_s")
             floor = bench.get("_slow_tok_per_s", 5.0)
             # The speed prompt allows 48 tokens. A thinking model spends all of
