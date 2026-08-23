@@ -1014,7 +1014,8 @@ class RotatingProvider:
     def __init__(self, rotator: Rotator, factory: Callable[[Route], Any],
                  tier: str = FRONTIER, judge_tier: str = LIGHT,
                  allow_paid: bool = False, meter: Any = None,
-                 on_route: Optional[Callable[[Selection], None]] = None):
+                 on_route: Optional[Callable[[Selection], None]] = None,
+                 on_error: Optional[Callable[[Route, BaseException], None]] = None):
         self.rotator = rotator
         self._factory = factory
         self._tier = tier
@@ -1022,6 +1023,10 @@ class RotatingProvider:
         self._allow_paid = allow_paid
         self.meter = meter
         self._on_route = on_route
+        # Called for EVERY route failure, retryable or not, so the run's error
+        # ledger sees provider errors the rotator would otherwise absorb by
+        # moving to the next pool.
+        self._on_error = on_error
         self._cache: Dict[str, Any] = {}
         self._cache_lock = threading.Lock()
         # Callers read `.model` for logging and pricing. It reflects the LAST
@@ -1137,6 +1142,11 @@ class RotatingProvider:
                 result = getattr(self._provider_for(route), method)(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
                 self.rotator.report(route, _classify(exc), _retry_after(exc))
+                if self._on_error is not None:
+                    try:
+                        self._on_error(route, exc)
+                    except Exception:  # noqa: BLE001 - a ledger must never break a call
+                        pass
                 last_error = exc
                 if not _is_retryable(exc):
                     raise

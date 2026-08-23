@@ -3124,6 +3124,72 @@ def _set_rotation_purpose(providers, display_name: str, purpose_contract, purpos
               + f" -> {', '.join(told)}", file=sys.stderr)
 
 
+# --- per-run ERROR LEDGER (owner 2026-08-23: "a place in the run that shows
+# me what errors occurred, what code was responsible, and a suggestion on how
+# to fix it"). One ledger per audited program, living in the run's checkpoint
+# directory as errors.md / errors.json, written after EVERY record so a crash
+# still leaves it behind, and rendered into the audit report. Process-global
+# because the catch sites are spread across review, fix, rotation and setup.
+_ERROR_LEDGER = None
+_ERROR_LEDGER_LOCK = threading.Lock()
+
+
+def _start_error_ledger(checkpoint, program: str) -> None:
+    """Open the ledger next to this run's checkpoint. Never raises."""
+    global _ERROR_LEDGER
+    try:
+        import flexfactor_errors as _fe
+        run_dir = os.path.dirname(str(getattr(checkpoint, "path", "") or "")) or \
+            os.path.join(RUNS_PATH, "no-checkpoint")
+        with _ERROR_LEDGER_LOCK:
+            _ERROR_LEDGER = _fe.ErrorLedger(run_dir, program, os.path.dirname(os.path.abspath(__file__)))
+        print(f"  [errors] ledger -> {_ERROR_LEDGER.md_path}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - the ledger must never break the run
+        print(f"  [errors] ledger unavailable: {exc}", file=sys.stderr)
+
+
+def _attach_ledger_suggester(provider) -> None:
+    """Let the ledger ask a model for a fix when no signature matches.
+
+    Labelled 'model suggestion, unverified' in the ledger. Uses the cheap judge
+    tier through the normal provider path, so it rotates, is metered and is
+    egress-gated like any other call; it is invoked only for unknown errors.
+    """
+    if _ERROR_LEDGER is None or provider is None:
+        return
+
+    def suggest(error_text: str, where_json: str) -> str:
+        data = _judge(provider, (
+            "You are a senior engineer reading one error from an automated code-repair "
+            "run. Propose the single most likely fix in 2-4 sentences, naming the file "
+            "and line when the stack gives one. If the evidence is insufficient, say "
+            "exactly what is missing instead of guessing."),
+            f"ERROR:\n{error_text[:1500]}\n\nRESPONSIBLE FRAME (json):\n{where_json[:800]}",
+            {"type": "object", "properties": {"suggestion": {"type": "string"}},
+             "required": ["suggestion"]}, max_tokens=600)
+        return str((data or {}).get("suggestion") or "")
+
+    _ERROR_LEDGER._suggester = suggest
+
+
+def _ledger(phase: str, error, **kw) -> None:
+    """Record one error in the run's ledger; a no-op before the ledger opens."""
+    led = _ERROR_LEDGER
+    if led is None:
+        return
+    try:
+        led.record(phase, error, **kw)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [errors] could not record: {exc}", file=sys.stderr)
+
+
+def _error_ledger_report_lines() -> list:
+    led = _ERROR_LEDGER
+    if led is None:
+        return []
+    return ["", *led.render_markdown(heading_level=2).splitlines()]
+
+
 def _report_route_quality(provider, role: str, signal: str, pfx: str = "  ") -> None:
     """Tell the rotator whether the work a route produced HELPED.
 
@@ -3727,7 +3793,11 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     return fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=fr.LIGHT,
                                allow_paid=True, meter=meter,
-                               on_route=_announce)
+                               on_route=_announce,
+                               # every route failure lands in the run's error
+                               # ledger, even the ones rotation absorbs
+                               on_error=lambda route, exc: _ledger(
+                                   "rotation", exc, route=route.id))
 
 
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
@@ -11359,9 +11429,11 @@ def _review_all(reviewers: list, project_dir: str,
                     if len(failed_idx) < len(reviewer_pool.entries):
                         print(f"  [retry] {rel}: review failed via {nm} ({ex}) "
                               "- retrying on another backend")
+                        _ledger("review-retry", ex, program_file=rel, route=str(nm))
                     else:
                         print(f"  [skip] {rel}: review failed via {nm} ({ex}); "
                               "every pool backend failed this file")
+                        _ledger("review", ex, program_file=rel, route=str(nm))
                         complete = False
                         break
                 finally:
@@ -11386,6 +11458,7 @@ def _review_all(reviewers: list, project_dir: str,
                 break
             except Exception as ex:  # one bad LLM call must not abort the sweep
                 print(f"  [skip] {rel}: review failed ({ex})")
+                _ledger("review", ex, program_file=rel)
                 complete = False  # a reviewer threw -> not fully reviewed
         if not complete:
             return (rel, "incomplete")  # NEVER clean; re-reviewed next cycle
@@ -12309,6 +12382,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         elif kind == "skip":
             errors += 1
             print(f"  [skip] {rel}: fix generation failed ({outcome[1]})")
+            _ledger("fix", str(outcome[1]), program_file=rel)
         elif kind == "oversized":
             # A DISTINCT non-success, deliberately NOT counted in `errors`.
             #
@@ -12878,6 +12952,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}error: could not resolve '{program_arg}' to a local source folder.",
                   file=sys.stderr)
             result["error"] = f"could not resolve '{program_arg}' to a local source folder"
+            _ledger("setup", result["error"], kind="environment")
             return result
         result["dir"] = project_dir
 
@@ -12893,6 +12968,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                    f"refusing to double-run (stale? delete {_audit_lock_path(project_dir)})")
             print(f"{pfx}error: {msg}", file=sys.stderr)
             result["error"] = msg
+            _ledger("setup", result["error"])
             return result
 
         # Cost budget (hard cap; 0 disables) shared by every provider call, and the
@@ -12953,6 +13029,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         checkpoint = _resume_checkpoint_for(
             _rsmod, recovered_run, program=display_name, project_dir=project_dir,
             mode=_resume_mode_for(args))
+        _start_error_ledger(checkpoint, display_name)
         # Deterministic code intelligence is captured BEFORE any mutation.  It
         # is rebuilt after the repair/test cycle so every byte-level change and
         # its dependency blast radius can be proven from two exact indexes.
@@ -13022,6 +13099,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}error: package.json could not be safely read (symlink/containment); "
                   "refusing to audit with the build gate disabled.", file=sys.stderr)
             result["error"] = "package.json unreadable (containment) - refused to audit"
+            _ledger("setup", result["error"], kind="program-defect")
             return result
         git = _is_git_repo(project_dir)
         if git:
@@ -13104,6 +13182,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}error: {why}. Set/repair ANTHROPIC_API_KEY and/or OPENAI_API_KEY "
                   f"(or pass --no-preflight to skip the live key check).", file=sys.stderr)
             result["error"] = why
+            _ledger("setup", result["error"])
             return result
         author = providers[0][1]
         # PURPOSE SIGHT (owner 2026-08-23: "give the rotator sight to see the
@@ -13114,6 +13193,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # hard need on every call. Fixed providers have no set_purpose and are
         # untouched.
         _set_rotation_purpose(providers, display_name, purpose_contract, purpose_blob, pfx)
+        _attach_ledger_suggester(author)
         cross = providers[1][1] if len(providers) > 1 else None
         # CONCURRENT FREE POOL (2026-08-12): when build_audit_providers found
         # multiple free backends usable at once, it populated
@@ -13203,6 +13283,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # A cleanup that BLEW UP must never read as a clean repo.
                 print(f"{pfx}autoclean FAILED: {exc}", file=sys.stderr)
                 result["autoclean"] = {"error": str(exc)}
+                _ledger("autoclean", exc)
 
         tree_dirty = git and not _git_tree_clean(project_dir)
         if tree_dirty and not args.allow_dirty:
@@ -13963,6 +14044,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "This is a provider/route fault, NOT evidence the repo is "
                         "clean - stopped fail-closed for resumable retry")
                     print(f"{pfx}STOP: {stop_reason}", file=sys.stderr)
+                    _ledger("baseline-gate", str(stop_reason), kind="program-defect")
                     # This is a resumable infrastructure abort, not an invitation
                     # to spend more time on purpose/UI/native-suite phases against
                     # a mostly unreviewed tree.  The checkpoint is already flushed.
@@ -15230,6 +15312,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                fix_done=len(done_set), fix_total=total_to_review, fixed=len(done_set),
                defects=len(all_findings), errors=errors_total, cost=round(meter.usd, 4),
                evidence=dashboard_evidence)
+        # The run ends by pointing at its own error ledger (or saying none).
+        if _ERROR_LEDGER is not None:
+            print(f"{pfx}{_ERROR_LEDGER.summary_line()}", file=sys.stderr)
+            result["errors_ledger"] = _ERROR_LEDGER.md_path
+            result["errors_recorded"] = len(_ERROR_LEDGER.entries)
+
         return result
     except Exception as ex:  # one program must never abort the batch
         import traceback as _tb
@@ -15831,6 +15919,10 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
             if a['unverified_files'] else ""),
          *_noop_split_lines(a),
+         *(["- **Errors recorded:** "
+            + (f"{len(_ERROR_LEDGER.entries)} (see the Errors section below; "
+               f"ledger at `{_ERROR_LEDGER.md_path}`)" if _ERROR_LEDGER and _ERROR_LEDGER.entries
+               else "none")]),
          # Tri-state. None = the build never ran (no build command exists),
          # which is NOT a pass and must never read like one.
          f"- **Baseline build:** {'passed' if a['baseline_ok'] is True else 'NOT RUN (unverified)' if a['baseline_ok'] is None else 'FAILED'}",
@@ -16158,6 +16250,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if a["fix_notes"]:
         L += ["## Fix notes / left unfixed", ""] + [f"- {n}" for n in a["fix_notes"]] + [""]
 
+    L += _error_ledger_report_lines()
     return _safe_report_write(project_dir, report_name, "\n".join(L))
 
 

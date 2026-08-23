@@ -29,7 +29,8 @@ sys.argv = sys.argv[:1]          # flexfactor parses argv at import time
 # Isolate the measured-speed gate: without this the tests read the REAL
 # %LOCALAPPDATA%\AITime\local-bench.json and every verdict below depends
 # on whatever was benched on this machine last night.
-os.environ["AITIME_STATE_DIR"] = tempfile.mkdtemp(prefix="ff-glimmer-tests-")
+_ISOLATED_STATE_DIR = tempfile.mkdtemp(prefix="ff-glimmer-tests-")
+os.environ["AITIME_STATE_DIR"] = _ISOLATED_STATE_DIR
 import flexfactor as F           # noqa: E402
 F._LOCAL_BENCH_CACHE = None
 
@@ -46,6 +47,11 @@ def route(rid: str, model: str, api: str = "ollama",
 class ExclusionMatching(unittest.TestCase):
     def setUp(self):
         os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
+        # Re-isolate every test: a sibling test module pops AITIME_STATE_DIR
+        # in its tearDown, and under pytest ordering these tests would then
+        # read the real local-bench.json.
+        os.environ["AITIME_STATE_DIR"] = _ISOLATED_STATE_DIR
+        F._LOCAL_BENCH_CACHE = None
 
     tearDown = setUp
 
@@ -82,6 +88,11 @@ class ExclusionMatching(unittest.TestCase):
 class ExclusionIsConfigurable(unittest.TestCase):
     def setUp(self):
         os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
+        # Re-isolate every test: a sibling test module pops AITIME_STATE_DIR
+        # in its tearDown, and under pytest ordering these tests would then
+        # read the real local-bench.json.
+        os.environ["AITIME_STATE_DIR"] = _ISOLATED_STATE_DIR
+        F._LOCAL_BENCH_CACHE = None
 
     tearDown = setUp
 
@@ -102,6 +113,11 @@ class WiredIntoTheRealFilter(unittest.TestCase):
 
     def setUp(self):
         os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
+        # Re-isolate every test: a sibling test module pops AITIME_STATE_DIR
+        # in its tearDown, and under pytest ordering these tests would then
+        # read the real local-bench.json.
+        os.environ["AITIME_STATE_DIR"] = _ISOLATED_STATE_DIR
+        F._LOCAL_BENCH_CACHE = None
 
     tearDown = setUp
 
