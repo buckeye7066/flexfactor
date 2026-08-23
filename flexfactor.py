@@ -3238,6 +3238,53 @@ def _hydrate_route_credentials(routes) -> list[str]:
     return sorted(loaded)
 
 
+# Routes that are REAL, free, and code-capable but must not be ROTATED INTO on
+# this machine because they are far too slow to carry a factory job.
+#
+# Muse Glimmer is the case this exists for. It is a 30B dense decoder and this
+# box has no GPU Ollama can use (`ollama ps` reports 100% CPU), so generation
+# measures around 1-1.5 tokens/second. Two consequences, both bad, and neither
+# of them visible until a run is already underway:
+#
+#   1. Rotation is CHEAPEST-FIRST and a local model is cost class 0 -- the very
+#      front of the queue. A slow local route in the pool is not merely slow,
+#      it is *preferentially* slow: it gets picked first, every sweep.
+#   2. The ollama HTTP timeout defaults to 600s (_ollama_http_timeout). At this
+#      rate almost any real generation exceeds it, so the route would be
+#      selected, time out, and burn a cooldown -- the same "error tour" failure
+#      that _unfit_for_code_reason was added to stop.
+#
+# So Glimmer is standalone-only by default (owner decision 2026-08-22): run it
+# deliberately with `--provider ollama --model muse-glimmer:30b`, which never
+# touches the rotator. This filter is process-local and is never written into
+# the shared rotation state, so it cannot leak to Factory Deck or Purpose
+# Foundry. Set FLEXFACTOR_ROTATION_EXCLUDE to a comma-separated list to change
+# it, or to the empty string to let Glimmer rotate after all.
+# Scoped to the LOCAL route on purpose. The catalog also carries
+# nvidia_nim/meta/muse-glimmer-30b (free-tier, strong) and
+# openrouter/meta/muse-glimmer-30b (paid) -- the SAME model served from the
+# cloud, at cloud speed. The slowness argument above is a property of THIS
+# machine's CPU, not of Muse Glimmer, so excluding the cloud rows too would
+# deny rotation a perfectly good free route for a reason that does not apply
+# to it. Only the local row is held back.
+_ROTATION_EXCLUDE_DEFAULT = "ollama/muse-glimmer"
+
+
+def _rotation_excluded_reason(model_or_route_id: str) -> str:
+    """Why this route is held out of rotation here, or '' when it may rotate."""
+    raw = os.environ.get("FLEXFACTOR_ROTATION_EXCLUDE")
+    if raw is None:
+        raw = _ROTATION_EXCLUDE_DEFAULT
+    low = str(model_or_route_id or "").lower()
+    for frag in (p.strip().lower() for p in raw.split(",")):
+        if frag and frag in low:
+            return (f"excluded from rotation ({frag}: too slow for a rotated job "
+                    f"on this CPU) - run it standalone with "
+                    f"--provider ollama --model muse-glimmer:30b, or clear "
+                    f"FLEXFACTOR_ROTATION_EXCLUDE to allow it")
+    return ""
+
+
 def _route_unusable_reason(route, model_mode: str) -> str:
     """Why this catalog route cannot be served here, or '' when it can.
 
@@ -3268,6 +3315,10 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     unfit = _unfit_for_code_reason(getattr(route, "id", "") or getattr(route, "model", ""))
     if unfit:
         return unfit
+    excluded = _rotation_excluded_reason(
+        getattr(route, "id", "") or getattr(route, "model", ""))
+    if excluded:
+        return excluded
     # EXTENDED TRANSPORTS must prove they are BUILDABLE here, not merely that
     # a binary exists on PATH. This filter's whole job is that an unbuildable
     # route never reaches the Rotator - one that does gets selected, fails at
