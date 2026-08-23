@@ -81,6 +81,26 @@ class MeasuredLocalGate(unittest.TestCase):
         self.assertTrue(F._rotation_excluded_reason("ollama/muse-glimmer:30b"))
         self.assertEqual(F._rotation_excluded_reason("ollama/gpt-oss:20b"), "")
 
+    def test_battery_verdict_outranks_raw_speed(self):
+        # Fast by rate, but the functional battery said no: excluded, with
+        # the battery's own reason carried through.
+        _write_bench(self.dir, [{"tag": "fast-but-dumb:4b", "ok": True,
+                                 "gen_tok_per_s": 40.0, "answered": True,
+                                 "rotation_eligible": False,
+                                 "exclusion_reason": "could not produce valid structured JSON"}])
+        why = F._rotation_excluded_reason("ollama/fast-but-dumb:4b")
+        self.assertIn("battery", why)
+        self.assertIn("structured JSON", why)
+
+    def test_battery_pass_admits_even_a_name_listed_route(self):
+        _write_bench(self.dir, [{"tag": "muse-glimmer:30b", "ok": True,
+                                 "gen_tok_per_s": 1.6, "answered": True,
+                                 "rotation_eligible": True, "exclusion_reason": ""}])
+        # Deliberate: the battery is the authority once it has run. A slow
+        # model cannot pass it (speed is one of its thresholds), so this
+        # asserts the precedence rule, not a real-world outcome.
+        self.assertEqual(F._rotation_excluded_reason("ollama/muse-glimmer:30b"), "")
+
     def test_corrupt_file_is_not_an_error(self):
         with open(os.path.join(self.dir, "local-bench.json"), "w") as fh:
             fh.write("{not json")

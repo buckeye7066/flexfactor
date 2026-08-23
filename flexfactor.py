@@ -3378,6 +3378,14 @@ def _rotation_excluded_reason(model_or_route_id: str) -> str:
         bench = _local_bench()
         entry = bench.get(low[len("ollama/"):])
         if isinstance(entry, dict) and entry.get("ok"):
+            # The functional battery (bench_battery.py) is the stronger verdict
+            # when it has run: speed AND valid JSON AND a real planted-defect
+            # repair AND a real review. Its reason is carried through verbatim.
+            if "rotation_eligible" in entry:
+                if entry.get("rotation_eligible"):
+                    return ""
+                return ("excluded from rotation (battery: %s)"
+                        % (entry.get("exclusion_reason") or "failed"))
             rate = entry.get("gen_tok_per_s")
             floor = bench.get("_slow_tok_per_s", 5.0)
             if not entry.get("answered"):
