@@ -2423,6 +2423,7 @@ class OpenAIProvider:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=out_cap,
+                **_reasoning_kwargs(self),
                 messages=[
                     {"role": "system", "content": REWRITE_SYSTEM},
                     {"role": "user", "content": instruction},
@@ -2441,6 +2442,7 @@ class OpenAIProvider:
                 model=self.judge_model,
                 response_format={"type": "json_object"},
                 max_tokens=out_cap,
+                **_reasoning_kwargs(self),
                 messages=[
                     {"role": "system", "content": GRADE_SYSTEM + " Keys: grade, meets_goal, rationale, issues."},
                     {"role": "user", "content": prompt},
@@ -2488,6 +2490,7 @@ class OpenAIProvider:
                         model=use_model,
                         response_format={"type": "json_object"},
                         max_tokens=out_cap,
+                        **_reasoning_kwargs(self),
                         messages=messages,
                     )
                     self._meter(resp, use_model)
@@ -3190,6 +3193,37 @@ def _error_ledger_report_lines() -> list:
     return ["", *led.render_markdown(heading_level=2).splitlines()]
 
 
+def _reasoning_extra_body(route) -> dict | None:
+    """Provider-specific knob that turns a cloud model's reasoning DOWN.
+
+    Live IPlay audit 2026-08-23 (ledger): 8 of 20 failed calls were
+    OutputBudgetError on OpenRouter free routes -- thinking models spent the
+    whole 8,000-token judge budget reasoning and never emitted the JSON, the
+    same disease the local models had (fixed there with Ollama's think=false).
+    Each such attempt cost minutes before rotation moved on.
+
+    Only backends with a DOCUMENTED knob get one; anything else is left alone,
+    because an unknown body field can be a 400 that rotation then treats as a
+    dead route. FLEXFACTOR_CLOUD_REASONING=full disables this.
+    """
+    if os.environ.get("FLEXFACTOR_CLOUD_REASONING", "").lower() == "full":
+        return None
+    base = str(getattr(route, "base_url", "") or "").lower()
+    if "openrouter.ai" in base:
+        # OpenRouter's unified reasoning parameter.
+        return {"reasoning": {"effort": "low"}}
+    if "integrate.api.nvidia.com" in base:
+        # NIM chat templates (DeepSeek/Qwen/Nemotron) honour this kwarg.
+        return {"chat_template_kwargs": {"thinking": False}}
+    return None
+
+
+def _reasoning_kwargs(provider) -> dict:
+    """`extra_body=` for an OpenAI-shaped call, when the route set one."""
+    body = getattr(provider, "_extra_body", None)
+    return {"extra_body": body} if body else {}
+
+
 def _report_route_quality(provider, role: str, signal: str, pfx: str = "  ") -> None:
     """Tell the rotator whether the work a route produced HELPED.
 
@@ -3382,6 +3416,7 @@ def _rotation_route_provider(route):
         if not base.endswith("/openai"):
             base += "/openai"
         prov = object.__new__(OpenAIProvider)
+        prov._extra_body = _reasoning_extra_body(route)
         prov.model = wire
         prov.judge_model = wire
         prov.meter = None
@@ -3400,6 +3435,7 @@ def _rotation_route_provider(route):
         # SDK raises on a missing env key at construction (same reason
         # _openai_rescue_provider bypasses __init__). Inject the route's client.
         prov = object.__new__(OpenAIProvider)
+        prov._extra_body = _reasoning_extra_body(route)
         prov.model = wire
         prov.judge_model = wire   # tiering happens at the rotation layer
         prov.meter = None         # RotatingProvider attaches the shared meter

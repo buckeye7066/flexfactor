@@ -217,5 +217,45 @@ class OllamaProviderThinkingChannel(unittest.TestCase):
         self.assertEqual(p._chat("m", "s", "u", 32), "")
 
 
+class CloudReasoningKnob(unittest.TestCase):
+    """Live IPlay audit 2026-08-23: 8 of 20 failed calls were OpenRouter
+    thinking models exhausting the judge budget on reasoning. Routes on
+    backends with a documented knob get reasoning turned down; others are
+    left untouched (an unknown body field can be a fatal 400)."""
+
+    def _route(self, base): 
+        import types; return types.SimpleNamespace(base_url=base)
+
+    def test_openrouter_and_nim_get_a_knob_others_do_not(self):
+        self.assertEqual(F._reasoning_extra_body(self._route("https://openrouter.ai/api/v1")),
+                         {"reasoning": {"effort": "low"}})
+        self.assertEqual(F._reasoning_extra_body(self._route("https://integrate.api.nvidia.com/v1")),
+                         {"chat_template_kwargs": {"thinking": False}})
+        self.assertIsNone(F._reasoning_extra_body(self._route("https://api.groq.com/openai/v1")))
+
+    def test_owner_can_restore_full_reasoning(self):
+        os.environ["FLEXFACTOR_CLOUD_REASONING"] = "full"
+        try:
+            self.assertIsNone(F._reasoning_extra_body(self._route("https://openrouter.ai/api/v1")))
+        finally:
+            os.environ.pop("FLEXFACTOR_CLOUD_REASONING", None)
+
+    def test_structured_call_carries_extra_body(self):
+        captured = {}
+        class _Completions:
+            def create(self_inner, **kw):
+                captured.update(kw)
+                import types
+                msg = types.SimpleNamespace(content='{"ok": 1}', reasoning_content=None)
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg, finish_reason="stop")],
+                                             usage=None)
+        p = object.__new__(F.OpenAIProvider)
+        p.model = "m"; p.judge_model = "m"; p.meter = None
+        p.client = type("C", (), {"chat": type("Ch", (), {"completions": _Completions()})()})()
+        p._extra_body = {"reasoning": {"effort": "low"}}
+        p.structured("sys", "user", {"type": "object", "properties": {"ok": {"type": "integer"}}}, max_tokens=64)
+        self.assertEqual(captured.get("extra_body"), {"reasoning": {"effort": "low"}})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
