@@ -1363,3 +1363,18 @@ mechanics a future change must not break:
   re-isolate it per test.
 - **Unfit additions:** `realtime`, `deep-research` (404 "not a chat model" /
   400 "Interactions API only", both seen live).
+
+## Structural (cross-file) fixes (2026-08-23)
+
+Owner order: "It sure would be nice if flexfactor would fix errors it found."
+A `[no-op: no fix found]` defect now gets ONE bounded cross-file escalation
+(`attempt_structural_fix`): the author model plans repo-contained operations -
+new files, rewrites of files it was SHOWN (primary + an optional one-round
+`need_files` read), renames - applied transactionally (all paths snapshotted,
+`_gate_file` syntax gate on every written code file, optional cross-model veto
+fail-open, full rollback on ANY failure). Bounds: 8 writes / 3 renames /
+8 need_files per plan, 10 escalations per fix pass. `--no-structural-fixes`
+disables. Classifier note: `_NOOP_NO_FIX_PATTERNS` now matches the canonical
+"cannot be fixed in this file alone" wording its own schema asks for - it
+previously classified as UNCLEAR, which would have starved this escalation.
+Tests: `flexfactor_structural_tests.py` (offline, 10 tests).
