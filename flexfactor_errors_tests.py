@@ -106,5 +106,54 @@ class LedgerWritesEveryRecord(unittest.TestCase):
         self.assertEqual(self.ledger.summary_line(), "[errors] none recorded")
 
 
+class RouteFailuresAreTheProviders(unittest.TestCase):
+    """Live 2026-08-23: a gated 403 and a 'not a chat model' 404 were filed as
+    flexfactor-defect because our HTTP client frame was on the stack."""
+
+    def setUp(self):
+        self.led = E.ErrorLedger(tempfile.mkdtemp(prefix="ff-errors-"), "prog", HERE)
+
+    def test_402_is_budget_with_the_allowance_fix(self):
+        e = self.led.record("rotation", "APIStatusError: Error code: 402 - requires more credits", route="openrouter/x:free")
+        self.assertEqual(e["kind"], E.KIND_BUDGET); self.assertIn("allowance", e["suggestion"])
+
+    def test_403_is_the_providers_not_ours(self):
+        try:
+            _boom()          # puts a FlexFactor frame on the stack
+        except ValueError:
+            pass
+        e = self.led.record("rotation", "PermissionDeniedError: Error code: 403 - gated", route="openrouter/inkling")
+        self.assertEqual(e["kind"], E.KIND_PROVIDER)
+
+    def test_not_a_chat_model_names_the_unfit_list(self):
+        e = self.led.record("rotation", "NotFoundError: 404 - This is not a chat model", route="openai_api/gpt-realtime")
+        self.assertEqual(e["kind"], E.KIND_PROVIDER); self.assertIn("unfit list", e["suggestion"])
+
+    def test_unknown_route_failure_defaults_to_provider_even_with_our_frame(self):
+        try:
+            _boom()
+        except ValueError as exc:
+            e = self.led.record("rotation", "Weird: never seen", route="r/x")
+        self.assertEqual(e["kind"], E.KIND_PROVIDER)
+
+    def test_model_suggester_is_never_asked_about_route_failures(self):
+        calls = []
+        led = E.ErrorLedger(self.led.run_dir, "prog", HERE, suggester=lambda t, w: calls.append(t) or "x")
+        led.record("rotation", "Weird: never seen", route="r/x")
+        led.record("fix", "Weird: never seen")
+        self.assertEqual(len(calls), 1)
+
+    def test_suggester_cannot_reenter_the_ledger(self):
+        led = E.ErrorLedger(self.led.run_dir, "prog", HERE)
+        def recursing(t, w):
+            led.record("fix", "Weird: inner")     # would loop without the guard
+            return "outer"
+        led._suggester = recursing
+        e = led.record("fix", "Weird: outer")
+        self.assertEqual(len(led.entries), 2)
+        self.assertEqual(e["suggestion_source"], "model")
+        self.assertEqual(led.entries[0]["suggestion_source"], "none")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

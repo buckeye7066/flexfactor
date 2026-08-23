@@ -23,6 +23,10 @@ _UNFIT_CODE_PATTERNS = (
     r"vision-only", r"synthetic-video", r"ai-synthetic-video",
     r"deep-research", r"antigravity", r"robotics-er", r"computer-use",
     r"nano-banana", r"omni-flash", r":batch$",
+    # Live IPlay audit 2026-08-23: openai_api/gpt-realtime-1.5 was rotated in
+    # as a light judge and answered 404 "This is not a chat model". Realtime
+    # (audio/websocket) products never serve chat completions.
+    r"realtime", r"deep-research",
 )
 
 _DEFAULT_SKIP_DIRS = {

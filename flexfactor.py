@@ -3166,7 +3166,7 @@ def _attach_ledger_suggester(provider) -> None:
             "exactly what is missing instead of guessing."),
             f"ERROR:\n{error_text[:1500]}\n\nRESPONSIBLE FRAME (json):\n{where_json[:800]}",
             {"type": "object", "properties": {"suggestion": {"type": "string"}},
-             "required": ["suggestion"]}, max_tokens=600)
+             "required": ["suggestion"]}, max_tokens=2000)   # thinking models need headroom
         return str((data or {}).get("suggestion") or "")
 
     _ERROR_LEDGER._suggester = suggest

@@ -64,6 +64,18 @@ SIGNATURES: List[Tuple[str, str, str]] = [
     (r"Interactions API|only supports Interactions", KIND_PROVIDER,
      "This is a 'deep research' product, not a chat model; it can never serve code work through this "
      "transport. It is on the unfit list (deep-research); refresh the catalog if it reappears."),
+    (r"\b402\b|requires more credits|can only afford", KIND_BUDGET,
+     "The provider's allowance for this key is spent (OpenRouter's free tier is balance-bound). "
+     "The rotator cools that pool and moves on; it recovers when the allowance resets. Do not "
+     "add paid credit to compensate."),
+    (r"\b403\b|PermissionDenied|not permitted|gated", KIND_PROVIDER,
+     "This route is gated or not permitted for the key in use. Rotation skips it after strikes; "
+     "to stop retrying it, exclude it (FLEXFACTOR_ROTATION_EXCLUDE=<fragment>) or have AI Time's "
+     "catalog mark it disabled."),
+    (r"not a chat model|does not support chat|unsupported_endpoint", KIND_PROVIDER,
+     "The catalog lists a model that cannot serve chat completions (realtime/audio/embedding "
+     "products). Add its family to the unfit list (flexfactor_directed._UNFIT_CODE_PATTERNS and "
+     "the Factory Deck twin) so rotation never selects it."),
     (r"\b429\b|rate.?limit|Too Many Requests", KIND_PROVIDER,
      "Rate-limited. The rotator cools the pool down and moves on; nothing to fix unless it recurs "
      "on every pool, which means the free tiers are exhausted for now."),
@@ -180,14 +192,26 @@ class ErrorLedger:
         where = responsible_frame(exc, self.tool_root)
         auto_kind, auto_sugg = classify(text + "\n" + (detail or ""))
         kind = kind or auto_kind
-        # A failure that points at the program's file is the program's unless
-        # a FlexFactor frame is also implicated (then it is still ours to fix).
         if not kind or kind == KIND_UNKNOWN:
-            kind = KIND_TOOL if where else (KIND_PROGRAM if program_file else
-                                            KIND_PROVIDER if route else KIND_UNKNOWN)
+            # A provider call always has our HTTP client on the stack; that
+            # frame is where the error SURFACED, not what caused it. Live
+            # 2026-08-23: a gated 403 and a 'not a chat model' 404 were
+            # filed as flexfactor-defect for exactly that reason. When the
+            # failure belongs to a route, it is the provider's unless a
+            # signature says otherwise; a program file means the program's;
+            # only then does a FlexFactor frame mean it is ours.
+            kind = (KIND_PROVIDER if route else
+                    KIND_PROGRAM if program_file else
+                    KIND_TOOL if where else KIND_UNKNOWN)
         sugg = suggestion or auto_sugg
         sugg_source = "signature" if (suggestion or auto_sugg != _SUGGEST_FALLBACK) else "none"
-        if sugg_source == "none" and self._suggester is not None:
+        # The model fallback is for errors in OUR phases. A route failure is
+        # the provider's business and the signature table covers it; asking a
+        # model about it would itself be a rotated call, whose own failure
+        # would land back here -- the loop this guard exists to prevent.
+        if sugg_source == "none" and self._suggester is not None and not route \
+                and not getattr(self, "_in_suggester", False):
+            self._in_suggester = True
             try:
                 model_sugg = self._suggester(text, json.dumps(where or {}))
                 if model_sugg and model_sugg.strip():
@@ -195,6 +219,8 @@ class ErrorLedger:
                     sugg_source = "model"
             except Exception as sx:  # noqa: BLE001 - the ledger must never throw
                 sugg = f"{_SUGGEST_FALLBACK} (model suggester failed: {sx})"
+            finally:
+                self._in_suggester = False
         entry = {
             "n": len(self.entries) + 1,
             "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
