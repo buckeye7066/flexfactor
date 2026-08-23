@@ -3321,12 +3321,78 @@ def _hydrate_route_credentials(routes) -> list[str]:
 _ROTATION_EXCLUDE_DEFAULT = "ollama/muse-glimmer"
 
 
+def _local_bench_path() -> str:
+    base = os.environ.get("AITIME_STATE_DIR") or os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "AITime")
+    return os.path.join(base, "local-bench.json")
+
+
+_LOCAL_BENCH_CACHE: "tuple[float, dict] | None" = None
+
+
+def _local_bench() -> dict:
+    """Measured speeds for local models, keyed by tag, or {} when unmeasured.
+
+    Written by C:\\Users\\firer\\glimmer\\tools\\bench_local_models.py -- the
+    same prompt through the same Ollama for every local model. Read-only here;
+    a missing or unreadable file just means "no measurement", never an error.
+    Cached per process: this is consulted once per catalog route.
+    """
+    global _LOCAL_BENCH_CACHE
+    path = _local_bench_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _LOCAL_BENCH_CACHE and _LOCAL_BENCH_CACHE[0] == mtime:
+        return _LOCAL_BENCH_CACHE[1]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        table = {
+            "_slow_tok_per_s": float(data.get("slow_tok_per_s") or 5.0),
+        }
+        for entry in data.get("models") or []:
+            if isinstance(entry, dict) and entry.get("tag"):
+                table[str(entry["tag"]).lower()] = entry
+    except (OSError, ValueError, TypeError):
+        return {}
+    _LOCAL_BENCH_CACHE = (mtime, table)
+    return table
+
+
 def _rotation_excluded_reason(model_or_route_id: str) -> str:
-    """Why this route is held out of rotation here, or '' when it may rotate."""
+    """Why this route is held out of rotation here, or '' when it may rotate.
+
+    Two sources, measured first:
+      1. local-bench.json -- a LOCAL route whose measured generation rate is
+         below the file's slow threshold (or that never answered) is held out.
+         Rotation is cheapest-first and local is cost class 0, so a slow local
+         model is not merely slow, it is picked FIRST every sweep.
+      2. FLEXFACTOR_ROTATION_EXCLUDE substrings -- the hand-written fallback
+         for routes nobody has measured yet (default: the local Muse Glimmer).
+    """
+    low = str(model_or_route_id or "").lower()
+
+    if low.startswith("ollama/"):
+        bench = _local_bench()
+        entry = bench.get(low[len("ollama/"):])
+        if isinstance(entry, dict) and entry.get("ok"):
+            rate = entry.get("gen_tok_per_s")
+            floor = bench.get("_slow_tok_per_s", 5.0)
+            if not entry.get("answered"):
+                return (f"excluded from rotation (measured: produced no answer "
+                        f"{'- reasoning-only reply' if entry.get('reasoning_only') else ''})")
+            if rate is not None and float(rate) < floor:
+                return (f"excluded from rotation (measured {rate} tok/s on this CPU, "
+                        f"below the {floor:g} tok/s floor for a rotated job) - run it "
+                        f"standalone with --provider ollama --model {entry['tag']}")
+            # Measured fast enough: the measurement outranks the name list.
+            return ""
+
     raw = os.environ.get("FLEXFACTOR_ROTATION_EXCLUDE")
     if raw is None:
         raw = _ROTATION_EXCLUDE_DEFAULT
-    low = str(model_or_route_id or "").lower()
     for frag in (p.strip().lower() for p in raw.split(",")):
         if frag and frag in low:
             return (f"excluded from rotation ({frag}: too slow for a rotated job "
