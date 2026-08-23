@@ -3081,6 +3081,84 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
     return prov
 
 
+_PURPOSE_VISION_HINTS = ("screenshot", "screen shot", "ui ", "user interface", "visual",
+                         "image", "photo", "render", "pixel", "layout", "ocr", "diagram",
+                         "video frame", "camera")
+
+
+def _purpose_needs_from_text(text: str) -> tuple:
+    """Capabilities the program's own purpose demands of any model serving it.
+
+    Deliberately narrow: only `vision` is inferred, and only from words that
+    mean the program's job involves looking at pictures. Everything else a
+    role needs (code authoring, review, JSON, honesty) is attached per call
+    site, not guessed from prose.
+    """
+    low = " " + re.sub(r"\s+", " ", str(text or "").lower()) + " "
+    if any(h in low for h in _PURPOSE_VISION_HINTS):
+        return ("vision",)
+    return ()
+
+
+def _set_rotation_purpose(providers, display_name: str, purpose_contract, purpose_blob: str,
+                          pfx: str = "") -> None:
+    """Tell every rotating provider in the pool what this program is for."""
+    slug = str(display_name or "program").strip()[:40]
+    if purpose_contract is not None:
+        first = str(getattr(purpose_contract, "purpose", "") or
+                    getattr(purpose_contract, "summary", "") or "").strip().split("\n")[0]
+        if first:
+            slug = f"{slug}: {first[:60]}"
+    needs = _purpose_needs_from_text(purpose_blob)
+    told = []
+    for name, prov in providers or []:
+        if hasattr(prov, "set_purpose"):
+            try:
+                prov.set_purpose(slug, needs)
+                told.append(name)
+            except Exception as exc:  # noqa: BLE001 - never let sight break the run
+                print(f"{pfx}[rotation] could not set purpose on {name}: {exc}", file=sys.stderr)
+    if told:
+        print(f"{pfx}[rotation] purpose sight: '{slug}'"
+              + (f" needs {','.join(needs)}" if needs else "")
+              + f" -> {', '.join(told)}", file=sys.stderr)
+
+
+def _intent_kw(provider, role: str, *needs: str, avoid_family: str | None = None) -> dict:
+    """`intent=` kwarg for a ROTATING provider; nothing for a fixed one.
+
+    Purpose sight lives in the rotator (flexfactor_rotation.CallIntent): the
+    role and hard needs let selection fit the route to the job and keep the
+    reviewer out of the author's family. A fixed provider (Anthropic, OpenAI,
+    Ollama, CLI) has one model and takes no such kwarg, so it gets nothing --
+    passing it would be a TypeError at the wire call.
+    """
+    if not hasattr(provider, "set_purpose"):
+        return {}
+    import flexfactor_rotation as _fr
+    return {"intent": _fr.CallIntent(role, tuple(needs), avoid_family)}
+
+
+def _judge_intent(provider, schema: dict) -> dict:
+    """The rotator intent for a judging call, derived from WHICH judgement.
+
+    Derived from the schema rather than passed by callers so the `_judge`
+    signature stays exactly what a dozen tests monkeypatch with two-argument
+    fakes. Review and adversarial verification are REVIEWER work (the route
+    must have found planted review defects; adversarial review must also be
+    honest about what it cannot see, and the rotating provider keeps it out of
+    the author's family). Everything else is a judge that must emit JSON.
+    """
+    try:
+        if schema is ADVERSARIAL_VERIFY_SCHEMA:
+            return _intent_kw(provider, "reviewer", "code_review", "structured_json", "honest")
+        if schema is AUDIT_FINDINGS_SCHEMA:
+            return _intent_kw(provider, "reviewer", "code_review", "structured_json")
+    except NameError:
+        pass
+    return _intent_kw(provider, "judge", "structured_json")
+
+
 def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8000) -> dict:
     """Run a CLASSIFICATION/judging structured call on the provider's cheap judge
     model (review findings, fix verification, program profiling, benefit scoring).
@@ -3090,7 +3168,7 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     the until-clean loop re-reviews), whereas generation must fail loudly."""
     data = provider.structured(system, prompt, schema, max_tokens=max_tokens,
                                model=getattr(provider, "judge_model", None),
-                               salvage_truncated=True)
+                               salvage_truncated=True, **_judge_intent(provider, schema))
     # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
     # clean/keep/approve/ready/pass is downgraded HERE, at the one judging
     # chokepoint, so no caller can read a truncated answer as authorization.
@@ -9783,7 +9861,8 @@ def generate_file_fix_edits(provider, rel_path: str, text: str, findings: list[d
     # Edits are hunk-sized, so 32k output is generous headroom (a response this
     # large means dozens of substantial edits, at which point the whole-file
     # fallback is the right tool anyway).
-    return provider.structured(FIX_EDITS_SYSTEM, prompt, FIX_EDITS_SCHEMA, max_tokens=FIX_EDITS_MAX_TOKENS)
+    return provider.structured(FIX_EDITS_SYSTEM, prompt, FIX_EDITS_SCHEMA, max_tokens=FIX_EDITS_MAX_TOKENS,
+                               **_intent_kw(provider, "author", "code_author", "structured_json"))
 
 
 def _apply_edits(text: str, edits: list[dict]) -> tuple[str | None, str]:
@@ -10897,6 +10976,9 @@ def _adversarial_verify_fix(reviewer, rel_path: str, original: str, fixed: str,
     # not as a clean pass. Budget refusals are re-raised, never retried.
     for _ in range(max(1, retries + 1)):
         try:
+            # _judge derives the REVIEWER intent from this schema: honest about
+            # what it cannot see, and not the author's family (avoid_family is
+            # filled in by the rotating provider from the last author).
             data = _judge(reviewer, ADVERSARIAL_VERIFY_SYSTEM, prompt, ADVERSARIAL_VERIFY_SCHEMA)
             last_ex = None
             break
@@ -12989,6 +13071,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = why
             return result
         author = providers[0][1]
+        # PURPOSE SIGHT (owner 2026-08-23: "give the rotator sight to see the
+        # goal of the app"). The rotating provider learns this program's
+        # purpose once; every selection it makes from here on carries the
+        # purpose slug in the journal, and any capability the purpose itself
+        # demands (a UI/visual purpose needs a model that can see) becomes a
+        # hard need on every call. Fixed providers have no set_purpose and are
+        # untouched.
+        _set_rotation_purpose(providers, display_name, purpose_contract, purpose_blob, pfx)
         cross = providers[1][1] if len(providers) > 1 else None
         # CONCURRENT FREE POOL (2026-08-12): when build_audit_providers found
         # multiple free backends usable at once, it populated

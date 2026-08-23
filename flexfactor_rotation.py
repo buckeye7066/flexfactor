@@ -128,6 +128,11 @@ class Route:
     quota_status: str = "unknown"
     resets_at: Optional[str] = None
     note: str = ""
+    # Purpose sight. Empty = unknown (never a disqualifier). Source is
+    # "measured" (bench_battery.py, local routes) or "declared" (tier/family,
+    # cloud routes) so a consumer can tell evidence from assertion.
+    capabilities: Tuple[str, ...] = ()
+    capabilities_source: str = ""
 
     @property
     def is_free(self) -> bool:
@@ -150,6 +155,11 @@ class Route:
             disabled_reason=raw.get("disabled_reason", ""),
             quota_status=raw.get("quota_status", "unknown"),
             resets_at=raw.get("resets_at"), note=raw.get("note", ""),
+            # Older catalogs have neither field; that is "unknown", not empty-
+            # on-purpose, and the rotator treats it as such.
+            capabilities=tuple(str(c) for c in (raw.get("capabilities") or [])
+                               if isinstance(c, str)),
+            capabilities_source=str(raw.get("capabilities_source") or ""),
         )
 
 
@@ -424,6 +434,74 @@ class StateStore:
 # Selection
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Purpose sight: what a call is FOR, so selection can fit the model to the job
+# --------------------------------------------------------------------------- #
+
+# Capability names. Local routes carry these MEASURED (bench_battery.py);
+# cloud routes carry them DECLARED by tier/family. A route with an empty list
+# is "unknown" and is never excluded on capability grounds -- the absence of a
+# measurement must not masquerade as a failed one.
+CAP_CODE_AUTHOR = "code_author"       # executed a planted-defect repair
+CAP_STRUCTURED_JSON = "structured_json"
+CAP_CODE_REVIEW = "code_review"       # found planted review defects
+CAP_HONEST = "honest"                 # admitted it had not seen a file
+CAP_VISION = "vision"
+
+ROLE_AUTHOR = "author"
+ROLE_REVIEWER = "reviewer"
+ROLE_JUDGE = "judge"
+ROLE_VISION = "vision"
+
+
+@dataclass(frozen=True)
+class CallIntent:
+    """What this call is for. The rotator fits the route to it.
+
+    role          -- author | reviewer | judge | vision
+    needs         -- capabilities the route MUST have (when its list is known)
+    avoid_family  -- model family the route must NOT be, when any alternative
+                     exists (author/reviewer independence). Soft: if every
+                     candidate is that family the call still runs, and the
+                     selection says so.
+    purpose       -- short slug of the program purpose this call serves; it is
+                     recorded on the selection so the journal can answer "what
+                     was this model working toward?".
+    """
+    role: str = ROLE_AUTHOR
+    needs: Tuple[str, ...] = ()
+    avoid_family: Optional[str] = None
+    purpose: str = ""
+
+    def with_purpose(self, purpose: str, extra_needs: Sequence[str] = ()) -> "CallIntent":
+        needs = tuple(dict.fromkeys(tuple(self.needs) + tuple(extra_needs)))
+        return CallIntent(self.role, needs, self.avoid_family, purpose or self.purpose)
+
+
+_FAMILY_PATTERNS = (
+    ("claude", "anthropic"), ("gpt-oss", "gpt-oss"), ("gpt-", "openai"), ("o1", "openai"),
+    ("o3", "openai"), ("o4", "openai"), ("gemma", "gemma"), ("gemini", "gemini"),
+    ("qwen", "qwen"), ("llama", "llama"), ("mistral", "mistral"), ("mixtral", "mistral"),
+    ("codestral", "mistral"), ("deepseek", "deepseek"), ("phi", "phi"), ("grok", "xai"),
+    ("glimmer", "muse"), ("muse", "muse"), ("kimi", "kimi"), ("glm", "glm"),
+    ("nemotron", "nvidia"), ("command", "cohere"),
+)
+
+
+def model_family(model_id: str) -> str:
+    """Coarse family of a model id, for author/reviewer independence.
+
+    Looks at the LAST path segment so 'openrouter/qwen/qwen3.6-27b' and
+    'ollama/qwen3-coder:30b' both say 'qwen'. Unknown families return the
+    segment itself, which still distinguishes them from each other.
+    """
+    seg = str(model_id or "").lower().split("/")[-1]
+    for needle, fam in _FAMILY_PATTERNS:
+        if needle in seg:
+            return fam
+    return seg.split(":")[0].split("-")[0] or "unknown"
+
+
 @dataclass
 class Selection:
     route: Route
@@ -434,6 +512,11 @@ class Selection:
     pinned: bool = False
     catalog_stale: bool = False
     considered_pools: int = 0
+    # Purpose sight: why this route, for what.
+    intent_role: str = ""
+    purpose: str = ""
+    fit: str = ""              # measured | declared | unknown
+    family_note: str = ""      # set when avoid_family could not be honoured
 
     @property
     def demoted(self) -> bool:
@@ -445,6 +528,12 @@ class Selection:
             bits.append("pinned")
         if self.demoted:
             bits.append(f"demoted from {self.demoted_from}")
+        if self.intent_role:
+            bits.append(f"as {self.intent_role}" + (f" ({self.fit})" if self.fit else ""))
+        if self.purpose:
+            bits.append(f"for {self.purpose}")
+        if self.family_note:
+            bits.append(self.family_note)
         # `catalog_stale` is DELIBERATELY not rendered here. Staleness is a fact
         # about the CATALOG FILE, not about this route, and the caller prints one
         # line per distinct route -- so a long run repeated "stale catalog" once
@@ -481,7 +570,8 @@ class Rotator:
     # -- the main entry point ---------------------------------------------
     def next_route(self, tier: str = FRONTIER, allow_paid: bool = False,
                    pin: Optional[str] = None, pin_strict: bool = True,
-                   now: Optional[float] = None) -> Selection:
+                   now: Optional[float] = None,
+                   intent: Optional[CallIntent] = None) -> Selection:
         """Choose the next route, and stamp the choice in the same breath.
 
         Read, select and stamp happen inside ONE held lock. Splitting them --
@@ -509,13 +599,16 @@ class Rotator:
             start = TIER_CHAIN.index(requested)
             for depth, candidate_tier in enumerate(TIER_CHAIN[start:]):
                 selection = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons)
+                    candidate_tier, allow_paid, state, now, reasons, intent)
                 if selection is None:
                     continue
                 selection.requested_tier = requested
                 if depth:
                     selection.demoted_from = requested
                 selection.catalog_stale = self.catalog.is_stale
+                if intent is not None:
+                    selection.intent_role = intent.role
+                    selection.purpose = intent.purpose
                 self._stamp(state, selection, now)
                 outcome["selection"] = selection
                 return
@@ -573,7 +666,8 @@ class Rotator:
 
     # -- pool-first selection ---------------------------------------------
     def _pick_in_tier(self, tier: str, allow_paid: bool, state: Dict[str, Any],
-                      now: float, reasons: Dict[str, str]) -> Optional[Selection]:
+                      now: float, reasons: Dict[str, str],
+                      intent: Optional[CallIntent] = None) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
             if route.tier != tier:
@@ -589,10 +683,31 @@ class Rotator:
                 continue
             if _cooling(state, f"route:{route.id}", now):
                 continue
+            # PURPOSE FIT, before pool selection. A route whose capability
+            # list is KNOWN and lacks a hard need is not a candidate for this
+            # call -- it would be picked first (cheapest) and then do the wrong
+            # job. A route with NO capability data is kept (unknown is not
+            # failed) and ranked after known-fit routes inside its pool.
+            if intent is not None and intent.needs and route.capabilities:
+                missing = [n for n in intent.needs if n not in route.capabilities]
+                if missing:
+                    reasons.setdefault(
+                        route.pool, f"lacks {','.join(missing)} for role {intent.role}")
+                    continue
             candidates.append(route)
 
         if not candidates:
             return None
+
+        family_note = ""
+        if intent is not None and intent.avoid_family:
+            others = [r for r in candidates
+                      if model_family(r.model) != intent.avoid_family]
+            if others:
+                candidates = others
+            else:
+                family_note = (f"no alternative to family '{intent.avoid_family}' "
+                               f"for {intent.role}; independence NOT achieved")
 
         # Group by the ledger each route actually drains. THIS is the rotation.
         pools: Dict[str, List[Route]] = {}
@@ -614,11 +729,25 @@ class Rotator:
                            self._pool_calls(state, p), p))
         pool = ordered[0]
 
-        routes = sorted(pools[pool], key=lambda r: (self._route_last_used(state, r),
+        def _fit_rank(r: Route) -> int:
+            # Known-fit (measured beats declared) ahead of unknown, inside the
+            # pool that LRU already chose. Pool order is never changed by fit.
+            if intent is None or not intent.needs:
+                return 0
+            if not r.capabilities:
+                return 2
+            return 0 if r.capabilities_source == "measured" else 1
+
+        routes = sorted(pools[pool], key=lambda r: (_fit_rank(r),
+                                                    self._route_last_used(state, r),
                                                     COST_ORDER.get(r.cost_class, 9),
                                                     r.id))
-        return Selection(route=routes[0], pool=pool, tier=tier,
-                         requested_tier=tier, considered_pools=len(ordered))
+        chosen = routes[0]
+        fit = ("" if intent is None or not intent.needs else
+               (chosen.capabilities_source or "declared") if chosen.capabilities else "unknown")
+        return Selection(route=chosen, pool=pool, tier=tier,
+                         requested_tier=tier, considered_pools=len(ordered),
+                         fit=fit, family_note=family_note)
 
     # -- state helpers -----------------------------------------------------
     @staticmethod
@@ -818,6 +947,35 @@ class RotatingProvider:
         # hardcoded guess that would misprice the first call.
         self.model = ROTATING_MODEL
         self.judge_model = ROTATING_JUDGE_MODEL
+        # Purpose sight. `set_purpose` is called once per program by the audit
+        # with the program's purpose slug and any capability the purpose
+        # itself demands (a UI-heavy purpose adds `vision`). Every call's
+        # intent is then completed with it, so the journal can say which
+        # program goal each route served. `_last_family` remembers who
+        # authored last so a reviewer intent can avoid that family
+        # automatically -- the author must never be the only judge of its
+        # own work.
+        self._purpose: str = ""
+        self._purpose_needs: Tuple[str, ...] = ()
+        self._last_family: Dict[str, str] = {}
+        self._family_lock = threading.Lock()
+
+    def set_purpose(self, purpose: str, needs: Sequence[str] = ()) -> None:
+        self._purpose = str(purpose or "")[:80]
+        self._purpose_needs = tuple(dict.fromkeys(str(n) for n in needs if n))
+
+    def _complete_intent(self, intent: Optional[CallIntent]) -> Optional[CallIntent]:
+        if intent is None:
+            if not self._purpose:
+                return None
+            intent = CallIntent()
+        intent = intent.with_purpose(self._purpose, self._purpose_needs)
+        if intent.role == ROLE_REVIEWER and intent.avoid_family is None:
+            with self._family_lock:
+                author_fam = self._last_family.get(ROLE_AUTHOR)
+            if author_fam:
+                intent = CallIntent(intent.role, intent.needs, author_fam, intent.purpose)
+        return intent
 
     # -- plumbing ----------------------------------------------------------
     def _provider_for(self, route: Route) -> Any:
@@ -855,13 +1013,20 @@ class RotatingProvider:
         retrying the same ledger cannot help, and every other ledger deserves a
         turn before the call is declared impossible.
         """
+        intent = self._complete_intent(kwargs.pop("intent", None))
         attempts = max(1, len({r.pool for r in self.catalog_routes(tier)}))
         last_error: Optional[BaseException] = None
         for _ in range(attempts):
+            # Only name the kwarg when there is an intent: test doubles and
+            # older Rotator shapes take the original signature.
             selection = self.rotator.next_route(
-                tier=tier, allow_paid=self._allow_paid)
+                tier=tier, allow_paid=self._allow_paid,
+                **({"intent": intent} if intent is not None else {}))
             route = selection.route
             self.model = route.model
+            if intent is not None and intent.role:
+                with self._family_lock:
+                    self._last_family[intent.role] = model_family(route.model)
             if self._on_route:
                 self._on_route(selection)
             try:
