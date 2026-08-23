@@ -72,6 +72,15 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "This route is gated or not permitted for the key in use. Rotation skips it after strikes; "
      "to stop retrying it, exclude it (FLEXFACTOR_ROTATION_EXCLUDE=<fragment>) or have AI Time's "
      "catalog mark it disabled."),
+    (r"Unsupported parameter: 'max_tokens'|max_completion_tokens", KIND_TOOL,
+     "Newer OpenAI models (gpt-5*, o-series, chat-latest) reject `max_tokens`; the chat call "
+     "must send `max_completion_tokens` for api.openai.com routes (OpenAIProvider builds the "
+     "kwargs in _chat/structured/grade). Until then each such route wastes the call's single "
+     "paid round in auto mode."),
+    (r"No available capacity was found for the model", KIND_PROVIDER,
+     "The provider has no capacity for this model right now (seen on sora-2-pro, a video "
+     "product). Rotation moves on; AI Time's catalog now disables non-chat products -- refresh "
+     "it with `python -m aitime.catalog` if this route reappears."),
     (r"not a chat model|does not support chat|unsupported_endpoint", KIND_PROVIDER,
      "The catalog lists a model that cannot serve chat completions (realtime/audio/embedding "
      "products). Add its family to the unfit list (flexfactor_directed._UNFIT_CODE_PATTERNS and "
