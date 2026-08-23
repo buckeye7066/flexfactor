@@ -3833,7 +3833,11 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
                                # every route failure lands in the run's error
                                # ledger, even the ones rotation absorbs
                                on_error=lambda route, exc: _ledger(
-                                   "rotation", exc, route=route.id))
+                                   "rotation", exc, route=route.id),
+                               # AUTO MODE (owner 2026-08-23): paid pools first
+                               # for ONE attempt per call, then free. --max-cost
+                               # still bounds the spend.
+                               paid_first=(str(model_mode).lower() == "auto"))
 
 
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by

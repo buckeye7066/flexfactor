@@ -590,7 +590,8 @@ class Rotator:
     def next_route(self, tier: str = FRONTIER, allow_paid: bool = False,
                    pin: Optional[str] = None, pin_strict: bool = True,
                    now: Optional[float] = None,
-                   intent: Optional[CallIntent] = None) -> Selection:
+                   intent: Optional[CallIntent] = None,
+                   paid_first: bool = False) -> Selection:
         """Choose the next route, and stamp the choice in the same breath.
 
         Read, select and stamp happen inside ONE held lock. Splitting them --
@@ -618,7 +619,8 @@ class Rotator:
             start = TIER_CHAIN.index(requested)
             for depth, candidate_tier in enumerate(TIER_CHAIN[start:]):
                 selection = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons, intent)
+                    candidate_tier, allow_paid, state, now, reasons, intent,
+                    paid_first=paid_first and allow_paid)
                 if selection is None:
                     continue
                 selection.requested_tier = requested
@@ -686,7 +688,8 @@ class Rotator:
     # -- pool-first selection ---------------------------------------------
     def _pick_in_tier(self, tier: str, allow_paid: bool, state: Dict[str, Any],
                       now: float, reasons: Dict[str, str],
-                      intent: Optional[CallIntent] = None) -> Optional[Selection]:
+                      intent: Optional[CallIntent] = None,
+                      paid_first: bool = False) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
             if route.tier != tier:
@@ -749,9 +752,19 @@ class Rotator:
         # end AND the cursor stepped past it, landing back on the same pool
         # every time. Two rotation mechanisms are one too many; the cursor
         # survives in state as a monotonic call counter for diagnostics only.
+        # AUTO MODE (owner 2026-08-23): "paid models first followed by free.
+        # Only do one round." With paid_first, every pool whose candidates are
+        # all paid ranks ahead of the free pools; LRU still orders within each
+        # group. The caller (RotatingProvider._run) grants paid_first to the
+        # FIRST attempt only, so a failed paid attempt falls to free pools and
+        # never loops back to spend again on the same call.
+        def _paid_pool(p: str) -> bool:
+            return all(not r.is_free for r in pools[p])
+
         ordered = sorted(
             pools.keys(),
-            key=lambda p: (self._pool_last_used(state, p),
+            key=lambda p: ((0 if _paid_pool(p) else 1) if paid_first else 0,
+                           self._pool_last_used(state, p),
                            self._pool_calls(state, p), p))
         pool = ordered[0]
 
@@ -1015,12 +1028,17 @@ class RotatingProvider:
                  tier: str = FRONTIER, judge_tier: str = LIGHT,
                  allow_paid: bool = False, meter: Any = None,
                  on_route: Optional[Callable[[Selection], None]] = None,
-                 on_error: Optional[Callable[[Route, BaseException], None]] = None):
+                 on_error: Optional[Callable[[Route, BaseException], None]] = None,
+                 paid_first: bool = False):
         self.rotator = rotator
         self._factory = factory
         self._tier = tier
         self._judge_tier = judge_tier
         self._allow_paid = allow_paid
+        # Auto mode: the first attempt of every call may go to a paid pool
+        # (paid ranked ahead of free); every later attempt of the SAME call is
+        # free-only. One paid round, never a paid retry loop.
+        self._paid_first = bool(paid_first and allow_paid)
         self.meter = meter
         self._on_route = on_route
         # Called for EVERY route failure, retryable or not, so the run's error
@@ -1124,12 +1142,20 @@ class RotatingProvider:
         intent = self._complete_intent(kwargs.pop("intent", None))
         attempts = max(1, len({r.pool for r in self.catalog_routes(tier)}))
         last_error: Optional[BaseException] = None
-        for _ in range(attempts):
-            # Only name the kwarg when there is an intent: test doubles and
+        for attempt in range(attempts):
+            first = attempt == 0
+            # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
+            extra: Dict[str, Any] = {}
+            if intent is not None:
+                extra["intent"] = intent
+            if self._paid_first:
+                extra["paid_first"] = first
             selection = self.rotator.next_route(
-                tier=tier, allow_paid=self._allow_paid,
-                **({"intent": intent} if intent is not None else {}))
+                tier=tier,
+                # one paid round: after the first attempt, free pools only
+                allow_paid=self._allow_paid and (first or not self._paid_first),
+                **extra)
             route = selection.route
             self.model = route.model
             if intent is not None and intent.role:
