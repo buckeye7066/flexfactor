@@ -114,5 +114,38 @@ class WiredIntoTheRealFilter(unittest.TestCase):
         self.assertEqual(F._route_unusable_reason(r, "auto"), "")
 
 
+
+class ReasoningBudgetIsNotAnEmptyReply(unittest.TestCase):
+    """Measured against meta/muse-glimmer-30b on NVIDIA NIM 2026-08-22:
+    `content: null`, `reasoning_content` populated, finish_reason "length".
+    The old `(content or "")` scored that as an empty answer, and the grade
+    path fed "{}" to _parse_grade -- a default grade from a call that never
+    produced one."""
+
+    @staticmethod
+    def _resp(content, reasoning=None, finish="stop"):
+        m = types.SimpleNamespace(content=content, reasoning_content=reasoning)
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=m, finish_reason=finish)])
+
+    def test_normal_answer_passes_through(self):
+        self.assertEqual(F._openai_message_text(self._resp("hello"), "x"), "hello")
+
+    def test_answer_wins_when_both_present(self):
+        self.assertEqual(
+            F._openai_message_text(self._resp("51", "thinking"), "x"), "51")
+
+    def test_null_content_with_reasoning_raises(self):
+        with self.assertRaises(F.ReasoningBudgetExhausted):
+            F._openai_message_text(self._resp(None, "thinking", "length"), "x")
+
+    def test_genuinely_empty_is_unchanged(self):
+        self.assertEqual(F._openai_message_text(self._resp(None), "x"), "")
+
+    def test_no_choices_is_unchanged(self):
+        self.assertEqual(
+            F._openai_message_text(types.SimpleNamespace(choices=[]), "x"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

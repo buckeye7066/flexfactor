@@ -2336,6 +2336,57 @@ def _openai_call_timeout_seconds() -> float:
     return value
 
 
+class ReasoningBudgetExhausted(RuntimeError):
+    """The model reasoned until its token budget ran out and never answered.
+
+    Distinct from "the model returned nothing", because the fix is different:
+    this one wants a larger max_tokens or a shorter prompt, not a different
+    provider. Raised rather than returned so it can never be mistaken for an
+    empty-but-valid answer.
+    """
+
+
+def _openai_message_text(resp, what: str) -> str:
+    """The assistant text from an OpenAI-shaped response.
+
+    Reasoning models put their chain of thought in a SEPARATE field and leave
+    `content` null when the budget is spent before they reach an answer.
+    Measured 2026-08-22 against meta/muse-glimmer-30b on NVIDIA NIM:
+    `content: null`, `reasoning_content` populated, `finish_reason: "length"`.
+
+    The old `(content or "")` collapsed that into an empty string, which the
+    rewrite path returns as "no output" and the grade path feeds to
+    _parse_grade as "{}" -- a DEFAULT GRADE manufactured from a call that never
+    produced one. A fabricated grade is worse than a failed call, so this case
+    raises instead.
+
+    A genuinely empty completion (no reasoning either) still returns "" exactly
+    as before; only the misdiagnosed case changes behaviour.
+    """
+    try:
+        message = resp.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    content = getattr(message, "content", None)
+    if content:
+        return content
+    reasoning = (getattr(message, "reasoning_content", None)
+                 or getattr(message, "reasoning", None) or "")
+    if reasoning:
+        try:
+            finish = resp.choices[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            finish = "unknown"
+        raise ReasoningBudgetExhausted(
+            f"{what}: the model spent its entire token budget reasoning and "
+            f"never produced an answer (finish_reason={finish!r}, "
+            f"{len(reasoning)} chars of reasoning). Raise max_tokens or "
+            f"shorten the prompt -- this is not an empty reply, and it must "
+            f"not be scored as one."
+        )
+    return ""
+
+
 class OpenAIProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import openai  # lazy import
@@ -2378,7 +2429,7 @@ class OpenAIProvider:
                 ],
             )
             self._meter(resp, self.model)
-        return (resp.choices[0].message.content or "").strip()
+        return _openai_message_text(resp, "rewrite").strip()
 
     def grade(self, prompt: str) -> Grade:
         # Grading is classification -> route to the cheap JUDGE model. Cap output to
@@ -2396,7 +2447,7 @@ class OpenAIProvider:
                 ],
             )
             self._meter(resp, self.judge_model)
-        return _parse_grade(resp.choices[0].message.content or "{}")
+        return _parse_grade(_openai_message_text(resp, "grade") or "{}")
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
                    model: str | None = None, salvage_truncated: bool = False) -> dict:
