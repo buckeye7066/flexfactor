@@ -549,6 +549,25 @@ def _cooling(state: Dict[str, Any], key: str, now: float) -> bool:
     return bool(until) and float(until) > now
 
 
+def _yield(entry: Dict[str, Any]) -> float:
+    """Laplace-smoothed share of attempts whose work was verified.
+
+    (verified + 1) / (attempts + 2): a route with no history scores 0.5 --
+    neither trusted nor punished -- and a single bad result cannot sink it.
+    """
+    v = int(entry.get("verified", 0) or 0)
+    attempts = v + sum(int(entry.get(s, 0) or 0) for s in ("rejected", "noop", "build_failed"))
+    return (v + 1.0) / (attempts + 2.0)
+
+
+def _route_yield(state: Dict[str, Any], route: Route, purpose: str) -> float:
+    q = (state.get("quality") or {}).get(route.id) or {}
+    entry = q.get(purpose or "*")
+    if entry is None and purpose:
+        entry = q.get("*")
+    return _yield(entry or {})
+
+
 def _pin_matches(route: Route, pin: str) -> bool:
     """A pin may name a route id, a backend, a pool, or a bare model id."""
     pin = pin.strip()
@@ -683,6 +702,13 @@ class Rotator:
                 continue
             if _cooling(state, f"route:{route.id}", now):
                 continue
+            # Chronically off-purpose for THIS program (see report_quality):
+            # skipped here, for this purpose only, with the reason visible.
+            if intent is not None and intent.purpose and \
+                    _cooling(state, f"route:{route.id}@{intent.purpose}", now):
+                reasons.setdefault(route.pool, f"{route.id} cooled down: low yield for "
+                                               f"'{intent.purpose}'")
+                continue
             # PURPOSE FIT, before pool selection. A route whose capability
             # list is KNOWN and lacks a hard need is not a candidate for this
             # call -- it would be picked first (cheapest) and then do the wrong
@@ -738,7 +764,11 @@ class Rotator:
                 return 2
             return 0 if r.capabilities_source == "measured" else 1
 
+        purpose = intent.purpose if intent is not None else ""
         routes = sorted(pools[pool], key=lambda r: (_fit_rank(r),
+                                                    # higher yield first; ties fall
+                                                    # through to LRU as before
+                                                    -_route_yield(state, r, purpose),
                                                     self._route_last_used(state, r),
                                                     COST_ORDER.get(r.cost_class, 9),
                                                     r.id))
@@ -789,6 +819,58 @@ class Rotator:
         route_entry["last_used_at"] = now
 
     # -- feedback ----------------------------------------------------------
+    # -- purpose effectiveness ----------------------------------------------
+    # `report` says whether a call was SERVED. This says whether the work the
+    # model produced HELPED -- the signal the callers already compute (a fix
+    # landed and was verified; the independent reviewer rejected it; the model
+    # produced a no-op; the build gate failed on its edit) attributed to the
+    # route and the program purpose. Two uses in selection:
+    #   * inside the LRU-chosen pool, prefer the route with the better yield
+    #     for this purpose (pool order is untouched, so quota still spreads);
+    #   * a route that is chronically off-purpose for THIS program is cooled
+    #     down for this program only, with the reason on the selection.
+    # Shared state, so FlexFactor and Factory Deck learn from each other.
+    QUALITY_SIGNALS = ("verified", "rejected", "noop", "build_failed")
+    QUALITY_MIN_ATTEMPTS = 5
+    QUALITY_FLOOR = 0.25            # yield below this, after enough tries -> cooldown
+    QUALITY_COOLDOWN_S = 1800.0
+
+    def report_quality(self, route: Route, signal: str, purpose: str = "",
+                       now: Optional[float] = None) -> Optional[str]:
+        """Record that this route's work helped (or did not) for a purpose.
+
+        Returns the cooldown note when this report tipped the route into a
+        purpose-scoped cooldown, else None. Never raises on a bad signal: an
+        unknown signal is recorded under "other" so it is still visible.
+        """
+        now = time.time() if now is None else now
+        signal = signal if signal in self.QUALITY_SIGNALS else "other"
+        key = purpose or "*"
+        note: Dict[str, Optional[str]] = {"cooldown": None}
+
+        def mutate(data: Dict[str, Any]) -> None:
+            q = data.setdefault("quality", {})
+            per_route = q.setdefault(route.id, {})
+            entry = per_route.setdefault(key, {"verified": 0, "rejected": 0, "noop": 0,
+                                               "build_failed": 0, "other": 0,
+                                               "last_at": 0.0})
+            entry[signal] = int(entry.get(signal, 0)) + 1
+            entry["last_at"] = now
+            attempts = sum(int(entry.get(s, 0)) for s in self.QUALITY_SIGNALS)
+            if attempts >= self.QUALITY_MIN_ATTEMPTS and _yield(entry) < self.QUALITY_FLOOR:
+                data.setdefault("cooldowns", {})[f"route:{route.id}@{key}"] = now + self.QUALITY_COOLDOWN_S
+                note["cooldown"] = (f"{route.id} cooled down {int(self.QUALITY_COOLDOWN_S // 60)} min "
+                                    f"for '{key}': yield {_yield(entry):.2f} over {attempts} "
+                                    f"attempt(s) is below {self.QUALITY_FLOOR}")
+
+        self.store.update(mutate)
+        return note["cooldown"]
+
+    def quality_for(self, route: Route, purpose: str = "") -> Dict[str, Any]:
+        """The recorded entry (copy) for a route+purpose, or an empty dict."""
+        q = (self.store.read().get("quality") or {}).get(route.id) or {}
+        return dict(q.get(purpose or "*") or {})
+
     def report(self, route: Route, outcome: str,
                retry_after_seconds: Optional[float] = None,
                now: Optional[float] = None) -> None:
@@ -958,11 +1040,25 @@ class RotatingProvider:
         self._purpose: str = ""
         self._purpose_needs: Tuple[str, ...] = ()
         self._last_family: Dict[str, str] = {}
+        self._last_selection: Dict[str, Selection] = {}
         self._family_lock = threading.Lock()
 
     def set_purpose(self, purpose: str, needs: Sequence[str] = ()) -> None:
         self._purpose = str(purpose or "")[:80]
         self._purpose_needs = tuple(dict.fromkeys(str(n) for n in needs if n))
+
+    def report_quality(self, role: str, signal: str) -> Optional[str]:
+        """Attribute a work result to the route that last served `role`.
+
+        Callers know whether a fix landed, was rejected, was a no-op, or broke
+        the build; they do not know which route authored it. This provider
+        does. Returns the cooldown note when one was triggered, else None.
+        """
+        with self._family_lock:
+            sel = self._last_selection.get(role)
+        if sel is None:
+            return None
+        return self.rotator.report_quality(sel.route, signal, sel.purpose)
 
     def _complete_intent(self, intent: Optional[CallIntent]) -> Optional[CallIntent]:
         if intent is None:
@@ -1027,6 +1123,7 @@ class RotatingProvider:
             if intent is not None and intent.role:
                 with self._family_lock:
                     self._last_family[intent.role] = model_family(route.model)
+                    self._last_selection[intent.role] = selection
             if self._on_route:
                 self._on_route(selection)
             try:

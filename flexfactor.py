@@ -3124,6 +3124,27 @@ def _set_rotation_purpose(providers, display_name: str, purpose_contract, purpos
               + f" -> {', '.join(told)}", file=sys.stderr)
 
 
+def _report_route_quality(provider, role: str, signal: str, pfx: str = "  ") -> None:
+    """Tell the rotator whether the work a route produced HELPED.
+
+    `signal`: verified | rejected | noop | build_failed. Attributed to the
+    route that last served `role` on a ROTATING provider; fixed providers have
+    one model and nothing to learn, so they take nothing. A triggered cooldown
+    is printed -- a route quietly losing its turn would be indistinguishable
+    from rotation simply not picking it.
+    """
+    fn = getattr(provider, "report_quality", None)
+    if fn is None:
+        return
+    try:
+        note = fn(role, signal)
+    except Exception as exc:  # noqa: BLE001 - accounting must never break the fix loop
+        print(f"{pfx}[rotation] quality report failed: {exc}", file=sys.stderr)
+        return
+    if note:
+        print(f"{pfx}[rotation] {note}", file=sys.stderr)
+
+
 def _intent_kw(provider, role: str, *needs: str, avoid_family: str | None = None) -> dict:
     """`intent=` kwarg for a ROTATING provider; nothing for a fixed one.
 
@@ -12253,6 +12274,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         kind = outcome[0]
         _fixtrace("attempt.outcome", rel, outcome=kind, detail=str(outcome[1])[:300],
                   attempts=attempt)
+        # PURPOSE EFFECTIVENESS feeds back into rotation: the route that
+        # authored this file's fix is credited or debited in the shared
+        # rotation state, for THIS program's purpose. A verified landing
+        # counts; an unverified one (kept_ok None: no build command) is no
+        # evidence either way and is not reported.
+        if kind == "fixed" and kept_ok is True:
+            _report_route_quality(author, "author", "verified")
+        elif kind == "reject":
+            why = str(outcome[1] or "").lower()
+            _report_route_quality(author, "author",
+                                  "build_failed" if ("build" in why or "gate" in why
+                                                     or "syntax" in why) else "rejected")
+        elif kind == "noop":
+            _report_route_quality(author, "author", "noop")
         if kind == "fixed":
             titles = kept_patch.get("fixed_titles") or []
             defects_fixed += len(titles) or len(targets)
