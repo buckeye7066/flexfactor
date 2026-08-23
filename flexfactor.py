@@ -2387,6 +2387,39 @@ def _openai_message_text(resp, what: str) -> str:
     return ""
 
 
+
+# Newer api.openai.com models (gpt-5*, o-series, chat-latest) reject the
+# classic `max_tokens` parameter with a 400 that NAMES the replacement:
+# "Unsupported parameter: 'max_tokens' ... Use 'max_completion_tokens'".
+# The swap is learned per wire-model at first rejection and the retry happens
+# INSIDE the same attempt, so in auto mode the call's single paid round is
+# spent on the answer, not on discovering the parameter name (run ledger
+# iplay-20260823-090034 entries 22/117: openai_api/chat-latest wasted its
+# paid round on this exact 400 twice). Other OpenAI-compatible backends
+# (Groq, NIM, OpenRouter, Gemini shim) never emit this error, so keying by
+# model name alone is safe.
+_NEEDS_MAX_COMPLETION_TOKENS: set = set()
+
+
+def _chat_create(client, **kwargs):
+    """client.chat.completions.create with the max_tokens param-name repair."""
+    model = kwargs.get("model", "")
+    if model in _NEEDS_MAX_COMPLETION_TOKENS and "max_tokens" in kwargs:
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as ex:  # noqa: BLE001 - re-raised unless it names the swap
+        msg = str(ex)
+        if ("max_tokens" in kwargs
+                and "max_completion_tokens" in msg
+                and ("unsupported_parameter" in msg
+                     or "Unsupported parameter" in msg)):
+            _NEEDS_MAX_COMPLETION_TOKENS.add(model)
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+            return client.chat.completions.create(**kwargs)
+        raise
+
+
 class OpenAIProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import openai  # lazy import
@@ -2420,7 +2453,8 @@ class OpenAIProvider:
         instruction = _egress_gate(instruction)
         out_cap = 16384
         with _budget_guard(self.meter, self.model, len(instruction), out_cap):
-            resp = self.client.chat.completions.create(
+            resp = _chat_create(
+                self.client,
                 model=self.model,
                 max_tokens=out_cap,
                 **_reasoning_kwargs(self),
@@ -2438,7 +2472,8 @@ class OpenAIProvider:
         prompt = _egress_gate(prompt)
         out_cap = 4000
         with _budget_guard(self.meter, self.judge_model, len(prompt), out_cap):
-            resp = self.client.chat.completions.create(
+            resp = _chat_create(
+                self.client,
                 model=self.judge_model,
                 response_format={"type": "json_object"},
                 max_tokens=out_cap,
@@ -2486,7 +2521,8 @@ class OpenAIProvider:
             try:
                 with _budget_guard(self.meter, use_model,
                                    len(prompt) + len(system), out_cap):
-                    resp = self.client.chat.completions.create(
+                    resp = _chat_create(
+                self.client,
                         model=use_model,
                         response_format={"type": "json_object"},
                         max_tokens=out_cap,
@@ -2531,7 +2567,8 @@ class OpenAIProvider:
         it goes through _budget_guard + _meter like any other call. Raises on failure
         (the caller classifies auth/credit errors vs transient)."""
         with _budget_guard(self.meter, self.judge_model, len("ping"), 1):
-            resp = self.client.chat.completions.create(
+            resp = _chat_create(
+                self.client,
                 model=self.judge_model, max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}])
             self._meter(resp, self.judge_model)
