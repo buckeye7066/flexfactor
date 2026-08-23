@@ -77,12 +77,20 @@ class OnePaidRoundThenFree(_Base):
         self.assertEqual(sum(1 for s in seen if not s.route.is_free), 1)   # exactly one paid round
 
     def test_every_call_gets_its_own_single_paid_round(self):
+        # With a paid route that ANSWERS, each call is served by exactly one
+        # paid attempt and never touches a free pool. (A paid route that fails
+        # goes on the rotator's normal error cooldown, so the next call's paid
+        # round finds no paid pool -- that is correct, and the test above
+        # covers the fall-to-free half.)
+        class _Working:
+            def __init__(self, route): self.route = route
+            def structured(self, *a, **k): return {"served_by": self.route.id}
         rot = self.rot()
         seen = []
-        p = R.RotatingProvider(rot, _Failing, tier=R.STRONG, judge_tier=R.STRONG,
+        p = R.RotatingProvider(rot, _Working, tier=R.STRONG, judge_tier=R.STRONG,
                                allow_paid=True, paid_first=True, on_route=seen.append)
         p.structured("s", "u", {}); p.structured("s", "u", {})
-        self.assertEqual(sum(1 for s in seen if not s.route.is_free), 2)
+        self.assertEqual([s.route.id for s in seen], ["openai_api/gpt-5", "openai_api/gpt-5"])
 
     def test_paid_first_is_inert_when_paid_is_not_allowed(self):
         rot = self.rot()
