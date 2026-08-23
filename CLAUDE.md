@@ -1322,3 +1322,44 @@ touching any of this. The one-paragraph map:
   - CI runs all of them on Windows + Linux and installs Playwright on Linux.
   Bash-tool TRAP for agents: large heredocs with backslashes/quotes get
   mangled - write patch scripts with the Write tool and run them.
+
+## Purpose sight, error ledger, reasoning knobs (2026-08-23, first live IPlay run)
+
+Read `recall rotation purpose ledger` in the vault for the measured story. The
+mechanics a future change must not break:
+
+- **The rotator fits the route to the call.** `flexfactor_rotation.CallIntent`
+  (role author|reviewer|judge|vision, hard `needs`, `avoid_family`, `purpose`)
+  rides on every rotated call. `_judge()` derives it from WHICH schema it is
+  given (AUDIT_FINDINGS -> reviewer; ADVERSARIAL_VERIFY -> reviewer + honest;
+  else judge); `generate_file_fix_edits` is an author. Fit is applied BEFORE
+  pool-first selection; pool order itself never changes. Catalog routes carry
+  `capabilities` (measured for local via `glimmer/tools/bench_battery.py`,
+  declared for cloud); empty = unknown, never excludes. A reviewer auto-avoids
+  the last author's family. `_set_rotation_purpose` runs once per program;
+  purpose-derived needs bind to the VISION role only (a program that PRODUCES
+  video must not narrow its code authors to image models -- learned live).
+- **Results feed back.** `_report_route_quality(provider, role, signal)` with
+  verified | rejected | noop | build_failed is called from `_fix_files`; yield
+  orders routes INSIDE the LRU pool; a route below 0.25 yield after 5 attempts
+  for a purpose is cooled down for that purpose only.
+- **Error ledger.** `flexfactor_errors.py` writes `<run dir>/errors.md|json`
+  after every record (phase, error, responsible file:line+source / program
+  file / route, kind, suggested fix). Hooks: review retry/skip, fix skip,
+  baseline STOP, setup refusals, autoclean, and every rotated route failure
+  (`RotatingProvider(on_error=)`). A route failure is the PROVIDER's even
+  when our HTTP frame is on the stack. The model fallback is never asked
+  about route failures and cannot re-enter the ledger. Add a `SIGNATURES`
+  row when a new failure shape is understood; never add "watch the log".
+- **Reasoning knobs.** Local: `OllamaProvider._chat` sends `think=false`
+  (`FLEXFACTOR_OLLAMA_THINK=1` restores); a reasoning-only reply raises
+  `ReasoningBudgetExhausted`, never returns "". Cloud: `_reasoning_extra_body`
+  sets OpenRouter `reasoning.effort=low` / NIM `chat_template_kwargs.thinking=
+  false` on rotated OpenAIProviders (`FLEXFACTOR_CLOUD_REASONING=full`
+  disables). Other backends untouched: an unknown body field can be a 400.
+- **Test-boundary trap.** Tests monkeypatch `_judge` with two-argument fakes
+  and use fake Rotators without `intent`; derive inside, pass `intent=` only
+  when non-None. Sibling test modules pop `AITIME_STATE_DIR` -- glimmer tests
+  re-isolate it per test.
+- **Unfit additions:** `realtime`, `deep-research` (404 "not a chat model" /
+  400 "Interactions API only", both seen live).
