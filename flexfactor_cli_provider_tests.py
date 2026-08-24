@@ -29,7 +29,8 @@ from providers import cli_provider as cp
 
 
 class Route:
-    def __init__(self, api, model="m", is_free=True, base_url=""):
+    def __init__(self, api, model="m", is_free=True, base_url="", backend=None,
+                 cost_class=None):
         self.api = api
         self.model = model
         self.wire_model = model
@@ -37,6 +38,13 @@ class Route:
         self.auth_env = None
         self.base_url = base_url
         self.id = model
+        # A real catalog route ALWAYS carries these two and the mode filter
+        # reads them. The stub used to omit them, which quietly made every test
+        # here depend on a permissive mode that no longer exists (owner order
+        # 2026-08-24: the only modes are free and paid). Default them off
+        # `is_free` so a stub route is self-consistent instead of 'unset'.
+        self.backend = backend or ("groq" if is_free else "openai_api")
+        self.cost_class = cost_class or ("free-tier" if is_free else "paid-metered")
 
 
 def _ext_on():
@@ -74,37 +82,50 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
         real = cp.cli_binary_for
         try:
             cp.cli_binary_for = lambda _api: (_ for _ in ()).throw(RuntimeError("boom"))
-            self.assertNotEqual(ff._route_unusable_reason(Route("claude-code"), "auto"), "")
+            self.assertNotEqual(ff._route_unusable_reason(Route("claude-code"), "free"), "")
             # An ordinary route is still evaluated normally.
-            self.assertEqual(ff._route_unusable_reason(Route("openai"), "auto"), "")
+            self.assertEqual(ff._route_unusable_reason(Route("openai"), "free"), "")
         finally:
             cp.cli_binary_for = real
 
     def test_an_unknown_api_is_still_rejected(self):
         self.assertIn("unsupported api",
-                      ff._route_unusable_reason(Route("bogus-api"), "auto"))
+                      ff._route_unusable_reason(Route("bogus-api"), "free"))
 
     def test_extended_apis_are_accepted_by_the_api_allowlist(self):
         # Regression: the allowlist must actually name them, or they are
         # rejected before the buildability check is ever consulted.
         for api in ("cursor", "codex-cli", "claude-code"):
             self.assertNotIn("unsupported api",
-                             ff._route_unusable_reason(Route(api), "auto"))
+                             ff._route_unusable_reason(Route(api), "free"))
 
-    def test_a_paid_extended_route_is_allowed_in_auto_mode(self):
-        """Auto rotation may use paid capacity under the shared cost budget."""
+    def test_the_claude_code_CLI_lane_is_reachable_in_paid_mode(self):
+        """The `claude` CLI IS the owner's Anthropic subscription, so 'paid'
+        ("anthropic and openai exclusively") has to be able to reach it.
+
+        It carries cost_class 'subscription' (flexfactor_discovery._CLI_ROUTES),
+        which FREE correctly excludes - so if PAID did not name the backend, this
+        lane would belong to neither mode and would be silently retired. Same for
+        `codex-cli`. Rotation stays bounded by --max-cost and the pool cooldown,
+        which is where the 2026-08-21 "leave no routes blocked" order lives now.
+        """
         import shutil
         if not shutil.which("claude"):
             # Buildability is a real PATH probe; without the CLI the route is
             # correctly refused, which is not what this test measures.
             self.skipTest("BLOCKED: `claude` CLI not on PATH on this host")
-        self.assertEqual(ff._route_unusable_reason(
-            Route("claude-code", is_free=False), "auto"), "")
+        route = Route("claude-code", is_free=False, backend="claude-code",
+                      cost_class="subscription")
+        self.assertEqual(ff._route_unusable_reason(route, "paid"), "")
+        # ...and free still refuses it: a flat-rate plan bills nothing extra per
+        # call, but it is an account the owner PAYS FOR, and 'free' is a promise
+        # about whose money is at stake, not about marginal cost.
+        self.assertNotEqual(ff._route_unusable_reason(route, "free"), "")
 
     def test_extensions_off_disables_the_cli_routes(self):
         os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
         self.assertIn("extended providers off",
-                      ff._route_unusable_reason(Route("claude-code"), "auto"))
+                      ff._route_unusable_reason(Route("claude-code"), "free"))
 
 
 class CliProviderBehaviourTests(unittest.TestCase):

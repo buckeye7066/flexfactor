@@ -36,11 +36,22 @@ F._LOCAL_BENCH_CACHE = None
 
 
 def route(rid: str, model: str, api: str = "ollama",
-          base: str = "http://127.0.0.1:11434"):
-    """Minimal stand-in for an aitime.catalog Route row."""
+          base: str = "http://127.0.0.1:11434",
+          backend: str | None = None, cost_class: str | None = None):
+    """Minimal stand-in for an aitime.catalog Route row.
+
+    `backend` and `cost_class` are NOT optional decoration: the mode filter
+    reads them, and a stub that omits them reports cost_class 'unset', which
+    the two-mode boundary treats as PAID (unknown cost must never be assumed
+    free - that assumption is the one that spends money). They default off the
+    rid the way discovery fills them, so a stub route is self-consistent.
+    """
     r = types.SimpleNamespace()
     r.id, r.model, r.api, r.base_url = rid, model, api, base
     r.wire_model, r.auth_env, r.pool = model, None, "local:ollama"
+    r.backend = backend or rid.split("/", 1)[0]
+    r.cost_class = cost_class or ("local-unlimited" if r.backend == "ollama"
+                                  else "free-tier")
     return r
 
 
@@ -123,19 +134,19 @@ class WiredIntoTheRealFilter(unittest.TestCase):
 
     def test_filter_rejects_local_glimmer(self):
         why = F._route_unusable_reason(
-            route("ollama/muse-glimmer:30b", "muse-glimmer:30b"), "auto")
+            route("ollama/muse-glimmer:30b", "muse-glimmer:30b"), "free")
         self.assertIn("excluded from rotation", why)
 
     def test_filter_admits_a_normal_local_route(self):
         self.assertEqual(
             F._route_unusable_reason(
-                route("ollama/qwen3-coder:30b", "qwen3-coder:30b"), "auto"),
+                route("ollama/qwen3-coder:30b", "qwen3-coder:30b"), "free"),
             "")
 
     def test_filter_admits_the_free_cloud_glimmer(self):
         r = route("nvidia_nim/meta/muse-glimmer-30b", "meta/muse-glimmer-30b",
                   api="openai", base="https://integrate.api.nvidia.com/v1")
-        self.assertEqual(F._route_unusable_reason(r, "auto"), "")
+        self.assertEqual(F._route_unusable_reason(r, "free"), "")
 
 
 

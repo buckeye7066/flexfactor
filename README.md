@@ -127,11 +127,18 @@ blocks completion instead of becoming a pass.
   The build gate + cross-model veto + rollback safety net is unchanged, so a weak
   fix is vetoed and retried, never shipped. The Audit launcher asks and defaults
   economy ON; explicit `--model` overrides it. No-op on the openai provider.
-- **`--model-mode local|paid|auto` (audit/prodready)** makes the cost/privacy
-  boundary executable. `local` permits only loopback FCC/Ollama routes and
-  disables paid rescue; `paid` permits credentialed vendor APIs and forbids
-  free/local fallback; `auto` prefers local/free routes. An unavailable
-  requested class fails explicitly instead of crossing the boundary.
+- **`--model-mode free|paid` (audit/prodready)** makes the cost/privacy boundary
+  executable, and there are exactly two of them (owner order 2026-08-24).
+  `free` (the DEFAULT) permits free routes only - the cloud free tiers (NVIDIA
+  NIM, Gemini, Groq, Cerebras, OpenRouter free) plus loopback FCC/Ollama - and
+  paid routes are FILTERED OUT of the catalog rather than merely ordered last,
+  because ordering is a preference and only a filter is a promise. `paid`
+  permits the owner's own Anthropic and OpenAI accounts and nothing else: the
+  metered keys, the Claude subscription, and the local `claude`/`codex` CLI
+  lanes - not reseller credits (OpenRouter, Cursor), not free tiers, not Ollama.
+  An unavailable requested class fails explicitly instead of crossing the
+  boundary. The retired `local` and `auto` spellings still PARSE and run as
+  `free` with a warning, so a saved command never dies on argparse exit 2.
 - Fix generation returns minimal **search/replace edit blocks** (output scales with
   the size of the change, not the file), with automatic whole-file regeneration
   fallback when an edit anchor fails to apply. `--whole-file-fixes` restores legacy
@@ -181,8 +188,8 @@ blocks completion instead of becoming a pass.
 ```bash
 python flexfactor.py --file <path> --goal "..."        # refactor
 python flexfactor.py scout --program <path|lnk|url>
-python flexfactor.py audit --program <path> --model-mode local [--program <path2> ...] [--parallel N]
-python flexfactor.py prodready --program <path> --model-mode auto  # detect + install + fix + score
+python flexfactor.py audit --program <path> --model-mode free [--program <path2> ...] [--parallel N]
+python flexfactor.py prodready --program <path> --model-mode paid  # detect + install + fix + score
 python flexfactor.py policy init                        # write deny-by-default owner policy
 python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -60,6 +61,15 @@ DEFAULT_QUOTA_COOLDOWN = 3600.0
 ROUTE_ERROR_COOLDOWN = 30.0
 POOL_STRIKE_COOLDOWN = 300.0
 STRIKES_BEFORE_POOL_COOLDOWN = 3
+# A route whose own TRANSPORT is dead here (a CLI binary that this account
+# cannot drive, one that has to be killed at its deadline) is not having a bad
+# minute -- it cannot serve this machine at all. MEASURED 2026-08-24 in
+# `local-ai-factory-20260824-005448-500119-21424`: `cli/codex` was selected and
+# failed 30 times with "The 'gpt-5.6-sol' model is not supported when using
+# Codex with a ChatGPT account", and `cli/claude-code` 23 times, each after
+# burning its full 600-second deadline. At ROUTE_ERROR_COOLDOWN that route is
+# back in the draw half a minute later; that run reviewed 2 of 287 files.
+TRANSPORT_DEAD_COOLDOWN = 3600.0
 
 # A catalog older than this is stale. Consumers warn and fall back rather than
 # blocking a build on a refresh -- a 4-hour-old catalog is still overwhelmingly
@@ -544,6 +554,64 @@ class Selection:
         return " ".join(bits)
 
 
+def allowance_key(route: "Route") -> str:
+    """The ledger a route ACTUALLY drains, when its pool name does not say so.
+
+    MEASURED from `%LOCALAPPDATA%\\AITime\\routes.json`, 2026-08-24: the catalog
+    carries 19 enabled OpenRouter free routes under 18 DIFFERENT pool names, one
+    per model (`openrouter:free:cohere/north-mini-code:free`, ...). OpenRouter's
+    free tier is ONE account-wide daily allowance, so pool-first rotation - whose
+    entire premise is that a pool IS a ledger - was handed eighteen ledgers where
+    there is one. 574 of the 898 error entries across that day's two 10-program
+    audits are that single exhausted allowance, re-tried per synthetic pool.
+
+    Backend + cost class, because they are different allowances on the same
+    backend: exhausting `openrouter:free-tier` must never bench the paid
+    `openrouter:paid-metered` credits, and vice versa.
+    """
+    return f"{route.backend}:{route.cost_class}"
+
+
+# A 429/quota refusal whose SCOPE is the whole account, not this model. Only
+# shapes measured in this toolchain's own ledgers; a guess here would bench a
+# healthy backend.
+_ACCOUNT_WIDE_LIMIT_MARKERS = (
+    # OpenRouter, verbatim: "Rate limit exceeded: free-models-per-day" with
+    # "limit_source": "openrouter_free_tier_daily".
+    "free-models-per-day", "_free_tier_daily", "free_tier_daily",
+    # Google Gemini free tier: "Quota exceeded for metric:
+    # generativelanguage.googleapis.com/generate_content_free_tier_requests".
+    "free_tier_requests",
+)
+
+_RESET_EPOCH_RE = re.compile(r"x-ratelimit-reset['\"]?\s*[:=]\s*['\"]?(\d{9,16})")
+
+
+def limit_scope(exc: BaseException) -> Tuple[str, Optional[float]]:
+    """("account"|"pool", reset epoch seconds or None) for a rate/quota refusal.
+
+    The provider's own body carries both answers and neither was ever read:
+    `limit_source: openrouter_free_tier_daily` says the allowance is account-
+    wide, and `X-RateLimit-Reset: 1787616000000` says exactly when it comes
+    back (epoch ms - the next UTC midnight). Contrast Groq's per-model
+    "tokens per minute (TPM) ... try again in 10.132s", which is correctly a
+    short cooldown on one pool.
+    """
+    blob = f"{type(exc).__name__} {exc}".lower()
+    scope = "account" if any(m in blob for m in _ACCOUNT_WIDE_LIMIT_MARKERS) else "pool"
+    until: Optional[float] = None
+    match = _RESET_EPOCH_RE.search(blob)
+    if match:
+        raw = float(match.group(1))
+        # Providers send seconds or milliseconds; both appear in the wild.
+        candidate = raw / 1000.0 if raw > 1e11 else raw
+        # Only trust a reset that is in the future and inside a day - a bogus
+        # far-future stamp must not bench an allowance for a decade.
+        if 0 < candidate - time.time() <= 25 * 3600:
+            until = candidate
+    return scope, until
+
+
 def _cooling(state: Dict[str, Any], key: str, now: float) -> bool:
     until = state.get("cooldowns", {}).get(key)
     return bool(until) and float(until) > now
@@ -702,6 +770,13 @@ class Rotator:
                 continue
             if _cooling(state, route.pool, now):
                 reasons[route.pool] = "pool cooling down"
+                continue
+            # The ACCOUNT-WIDE allowance behind this pool. A catalog that names
+            # one ledger per model (see allowance_key) would otherwise let one
+            # exhausted daily quota be re-tried eighteen times per call.
+            if _cooling(state, f"allowance:{allowance_key(route)}", now):
+                reasons[route.pool] = (f"{allowance_key(route)} allowance "
+                                       "exhausted (account-wide)")
                 continue
             if _cooling(state, f"route:{route.id}", now):
                 continue
@@ -886,10 +961,12 @@ class Rotator:
 
     def report(self, route: Route, outcome: str,
                retry_after_seconds: Optional[float] = None,
-               now: Optional[float] = None) -> None:
+               now: Optional[float] = None,
+               scope: str = "pool",
+               reset_at: Optional[float] = None) -> None:
         """Record what a call did so the next pick is better informed.
 
-        outcome: ok | rate_limited | quota_exhausted | error
+        outcome: ok | rate_limited | quota_exhausted | transport_dead | error
         """
         now = time.time() if now is None else now
 
@@ -916,15 +993,35 @@ class Rotator:
                 cooldowns.pop(f"route:{route.id}", None)
                 return
 
-            if outcome == "rate_limited":
-                cooldowns[route.pool] = now + float(
-                    retry_after_seconds or DEFAULT_RATE_LIMIT_COOLDOWN)
+            if outcome in ("rate_limited", "quota_exhausted"):
+                if outcome == "rate_limited":
+                    span = float(retry_after_seconds or DEFAULT_RATE_LIMIT_COOLDOWN)
+                else:
+                    span = float(retry_after_seconds
+                                 or _seconds_until(route.resets_at, now)
+                                 or DEFAULT_QUOTA_COOLDOWN)
+                if scope == "account":
+                    # ACCOUNT-WIDE: every route on this backend's allowance is
+                    # spent, whatever the catalog calls their pools. The
+                    # provider named its own reset - honour it instead of
+                    # re-testing a dead daily quota every 60 seconds.
+                    until = reset_at if reset_at and reset_at > now else now + max(
+                        span, DEFAULT_QUOTA_COOLDOWN)
+                    cooldowns[f"allowance:{allowance_key(route)}"] = until
+                    return
+                cooldowns[route.pool] = now + span
                 return
 
-            if outcome == "quota_exhausted":
-                cooldowns[route.pool] = now + float(
-                    retry_after_seconds or _seconds_until(route.resets_at, now)
-                    or DEFAULT_QUOTA_COOLDOWN)
+            if outcome == "transport_dead":
+                # BENCH THE ROUTE, NEVER THE POOL. The transport cannot serve
+                # this machine, so re-drawing it in thirty seconds only spends
+                # another deadline; but a broken CLI entry must not take a
+                # backend that has other working routes out with it. Strikes are
+                # cleared for the same reason: this is a verdict about one
+                # route, not evidence that its provider is sick.
+                cooldowns[f"route:{route.id}"] = now + float(
+                    retry_after_seconds or TRANSPORT_DEAD_COOLDOWN)
+                strikes.pop(route.id, None)
                 return
 
             # Plain error: blame the route first. Only after it keeps failing do
@@ -1167,14 +1264,23 @@ class RotatingProvider:
             try:
                 result = getattr(self._provider_for(route), method)(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
-                self.rotator.report(route, _classify(exc), _retry_after(exc))
+                # A PAYLOAD refusal is not this route's doing. Reporting it here
+                # would strike an innocent route and, three payloads later, cool
+                # its whole pool -- see _PAYLOAD_FAULT_MARKERS for the measured
+                # case. The ledger hook still fires: not charging the route must
+                # never make the failure invisible.
+                payload_fault = is_payload_fault(exc)
+                if not payload_fault:
+                    scope, reset_at = limit_scope(exc)
+                    self.rotator.report(route, _classify(exc), _retry_after(exc),
+                                        scope=scope, reset_at=reset_at)
                 if self._on_error is not None:
                     try:
                         self._on_error(route, exc)
                     except Exception:  # noqa: BLE001 - a ledger must never break a call
                         pass
                 last_error = exc
-                if not _is_retryable(exc):
+                if payload_fault or not _is_retryable(exc):
                     raise
                 continue
             self.rotator.report(route, "ok")
@@ -1263,6 +1369,41 @@ _ROUTE_CAPABILITY_MARKERS = (
 )
 
 
+# An exception type whose failure can ONLY be a property of the route that
+# raised it. A CLI provider *is* the route: the binary, its login, its account
+# entitlements and its deadline all belong to that one entry in the catalog, so
+# `codex.CMD` exiting 1 or `claude.EXE` being killed says nothing whatever about
+# the payload or about any of the other 640 routes.
+_TRANSPORT_FAULT_TYPES = ("CliUnavailable",)
+
+# A refusal of the REQUEST BODY. No route can accept it, so rotating is pure
+# waste -- and, worse, `Rotator.report` would charge the refusal to whichever
+# innocent route happened to be selected. MEASURED 2026-08-24: one
+# `payload contains ['private_key']` struck three healthy routes in two seconds
+# (repo-rewards run 21424: openrouter/anthropic/claude-opus-4.8-fast,
+# nvidia_nim/nvidia/cosmos-reason2-8b, gemini/gemini-3.1-pro-preview), and
+# three strikes cool a whole POOL for five minutes. A secret in the audited repo
+# must never bench a provider.
+_PAYLOAD_FAULT_MARKERS = ("flexfactor_egress_blocked",)
+
+
+def is_transport_dead_error(exc: BaseException) -> bool:
+    """True when the ROUTE'S OWN transport failed, implicating no other route."""
+    return type(exc).__name__ in _TRANSPORT_FAULT_TYPES
+
+
+def is_payload_fault(exc: BaseException) -> bool:
+    """True when the request BODY was refused before any backend saw it.
+
+    Never retryable (the next route gets the same bytes and the same verdict)
+    and never chargeable to a route (the route did nothing wrong).
+    """
+    if type(exc).__name__ == "EgressBlockedError":
+        return True
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(m in blob for m in _PAYLOAD_FAULT_MARKERS)
+
+
 def is_route_capability_error(exc: BaseException) -> bool:
     """True when a 4xx names a limit/capability of THIS route specifically.
 
@@ -1271,6 +1412,8 @@ def is_route_capability_error(exc: BaseException) -> bool:
     """
     blob = f"{type(exc).__name__} {exc}".lower()
     if type(exc).__name__ == "RouteCapabilityError":
+        return True
+    if is_transport_dead_error(exc):
         return True
     return any(m in blob for m in _ROUTE_CAPABILITY_MARKERS)
 
@@ -1283,6 +1426,12 @@ def _classify(exc: BaseException) -> str:
         return "rate_limited"
     if any(m in blob for m in ("quota", "insufficient", "credit", "billing")):
         return "quota_exhausted"
+    # Checked AFTER the two allowance outcomes on purpose: a CLI that reports a
+    # usage limit still has a real reset time worth honouring, and those
+    # branches carry it. Everything else from a CLI is its transport being dead
+    # here, which a 30-second route cooldown does not describe.
+    if is_transport_dead_error(exc):
+        return "transport_dead"
     return "error"
 
 
@@ -1310,6 +1459,9 @@ def _is_retryable(exc: BaseException) -> bool:
     report it as "all providers failed".
     """
     if isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+        return False
+    if is_payload_fault(exc):
+        # The next route gets the identical bytes and refuses them identically.
         return False
     if isinstance(exc, (TypeError, AttributeError, NameError, ImportError,
                         SyntaxError, IndentationError, AssertionError)):

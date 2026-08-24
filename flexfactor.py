@@ -51,6 +51,7 @@ import datetime
 import difflib
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -2618,6 +2619,57 @@ def _ollama_http_timeout() -> float:
         return 600.0
 
 
+def _ollama_http_error(exc):
+    """Fold Ollama's own explanation into an HTTPError's message.
+
+    urllib puts the server's reason in the RESPONSE BODY and NOWHERE ELSE:
+    `str(HTTPError)` is only ever "HTTP Error 400: Bad Request". MEASURED
+    2026-08-24, GrantFlow run `grantflow-20260824-051330-625243-16164`: three
+    ledger entries reading exactly that against `ollama/deepseek-r1:8b`, each
+    filed with `suggestion: no known fix`, on the one FREE, UNMETERED,
+    un-rate-limitable reviewer this machine has -- while every cloud pool was
+    429-exhausted and the run reviewed **0 of 3537** files. The sentence that
+    names the fix existed; it was read by nobody and then discarded.
+
+    Also the enabling half of route classification: `_is_retryable` asks
+    `is_route_capability_error`, which matches on the MESSAGE. With the body
+    dropped there is nothing to match, so a local 400 was fatal to the whole
+    call instead of rotating to a cloud route that could have answered.
+
+    NEVER raises and never invents: a body that cannot be read or is empty
+    returns *exc* untouched, so a decode problem can only cost the detail, not
+    the error itself. The body is re-wrapped so `.read()` still works
+    downstream, and `.status`/`.code` are preserved for the status-based rules.
+    """
+    import urllib.error
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        return exc
+    if not raw:
+        return exc
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return exc
+    try:
+        parsed = json.loads(text)
+        detail = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(detail, dict):
+            detail = detail.get("message") or json.dumps(detail)
+        if detail:
+            text = str(detail)
+    except Exception:  # noqa: BLE001 - a non-JSON body is still the explanation
+        pass
+    text = " ".join(text.split())[:600]
+    if not text:
+        return exc
+    enriched = urllib.error.HTTPError(
+        getattr(exc, "url", None) or getattr(exc, "filename", None) or "",
+        exc.code, f"{exc.msg}: {text}", exc.hdrs, io.BytesIO(raw))
+    return enriched
+
+
 def _local_only_opener():
     """urllib opener for the local-only provider (Sol findings 1+2): NO proxy
     (an inherited HTTP_PROXY would ship the payload to the proxy host - the
@@ -2671,6 +2723,7 @@ class OllamaProvider:
 
     def _chat(self, model: str, system: str, user: str, max_tokens: int,
               schema: dict | None = None) -> str:
+        import urllib.error
         import urllib.request
         payload = {"model": model, "stream": False,
                    "messages": [{"role": "system", "content": system},
@@ -2698,8 +2751,16 @@ class OllamaProvider:
             # server can actually serve; waiting here does NOT tick the HTTP
             # timeout (that starts only once the request is sent).
             with _ollama_gate():
-                with self._opener.open(req, timeout=_ollama_http_timeout()) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                try:
+                    with self._opener.open(req, timeout=_ollama_http_timeout()) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as http_exc:
+                    # Ollama's reason lives in the body and is gone the moment
+                    # nobody reads it -- see _ollama_http_error.
+                    enriched = _ollama_http_error(http_exc)
+                    if enriched is http_exc:
+                        raise
+                    raise enriched from http_exc
             if self.meter is not None:
                 self.meter.record(f"ollama:{model}",
                                   input_tokens=int(data.get("prompt_eval_count") or 0),
@@ -3736,6 +3797,134 @@ def _rotation_excluded_reason(model_or_route_id: str) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# MODEL MODE: exactly two choices (owner order 2026-08-24)
+#
+#   "currently I am given three choices as for pay, local is a choice and auto
+#    is a choice. I don't fully understand the difference. My choices should be
+#    either paid or free. that's it. paid uses both anthropic and openai
+#    exclusively until credits expire and free uses free exclusively."
+#
+# The old three were confusing for good reason, and two of them were costing
+# reviewed files outright:
+#   - 'local' meant LOOPBACK ONLY. It reads like "free", but it excluded all 126
+#     credentialed cloud free-tier routes and pinned the run to Ollama, which is
+#     CPU-only on this machine (measured 20+ min for one large-file review).
+#     It was also the launcher's DEFAULT, so the safe-sounding choice was the
+#     slowest possible one.
+#   - 'auto' meant free-first with paid allowed to rotate in. Measured on the
+#     2026-08-24 GrantFlow run: spend_usd 0.0 while every free allowance was
+#     exhausted and 0 of 3537 files were reviewed - so in practice it was
+#     neither reliably free nor reliably paid.
+#
+# The two modes now mean exactly what they say:
+#   free  - free routes EXCLUSIVELY: cloud free tiers (NVIDIA NIM, Gemini, Groq,
+#           Cerebras, OpenRouter free) plus local Ollama/FCC. Paid routes are
+#           FILTERED OUT of the catalog, not merely ordered last. Ordering is a
+#           preference; a filter is a guarantee, and this is the enforcement
+#           point for the standing "FREE must never silently become PAID" rule.
+#   paid  - the owner's Anthropic and OpenAI accounts EXCLUSIVELY, until their
+#           credits expire. Nothing else: not OpenRouter credits (a reseller,
+#           not the owner's account), not Groq/NIM/Gemini/Cerebras, not Ollama.
+#
+# SUPERSEDES the 2026-08-21 "paid can be rotated in until exhausted" order for
+# MODE SELECTION. Paid still rotates until exhausted - but inside 'paid' mode,
+# which is where the owner asked for it, instead of leaking into a free run.
+MODEL_MODES = ("free", "paid")
+# Retired spellings stay ACCEPTED (never offered as a third choice) so an
+# invocation nobody found - a desktop shortcut, a scheduled task, a saved
+# command line - degrades to the safe mode with a warning instead of dying on
+# argparse exit 2, which is this repo's documented launcher-drift trap.
+_MODEL_MODE_ALIASES = {"auto": "free", "local": "free"}
+_MODEL_MODE_WARNED: set = set()
+
+# The backends that ARE the owner's Anthropic and OpenAI accounts. Enumerated
+# against the live catalogs, not guessed: routes.json carries anthropic_sub (4),
+# anthropic_api (4) and openai_api (104), and catalog.auto.json carries the two
+# locally-installed coding CLIs.
+#   anthropic_sub  - the flat-rate Claude subscription
+#   anthropic_api  - the metered Anthropic key
+#   openai_api     - the metered OpenAI key
+#   claude-code    - the SAME Anthropic subscription, reached through the `claude`
+#                    CLI (flexfactor_discovery._CLI_ROUTES, cost_class
+#                    'subscription')
+#   codex-cli      - likewise the owner's OpenAI account through `codex`
+# The two CLI lanes are named explicitly because they are excluded from FREE by
+# cost_class 'subscription' (correctly - see _FREE_MODE_COST_CLASSES below), so
+# omitting them here would strand them in NEITHER mode and silently retire two
+# whole route lanes that are exactly what the owner asked 'paid' to be.
+#
+# Deliberately absent: 'cursor' and 'openrouter'. Both are subscriptions or
+# credits the owner holds, but they are RESELLERS - a cursor seat is not an
+# Anthropic account, and 383 of the 385 paid openrouter routes are somebody
+# else's rebilling. "Anthropic and OpenAI exclusively" is a statement about
+# whose account is billed, not about which model answers.
+_PAID_MODE_BACKENDS = frozenset({"anthropic_sub", "anthropic_api", "openai_api",
+                                 "claude-code", "codex-cli"})
+# Cost classes that cost the owner NOTHING MORE to use.
+#
+# Deliberately NOT flexfactor_rotation.FREE_COST_CLASSES, and the difference is
+# the point: that tuple includes SUBSCRIPTION because the rotator reasons about
+# MARGINAL cost, and a flat-rate plan bills nothing extra per call. This set
+# reasons about WHOSE ACCOUNT it is, which is what the owner's two modes are
+# about - so `anthropic:max-plan` (cost_class 'subscription') is PAID here. It
+# is an Anthropic account the owner pays for, so it belongs in 'paid' where they
+# asked for Anthropic, not smuggled into a run they asked to keep free.
+_FREE_MODE_COST_CLASSES = frozenset({"free-tier", "local-unlimited", "free"})
+
+
+def normalize_model_mode(raw) -> str:
+    """Any accepted spelling -> one of MODEL_MODES. Unknown input is 'free',
+    because the failure that costs money is the one that guesses 'paid'."""
+    val = str(raw or "").strip().lower()
+    if val in MODEL_MODES:
+        return val
+    mapped = _MODEL_MODE_ALIASES.get(val)
+    if mapped:
+        if val not in _MODEL_MODE_WARNED:
+            _MODEL_MODE_WARNED.add(val)
+            print(f"[model-mode] '{val}' is retired and now runs as '{mapped}'. "
+                  f"The only modes are: {', '.join(MODEL_MODES)}.", file=sys.stderr)
+        return mapped
+    if val and val not in _MODEL_MODE_WARNED:
+        _MODEL_MODE_WARNED.add(val)
+        print(f"[model-mode] unknown mode '{val}'; running as 'free'. "
+              f"The only modes are: {', '.join(MODEL_MODES)}.", file=sys.stderr)
+    return "free"
+
+
+def model_mode_refusal(route, model_mode: str) -> str:
+    """THE MODE BOUNDARY, on its own so it can be tested on its own.
+
+    '' when this route is allowed in this mode, else why not.
+
+    It is a separate function because `_route_unusable_reason` returns EARLY for
+    unrelated reasons - a missing credential, an unfit model, an unbuildable
+    transport - so asking that function "did the mode allow this?" cannot
+    distinguish "the mode admitted it" from "the mode never got a look in". A
+    test written against the combined answer silently passes; this seam makes
+    the boundary answerable by itself.
+
+    Enforced by EXCLUSION rather than by ordering in `_pick_in_tier`, because
+    the owner's two modes are promises about what a run can SPEND, and a
+    preference is not a promise: COST_ORDER only decides what is tried FIRST, so
+    under ordering alone a paid route stays reachable the moment free capacity
+    runs out - which is the exact night this rule was written after.
+    """
+    mode = normalize_model_mode(model_mode)
+    cost = str(getattr(route, "cost_class", "") or "").lower()
+    backend = str(getattr(route, "backend", "") or "").lower()
+    if mode == "free":
+        if cost not in _FREE_MODE_COST_CLASSES:
+            return (f"model mode 'free' excludes paid route "
+                    f"(cost_class {cost or 'unset'!r})")
+    elif mode == "paid":
+        if backend not in _PAID_MODE_BACKENDS:
+            return (f"model mode 'paid' is the owner's Anthropic/OpenAI accounts "
+                    f"only (backend {backend or 'unset'!r})")
+    return ""
+
+
 def _route_unusable_reason(route, model_mode: str) -> str:
     """Why this catalog route cannot be served here, or '' when it can.
 
@@ -3785,15 +3974,7 @@ def _route_unusable_reason(route, model_mode: str) -> str:
         return f"missing {route.auth_env}"
     if route.api == "anthropic" and not _provider_key_present("anthropic"):
         return "no anthropic credential in this environment"
-    if model_mode == "local":
-        try:
-            import urllib.parse
-            host = urllib.parse.urlsplit(route.base_url).hostname or ""
-        except ValueError:
-            host = ""
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            return "model mode 'local' excludes non-local routes"
-    return ""
+    return model_mode_refusal(route, model_mode)
 
 
 def _extended_route_unusable(route) -> str:
@@ -3928,7 +4109,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
                                # AUTO MODE (owner 2026-08-23): paid pools first
                                # for ONE attempt per call, then free. --max-cost
                                # still bounds the spend.
-                               paid_first=(str(model_mode).lower() == "auto"))
+                               paid_first=(str(model_mode).lower() == "paid"))
 
 
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
@@ -4049,10 +4230,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     _PROVIDER_DIAGNOSIS = ""
     _LAST_FREE_REVIEW_POOL = []
     primary = args.provider
-    model_mode = str(getattr(args, "model_mode", "auto") or "auto").lower()
-    if model_mode not in {"auto", "local", "paid"}:
-        _PROVIDER_DIAGNOSIS = "invalid model mode; expected auto, local, or paid"
-        return []
+    model_mode = normalize_model_mode(getattr(args, "model_mode", "free"))
     if primary == "ollama":
         # LOCAL-ONLY: never silently add a CLOUD cross-checker to a run the
         # owner pointed at the local provider - that would defeat the whole
@@ -4075,13 +4253,18 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     def _permitted(name: str | None) -> bool:
         if not name:
             return False
-        if model_mode == "local":
-            return name == "ollama" or _provider_free_routed(name)
         if model_mode == "paid":
+            # The owner's own two accounts, and they must be REAL: a key that is
+            # actually present, and not one silently re-pointed at the free FCC
+            # proxy (which would make a 'paid' run quietly free - the mirror of
+            # the failure the free mode guards against).
             return (name in {"anthropic", "openai"}
                     and _provider_key_present(name)
                     and not _provider_free_routed(name))
-        return True
+        # free: Ollama always, and a vendor name only while it is free-routed
+        # through the local FCC proxy. A direct billable client is never
+        # permitted in a mode whose whole promise is that it cannot spend.
+        return name == "ollama" or _provider_free_routed(name)
 
     def _usable(name: str | None) -> bool:
         if not _permitted(name):
@@ -4239,7 +4422,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                      or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
-    if args.use_both and model_mode != "local" and other and _usable(other):
+    if args.use_both and model_mode == "paid" and other and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
         # defaults to the cheap model, not a second frontier model. This keeps the
@@ -5080,16 +5263,36 @@ def _find_local_project(*name_hints: str) -> str | None:
         root_dirs.extend(os.path.join(root, e) for e in entries
                          if os.path.isdir(os.path.join(root, e)))
 
+    # A HIDDEN sibling is a config/data directory, not a source checkout, and
+    # `_slugify` cannot tell them apart: the leading dot is not alnum, so it
+    # becomes "-" and is stripped, making '.ellie' and 'Ellie' BOTH 'ellie'.
+    # `os.listdir` hands back the dot-entry first, so the "exact" pass below
+    # returned it every time. Measured live 2026-08-24 (10-program audit):
+    # --program .../Ellie resolved to ~/.ellie and .../ForgePress to
+    # ~/.forgepress; both programs ran to completion with files_total=0 and
+    # analyzed_source_files=0 - a full audit of nothing. Deterministic, not a
+    # race. `_file_tree` already refuses to walk into dot-directories, so even
+    # when one IS selected it can never yield a file - the empty result was
+    # guaranteed the moment the wrong directory won.
+    # Visible candidates are therefore tried first WITHIN each precision tier;
+    # hidden ones remain a last resort so a genuinely dot-named project still
+    # resolves rather than regressing to "not found". Tier order (exact before
+    # prefix) is unchanged.
+    visible = [d for d in root_dirs if not os.path.basename(d).startswith(".")]
+    hidden = [d for d in root_dirs if os.path.basename(d).startswith(".")]
+
     # Pass 1 (global): exact slug match (despaced form included) - precise.
-    for full in root_dirs:
-        if _slugify(os.path.basename(full)) in exact:
-            return full
+    for tier in (visible, hidden):
+        for full in tier:
+            if _slugify(os.path.basename(full)) in exact:
+                return full
     # Pass 2 (global): prefix match - tolerant of name/folder drift.
-    for full in root_dirs:
-        entry_slug = _slugify(os.path.basename(full))
-        entry_squash = entry_slug.replace("-", "")
-        if any(entry_slug.startswith(c) or entry_squash.startswith(c) for c in prefix_cands):
-            return full
+    for tier in (visible, hidden):
+        for full in tier:
+            entry_slug = _slugify(os.path.basename(full))
+            entry_squash = entry_slug.replace("-", "")
+            if any(entry_slug.startswith(c) or entry_squash.startswith(c) for c in prefix_cands):
+                return full
     return None
 
 
@@ -14081,6 +14284,41 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         checkpoint, display_name, failing_log)
                     if log_path:
                         print(f"{pfx}baseline failure log: {log_path}")
+                    # AND PUT IT IN THE LEDGER. Writing the log file was only
+                    # half the promise: errors.md/errors.json are the surface
+                    # the owner actually reads (and the dashboard's per-program
+                    # error box renders), and a red or REFUSED baseline never
+                    # reached them. Measured live 2026-08-24: 8 of 8 programs
+                    # had a baseline-publication-failure.log on disk while
+                    # `grep -c flexfactor-containment errors.md` was 0 for all
+                    # ten - the single most consequential failure of the run
+                    # was the one failure the ledger did not mention.
+                    # flexfactor_errors is imported LOCALLY everywhere else in
+                    # this module (see _start_error_ledger); there is no
+                    # module-level alias to borrow.
+                    import flexfactor_errors as _fe_kinds
+                    _blocked = "[flexfactor-containment]" in str(failing_log or "")
+                    _ledger(
+                        "baseline",
+                        ("baseline publication gate BLOCKED: the project's "
+                         "build/test commands were refused before they ran"
+                         if _blocked else
+                         "baseline publication suite is RED and bounded "
+                         "targeted repair did not fix it"),
+                        kind=(_fe_kinds.KIND_ENV if _blocked
+                              else _fe_kinds.KIND_PROGRAM),
+                        detail=_tail(str(failing_log or ""), 40),
+                        suggestion=(
+                            "The containment/trust gate refused this repository's "
+                            "install/build/test. Add its path to ~/.flexfactor/policy.json "
+                            "\"trusted_repos\", set FLEXFACTOR_TRUSTED_REPOS, or pass "
+                            "--trust-repo. Until then NOTHING is verified: no build, no "
+                            "tests, and publication stays refused."
+                            if _blocked else
+                            f"Read the full log at {log_path or '(not written)'}. "
+                            "Publication (push/merge) stays refused while the baseline "
+                            "is red; the review still runs."),
+                    )
 
             if not repair.get("ok"):
                 attempted = sorted((repair.get("attempted") or {}).keys())
@@ -17176,11 +17414,18 @@ def main(argv=None) -> int:
                             help="How many programs to audit concurrently (default: 1).")
         parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
                             help="LLM backend (default: anthropic).")
-        parser.add_argument("--model-mode", choices=["auto", "local", "paid"], default="auto",
-                            dest="model_mode",
-                            help="Runtime boundary: auto prefers free/local routes; local forbids "
-                                 "paid APIs and cloud cross-checks; paid forbids local/free-proxy "
-                                 "fallbacks. Missing permitted providers fail explicitly.")
+        # choices still ACCEPTS the retired spellings so an invocation we did not
+        # find degrades with a warning instead of argparse exit 2 (the documented
+        # launcher-drift trap), but metavar OFFERS exactly the two the owner asked
+        # for, so --help and any error message show two choices and only two.
+        parser.add_argument("--model-mode",
+                            choices=["free", "paid", "auto", "local"],
+                            metavar="{free,paid}",
+                            default="free", dest="model_mode",
+                            help="free (default): free routes only - cloud free tiers plus local "
+                                 "Ollama/FCC; the run cannot spend. paid: the owner's Anthropic and "
+                                 "OpenAI accounts only, until their credits expire. "
+                                 "('auto' and 'local' are retired and run as 'free'.)")
         parser.add_argument("--model", default=None, help="Override the AUTHOR model id (code generation).")
         parser.add_argument("--economy", action="store_true", dest="economy",
                             help="Cheapest-credits mode: author fixes/tests with claude-sonnet-5 "
@@ -17469,7 +17714,7 @@ def main(argv=None) -> int:
             args.push = True
         if "--no-merge" not in rest:
             args.merge = True
-        if args.model_mode == "local":
+        if normalize_model_mode(args.model_mode) == "free":
             # The provider adapters have a transport-rescue path that can use
             # these captured keys after a loopback timeout. Local means local:
             # remove that escape hatch before any provider is constructed.

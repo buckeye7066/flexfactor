@@ -68,6 +68,26 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The provider's allowance for this key is spent (OpenRouter's free tier is balance-bound). "
      "The rotator cools that pool and moves on; it recovers when the allowance resets. Do not "
      "add paid credit to compensate."),
+    # THE 55 CLI FAILURES OF 2026-08-24 (local-ai-factory run 21424: 30x
+    # cli/codex, 23x cli/claude-code). Every one was filed kind=provider with
+    # "no known fix", because nothing matched. Neither is the provider's doing:
+    # a CLI route is a local binary, its login and its deadline.
+    (r"CliUnavailable.*(is not supported when using|not supported with your|"
+     r"not available on your plan|Invalid API key|Please run .*login|not logged in)",
+     KIND_ENV,
+     "The local CLI is installed but cannot serve this account as configured (measured: codex "
+     "refusing its configured model for a ChatGPT account). Fix the CLI's own login/model "
+     "settings, or take the route out of rotation: FLEXFACTOR_ROTATION_EXCLUDE=<fragment> for "
+     "that one route, or FLEXFACTOR_ROTATION_EXTENSIONS=0 for every CLI/Cursor route. "
+     "FlexFactor benches the route for an hour after the first failure, so a run no longer "
+     "spends a turn on it per call."),
+    (r"CliUnavailable.*(exceeded \d+s and was killed|returned no output|not found on PATH)",
+     KIND_ENV,
+     "The local CLI did not answer: it was killed at its deadline, returned nothing, or is not "
+     "on PATH. Raise/lower the CLI timeout for that transport, or take the route out of rotation "
+     "(FLEXFACTOR_ROTATION_EXCLUDE=<fragment>, or FLEXFACTOR_ROTATION_EXTENSIONS=0 for all "
+     "CLI/Cursor routes). FlexFactor benches the route for an hour after the first failure - "
+     "measured 2026-08-24, 23 kills at 600s each in one run."),
     (r"\b403\b|PermissionDenied|not permitted|gated", KIND_PROVIDER,
      "This route is gated or not permitted for the key in use. Rotation skips it after strikes; "
      "to stop retrying it, exclude it (FLEXFACTOR_ROTATION_EXCLUDE=<fragment>) or have AI Time's "
@@ -85,6 +105,19 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The catalog lists a model that cannot serve chat completions (realtime/audio/embedding "
      "products). Add its family to the unfit list (flexfactor_directed._UNFIT_CODE_PATTERNS and "
      "the Factory Deck twin) so rotation never selects it."),
+    # MORE SPECIFIC THAN THE GENERIC 429 BELOW, SO IT MUST STAY ABOVE IT.
+    # 574 of the 898 ledger entries across the two 10-program audits of
+    # 2026-08-24 are this ONE refusal, re-tried: OpenRouter's free tier is a
+    # single account-wide DAILY allowance, and AI Time's catalog spells it as 18
+    # per-model pools, so the rotator re-tested a dead daily quota once per pool
+    # per call. The generic row below called that "nothing to fix".
+    (r"free-models-per-day|_free_tier_daily|free_tier_requests", KIND_BUDGET,
+     "The account's FREE DAILY allowance for that backend is spent - one allowance, however "
+     "many models the catalog lists under it. FlexFactor now benches the whole allowance until "
+     "the reset the provider named (X-RateLimit-Reset) instead of re-testing it every 60s, and "
+     "the run continues on other backends. It returns by itself at the daily reset; do not add "
+     "paid credit to compensate. If a run must not depend on it, point the run at a backend "
+     "with headroom rather than waiting."),
     (r"\b429\b|rate.?limit|Too Many Requests", KIND_PROVIDER,
      "Rate-limited. The rotator cools the pool down and moves on; nothing to fix unless it recurs "
      "on every pool, which means the free tiers are exhausted for now."),
@@ -109,9 +142,24 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The egress gate found a secret/PII pattern in repo-derived text and refused to send it to a "
      "cloud model. Remove the secret from the repo (or use --redact / FLEXFACTOR_ALLOW_EGRESS for a "
      "known-safe fixture)."),
-    (r"flexfactor_policy_blocked|rc 126|containment_blocked", KIND_ENV,
-     "The command policy or containment gate refused the command. Trust the repo (--trust-repo / "
-     "FLEXFACTOR_TRUSTED_REPOS) or allow the command class in ~/.flexfactor/policy.json."),
+    # 'flexfactor-containment' (hyphens) is the string the gate ACTUALLY emits -
+    # `_run_target_code`/`_spawn` prefix every refusal with
+    # "[flexfactor-containment] REFUSED: ". The underscored 'containment_blocked'
+    # is the ATTRIBUTE name (cp.flexfactor_containment_blocked) and never appears
+    # in the message, so this row could not match a real refusal. Measured live
+    # 2026-08-24: 8 of 8 programs had their whole baseline build+test suite
+    # refused, and every one classified as 'unknown' with the generic fallback
+    # suggestion instead of naming the one-line fix.
+    (r"flexfactor_policy_blocked|flexfactor-containment|rc 126|containment_blocked",
+     KIND_ENV,
+     # This row covers TWO different refusals with two different remedies, and
+     # naming only the command-class one misdirects the owner for the other:
+     # a TRUST refusal is fixed with policy.json "trusted_repos", a POLICY
+     # refusal with "allow_classes". Name both, with the key spelled out.
+     "The command policy or containment gate refused the command. If the repository is "
+     "untrusted: add its path to ~/.flexfactor/policy.json \"trusted_repos\", set "
+     "FLEXFACTOR_TRUSTED_REPOS, or pass --trust-repo. If a command CLASS was blocked: "
+     "allow it via \"allow_classes\" in the same file / FLEXFACTOR_ALLOW_CLASSES."),
     (r"UnicodeDecodeError.*charmap|'charmap' codec", KIND_TOOL,
      "A subprocess was read with the Windows locale codec. Every capture site must pass "
      "encoding='utf-8', errors='replace' (see _run)."),

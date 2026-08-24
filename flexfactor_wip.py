@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys as _sys
 import uuid
 from typing import Callable
 
@@ -234,6 +235,52 @@ def _unquote_porcelain_path(raw: str) -> str:
     return rel[:-1] if rel.endswith("/") else rel
 
 
+def refuse_removal_reason(project_dir: str, rel: str) -> str:
+    """'' when `rel` is a safe removal target under `project_dir`, else WHY not.
+
+    This is the last thing standing between a bad input and a real deletion.
+    `_remove_captured_untracked` deletes whatever it is handed, recursively, and
+    nothing upstream proves those paths are safe: they are sliced out of
+    `git status --porcelain` TEXT (`line[3:]`), so a malformed line, an
+    unexpected porcelain shape, or git having run against the WRONG repository
+    all arrive here as an ordinary-looking relative path.
+
+    Measured 2026-08-24: every FILE inside C:/Users/firer/flexfactor/.git was
+    removed twice during live audit runs (01:57 and 05:12) while the directory
+    itself survived - precisely the shape of the walk below, which unlinks every
+    file, rmdir's every subdirectory, and would then fail its final rmdir on a
+    handle git still held. The cause was never proven. This guard makes that
+    mechanism impossible whatever the cause was, and it costs nothing in normal
+    operation: git never reports `.git` as untracked, so a correct run never
+    trips it. A refusal is returned to the caller as a FAILED path, which keeps
+    the WIP ref and stops the run from proceeding as if the tree were clean -
+    never a silent skip.
+    """
+    if not rel:
+        return "empty path"
+    if os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
+        return f"absolute path refused: {rel!r}"
+    parts = [q for q in rel.replace("\\", "/").split("/") if q not in ("", ".")]
+    if not parts:
+        return f"path resolves to the project root itself: {rel!r}"
+    # A repository directory is NEVER a legitimate removal target for a tool
+    # whose whole job is to preserve and restore work.
+    for q in parts:
+        if q.casefold() == ".git":
+            return f"refusing to delete a git directory: {rel!r}"
+    if ".." in parts:
+        return f"path escapes with '..': {rel!r}"
+    root = os.path.realpath(project_dir)
+    full = os.path.realpath(os.path.join(project_dir, rel.replace("/", os.sep)))
+    if os.path.normcase(full) == os.path.normcase(root):
+        return f"path resolves to the project root itself: {rel!r}"
+    # realpath resolves symlinks AND Windows junctions, so a link pointing out
+    # of the tree cannot smuggle a deletion past the containment check.
+    if not os.path.normcase(full).startswith(os.path.normcase(root) + os.sep):
+        return f"path escapes the project directory: {rel!r} -> {full}"
+    return ""
+
+
 def _remove_captured_untracked(project_dir: str, untracked: list[str]) -> list[str]:
     """Unlink exactly the untracked paths the snapshot captured, then prune
     directories that became empty. Returns the paths that could not be removed."""
@@ -242,6 +289,13 @@ def _remove_captured_untracked(project_dir: str, untracked: list[str]) -> list[s
     for raw in untracked:
         rel = _unquote_porcelain_path(raw)
         if not rel:
+            continue
+        refusal = refuse_removal_reason(project_dir, rel)
+        if refusal:
+            # Loud, and counted as a failure so the caller keeps the WIP ref and
+            # refuses to treat the worktree as clean. Never a silent skip.
+            print(f"[flexfactor-wip] REFUSED removal - {refusal}", file=_sys.stderr)
+            failed.append(rel)
             continue
         full = os.path.join(project_dir, rel.replace("/", os.sep))
         try:

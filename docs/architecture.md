@@ -30,7 +30,7 @@ Machine-local state is under `~/.flexfactor/`: `brain.json` for bounded reposito
 
 ### Provider contract
 
-Provider adapters implement completion, structured output, grading, and health checks. Ollama is local-only and refuses non-loopback endpoints. Cloud adapters cross the secret/PII gate. Free-first routing may use a loopback FCC endpoint; paid rescue is bounded, named, and metered. Audit and prodready expose `--model-mode auto|local|paid`: local removes paid-rescue credentials before provider construction, paid excludes loopback/Ollama routes, and unavailable requested modes fail rather than silently converting intent.
+Provider adapters implement completion, structured output, grading, and health checks. Ollama is local-only and refuses non-loopback endpoints. Cloud adapters cross the secret/PII gate. Free-first routing may use a loopback FCC endpoint; paid rescue is bounded, named, and metered. Audit and prodready expose exactly two modes, `--model-mode free|paid` (owner order 2026-08-24). `free` is the default: it removes paid-rescue credentials before provider construction and EXCLUDES every billable route from the catalog, so the run cannot spend - a filter, not an ordering preference. `paid` is the owner's own Anthropic and OpenAI accounts only (metered keys, the Claude subscription, and the local `claude`/`codex` CLI lanes), and it excludes free tiers, Ollama, and reseller credits such as OpenRouter and Cursor. Unavailable requested modes fail rather than silently converting intent, and the retired `local`/`auto` spellings normalize to `free` with a warning rather than dying at argparse.
 
 ### Extensibility
 

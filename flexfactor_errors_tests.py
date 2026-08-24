@@ -136,6 +136,61 @@ class RouteFailuresAreTheProviders(unittest.TestCase):
             e = self.led.record("rotation", "Weird: never seen", route="r/x")
         self.assertEqual(e["kind"], E.KIND_PROVIDER)
 
+    # -- 2026-08-24: 55 CLI failures filed "provider / no known fix" ---------
+    #
+    # local-ai-factory-20260824-005448-500119-21424 recorded 30x cli/codex and
+    # 23x cli/claude-code, every one of them kind=provider with the fallback
+    # suggestion. Neither is the provider's doing and neither is unknown: one
+    # is a codex CLI configured for a model this ChatGPT account cannot use,
+    # the other a CLI that had to be killed at its 600-second deadline. That
+    # run reviewed 2 of 287 files.
+
+    def test_a_codex_account_refusal_is_the_environments_and_names_the_fix(self):
+        e = self.led.record(
+            "rotation",
+            "CliUnavailable: C:\\Users\\firer\\AppData\\Roaming\\npm\\codex.CMD: "
+            'exited 1: ERROR: {"status":400,"error":{"message":"The '
+            "'gpt-5.6-sol' model is not supported when using Codex with a "
+            'ChatGPT account."}}',
+            route="cli/codex")
+        self.assertEqual(e["kind"], E.KIND_ENV)
+        self.assertEqual(e["suggestion_source"], "signature")
+        self.assertIn("FLEXFACTOR_ROTATION_EXTENSIONS", e["suggestion"])
+
+    def test_a_killed_cli_is_the_environments_and_names_the_fix(self):
+        e = self.led.record(
+            "rotation",
+            "CliUnavailable: C:\\Users\\firer\\.local\\bin\\claude.EXE: "
+            "exceeded 600s and was killed",
+            route="cli/claude-code")
+        self.assertEqual(e["kind"], E.KIND_ENV)
+        self.assertEqual(e["suggestion_source"], "signature")
+
+    def test_an_account_wide_daily_quota_says_so_instead_of_generic_rate_limit(self):
+        """574 of 898 entries in one day were this one refusal, re-tried."""
+        e = self.led.record(
+            "rotation",
+            "RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit "
+            "exceeded: free-models-per-day. Add 10 credits to unlock 1000 free "
+            "model requests per day', 'code': 429, 'metadata': {'headers': "
+            "{'X-RateLimit-Reset': '1787616000000'}, 'limit_source': "
+            "'openrouter_free_tier_daily'}}}",
+            route="openrouter/cohere/north-mini-code:free")
+        self.assertEqual(e["suggestion_source"], "signature")
+        self.assertIn("daily", e["suggestion"].lower())
+        self.assertNotIn("nothing to fix", e["suggestion"])
+
+    def test_a_per_minute_rate_limit_still_gets_the_generic_row(self):
+        """Groq's TPM limit must NOT be described as a spent daily allowance."""
+        e = self.led.record(
+            "rotation",
+            "RateLimitError: Error code: 429 - Rate limit reached for model "
+            "`llama-4-scout` on tokens per minute (TPM): Limit 30000. Please "
+            "try again in 10.132s.",
+            route="groq/llama-4-scout")
+        self.assertEqual(e["kind"], E.KIND_PROVIDER)
+        self.assertNotIn("daily", e["suggestion"].lower())
+
     def test_model_suggester_is_never_asked_about_route_failures(self):
         calls = []
         led = E.ErrorLedger(self.led.run_dir, "prog", HERE, suggester=lambda t, w: calls.append(t) or "x")

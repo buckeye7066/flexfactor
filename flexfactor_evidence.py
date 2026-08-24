@@ -922,22 +922,45 @@ class RuntimeMode:
 
 
 def resolve_runtime_mode(mode: str, provider: str, model: str | None,
-                         credentials_present: bool, local_available: bool) -> RuntimeMode:
-    """Provider-neutral, fail-explicit free/paid mode policy."""
-    mode = str(mode or "auto").lower()
-    if mode not in {"auto", "local", "paid"}:
-        raise ValueError("mode must be auto, local, or paid")
-    if mode == "local":
-        if not local_available:
-            raise RuntimeError("local mode requested but no configured local provider is reachable")
-        return RuntimeMode("local", provider, model, True, "explicit local-only mode")
+                         credentials_present: bool, local_available: bool,
+                         cloud_free_available: bool = False) -> RuntimeMode:
+    """Provider-neutral, fail-explicit free/paid mode policy.
+
+    TWO modes, matching the CLI exactly (owner order 2026-08-24): a second mode
+    vocabulary living in the evidence module is how the launcher-drift trap
+    starts - one surface says free/paid while another still says auto/local/paid,
+    and the run records a mode name the operator was never offered.
+
+    Free capacity is TWO things and the caller must say so separately: the cloud
+    free tiers and the loopback ones. Collapsing them into one flag is the exact
+    mistake the retired 'local' mode made - it shut out 126 credentialed cloud
+    free-tier routes and pinned runs to CPU-only Ollama. ``cloud_free_available``
+    defaults to False so an existing caller resolves exactly as it did before.
+
+    ``local_only`` is therefore a property of the RESOLVED run, not of the mode:
+    a free run is local-only only when loopback is the only free capacity there
+    is. That distinction is load-bearing because ``local_only`` is what the
+    egress record claims, and claiming zero egress for a run that reached a
+    cloud free tier would be a false record, not a conservative one.
+    """
+    raw = str(mode or "free").strip().lower()
+    # Retired spellings are ACCEPTED, never offered - a saved command or
+    # scheduled task must degrade to the safe mode, not die. Both meant free.
+    mode = {"auto": "free", "local": "free"}.get(raw, raw)
+    if mode not in {"free", "paid"}:
+        raise ValueError("mode must be free or paid")
+    free_available = bool(local_available or cloud_free_available)
     if mode == "paid":
+        # Unchanged, and deliberately so: paid must never resolve to something
+        # cheaper behind the operator's back any more than free may resolve to
+        # something billable. Both directions are silent-substitution bugs.
         if not credentials_present:
-            hint = " A configured local provider is available." if local_available else ""
+            hint = " Free routes are available." if free_available else ""
             raise RuntimeError("paid mode requested but credentials are absent." + hint)
         return RuntimeMode("paid", provider, model, False, "explicit paid mode")
-    if local_available:
-        return RuntimeMode("local", provider, model, True, "auto selected reachable local provider")
-    if credentials_present:
-        return RuntimeMode("paid", provider, model, False, "auto selected configured paid provider")
-    raise RuntimeError("no reachable local provider and no paid credentials")
+    if not free_available:
+        raise RuntimeError("free mode requested but no free route is reachable")
+    local_only = bool(local_available and not cloud_free_available)
+    return RuntimeMode("free", provider, model, local_only,
+                       "explicit free mode (loopback only)" if local_only
+                       else "explicit free mode (cloud free tiers reachable)")
