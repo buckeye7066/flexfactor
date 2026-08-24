@@ -17520,6 +17520,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_prodready", "flexfactor_prodready_persist",
                  "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
+                 "flexfactor_errors",
                  "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",
                  "flexfactor_web", "flexfactor_dashboard",
                  "flexfactor_dashboard_v2", "flexfactor_self_audit_report"):
