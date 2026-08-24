@@ -1486,3 +1486,113 @@ disables. Classifier note: `_NOOP_NO_FIX_PATTERNS` now matches the canonical
 "cannot be fixed in this file alone" wording its own schema asks for - it
 previously classified as UNCLEAR, which would have starved this escalation.
 Tests: `flexfactor_structural_tests.py` (offline, 10 tests).
+
+## 13 of 13 programs reviewed almost nothing (2026-08-24) — route faults killing calls
+
+Two live 10-program audits (`~/.flexfactor/runs/*-21424` and `*-16164`, 898
+error entries across 16 run dirs). **Every one of the 13 programs** ended on the
+same line:
+
+> `review made no progress: three consecutive semantic review batches completed
+> ZERO files (0 of 3537 candidate file(s) reviewed all run)`
+
+| program | reviewed | candidates |
+|---|---:|---:|
+| GrantFlow | 0 | 3537 |
+| incognito | 0 | 446 |
+| sermonsmith-monorepo | 0 | 318 |
+| repo-rewards | 0 | 84 |
+| genemap-discovery | 2 | 368 |
+| local-ai-factory | 2 | 287 |
+| FutureU | 11 | 55 |
+
+**The circuit breaker and `build_review_ledger` were both RIGHT** — they named a
+route fault and would have printed `ZERO WORK`. The accounting was not the
+defect. `REVIEW_FIX_BATCH_SIZE` is 8, so the breaker fires after 24 attempted
+files; the rest are honestly `never_attempted`. What has to be fixed is upstream:
+**five of FlexFactor's own classification rules turned individually-recoverable
+route failures into DEAD calls, and a dead call is an INCOMPLETE file.**
+
+1. **`CliUnavailable` was not a route fault.** 30x `cli/codex: exited 1: "The
+   'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT
+   account"`, 23x `cli/claude-code: exceeded 600s and was killed` — all in the
+   run that reviewed 2 of 287. A CLI provider **is** the route (binary, login,
+   entitlements, deadline), so its failure can never implicate the payload; yet
+   `_is_retryable` said no and the whole call died without trying any of the
+   other 640 routes. `is_transport_dead_error()` now feeds
+   `is_route_capability_error()`.
+2. **A dead transport got the ordinary 30s route cooldown**, so it was re-drawn
+   30 times, 23 of those at 600s each (3.8 hours of pure deadline).
+   `_classify -> "transport_dead"` benches the **route** for
+   `TRANSPORT_DEAD_COOLDOWN` (1h) and clears its strikes. **Never the pool** —
+   one broken CLI entry must not take a backend's working routes with it.
+3. **`EgressBlockedError` was charged to the route.** Measured 3 innocent routes
+   struck per blocked payload in five runs (repo-rewards 04:47:34:
+   claude-opus-4.8-fast, cosmos-reason2-8b, gemini-3.1-pro-preview, within 2s,
+   all for one `payload contains ['private_key'] (near line(s) [369])`), and
+   3 strikes cool a whole POOL for 300s. A secret in the AUDITED repo was
+   benching the owner's providers. `is_payload_fault()` skips `report()`; the
+   `on_error` ledger hook still fires (not charging the route must never make
+   the failure invisible) and the call still fails once.
+4. **One account-wide daily quota was treated as eighteen ledgers.** 574 of the
+   898 entries are the SAME refusal: `429 'Rate limit exceeded:
+   free-models-per-day' ... 'limit_source': 'openrouter_free_tier_daily',
+   'X-RateLimit-Reset': '1787616000000'`. OpenRouter's free tier is ONE
+   account-wide daily allowance; AI Time's catalog spells it as **18 pools, one
+   per model** (`openrouter:free:cohere/north-mini-code:free`, …) — verified in
+   `%LOCALAPPDATA%\AITime\routes.json`, 19 enabled free routes / 18 pools. That
+   is the "rotating model NAMES spreads nothing" failure pool-first rotation
+   exists to prevent, re-created by a naming convention. And because
+   `'rate limit'` matched first, a DAILY quota got a **60-second** cooldown and
+   was re-tested every minute all night.
+   `allowance_key(route)` = backend + cost class (free and paid on one backend
+   stay separate); `limit_scope(exc)` reads the SCOPE and the RESET out of the
+   body; `_pick_in_tier` skips a cooling `allowance:<key>` with a named reason.
+   **Pools are deliberately NOT renamed**: `_run`'s attempt budget is one turn
+   per pool, so the turns freed from the dead allowance go to backends that can
+   answer instead of shrinking the budget. Groq's per-model
+   `tokens per minute (TPM) … try again in 10.132s` stays POOL scope, with its
+   own over-match guard test.
+5. **`OllamaProvider` discarded the body of every HTTP error.** 3x
+   `HTTPError: HTTP Error 400: Bad Request` on `ollama/deepseek-r1:8b` in the
+   GrantFlow run, filed `suggestion: no known fix` — on the one FREE, UNMETERED,
+   un-rate-limitable reviewer this machine has, while every cloud allowance was
+   429-exhausted. urllib puts the reason in the body and NOWHERE else, and
+   `str(HTTPError)` is only ever `HTTP Error 400: Bad Request`.
+   `_ollama_http_error()` folds it into the message (preserving `.status`,
+   leaving `.read()` working), which is also what lets the marker-based
+   route-capability rules see it at all. **Fails open**: an unreadable body
+   returns the original error untouched.
+
+The ledger's own `kind`/suggestion was wrong for the two biggest groups: an
+unclassified ROUTE failure defaults to `provider` + "no known fix", so 55 CLI
+failures were the provider's fault and 574 daily-quota refusals got "nothing to
+fix unless it recurs on every pool" — it had recurred 574 times. Three new
+`SIGNATURES` rows (both CLI shapes → `environment`, the daily allowance →
+`budget`); the daily row must stay ABOVE the generic 429 row or the generic one
+wins.
+
+Tests: `flexfactor_route_fault_tests.py` (20, offline, state redirected at
+import) + 4 in `flexfactor_errors_tests.py`. Verified by disabling each fix and
+re-running. **Trap hit in passing** (the documented one): the `_Rotator` double
+at `flexfactor_tests.py:15150` took the old `report()` signature and died on the
+new kwarg with a TypeError that said nothing about rotation — it takes `**kw`
+now.
+
+### What this was NOT, and what is still OPEN
+- **Not the review ledger.** `candidates == acted_on + skipped_by_reason +
+  failed` balanced; `never_attempted` carried the remainder.
+- **Not `_find_local_project`.** GrantFlow resolved to the real checkout
+  (`files_total 3537`).
+- **The ollama 400 itself is NOT diagnosed.** Probed live the same day against
+  the real server with `AUDIT_FINDINGS_SCHEMA` / `AUDIT_BATCH_SCHEMA` /
+  `PURPOSE_GAP_SCHEMA`: all three TIMED OUT at 300s rather than 400ing, so the
+  shape that produced the 400 was not reproduced. The body fix makes the next
+  occurrence self-describing; it does not claim to have cured it.
+- **OPEN: no paid route was ever reached** in the GrantFlow run despite
+  `--model-mode auto` (paid-first) — `spend_usd 0.0`, and no `openrouter:credits`
+  / `openai_api:paid-metered` / `anthropic:max-plan` route appears anywhere in
+  its ledger, while every free allowance was exhausted. Not investigated here.
+- **OPEN: `--parallel 10`** points ten concurrent audits at ONE shared free
+  allowance and ONE shared rotation state file. Every fix above is a
+  per-failure remedy; the contention itself is untouched.
