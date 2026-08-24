@@ -331,6 +331,107 @@ def open_ledger(md_path: str) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Copy button (owner request 2026-08-24: "a 'copy' button by each of the error
+# boxes that saves that information to my clipboard").
+#
+# The box only ever PAINTS the newest few entries (ERR_ROWS, fewer on a short
+# window). What is worth pasting into an issue or a chat is the whole program's
+# ledger, so the payload re-reads it AT CLICK TIME. That does not break the
+# standing no-per-frame-disk-I/O rule the redraw loop lives by - a click is not
+# a frame, and it happens at human speed, not 25fps.
+#
+# Truncation is never silent: a capped payload says how many it left out and
+# where the rest lives, the same contract the box footer already keeps.
+# --------------------------------------------------------------------------- #
+COPY_MAX_ROWS = 200
+COPY_FEEDBACK_S = 1.6
+# program key -> monotonic deadline until which the button reads "copied!"
+_COPIED_UNTIL: dict[str, float] = {}
+
+
+def format_error_clipboard(name: str, md_path: str, headline: str, rows: list,
+                           total: int, limit: int = COPY_MAX_ROWS) -> str:
+    """The plain text one copy click puts on the clipboard.
+
+    Pure and Tk-free so it can be tested without a display: the same three
+    facts the box paints per entry (what failed / which code is responsible /
+    what to do), plus the ledger path so a truncated payload is still
+    actionable."""
+    rows = list(rows or [])
+    shown = rows[:max(0, int(limit))]
+    out = [f"FlexFactor errors - {name}"]
+    if headline:
+        out.append(headline)
+    if md_path:
+        out.append(f"ledger: {md_path}")
+    out.append("")
+    if not shown:
+        out.append("(no errors recorded)")
+    for r in shown:
+        fix = r.get("fix") or "no known fix"
+        # An unverified model guess is never dressed as a known fix - the same
+        # rule the painted box follows.
+        if r.get("fix_source") == "model":
+            fix = "(unverified) " + fix
+        out.append(f"#{r.get('n')} {r.get('kind')} / {r.get('phase')}")
+        out.append(f"  error: {r.get('error', '')}")
+        out.append(f"  code : {r.get('where', '')}")
+        out.append(f"  fix  : {fix}")
+        out.append("")
+    left = int(total or 0) - len(shown)
+    if left > 0:
+        out.append(f"... and {left} more of {total} total - full ledger: "
+                   f"{md_path or '(path unknown)'}")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def error_clipboard_payload(p: dict) -> str:
+    """Build one program's copy payload, reading the FULL ledger when it can.
+
+    Falls back to the cached handful the box is already showing if the read
+    fails - a degraded copy beats a dead button, and the header still names
+    the ledger path."""
+    info = errors_for(p)
+    name = str(p.get("name") or f"#{p.get('index')}")
+    rows = info.get("rows") or []
+    total = int(info.get("total") or len(rows))
+    if _fe is not None:
+        try:
+            entries = _fe.load_entries(_run_dir_for(p))
+            total = len(entries)
+            rows = _fe.ui_entries(entries, min(len(entries), COPY_MAX_ROWS))
+        except Exception:  # noqa: BLE001 - never take the panel down
+            pass
+    return format_error_clipboard(name, info.get("md_path") or "",
+                                  info.get("headline") or "", rows, total)
+
+
+def copy_to_clipboard(widget, text: str) -> bool:
+    """Put text on the system clipboard through Tk. Never raises.
+
+    NOTE (Windows): Tk owns the clipboard while the process lives, so the text
+    survives for as long as the dashboard is open - which is the whole window
+    in which the owner would paste it. Closing the dashboard immediately after
+    copying can drop it; that is a Tk/Win32 property, not something this
+    function can fix without a native clipboard render."""
+    try:
+        widget.clipboard_clear()
+        widget.clipboard_append(text)
+        widget.update_idletasks()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def do_copy(widget, p: dict, key: str) -> bool:
+    """Click action: copy, and arm the 'copied!' label if it actually worked."""
+    ok = copy_to_clipboard(widget, error_clipboard_payload(p))
+    if ok:
+        _COPIED_UNTIL[key] = time.monotonic() + COPY_FEEDBACK_S
+    return ok
+
+
 def bar_targets(p: dict) -> dict:
     """Compute the 0..1 targets for one program's three bars from raw fields."""
     files_total = max(1, int(p.get("files_total") or 0) or 1)
@@ -669,8 +770,37 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
         footer_h = 16
         room = int(max(0.0, (by1 - footer_h) - ey) // ERR_ROW_H)
         drawn = rows[:room]
+
+        # ---- copy button, top-right of this box ------------------------ #
+        # Only when there is something to copy: a panel reading "nothing has
+        # gone wrong yet" gets no button, so the box keeps its invariant of no
+        # clickable region when there is nothing to act on (and the owner never
+        # clicks a control that yields an empty paste).
+        # Registered BEFORE the box-wide "open errors.md" hit added at the end
+        # of this block: on_click fires the FIRST matching region, and the box
+        # rectangle completely contains this one, so appending it later would
+        # make the button unreachable.
+        chx0 = bx1 - 6
+        if rows:
+            ckey = program_key(p)
+            copied = _COPIED_UNTIL.get(ckey, 0.0) > time.monotonic()
+            clabel = "copied!" if copied else "copy"
+            cw = (_measure(F_NOTE, clabel) or 28) + 14
+            chx1, chx0 = bx1 - 6, bx1 - 6 - cw
+            chy0, chy1 = by0 + 2, by0 + 18
+            canvas.create_rectangle(chx0, chy0, chx1, chy1,
+                                    outline=FIXCOL if copied else EDGE,
+                                    fill=BG, width=1)
+            canvas.create_text((chx0 + chx1) / 2, (chy0 + chy1) / 2,
+                               text=clabel, fill=FIXCOL if copied else DIM,
+                               font=F_NOTE)
+            hits.append((chx0, chy0, chx1, chy1,
+                         lambda p=p, k=ckey, c=canvas: do_copy(c, p, k)))
+
         if drawn:
-            canvas.create_text(bx1 - 8, by0 + 10, anchor="e",
+            # Sits left of the copy button, measured rather than guessed, so it
+            # cannot paint over it at another DPI.
+            canvas.create_text(chx0 - 8, by0 + 10, anchor="e",
                                text="newest first", fill=DIM, font=F_NOTE)
         for row in drawn:
             kcol = KIND_COLOR.get(row["kind"], DIM)

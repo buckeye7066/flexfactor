@@ -351,5 +351,169 @@ class RenderedBoxTests(unittest.TestCase):
         self.assertTrue(longest.endswith("..."))
 
 
+class CopyPayloadTests(unittest.TestCase):
+    """The text a copy click produces. Pure - no Tk, so it runs headless.
+
+    Owner, 2026-08-24: "give me a 'copy' button by each of the error boxes that
+    saves that information to my clipboard."
+    """
+
+    @staticmethod
+    def _rows(n):
+        return [{"n": i, "kind": "provider", "phase": "rotation",
+                 "error": f"boom {i}", "where": f"flexfactor.py:{100 + i}",
+                 "fix": f"fix {i}", "fix_source": "signature"}
+                for i in range(1, n + 1)]
+
+    def test_it_carries_the_three_facts_the_box_shows(self):
+        out = dash.format_error_clipboard("Demo", "C:/run/errors.md",
+                                          "2 errors: 2 provider",
+                                          self._rows(2), 2)
+        for expected in ("Demo", "2 errors: 2 provider", "C:/run/errors.md",
+                         "boom 1", "flexfactor.py:101", "fix 1", "boom 2"):
+            self.assertIn(expected, out)
+
+    def test_an_unverified_model_guess_is_still_labelled_in_the_paste(self):
+        rows = self._rows(1)
+        rows[0]["fix_source"] = "model"
+        out = dash.format_error_clipboard("Demo", "", "", rows, 1)
+        self.assertIn("(unverified)", out,
+                      "a model guess must not be pasted as a known fix")
+
+    def test_truncation_is_announced_never_silent(self):
+        out = dash.format_error_clipboard("Demo", "C:/run/errors.md", "",
+                                          self._rows(10), 10, limit=4)
+        self.assertIn("boom 4", out)
+        self.assertNotIn("boom 5", out)
+        self.assertIn("6 more of 10", out)
+        self.assertIn("C:/run/errors.md", out,
+                      "a truncated paste must still say where the rest lives")
+
+    def test_no_rows_says_so_rather_than_pasting_an_empty_string(self):
+        out = dash.format_error_clipboard("Demo", "", "", [], 0)
+        self.assertIn("no errors recorded", out)
+        self.assertTrue(out.strip())
+
+
+class CopyButtonRenderTests(unittest.TestCase):
+    """The button itself, drawn on a real canvas and read back."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tkinter as tk
+            cls.root = tk.Tk()
+            cls.root.withdraw()
+            cls.canvas = tk.Canvas(cls.root, width=960, height=620)
+        except Exception as ex:  # noqa: BLE001 - headless: skip, never pass quietly
+            raise unittest.SkipTest(f"no display for Tk: {ex}")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ffcopy-")
+        dash._ERR_CACHE.clear()
+        dash._COPIED_UNTIL.clear()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ledger(self, entries):
+        run = os.path.join(self.tmp, "run-c")
+        os.makedirs(run, exist_ok=True)
+        with open(os.path.join(run, "errors.json"), "w", encoding="utf-8") as fh:
+            json.dump({"program": "Demo", "entries": entries}, fh)
+        with open(os.path.join(run, "errors.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Errors")
+        return run
+
+    def _draw(self, progs, w=960, h=620):
+        hits: list = []
+        self.canvas.delete("all")
+        dash.draw_frame(self.canvas, hits, {}, w, h, progs, status_label="test")
+        texts = [self.canvas.itemcget(i, "text") for i in self.canvas.find_all()
+                 if self.canvas.type(i) == "text"]
+        return texts, hits
+
+    def test_a_box_with_errors_gets_a_copy_button(self):
+        run = self._ledger([_entry(1, "provider", "rotation", "boom")])
+        texts, _ = self._draw([{"name": "Demo", "run_dir": run}])
+        self.assertIn("copy", texts)
+
+    def test_a_box_with_nothing_wrong_gets_no_button(self):
+        """No dead control, and the box keeps its no-clickable-region rule."""
+        run = self._ledger([])
+        texts, _ = self._draw([{"name": "Demo", "run_dir": run}])
+        self.assertNotIn("copy", texts)
+
+    def test_the_button_is_reachable_and_not_swallowed_by_the_box(self):
+        """on_click fires the FIRST matching hit and the box CONTAINS the
+        button, so registration order is the whole ballgame."""
+        run = self._ledger([_entry(1, "provider", "rotation", "boom")])
+        _, hits = self._draw([{"name": "Demo", "run_dir": run}])
+        boxes = [h for h in hits if h[3] - h[1] > 100]      # the tall error box
+        self.assertTrue(boxes, f"expected an error box region: {hits}")
+        box = boxes[0]
+        # Pick the button by CONTAINMENT in this box, not by size - the panel
+        # also registers a 24x24 dismiss "x" that a bare size filter grabs.
+        inside = [h for h in hits
+                  if h is not box and box[0] <= h[0] and h[2] <= box[2]
+                  and box[1] <= h[1] and h[3] <= box[3]]
+        self.assertTrue(inside, f"no clickable region inside the error box: {hits}")
+        btn = inside[0]
+        self.assertLess(hits.index(btn), hits.index(box),
+                        "the copy button must be registered BEFORE the box-wide "
+                        "ledger hit or it can never be clicked")
+        self.assertTrue(box[0] <= btn[0] and btn[2] <= box[2]
+                        and box[1] <= btn[1] and btn[3] <= box[3],
+                        "button should sit inside its own box")
+
+    def test_the_button_does_not_paint_over_newest_first(self):
+        run = self._ledger([_entry(1, "provider", "rotation", "boom")])
+        texts, hits = self._draw([{"name": "Demo", "run_dir": run}])
+        self.assertIn("newest first", texts)
+        self.assertIn("copy", texts)
+
+    def test_clicking_copies_EVERY_entry_not_just_the_three_painted(self):
+        """The box paints ERR_ROWS; the paste is the whole ledger. That is the
+        difference between a screenshot and something you can act on."""
+        run = self._ledger([_entry(i, "provider", "rotation", f"boom{i}")
+                            for i in range(1, 13)])
+        prog = {"name": "Demo", "run_dir": run}
+        texts, hits = self._draw([prog])
+        painted = " | ".join(texts)
+        # Entries render NEWEST FIRST, so the box shows #12/#11/#10 and the
+        # OLDEST are the ones off-screen. Assert on one of those.
+        self.assertNotIn("boom1 ", painted + " ",
+                         "precondition: the oldest entries are not painted")
+
+        payload = dash.error_clipboard_payload(prog)
+        for i in range(1, 13):
+            self.assertIn(f"boom{i}", payload,
+                          f"entry {i} missing from the copied text")
+
+    def test_the_click_action_actually_reaches_the_clipboard(self):
+        run = self._ledger([_entry(1, "provider", "rotation", "clipboard-marker")])
+        prog = {"name": "Demo", "run_dir": run}
+        ok = dash.do_copy(self.canvas, prog, dash.program_key(prog))
+        if not ok:
+            self.skipTest("no working system clipboard in this environment")
+        self.assertIn("clipboard-marker", self.root.clipboard_get())
+
+    def test_a_successful_copy_shows_confirmation_on_the_next_frame(self):
+        run = self._ledger([_entry(1, "provider", "rotation", "boom")])
+        prog = {"name": "Demo", "run_dir": run}
+        if not dash.do_copy(self.canvas, prog, dash.program_key(prog)):
+            self.skipTest("no working system clipboard in this environment")
+        texts, _ = self._draw([prog])
+        self.assertIn("copied!", texts,
+                      "a click with no visible result reads as a broken button")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
