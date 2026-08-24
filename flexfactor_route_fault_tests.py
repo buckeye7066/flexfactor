@@ -349,5 +349,126 @@ class OllamaErrorBodyTests(unittest.TestCase):
         self.assertTrue(R._is_retryable(exc), str(exc))
 
 
+# --------------------------------------------------------------------------- #
+# 5. ONE account-wide daily allowance is not eighteen independent ledgers.
+# --------------------------------------------------------------------------- #
+
+# The exact body, from the ledgers. Note what it hands us and nobody read:
+# `limit_source: openrouter_free_tier_daily` (the SCOPE is the account, not the
+# model) and `X-RateLimit-Reset: 1787616000000` (the exact epoch-ms reset).
+OPENROUTER_DAILY = (
+    "Error code: 429 - {'error': {'message': 'Rate limit exceeded: "
+    "free-models-per-day. Add 10 credits to unlock 1000 free model requests per "
+    "day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', "
+    "'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1787616000000'}, "
+    "'limit_source': 'openrouter_free_tier_daily', 'remedy_hint': 'Wait for the "
+    "daily reset (see X-RateLimit-Reset)'}}}")
+
+# Groq's, for contrast: a per-model tokens-per-minute limit that names its own
+# ten-second retry. Nothing account-wide about it.
+GROQ_TPM = (
+    "Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+    "`meta-llama/llama-4-scout-17b-16e-instruct` in organization `org_01k` "
+    "service tier `on_demand` on tokens per minute (TPM): Limit 30000, Used "
+    "15684, Requested 19382. Please try again in 10.132s.'}}")
+
+
+class Limited(Exception):
+    def __init__(self, message, status_code=429):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def or_free(model: str) -> R.Route:
+    """An OpenRouter free route exactly as AI Time's catalog spells it.
+
+    MEASURED from `%LOCALAPPDATA%\\AITime\\routes.json` on 2026-08-24: 19 enabled
+    OpenRouter free routes carrying 18 DIFFERENT pool names, one per model
+    (`openrouter:free:cohere/north-mini-code:free`, ...). OpenRouter's free tier
+    is ONE account-wide daily allowance, so the rotator was told it had eighteen
+    ledgers where it had one - the precise failure ("rotating model NAMES
+    spreads nothing") that pool-first rotation exists to prevent. 574 of the two
+    runs' 898 ledger entries are that one exhausted allowance, re-tried.
+    """
+    return R.Route(
+        id=f"openrouter/{model}:free", backend="openrouter",
+        backend_label="openrouter", model=f"{model}:free",
+        wire_model=f"{model}:free", api="openai",
+        base_url="https://openrouter.ai/api/v1",
+        pool=f"openrouter:free:{model}:free", cost_class=R.FREE_TIER,
+        tier=R.FRONTIER, enabled=True)
+
+
+class AccountWideAllowanceTests(RouteFaultTestCase):
+    def test_the_scope_of_a_daily_account_limit_is_read_from_the_message(self):
+        self.assertEqual(R.limit_scope(Limited(OPENROUTER_DAILY))[0], "account")
+        self.assertEqual(R.limit_scope(Limited(GROQ_TPM))[0], "pool")
+
+    def test_the_reset_timestamp_in_the_message_is_used(self):
+        _scope, until = R.limit_scope(Limited(OPENROUTER_DAILY))
+        self.assertIsNotNone(until)
+        # 1787616000000 ms == 2026-08-25T00:00:00Z, the daily reset.
+        self.assertEqual(int(until), 1787616000)
+
+    def test_one_daily_429_benches_every_route_on_that_allowance(self):
+        """The 574-entry storm: 18 synthetic pools, one dead allowance."""
+        cat = catalog(or_free("a/one"), or_free("b/two"), or_free("c/three"),
+                      route("zz/backup", "zz:free-tier", cost=R.FREE_TIER))
+        prov = self.provider(
+            cat, failures={f"openrouter/{m}:free": Limited(OPENROUTER_DAILY)
+                           for m in ("a/one", "b/two", "c/three")})
+        self.assertEqual(prov.complete("x"), "completed by zz/backup")
+        tried = [rid for rid, f in self.built.items() if f.calls]
+        self.assertEqual(
+            len([t for t in tried if t.startswith("openrouter/")]), 1,
+            "one account-wide refusal must bench the whole allowance, not be "
+            f"re-tried once per synthetic per-model pool (tried: {tried})")
+
+    def test_the_bench_outlives_the_60_second_pool_cooldown(self):
+        """A DAILY quota must not be re-tested every minute for the rest of the
+        night. The ordinary pool cooldown is expired here on purpose - it is the
+        only thing hiding the defect within a single call."""
+        cat = catalog(or_free("a/one"), or_free("b/two"),
+                      route("zz/backup", "zz:free-tier", cost=R.FREE_TIER))
+        prov = self.provider(
+            cat, failures={f"openrouter/{m}:free": Limited(OPENROUTER_DAILY)
+                           for m in ("a/one", "b/two")})
+        prov.complete("x")
+        before = sum(f.calls for rid, f in self.built.items()
+                     if rid.startswith("openrouter/"))
+
+        def expire_pool_cooldowns(data):
+            data["cooldowns"] = {k: v for k, v in (data.get("cooldowns") or {}).items()
+                                 if k.startswith("allowance:")}
+        self.store.update(expire_pool_cooldowns)
+
+        prov.complete("x")
+        after = sum(f.calls for rid, f in self.built.items()
+                    if rid.startswith("openrouter/"))
+        self.assertEqual(before, after,
+                         "the daily allowance is still exhausted; only the "
+                         "60-second per-pool cooldowns have lapsed")
+        until = self.store.read()["cooldowns"]["allowance:openrouter:free-tier"]
+        self.assertGreater(until - time.time(), R.DEFAULT_RATE_LIMIT_COOLDOWN * 10)
+
+    def test_a_per_model_rate_limit_still_only_cools_its_own_pool(self):
+        """Groq's TPM limit is NOT account-wide. Over-cooling would bench a
+        backend that is answering fine on every other model."""
+        cat = catalog(route("groq/a", "groq:free-tier", cost=R.FREE_TIER),
+                      route("groq/b", "groq:other", cost=R.FREE_TIER))
+        prov = self.provider(cat, failures={"groq/a": Limited(GROQ_TPM)})
+        self.assertEqual(prov.complete("x"), "completed by groq/b")
+        cooldowns = self.store.read()["cooldowns"]
+        self.assertIn("groq:free-tier", cooldowns)
+        self.assertNotIn("allowance:groq:free-tier", cooldowns)
+
+    def test_the_allowance_key_names_the_backend_and_its_cost_class(self):
+        self.assertEqual(R.allowance_key(or_free("a/one")), "openrouter:free-tier")
+        # Paid OpenRouter credits are a DIFFERENT allowance from the free tier;
+        # exhausting the free one must never bench the paid one.
+        paid = route("openrouter/big", "openrouter:credits", cost=R.PAID_METERED)
+        self.assertNotEqual(R.allowance_key(paid), R.allowance_key(or_free("a/one")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

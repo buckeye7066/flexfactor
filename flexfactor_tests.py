@@ -15147,7 +15147,10 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
                 return fr.Selection(route=route, pool=route.pool,
                                     tier=route.tier, requested_tier=route.tier)
 
-            def report(self, route, outcome, retry_after=None):
+            # **kw so this double cannot fail the suite merely because the real
+            # Rotator grew an optional argument (scope/reset_at, 2026-08-24).
+            # A signature-drift TypeError here says nothing about rotation.
+            def report(self, route, outcome, retry_after=None, **kw):
                 pass
 
         prov = fr.RotatingProvider(

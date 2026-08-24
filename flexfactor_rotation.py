@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -553,6 +554,64 @@ class Selection:
         return " ".join(bits)
 
 
+def allowance_key(route: "Route") -> str:
+    """The ledger a route ACTUALLY drains, when its pool name does not say so.
+
+    MEASURED from `%LOCALAPPDATA%\\AITime\\routes.json`, 2026-08-24: the catalog
+    carries 19 enabled OpenRouter free routes under 18 DIFFERENT pool names, one
+    per model (`openrouter:free:cohere/north-mini-code:free`, ...). OpenRouter's
+    free tier is ONE account-wide daily allowance, so pool-first rotation - whose
+    entire premise is that a pool IS a ledger - was handed eighteen ledgers where
+    there is one. 574 of the 898 error entries across that day's two 10-program
+    audits are that single exhausted allowance, re-tried per synthetic pool.
+
+    Backend + cost class, because they are different allowances on the same
+    backend: exhausting `openrouter:free-tier` must never bench the paid
+    `openrouter:paid-metered` credits, and vice versa.
+    """
+    return f"{route.backend}:{route.cost_class}"
+
+
+# A 429/quota refusal whose SCOPE is the whole account, not this model. Only
+# shapes measured in this toolchain's own ledgers; a guess here would bench a
+# healthy backend.
+_ACCOUNT_WIDE_LIMIT_MARKERS = (
+    # OpenRouter, verbatim: "Rate limit exceeded: free-models-per-day" with
+    # "limit_source": "openrouter_free_tier_daily".
+    "free-models-per-day", "_free_tier_daily", "free_tier_daily",
+    # Google Gemini free tier: "Quota exceeded for metric:
+    # generativelanguage.googleapis.com/generate_content_free_tier_requests".
+    "free_tier_requests",
+)
+
+_RESET_EPOCH_RE = re.compile(r"x-ratelimit-reset['\"]?\s*[:=]\s*['\"]?(\d{9,16})")
+
+
+def limit_scope(exc: BaseException) -> Tuple[str, Optional[float]]:
+    """("account"|"pool", reset epoch seconds or None) for a rate/quota refusal.
+
+    The provider's own body carries both answers and neither was ever read:
+    `limit_source: openrouter_free_tier_daily` says the allowance is account-
+    wide, and `X-RateLimit-Reset: 1787616000000` says exactly when it comes
+    back (epoch ms - the next UTC midnight). Contrast Groq's per-model
+    "tokens per minute (TPM) ... try again in 10.132s", which is correctly a
+    short cooldown on one pool.
+    """
+    blob = f"{type(exc).__name__} {exc}".lower()
+    scope = "account" if any(m in blob for m in _ACCOUNT_WIDE_LIMIT_MARKERS) else "pool"
+    until: Optional[float] = None
+    match = _RESET_EPOCH_RE.search(blob)
+    if match:
+        raw = float(match.group(1))
+        # Providers send seconds or milliseconds; both appear in the wild.
+        candidate = raw / 1000.0 if raw > 1e11 else raw
+        # Only trust a reset that is in the future and inside a day - a bogus
+        # far-future stamp must not bench an allowance for a decade.
+        if 0 < candidate - time.time() <= 25 * 3600:
+            until = candidate
+    return scope, until
+
+
 def _cooling(state: Dict[str, Any], key: str, now: float) -> bool:
     until = state.get("cooldowns", {}).get(key)
     return bool(until) and float(until) > now
@@ -711,6 +770,13 @@ class Rotator:
                 continue
             if _cooling(state, route.pool, now):
                 reasons[route.pool] = "pool cooling down"
+                continue
+            # The ACCOUNT-WIDE allowance behind this pool. A catalog that names
+            # one ledger per model (see allowance_key) would otherwise let one
+            # exhausted daily quota be re-tried eighteen times per call.
+            if _cooling(state, f"allowance:{allowance_key(route)}", now):
+                reasons[route.pool] = (f"{allowance_key(route)} allowance "
+                                       "exhausted (account-wide)")
                 continue
             if _cooling(state, f"route:{route.id}", now):
                 continue
@@ -895,7 +961,9 @@ class Rotator:
 
     def report(self, route: Route, outcome: str,
                retry_after_seconds: Optional[float] = None,
-               now: Optional[float] = None) -> None:
+               now: Optional[float] = None,
+               scope: str = "pool",
+               reset_at: Optional[float] = None) -> None:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | transport_dead | error
@@ -925,15 +993,23 @@ class Rotator:
                 cooldowns.pop(f"route:{route.id}", None)
                 return
 
-            if outcome == "rate_limited":
-                cooldowns[route.pool] = now + float(
-                    retry_after_seconds or DEFAULT_RATE_LIMIT_COOLDOWN)
-                return
-
-            if outcome == "quota_exhausted":
-                cooldowns[route.pool] = now + float(
-                    retry_after_seconds or _seconds_until(route.resets_at, now)
-                    or DEFAULT_QUOTA_COOLDOWN)
+            if outcome in ("rate_limited", "quota_exhausted"):
+                if outcome == "rate_limited":
+                    span = float(retry_after_seconds or DEFAULT_RATE_LIMIT_COOLDOWN)
+                else:
+                    span = float(retry_after_seconds
+                                 or _seconds_until(route.resets_at, now)
+                                 or DEFAULT_QUOTA_COOLDOWN)
+                if scope == "account":
+                    # ACCOUNT-WIDE: every route on this backend's allowance is
+                    # spent, whatever the catalog calls their pools. The
+                    # provider named its own reset - honour it instead of
+                    # re-testing a dead daily quota every 60 seconds.
+                    until = reset_at if reset_at and reset_at > now else now + max(
+                        span, DEFAULT_QUOTA_COOLDOWN)
+                    cooldowns[f"allowance:{allowance_key(route)}"] = until
+                    return
+                cooldowns[route.pool] = now + span
                 return
 
             if outcome == "transport_dead":
@@ -1195,7 +1271,9 @@ class RotatingProvider:
                 # never make the failure invisible.
                 payload_fault = is_payload_fault(exc)
                 if not payload_fault:
-                    self.rotator.report(route, _classify(exc), _retry_after(exc))
+                    scope, reset_at = limit_scope(exc)
+                    self.rotator.report(route, _classify(exc), _retry_after(exc),
+                                        scope=scope, reset_at=reset_at)
                 if self._on_error is not None:
                     try:
                         self._on_error(route, exc)
