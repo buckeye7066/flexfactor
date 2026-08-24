@@ -109,9 +109,24 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The egress gate found a secret/PII pattern in repo-derived text and refused to send it to a "
      "cloud model. Remove the secret from the repo (or use --redact / FLEXFACTOR_ALLOW_EGRESS for a "
      "known-safe fixture)."),
-    (r"flexfactor_policy_blocked|rc 126|containment_blocked", KIND_ENV,
-     "The command policy or containment gate refused the command. Trust the repo (--trust-repo / "
-     "FLEXFACTOR_TRUSTED_REPOS) or allow the command class in ~/.flexfactor/policy.json."),
+    # 'flexfactor-containment' (hyphens) is the string the gate ACTUALLY emits -
+    # `_run_target_code`/`_spawn` prefix every refusal with
+    # "[flexfactor-containment] REFUSED: ". The underscored 'containment_blocked'
+    # is the ATTRIBUTE name (cp.flexfactor_containment_blocked) and never appears
+    # in the message, so this row could not match a real refusal. Measured live
+    # 2026-08-24: 8 of 8 programs had their whole baseline build+test suite
+    # refused, and every one classified as 'unknown' with the generic fallback
+    # suggestion instead of naming the one-line fix.
+    (r"flexfactor_policy_blocked|flexfactor-containment|rc 126|containment_blocked",
+     KIND_ENV,
+     # This row covers TWO different refusals with two different remedies, and
+     # naming only the command-class one misdirects the owner for the other:
+     # a TRUST refusal is fixed with policy.json "trusted_repos", a POLICY
+     # refusal with "allow_classes". Name both, with the key spelled out.
+     "The command policy or containment gate refused the command. If the repository is "
+     "untrusted: add its path to ~/.flexfactor/policy.json \"trusted_repos\", set "
+     "FLEXFACTOR_TRUSTED_REPOS, or pass --trust-repo. If a command CLASS was blocked: "
+     "allow it via \"allow_classes\" in the same file / FLEXFACTOR_ALLOW_CLASSES."),
     (r"UnicodeDecodeError.*charmap|'charmap' codec", KIND_TOOL,
      "A subprocess was read with the Windows locale codec. Every capture site must pass "
      "encoding='utf-8', errors='replace' (see _run)."),

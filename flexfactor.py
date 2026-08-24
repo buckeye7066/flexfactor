@@ -5080,16 +5080,36 @@ def _find_local_project(*name_hints: str) -> str | None:
         root_dirs.extend(os.path.join(root, e) for e in entries
                          if os.path.isdir(os.path.join(root, e)))
 
+    # A HIDDEN sibling is a config/data directory, not a source checkout, and
+    # `_slugify` cannot tell them apart: the leading dot is not alnum, so it
+    # becomes "-" and is stripped, making '.ellie' and 'Ellie' BOTH 'ellie'.
+    # `os.listdir` hands back the dot-entry first, so the "exact" pass below
+    # returned it every time. Measured live 2026-08-24 (10-program audit):
+    # --program .../Ellie resolved to ~/.ellie and .../ForgePress to
+    # ~/.forgepress; both programs ran to completion with files_total=0 and
+    # analyzed_source_files=0 - a full audit of nothing. Deterministic, not a
+    # race. `_file_tree` already refuses to walk into dot-directories, so even
+    # when one IS selected it can never yield a file - the empty result was
+    # guaranteed the moment the wrong directory won.
+    # Visible candidates are therefore tried first WITHIN each precision tier;
+    # hidden ones remain a last resort so a genuinely dot-named project still
+    # resolves rather than regressing to "not found". Tier order (exact before
+    # prefix) is unchanged.
+    visible = [d for d in root_dirs if not os.path.basename(d).startswith(".")]
+    hidden = [d for d in root_dirs if os.path.basename(d).startswith(".")]
+
     # Pass 1 (global): exact slug match (despaced form included) - precise.
-    for full in root_dirs:
-        if _slugify(os.path.basename(full)) in exact:
-            return full
+    for tier in (visible, hidden):
+        for full in tier:
+            if _slugify(os.path.basename(full)) in exact:
+                return full
     # Pass 2 (global): prefix match - tolerant of name/folder drift.
-    for full in root_dirs:
-        entry_slug = _slugify(os.path.basename(full))
-        entry_squash = entry_slug.replace("-", "")
-        if any(entry_slug.startswith(c) or entry_squash.startswith(c) for c in prefix_cands):
-            return full
+    for tier in (visible, hidden):
+        for full in tier:
+            entry_slug = _slugify(os.path.basename(full))
+            entry_squash = entry_slug.replace("-", "")
+            if any(entry_slug.startswith(c) or entry_squash.startswith(c) for c in prefix_cands):
+                return full
     return None
 
 
@@ -14081,6 +14101,41 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         checkpoint, display_name, failing_log)
                     if log_path:
                         print(f"{pfx}baseline failure log: {log_path}")
+                    # AND PUT IT IN THE LEDGER. Writing the log file was only
+                    # half the promise: errors.md/errors.json are the surface
+                    # the owner actually reads (and the dashboard's per-program
+                    # error box renders), and a red or REFUSED baseline never
+                    # reached them. Measured live 2026-08-24: 8 of 8 programs
+                    # had a baseline-publication-failure.log on disk while
+                    # `grep -c flexfactor-containment errors.md` was 0 for all
+                    # ten - the single most consequential failure of the run
+                    # was the one failure the ledger did not mention.
+                    # flexfactor_errors is imported LOCALLY everywhere else in
+                    # this module (see _start_error_ledger); there is no
+                    # module-level alias to borrow.
+                    import flexfactor_errors as _fe_kinds
+                    _blocked = "[flexfactor-containment]" in str(failing_log or "")
+                    _ledger(
+                        "baseline",
+                        ("baseline publication gate BLOCKED: the project's "
+                         "build/test commands were refused before they ran"
+                         if _blocked else
+                         "baseline publication suite is RED and bounded "
+                         "targeted repair did not fix it"),
+                        kind=(_fe_kinds.KIND_ENV if _blocked
+                              else _fe_kinds.KIND_PROGRAM),
+                        detail=_tail(str(failing_log or ""), 40),
+                        suggestion=(
+                            "The containment/trust gate refused this repository's "
+                            "install/build/test. Add its path to ~/.flexfactor/policy.json "
+                            "\"trusted_repos\", set FLEXFACTOR_TRUSTED_REPOS, or pass "
+                            "--trust-repo. Until then NOTHING is verified: no build, no "
+                            "tests, and publication stays refused."
+                            if _blocked else
+                            f"Read the full log at {log_path or '(not written)'}. "
+                            "Publication (push/merge) stays refused while the baseline "
+                            "is red; the review still runs."),
+                    )
 
             if not repair.get("ok"):
                 attempted = sorted((repair.get("attempted") or {}).keys())
