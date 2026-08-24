@@ -51,6 +51,7 @@ import datetime
 import difflib
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -2618,6 +2619,57 @@ def _ollama_http_timeout() -> float:
         return 600.0
 
 
+def _ollama_http_error(exc):
+    """Fold Ollama's own explanation into an HTTPError's message.
+
+    urllib puts the server's reason in the RESPONSE BODY and NOWHERE ELSE:
+    `str(HTTPError)` is only ever "HTTP Error 400: Bad Request". MEASURED
+    2026-08-24, GrantFlow run `grantflow-20260824-051330-625243-16164`: three
+    ledger entries reading exactly that against `ollama/deepseek-r1:8b`, each
+    filed with `suggestion: no known fix`, on the one FREE, UNMETERED,
+    un-rate-limitable reviewer this machine has -- while every cloud pool was
+    429-exhausted and the run reviewed **0 of 3537** files. The sentence that
+    names the fix existed; it was read by nobody and then discarded.
+
+    Also the enabling half of route classification: `_is_retryable` asks
+    `is_route_capability_error`, which matches on the MESSAGE. With the body
+    dropped there is nothing to match, so a local 400 was fatal to the whole
+    call instead of rotating to a cloud route that could have answered.
+
+    NEVER raises and never invents: a body that cannot be read or is empty
+    returns *exc* untouched, so a decode problem can only cost the detail, not
+    the error itself. The body is re-wrapped so `.read()` still works
+    downstream, and `.status`/`.code` are preserved for the status-based rules.
+    """
+    import urllib.error
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        return exc
+    if not raw:
+        return exc
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return exc
+    try:
+        parsed = json.loads(text)
+        detail = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(detail, dict):
+            detail = detail.get("message") or json.dumps(detail)
+        if detail:
+            text = str(detail)
+    except Exception:  # noqa: BLE001 - a non-JSON body is still the explanation
+        pass
+    text = " ".join(text.split())[:600]
+    if not text:
+        return exc
+    enriched = urllib.error.HTTPError(
+        getattr(exc, "url", None) or getattr(exc, "filename", None) or "",
+        exc.code, f"{exc.msg}: {text}", exc.hdrs, io.BytesIO(raw))
+    return enriched
+
+
 def _local_only_opener():
     """urllib opener for the local-only provider (Sol findings 1+2): NO proxy
     (an inherited HTTP_PROXY would ship the payload to the proxy host - the
@@ -2671,6 +2723,7 @@ class OllamaProvider:
 
     def _chat(self, model: str, system: str, user: str, max_tokens: int,
               schema: dict | None = None) -> str:
+        import urllib.error
         import urllib.request
         payload = {"model": model, "stream": False,
                    "messages": [{"role": "system", "content": system},
@@ -2698,8 +2751,16 @@ class OllamaProvider:
             # server can actually serve; waiting here does NOT tick the HTTP
             # timeout (that starts only once the request is sent).
             with _ollama_gate():
-                with self._opener.open(req, timeout=_ollama_http_timeout()) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                try:
+                    with self._opener.open(req, timeout=_ollama_http_timeout()) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as http_exc:
+                    # Ollama's reason lives in the body and is gone the moment
+                    # nobody reads it -- see _ollama_http_error.
+                    enriched = _ollama_http_error(http_exc)
+                    if enriched is http_exc:
+                        raise
+                    raise enriched from http_exc
             if self.meter is not None:
                 self.meter.record(f"ollama:{model}",
                                   input_tokens=int(data.get("prompt_eval_count") or 0),
