@@ -181,10 +181,12 @@ def _attempt_info_uncached(p: dict) -> str:
 #   * NO per-frame disk I/O. redraw() runs at ~25 fps; the read is behind a TTL
 #     cache, same as attempt_info().
 #   * READ-ONLY. This viewer opens errors.json for reading and nothing else.
-#   * NO unlabelled scopes. The panel's "errors" counter counts FILES that
-#     errored during review/fix; the ledger counts EVERY recorded failure
-#     including absorbed provider retries. Two different numbers, so they are
-#     labelled "file errors" and "run ledger" and never sit unlabelled together.
+#   * NO unlabelled scopes. The panel's counter counts FILES that errored
+#     during review/fix; the box counts EVERY recorded failure, including the
+#     provider retries rotation absorbed. Two different numbers, so the counter
+#     reads "file errors: N" and the box header names its own total by kind
+#     ("3 errors: 1 flexfactor-defect, 1 provider, 1 budget"). They must never
+#     sit next to each other as two bare numbers.
 # --------------------------------------------------------------------------- #
 _ERR_TTL_S = 2.0
 # key -> (expires_at, value, stat signature of errors.json when it was parsed)
