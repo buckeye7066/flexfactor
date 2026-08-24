@@ -276,6 +276,7 @@ class PricingAndEconomyTests(unittest.TestCase):
         # an explicit --model always wins.
         class Args:
             provider = "anthropic"
+            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
             model = None
             economy = True
             use_both = False
@@ -308,6 +309,7 @@ class PricingAndEconomyTests(unittest.TestCase):
         # return [] and not crash a later fix call by picking the broke provider.
         class Args:
             provider = "anthropic"
+            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
             model = None
             economy = False
             use_both = True
@@ -401,6 +403,7 @@ class PricingAndEconomyTests(unittest.TestCase):
         # A usable owner-chosen cloud primary is never displaced by ollama.
         class Args:
             provider = "anthropic"
+            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
             model = None
             economy = False
             use_both = False
@@ -517,6 +520,7 @@ class PricingAndEconomyTests(unittest.TestCase):
         # so the caller can tell the user to top up (vs "no key set").
         class Args:
             provider = "anthropic"
+            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
             model = None
             economy = False
             use_both = True
@@ -650,9 +654,17 @@ class RotationDefaultProviderTests(unittest.TestCase):
             ff.make_provider = real_make
 
     def test_ai_rotate_off_restores_prior_behaviour(self):
+        # The subject here is the FALL-THROUGH path, not the cost boundary, and
+        # the only credential these stubs present is a direct anthropic key. So
+        # the mode has to be the one in which that key is a legal provider: the
+        # 'free' default admits no billable client by design, and inheriting it
+        # here would make this assert "free mode refuses a paid key" - true, but
+        # already pinned elsewhere, and it would stop measuring rotation at all.
+        class Args(self.Args):
+            model_mode = "paid"
         self._write_catalog([self._route("groq/llama-x")])
         os.environ["AI_ROTATE"] = "off"
-        providers = self._providers_with_stubbed_backends(self.Args)
+        providers = self._providers_with_stubbed_backends(Args)
         self.assertNotIn("rotation", [n for n, _ in providers])
         self.assertTrue(providers, "prior behaviour must still yield a provider")
 
@@ -854,24 +866,41 @@ class RotationDefaultProviderTests(unittest.TestCase):
 
     def test_paid_and_gemini_routes_are_ROTATED_not_filtered(self):
         """Owner order 2026-08-21: "Paid can be rotated in until exhausted.
-        Leave no routes blocked."
+        Leave no routes blocked." STILL TRUE - now scoped to 'paid' mode by the
+        2026-08-24 order ("paid uses both anthropic and openai exclusively until
+        credits expire and free uses free exclusively").
 
-        Both of these were previously dropped by name, and the free-only rule in
-        particular was load-bearing enough that removing it silently would be
-        indistinguishable from a bug. Pin the new contract explicitly.
+        Both routes were once dropped BY NAME, and that free-only rule was
+        load-bearing enough that removing it silently would be indistinguishable
+        from a bug. The same hazard applies to superseding it, so both halves of
+        the new boundary are pinned here rather than one assertion being quietly
+        deleted: inside the mode the owner asked for it, nothing blocks paid;
+        outside it, the mode is the block.
         """
         import flexfactor_rotation as fr
         paid = fr.Route.from_json(self._route("openai_api/gpt-4o", cost="paid-metered"))
-        self.assertEqual(ff._route_unusable_reason(paid, "auto"), "",
+        self.assertEqual(ff._route_unusable_reason(paid, "paid"), "",
                          "paid routes must reach the rotator; the BOUND is "
                          "--max-cost plus the pool's quota_exhausted cooldown, "
                          "not this filter")
+        # The 2026-08-24 supersession, stated as an assertion so it cannot be
+        # undone by accident: in 'free' the bound IS this filter, because a
+        # promise about what a run can spend cannot be kept by ordering alone -
+        # ordering only decides what is tried FIRST, so a paid route stays
+        # reachable the moment free capacity runs out.
+        self.assertNotEqual(ff._route_unusable_reason(paid, "free"), "",
+                            "'free uses free exclusively' (owner 2026-08-24)")
         gem = self._route("gemini/gemini-2.5-flash", api="gemini")
         gem["auth_env"] = "FLEXROT_GEMINI_KEY"
         os.environ["FLEXROT_GEMINI_KEY"] = "test-key"
         try:
+            # Gemini is a CLOUD free tier: admitted by 'free' (this is the
+            # capacity the retired 'local' mode threw away), and excluded from
+            # 'paid', which is the owner's own two accounts and nothing else.
             self.assertEqual(
-                ff._route_unusable_reason(fr.Route.from_json(gem), "auto"), "")
+                ff._route_unusable_reason(fr.Route.from_json(gem), "free"), "")
+            self.assertNotEqual(
+                ff._route_unusable_reason(fr.Route.from_json(gem), "paid"), "")
         finally:
             os.environ.pop("FLEXROT_GEMINI_KEY", None)
 
@@ -1014,16 +1043,34 @@ class RotationDefaultProviderTests(unittest.TestCase):
             os.path.abspath(_TEST_STATE_DIR)))
         self.assertFalse(os.path.exists(ff._FCC_ENV_FILE))
 
-    def test_local_mode_excludes_non_local_routes(self):
+    def test_the_retired_local_spelling_now_admits_cloud_FREE_routes(self):
+        """Owner order 2026-08-24 retired 'local'; this pins what changed.
+
+        'local' used to mean LOOPBACK ONLY, and the assertion that used to live
+        here - a remote groq route is excluded - was the very rule that shut all
+        126 credentialed cloud free-tier routes out of the mode the launcher
+        offered as its DEFAULT, pinning runs to CPU-only Ollama (measured 20+
+        minutes for one large-file review). The spelling still has to be
+        ACCEPTED, because a shortcut or scheduled task nobody found must degrade
+        rather than die on argparse exit 2 - but it now resolves to 'free', and
+        free means every free route, not just the loopback ones.
+        """
         import flexfactor_rotation as fr
         remote = dict(self._route("groq/llama-x"))
         remote["base_url"] = "https://api.groq.com/openai/v1"
-        self.assertIn("local", ff._route_unusable_reason(
-            fr.Route.from_json(remote), "local"))
+        self.assertEqual(ff._route_unusable_reason(
+            fr.Route.from_json(remote), "local"), "",
+            "a REMOTE free-tier route is exactly what the retired 'local' mode "
+            "wrongly excluded; under 'free' it must be admitted")
         local = self._route("ollama/qwen", api="ollama", auth_env="",
                             cost="local-unlimited")
         self.assertEqual(ff._route_unusable_reason(
             fr.Route.from_json(local), "local"), "")
+        # What 'local' must still refuse: anything billable. The retired name
+        # resolves to free, so the cost promise it always implied still holds.
+        paid = dict(self._route("openai_api/gpt-4o", cost="paid-metered"))
+        self.assertNotEqual(ff._route_unusable_reason(
+            fr.Route.from_json(paid), "local"), "")
 
 
 class FreeReviewPoolTests(unittest.TestCase):
@@ -12554,19 +12601,56 @@ class EvidenceRuntimeTests(unittest.TestCase):
         ev = self._ev()
         with self.assertRaisesRegex(RuntimeError, "credentials are absent"):
             ev.resolve_runtime_mode("paid", "anthropic", None, False, True)
-        local = ev.resolve_runtime_mode("local", "ollama", "qwen", False, True)
-        self.assertTrue(local.local_only)
-        self.assertEqual(local.mode, "local")
+        # The retired spelling still RESOLVES (a saved command must not die) but
+        # it now records the mode the operator was actually offered.
+        free = ev.resolve_runtime_mode("local", "ollama", "qwen", False, True)
+        self.assertEqual(free.mode, "free")
+        self.assertTrue(free.local_only, "loopback was the only free capacity")
+
+    def test_free_mode_records_egress_truthfully_when_cloud_free_is_reachable(self):
+        """`local_only` is what the evidence record claims about EGRESS, so it
+        has to track the resolved run and not the mode name. A free run that
+        reached a cloud free tier did send bytes off this machine; recording it
+        as local-only would be a false record, not a conservative one."""
+        ev = self._ev()
+        mixed = ev.resolve_runtime_mode("free", "anthropic", None, False,
+                                        local_available=True,
+                                        cloud_free_available=True)
+        self.assertEqual(mixed.mode, "free")
+        self.assertFalse(mixed.local_only)
+        cloud_only = ev.resolve_runtime_mode("free", "anthropic", None, False,
+                                             local_available=False,
+                                             cloud_free_available=True)
+        self.assertEqual(cloud_only.mode, "free")
+        self.assertFalse(cloud_only.local_only)
+        with self.assertRaisesRegex(RuntimeError, "no free route"):
+            ev.resolve_runtime_mode("free", "anthropic", None, True, False)
+        with self.assertRaisesRegex(ValueError, "free or paid"):
+            ev.resolve_runtime_mode("cheap", "anthropic", None, True, True)
 
     def test_audit_cli_exposes_runtime_mode_boundary(self):
-        captured = {}
-        real = ff.run_audit
-        ff.run_audit = lambda args: captured.setdefault("args", args) or 0
-        try:
-            ff.main(["audit", "--program", ".", "--model-mode", "local", "--yes"])
-        finally:
-            ff.run_audit = real
-        self.assertEqual(captured["args"].model_mode, "local")
+        def _parsed(*extra):
+            captured = {}
+            real = ff.run_audit
+            ff.run_audit = lambda args: captured.setdefault("args", args) or 0
+            try:
+                ff.main(["audit", "--program", ".", *extra, "--yes"])
+            finally:
+                ff.run_audit = real
+            return captured["args"]
+
+        # The two the owner asked for, reaching the CLI verbatim.
+        self.assertEqual(_parsed("--model-mode", "free").model_mode, "free")
+        self.assertEqual(_parsed("--model-mode", "paid").model_mode, "paid")
+        # Omitted -> free. The default may never be the one that spends.
+        self.assertEqual(ff.normalize_model_mode(_parsed().model_mode), "free")
+        # A retired spelling must PARSE (argparse exit 2 is the launcher-drift
+        # trap: a shortcut nobody found would just stop working) and then
+        # normalize to free rather than being honoured as a third mode.
+        for retired in ("auto", "local"):
+            self.assertEqual(
+                ff.normalize_model_mode(_parsed("--model-mode", retired).model_mode),
+                "free", f"'{retired}' must degrade to free, not survive as a mode")
 
     def test_paid_runtime_never_falls_back_to_free_proxy_or_ollama(self):
         class Args:

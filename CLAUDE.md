@@ -481,6 +481,55 @@ the apply test and independent of it.
   (System event 1074), which is why `status.json` holds live phases instead of
   the atexit obituary's `DIED ...`.
 
+## TWO model modes, `free` and `paid` (owner order 2026-08-24)
+
+> "currently I am given three choices as for pay, local is a choice and auto is
+>  a choice. I don't fully understand the difference. My choices should be
+>  either paid or free. that's it. paid uses both anthropic and openai
+>  exclusively until credits expire and free uses free exclusively."
+
+`MODEL_MODES = ("free", "paid")`. `normalize_model_mode()` is the single
+entrypoint; `model_mode_refusal(route, mode)` is the boundary, split out of
+`_route_unusable_reason` so it can be tested ALONE (that function returns early
+for missing credentials / unfit models / unbuildable transports, so asking it
+"did the mode allow this?" cannot distinguish an admission from a mode that
+never got a look in).
+
+- **`free` (DEFAULT)** — `cost_class` in `{free-tier, local-unlimited, free}`.
+  Cloud free tiers (NVIDIA NIM 79, Gemini 26, OpenRouter free 16, Groq 7,
+  Cerebras 2) plus loopback FCC/Ollama. Enforced by EXCLUSION, never by
+  ordering: `COST_ORDER` only decides what is tried FIRST, so under ordering
+  alone a paid route stays reachable the moment free capacity runs out — the
+  exact night this rule was written after. This is the enforcement point for the
+  standing "FREE must never silently become PAID" rule.
+- **`paid`** — `backend` in `{anthropic_sub, anthropic_api, openai_api,
+  claude-code, codex-cli}`: the owner's OWN two accounts, including the
+  `claude`/`codex` CLI lanes from `catalog.auto.json`. Paid still rotates until
+  exhausted (2026-08-21 order), bounded by `--max-cost` + pool cooldown — that
+  order is not repealed, it is SCOPED to this mode.
+- **Deliberately in NEITHER mode:** `openrouter` paid-metered (385 routes) and
+  `cursor`. Resellers, not the owner's accounts. `subscription` cost_class is
+  excluded from `free` even though `flexfactor_rotation.FREE_COST_CLASSES`
+  counts it free — that tuple reasons about MARGINAL cost, these modes reason
+  about WHOSE ACCOUNT it is.
+- **TRAP — a route in neither mode is silently retired.** `claude-code` /
+  `codex-cli` carry `cost_class='subscription'` (excluded from free, correctly)
+  AND a backend name of their own, so omitting them from `_PAID_MODE_BACKENDS`
+  stranded two whole lanes in nothing at all. Any new backend must be placed in
+  exactly one mode ON PURPOSE. Pinned by `flexfactor_model_mode_tests.py`.
+- **Retired spellings `auto` and `local` are ACCEPTED, never OFFERED.** They
+  normalize to `free` with a stderr warning. `argparse` keeps them in `choices`
+  with `metavar="{free,paid}"` so `--help` shows two and a stale shortcut or
+  scheduled task degrades instead of dying on exit 2 (the launcher-drift trap).
+  `local` used to mean LOOPBACK ONLY — it shut out all 126 credentialed cloud
+  free-tier routes, pinned runs to CPU-only Ollama (20+ min for one large-file
+  review), and it was the launcher's DEFAULT, so the safe-sounding choice was
+  the slowest possible one.
+- **Both surfaces move together.** `flexfactor_launch.ps1` (the only launcher
+  that passes `--model-mode`) and `flexfactor_evidence.resolve_runtime_mode`
+  speak the same two modes. A second mode vocabulary anywhere is how the
+  launcher-drift trap starts.
+
 ## Pool-first rotation is the DEFAULT provider (2026-08-19, owner order 2026-08-18)
 
 `build_audit_providers`' free-first path now tries rotation FIRST: when the
@@ -499,7 +548,10 @@ catalog's `strong` author tier; judging rides `light`.
 - **Routes are filtered BEFORE the Rotator sees them** (`_route_unusable_reason`):
   unsupported api (gemini — no provider class), missing `auth_env` credential,
   paid cost class (rotation stays FREE-ONLY, `allow_paid=False` — never
-  auto-promote), non-loopback in `--model-mode local`. An unbuildable route
+  auto-promote), and the MODE BOUNDARY (`model_mode_refusal`, 2026-08-24): in
+  `--model-mode free` every billable route is excluded by `cost_class`, in
+  `paid` every backend that is not one of the owner's own Anthropic/OpenAI
+  accounts is excluded. An unbuildable route
   left in would be selected, fail, and burn a cooldown — across 600+ routes
   the first sweep becomes an error tour. Exclusions are counted and printed.
 - **The judge sentinel must never reach the wire.** `_judge()` passes
@@ -1589,10 +1641,17 @@ now.
   `PURPOSE_GAP_SCHEMA`: all three TIMED OUT at 300s rather than 400ing, so the
   shape that produced the 400 was not reproduced. The body fix makes the next
   occurrence self-describing; it does not claim to have cured it.
-- **OPEN: no paid route was ever reached** in the GrantFlow run despite
-  `--model-mode auto` (paid-first) — `spend_usd 0.0`, and no `openrouter:credits`
-  / `openai_api:paid-metered` / `anthropic:max-plan` route appears anywhere in
-  its ledger, while every free allowance was exhausted. Not investigated here.
+- **~~OPEN~~ ADDRESSED BY DESIGN 2026-08-24: no paid route was ever reached** in
+  the GrantFlow run despite `--model-mode auto` (paid-first) — `spend_usd 0.0`,
+  and no `openrouter:credits` / `openai_api:paid-metered` / `anthropic:max-plan`
+  route appears anywhere in its ledger, while every free allowance was
+  exhausted. `auto` is the mode that produced this: it promised free-first with
+  paid allowed to rotate in and delivered neither. It is retired — the modes are
+  now `free` and `paid`, each an exclusion rather than an ordering, so "was paid
+  reachable?" is answerable per mode instead of per run. HONEST LIMIT: this
+  removes the AMBIGUITY that produced the symptom; no live paid run has been
+  measured since, so the underlying reachability of the paid pools is CHANGED,
+  not VERIFIED.
 - **OPEN: `--parallel 10`** points ten concurrent audits at ONE shared free
   allowance and ONE shared rotation state file. Every fix above is a
   per-failure remedy; the contention itself is untouched.

@@ -49,7 +49,7 @@
 
 ### E. Secret egress to a cloud provider
 - `flexfactor_egress` scans `instruction`/`prompt` of `complete`/`grade`/`structured` in every cloud provider; default refuses (`EgressBlockedError`), `--redact`, `--allow-sensitive`, `FLEXFACTOR_ALLOW_EGRESS`, policy `allow_egress`.
-- Ollama is loopback-only; `--model-mode local` removes paid credentials before provider construction.
+- Ollama is loopback-only; `--model-mode free` (the DEFAULT, and what the retired `local`/`auto` spellings now resolve to) removes paid credentials before provider construction and excludes every billable route from the catalog.
 - `flexfactor_sandbox.scrub_env` keeps credentials out of target processes; `_write_run_manifest`/evidence redact via `flexfactor_evidence._redact`.
 - **Residual:** block tier is high-confidence only; low-confidence PII can pass unless redact mode.
 

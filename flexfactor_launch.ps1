@@ -117,7 +117,7 @@ function Invoke-FlexFactorJob {
 # flexfactor_run.py is a thin shim onto flexfactor.run_cli (the same entry the
 # installed console script uses); directed orchestration is native to the runtime.
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
-$selectedRuntimeMode = "local"
+$selectedRuntimeMode = "free"   # two modes only: free (default) / paid
 
 Write-Host ""
 Write-Host "  ____  _           ____         _             " -ForegroundColor Cyan
@@ -161,11 +161,24 @@ $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
 # clears the loopback route. The CLI receives the same boundary and refuses
 # to cross it even if environment variables are later changed.
 if ($mode -eq "3" -or $mode -eq "4") {
-    $selectedRuntimeMode = Read-Host "Model mode [local / paid / auto] (Enter = local)"
-    if ([string]::IsNullOrWhiteSpace($selectedRuntimeMode)) { $selectedRuntimeMode = "local" }
+    # TWO choices, and each says what it costs (owner order 2026-08-24). The old
+    # menu offered local / paid / auto, and the two non-paid names did not mean
+    # what they looked like: 'local' was LOOPBACK ONLY (it shut out all 126
+    # credentialed cloud free-tier routes and pinned the run to CPU-only Ollama)
+    # and it was the DEFAULT, while 'auto' was free-first-then-paid and in
+    # practice reached neither - the 2026-08-24 run spent $0.00 with every free
+    # allowance exhausted and reviewed 0 of 3537 files.
+    $selectedRuntimeMode = Read-Host "Model mode [free / paid] (Enter = free)"
+    if ([string]::IsNullOrWhiteSpace($selectedRuntimeMode)) { $selectedRuntimeMode = "free" }
     $selectedRuntimeMode = $selectedRuntimeMode.ToLowerInvariant()
-    if ($selectedRuntimeMode -notin @("local", "paid", "auto")) {
-        Write-Host "Unknown model mode '$selectedRuntimeMode'." -ForegroundColor Red
+    # Retired spellings stay ACCEPTED but are never OFFERED, so muscle memory or
+    # a saved command does not dead-end on 'exit 2'. Both meant free in practice.
+    if ($selectedRuntimeMode -in @("local", "auto")) {
+        Write-Host "  '$selectedRuntimeMode' is retired - running as 'free'." -ForegroundColor Yellow
+        $selectedRuntimeMode = "free"
+    }
+    if ($selectedRuntimeMode -notin @("free", "paid")) {
+        Write-Host "Unknown model mode '$selectedRuntimeMode'. Choose free or paid." -ForegroundColor Red
         Read-Host "Press Enter to close"; exit 2
     }
     if ($selectedRuntimeMode -eq "paid") {
@@ -178,13 +191,14 @@ if ($mode -eq "3" -or $mode -eq "4") {
             Write-Host "Paid mode requested, but no captured paid credential is available." -ForegroundColor Red
             Read-Host "Press Enter to close"; exit 1
         }
-        Write-Host "  Paid mode: only credentialed vendor APIs are permitted; no local fallback." -ForegroundColor Yellow
-    } elseif ($selectedRuntimeMode -eq "local") {
+        Write-Host "  Paid mode: your Anthropic and OpenAI accounts ONLY, until their credits" -ForegroundColor Yellow
+        Write-Host "             expire. No free routes, no Ollama, no OpenRouter resale." -ForegroundColor Yellow
+    } else {
         $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = ""
         $env:FLEXFACTOR_FALLBACK_OPENAI_KEY = ""
-        Write-Host "  Local mode: free loopback/Ollama routes only; paid rescue is disabled." -ForegroundColor Green
-    } else {
-        Write-Host "  Auto mode: prefer free/local routes, then configured paid credentials." -ForegroundColor Yellow
+        Write-Host "  Free mode: free routes ONLY - cloud free tiers (NVIDIA NIM, Gemini, Groq," -ForegroundColor Green
+        Write-Host "             Cerebras, OpenRouter free) plus local Ollama/FCC. Paid routes are" -ForegroundColor Green
+        Write-Host "             filtered out, so this run cannot spend." -ForegroundColor Green
     }
 }
 
