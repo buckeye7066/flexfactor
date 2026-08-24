@@ -68,6 +68,26 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The provider's allowance for this key is spent (OpenRouter's free tier is balance-bound). "
      "The rotator cools that pool and moves on; it recovers when the allowance resets. Do not "
      "add paid credit to compensate."),
+    # THE 55 CLI FAILURES OF 2026-08-24 (local-ai-factory run 21424: 30x
+    # cli/codex, 23x cli/claude-code). Every one was filed kind=provider with
+    # "no known fix", because nothing matched. Neither is the provider's doing:
+    # a CLI route is a local binary, its login and its deadline.
+    (r"CliUnavailable.*(is not supported when using|not supported with your|"
+     r"not available on your plan|Invalid API key|Please run .*login|not logged in)",
+     KIND_ENV,
+     "The local CLI is installed but cannot serve this account as configured (measured: codex "
+     "refusing its configured model for a ChatGPT account). Fix the CLI's own login/model "
+     "settings, or take the route out of rotation: FLEXFACTOR_ROTATION_EXCLUDE=<fragment> for "
+     "that one route, or FLEXFACTOR_ROTATION_EXTENSIONS=0 for every CLI/Cursor route. "
+     "FlexFactor benches the route for an hour after the first failure, so a run no longer "
+     "spends a turn on it per call."),
+    (r"CliUnavailable.*(exceeded \d+s and was killed|returned no output|not found on PATH)",
+     KIND_ENV,
+     "The local CLI did not answer: it was killed at its deadline, returned nothing, or is not "
+     "on PATH. Raise/lower the CLI timeout for that transport, or take the route out of rotation "
+     "(FLEXFACTOR_ROTATION_EXCLUDE=<fragment>, or FLEXFACTOR_ROTATION_EXTENSIONS=0 for all "
+     "CLI/Cursor routes). FlexFactor benches the route for an hour after the first failure - "
+     "measured 2026-08-24, 23 kills at 600s each in one run."),
     (r"\b403\b|PermissionDenied|not permitted|gated", KIND_PROVIDER,
      "This route is gated or not permitted for the key in use. Rotation skips it after strikes; "
      "to stop retrying it, exclude it (FLEXFACTOR_ROTATION_EXCLUDE=<fragment>) or have AI Time's "
@@ -85,6 +105,19 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The catalog lists a model that cannot serve chat completions (realtime/audio/embedding "
      "products). Add its family to the unfit list (flexfactor_directed._UNFIT_CODE_PATTERNS and "
      "the Factory Deck twin) so rotation never selects it."),
+    # MORE SPECIFIC THAN THE GENERIC 429 BELOW, SO IT MUST STAY ABOVE IT.
+    # 574 of the 898 ledger entries across the two 10-program audits of
+    # 2026-08-24 are this ONE refusal, re-tried: OpenRouter's free tier is a
+    # single account-wide DAILY allowance, and AI Time's catalog spells it as 18
+    # per-model pools, so the rotator re-tested a dead daily quota once per pool
+    # per call. The generic row below called that "nothing to fix".
+    (r"free-models-per-day|_free_tier_daily|free_tier_requests", KIND_BUDGET,
+     "The account's FREE DAILY allowance for that backend is spent - one allowance, however "
+     "many models the catalog lists under it. FlexFactor now benches the whole allowance until "
+     "the reset the provider named (X-RateLimit-Reset) instead of re-testing it every 60s, and "
+     "the run continues on other backends. It returns by itself at the daily reset; do not add "
+     "paid credit to compensate. If a run must not depend on it, point the run at a backend "
+     "with headroom rather than waiting."),
     (r"\b429\b|rate.?limit|Too Many Requests", KIND_PROVIDER,
      "Rate-limited. The rotator cools the pool down and moves on; nothing to fix unless it recurs "
      "on every pool, which means the free tiers are exhausted for now."),
