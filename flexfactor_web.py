@@ -202,6 +202,31 @@ class Sampler:
 
 # ------------------------------------------------------------ payload
 
+# The per-program error ledger, read straight off disk. Kept small on
+# purpose: the phone gets the newest few entries plus the counts, and the run
+# directory holds the rest - shipping 148 entries over a phone link to render
+# three of them would be waste, and re-formatting them here would be a second
+# implementation to drift from the first.
+_LEDGER_ROWS = 3
+
+
+def _ledger_view(p: dict) -> dict:
+    try:
+        import flexfactor_errors as fe
+    except Exception:  # noqa: BLE001 - viewer feature, never a 500
+        return {"available": False, "total": 0, "headline": "", "rows": []}
+    try:
+        run_dir = str(p.get("run_dir") or "")
+        if not run_dir or not os.path.isdir(run_dir):
+            run_dir = fe.find_run_dir(str(p.get("name") or ""))
+        entries = fe.load_entries(run_dir)
+        return {"available": True, "total": len(entries),
+                "headline": fe.headline(entries),
+                "rows": fe.ui_entries(entries, _LEDGER_ROWS)}
+    except Exception:  # noqa: BLE001
+        return {"available": False, "total": 0, "headline": "", "rows": []}
+
+
 def build_state(sampler: Sampler) -> dict:
     progs, mtime = dash.read_status(sampler.status_path)
     now = time.time()
@@ -279,6 +304,12 @@ def build_state(sampler: Sampler) -> dict:
             "cost": float(p.get("cost") or 0.0),
             "cap": float(p.get("cap") or 0.0),
 
+            # 6b. THE ERROR BOX, phone edition (owner 2026-08-23). Same
+            # reader as the desktop dashboard - flexfactor_errors owns both, so
+            # the box on the phone can never say something different from the
+            # box at the desk or from errors.md itself.
+            "ledger": _ledger_view(p),
+
             # 7. what it is doing right now
             "current_file": p.get("current_file") or "",
             "cycles": p.get("cycles"),
@@ -337,6 +368,18 @@ svg{display:block;width:100%;height:38px}
 .sev{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .sev span{font-size:11px;padding:2px 8px;border-radius:999px;background:#1c2530}
 .err{color:#f85149;font-weight:600}
+.errhead{color:#ff7b72;font-weight:600;font-size:12px;margin:2px 0 6px}
+.errrow{background:#1a1113;border:1px solid #30363d;border-radius:6px;
+        padding:6px 8px;margin-bottom:6px}
+.errkind{font-weight:600;font-size:12px;margin-bottom:2px}
+.errmsg{font-family:ui-monospace,Consolas,monospace;font-size:12px;
+        color:#c9d1d9;word-break:break-word}
+.errfix{color:#7ee787;font-size:12px;margin-top:2px}
+.k-flexfactor-defect{color:#f85149}
+.k-program-defect{color:#ff7b72}
+.k-provider,.k-budget{color:#d29922}
+.k-environment{color:#58a6ff}
+.k-unknown{color:#8b949e}
 .ok{color:#3fb950;font-weight:600}
 .warnbox{background:#3a1d1d;border:1px solid #f85149;color:#ffb4ae;
  padding:9px 11px;border-radius:10px;font-size:12px;margin-top:10px}
@@ -443,6 +486,30 @@ function card(p){
        (c.controls_executed||0)+'/'+(c.controls||0)+' controls</div>'+
        '<div class="dim">Impact '+(im.affected_files||0)+' files · '+(im.tests||0)+' tests · commit '+
        esc((e.final_commit||'').slice(0,12)||'—')+'</div>';
+  }
+
+  // 6b. errors — what failed, whose code, and the suggested fix
+  var L=p.ledger||{};
+  h+='<div class="lbl">Errors — this run\u0027s ledger</div>';
+  if(!L.available){
+    h+='<div class="dim">ledger unavailable</div>';
+  }else if(!L.total){
+    h+='<div class="dim">no errors recorded — nothing has gone wrong yet</div>';
+  }else{
+    h+='<div class="errhead">'+esc(L.headline)+'</div>';
+    (L.rows||[]).forEach(function(r){
+      h+='<div class="errrow"><div class="errkind k-'+esc(r.kind)+'">#'+esc(r.n)+
+         ' '+esc(r.kind)+' / '+esc(r.phase)+'</div>'+
+         '<div class="errmsg">'+esc(r.error)+'</div>'+
+         '<div class="dim">code: '+esc(r.where)+'</div>'+
+         '<div class="errfix">fix: '+
+         (r.fix_source==="model"?"(unverified) ":"")+
+         esc(r.fix||"no known fix")+'</div></div>';
+    });
+    if(L.total>(L.rows||[]).length){
+      h+='<div class="dim">+'+(L.total-(L.rows||[]).length)+
+         ' more in the run\u0027s errors.md</div>';
+    }
   }
 
   // 7. right now

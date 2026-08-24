@@ -1,5 +1,61 @@
 # FlexFactor - Current state vs. purpose (gap register)
 
+## 0. UPDATE 2026-08-23 (supersedes the counts below; the analysis still stands)
+
+Everything in sections 1-5 was written against HEAD `9875420` on 2026-08-22.
+Re-measured today at `a03ee7c` + this change. What moved:
+
+| Then (2026-08-22) | Now (2026-08-23, measured) |
+|---|---|
+| main suite 887 collected, **9 FAIL** | `flexfactor_tests.py` **888 run, 0 failures**, 8 skipped |
+| module suites run individually | **29 test modules, all green - 1,395 tests, 0 failures** (counted from the run, not estimated): the CI list plus errors / structural / openai-param / intent / paid-first / quality / localbench / glimmer / config-surface / ledger-routing / dashboard |
+| CI status not recorded here | `production-readiness` and `rotation-extensions` **green on main** (run 32668261872, 2026-08-23) |
+| section 5 item 9 "9 main-suite failures" | **CLOSED** |
+| section 5 item 3 "dashboard has no panels for the newer evidence" | **still open for chunk/coverage/journey panels**; the dashboard now DOES carry the run's error ledger, per program |
+
+Closed today, each with the evidence that closed it:
+
+1. **`flexfactor_errors` was never in the wheel.** It is imported at runtime by
+   `_start_error_ledger`, so an installed FlexFactor printed
+   `[errors] ledger unavailable: No module named 'flexfactor_errors'` and
+   recorded nothing - the error ledger did not exist outside a source checkout.
+   Added to `py-modules`; `test_the_error_ledger_loads_from_the_wheel` imports
+   it from a fresh venv outside the checkout, and
+   `test_every_module_the_runtime_imports_is_in_the_wheel` pins the CLASS (the
+   CI import step could not: it imports the list, so the list was its own
+   oracle). Verified by removing the entry again - the test reddens.
+2. **The error ledger was process-global under `--parallel`.** Several programs
+   audit in one process; the last to open a ledger owned every other program's
+   errors. Now a ContextVar + `_CtxThreadPoolExecutor`
+   (`flexfactor_ledger_routing_tests.py`, including a control test that shows a
+   stock executor mis-filing).
+3. **`gitignore_protects` (high) FAILED on FlexFactor itself** - `.env` was not
+   ignored in a repo whose every credential comes from the environment. Fixed,
+   asserted through `git check-ignore`, not by grepping `.gitignore`.
+4. **`config_documented` (medium) FAILED** - no `.env.example`. Written, and
+   kept honest in both directions by `flexfactor_config_surface_tests.py`
+   (it found 8 runtime variables that had never been documented anywhere).
+5. **`license_present` (low) FAILED** - no LICENSE file, while `pyproject.toml`
+   had declared `Proprietary` all along. Written to match.
+
+FlexFactor's own readiness rubric, run on FlexFactor with real build evidence
+(`python -m compileall -q .` exit 0) and the 29-module battery as the test
+evidence: **11 of 11 evaluated gates PASS, 2 N/A, no blockers** (was 6 pass /
+9 evaluated with 3 blockers this morning).
+
+Not closed, and deliberately named rather than quietly dropped:
+
+- `pytest` collects only `flexfactor_tests.py` (`python_files` in
+  `pyproject.toml`). That is a real choice - the modules share process state -
+  but it means the *detected* test command (`python -m pytest -q`, 880 passed)
+  exercises a fraction of the battery CI runs. The binding gate is the workflow,
+  not pytest.
+- Windows network isolation is still `best-effort-env` (section 5 item 1).
+- Sections 5.2 (Linux bwrap unrun here), 5.4 (resume hash-verification scope),
+  5.5 (scout mutation path outside the orphan-WIP transaction) and 5.7 (purpose
+  `gh` runner outside the broker) are unchanged and still open.
+
+
 Tree: HEAD `9875420` (feat: one canonical packaged runtime) + uncommitted
 changes to flexfactor.py, flexfactor_cmdpolicy.py, flexfactor_evidence.py,
 flexfactor_partial.py, flexfactor_purpose.py, flexfactor_tests.py,

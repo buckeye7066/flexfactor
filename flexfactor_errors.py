@@ -306,3 +306,131 @@ class ErrorLedger:
         if not self.entries:
             return "[errors] none recorded"
         return f"[errors] {len(self.entries)} recorded -> {self.md_path}"
+
+
+# --------------------------------------------------------------------------- #
+# READING the ledger back (owner 2026-08-23: "set the error reports for
+# flexfactor as communication in a box I can see below each program being run")
+#
+# The ledger already wrote the truth to disk; what was missing was a way to SEE
+# it without opening a file mid-run. These readers are the single implementation
+# behind every viewer (Tk dashboard, phone web dashboard), so the box under a
+# program can never drift from what errors.md says.
+#
+# Every function here is read-only, stdlib-only, and returns something usable on
+# any failure -- a viewer must never crash, and must never block, because a
+# ledger is mid-write. `_write_locked` writes via temp+replace, so a reader
+# either sees the previous complete file or the new complete file, never a torn
+# one; a ValueError still falls through to "no entries" rather than an exception.
+# --------------------------------------------------------------------------- #
+
+def slug_for(program: str) -> str:
+    """The run-directory slug flexfactor.py builds for a program name."""
+    return "".join(c.lower() if c.isalnum() else "-" for c in str(program or "")).strip("-")
+
+
+def find_run_dir(program: str, runs_root: str = "") -> str:
+    """Newest run directory for `program`, or "" when there is none.
+
+    Used only as a FALLBACK: the audit publishes `run_dir` into status.json, and
+    a viewer should prefer that. This exists so the box still works for a run
+    started by an older build, or when the status entry has not been written yet.
+    Newest by mtime, because a program audited repeatedly has many run dirs and
+    only the current one is the answer to "what is going wrong right now".
+    """
+    root = runs_root or os.path.join(os.path.expanduser("~"), ".flexfactor", "runs")
+    slug = slug_for(program)
+    if not slug or not os.path.isdir(root):
+        return ""
+    best, best_m = "", -1.0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return ""
+    for name in names:
+        if not name.startswith(slug + "-"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            m = os.path.getmtime(os.path.join(path, "errors.json"))
+        except OSError:
+            try:
+                m = os.path.getmtime(path)
+            except OSError:
+                continue
+        if m > best_m:
+            best, best_m = path, m
+    return best
+
+
+def load_entries(run_dir: str) -> List[Dict[str, Any]]:
+    """Entries recorded so far in `run_dir`. [] on any problem."""
+    if not run_dir:
+        return []
+    try:
+        with open(os.path.join(run_dir, "errors.json"), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def counts_by_kind(entries: List[Dict[str, Any]]) -> Dict[str, int]:
+    """{kind: n}, so a viewer can say '3 ours, 140 the provider's' rather than
+    one undifferentiated number -- the distinction that decides whether the
+    owner has anything to act on."""
+    out: Dict[str, int] = {}
+    for e in entries or []:
+        k = str(e.get("kind") or KIND_UNKNOWN)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def where_of(entry: Dict[str, Any]) -> str:
+    """'which code is responsible', as one short string."""
+    r = entry.get("responsible") or {}
+    if r.get("file"):
+        fn = r.get("function") or ""
+        return f"{r['file']}:{r.get('line', '?')}" + (f" {fn}()" if fn else "")
+    if entry.get("program_file"):
+        return str(entry["program_file"])
+    if entry.get("route"):
+        return f"route {entry['route']}"
+    return "not attributable"
+
+
+def ui_entries(entries: List[Dict[str, Any]], limit: int = 3,
+               kinds: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """The last `limit` entries as flat strings a panel can draw directly.
+
+    NEWEST FIRST: a live run appends, and the useful question during one is
+    "what just broke", not "what broke first". Each row carries the three things
+    the owner asked for and nothing else: what failed, which code is
+    responsible, and the suggested fix.
+    """
+    rows: List[Dict[str, str]] = []
+    pool = [e for e in (entries or [])
+            if not kinds or str(e.get("kind") or "") in kinds]
+    for e in reversed(pool[-max(0, int(limit)):] if limit else pool):
+        err = str(e.get("error") or "").strip().splitlines()
+        rows.append({
+            "n": str(e.get("n") or ""),
+            "phase": str(e.get("phase") or ""),
+            "kind": str(e.get("kind") or KIND_UNKNOWN),
+            "error": (err[0] if err else "(no message)"),
+            "where": where_of(e),
+            "fix": " ".join(str(e.get("suggestion") or "").split()),
+            "fix_source": str(e.get("suggestion_source") or ""),
+        })
+    return rows
+
+
+def headline(entries: List[Dict[str, Any]]) -> str:
+    """One line for a panel header: total plus the split that matters."""
+    if not entries:
+        return "no errors recorded"
+    counts = counts_by_kind(entries)
+    order = [KIND_TOOL, KIND_PROGRAM, KIND_PROVIDER, KIND_BUDGET, KIND_ENV, KIND_UNKNOWN]
+    parts = [f"{counts[k]} {k}" for k in order if counts.get(k)]
+    return f"{len(entries)} error{'' if len(entries) == 1 else 's'}: " + ", ".join(parts)

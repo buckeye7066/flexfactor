@@ -25,6 +25,14 @@ import subprocess
 import sys
 import time
 
+# The error ledger's own reader. Stdlib-only and never imports flexfactor,
+# so this stays a pure viewer. Soft import: an older tree without the module
+# must still get a working dashboard, just without the error box.
+try:
+    import flexfactor_errors as _fe
+except Exception:  # noqa: BLE001 - a missing viewer feature is not a crash
+    _fe = None
+
 STATUS_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.expanduser("~"), ".flexfactor", "status.json")
 
@@ -57,6 +65,19 @@ BUDGET = "#d29922"   # amber
 BUDGET_OVER = "#f85149"  # red when at/over cap
 DONE = "#3fb950"
 ERRCOL = "#f85149"
+ERRBOX = "#1a1113"    # error box fill - a shade warmer than PANEL
+ERRHEAD = "#ff7b72"
+FIXCOL = "#7ee787"    # the suggested fix reads as the actionable line
+
+# Which kind of error the entry was filed under, in the box's accent color.
+KIND_COLOR = {
+    "flexfactor-defect": "#f85149",   # ours - the only kind that is a bug here
+    "program-defect": "#ff7b72",      # the audited program's
+    "provider": "#d29922",            # a route failed; rotation absorbs it
+    "budget": "#d29922",
+    "environment": "#58a6ff",
+    "unknown": "#8b949e",
+}
 
 # Severity colors, drawn in this order.
 SEV_ORDER = ["critical", "high", "medium", "low", "info"]
@@ -144,6 +165,168 @@ def _attempt_info_uncached(p: dict) -> str:
         return " - ".join(bits)
     except Exception:
         return ""
+
+
+# --------------------------------------------------------------------------- #
+# THE ERROR BOX (owner 2026-08-23: "set the error reports for flexfactor as
+# communication in a box I can see below each program being run")
+#
+# The run already writes a full ledger -- what failed, which code is
+# responsible, and a suggested fix -- to <run dir>/errors.{json,md}. Until now
+# that could only be read by opening the file after the fact, so the live panel
+# said "errors: 3" and nothing about WHAT. This reads the same errors.json the
+# report is built from and draws the last few entries under the program.
+#
+# Rules this inherits from the rest of the file:
+#   * NO per-frame disk I/O. redraw() runs at ~25 fps; the read is behind a TTL
+#     cache, same as attempt_info().
+#   * READ-ONLY. This viewer opens errors.json for reading and nothing else.
+#   * NO unlabelled scopes. The panel's "errors" counter counts FILES that
+#     errored during review/fix; the ledger counts EVERY recorded failure
+#     including absorbed provider retries. Two different numbers, so they are
+#     labelled "file errors" and "run ledger" and never sit unlabelled together.
+# --------------------------------------------------------------------------- #
+_ERR_TTL_S = 2.0
+# key -> (expires_at, value, stat signature of errors.json when it was parsed)
+_ERR_CACHE: dict[str, tuple[float, dict, tuple]] = {}
+ERR_ROWS = 3          # most entries drawn (fewer when they do not fit)
+ERR_ROW_H = 46        # px one entry needs: kind line, error, code, fix
+ERR_BOX_H = 200       # px reserved at the bottom (fits ERR_ROWS entries)
+
+
+def _run_dir_for(p: dict) -> str:
+    """Where this program's ledger lives. Status first, disk-scan as fallback."""
+    rd = str(p.get("run_dir") or "")
+    if rd and os.path.isdir(rd):
+        return rd
+    if _fe is None:
+        return ""
+    return _fe.find_run_dir(str(p.get("name") or ""))
+
+
+def _errors_uncached(p: dict) -> dict:
+    if _fe is None:
+        return {"headline": "", "rows": [], "md_path": "", "available": False}
+    run_dir = _run_dir_for(p)
+    entries = _fe.load_entries(run_dir)
+    return {"headline": _fe.headline(entries),
+            "rows": _fe.ui_entries(entries, ERR_ROWS),
+            "total": len(entries),
+            "md_path": os.path.join(run_dir, "errors.md") if run_dir else "",
+            "available": True}
+
+
+def _ledger_stat(p: dict) -> tuple:
+    """(mtime, size) of this program's errors.json - the cheap change signal."""
+    try:
+        st = os.stat(os.path.join(_run_dir_for(p), "errors.json"))
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ()
+
+
+def errors_for(p: dict) -> dict:
+    """This program's ledger view, recomputed at most every _ERR_TTL_S - and
+    only when the file actually changed.
+
+    A long run's ledger grows without bound (measured: 148 entries = 472 KB,
+    5.7 ms to parse; tracebacks are capped per entry, not per file). Re-parsing
+    that for every program every couple of seconds for hours is work with no
+    output, so past the TTL we stat first and only re-read when mtime or size
+    moved. On this machine a stat is single-digit milliseconds and a parse is
+    not, and the ledger is quiet most of the time.
+    """
+    key = program_key(p)
+    now = time.monotonic()
+    hit = _ERR_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    sig = _ledger_stat(p)
+    if hit and hit[2] == sig and sig:
+        _ERR_CACHE[key] = (now + _ERR_TTL_S, hit[1], sig)   # unchanged: keep it
+        return hit[1]
+    try:
+        value = _errors_uncached(p)
+    except Exception:  # noqa: BLE001 - the box must never take the panel down
+        value = {"headline": "", "rows": [], "md_path": "", "available": False}
+    _ERR_CACHE[key] = (now + _ERR_TTL_S, value, sig)
+    return value
+
+
+_FONT_CACHE: dict = {}
+
+
+def _measure(spec, text: str):
+    """Width of `text` in font `spec`, or None when Tk cannot tell us.
+
+    Measured, not estimated: the first screenshot of this box (2026-08-23) had
+    the fix line running past the panel edge and over the next program, because
+    a fixed characters-per-pixel guess is wrong for a proportional font at any
+    DPI but the one it was tuned on. Font objects are cached; `measure` is one
+    cheap Tcl call."""
+    try:
+        import tkinter.font as tkfont
+    except Exception:  # noqa: BLE001 - no Tk at all
+        return None
+    for attempt in (0, 1):
+        try:
+            font = _FONT_CACHE.get(spec)
+            if font is None:
+                font = _FONT_CACHE[spec] = tkfont.Font(font=spec)
+            return font.measure(text)
+        except Exception:  # noqa: BLE001
+            # A cached Font belongs to the Tk interpreter that made it. If that
+            # root is gone (a second dashboard window, a test that builds one
+            # root per case) every measure raises and we would SILENTLY drop
+            # back to the character-width guess - which is exactly the overflow
+            # this function exists to prevent. Rebuild once, then give up.
+            _FONT_CACHE.pop(spec, None)
+            if attempt:
+                return None
+    return None
+
+
+def fit(text: str, px: float, char_px: float = 5.3, spec=None) -> str:
+    """Truncate to what actually fits `px` wide, with an ellipsis when cut.
+
+    Canvas text does not clip to a rectangle, so an untruncated error message
+    paints straight over the next panel. With `spec` the width is MEASURED in
+    that font; without it (or on a Tk-less machine) it falls back to the
+    characters-per-pixel estimate, which is why `char_px` still exists."""
+    t = " ".join(str(text or "").split())
+    if not t:
+        return t
+    width = _measure(spec, t) if spec is not None else None
+    if width is None:
+        n = max(4, int(px / max(1.0, char_px)))
+        return t if len(t) <= n else t[: n - 3] + "..."
+    if width <= px:
+        return t
+    # Proportional first cut, then walk in until it fits. Bounded: the ratio
+    # lands within a character or two, so this is a handful of measures.
+    keep = max(1, int(len(t) * px / max(1.0, width)) - 1)
+    cut = t[:keep] + "..."
+    while keep > 1 and (_measure(spec, cut) or 0) > px:
+        keep -= 1
+        cut = t[:keep] + "..."
+    return cut
+
+
+def open_ledger(md_path: str) -> bool:
+    """Open errors.md in whatever the OS uses for .md. Read-only action: it
+    hands the path to the shell and never touches the run. False if it cannot."""
+    try:
+        if not md_path or not os.path.exists(md_path):
+            return False
+        if os.name == "nt":
+            os.startfile(md_path)  # type: ignore[attr-defined]  # no console window
+        else:
+            subprocess.Popen(["xdg-open", md_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=_NO_WINDOW)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def bar_targets(p: dict) -> dict:
@@ -242,6 +425,292 @@ def visible_programs(progs: list[dict]) -> list[dict]:
     return [p for p in progs if not is_dismissed(p)]
 
 
+# --------------------------------------------------------------------------- #
+# ONE FRAME. Lifted out of _main's closure (2026-08-23) so the panel - bars,
+# stats, and the new error box - can be DRAWN AND READ BACK by a test rather
+# than only looked at by a person. `hits` and `shown` are passed in because they
+# outlive a frame: `hits` is the click map rebuilt each time, `shown` holds the
+# eased bar values that make bars glide instead of jump.
+# --------------------------------------------------------------------------- #
+def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
+               all_progs: list, status_label: str = "") -> None:
+    def ease(key: tuple, target: float) -> float:
+        cur = shown.get(key, 0.0)
+        cur += (target - cur) * 0.18  # simple exponential glide
+        if abs(target - cur) < 0.002:
+            cur = target
+        shown[key] = cur
+        return cur
+
+    def draw_bar(x: float, base_y: float, w: float, h: float, frac: float,
+                 color: str, label: str, value_txt: str) -> None:
+        # Track.
+        canvas.create_rectangle(x, base_y - h, x + w, base_y, outline=EDGE, width=1)
+        fh = max(0.0, min(1.0, frac)) * h
+        if fh > 0:
+            canvas.create_rectangle(x, base_y - fh, x + w, base_y, outline="", fill=color)
+        canvas.create_text(x + w / 2, base_y - h - 12, text=value_txt, fill=TEXT,
+                           font=("Segoe UI", 9, "bold"))
+        canvas.create_text(x + w / 2, base_y + 12, text=label, fill=DIM,
+                           font=("Segoe UI", 8))
+
+    progs = visible_programs(all_progs)
+    hidden = len(all_progs) - len(progs)
+
+    canvas.create_text(14, 16, anchor="w", text="FlexFactor", fill=TEXT,
+                       font=("Segoe UI", 14, "bold"))
+    canvas.create_text(W - 14, 16, anchor="e",
+                       text=status_label or f"watching {os.path.basename(STATUS_PATH)}",
+                       fill=DIM, font=("Segoe UI", 8))
+    # A dismissed panel is never a silent disappearance: the count and the
+    # way back are always on screen. The run itself still reports it.
+    if hidden:
+        canvas.create_text(W / 2, 16, text=f"{hidden} dismissed - click to "
+                                           f"show (they are still audited)",
+                           fill=DIM, font=("Segoe UI", 8))
+        hits.append((W / 2 - 140, 8, W / 2 + 140, 24, restore_all))
+
+    if not all_progs:
+        canvas.create_text(W / 2, H / 2, text="waiting for an audit to start...",
+                           fill=DIM, font=("Segoe UI", 12))
+        return
+    if not progs:
+        canvas.create_text(W / 2, H / 2, text="all panels dismissed - click "
+                                              "the line above to show them",
+                           fill=DIM, font=("Segoe UI", 12))
+        return
+
+    n = len(progs)
+    pad = 14
+    col_w = (W - pad * (n + 1)) / n
+    top = 40
+    bottom = H - pad
+    panel_h = bottom - top
+
+    for i, p in enumerate(progs):
+        cx = pad + i * (col_w + pad)
+        # Panel.
+        canvas.create_rectangle(cx, top, cx + col_w, bottom, outline=EDGE,
+                                fill=PANEL, width=1)
+        name = str(p.get("name") or f"program {p.get('index', i + 1)}")
+        phase = str(p.get("phase") or "")
+        done = bool(p.get("done"))
+        cyc = p.get("cycle")
+        cycles = p.get("cycles")
+        title_col = DONE if done else REVIEW
+        canvas.create_text(cx + col_w / 2, top + 16, text=name[:34], fill=title_col,
+                           font=("Segoe UI", 11, "bold"))
+        sub = ("DONE" if done else phase) + (
+            f"  (cycle {cyc}/{cycles})"
+            if cyc and cycles and not done and "cycle" not in phase else "")
+        canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
+                           font=("Segoe UI", 8))
+        # Dismiss control, drawn AFTER the title and subtitle so a long
+        # centred program name paints under it and can never bury the only
+        # way to reclaim the column. `p=p` binds THIS program - a bare
+        # closure over the loop variable would hand every "x" the last
+        # panel drawn.
+        canvas.create_text(cx + col_w - 12, top + 12, text="x", fill=DIM,
+                           font=("Segoe UI", 11, "bold"))
+        hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
+                     lambda p=p: dismiss(p)))
+        # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
+        # process, so it resets to 1 on every restart - after five restarts the
+        # panel still read "cycle 1/12" while four earlier attempts had produced
+        # nothing. That hides exactly what the honesty doctrine cares about. These
+        # two numbers survive restarts: `attempt` (how many times this program has
+        # been (re)launched + resumed) and `landed` (commits actually on the
+        # branch - the DURABLE metric; the per-cycle "fixed" counter resets too).
+        att = attempt_info(p)
+        if att:
+            canvas.create_text(cx + col_w / 2, top + 47, text=att[:46], fill=DIM,
+                               font=("Segoe UI", 8))
+
+        t = bar_targets(p)
+        # Three bars side by side. Baseline lifted to leave room below for the
+        # stat row, the severity breakdown, and the current-file footer.
+        bar_area_top = top + 56
+        # The error box owns the bottom ERR_BOX_H px of every panel, so the
+        # bars and stats sit above it. max() keeps the bars from inverting
+        # when the window is dragged short - a negative height drew the fill
+        # upward, over the title.
+        err_top = bottom - ERR_BOX_H
+        base_y = err_top - 150
+        bh = max(24.0, base_y - bar_area_top - 16)
+        bw = min(46.0, (col_w - 4 * pad) / 3)
+        gap = (col_w - 3 * bw) / 4
+        bars = [
+            ("review", t["review"], REVIEW, "Review", f"{t['review'] * 100:.0f}%"),
+            ("fix", t["fix"], FIX, "Fix", f"{t['fix'] * 100:.0f}%"),
+        ]
+        cap = t["cap"]
+        if cap:
+            over = t["budget"] >= 0.999
+            bars.append(("budget", t["budget"], BUDGET_OVER if over else BUDGET,
+                         "Budget", f"${t['cost']:.2f}"))
+        else:
+            bars.append(("budget", 0.0, BUDGET, "Budget", f"${t['cost']:.2f}"))
+
+        fixed = int(p.get("fixed") or 0)
+        fix_total = int(p.get("fix_total") or 0)
+        # The Fix bar's value text shows files completed / files to fix, so it
+        # reads as "files", not a bare percentage that looks like defects.
+        bars[1] = ("fix", bars[1][1], FIX, "Files fixed",
+                   f"{fixed}/{fix_total}" if fix_total else "0/0")
+        # SCOPE FIX (2026-08-14, owner caught it): `reviewed`/`files_total`/
+        # `defects` are THIS BATCH (20 files); `fix_done`/`fix_total` are the
+        # WHOLE PROGRAM (3,140 files). The Review bar therefore hit 100% while
+        # 0.6% of the program had been reviewed, and "45 defects" next to
+        # "/3140" implied 45 defects across the whole program. Same panel, two
+        # scopes, unlabelled - a false impression of progress, which is exactly
+        # what the honesty doctrine forbids. Label the batch bar as a batch.
+        batch_n = int(p.get("files_total") or 0)
+        if batch_n and fix_total and batch_n < fix_total:
+            bars[0] = (bars[0][0], bars[0][1], bars[0][2], "Review (batch)",
+                       f"{int(p.get('reviewed') or 0)}/{batch_n}")
+
+        for j, (key, target, color, label, vtxt) in enumerate(bars):
+            bx = cx + gap + j * (bw + gap)
+            # Keyed by program IDENTITY, not by loop index: dismissing a
+            # panel shifts every later program one column left, and an
+            # index key would hand each of them the DISMISSED panel's eased
+            # bar values to glide down from - a visibly wrong percentage on
+            # panels that never changed.
+            frac = ease((program_key(p), key), target)
+            draw_bar(bx, base_y, bw, bh, frac, color, label, vtxt)
+
+        # Stat row. Labels spell out units: "defects" are individual findings;
+        # "files fixed" are whole files. The two are different counts.
+        stats_y = base_y + 38
+        defects = int(p.get("defects") or 0)
+        defects_fixed = int(p.get("defects_fixed") or 0)
+        errors = int(p.get("errors") or 0)
+        # "defects found" counts ONLY the files reviewed in the current batch,
+        # so say so - unqualified next to a /3140 denominator it read as a
+        # whole-program total (owner, 2026-08-14: "3140 files ... yet only 45
+        # defects found. That is quite a gap").
+        scoped = (f"defects found: {defects}  (in {int(p.get('reviewed') or 0)} "
+                  f"files reviewed so far)"
+                  if batch_n and fix_total and batch_n < fix_total
+                  else f"defects found: {defects}")
+        canvas.create_text(cx + col_w / 2, stats_y, text=scoped,
+                           fill=TEXT, font=("Segoe UI", 9, "bold"))
+
+        # Severity breakdown: one colored "label N" chip per present severity,
+        # in fixed order, centered. Only severities with a count are shown.
+        sev = p.get("severity") or {}
+        chips = [(s, int(sev.get(s) or 0)) for s in SEV_ORDER if sev.get(s)]
+        sev_y = stats_y + 18
+        if chips:
+            labels = [f"{s} {n}" for s, n in chips]
+            widths = [len(t_) * 6.5 + 14 for t_ in labels]
+            total_w = sum(widths)
+            sx = cx + (col_w - total_w) / 2
+            for (s, n), lbl, wd in zip(chips, labels, widths):
+                canvas.create_text(sx + wd / 2, sev_y, text=lbl,
+                                   fill=SEV_COLOR.get(s, DIM),
+                                   font=("Segoe UI", 8, "bold"))
+                sx += wd
+        else:
+            canvas.create_text(cx + col_w / 2, sev_y, text="(no defects yet)",
+                               fill=DIM, font=("Segoe UI", 8))
+
+        # Progress in plain units: whole files fixed, and individual defects
+        # addressed across those files (one fixed file resolves many defects).
+        canvas.create_text(cx + col_w / 2, sev_y + 20,
+                           text=f"files fixed: {fixed}/{fix_total}     "
+                                f"defects fixed: {defects_fixed}",
+                           fill=FIX, font=("Segoe UI", 9))
+        cost_txt = f"     ${t['cost']:.2f} / ${cap:.0f} cap" if cap else f"     ${t['cost']:.2f}"
+        # "file errors" = files that errored in review/fix. The box below
+        # counts EVERY recorded failure (provider retries included). Naming
+        # both is what keeps them from reading as one contradicting number.
+        canvas.create_text(cx + col_w / 2, sev_y + 38,
+                           text=f"file errors: {errors}{cost_txt}",
+                           fill=ERRCOL if errors else DIM, font=("Segoe UI", 9))
+
+        # Current file at the very bottom of the panel.
+        cur = str(p.get("current_file") or "")
+        cur_short = os.path.basename(cur) if cur else "-"
+        canvas.create_text(cx + col_w / 2, err_top - 30, text="working on",
+                           fill=DIM, font=("Segoe UI", 8))
+        canvas.create_text(cx + col_w / 2, err_top - 14, text=cur_short[:40],
+                           fill=TEXT, font=("Consolas", 9, "bold"))
+
+        # ---------------- the error box -------------------------------- #
+        # Three lines per entry, in the order the owner asked for them:
+        # what failed, which code is responsible, what to do about it.
+        info = errors_for(p)
+        bx0, bx1 = cx + 8, cx + col_w - 8
+        by0, by1 = err_top, bottom - 8
+        inner = bx1 - bx0 - 16
+        canvas.create_rectangle(bx0, by0, bx1, by1, outline=EDGE,
+                                fill=ERRBOX, width=1)
+        rows = info.get("rows") or []
+        if info.get("available"):
+            head = info.get("headline") or "no errors recorded"
+        else:
+            head = "error ledger unavailable"
+        F_HEAD = ("Segoe UI", 8, "bold")
+        F_KIND = ("Segoe UI", 8, "bold")
+        F_MONO = ("Consolas", 8)
+        F_FIX = ("Segoe UI", 8)
+        F_NOTE = ("Segoe UI", 7)
+        canvas.create_text(bx0 + 8, by0 + 10, anchor="w",
+                           text=fit(head, inner, spec=F_HEAD),
+                           fill=ERRHEAD if rows else DIM, font=F_HEAD)
+        ey = by0 + 26
+        # How many entries actually FIT. Drawing a fixed three ran the last one
+        # out of the bottom of the box on a short window and painted it over the
+        # footer - so the count follows the geometry, and whatever does not fit
+        # is COUNTED in the footer rather than silently dropped.
+        footer_h = 16
+        room = int(max(0.0, (by1 - footer_h) - ey) // ERR_ROW_H)
+        drawn = rows[:room]
+        if drawn:
+            canvas.create_text(bx1 - 8, by0 + 10, anchor="e",
+                               text="newest first", fill=DIM, font=F_NOTE)
+        for row in drawn:
+            kcol = KIND_COLOR.get(row["kind"], DIM)
+            canvas.create_text(bx0 + 8, ey, anchor="w",
+                               text=fit(f"#{row['n']} {row['kind']} / {row['phase']}",
+                                        inner, spec=F_KIND),
+                               fill=kcol, font=F_KIND)
+            canvas.create_text(bx0 + 8, ey + 12, anchor="w",
+                               text=fit(row["error"], inner, spec=F_MONO),
+                               fill=TEXT, font=F_MONO)
+            canvas.create_text(bx0 + 8, ey + 24, anchor="w",
+                               text=fit("code: " + row["where"], inner, spec=F_MONO),
+                               fill=DIM, font=F_MONO)
+            fix_txt = row["fix"] or "no known fix"
+            # An unverified model guess is never dressed as a known fix.
+            if row.get("fix_source") == "model":
+                fix_txt = "(unverified) " + fix_txt
+            canvas.create_text(bx0 + 8, ey + 36, anchor="w",
+                               text=fit("fix: " + fix_txt, inner, spec=F_FIX),
+                               fill=FIXCOL, font=F_FIX)
+            ey += ERR_ROW_H
+        if not rows:
+            canvas.create_text((bx0 + bx1) / 2, (by0 + by1) / 2,
+                               text="nothing has gone wrong yet"
+                                    if info.get("available")
+                                    else "flexfactor_errors.py not importable",
+                               fill=DIM, font=F_FIX)
+        # The box shows the newest few; the ledger holds all of them. One click
+        # opens it rather than making the owner hunt for the path.
+        md = info.get("md_path") or ""
+        total = int(info.get("total") or 0)
+        if md and total:
+            hidden_n = total - len(drawn)
+            note = (f"click for all {total} in errors.md" if hidden_n <= 0
+                    else f"+{hidden_n} more - click for errors.md")
+            canvas.create_text((bx0 + bx1) / 2, by1 - 8,
+                               text=fit(note, inner, spec=F_NOTE),
+                               fill=DIM, font=F_NOTE)
+            hits.append((bx0, by0, bx1, by1, lambda md=md: open_ledger(md)))
+
+
+
 def _main() -> int:
     import tkinter as tk
 
@@ -268,209 +737,12 @@ def _main() -> int:
 
     canvas.bind("<Button-1>", on_click)
 
-    def ease(key: tuple, target: float) -> float:
-        cur = shown.get(key, 0.0)
-        cur += (target - cur) * 0.18  # simple exponential glide
-        if abs(target - cur) < 0.002:
-            cur = target
-        shown[key] = cur
-        return cur
-
-    def draw_bar(x: float, base_y: float, w: float, h: float, frac: float,
-                 color: str, label: str, value_txt: str) -> None:
-        # Track.
-        canvas.create_rectangle(x, base_y - h, x + w, base_y, outline=EDGE, width=1)
-        fh = max(0.0, min(1.0, frac)) * h
-        if fh > 0:
-            canvas.create_rectangle(x, base_y - fh, x + w, base_y, outline="", fill=color)
-        canvas.create_text(x + w / 2, base_y - h - 12, text=value_txt, fill=TEXT,
-                           font=("Segoe UI", 9, "bold"))
-        canvas.create_text(x + w / 2, base_y + 12, text=label, fill=DIM,
-                           font=("Segoe UI", 8))
-
     def redraw() -> None:
         canvas.delete("all")
         hits.clear()
-        all_progs = read_status(STATUS_PATH)
-        progs = visible_programs(all_progs)
-        hidden = len(all_progs) - len(progs)
-        W = canvas.winfo_width() or 960
-        H = canvas.winfo_height() or 620
-
-        canvas.create_text(14, 16, anchor="w", text="FlexFactor", fill=TEXT,
-                           font=("Segoe UI", 14, "bold"))
-        canvas.create_text(W - 14, 16, anchor="e",
-                           text=f"watching {os.path.basename(STATUS_PATH)}",
-                           fill=DIM, font=("Segoe UI", 8))
-        # A dismissed panel is never a silent disappearance: the count and the
-        # way back are always on screen. The run itself still reports it.
-        if hidden:
-            canvas.create_text(W / 2, 16, text=f"{hidden} dismissed - click to "
-                                               f"show (they are still audited)",
-                               fill=DIM, font=("Segoe UI", 8))
-            hits.append((W / 2 - 140, 8, W / 2 + 140, 24, restore_all))
-
-        if not all_progs:
-            canvas.create_text(W / 2, H / 2, text="waiting for an audit to start...",
-                               fill=DIM, font=("Segoe UI", 12))
-            root.after(40, redraw)
-            return
-        if not progs:
-            canvas.create_text(W / 2, H / 2, text="all panels dismissed - click "
-                                                  "the line above to show them",
-                               fill=DIM, font=("Segoe UI", 12))
-            root.after(40, redraw)
-            return
-
-        n = len(progs)
-        pad = 14
-        col_w = (W - pad * (n + 1)) / n
-        top = 40
-        bottom = H - pad
-        panel_h = bottom - top
-
-        for i, p in enumerate(progs):
-            cx = pad + i * (col_w + pad)
-            # Panel.
-            canvas.create_rectangle(cx, top, cx + col_w, bottom, outline=EDGE,
-                                    fill=PANEL, width=1)
-            name = str(p.get("name") or f"program {p.get('index', i + 1)}")
-            phase = str(p.get("phase") or "")
-            done = bool(p.get("done"))
-            cyc = p.get("cycle")
-            cycles = p.get("cycles")
-            title_col = DONE if done else REVIEW
-            canvas.create_text(cx + col_w / 2, top + 16, text=name[:34], fill=title_col,
-                               font=("Segoe UI", 11, "bold"))
-            sub = ("DONE" if done else phase) + (
-                f"  (cycle {cyc}/{cycles})"
-                if cyc and cycles and not done and "cycle" not in phase else "")
-            canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
-                               font=("Segoe UI", 8))
-            # Dismiss control, drawn AFTER the title and subtitle so a long
-            # centred program name paints under it and can never bury the only
-            # way to reclaim the column. `p=p` binds THIS program - a bare
-            # closure over the loop variable would hand every "x" the last
-            # panel drawn.
-            canvas.create_text(cx + col_w - 12, top + 12, text="x", fill=DIM,
-                               font=("Segoe UI", 11, "bold"))
-            hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
-                         lambda p=p: dismiss(p)))
-            # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
-            # process, so it resets to 1 on every restart - after five restarts the
-            # panel still read "cycle 1/12" while four earlier attempts had produced
-            # nothing. That hides exactly what the honesty doctrine cares about. These
-            # two numbers survive restarts: `attempt` (how many times this program has
-            # been (re)launched + resumed) and `landed` (commits actually on the
-            # branch - the DURABLE metric; the per-cycle "fixed" counter resets too).
-            att = attempt_info(p)
-            if att:
-                canvas.create_text(cx + col_w / 2, top + 47, text=att[:46], fill=DIM,
-                                   font=("Segoe UI", 8))
-
-            t = bar_targets(p)
-            # Three bars side by side. Baseline lifted to leave room below for the
-            # stat row, the severity breakdown, and the current-file footer.
-            bar_area_top = top + 56
-            base_y = bottom - 150
-            bh = base_y - bar_area_top - 16
-            bw = min(46.0, (col_w - 4 * pad) / 3)
-            gap = (col_w - 3 * bw) / 4
-            bars = [
-                ("review", t["review"], REVIEW, "Review", f"{t['review'] * 100:.0f}%"),
-                ("fix", t["fix"], FIX, "Fix", f"{t['fix'] * 100:.0f}%"),
-            ]
-            cap = t["cap"]
-            if cap:
-                over = t["budget"] >= 0.999
-                bars.append(("budget", t["budget"], BUDGET_OVER if over else BUDGET,
-                             "Budget", f"${t['cost']:.2f}"))
-            else:
-                bars.append(("budget", 0.0, BUDGET, "Budget", f"${t['cost']:.2f}"))
-
-            fixed = int(p.get("fixed") or 0)
-            fix_total = int(p.get("fix_total") or 0)
-            # The Fix bar's value text shows files completed / files to fix, so it
-            # reads as "files", not a bare percentage that looks like defects.
-            bars[1] = ("fix", bars[1][1], FIX, "Files fixed",
-                       f"{fixed}/{fix_total}" if fix_total else "0/0")
-            # SCOPE FIX (2026-08-14, owner caught it): `reviewed`/`files_total`/
-            # `defects` are THIS BATCH (20 files); `fix_done`/`fix_total` are the
-            # WHOLE PROGRAM (3,140 files). The Review bar therefore hit 100% while
-            # 0.6% of the program had been reviewed, and "45 defects" next to
-            # "/3140" implied 45 defects across the whole program. Same panel, two
-            # scopes, unlabelled - a false impression of progress, which is exactly
-            # what the honesty doctrine forbids. Label the batch bar as a batch.
-            batch_n = int(p.get("files_total") or 0)
-            if batch_n and fix_total and batch_n < fix_total:
-                bars[0] = (bars[0][0], bars[0][1], bars[0][2], "Review (batch)",
-                           f"{int(p.get('reviewed') or 0)}/{batch_n}")
-
-            for j, (key, target, color, label, vtxt) in enumerate(bars):
-                bx = cx + gap + j * (bw + gap)
-                # Keyed by program IDENTITY, not by loop index: dismissing a
-                # panel shifts every later program one column left, and an
-                # index key would hand each of them the DISMISSED panel's eased
-                # bar values to glide down from - a visibly wrong percentage on
-                # panels that never changed.
-                frac = ease((program_key(p), key), target)
-                draw_bar(bx, base_y, bw, bh, frac, color, label, vtxt)
-
-            # Stat row. Labels spell out units: "defects" are individual findings;
-            # "files fixed" are whole files. The two are different counts.
-            stats_y = base_y + 38
-            defects = int(p.get("defects") or 0)
-            defects_fixed = int(p.get("defects_fixed") or 0)
-            errors = int(p.get("errors") or 0)
-            # "defects found" counts ONLY the files reviewed in the current batch,
-            # so say so - unqualified next to a /3140 denominator it read as a
-            # whole-program total (owner, 2026-08-14: "3140 files ... yet only 45
-            # defects found. That is quite a gap").
-            scoped = (f"defects found: {defects}  (in {int(p.get('reviewed') or 0)} "
-                      f"files reviewed so far)"
-                      if batch_n and fix_total and batch_n < fix_total
-                      else f"defects found: {defects}")
-            canvas.create_text(cx + col_w / 2, stats_y, text=scoped,
-                               fill=TEXT, font=("Segoe UI", 9, "bold"))
-
-            # Severity breakdown: one colored "label N" chip per present severity,
-            # in fixed order, centered. Only severities with a count are shown.
-            sev = p.get("severity") or {}
-            chips = [(s, int(sev.get(s) or 0)) for s in SEV_ORDER if sev.get(s)]
-            sev_y = stats_y + 18
-            if chips:
-                labels = [f"{s} {n}" for s, n in chips]
-                widths = [len(t_) * 6.5 + 14 for t_ in labels]
-                total_w = sum(widths)
-                sx = cx + (col_w - total_w) / 2
-                for (s, n), lbl, wd in zip(chips, labels, widths):
-                    canvas.create_text(sx + wd / 2, sev_y, text=lbl,
-                                       fill=SEV_COLOR.get(s, DIM),
-                                       font=("Segoe UI", 8, "bold"))
-                    sx += wd
-            else:
-                canvas.create_text(cx + col_w / 2, sev_y, text="(no defects yet)",
-                                   fill=DIM, font=("Segoe UI", 8))
-
-            # Progress in plain units: whole files fixed, and individual defects
-            # addressed across those files (one fixed file resolves many defects).
-            canvas.create_text(cx + col_w / 2, sev_y + 20,
-                               text=f"files fixed: {fixed}/{fix_total}     "
-                                    f"defects fixed: {defects_fixed}",
-                               fill=FIX, font=("Segoe UI", 9))
-            cost_txt = f"     ${t['cost']:.2f} / ${cap:.0f} cap" if cap else f"     ${t['cost']:.2f}"
-            canvas.create_text(cx + col_w / 2, sev_y + 38,
-                               text=f"errors: {errors}{cost_txt}",
-                               fill=ERRCOL if errors else DIM, font=("Segoe UI", 9))
-
-            # Current file at the very bottom of the panel.
-            cur = str(p.get("current_file") or "")
-            cur_short = os.path.basename(cur) if cur else "-"
-            canvas.create_text(cx + col_w / 2, bottom - 30, text="working on",
-                               fill=DIM, font=("Segoe UI", 8))
-            canvas.create_text(cx + col_w / 2, bottom - 14, text=cur_short[:40],
-                               fill=TEXT, font=("Consolas", 9, "bold"))
-
+        draw_frame(canvas, hits, shown,
+                   canvas.winfo_width() or 960, canvas.winfo_height() or 620,
+                   read_status(STATUS_PATH))
         root.after(40, redraw)  # ~25 fps for smooth bar glide
 
     redraw()

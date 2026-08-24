@@ -38,6 +38,7 @@ py-modules = [
   "flexfactor_directed",
   "flexfactor_discovery",
   "flexfactor_egress",
+  "flexfactor_errors",
   "flexfactor_evidence",
   "flexfactor_flags",
   "flexfactor_journeys",

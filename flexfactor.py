@@ -46,6 +46,7 @@ import argparse
 import atexit
 import concurrent.futures
 import contextlib
+import contextvars
 import datetime
 import difflib
 import errno
@@ -3164,6 +3165,25 @@ def _set_rotation_purpose(providers, display_name: str, purpose_contract, purpos
               + f" -> {', '.join(told)}", file=sys.stderr)
 
 
+class _CtxThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A ThreadPoolExecutor whose workers inherit the SUBMITTING thread's context.
+
+    Why this exists (2026-08-23): with `--parallel N` every program is audited
+    on its own thread of ONE process, and the per-run error ledger is selected
+    by a ContextVar. A plain pool worker starts with an EMPTY context, so a
+    review or fix task -- and every provider failure raised inside it -- would
+    resolve to no ledger at all, or to whichever program opened one last.
+    Copying the context at submit time (which runs on the program's own thread)
+    files every error under the program that actually produced it. That is what
+    makes the dashboard's per-program error box true rather than plausible.
+
+    `Executor.map` is built on `submit`, so it is covered too.
+    """
+
+    def submit(self, fn, /, *args, **kwargs):  # type: ignore[override]
+        return super().submit(contextvars.copy_context().run, fn, *args, **kwargs)
+
+
 # --- per-run ERROR LEDGER (owner 2026-08-23: "a place in the run that shows
 # me what errors occurred, what code was responsible, and a suggestion on how
 # to fix it"). One ledger per audited program, living in the run's checkpoint
@@ -3174,18 +3194,42 @@ _ERROR_LEDGER = None
 _ERROR_LEDGER_LOCK = threading.Lock()
 
 
-def _start_error_ledger(checkpoint, program: str) -> None:
-    """Open the ledger next to this run's checkpoint. Never raises."""
+# The ledger THIS program's work must write to. A ContextVar rather than the
+# bare global because `--parallel` audits several programs in one process and
+# the global is last-writer-wins: before this, every error from every program
+# landed in whichever run opened its ledger last, so a per-program view could
+# only ever have been guessing. The global stays as the fallback for call sites
+# outside a program's context (and is the same object in a single-program run).
+_ERROR_LEDGER_VAR: contextvars.ContextVar = contextvars.ContextVar(
+    "flexfactor_error_ledger", default=None)
+
+
+def _current_error_ledger():
+    """The ledger of the program running on this thread, else the last opened."""
+    return _ERROR_LEDGER_VAR.get() or _ERROR_LEDGER
+
+
+def _start_error_ledger(checkpoint, program: str):
+    """Open the ledger next to this run's checkpoint. Never raises.
+
+    Returns the ledger (or None) so the caller can publish its paths to the live
+    dashboard, and binds it to this thread's context so every task submitted
+    from here through _CtxThreadPoolExecutor files errors under THIS program.
+    """
     global _ERROR_LEDGER
     try:
         import flexfactor_errors as _fe
         run_dir = os.path.dirname(str(getattr(checkpoint, "path", "") or "")) or \
             os.path.join(RUNS_PATH, "no-checkpoint")
+        led = _fe.ErrorLedger(run_dir, program, os.path.dirname(os.path.abspath(__file__)))
         with _ERROR_LEDGER_LOCK:
-            _ERROR_LEDGER = _fe.ErrorLedger(run_dir, program, os.path.dirname(os.path.abspath(__file__)))
-        print(f"  [errors] ledger -> {_ERROR_LEDGER.md_path}", file=sys.stderr)
+            _ERROR_LEDGER = led
+        _ERROR_LEDGER_VAR.set(led)
+        print(f"  [errors] ledger -> {led.md_path}", file=sys.stderr)
+        return led
     except Exception as exc:  # noqa: BLE001 - the ledger must never break the run
         print(f"  [errors] ledger unavailable: {exc}", file=sys.stderr)
+        return None
 
 
 def _attach_ledger_suggester(provider) -> None:
@@ -3195,7 +3239,8 @@ def _attach_ledger_suggester(provider) -> None:
     tier through the normal provider path, so it rotates, is metered and is
     egress-gated like any other call; it is invoked only for unknown errors.
     """
-    if _ERROR_LEDGER is None or provider is None:
+    led = _current_error_ledger()
+    if led is None or provider is None:
         return
 
     def suggest(error_text: str, where_json: str) -> str:
@@ -3209,12 +3254,12 @@ def _attach_ledger_suggester(provider) -> None:
              "required": ["suggestion"]}, max_tokens=2000)   # thinking models need headroom
         return str((data or {}).get("suggestion") or "")
 
-    _ERROR_LEDGER._suggester = suggest
+    led._suggester = suggest
 
 
 def _ledger(phase: str, error, **kw) -> None:
     """Record one error in the run's ledger; a no-op before the ledger opens."""
-    led = _ERROR_LEDGER
+    led = _current_error_ledger()
     if led is None:
         return
     try:
@@ -3223,8 +3268,17 @@ def _ledger(phase: str, error, **kw) -> None:
         print(f"  [errors] could not record: {exc}", file=sys.stderr)
 
 
+def _error_ledger_report_line() -> str:
+    """'12 (see the Errors section below; ledger at ...)' or 'none'."""
+    led = _current_error_ledger()
+    if led is None or not led.entries:
+        return "none"
+    return (f"{len(led.entries)} (see the Errors section below; "
+            f"ledger at `{led.md_path}`)")
+
+
 def _error_ledger_report_lines() -> list:
-    led = _ERROR_LEDGER
+    led = _current_error_ledger()
     if led is None:
         return []
     return ["", *led.render_markdown(heading_level=2).splitlines()]
@@ -9856,7 +9910,7 @@ def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
             # incomplete evidence rather than quietly publishing a smaller vote.
             return None, f"{type(ex).__name__}: {ex}"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+    with _CtxThreadPoolExecutor(max_workers=n) as pool:
         rows = list(pool.map(_one, range(n)))
     results = [result for result, _error in rows]
     errors = [error for _result, error in rows if error]
@@ -11982,7 +12036,7 @@ def _review_all(reviewers: list, project_dir: str,
             n_workers = max(1, min(workers, single_provider_workers, len(units)))
         else:
             n_workers = max(1, min(workers, len(units)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+        with _CtxThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_review_unit, unit) for unit in units]
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -12046,7 +12100,7 @@ def _review_all(reviewers: list, project_dir: str,
                     if total else 1)
     else:
         n_workers = max(1, min(workers, total)) if total else 1
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+    with _CtxThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_review_one, rel): rel for rel in files}
         for fut in concurrent.futures.as_completed(futures):
             try:
@@ -12288,7 +12342,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     # overshoot the cost cap by at most `prefetch_n` calls; new prefetches stop
     # submitting the moment the meter is over.
     prefetch_n = max(0, int(getattr(args, "fix_prefetch", FIX_PREFETCH_WORKERS)))
-    prefetch_pool = (concurrent.futures.ThreadPoolExecutor(max_workers=prefetch_n)
+    prefetch_pool = (_CtxThreadPoolExecutor(max_workers=prefetch_n)
                      if prefetch_n and len(fixable_files) > 1 else None)
     prefetched: dict[str, concurrent.futures.Future] = {}
 
@@ -13464,7 +13518,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         checkpoint = _resume_checkpoint_for(
             _rsmod, recovered_run, program=display_name, project_dir=project_dir,
             mode=_resume_mode_for(args))
-        _start_error_ledger(checkpoint, display_name)
+        _error_ledger = _start_error_ledger(checkpoint, display_name)
+        if _error_ledger is not None:
+            # The dashboard reads the ledger straight off disk; it only needs to
+            # be told WHERE. Publishing the directory (not a copy of the entries)
+            # keeps status.json small and keeps the viewer a pure reader of the
+            # same errors.json the report is built from -- one source of truth.
+            report(run_dir=_error_ledger.run_dir,
+                   errors_ledger=_error_ledger.md_path)
         # Deterministic code intelligence is captured BEFORE any mutation.  It
         # is rebuilt after the repair/test cycle so every byte-level change and
         # its dependency blast radius can be proven from two exact indexes.
@@ -15748,10 +15809,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                defects=len(all_findings), errors=errors_total, cost=round(meter.usd, 4),
                evidence=dashboard_evidence)
         # The run ends by pointing at its own error ledger (or saying none).
-        if _ERROR_LEDGER is not None:
-            print(f"{pfx}{_ERROR_LEDGER.summary_line()}", file=sys.stderr)
-            result["errors_ledger"] = _ERROR_LEDGER.md_path
-            result["errors_recorded"] = len(_ERROR_LEDGER.entries)
+        _led = _current_error_ledger()
+        if _led is not None:
+            print(f"{pfx}{_led.summary_line()}", file=sys.stderr)
+            result["errors_ledger"] = _led.md_path
+            result["errors_recorded"] = len(_led.entries)
 
         return result
     except Exception as ex:  # one program must never abort the batch
@@ -16354,10 +16416,10 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
          + (f" ({len(a['unverified_files'])} unverified — project didn't build at baseline)"
             if a['unverified_files'] else ""),
          *_noop_split_lines(a),
-         *(["- **Errors recorded:** "
-            + (f"{len(_ERROR_LEDGER.entries)} (see the Errors section below; "
-               f"ledger at `{_ERROR_LEDGER.md_path}`)" if _ERROR_LEDGER and _ERROR_LEDGER.entries
-               else "none")]),
+         # This program's ledger, resolved through the ContextVar: the bare
+         # global is whichever program opened one LAST, so under --parallel the
+         # report would cite another program's error count and path.
+         *(["- **Errors recorded:** " + _error_ledger_report_line()]),
          # Tri-state. None = the build never ran (no build command exists),
          # which is NOT a pass and must never read like one.
          f"- **Baseline build:** {'passed' if a['baseline_ok'] is True else 'NOT RUN (unverified)' if a['baseline_ok'] is None else 'FAILED'}",

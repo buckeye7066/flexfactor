@@ -1364,6 +1364,74 @@ mechanics a future change must not break:
 - **Unfit additions:** `realtime`, `deep-research` (404 "not a chat model" /
   400 "Interactions API only", both seen live).
 
+## The error box: every run reports its own failures, per program (2026-08-23)
+
+> "Can you set the error reports for flexfactor as communication in a box I can
+> see below each program being run?" - owner
+
+The ledger already wrote the truth (`flexfactor_errors.py` -> `<run
+dir>/errors.{md,json}`); what was missing was a way to SEE it during the run.
+The live panel said `errors: 3` and nothing about WHAT.
+
+- **One reader, three surfaces.** `flexfactor_errors` gained the reading half:
+  `find_run_dir` (newest run for a program - the FALLBACK), `load_entries`,
+  `counts_by_kind`, `where_of`, `ui_entries` (newest first, flat strings) and
+  `headline`. The Tk dashboard, the phone dashboard and errors.md therefore
+  cannot disagree; a second formatter would have been a second thing to drift.
+- **`flexfactor_dashboard.py`** draws a box in the bottom `ERR_BOX_H` px of every
+  panel: headline (`3 errors: 1 flexfactor-defect, 1 provider, 1 budget`), then
+  per entry the three facts the owner asked for - what failed / `code:` which
+  code is responsible / `fix:` what to do - and a click that opens errors.md.
+  Reads are TTL-cached (`_ERR_TTL_S`); redraw runs at ~25fps and the standing
+  rule is NO per-frame disk I/O.
+- **`flexfactor_web.py`** carries the same rows in `/api/state` (`ledger`) and
+  renders them as cards, so the box is on the phone too.
+- **TWO ERROR NUMBERS, BOTH LABELLED.** The panel's counter is now
+  `file errors: N` (files that errored in review/fix); the box is the run
+  ledger (every recorded failure, provider retries included). Unlabelled, `2`
+  next to `40` reads as a bug in one of them - the same two-scopes-side-by-side
+  defect that made a 0.6%-reviewed program read as "100%".
+- **A model-sourced suggestion renders as `(unverified)`.** The signature table
+  is knowledge; a model guess is a guess, and the box says which it is.
+
+### What made the box HONEST, and must not regress
+
+- **Per-program routing.** `_ERROR_LEDGER` was a bare process global while
+  `--parallel N` audits several programs in ONE process, so the last program to
+  start owned every other program's errors. It is now `_ERROR_LEDGER_VAR`
+  (a ContextVar) resolved by `_current_error_ledger()`, and the audit-path pools
+  are `_CtxThreadPoolExecutor`, which copies the submitting thread's context
+  into its workers (a plain pool worker starts with an EMPTY context - that is
+  the whole bug). `flexfactor_ledger_routing_tests.py` pins both halves and
+  includes a control test showing a stock executor mis-files.
+- **`audit_one_program` publishes `run_dir` + `errors_ledger`** into the
+  ProgressBus right after the ledger opens, so a viewer is told where to look
+  instead of guessing from the program name.
+- **`draw_frame` was lifted out of `_main`'s closure** so a test can draw a
+  frame and READ THE CANVAS BACK. `flexfactor_dashboard_tests.py` asserts the
+  painted text, and asserts geometrically that nothing paints outside its box.
+  The three older dashboard greps in `flexfactor_tests.py` follow it there.
+- **Truncation MEASURES the font** (`_measure`, cached `tkinter.font.Font`). The
+  first screenshot of this box had the fix line painting over the next program
+  because a characters-per-pixel guess is wrong at any DPI but the one it was
+  tuned on. The cache rebuilds a Font whose Tk interpreter has died - otherwise
+  every measure raises and it silently falls back to guessing.
+- **Rows follow the geometry.** A fixed three entries ran out of the bottom of
+  the box on a short window; the count is computed from the space available and
+  the remainder is COUNTED in the footer (`+N more`), never silently dropped.
+
+## Configuration surface (`.env.example`, 2026-08-23)
+
+FlexFactor's own readiness rubric has a `config_documented` gate, and it was
+FAILING on FlexFactor. `.env.example` now documents every environment variable
+the runtime reads, with defaults and the measurement behind the dangerous ones
+(the 307.8s free-queue floor, the 900s per-file fix ceiling). `.gitignore` now
+ignores `.env` / `.env.*` (keeping the template) and `runs/`.
+`flexfactor_config_surface_tests.py` keeps it true in BOTH directions: no
+documented-but-never-read fiction, and no runtime variable missing from the
+template (it found eight on the first run). It also asserts git actually ignores
+`.env` - the outcome, not the presence of a line.
+
 ## Structural (cross-file) fixes (2026-08-23)
 
 Owner order: "It sure would be nice if flexfactor would fix errors it found."

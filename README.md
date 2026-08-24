@@ -44,7 +44,8 @@ paid service.
   codebase (up to 10 programs in parallel). Dual-model adversarial review, per-file
   build gate, cross-model veto, unit + e2e test generation, converges with
   `--until-clean`, hard `--max-cost` budget (default $150/program), live Tkinter
-  dashboard, persistent per-project memory ("brain") in `~/.flexfactor/`.
+  dashboard with a **per-program error box** (see below), persistent per-project
+  memory ("brain") in `~/.flexfactor/`.
   Large files are reviewed in complete line-numbered chunks rather than truncated
   or omitted. Bounded files are grouped into semantic review batches, with an
   opt-in concurrency control for known-capacity single-provider runs
@@ -186,7 +187,33 @@ python flexfactor.py policy init                        # write deny-by-default 
 python flexfactor.py policy show                        # effective gate policy (file + env)
 python flexfactor_tests.py                              # unit tests (no API keys needed)
 python flexfactor_dashboard.py --selftest               # dashboard self-check
+python flexfactor_dashboard_tests.py                    # draws a frame, reads it back
+python flexfactor_web.py --print-url                    # same view, phone-reachable
 ```
+
+### Errors are reported IN the run, not in a log
+
+Every run writes an error ledger - what failed, which code is responsible, and a
+suggested fix - to `~/.flexfactor/runs/<run-id>/errors.md` (and `.json`). The
+live dashboard shows the newest entries in a box **under each program being
+run**, one box per program, and the phone dashboard (`flexfactor_web.py`) shows
+the same thing from the same file. Nobody has to watch a log to find out what
+went wrong:
+
+```
+3 errors: 1 flexfactor-defect, 1 provider, 1 budget      newest first
+#3 flexfactor-defect / fix
+BadRequestError: Unsupported parameter: 'max_tokens'
+code: flexfactor.py:2489 structured()
+fix: Newer OpenAI models reject max_tokens; send max_completion_tokens ...
+                     click for all 3 in errors.md
+```
+
+The panel's `file errors` counter and the box are DIFFERENT scopes and are
+labelled as such: the counter counts files that errored during review/fix, the
+box counts every recorded failure including the provider retries rotation
+absorbed. A suggestion that came from a model rather than the signature table is
+prefixed `(unverified)`.
 
 Desktop launchers (in `G:\One Drive\Desktop`): **FlexFactor.lnk** (menu),
 **Scout a Program.lnk**, **Audit a Program.lnk** -> the `.ps1` launchers here.

@@ -55,6 +55,35 @@ class EntryPointParityTests(unittest.TestCase):
         missing = [k for k, v in m["modules"].items() if not v["importable"]]
         self.assertEqual(missing, [], m["modules"])
 
+    def test_every_module_the_runtime_imports_is_in_the_wheel(self):
+        """A module imported at runtime but missing from `py-modules` is a
+        feature that silently does not exist in an installed FlexFactor.
+
+        Found live 2026-08-23: `flexfactor_errors` - the per-run error ledger,
+        and everything the dashboard's error box reads - was imported by
+        `_start_error_ledger` and absent from the wheel, so a packaged run
+        printed "[errors] ledger unavailable: No module named ..." and reported
+        nothing. The CI import step could not catch it: it imports the LIST,
+        so the list is its own oracle. This compares the list against what the
+        source actually imports.
+        """
+        import re as _re, tomllib
+        with open(os.path.join(HERE, "pyproject.toml"), "rb") as fh:
+            packaged = set(tomllib.load(fh)["tool"]["setuptools"]["py-modules"])
+        pattern = _re.compile(r"^\s*(?:import|from)\s+(flexfactor_[a-z_0-9]+)", _re.M)
+        needed = set()
+        for name in os.listdir(HERE):
+            if (not name.startswith("flexfactor") or not name.endswith(".py")
+                    or name.endswith("_tests.py")):
+                continue
+            with open(os.path.join(HERE, name), encoding="utf-8", errors="replace") as fh:
+                for mod in pattern.findall(fh.read()):
+                    if os.path.isfile(os.path.join(HERE, mod + ".py")):
+                        needed.add(mod)
+        missing = sorted(needed - packaged)
+        self.assertEqual(missing, [], f"imported by the runtime, absent from "
+                                      f"pyproject py-modules: {missing}")
+
     def test_directed_orchestration_is_wired_without_the_shim(self):
         m = _manifest(ENTRY_POINTS["source-script"])
         self.assertTrue(m["wired"]["directed"])
@@ -158,6 +187,16 @@ class CleanInstallTests(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=300)
             self.assertEqual(cp.returncode, 0, (mode, cp.stderr[-1500:]))
+
+    def test_the_error_ledger_loads_from_the_wheel(self):
+        # The owner-facing half of the check above: the ledger and its readers
+        # (which the dashboards use) must work in an installed FlexFactor.
+        cp = subprocess.run(
+            [self.vpy, "-c", "import flexfactor_errors as e; "
+                             "print(len(e.SIGNATURES), e.headline([]))"],
+            cwd=self.outside, env=self.env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(cp.returncode, 0, cp.stderr[-1500:])
+        self.assertIn("no errors recorded", cp.stdout)
 
     def test_prodready_engine_loads_from_the_wheel(self):
         cp = subprocess.run([self.vpy, "-c",

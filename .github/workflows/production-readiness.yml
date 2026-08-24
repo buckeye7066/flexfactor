@@ -72,6 +72,17 @@ jobs:
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
                    flexfactor_cli_provider_tests.py \
+                   flexfactor_errors_tests.py \
+                   flexfactor_structural_tests.py \
+                   flexfactor_openai_param_tests.py \
+                   flexfactor_intent_tests.py \
+                   flexfactor_paidfirst_tests.py \
+                   flexfactor_quality_tests.py \
+                   flexfactor_localbench_tests.py \
+                   flexfactor_glimmer_tests.py \
+                   flexfactor_config_surface_tests.py \
+                   flexfactor_ledger_routing_tests.py \
+                   flexfactor_dashboard_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \
                    test_flexfactor_wip.py \
