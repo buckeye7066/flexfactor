@@ -5241,11 +5241,37 @@ def _gather_from_folder(folder: str) -> tuple[str, str]:
     fp = _purpose_module()
     if fp is not None and hasattr(fp, "gather_purpose_evidence"):
         try:
-            def _gh_runner(a, cwd):
-                cp = _run(list(a), cwd, timeout=60)  # same policy chokepoint as every tool call
-                return cp.stdout if cp.returncode == 0 else None
+            # BOTH runners must return STDOUT (a string) or None - that is
+            # `gather_purpose_evidence`'s contract, and the module calls
+            # `.splitlines()` on what comes back.
+            #
+            # Measured 2026-08-23 on this very repo: they did not. `git_runner`
+            # handed back a CompletedProcess, so the FIRST git call raised
+            # `AttributeError: 'CompletedProcess' object has no attribute
+            # 'splitlines'`, the whole gather aborted, and every audit put
+            # "[purpose evidence gathering failed: ...]" into the prompt in
+            # place of the entire cited evidence block - manifests, docs, tests,
+            # schemas, routes, integrations, deploy, history. The cache stayed
+            # EMPTY, so `_purpose_confidence_for` was grading confidence on
+            # nothing. `gh_runner` was separately dropping the executable: it
+            # ran `_run(["pr", "list", ...])`, which on this machine executes
+            # /usr/bin/pr (the text paginator), fails, and is recorded as
+            # "GitHub evidence unavailable" - so PR/issue signal never once
+            # reached an audit either.
+            #
+            # Still the same policy chokepoint: `_git`/`_run` gate, classify and
+            # _winify every one of these calls.
+            def _stdout_or_none(cp):
+                return cp.stdout if getattr(cp, "returncode", 1) == 0 else None
+
+            def _purpose_git_runner(a, cwd):
+                return _stdout_or_none(_git(list(a), cwd))
+
+            def _purpose_gh_runner(a, cwd):
+                return _stdout_or_none(_run(["gh", *list(a)], cwd, timeout=60))
+
             evidence = fp.gather_purpose_evidence(
-                folder, git_runner=lambda a, cwd: _git_argv(a, cwd), gh_runner=_gh_runner)
+                folder, git_runner=_purpose_git_runner, gh_runner=_purpose_gh_runner)
             _PURPOSE_EVIDENCE_CACHE[os.path.normcase(os.path.abspath(folder))] = evidence
             parts.append(fp.render_purpose_evidence_block(evidence))
         except Exception as ex:  # noqa: BLE001 - evidence gathering must not abort profiling

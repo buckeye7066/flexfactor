@@ -1432,6 +1432,46 @@ documented-but-never-read fiction, and no runtime variable missing from the
 template (it found eight on the first run). It also asserts git actually ignores
 `.env` - the outcome, not the presence of a line.
 
+## FOURTH written-but-not-wired instance: purpose evidence never gathered (2026-08-23)
+
+Measured on this repo, live: `_gather_from_folder` put
+
+    [purpose evidence gathering failed: AttributeError: 'CompletedProcess'
+     object has no attribute 'splitlines']
+
+into the prompt **in place of the entire deterministic evidence block** -
+manifests, docs, tests, schemas, routes, integrations, deploy, git history,
+PRs/issues, every one of them CITED. `_PURPOSE_EVIDENCE_CACHE` stayed EMPTY, so
+`_purpose_confidence_for` - which gates gap-driven fixing - was grading purpose
+confidence on nothing.
+
+Two injected runners, both breaking `gather_purpose_evidence`'s stated contract
+("`git_runner(args, cwd)` / `gh_runner(args, cwd)` return stdout or None"; the
+module calls `.splitlines()` on the result):
+
+- `git_runner=lambda a, cwd: _git_argv(a, cwd)` returned a **CompletedProcess**.
+  The FIRST git call raised inside the module and the whole gather aborted in
+  the call site's own `except`.
+- `_gh_runner` ran `_run(list(a), ...)`, **dropping the `gh` executable**. On
+  this machine `_run(["pr", "list", ...])` executes `/usr/bin/pr`, the text
+  paginator - it fails, and the result is filed as "GitHub evidence
+  unavailable", so PR/issue signal never once reached an audit.
+
+Both now go through `_stdout_or_none()` and the same `_git`/`_run` policy
+chokepoint, with `["gh", *a]` spelled out. **Measured before -> after on this
+repository: 0 sources -> 78** (50 commit subjects, 6 branches, 30 pull requests,
+4 honest unknowns).
+
+`flexfactor_purpose_wiring_tests.py` drives the REAL injection over a real
+throwaway git repo. The module's own unit tests could never have caught this -
+they inject their own correct fakes; only a test of THE WIRING can. All four
+tests were verified to fail against the original code before being trusted.
+
+**This is the fourth instance of the same trap** (after `flexfactor_runstate`,
+the `set_phase`/`record_cycle`/`record_spend` group, and `_UI_EXPLORER_JS`).
+When a module takes an injected callable, TEST THE INJECTION, not just the
+module: grep every symbol it exports and drive the real call site once.
+
 ## Structural (cross-file) fixes (2026-08-23)
 
 Owner order: "It sure would be nice if flexfactor would fix errors it found."

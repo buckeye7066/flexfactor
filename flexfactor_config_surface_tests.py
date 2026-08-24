@@ -83,9 +83,16 @@ class ConfigSurfaceTests(unittest.TestCase):
     def test_the_template_lists_no_variable_the_code_never_reads(self):
         listed = documented()
         self.assertTrue(listed, "the template must document something")
+        # The runtime is not only Python: flexfactor_assets/*.js is PACKAGE DATA
+        # driven by flexfactor_journeys, and it reads its own knobs. Scanning
+        # .py alone made a real, documented variable look like fiction.
         sources = _runtime_sources() + [
             os.path.join(HERE, f) for f in os.listdir(HERE)
             if f.endswith(".py") and (f.startswith("test_") or f.endswith("_tests.py"))]
+        assets = os.path.join(HERE, "flexfactor_assets")
+        if os.path.isdir(assets):
+            sources += [os.path.join(assets, f) for f in os.listdir(assets)
+                        if f.endswith((".js", ".mjs", ".cjs"))]
         blob = ""
         for path in sources:
             with open(path, encoding="utf-8", errors="replace") as fh:

@@ -8,7 +8,7 @@ Re-measured today at `a03ee7c` + this change. What moved:
 | Then (2026-08-22) | Now (2026-08-23, measured) |
 |---|---|
 | main suite 887 collected, **9 FAIL** | `flexfactor_tests.py` **888 run, 0 failures**, 8 skipped |
-| module suites run individually | **29 test modules, all green - 1,395 tests, 0 failures** (counted from the run, not estimated): the CI list plus errors / structural / openai-param / intent / paid-first / quality / localbench / glimmer / config-surface / ledger-routing / dashboard |
+| module suites run individually | **30 test modules, all green - 1,399 tests, 0 failures** (counted from the run, not estimated): the CI list plus errors / structural / openai-param / intent / paid-first / quality / localbench / glimmer / config-surface / ledger-routing / dashboard / purpose-wiring |
 | CI status not recorded here | `production-readiness` and `rotation-extensions` **green on main** (run 32668261872, 2026-08-23) |
 | section 5 item 9 "9 main-suite failures" | **CLOSED** |
 | section 5 item 3 "dashboard has no panels for the newer evidence" | **still open for chunk/coverage/journey panels**; the dashboard now DOES carry the run's error ledger, per program |
@@ -39,9 +39,20 @@ Closed today, each with the evidence that closed it:
    had declared `Proprietary` all along. Written to match.
 
 FlexFactor's own readiness rubric, run on FlexFactor with real build evidence
-(`python -m compileall -q .` exit 0) and the 29-module battery as the test
+(`python -m compileall -q .` exit 0) and the 30-module battery as the test
 evidence: **11 of 11 evaluated gates PASS, 2 N/A, no blockers** (was 6 pass /
 9 evaluated with 3 blockers this morning).
+
+6. **The purpose-evidence gather had never run** (section 4's "`gather_purpose_evidence`
+   default `gh` runner is raw `subprocess.run`" was out of date, and understated
+   it). Both injected runners broke the module's documented contract: the git
+   runner returned a `CompletedProcess` where a string was required, so the
+   first call raised and the WHOLE gather aborted into
+   `[purpose evidence gathering failed: ...]`; the gh runner dropped the `gh`
+   executable and silently ran `/usr/bin/pr`. Measured before -> after on this
+   repository: **0 evidence sources -> 78** (50 commits, 6 branches, 30 PRs).
+   `flexfactor_purpose_wiring_tests.py` drives the real injection; all four
+   tests were confirmed to fail against the old code.
 
 Not closed, and deliberately named rather than quietly dropped:
 
@@ -51,6 +62,13 @@ Not closed, and deliberately named rather than quietly dropped:
   exercises a fraction of the battery CI runs. The binding gate is the workflow,
   not pytest.
 - Windows network isolation is still `best-effort-env` (section 5 item 1).
+- `test_flexfactor_journeys.test_isolated_run_executes_every_journey_and_is_complete`
+  is host-speed sensitive on shared CI: on ubuntu (run 32686466307) one re-login
+  action exceeded the explorer's 15s per-action deadline while all 40 journeys
+  passed, and a timeout blocks completeness by design. The CI job now sets
+  `FLEXFACTOR_E2E_ACTION_TIMEOUT_MS=45000` so the deadline measures HANGS rather
+  than runner speed; the default and the fail-closed completeness rule are
+  unchanged. Windows CI and three local runs passed the same test unmodified.
 - Sections 5.2 (Linux bwrap unrun here), 5.4 (resume hash-verification scope),
   5.5 (scout mutation path outside the orphan-WIP transaction) and 5.7 (purpose
   `gh` runner outside the broker) are unchanged and still open.
