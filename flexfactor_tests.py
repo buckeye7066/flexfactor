@@ -14199,30 +14199,46 @@ class DashboardDismissTests(unittest.TestCase):
         self.assertEqual([p["dir"] for p in self.dash.visible_programs([a, b])],
                          ["C:/two"])
 
+    # NOTE (2026-08-23): the per-frame drawing moved out of `_main`'s closure
+    # into the module-level `draw_frame`, so the error box could be rendered and
+    # read back by a test instead of only looked at. These three greps followed
+    # it. They are still source greps and still weak on their own - the real
+    # behavioural coverage now lives in flexfactor_dashboard_tests.py, which
+    # draws a frame on a real canvas - so each one asserts BOTH that the
+    # property is present and that it is present in the function that actually
+    # runs, which is what silently stopped being true when the code moved.
+    def _frame_src(self):
+        src = inspect.getsource(self.dash.draw_frame)
+        self.assertGreater(len(src), 2000, "draw_frame must still be the frame")
+        return src
+
     def test_the_control_is_wired_into_the_render_loop(self):
-        """The logic above is only reachable because redraw() filters through
+        """The logic above is only reachable because the frame filters through
         visible_programs and registers a clickable region per panel."""
-        src = inspect.getsource(self.dash._main)
+        src = self._frame_src()
         self.assertIn("visible_programs(", src)
         self.assertIn("dismiss(p)", src)
         self.assertIn("restore_all", src)
-        self.assertIn('canvas.bind("<Button-1>"', src)
         # The per-panel lambda must bind the loop variable, or every "x" would
         # dismiss whichever panel was drawn last.
         self.assertIn("lambda p=p:", src)
+        # The click map itself is owned by the loop that owns the window.
+        main = inspect.getsource(self.dash._main)
+        self.assertIn('canvas.bind("<Button-1>"', main)
+        self.assertIn("draw_frame(canvas, hits, shown", main)
 
     def test_bar_animation_is_keyed_by_program_not_by_column_index(self):
         """Dismissing a panel shifts every later program one column left. Keyed
         by the loop INDEX, each of them would inherit the dismissed panel's
         eased bar values and glide from a percentage that was never theirs."""
-        src = inspect.getsource(self.dash._main)
+        src = self._frame_src()
         self.assertIn("ease((program_key(p), key), target)", src)
         self.assertNotIn("ease((i, key)", src)
 
     def test_the_dismiss_control_is_drawn_after_the_panel_title(self):
         """A long centred program name drawn AFTER the "x" would paint over the
         only way to reclaim the column."""
-        src = inspect.getsource(self.dash._main)
+        src = self._frame_src()
         title = src.index('text=name[:34]')
         control = src.index('text="x"')
         self.assertGreater(control, title,

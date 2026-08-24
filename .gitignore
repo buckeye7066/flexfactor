@@ -35,3 +35,16 @@ catalog.auto.json
 
 # Run evidence written into the audited repo by FlexFactor itself (never committed)
 *_run_manifest_*.json
+
+# Secrets. FlexFactor takes every credential from the ENVIRONMENT (see
+# .env.example for the full surface), so a .env in this checkout holds real
+# provider keys. Its own readiness gate `gitignore_protects` is CRITICAL-
+# adjacent for exactly this reason and was failing here until 2026-08-23.
+# `.env.example` is the documented template and stays tracked.
+.env
+.env.*
+!.env.example
+
+# Per-run evidence written by a run started FROM this checkout (`runs/`), the
+# same class as logs/ above: it is output, not source.
+runs/

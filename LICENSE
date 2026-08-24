@@ -1,0 +1,28 @@
+FlexFactor
+Copyright (c) 2026 the FlexFactor author. All rights reserved.
+
+PROPRIETARY - NOT OPEN SOURCE.
+
+This software and its source code are proprietary and confidential. No licence,
+express or implied, is granted to any person to use, copy, modify, merge,
+publish, distribute, sublicense or sell this software or any portion of it,
+except by separate written permission from the copyright holder.
+
+This file states the licence the package metadata has always declared
+(`pyproject.toml`: license = { text = "Proprietary" }). It is written down here
+because a repository with no LICENSE file is ambiguous to every tool and reader
+that looks for one, not because the terms have changed.
+
+THIRD-PARTY COMPONENTS
+FlexFactor's runtime is Python standard library only. The optional provider SDKs
+(`anthropic`, `openai`) and the optional Playwright browser engine used by the
+journey tests are installed separately and remain under their own licences; this
+notice covers only FlexFactor's own code.
+
+NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

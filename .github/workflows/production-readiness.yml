@@ -72,6 +72,18 @@ jobs:
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
                    flexfactor_cli_provider_tests.py \
+                   flexfactor_errors_tests.py \
+                   flexfactor_structural_tests.py \
+                   flexfactor_openai_param_tests.py \
+                   flexfactor_intent_tests.py \
+                   flexfactor_paidfirst_tests.py \
+                   flexfactor_quality_tests.py \
+                   flexfactor_localbench_tests.py \
+                   flexfactor_glimmer_tests.py \
+                   flexfactor_config_surface_tests.py \
+                   flexfactor_ledger_routing_tests.py \
+                   flexfactor_dashboard_tests.py \
+                   flexfactor_purpose_wiring_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \
                    test_flexfactor_wip.py \
@@ -90,6 +102,15 @@ jobs:
           done
         env:
           FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+          # The explorer races every browser action against a deadline so a hang
+          # becomes a named `timeout` finding instead of a stall, and a timeout
+          # blocks completeness (fail-closed, deliberately). The 15s default is
+          # tuned for a developer machine; a shared 2-core runner with a cold
+          # browser exceeded it on a re-login (ubuntu, run 32686466307) while all
+          # 40 journeys passed. Widening the budget HERE keeps the deadline
+          # measuring hangs rather than runner speed - the default, and the rule
+          # that a timeout blocks completeness, are both unchanged.
+          FLEXFACTOR_E2E_ACTION_TIMEOUT_MS: "45000"
       - name: Rotation-extension tests
         shell: bash
         env:
