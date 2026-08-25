@@ -26,6 +26,7 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
                                     applied_files: list[str] | set[str] | None,
                                     unverified_files: list[str] | set[str] | None,
                                     test_files: list[str] | set[str] | None,
+                                    tests_by_source: dict[str, list[str]] | None,
                                     verification_passed: bool) -> dict | None:
     """Attach deterministic implementation evidence to every market decision.
 
@@ -44,16 +45,26 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
     tests = sorted({
         str(path).replace("\\", "/") for path in (test_files or []) if str(path).strip()
     })
+    source_tests = {
+        str(source).replace("\\", "/"): sorted({
+            str(path).replace("\\", "/")
+            for path in (paths or [])
+            if str(path).strip()
+        })
+        for source, paths in (tests_by_source or {}).items()
+    }
     for competitor in competitor_research.get("competitors") or []:
         idea = competitor.get("idea") or {}
         target = str(idea.get("file") or "").replace("\\", "/")
         target_applied = bool(target and target in applied)
         target_verified = bool(target_applied and target not in unverified)
+        target_tests = source_tests.get(target, [])
         implementation_evidence = {
             "target_file": target,
             "target_applied": target_applied,
             "target_verified": target_verified,
-            "test_files": tests,
+            "test_files": target_tests,
+            "all_generated_test_files": tests,
             "verification_passed": bool(verification_passed),
         }
         competitor["implementation_evidence"] = implementation_evidence
@@ -63,7 +74,7 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
             status = "rejected-duplicate"
         elif not competitor.get("entered_fix_stream"):
             status = "not-selected"
-        elif target_verified and tests and verification_passed:
+        elif target_verified and target_tests and verification_passed:
             status = "applied-and-build-verified"
         elif target_applied:
             status = "applied-verification-incomplete"
@@ -71,6 +82,7 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
             status = "not-applied"
         competitor["implementation_status"] = status
     competitor_research["implementation_evidence_version"] = SCHEMA
+    competitor_research["test_evidence_by_source"] = source_tests
     return competitor_research
 
 
