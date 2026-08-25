@@ -452,6 +452,8 @@ Do not fabricate:
 - Payment validation
 - Regulatory status
 - Production test results
+- Security certification
+- The existence or outcome of a review attributed to a named person
 Do not bypass:
 - Authentication
 - Authorization

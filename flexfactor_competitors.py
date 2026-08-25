@@ -197,6 +197,13 @@ def _default_opener(url: str, data: bytes | None = None,
     return raw.decode("utf-8", "replace")
 
 
+# Keep an immutable identity for the production transport. Test harnesses and
+# callers deliberately replace ``_default_opener`` with an offline/instrumented
+# transport; comparing against the mutable module global would mistake that
+# injection for production and silently route around it.
+_PRODUCTION_OPENER = _default_opener
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Keep bearer credentials bound to the explicitly configured origin."""
 
@@ -252,7 +259,8 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
         "sources": ["web"],
         "safe": True,
     }).encode("utf-8")
-    request = _default_firecrawl_opener if opener is _default_opener else opener
+    request = (_default_firecrawl_opener
+               if opener is _PRODUCTION_OPENER else opener)
     root = json.loads(request(endpoint, payload, headers))
     if not isinstance(root, dict) or root.get("success") is False:
         raise RuntimeError("Firecrawl v2 reported failure or invalid JSON shape")

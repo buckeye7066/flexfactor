@@ -535,7 +535,7 @@ Distinguish saved, submitted, pending, failed, cancelled, and completed states
 Use accessibility features where applicable
 Remove developer-facing language, internal approval notes, debug controls, incomplete labels, and implementation details from normal production workflows unless users genuinely need them. Do not hide missing functionality behind attractive presentation.
 10. EXTERNAL SERVICES, CREDENTIALS, AND APPROVALS
-Do not fabricate credentials, API access, legal approval, clinical validation, curriculum approval, privacy approval, payment validation, regulatory status, production test results, or external-provider success.
+Do not fabricate credentials, API access, legal approval, clinical validation, curriculum approval, privacy approval, payment validation, regulatory status, production test results, external-provider success, security certification, or the existence or outcome of a review attributed to a named person.
 Do not bypass authentication, authorization, two-factor authentication, consent, signatures, payment controls, provider restrictions, or security protections.
 When a true external dependency prevents final release:
 1.  Complete every software, content, test, documentation, and configuration task that does not require the missing external action.
