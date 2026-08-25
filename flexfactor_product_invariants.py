@@ -7,6 +7,7 @@ the audit, the readiness card, and tests without another model opinion.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,11 +23,43 @@ MUTATING_REUSE_MODES = {
 }
 
 
+def competitor_capability_id(competitor: dict, index: int) -> str:
+    """Stable per-research-ledger identifier used to bind tests to a feature."""
+    idea = competitor.get("idea") or {}
+    raw = f"{competitor.get('name') or 'competitor'}-{idea.get('idea_title') or 'capability'}"
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:80]
+    return f"competitor-{index + 1}-{slug or 'capability'}"
+
+
+def collect_capability_test_evidence(*, test_path: str,
+                                     contents: str,
+                                     required_capabilities: list[dict] | None
+                                     ) -> dict[str, list[str]]:
+    """Bind a generated test artifact only to capability IDs it names.
+
+    The native suite still decides whether the artifact executes successfully;
+    this helper prevents target-level coverage from being reused as evidence for
+    a second capability that happened to change the same source file.
+    """
+    path = str(test_path or "").replace("\\", "/").strip()
+    body = str(contents or "")
+    if not path or not body:
+        return {}
+    evidence: dict[str, list[str]] = {}
+    for capability in required_capabilities or []:
+        capability_id = str(capability.get("capability_id") or "").strip()
+        marker = f"FLEXFACTOR_CAPABILITY:{capability_id}"
+        if capability_id and marker in body:
+            evidence[capability_id] = [path]
+    return evidence
+
+
 def stamp_competitor_implementation(*, competitor_research: dict | None,
                                     applied_files: list[str] | set[str] | None,
                                     unverified_files: list[str] | set[str] | None,
                                     test_files: list[str] | set[str] | None,
                                     tests_by_source: dict[str, list[str]] | None,
+                                    tests_by_capability: dict[str, list[str]] | None,
                                     verification_passed: bool) -> dict | None:
     """Attach deterministic implementation evidence to every market decision.
 
@@ -53,13 +86,24 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
         })
         for source, paths in (tests_by_source or {}).items()
     }
-    for competitor in competitor_research.get("competitors") or []:
+    capability_tests = {
+        str(capability): sorted({
+            str(path).replace("\\", "/")
+            for path in (paths or [])
+            if str(path).strip()
+        })
+        for capability, paths in (tests_by_capability or {}).items()
+    }
+    for index, competitor in enumerate(competitor_research.get("competitors") or []):
         idea = competitor.get("idea") or {}
+        capability_id = competitor_capability_id(competitor, index)
+        competitor["capability_id"] = capability_id
         target = str(idea.get("file") or "").replace("\\", "/")
         target_applied = bool(target and target in applied)
         target_verified = bool(target_applied and target not in unverified)
-        target_tests = source_tests.get(target, [])
+        target_tests = capability_tests.get(capability_id, [])
         implementation_evidence = {
+            "capability_id": capability_id,
             "target_file": target,
             "target_applied": target_applied,
             "target_verified": target_verified,
@@ -68,10 +112,10 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
             "verification_passed": bool(verification_passed),
         }
         competitor["implementation_evidence"] = implementation_evidence
-        if not idea.get("accept"):
-            status = "rejected-purpose-fit"
-        elif idea.get("already_present") is True:
+        if idea.get("already_present") is True:
             status = "rejected-duplicate"
+        elif not idea.get("accept"):
+            status = "rejected-purpose-fit"
         elif not competitor.get("entered_fix_stream"):
             status = "not-selected"
         elif target_verified and target_tests and verification_passed:
@@ -83,6 +127,7 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
         competitor["implementation_status"] = status
     competitor_research["implementation_evidence_version"] = SCHEMA
     competitor_research["test_evidence_by_source"] = source_tests
+    competitor_research["test_evidence_by_capability"] = capability_tests
     return competitor_research
 
 
@@ -107,7 +152,7 @@ def _utc_timestamp_is_current(value: Any, max_age_days: int = 30) -> bool:
     except (TypeError, ValueError):
         return False
     age = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
-    return age.total_seconds() >= -300 and age.days <= max_age_days
+    return -300 <= age.total_seconds() <= max_age_days * 24 * 60 * 60
 
 
 def _gate(gate_id: str, passed: bool, evidence: str, remediation: str) -> dict:
@@ -130,7 +175,8 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
                                 competitor_target: int = 5,
                                 applied_files: list[str] | set[str] | None = None,
                                 test_files: list[str] | set[str] | None = None,
-                                verification_passed: bool | None = None) -> dict:
+                                verification_passed: bool | None = None,
+                                license_compatible=None) -> dict:
     """Return immutable, JSON-safe evidence and every blocking invariant.
 
     A competitor capability is selected only when its evidence is current and
@@ -179,8 +225,20 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     ))
 
     research = competitor_research or {}
-    target = max(1, int(research.get("target") or competitor_target or 5))
-    verified = int(research.get("verified") or 0)
+    competitors = list(research.get("competitors") or [])
+    configured_target = max(1, int(competitor_target or 5))
+    reported_target = max(1, int(research.get("target") or configured_target))
+    target = max(configured_target, reported_target)
+    reported_verified = int(research.get("verified") or 0)
+    verified = sum(
+        1
+        for competitor in competitors
+        if competitor.get("evidence_status") == "verified"
+        and any(
+            _text(url).startswith(("https://", "http://"))
+            for url in (competitor.get("evidence_urls") or [])
+        )
+    )
     current = _utc_timestamp_is_current(research.get("researched_at"))
     gates.append(_gate(
         "competitive-research-current",
@@ -190,12 +248,11 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     ))
     gates.append(_gate(
         "competitive-coverage",
-        current and verified >= target,
-        f"corroborated={verified}/{target}; {research.get('coverage_note') or ''}",
+        current and verified >= target and reported_verified == verified,
+        f"corroborated={verified}/{target}; reported={reported_verified}; {research.get('coverage_note') or ''}",
         "Corroborate the target number of real alternatives from reachable sources; never pad a shortfall with invented products.",
     ))
 
-    competitors = list(research.get("competitors") or [])
     provenance_failures: list[str] = []
     review_failures: list[str] = []
     copying_failures: list[str] = []
@@ -204,8 +261,9 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     applied = {str(path).replace("\\", "/") for path in (applied_files or [])}
     tests = {str(path).replace("\\", "/") for path in (test_files or [])}
 
-    for competitor in competitors:
+    for index, competitor in enumerate(competitors):
         name = _text(competitor.get("name")) or "(unnamed competitor)"
+        capability_id = competitor_capability_id(competitor, index)
         evidence_urls = [
             _text(url) for url in (competitor.get("evidence_urls") or [])
             if _text(url).startswith(("https://", "http://"))
@@ -213,10 +271,23 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
         if competitor.get("evidence_status") == "verified" and not evidence_urls:
             provenance_failures.append(f"{name}: verified without a source URL")
         reuse_mode = _text(competitor.get("reuse_mode"))
+        license_name = _text(competitor.get("license"))
+        license_source = _text(competitor.get("license_source"))
         if reuse_mode not in KNOWN_REUSE_MODES:
             copying_failures.append(f"{name}: unknown reuse mode {reuse_mode or '(missing)'}")
-        if reuse_mode == "direct-code-reuse" and not _text(competitor.get("license")):
-            copying_failures.append(f"{name}: direct reuse without a recorded license")
+        if reuse_mode == "direct-code-reuse":
+            try:
+                compatible = (
+                    license_compatible(license_name)
+                    if callable(license_compatible)
+                    else None
+                )
+            except Exception:
+                compatible = None
+            if not license_name or not license_source or compatible is not True:
+                copying_failures.append(
+                    f"{name}: direct reuse without an attributable compatible-license record"
+                )
 
         idea = dict(competitor.get("idea") or {})
         accepted = bool(idea.get("accept"))
@@ -247,6 +318,7 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
 
         record = {
             "competitor": name,
+            "capability_id": capability_id,
             "capability": required_review["idea_title"],
             "source_urls": evidence_urls,
             "purpose_fit": required_review["purpose_reason"],
@@ -256,6 +328,8 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
             "risk_reason": risk_reason,
             "risk_mitigation": mitigation,
             "reuse_mode": reuse_mode,
+            "license": license_name,
+            "license_source": license_source,
             "file": str(idea.get("file") or "").replace("\\", "/"),
         }
         if accepted:
@@ -305,6 +379,10 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
                 f"{record['competitor']}: implementation was not applied and build-verified"
             )
         implementation = dict(competitor.get("implementation_evidence") or {})
+        if implementation.get("capability_id") != record["capability_id"]:
+            delivery_failures.append(
+                f"{record['competitor']}: implementation evidence is not bound to its capability id"
+            )
         if implementation.get("target_file") != path:
             delivery_failures.append(
                 f"{record['competitor']}: implementation evidence does not name {path}"
@@ -357,6 +435,8 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
 
 __all__ = [
     "SCHEMA",
+    "collect_capability_test_evidence",
+    "competitor_capability_id",
     "evaluate_product_invariants",
     "stamp_competitor_implementation",
 ]
