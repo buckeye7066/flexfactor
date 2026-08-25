@@ -44,6 +44,12 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         raw = ("manual" + "\n_-" + "approval").encode()
         self.assertIn("manual_gate", policy.matching_labels(raw))
 
+    def test_third_person_completion_phrase_is_detected(self):
+        raw = ("owner signs" + " off").encode()
+        self.assertIn(
+            "organizational_gate_third_person", policy.matching_labels(raw)
+        )
+
     def test_jsx_and_static_string_boundaries_are_detected(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))

@@ -47,6 +47,10 @@ _STATIC_LITERAL = re.compile(
 _PROHIBITED_FRAGMENTS = (
     ("organizational_gate", "sign" + " off"),
     ("organizational_gate_compact", "sign" + "off"),
+    ("organizational_gate_third_person", "signs" + " off"),
+    ("organizational_gate_gerund", "signing" + " off"),
+    ("organizational_gate_plural", "sign" + " offs"),
+    ("organizational_gate_compact_plural", "sign" + "offs"),
     ("completed_organizational_gate", "signed" + " off"),
     ("identity_gate", "authenticated " + "reviewer"),
     ("mandatory_reviewer_gate", "required " + "reviewer"),
