@@ -12,7 +12,7 @@ A run cannot report convergence, finish its resumable checkpoint, or claim produ
 4. Competitor research ran within the last 30 days and corroborated the configured target count with source URLs.
 5. Every candidate has a purpose-fit, duplicate, provenance, wiring, verification, and adoption-risk decision.
 6. Reuse mode is mechanically bounded by source ownership and license provenance; reference-only evidence cannot drive code changes.
-7. Every selected capability entered the normal build-gated fix stream, changed its named target, was wired through the described boundary, gained focused executable tests, and passed the repository's full verification suite and exact-tree quality gates.
+7. Every selected capability entered the normal build-gated fix stream, changed its named target in that competitor phase, was wired through the described boundary, gained focused executable tests mapped to that exact source target, and passed the repository's full verification suite and exact-tree quality gates.
 
 It is valid to reject every competitor feature when the recorded purpose-fit, duplication, provenance, or risk review supports that decision. It is not valid to copy a competitor roadmap, silently drop an accepted candidate, or report a selected capability as delivered when only research or scaffolding exists.
 
