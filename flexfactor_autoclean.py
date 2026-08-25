@@ -36,31 +36,33 @@ silently treated as clean.
 from __future__ import annotations
 
 import json
-import subprocess
 
 #: Check states that do not block a merge.
 _OK_CHECK = {"SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED", None, ""}
 
 TIMEOUT_S = 300
 
+# CONTAINMENT (i-5). THIS MODULE OWNS NO PROCESS LAUNCHER.
+#
+# It used to hold a private `_run` built on the subprocess module, and it is
+# the module that runs `git commit` and `gh pr merge` against the owner's
+# repositories. A process started here is outside `flexfactor._run`, so
+# `flexfactor_cmdpolicy` never classifies it, the execution ledger never
+# records it, and the containment claim FlexFactor prints does not cover it -
+# the same defect the contract named as g-5 in the purpose-evidence gatherer.
+#
+# Every entry point therefore takes a REQUIRED `run` runner with the contract
+#
+#     run(cmd: list[str], cwd: str, timeout: int = TIMEOUT_S)
+#         -> (exit_code, combined_output)   # never raises
+#
+# and there is no default. "Somebody called clean_repo without wiring the
+# chokepoint" is a TypeError at the call site, not a silent raw subprocess.
 
-def _run(cmd, cwd, timeout=TIMEOUT_S):
-    """Run one command; return (exit_code, combined_output). Never raises."""
-    try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout, encoding="utf-8", errors="replace")
-        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
-    except FileNotFoundError:
-        return 127, str(cmd[0]) + ": not found"
-    except subprocess.TimeoutExpired:
-        return 124, " ".join(cmd) + ": timed out after " + str(timeout) + "s"
-    except Exception as exc:                                  # pragma: no cover
-        return 1, " ".join(cmd) + ": " + str(exc)
 
-
-def _gh_json(args, cwd):
+def _gh_json(args, cwd, run):
     """Run a `gh` command expecting JSON. Returns (data, error_reason)."""
-    code, out = _run(["gh"] + args, cwd)
+    code, out = run(["gh"] + args, cwd)
     if code != 0:
         return None, out or ("gh exited " + str(code))
     try:
@@ -81,10 +83,10 @@ def _skip(res, item, reason):
 # --------------------------------------------------------------------------
 # Step 1: uncommitted changes
 # --------------------------------------------------------------------------
-def commit_pending_changes(project_dir):
+def commit_pending_changes(project_dir, *, run):
     """Commit pre-existing uncommitted changes. Never discards them."""
     res = _result("uncommitted-changes")
-    code, out = _run(["git", "status", "--porcelain"], project_dir)
+    code, out = run(["git", "status", "--porcelain"], project_dir)
     if code != 0:
         res["failed"].append({"item": "git status", "reason": out})
         res["candidates"] = 1
@@ -94,7 +96,7 @@ def commit_pending_changes(project_dir):
     if not changed:
         return res
 
-    code, out = _run(["git", "add", "-A"], project_dir)
+    code, out = run(["git", "add", "-A"], project_dir)
     if code != 0:
         for ln in changed:
             res["failed"].append({"item": ln.strip(), "reason": "git add -A: " + out[:160]})
@@ -103,7 +105,7 @@ def commit_pending_changes(project_dir):
            "FlexFactor cleans the repo before starting new work. These changes "
            "were already on disk; they are committed here so they stay visible "
            "in history instead of being swept into an unrelated fix commit.")
-    code, out = _run(["git", "commit", "-m", msg], project_dir)
+    code, out = run(["git", "commit", "-m", msg], project_dir)
     if code != 0:
         # "nothing to commit" is a legitimate no-op (e.g. all changes ignored).
         reason = ("nothing to commit after staging (ignored by .gitignore)"
@@ -133,14 +135,14 @@ def _pr_blocking_checks(pr):
     return bad
 
 
-def land_open_prs(project_dir, repo=None):
+def land_open_prs(project_dir, repo=None, *, run):
     """Merge every green, mergeable, non-draft PR. Leave red ones OPEN."""
     res = _result("open-pull-requests")
     args = ["pr", "list", "--state", "open", "--limit", "100",
             "--json", "number,title,isDraft,mergeable,statusCheckRollup"]
     if repo:
         args += ["-R", repo]
-    prs, err = _gh_json(args, project_dir)
+    prs, err = _gh_json(args, project_dir, run)
     if prs is None:
         res["candidates"] = 1
         res["failed"].append({"item": "gh pr list", "reason": err[:200]})
@@ -162,7 +164,7 @@ def land_open_prs(project_dir, repo=None):
         margs = ["pr", "merge", str(num), "--squash", "--delete-branch"]
         if repo:
             margs += ["-R", repo]
-        code, out = _run(["gh"] + margs, project_dir)
+        code, out = run(["gh"] + margs, project_dir)
         if code == 0:
             res["acted_on"].append(num)
         else:
@@ -173,7 +175,7 @@ def land_open_prs(project_dir, repo=None):
 # --------------------------------------------------------------------------
 # Step 3: Dependabot security alerts
 # --------------------------------------------------------------------------
-def report_dependabot(project_dir, repo=None):
+def report_dependabot(project_dir, repo=None, *, run):
     """Account for open Dependabot alerts.
 
     Dependabot's own PRs are merged by `land_open_prs`. Anything still open
@@ -189,7 +191,7 @@ def report_dependabot(project_dir, repo=None):
              "pkg:.security_vulnerability.package.name}]")
     alerts, err = _gh_json(
         ["api", "repos/" + repo + "/dependabot/alerts", "--paginate", "-q", query],
-        project_dir)
+        project_dir, run)
     if alerts is None:
         res["candidates"] = 1
         _skip(res, "dependabot", "alerts unavailable: " + err[:160])
@@ -205,14 +207,14 @@ def report_dependabot(project_dir, repo=None):
 # --------------------------------------------------------------------------
 # Step 4: open issues
 # --------------------------------------------------------------------------
-def report_open_issues(project_dir, repo=None):
+def report_open_issues(project_dir, repo=None, *, run):
     """Account for open issues so the run can fold them into its work theme."""
     res = _result("open-issues")
     args = ["issue", "list", "--state", "open", "--limit", "100",
             "--json", "number,title"]
     if repo:
         args += ["-R", repo]
-    issues, err = _gh_json(args, project_dir)
+    issues, err = _gh_json(args, project_dir, run)
     if issues is None:
         res["candidates"] = 1
         _skip(res, "issues", "issue list unavailable: " + err[:160])
@@ -228,15 +230,15 @@ def report_open_issues(project_dir, repo=None):
 # --------------------------------------------------------------------------
 # Step 5: start from the real union
 # --------------------------------------------------------------------------
-def sync_with_main(project_dir):
+def sync_with_main(project_dir, *, run):
     """Pull origin's current branch so new work builds on what just landed."""
     res = _result("sync-with-origin", candidates=1)
-    code, out = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], project_dir)
+    code, out = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], project_dir)
     if code != 0:
         res["failed"].append({"item": "rev-parse", "reason": out[:160]})
         return res
     branch = out.strip()
-    code, out = _run(["git", "pull", "--ff-only", "origin", branch], project_dir)
+    code, out = run(["git", "pull", "--ff-only", "origin", branch], project_dir)
     if code == 0:
         res["acted_on"].append("fast-forwarded " + branch + " from origin")
         return res
@@ -270,7 +272,7 @@ def summarise(steps):
     return total
 
 
-def clean_repo(project_dir, repo=None, report=None):
+def clean_repo(project_dir, repo=None, report=None, *, run):
     """Run every cleanup step in order and return the accounted summary."""
     say = report if callable(report) else (lambda *a, **k: None)
     steps = []
@@ -280,7 +282,8 @@ def clean_repo(project_dir, repo=None, report=None):
             (report_open_issues, True),
             (sync_with_main, False))
     for fn, needs_repo in plan:
-        res = fn(project_dir, repo) if needs_repo else fn(project_dir)
+        res = (fn(project_dir, repo, run=run) if needs_repo
+               else fn(project_dir, run=run))
         steps.append(res)
         say("autoclean " + res["step"] + ": " + str(len(res["acted_on"]))
             + " done, " + str(len(res["skipped"])) + " skipped, "

@@ -847,6 +847,19 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
                                  "direct": coverage.get("function_direct_coverage_total", 0),
                                  "module_executed_only": coverage.get("function_module_execution_total", 0),
                                  "blocked": direct_gate.get("blocked", 0),
+                                 # A block is only evidence when its REASON is
+                                 # recorded next to it, and a REJECTED block has
+                                 # to appear too - a declaration that vanishes
+                                 # is indistinguishable from one never made.
+                                 "blocked_ids": list(direct_gate.get("blocked_ids") or [])[:200],
+                                 "blocked_reasons": dict(direct_gate.get("blocked_reasons") or {}),
+                                 "blocked_without_reason": list(
+                                     direct_gate.get("blocked_without_reason") or [])[:200],
+                                 "unknown_blocked_ids": list(
+                                     direct_gate.get("unknown_blocked_ids") or [])[:200],
+                                 "blocked_superseded_by_direct": list(
+                                     direct_gate.get("blocked_superseded_by_direct") or [])[:200],
+                                 "blocked_declared": direct_gate.get("blocked_declared", 0),
                                  "basis": coverage.get("function_coverage_basis",
                                                        "module-execution-only (NOT direct)"),
                                  "unproven_ids": list(direct_gate.get("unproven_ids") or [])[:200]}),

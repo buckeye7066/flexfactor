@@ -19,6 +19,19 @@ import unittest
 import flexfactor_autoclean as ac
 
 
+def _test_runner(cmd, cwd, timeout=ac.TIMEOUT_S):
+    """The test scaffold's own runner.
+
+    `flexfactor_autoclean` no longer owns a launcher (g-5 class: a raw
+    subprocess outside FlexFactor's command chokepoint). Production injects a
+    runner backed by `flexfactor._run`; these tests, which are not the product,
+    inject this one.
+    """
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                       timeout=timeout, encoding="utf-8", errors="replace")
+    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+
+
 def _git(args, cwd):
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
                           text=True, encoding="utf-8", errors="replace")
@@ -59,7 +72,7 @@ class CommitPendingChangesTests(unittest.TestCase):
         d = _repo()
         with open(os.path.join(d, "wip.txt"), "w") as fh:
             fh.write("owner work\n")
-        res = ac.commit_pending_changes(d)
+        res = ac.commit_pending_changes(d, run=_test_runner)
         self.assertEqual(res["candidates"], 1)
         self.assertEqual(len(res["acted_on"]), 1)
         # The content must still exist on disk AND be in the commit.
@@ -71,7 +84,7 @@ class CommitPendingChangesTests(unittest.TestCase):
 
     def test_clean_tree_reports_zero_candidates_not_success(self):
         d = _repo()
-        res = ac.commit_pending_changes(d)
+        res = ac.commit_pending_changes(d, run=_test_runner)
         self.assertEqual(res["candidates"], 0)
         self.assertEqual(res["acted_on"], [])
 
@@ -80,7 +93,7 @@ class CommitPendingChangesTests(unittest.TestCase):
         for name in ("a.txt", "b.txt"):
             with open(os.path.join(d, name), "w") as fh:
                 fh.write(name)
-        res = ac.commit_pending_changes(d)
+        res = ac.commit_pending_changes(d, run=_test_runner)
         ac.summarise([res])  # must not raise
 
 
@@ -88,7 +101,7 @@ class PullRequestPolicyTests(unittest.TestCase):
     """Red/draft/conflicting PRs are SKIPPED WITH A REASON, never merged."""
 
     def _list_stub(self, prs):
-        def fake(args, cwd):
+        def fake(args, cwd, run=None):
             return prs, ""
         return fake
 
@@ -99,7 +112,7 @@ class PullRequestPolicyTests(unittest.TestCase):
         orig = ac._gh_json
         ac._gh_json = self._list_stub(prs)
         try:
-            res = ac.land_open_prs("/nonexistent", repo="o/r")
+            res = ac.land_open_prs("/nonexistent", repo="o/r", run=_test_runner)
         finally:
             ac._gh_json = orig
         self.assertEqual(res["acted_on"], [])
@@ -117,7 +130,7 @@ class PullRequestPolicyTests(unittest.TestCase):
         orig = ac._gh_json
         ac._gh_json = self._list_stub(prs)
         try:
-            res = ac.land_open_prs("/nonexistent", repo="o/r")
+            res = ac.land_open_prs("/nonexistent", repo="o/r", run=_test_runner)
         finally:
             ac._gh_json = orig
         self.assertEqual(res["acted_on"], [])
@@ -129,7 +142,7 @@ class PullRequestPolicyTests(unittest.TestCase):
     def test_green_pr_is_merged(self):
         prs = [{"number": 9, "isDraft": False, "mergeable": "MERGEABLE",
                 "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS"}]}]
-        orig_json, orig_run = ac._gh_json, ac._run
+        orig_json = ac._gh_json
         merged = []
 
         def fake_run(cmd, cwd, timeout=ac.TIMEOUT_S):
@@ -137,20 +150,19 @@ class PullRequestPolicyTests(unittest.TestCase):
             return 0, "merged"
 
         ac._gh_json = self._list_stub(prs)
-        ac._run = fake_run
         try:
-            res = ac.land_open_prs("/nonexistent", repo="o/r")
+            res = ac.land_open_prs("/nonexistent", repo="o/r", run=fake_run)
         finally:
-            ac._gh_json, ac._run = orig_json, orig_run
+            ac._gh_json = orig_json
         self.assertEqual(res["acted_on"], [9])
         self.assertTrue(any("merge" in c for c in merged[0]))
         ac.summarise([res])
 
     def test_unreachable_gh_is_a_FAILURE_not_a_silent_clean_repo(self):
         orig = ac._gh_json
-        ac._gh_json = lambda args, cwd: (None, "gh: not found")
+        ac._gh_json = lambda args, cwd, run=None: (None, "gh: not found")
         try:
-            res = ac.land_open_prs("/nonexistent", repo="o/r")
+            res = ac.land_open_prs("/nonexistent", repo="o/r", run=_test_runner)
         finally:
             ac._gh_json = orig
         self.assertEqual(res["candidates"], 1)
@@ -161,10 +173,10 @@ class PullRequestPolicyTests(unittest.TestCase):
 class ReportingStepsTests(unittest.TestCase):
     def test_open_issues_are_accounted_not_dropped(self):
         orig = ac._gh_json
-        ac._gh_json = lambda args, cwd: ([{"number": 3, "title": "x"},
-                                          {"number": 4, "title": "y"}], "")
+        ac._gh_json = lambda args, cwd, run=None: ([{"number": 3, "title": "x"},
+                                                    {"number": 4, "title": "y"}], "")
         try:
-            res = ac.report_open_issues("/nonexistent", repo="o/r")
+            res = ac.report_open_issues("/nonexistent", repo="o/r", run=_test_runner)
         finally:
             ac._gh_json = orig
         self.assertEqual(res["candidates"], 2)
@@ -172,7 +184,7 @@ class ReportingStepsTests(unittest.TestCase):
         ac.summarise([res])
 
     def test_missing_repo_slug_is_reported_not_assumed_clean(self):
-        res = ac.report_dependabot("/nonexistent", repo=None)
+        res = ac.report_dependabot("/nonexistent", repo=None, run=_test_runner)
         self.assertEqual(res["candidates"], 1)
         self.assertIn("no GitHub repo slug", res["skipped"][0]["reason"])
         ac.summarise([res])

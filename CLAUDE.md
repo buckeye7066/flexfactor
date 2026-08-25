@@ -1729,7 +1729,7 @@ so a caller needing one row renders that instead of truncating. **Never slice
 
 ## `flexfactor_invariant_sweep_tests.py` - the invariants are executable now
 
-25 tests, in the CI module list, canary-verified against the REAL tree (a
+**43 tests as of slice 2** (25 in slice 1), in the CI module list, canary-verified against the REAL tree (a
 synthetic `if final_ok:` + ungated `_git(["push"...])` + `.get(..., True)`
 appended to `flexfactor.py` made three sweeps fail with exact `file:line`;
 removing it returned all 25 to green).
@@ -1743,12 +1743,47 @@ removing it returned all 25 to green).
   run flagged five sites - ONE real (`'PASS' if ok else ...`, now `ok is True`)
   and FOUR already-correct. Those four are NOT allowlisted; the analyser
   understands them. A sweep that cries wolf gets muted.
-- **Git mutation registry (i-2/i-4).** Only `_commit_and_sync` and
-  `_apply_integration_impl` may issue `git commit|push|merge`, each with its
-  gate written down (`is not True` rollback; exception-based rollback +
-  disclosure). A new mutation site ANYWHERE fails, which forces whoever adds
-  one to declare its gate instead of inheriting trust by proximity. The
-  registry must also not rot: a declared site that no longer exists fails too.
+- **Git mutation registry (i-2/i-4).** Only `_commit_and_sync`,
+  `_apply_integration_impl` and `flexfactor_autoclean.commit_pending_changes`
+  may issue `git commit|push|merge`, each with its gate written down
+  (`is not True` rollback; exception-based rollback + disclosure; the
+  accounting identity). A new mutation site ANYWHERE fails, which forces
+  whoever adds one to declare its gate instead of inheriting trust by
+  proximity. The registry must also not rot: a declared site that no longer
+  exists fails too. **BLIND SPOT FIXED 2026-08-25:** the scan matched only
+  `argv[0]`, so `_git(["commit", ...])` was caught but the identical
+  `run(["git", "commit", ...])` was invisible - which is how autoclean's
+  commit of the owner's working tree stayed undeclared. A leading
+  `git`/`gh` element is now stripped before matching.
+- **Process-launch chokepoint (i-5, slice 2).** `flexfactor._run` is the ONLY
+  place a process is started for an audit: it classifies the command
+  (`flexfactor_cmdpolicy`), hands install/build/test to the execution broker,
+  records the decision in the execution ledger, and never raises. A launch
+  anywhere else is subject to NONE of that, which means FlexFactor can print a
+  containment claim a real code path does not honour. The sweep now walks every
+  first-party Python file for `subprocess.run/Popen/call/check_call/
+  check_output/getoutput/getstatusoutput` and `os.system/popen/startfile/
+  spawn*/exec*`, **resolving module aliases** (`import subprocess as sp`), and
+  forbids `from subprocess import run` outright because a bare name hides from
+  the attribute scan. Every launch must be in `_PROCESS_LAUNCH_SITES` keyed
+  `"<relpath>::<function>"` with a reason of 40+ characters; the registry must
+  not rot. **Canary-verified live twice** (a real `subprocess.run(['npm',
+  'install'])` in `flexfactor_trust.py` failed with `flexfactor_trust.py:217
+  subprocess.run`; the aliased import failed with `:1 from subprocess import
+  run`).
+- **Helper modules own NO launcher** (the g-5 class, closed as a class).
+  `flexfactor_purpose.gather_purpose_evidence` had `_default_git_runner` /
+  `_default_gh_runner`, both raw `subprocess.run`; **both are deleted and both
+  runners are now REQUIRED keyword arguments**, so an unbrokered gather is a
+  `TypeError`, and `None` means "this tool is unavailable" -> UNKNOWN entries.
+  Sweeping for the same shape found two the contract never named:
+  `flexfactor_autoclean` (which runs `git commit` and `gh pr merge` on the
+  OWNER's repos) and `flexfactor_locate` (`gh api`, `gh repo clone`). Both
+  launchers are gone; autoclean takes a required keyword-only `run` on every
+  entry point, locate reports a NOTE instead of running anything, and
+  `flexfactor._brokered_tuple_runner` (an `(rc, output)` adapter over `_run`)
+  is what the audit injects. **Add a helper that shells out and you must inject
+  the runner - never give it a default.**
 - **Fail-open verification reads.** `.get("verification_is_real", True)` and
   `... is False` are both build failures now.
 - **The eight `false_substitutes`**, each its own named check - several
@@ -1782,3 +1817,42 @@ it against now.**
 The old entry ("887 collected, 9 failures, 8 skipped") measured a checkout with
 missing dependencies and no `.git`; every one of those failures was
 environmental.
+
+
+## Blocked-with-reason coverage: an unreasoned block is UNREPRESENTABLE (2026-08-25, g-4)
+
+The contract said the direct-coverage gate had no way for the audit path to
+declare blocked functions ("`blocked` is always `{}`"). **That premise was
+already stale** - the same class of error as `x-1..x-6`: commit `9191e77`, the
+commit that WROTE the contract, had already added a reader for
+`.flexfactor-coverage-blocked.json` to `_direct_coverage_evidence`.
+
+What was really wrong is worth remembering, because both halves are failures
+the contract rejects by name:
+
+- the reader kept only entries whose reason was a non-empty string and threw
+  the rest away **between the file and the gate**. So `blocked_without_reason`
+  - the one surface that names a bad declaration - could never be non-empty in
+  a real run. That is UNDER-REPORTING: the owner declared something and nothing
+  said what became of it.
+- and the gate's `elif bid in direct_set: continue` silently dropped a
+  declaration the tool had proven anyway.
+
+Now:
+
+- `flexfactor_coverage.BlockedFunction(id, reason)` **validates in the
+  constructor**. There is no object that can carry a block without a reason, so
+  an unreasoned block is unrepresentable rather than merely ignored.
+- `load_blocked_declarations(project_dir)` returns `(accepted, rejected, meta)`
+  and **nothing is dropped**: a bad entry comes back named, the audit prints it,
+  and it lands in `meta["blocked_rejected"]`.
+- the gate asserts an accounting identity -
+  `declared == blocked + without_reason + unknown + superseded_by_direct` -
+  so a declaration cannot vanish.
+- **blocked is visibly distinct from covered in all three surfaces**:
+  `merge_into_function_coverage` labels each function `coverage_state`
+  (`direct` / `blocked-with-reason` / `unproven`) and totals
+  `function_blocked_total`; the quality-gate evidence carries `blocked_ids`,
+  `blocked_reasons`, `blocked_without_reason`, `unknown_blocked_ids`,
+  `blocked_declared`; the dashboard payload carries `functions_blocked` and
+  `functions_blocked_without_reason`. Blocked NEVER increments the direct count.

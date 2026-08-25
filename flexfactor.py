@@ -4727,7 +4727,10 @@ def run(args) -> int:
             _res = _locate.resolve_source_file(
                 args.file, roots=_PROJECT_ROOTS,
                 owner=os.environ.get("FLEXFACTOR_GITHUB_OWNER",
-                                     _locate.DEFAULT_OWNER))
+                                     _locate.DEFAULT_OWNER),
+                # The module owns no launcher; `gh api` / `gh repo clone` go
+                # through the command chokepoint like every other process.
+                run=_brokered_tuple_runner)
             print(_locate.format_resolution(args.file, _res))
             if _res.get("path"):
                 args.file = _res["path"]
@@ -5912,6 +5915,20 @@ def _git_argv(argv: list[str], cwd: str) -> subprocess.CompletedProcess:
     if argv and argv[0] == "git":
         argv = argv[1:]
     return _git(argv, cwd)
+
+
+def _brokered_tuple_runner(cmd, cwd=None, timeout: int = 300):
+    """`(exit_code, combined_output)` over the SAME chokepoint as everything else.
+
+    Helper modules (flexfactor_locate, flexfactor_autoclean) want the simple
+    tuple shape and must not own a launcher: a raw `subprocess.run` in a helper
+    is outside `_run`, so `flexfactor_cmdpolicy` never classifies it, the
+    execution ledger never records it, and the containment claim FlexFactor
+    prints does not cover it (i-5). Both modules now REFUSE to launch anything
+    themselves; this adapter is what the audit hands them.
+    """
+    cp = _run([str(c) for c in (cmd or [])], cwd or os.getcwd(), timeout=timeout)
+    return cp.returncode, ((cp.stdout or "") + (cp.stderr or "")).strip()
 
 
 def _is_git_repo(path: str) -> bool:
@@ -13533,9 +13550,11 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     """Run the project's tests under a grounded coverage tool (when one exists)
     and turn the artifact into per-function DIRECT evidence rows.
 
-    Returns {"rows": [...], "blocked": {}, "meta": {...}}. No tool -> every
-    first-party function stays UNPROVEN with the reason recorded; nothing is
-    invented and nothing passes by default."""
+    Returns {"rows": [...], "blocked": [BlockedFunction, ...], "meta": {...}}.
+    No tool -> every first-party function stays UNPROVEN with the reason
+    recorded; nothing is invented and nothing passes by default. `blocked`
+    holds only declarations that carry a reason; the rest are named in
+    meta["blocked_rejected"], never discarded."""
     eco = ("node" if stack.get("is_node") else "python" if stack.get("is_python")
            else ((stack.get("ecosystems") or [None])[0] or "unknown"))
     spec = {"ecosystem": eco, "test_cmd": stack.get("full_suite_cmd") or stack.get("test_cmd"),
@@ -13582,20 +13601,21 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     rows = _ff_coverage.direct_function_rows(index, merged)
     # Functions the OWNER declares unexecutable (destructive against production
     # resources, hardware-bound, ...) WITH a reason: .flexfactor-coverage-blocked.json
-    # {"<symbol id>": "<reason>"}. A reason-less entry does not count (the gate
-    # ignores it), so nothing can be blocked silently.
-    blocked: dict[str, str] = {}
-    try:
-        with open(os.path.join(project_dir, ".flexfactor-coverage-blocked.json"),
-                  encoding="utf-8") as fh:
-            raw_blocked = json.load(fh)
-        if isinstance(raw_blocked, dict):
-            blocked = {str(k): str(v) for k, v in raw_blocked.items() if str(v).strip()}
-            meta["blocked_declared"] = len(raw_blocked)
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError) as ex:
-        meta["blocked_file_error"] = f"{type(ex).__name__}: {ex}"
+    # {"<symbol id>": "<reason>"}.
+    #
+    # An unreasoned block is IMPOSSIBLE TO EXPRESS - `BlockedFunction` refuses
+    # to exist without a reason - and it is never silently dropped either. The
+    # loader used to keep only entries whose reason was a non-empty string and
+    # discard the rest between the file and the gate: the owner declared
+    # something and no surface ever said it had been discarded. Both halves
+    # matter, because under-reporting and false confidence are the two
+    # failures the governing contract rejects by name.
+    blocked, blocked_rejected, blocked_meta = _ff_coverage.load_blocked_declarations(
+        project_dir)
+    meta["blocked_file"] = blocked_meta
+    meta["blocked_rejected"] = blocked_rejected
+    for bad in blocked_rejected:
+        print(f"{pfx}coverage: REJECTED blocked declaration: {bad['why']}")
     if not runnable:
         meta["reason"] = ("no grounded coverage tool for this stack (nothing was invented); "
                           "every first-party function remains UNPROVEN")
@@ -14016,7 +14036,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     checkpoint.set_phase("cleaning repo before new work")
                 _clean = _autoclean.clean_repo(
                     project_dir, repo=_slug,
-                    report=lambda m: print(f"{pfx}{m}"))
+                    report=lambda m: print(f"{pfx}{m}"),
+                    # autoclean owns no launcher: its `git commit` /
+                    # `gh pr merge` go through the command chokepoint.
+                    run=_brokered_tuple_runner)
                 print(f"{pfx}" + _autoclean.format_summary(_clean).replace(
                     "\n", f"\n{pfx}"))
                 result["autoclean"] = {
@@ -16082,6 +16105,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                              "functions_direct": _cov.get("function_direct_coverage_total", 0),
                              "functions_module_executed": _cov.get("function_module_execution_total", 0),
                              "functions_executed": _cov.get("function_direct_coverage_total", 0),
+                             # BLOCKED is a third state and has to be visible.
+                             # Left out, a blocked-with-reason function is
+                             # indistinguishable from one nobody accounted for,
+                             # and a run whose gate is complete looks partial.
+                             "functions_blocked": _cov.get("function_blocked_total", 0),
+                             "functions_blocked_without_reason": _cov.get(
+                                 "function_blocked_without_reason_total", 0),
                              "coverage_basis": _cov.get("function_coverage_basis",
                                                         "module-execution-only (NOT direct)"),
                              "routes": _cov.get("discovered_route_total", 0),
