@@ -845,7 +845,8 @@ def load_blocked_declarations(project_dir: str,
     return accepted, rejected, meta
 
 
-def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
+def direct_function_gate(rows: list[dict], *, blocked=None,
+                         rejected_declarations: list[dict] | None = None) -> dict:
     """Fail-closed gate: complete ONLY when every first-party function is
     either directly proven or explicitly blocked WITH a reason. Module-level
     execution is never counted - rows only carry "direct" or "unproven".
@@ -865,9 +866,9 @@ def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
 
     and that identity is asserted, not merely documented.
     """
-    accepted, rejected = ([], [])
+    accepted, parsed_rejected = ([], [])
     if isinstance(blocked, dict):
-        accepted, rejected = blocked_declarations(blocked)
+        accepted, parsed_rejected = blocked_declarations(blocked)
         declared = len(blocked)
     else:
         items = list(blocked or [])
@@ -878,8 +879,18 @@ def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
                 try:
                     accepted.append(BlockedFunction(*item))
                 except (BlockedDeclarationError, TypeError, ValueError) as ex:
-                    rejected.append({"id": None, "raw_reason": None, "why": str(ex)})
+                    raw_id = item[0] if isinstance(item, (list, tuple)) and item else None
+                    raw_reason = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+                    parsed_rejected.append({"id": None if raw_id is None else str(raw_id),
+                                            "raw_reason": raw_reason, "why": str(ex)})
         declared = len(items)
+
+    # Rejections produced by load_blocked_declarations are part of the owner's
+    # declaration set too. They used to be printed and attached to metadata,
+    # then silently omitted from this gate; a fully covered project could
+    # therefore report complete=True while its declaration file was malformed.
+    rejected = list(rejected_declarations or []) + parsed_rejected
+    declared += len(rejected_declarations or [])
     blocked_without_reason = [r["id"] for r in rejected if r.get("id")]
     unreadable = [r for r in rejected if not r.get("id")]
 
@@ -915,7 +926,8 @@ def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
         "schema": COVERAGE_ROWS_SCHEMA,
         "total": total, "direct": len(direct_ids), "unproven": len(unproven_ids),
         "blocked": len(blocked_ids),
-        "complete": total == len(direct_ids) + len(blocked_ids),
+        "complete": (total == len(direct_ids) + len(blocked_ids)
+                     and not rejected and not unknown_blocked),
         "unproven_ids": unproven_ids, "blocked_ids": blocked_ids,
         "blocked_reasons": reasons,
         "blocked_without_reason": blocked_without_reason,
@@ -927,7 +939,8 @@ def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
 
 
 def merge_into_function_coverage(fc: dict, rows: list[dict], *,
-                                 blocked: dict[str, str] | None = None) -> dict:
+                                 blocked: dict[str, str] | None = None,
+                                 blocked_rejected: list[dict] | None = None) -> dict:
     """Overlay direct rows (by id) on a `function_coverage()` dict from
     flexfactor_evidence, recompute the direct total, attach the gate and
     state the basis honestly. Every other key is preserved."""
@@ -958,7 +971,8 @@ def merge_into_function_coverage(fc: dict, rows: list[dict], *,
     merged["function_total"] = len(functions)
     merged["function_direct_coverage_total"] = sum(
         bool(f.get("direct_function_coverage")) for f in functions)
-    gate = direct_function_gate(gate_rows, blocked=blocked)
+    gate = direct_function_gate(
+        gate_rows, blocked=blocked, rejected_declarations=blocked_rejected)
     merged["direct_gate"] = gate
     # Blocked is a THIRD state, and every surface that reports coverage has to
     # be able to say so without digging into the gate: a blocked function is
