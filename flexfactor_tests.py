@@ -2283,6 +2283,99 @@ class ProviderReservationChokepointTests(unittest.TestCase):
         self.assertLessEqual(m.usd, 0.20)
 
 
+class ScoutUnverifiedRetentionTests(unittest.TestCase):
+    """Scout must stop before its first mutation when no verifier can run."""
+
+    @staticmethod
+    def _opts(verify):
+        import types
+        return types.SimpleNamespace(
+            dry_run=False, allow_dirty=True, verify=verify,
+            push=False, merge=False, branch_prefix="flexfactor/adopt-",
+            allow_scripts=False, isolate_verify=True)
+
+    def test_no_detected_verify_command_retains_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            res = ff.apply_integration(
+                project, "demo",
+                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                 "packages": []},
+                self._opts(True))
+            self.assertEqual(res.status, "skipped-unverified")
+            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+
+    def test_python_project_uses_its_real_test_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "pyproject.toml"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("[project]\nname='fixture'\nversion='0.0.1'\n")
+            os.makedirs(os.path.join(project, "tests"))
+            with open(os.path.join(project, "tests", "test_app.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("def test_ok():\n    assert True\n")
+            is_node, commands = ff._detect_verify(project)
+            self.assertFalse(is_node)
+            self.assertIn(["python", "-m", "pytest", "-q"], commands)
+
+    def test_no_verifier_refuses_before_provider_generation(self):
+        import argparse
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        repo = {"fullName": "x/y", "htmlUrl": "https://example.com/x/y",
+                "licenseSpdx": "MIT"}
+        evaluation = {
+            "need": "n", "repo": repo, "result": {"repo": repo},
+            "benefit": {"benefit_score": 90}, "recommendation": "ADOPT",
+            "evidence": {"license": "MIT", "commit_sha": "a" * 40,
+                         "commit_pin_source": "test"},
+            "verdicts": {"safe_to_integrate": True},
+        }
+        calls = {"generate": 0}
+
+        def generated(*args, **kwargs):
+            calls["generate"] += 1
+            return None, "must not run"
+
+        with tempfile.TemporaryDirectory() as project:
+            args = argparse.Namespace(
+                apply=True, apply_tier="adopt", clone_inspect=False,
+                program=project, verify=True, legacy_inline_apply=True,
+                allow_scripts=False, isolate_verify=True)
+            with mock.patch.object(ff, "resolve_project_dir",
+                                   lambda *a: project), \
+                 mock.patch.object(ff, "_approve_candidate",
+                                   lambda *a: True), \
+                 mock.patch.object(ff._scout_contract,
+                                   "scout_may_mutate_target",
+                                   lambda *a: (True, "test approval")), \
+                 mock.patch.object(ff, "generate_integration", generated):
+                with redirect_stdout(io.StringIO()):
+                    results = ff._apply_phase(
+                        args, "P", {"summary": "s"}, [evaluation], object())
+        self.assertEqual(results[0].status, "skipped-unverified")
+        self.assertEqual(calls["generate"], 0)
+
+    def test_disabled_verification_retains_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            before = open(os.path.join(project, "package.json"), "rb").read()
+            res = ff.apply_integration(
+                project, "demo",
+                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                 "packages": []},
+                self._opts(False))
+            self.assertEqual(res.status, "skipped-unverified")
+            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertEqual(open(os.path.join(project, "package.json"), "rb").read(), before)
+
+
 class PathContainmentTests(unittest.TestCase):
     """Round-3 defect 2: model-generated paths must be contained to the repo; a
     write outside project_dir is a sandbox escape."""
@@ -2308,7 +2401,7 @@ class PathContainmentTests(unittest.TestCase):
         class Opts:
             dry_run = False
             allow_dirty = True
-            verify = False
+            verify = True
             branch_prefix = "flexfactor/adopt-"
             push = False
             merge = False
@@ -2316,6 +2409,8 @@ class PathContainmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"scripts":{"build":"node -e \\"process.exit(0)\\""}}')
             outside = os.path.join(tmp, "OUTSIDE.txt")
             patch = {"files": [{"path": r"..\OUTSIDE.txt", "contents": "pwned"}],
                      "packages": []}
@@ -4403,7 +4498,7 @@ class SnapshotTriStateTests(unittest.TestCase):
     class _Opts:
         dry_run = False
         allow_dirty = True
-        verify = False
+        verify = True
         push = False
         merge = False
         branch_prefix = "flexfactor/adopt-"
@@ -4414,7 +4509,7 @@ class SnapshotTriStateTests(unittest.TestCase):
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
             with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"name":"x"}')
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
             outside = os.path.join(tmp, "outside-lock.json")
             with open(outside, "w", encoding="utf-8") as fh:
                 fh.write("LOCKDATA")
@@ -4444,7 +4539,7 @@ class SnapshotTriStateTests(unittest.TestCase):
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
             with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"name":"x"}')  # no package-lock.json -> genuinely missing
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')  # no package-lock.json -> genuinely missing
             real_run = ff._run
             ff._run = lambda cmd, cwd, timeout=900: ff.subprocess.CompletedProcess(cmd, 1, "", "npm mock fail")
             patch = {"files": [{"path": "new.js", "contents": "console.log(1)"}],
@@ -6536,13 +6631,15 @@ class VerifyDisclosureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             note = ff._verify_disclosure(self._args(verify=False), tmp)
             self.assertIn("DISABLED", note)
-            self.assertIn("WITHOUT any build check", note)
+            self.assertIn("REFUSED", note)
+            self.assertIn("before generation", note)
 
     def test_no_verifier_detected_disclosed(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:  # no package.json at all
             note = ff._verify_disclosure(self._args(), tmp)
-            self.assertIn("no build/lint script detected", note)
+            self.assertIn("no build/test/lint/typecheck command detected", note)
+            self.assertIn("REFUSED", note)
 
     def test_real_verifier_disclosed_with_command(self):
         import tempfile
@@ -6781,7 +6878,7 @@ class ScoutEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._make_target(tmp)
             rc = self._run_scenario(tmp, verify_rc=1)
-            self.assertEqual(rc, 0)  # scout completes; the APPLY was rolled back
+            self.assertEqual(rc, 4)  # zero work landed; supervisors must see failure
             branches = self._git_out(tmp, "branch", "--list")
             self.assertNotIn("flexfactor/adopt-good-widget", branches)
             self.assertFalse(os.path.exists(os.path.join(tmp, "widget_integration.js")))
@@ -8723,7 +8820,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             finally:
                 for n, fn in saved.items():
                     setattr(ff, n, fn)
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 4,
+                             "--apply with zero landed changes must fail visibly")
             branches = subprocess.run(
                 ["git", "-C", tmp, "branch", "--list"],
                 capture_output=True, text=True).stdout
@@ -9572,8 +9670,8 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
         ff._git = fake_git
         ff._git_has_remote = lambda pd: True
         ff._full_gate = lambda pd, st: (True, "")
-        ff._gh_pr_automerge = lambda pd, br, base: (pr_calls.append((br, base))
-                                                   or "PR opened with auto-merge")
+        ff._gh_pr_automerge = lambda pd, br, base, stack: (
+            pr_calls.append((br, base)) or "PR opened with auto-merge")
         ff._git_current_branch = lambda pd: "flexfactor/prodready-x"
         args = types.SimpleNamespace(push=True, merge=True)
         try:
@@ -10796,7 +10894,7 @@ class VacuousGateTests(unittest.TestCase):
                  "_git_has_remote": lambda pd: True,
                  "_git_current_branch": lambda pd: "main",
                  "_full_gate": lambda pd, st: (True, "log"),
-                 "_gh_pr_automerge": lambda pd, br, base: (
+                 "_gh_pr_automerge": lambda pd, br, base, stack: (
                      gh_calls.append((br, base)) or
                      f"PR opened with auto-merge - lands on {base} when checks pass")}
         for name, fn in stubs.items():
@@ -14962,7 +15060,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
     class _Opts:
         dry_run = False
         allow_dirty = True
-        verify = False
+        verify = True
         push = True
         merge = True
         branch_prefix = "flexfactor/adopt-"
@@ -14976,7 +15074,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
         for kv in (["user.email", "t@example.com"], ["user.name", "T"]):
             subprocess.run(["git", "-C", proj, "config"] + kv, check=True)
         with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-            fh.write('{"name":"x","version":"1.0.0"}')
+            fh.write('{"name":"x","version":"1.0.0","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
         subprocess.run(["git", "-C", proj, "add", "-A"], check=True)
         subprocess.run(["git", "-C", proj, "commit", "-qm", "seed"], check=True)
         subprocess.run(["git", "-C", proj, "remote", "add", "origin", remote], check=True)

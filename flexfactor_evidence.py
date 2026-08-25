@@ -860,6 +860,8 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
                                  "blocked_superseded_by_direct": list(
                                      direct_gate.get("blocked_superseded_by_direct") or [])[:200],
                                  "blocked_declared": direct_gate.get("blocked_declared", 0),
+                                 "blocked_rejected": list(
+                                     direct_gate.get("blocked_rejected") or [])[:200],
                                  "basis": coverage.get("function_coverage_basis",
                                                        "module-execution-only (NOT direct)"),
                                  "unproven_ids": list(direct_gate.get("unproven_ids") or [])[:200]}),
