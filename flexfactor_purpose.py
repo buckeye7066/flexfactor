@@ -921,30 +921,21 @@ def _walk_repo(project_dir: str) -> list[str]:
     return out
 
 
-def _default_git_runner(args: list[str], cwd: str) -> str | None:
-    import subprocess
-    try:
-        cp = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                            encoding="utf-8", errors="replace", timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if cp.returncode != 0:
-        return None
-    return cp.stdout or ""
-
-
-def _default_gh_runner(args: list[str], cwd: str) -> str | None:
-    """`gh` is optional: absent, unauthenticated or failing all yield None, so
-    the caller records an UNKNOWN instead of crashing."""
-    import subprocess
-    try:
-        cp = subprocess.run(["gh", *args], cwd=cwd, capture_output=True,
-                            encoding="utf-8", errors="replace", timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if cp.returncode != 0:
-        return None
-    return cp.stdout or ""
+# CONTAINMENT (i-5). This module deliberately owns NO process launcher.
+#
+# It used to carry `_default_git_runner` / `_default_gh_runner`, both of which
+# called `subprocess.run` directly. That is a containment hole, not a style
+# problem: a process started here is outside `flexfactor._run`, so it is not
+# classified by `flexfactor_cmdpolicy`, not routed through the execution
+# broker, and not covered by the containment claim the tool PRINTS. The gh half
+# was the one the contract named (g-5); the git half had exactly the same
+# defect and is removed with it.
+#
+# `gather_purpose_evidence` therefore REQUIRES its runners. There is no default
+# to fall back to, so "somebody called it without wiring the chokepoint" is a
+# TypeError at the call site rather than a silent raw subprocess. Passing None
+# is the explicit "this tool is not available to me" answer, and it produces
+# UNKNOWN entries - never an unbrokered process.
 
 
 def _dep_integration(dep: str) -> str | None:
@@ -972,6 +963,13 @@ def _program_kinds(text: str) -> set[str]:
             if any(w in low for w in words)}
 
 
+def _absent_runner(args: list[str], cwd: str) -> None:
+    """The runner used when a caller says a tool is unavailable. It runs
+    nothing at all - the point of requiring injection is that this module can
+    never be the thing that starts a process."""
+    return None
+
+
 def _empty_evidence() -> dict:
     return {"sources": [], "contradictions": [], "unknowns": [], "integrations": [],
             "schemas": [], "routes": [],
@@ -979,7 +977,7 @@ def _empty_evidence() -> dict:
             "deploy": {"targets": [], "ci": []}, "product_claims": []}
 
 
-def gather_purpose_evidence(project_dir: str, *, git_runner=None, gh_runner=None,
+def gather_purpose_evidence(project_dir: str, *, git_runner, gh_runner,
                             max_items: int = 200) -> dict:
     """Gather and CITE every deterministic purpose signal the repo offers.
 
@@ -991,9 +989,17 @@ def gather_purpose_evidence(project_dir: str, *, git_runner=None, gh_runner=None
     absent tool becomes an `unknowns` entry.
 
     `git_runner(args, cwd)` / `gh_runner(args, cwd)` return stdout or None.
+    BOTH ARE REQUIRED: this module never starts a process of its own, so the
+    caller must hand over runners that go through FlexFactor's command
+    chokepoint (`flexfactor._git` / `flexfactor._run`). Pass None for a tool
+    that is genuinely unavailable - that yields UNKNOWNs, never a subprocess.
     """
-    git_runner = git_runner or _default_git_runner
-    gh_runner = gh_runner or _default_gh_runner
+    have_git_runner = git_runner is not None
+    have_gh_runner = gh_runner is not None
+    if not have_git_runner:
+        git_runner = _absent_runner
+    if not have_gh_runner:
+        gh_runner = _absent_runner
     project_dir = os.path.abspath(project_dir)
     ev = _empty_evidence()
     sources, contradictions, unknowns = ev["sources"], ev["contradictions"], ev["unknowns"]
@@ -1381,7 +1387,10 @@ def gather_purpose_evidence(project_dir: str, *, git_runner=None, gh_runner=None
 
     # ---- git history -------------------------------------------------------------
     git_marker = os.path.join(project_dir, ".git")
-    if os.path.isdir(git_marker) or os.path.isfile(git_marker):
+    if not have_git_runner:
+        unknowns.append("git history not gathered: the caller supplied no brokered git "
+                        "runner, and this module never launches a process itself")
+    elif os.path.isdir(git_marker) or os.path.isfile(git_marker):
         log = git_runner(["log", "-50", "--format=%s"], project_dir)
         if log is None:
             unknowns.append("git log unavailable (git missing or repository unreadable)")
@@ -1419,8 +1428,11 @@ def gather_purpose_evidence(project_dir: str, *, git_runner=None, gh_runner=None
     ):
         raw = gh_runner(args, project_dir)
         if raw is None:
-            unknowns.append(f"GitHub {what} unavailable (gh absent, unauthenticated, "
-                            "or no GitHub remote)")
+            unknowns.append(
+                f"GitHub {what} not gathered: the caller supplied no brokered gh runner"
+                if not have_gh_runner else
+                f"GitHub {what} unavailable (gh absent, unauthenticated, "
+                "or no GitHub remote)")
             continue
         try:
             items = json.loads(raw) if raw.strip() else []

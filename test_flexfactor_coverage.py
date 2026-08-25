@@ -241,9 +241,134 @@ class GateTests(unittest.TestCase):
         self.assertEqual(g["blocked_without_reason"], ["b", "c"])
 
     def test_unknown_blocked_ids_are_named_not_counted(self):
-        g = cov.direct_function_gate(self._rows(), blocked={"zzz": "whatever"})
+        g = cov.direct_function_gate(
+            self._rows(), blocked={"zzz": "hardware-bound: needs the label printer"})
         self.assertEqual(g["unknown_blocked_ids"], ["zzz"])
         self.assertEqual(g["blocked"], 0)
+
+
+class BlockedDeclarationTests(unittest.TestCase):
+    """g-4. A blocked function must carry a reason, and an unreasoned block has
+    to be IMPOSSIBLE TO EXPRESS - not merely ignored, and not silently dropped.
+
+    Both of the failure modes here are ones the governing contract rejects by
+    name: a dropped declaration UNDER-REPORTS (the owner declared something and
+    no surface says what became of it), and an accepted reason-less block
+    produces FALSE CONFIDENCE (a function counts as accounted for with no
+    account given).
+    """
+
+    def test_a_block_without_a_reason_cannot_be_constructed(self):
+        for bad in ("", "   ", None, "n/a", "-", "x"):
+            with self.assertRaises(cov.BlockedDeclarationError, msg=repr(bad)):
+                cov.BlockedFunction("sym", bad)
+
+    def test_a_block_without_an_id_cannot_be_constructed(self):
+        with self.assertRaises(cov.BlockedDeclarationError):
+            cov.BlockedFunction("  ", "destructive against production data")
+
+    def test_a_valid_block_is_immutable_and_normalised(self):
+        b = cov.BlockedFunction("  sym  ", "  destructive  against\n production ")
+        self.assertEqual(b.id, "sym")
+        self.assertEqual(b.reason, "destructive against production")
+        with self.assertRaises(AttributeError):
+            b.reason = "something else"
+
+    def test_a_rejected_declaration_is_reported_never_dropped(self):
+        accepted, rejected = cov.blocked_declarations({"a": "", "b": "needs live gateway"})
+        self.assertEqual([b.id for b in accepted], ["b"])
+        self.assertEqual([r["id"] for r in rejected], ["a"])
+        self.assertIn("no usable reason", rejected[0]["why"])
+
+    def test_a_non_mapping_payload_is_one_named_rejection(self):
+        accepted, rejected = cov.blocked_declarations(["a", "b"])
+        self.assertEqual(accepted, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("got list", rejected[0]["why"])
+
+    def test_the_gate_accounts_for_every_declared_entry(self):
+        rows = [{"id": "a", "status": "direct"},
+                {"id": "b", "status": "unproven"},
+                {"id": "c", "status": "unproven"}]
+        g = cov.direct_function_gate(rows, blocked={
+            "a": "declared, but the tool proved it anyway",
+            "b": "",
+            "c": "requires a live payment gateway",
+            "zzz": "names no function in this repository",
+        })
+        self.assertEqual(g["blocked_declared"], 4)
+        self.assertEqual(g["blocked_ids"], ["c"])
+        self.assertEqual(g["blocked_without_reason"], ["b"])
+        self.assertEqual(g["unknown_blocked_ids"], ["zzz"])
+        self.assertEqual(g["blocked_superseded_by_direct"], ["a"])
+        # The identity: nothing declared may go unaccounted for.
+        self.assertEqual(
+            g["blocked_declared"],
+            g["blocked"] + len(g["blocked_without_reason"])
+            + len(g["unknown_blocked_ids"]) + len(g["blocked_superseded_by_direct"]))
+
+    def test_an_unreasoned_block_never_counts_as_covered(self):
+        rows = [{"id": "b", "status": "unproven"}]
+        g = cov.direct_function_gate(rows, blocked={"b": ""})
+        self.assertFalse(g["complete"])
+        self.assertEqual(g["blocked"], 0)
+        self.assertEqual(g["unproven_ids"], ["b"])
+
+    def test_blocked_functions_are_accepted_as_objects_too(self):
+        rows = [{"id": "b", "status": "unproven"}]
+        g = cov.direct_function_gate(
+            rows, blocked=[cov.BlockedFunction("b", "destructive: drops the table")])
+        self.assertTrue(g["complete"])
+        self.assertEqual(g["blocked_reasons"], {"b": "destructive: drops the table"})
+
+    def test_load_reports_a_missing_file_as_absent_not_as_an_error(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        accepted, rejected, meta = cov.load_blocked_declarations(d)
+        self.assertEqual((accepted, rejected), ([], []))
+        self.assertFalse(meta["present"])
+
+    def test_load_reports_an_unparseable_file_instead_of_ignoring_it(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, cov.BLOCKED_DECLARATION_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{not json")
+        accepted, rejected, meta = cov.load_blocked_declarations(d)
+        self.assertEqual(accepted, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertTrue(meta["present"])
+        self.assertIn("could not be read", rejected[0]["why"])
+
+    def test_load_keeps_the_reason_less_entry_visible(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, cov.BLOCKED_DECLARATION_FILE), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"good": "hardware-bound: needs the label printer",
+                       "bad": ""}, fh)
+        accepted, rejected, meta = cov.load_blocked_declarations(d)
+        self.assertEqual([b.id for b in accepted], ["good"])
+        self.assertEqual([r["id"] for r in rejected], ["bad"])
+        self.assertEqual((meta["declared"], meta["accepted"], meta["rejected"]),
+                         (2, 1, 1))
+
+    def test_the_merged_view_labels_blocked_distinctly_from_covered(self):
+        fc = {"functions": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"},
+                            {"id": "c", "name": "c"}]}
+        rows = [{"id": "a", "status": "direct", "evidence": {"k": 1}, "reason": "ran"},
+                {"id": "b", "status": "unproven", "evidence": None, "reason": "no"},
+                {"id": "c", "status": "unproven", "evidence": None, "reason": "no"}]
+        merged = cov.merge_into_function_coverage(
+            fc, rows, blocked={"b": "destructive: wipes the production bucket"})
+        states = {f["id"]: f["coverage_state"] for f in merged["functions"]}
+        self.assertEqual(states, {"a": "direct", "b": "blocked-with-reason",
+                                  "c": "unproven"})
+        self.assertEqual(merged["function_blocked_total"], 1)
+        # Blocked never inflates the DIRECT count.
+        self.assertEqual(merged["function_direct_coverage_total"], 1)
+        self.assertEqual(merged["functions"][1]["blocked_reason"],
+                         "destructive: wipes the production bucket")
 
     def test_a_status_that_is_not_direct_is_never_counted(self):
         rows = [{"id": "m", "status": "module-executed", "evidence": None, "reason": ""}]

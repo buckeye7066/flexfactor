@@ -298,6 +298,16 @@ _MUTATION_SITES = {
         "commit and no push. Behaviourally pinned by "
         "flexfactor_tests.VacuousGateTests."
     ),
+    "commit_pending_changes": (
+        "flexfactor_autoclean's pre-work cleanup. It commits the OWNER's "
+        "pre-existing uncommitted changes so they stay visible in history "
+        "instead of being swept into an unrelated fix commit; it never "
+        "discards work and never pushes. The gate is the module's accounting "
+        "identity (candidates == acted + skipped + failed, asserted in "
+        "summarise), which makes a silent no-op impossible - and the command "
+        "now goes through the injected brokered runner, so "
+        "flexfactor_cmdpolicy classifies it like every other process."
+    ),
     "_apply_integration_impl": (
         "scout apply. Gate is exception-based, not tri-state: a failing verify "
         "command raises ApplyError, which rolls every touched file back before "
@@ -324,16 +334,208 @@ def scan_git_mutation_sites(source: str) -> dict[str, list[int]]:
 
         def visit_Call(self, node):
             for arg in node.args:
-                if isinstance(arg, (ast.List, ast.Tuple)) and arg.elts:
-                    first = arg.elts[0]
-                    if (isinstance(first, ast.Constant)
-                            and first.value in _GIT_MUTATIONS):
-                        found.setdefault(stack[-1] if stack else "<module>",
-                                         []).append(node.lineno)
+                if not (isinstance(arg, (ast.List, ast.Tuple)) and arg.elts):
+                    continue
+                elts = list(arg.elts)
+                # BLIND SPOT, found 2026-08-25: this used to look only at
+                # elts[0], so `_git(["commit", ...])` was seen but the equally
+                # real `run(["git", "commit", ...])` was not - and
+                # flexfactor_autoclean's commit of the owner's working tree sat
+                # outside the registry, undeclared, for exactly that reason.
+                if isinstance(elts[0], ast.Constant) and elts[0].value in ("git", "gh"):
+                    elts = elts[1:]
+                if (elts and isinstance(elts[0], ast.Constant)
+                        and elts[0].value in _GIT_MUTATIONS):
+                    found.setdefault(stack[-1] if stack else "<module>",
+                                     []).append(node.lineno)
             self.generic_visit(node)
 
     Visitor().visit(ast.parse(source))
     return found
+
+
+# --------------------------------------------------------------------------- #
+# i-5: every process launch goes through the command chokepoint
+# --------------------------------------------------------------------------- #
+# `flexfactor._run` is the single place a process is started on behalf of an
+# audit. It classifies the command (flexfactor_cmdpolicy), routes
+# target-controlled code (install / build / test) through the execution broker,
+# records the decision in the execution ledger, and never raises. A process
+# started ANYWHERE ELSE is subject to none of that - which means FlexFactor can
+# print a containment claim that a real code path does not honour. That is not
+# a style issue; it is invariant i-5 failing silently.
+#
+# The contract named one instance (g-5, the purpose-evidence `gh` runner). This
+# scan is the class, so the next one fails the build instead of waiting to be
+# found by reading.
+_SUBPROCESS_LAUNCHERS = frozenset({
+    "run", "Popen", "call", "check_call", "check_output",
+    "getoutput", "getstatusoutput",
+})
+_OS_LAUNCHERS = frozenset({
+    "system", "popen", "startfile", "posix_spawn", "posix_spawnp",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "execl", "execle", "execlp", "execv", "execve", "execvp", "execvpe",
+})
+
+
+def scan_process_launch_sites(source: str) -> dict[str, list[tuple[int, str]]]:
+    """{enclosing function: [(line, "subprocess.run"), ...]} for this source.
+
+    Module ALIASES are resolved (`import subprocess as sp` -> `sp.run` is still
+    a launch), because an alias is the cheapest way to hide from a grep.
+    """
+    tree = ast.parse(source)
+    sub_names, os_names = {"subprocess"}, {"os"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "subprocess" and a.asname:
+                    sub_names.add(a.asname)
+                elif a.name == "os" and a.asname:
+                    os_names.add(a.asname)
+
+    found: dict[str, list[tuple[int, str]]] = {}
+    stack: list[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            what = None
+            f = node.func
+            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+                if f.value.id in sub_names and f.attr in _SUBPROCESS_LAUNCHERS:
+                    what = f"{f.value.id}.{f.attr}"
+                elif f.value.id in os_names and f.attr in _OS_LAUNCHERS:
+                    what = f"{f.value.id}.{f.attr}"
+            if what is not None:
+                found.setdefault(stack[-1] if stack else "<module>",
+                                 []).append((node.lineno, what))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return found
+
+
+def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
+    """`from subprocess import run` / `from os import system` bind a launcher to
+    a BARE name, which the attribute scan above cannot see. Forbidden outright:
+    product code has no legitimate need for one."""
+    out = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module == "subprocess":
+            names = [a.name for a in node.names if a.name in _SUBPROCESS_LAUNCHERS]
+        elif node.module == "os":
+            names = [a.name for a in node.names if a.name in _OS_LAUNCHERS]
+        else:
+            continue
+        for n in names:
+            out.append((node.lineno, f"from {node.module} import {n}"))
+    return out
+
+
+# The ONLY functions in product code permitted to start a process outside
+# `flexfactor._run`, each with the reason it is not a containment hole. A new
+# launch site anywhere else fails the build, which forces whoever adds one to
+# say why it does not belong behind the chokepoint - or to route it there.
+#
+# Key is "<path relative to the repo root>::<enclosing function>".
+_PROCESS_LAUNCH_SITES = {
+    "flexfactor.py::_run": (
+        "THE chokepoint. This is the call every audited process funnels into: "
+        "it classifies the command, hands install/build/test to the execution "
+        "broker, records the decision in the execution ledger, and never raises."
+    ),
+    "flexfactor.py::_ensure_fcc_proxy": (
+        "Starts FlexFactor's OWN AI router (the FCC proxy binary). argv is "
+        "entirely FlexFactor-authored and contains nothing an audited "
+        "repository controls, so the broker - which exists for target-"
+        "controlled code - does not apply. `_run` waits for completion and "
+        "therefore cannot express a long-lived daemon at all."
+    ),
+    "flexfactor.py::_resolve_shortcut": (
+        "Reads a .lnk the OWNER named, via WScript.Shell. Read-only, executes "
+        "no repository code; the path is rejected if it holds a control "
+        "character and its quotes are doubled before interpolation."
+    ),
+    "flexfactor.py::_shortcut_working_dir": (
+        "The same .lnk read as _resolve_shortcut, for the working directory."
+    ),
+    "flexfactor.py::_try_start_repo_rewards": (
+        "Starts the OWNER's own repo-rewards service through its launcher, at "
+        "a hardcoded owner path. It is not a repository under audit and "
+        "nothing an audited repository controls can reach it. RESIDUAL RISK, "
+        "named rather than hidden: that launcher runs the project's own "
+        "`npm run dev`, so this is a lifecycle-script launch outside the "
+        "broker, authorized only by the owner's hardcoded path."
+    ),
+    "flexfactor.py::_launch_dashboard": (
+        "Launches FlexFactor's own dashboard with the running interpreter. "
+        "Own code, no repository input."
+    ),
+    "flexfactor_dashboard.py::_attempt_info_uncached": (
+        "Read-only `git -C <project> log` inside the DASHBOARD process, which "
+        "is a viewer: it applies nothing and publishes nothing."
+    ),
+    "flexfactor_dashboard.py::open_ledger": (
+        "Hands a FlexFactor-authored errors.md path to the OS viewer "
+        "(os.startfile / xdg-open). Read-only, no repository code."
+    ),
+    "flexfactor_dashboard_v2.py::_durable_facts_uncached": (
+        "The same read-only `git log` query as the v1 dashboard, same reason."
+    ),
+    "flexfactor_discovery.py::_cursor_models_from_daemon": (
+        "Capability probe of a local CLI (`cursor --list-models`), and only "
+        "when FLEXFACTOR_CURSOR_PROBE=1. Fixed argv, no repository input."
+    ),
+    "flexfactor_evidence.py::_git_files": (
+        "Read-only `git ls-files -z`, which needs BYTE output decoded with "
+        "surrogateescape so a non-UTF-8 filename survives. `_run` is text-mode "
+        "by contract (utf-8 / replace) and cannot return those bytes. It "
+        "executes no repository code and falls back to a filesystem walk."
+    ),
+    "flexfactor_sandbox.py::_probe_cmd": (
+        "This module IS the containment mechanism `_run` delegates to; its "
+        "launches are the enforcement point, not a way around it. _probe_cmd "
+        "measures what the host can actually enforce."
+    ),
+    "flexfactor_sandbox.py::_probe_windows_job": (
+        "Containment probe: really creates a Job Object, assigns a suspended "
+        "child and resumes it, so the capability report states a MEASURED "
+        "fact rather than an assumption."
+    ),
+    "flexfactor_sandbox.py::kill_tree": (
+        "Teardown. `taskkill /T /F` is the fallback for when the job object "
+        "never attached; leaving an escaped process alive is the worse outcome."
+    ),
+    "flexfactor_sandbox.py::run_contained": (
+        "The contained launch itself - what `_run` hands target-controlled "
+        "code to."
+    ),
+    "flexfactor_sandbox.py::spawn_contained": (
+        "The contained launch for long-lived processes (dev servers) - what "
+        "`_spawn` hands target-controlled code to."
+    ),
+    "providers/cli_provider.py::_run_cli": (
+        "FlexFactor's own AI provider layer invoking a coding CLI. argv is "
+        "FlexFactor-authored, the prompt travels on STDIN and never in argv, "
+        "and a recursion guard refuses a nested agent."
+    ),
+    "providers/cli_provider.py::ping": (
+        "`<binary> --version` liveness probe for the same provider layer. "
+        "Fixed argv, no repository input."
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -509,6 +711,22 @@ class GitMutationGateSweepTests(unittest.TestCase):
         self.assertIn("ship", sites)
         self.assertNotIn("ship", _MUTATION_SITES,
                          "canary function must not be a declared site")
+
+    def test_canary_a_git_PREFIXED_argv_IS_caught(self):
+        """The blind spot itself. `run(["git", "commit", ...])` is the same
+        mutation as `_git(["commit", ...])`, and it went unseen until
+        2026-08-25 - which is how flexfactor_autoclean's commit of the owner's
+        working tree stayed out of the declared-mutation registry."""
+        canary = (
+            "def ship(p):\n"
+            "    run(['git', 'commit', '-m', 'x'], p)\n"
+        )
+        self.assertEqual(scan_git_mutation_sites(canary).get("ship"), [2],
+                         "a git-prefixed argv must be seen as a mutation site")
+
+    def test_canary_a_non_mutating_git_command_is_NOT_flagged(self):
+        canary = "def look(p):\n    run(['git', 'status'], p)\n"
+        self.assertEqual(scan_git_mutation_sites(canary), {})
 
 
 class VerificationRealitySweepTests(unittest.TestCase):
@@ -696,6 +914,258 @@ class ContainmentClaimSingleSourceTests(unittest.TestCase):
         self.assertEqual(offences, [], "\n".join(
             ["the containment claim was sliced - render `claim_headline` "
              "instead, which is built negative-first:"] + offences))
+
+
+class ProcessLaunchChokepointSweepTests(unittest.TestCase):
+    """i-5. Nothing may start a process outside `flexfactor._run` unless it is
+    declared here with a reason.
+
+    The contract named ONE instance of this (g-5: the purpose-evidence `gh`
+    runner called `subprocess.run` directly). One-off fixes are how this class
+    of defect keeps coming back, so the rule is now mechanical: a new launch
+    site fails the build with file:line, and whoever adds one must either route
+    it through the chokepoint or write down why it is not a hole.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sources = {p: _read(p) for p in repo_python_files()}
+
+    @staticmethod
+    def _key(path: str, fn: str) -> str:
+        rel = os.path.relpath(path, _HERE).replace(os.sep, "/")
+        return f"{rel}::{fn}"
+
+    def _all_sites(self) -> dict[str, list[str]]:
+        sites: dict[str, list[str]] = {}
+        for path, src in self.sources.items():
+            rel = os.path.relpath(path, _HERE).replace(os.sep, "/")
+            for fn, hits in scan_process_launch_sites(src).items():
+                sites.setdefault(self._key(path, fn), []).extend(
+                    f"{rel}:{ln} {what}" for ln, what in hits)
+        return sites
+
+    def test_every_process_launch_is_declared_or_goes_through_the_chokepoint(self):
+        sites = self._all_sites()
+        undeclared = {k: v for k, v in sites.items()
+                      if k not in _PROCESS_LAUNCH_SITES}
+        self.assertEqual(undeclared, {}, (
+            "a process launch appeared outside FlexFactor's command "
+            "chokepoint. `flexfactor._run` classifies the command, routes "
+            "target-controlled code through the execution broker and records "
+            "it in the execution ledger; a launch that skips it is not "
+            "covered by the containment claim the tool PRINTS (i-5). Route it "
+            "through `_run` / `_git` / `_spawn`, or - if it genuinely cannot "
+            "be - add it to _PROCESS_LAUNCH_SITES with the reason it is not a "
+            f"hole: {undeclared}"))
+
+    def test_the_launch_site_registry_does_not_rot(self):
+        """A reason for a site that no longer exists is a reason nobody will
+        notice is stale - the exact failure the contract sweep found in
+        x-1..x-6."""
+        stale = sorted(set(_PROCESS_LAUNCH_SITES) - set(self._all_sites()))
+        self.assertEqual(stale, [], (
+            "_PROCESS_LAUNCH_SITES declares sites that are gone from the "
+            f"tree: {stale}"))
+
+    def test_every_declared_exemption_carries_a_written_reason(self):
+        unreasoned = [k for k, why in _PROCESS_LAUNCH_SITES.items()
+                      if len((why or "").strip()) < 40]
+        self.assertEqual(unreasoned, [], (
+            "an exemption without a real reason is an allowlist entry that "
+            f"means nothing: {unreasoned}"))
+
+    def test_no_product_module_imports_a_launcher_by_bare_name(self):
+        offences = []
+        for path, src in self.sources.items():
+            for ln, what in scan_launcher_imports(src):
+                offences.append(f"{os.path.relpath(path, _HERE)}:{ln} {what}")
+        self.assertEqual(offences, [], "\n".join(
+            ["a launcher was imported under a bare name, which hides it from "
+             "the attribute scan:"] + offences))
+
+    def test_the_purpose_evidence_gatherer_owns_no_launcher(self):
+        """g-5, behaviourally. The gather must be impossible to run
+        unbrokered: omitting a runner is a TypeError, not a raw subprocess."""
+        import flexfactor_purpose as fp
+        self.assertFalse(hasattr(fp, "_default_gh_runner"))
+        self.assertFalse(hasattr(fp, "_default_git_runner"))
+        with self.assertRaises(TypeError):
+            fp.gather_purpose_evidence(_HERE)
+
+    def test_the_helpers_that_touch_the_owners_repos_own_no_launcher(self):
+        """flexfactor_autoclean runs `git commit` and `gh pr merge` against the
+        owner's repositories; flexfactor_locate runs `gh api` / `gh repo
+        clone`. Both had the same shape as g-5 and both now REQUIRE a brokered
+        runner instead of defaulting to one of their own."""
+        import flexfactor_autoclean as ac
+        import flexfactor_locate as loc
+        self.assertFalse(hasattr(ac, "_run"),
+                         "flexfactor_autoclean grew a private launcher again")
+        self.assertFalse(hasattr(loc, "_run_default"),
+                         "flexfactor_locate grew a private launcher again")
+        with self.assertRaises(TypeError):
+            ac.clean_repo(_HERE)
+        # locate keeps legitimate non-process paths, so its refusal is a
+        # REPORTED note - never conflated with a negative answer.
+        code, note = loc._no_runner(["gh", "api", "x"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("no brokered command runner", note)
+
+    def test_the_audit_injects_the_brokered_runner_into_both_helpers(self):
+        """Testing the module is not testing the WIRING - this repo has five
+        recorded instances of a feature that was written and never reached
+        production behaviour."""
+        import inspect
+        import flexfactor as ff
+        src = inspect.getsource(ff)
+        for call in ("_autoclean.clean_repo(", "_locate.resolve_source_file("):
+            i = src.index(call)
+            self.assertIn("run=_brokered_tuple_runner", src[i:i + 600],
+                          f"{call} no longer injects the brokered runner")
+        import textwrap
+        adapter = textwrap.dedent(inspect.getsource(ff._brokered_tuple_runner))
+        self.assertIn("_run(", adapter)
+        # AST, not grep: the adapter's own docstring names `subprocess.run`
+        # when it explains why it exists.
+        self.assertEqual(scan_process_launch_sites(adapter), {},
+                         "the brokered adapter grew a launcher of its own")
+
+    def test_canary_a_new_bypassing_subprocess_IS_caught(self):
+        """A check that cannot fail proves nothing. Feed the analyser a
+        synthetic bypass and prove it is reported, with its line."""
+        canary = (
+            "import subprocess\n"
+            "def install_deps(cwd):\n"
+            "    return subprocess.run(['npm', 'install'], cwd=cwd)\n"
+        )
+        sites = scan_process_launch_sites(canary)
+        self.assertIn("install_deps", sites)
+        self.assertEqual(sites["install_deps"], [(3, "subprocess.run")])
+        self.assertNotIn("flexfactor.py::install_deps", _PROCESS_LAUNCH_SITES)
+
+    def test_canary_an_ALIASED_launcher_IS_caught(self):
+        canary = (
+            "import subprocess as sp\n"
+            "import os as _o\n"
+            "def sneaky(cwd):\n"
+            "    sp.Popen(['sh', '-c', 'x'])\n"
+            "    _o.system('echo hi')\n"
+        )
+        self.assertEqual(scan_process_launch_sites(canary)["sneaky"],
+                         [(4, "sp.Popen"), (5, "_o.system")])
+
+    def test_canary_a_bare_name_import_IS_caught(self):
+        self.assertTrue(scan_launcher_imports("from subprocess import run\n"))
+        self.assertTrue(scan_launcher_imports("from os import system\n"))
+        self.assertEqual(scan_launcher_imports("from os import path\n"), [])
+
+    def test_canary_prose_naming_subprocess_is_NOT_a_false_positive(self):
+        """A sweep that cries wolf gets muted. The scan is AST-based, so a
+        docstring that merely names `subprocess.run([...])` is not a launch."""
+        canary = (
+            "def documented():\n"
+            '    """Callers do subprocess.run([...]) themselves."""\n'
+            "    return None\n"
+        )
+        self.assertEqual(scan_process_launch_sites(canary), {})
+
+
+class BlockedCoverageDeclarationWiringTests(unittest.TestCase):
+    """g-4. The direct-coverage gate can now be told "blocked, and here is why"
+    from the audit path - and a block WITHOUT a reason is neither accepted nor
+    silently discarded.
+
+    Testing the module is not testing the wiring. The audit used to filter the
+    declaration file with `if str(v).strip()`, which threw reason-less entries
+    away between the file and the gate: `blocked_without_reason` could never be
+    non-empty in a real run, so the one surface that names a bad declaration
+    was unreachable.
+    """
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="ff-blocked-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _write(self, payload):
+        import json as _json
+        import flexfactor_coverage as cov
+        with open(os.path.join(self.dir, cov.BLOCKED_DECLARATION_FILE), "w",
+                  encoding="utf-8") as fh:
+            _json.dump(payload, fh)
+
+    def _evidence(self):
+        import flexfactor as ff
+        return ff._direct_coverage_evidence(self.dir, {}, {"symbols": []})
+
+    def test_the_audit_path_reads_the_declaration_through_the_validating_loader(self):
+        import inspect
+        import flexfactor as ff
+        src = inspect.getsource(ff._direct_coverage_evidence)
+        self.assertIn("load_blocked_declarations", src,
+                      "the audit path grew its own declaration parser again")
+        self.assertNotIn('if str(v).strip()', src,
+                         "the silent filter that dropped reason-less blocks is back")
+
+    def test_a_reasoned_block_reaches_the_gate(self):
+        self._write({"sym:1": "destructive: drops the production table"})
+        out = self._evidence()
+        self.assertEqual([b.id for b in out["blocked"]], ["sym:1"])
+        self.assertEqual(out["blocked"][0].reason,
+                         "destructive: drops the production table")
+        self.assertEqual(out["meta"]["blocked_rejected"], [])
+
+    def test_a_reason_less_block_is_REPORTED_not_dropped_and_not_accepted(self):
+        self._write({"sym:1": "  "})
+        out = self._evidence()
+        self.assertEqual(out["blocked"], [],
+                         "an unreasoned block must never reach the gate")
+        self.assertEqual([r["id"] for r in out["meta"]["blocked_rejected"]], ["sym:1"])
+        self.assertEqual(out["meta"]["blocked_file"]["declared"], 1)
+        self.assertEqual(out["meta"]["blocked_file"]["accepted"], 0)
+
+    def test_an_unreasoned_block_is_unrepresentable_not_merely_ignored(self):
+        import flexfactor_coverage as cov
+        with self.assertRaises(cov.BlockedDeclarationError):
+            cov.BlockedFunction("sym:1", "")
+        # ... and the gate cannot be handed one by any other route either.
+        g = cov.direct_function_gate([{"id": "sym:1", "status": "unproven"}],
+                                     blocked={"sym:1": ""})
+        self.assertEqual(g["blocked"], 0)
+        self.assertFalse(g["complete"])
+        self.assertEqual(g["blocked_without_reason"], ["sym:1"])
+
+    def test_blocked_is_visibly_distinct_from_covered_in_the_reported_surfaces(self):
+        """It must never read as covered, and never vanish either."""
+        import inspect
+        import flexfactor as ff
+        import flexfactor_coverage as cov
+        import flexfactor_evidence as fe
+
+        merged = cov.merge_into_function_coverage(
+            {"functions": [{"id": "a", "name": "a"}, {"id": "b", "name": "b"}]},
+            [{"id": "a", "status": "direct", "evidence": {"k": 1}, "reason": "ran"},
+             {"id": "b", "status": "unproven", "evidence": None, "reason": "no"}],
+            blocked={"b": "hardware-bound: needs the label printer"})
+        self.assertEqual(merged["function_direct_coverage_total"], 1)
+        self.assertEqual(merged["function_blocked_total"], 1)
+        states = {f["id"]: f["coverage_state"] for f in merged["functions"]}
+        self.assertEqual(states, {"a": "direct", "b": "blocked-with-reason"})
+
+        # the quality-gate evidence record carries the reasons, not just a count
+        gate_src = inspect.getsource(fe.quality_gates)
+        for key in ("blocked_reasons", "blocked_without_reason",
+                    "unknown_blocked_ids", "blocked_declared"):
+            self.assertIn(key, gate_src,
+                          f"the function-coverage gate evidence dropped {key}")
+
+        # the dashboard payload names blocked as its own number
+        ff_src = inspect.getsource(ff)
+        self.assertIn('"functions_blocked"', ff_src,
+                      "the dashboard cannot distinguish blocked from missing")
+        self.assertIn('"functions_blocked_without_reason"', ff_src)
 
 
 class SweepIsWiredIntoCITests(unittest.TestCase):

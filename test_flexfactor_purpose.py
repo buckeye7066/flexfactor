@@ -34,6 +34,19 @@ def _git(root: str, *args: str) -> subprocess.CompletedProcess:
 GIT_AVAILABLE = shutil.which("git") is not None
 
 
+def _real_git(args, cwd):
+    """The test scaffold's own git runner.
+
+    `gather_purpose_evidence` no longer owns a default runner (that default was
+    a raw `subprocess.run` outside FlexFactor's command chokepoint - the g-5
+    containment hole). Production injects a runner backed by `flexfactor._git`;
+    these unit tests, which are not the product, inject this one.
+    """
+    cp = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                        encoding="utf-8", errors="replace", timeout=60)
+    return cp.stdout or "" if cp.returncode == 0 else None
+
+
 def _fake_gh(args, cwd):
     if args[0] == "pr":
         return json.dumps([{"number": 7, "title": "Add checkout flow", "state": "MERGED"},
@@ -152,7 +165,7 @@ class GatherEvidenceFullFixtureTests(_TempRepo):
         build_full_fixture(self.root)
         if GIT_AVAILABLE:
             git_init_with_history(self.root)
-        self.ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh)
+        self.ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_fake_gh)
 
     def _kinds(self):
         return {s["kind"] for s in self.ev["sources"]}
@@ -279,8 +292,7 @@ class GatherEvidenceFullFixtureTests(_TempRepo):
 class GhAbsentTests(_TempRepo):
     def test_gh_absent_records_unknowns_and_never_crashes(self):
         build_full_fixture(self.root)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_absent_gh)
         self.assertEqual(ev["history"]["prs"], [])
         self.assertEqual(ev["history"]["issues"], [])
         self.assertTrue(any("GitHub pull requests unavailable" in u for u in ev["unknowns"]))
@@ -288,16 +300,35 @@ class GhAbsentTests(_TempRepo):
         # Not a git repo at all -> history is an unknown, not a crash.
         self.assertTrue(any("not a git repository" in u for u in ev["unknowns"]))
 
-    def test_default_gh_runner_returns_none_when_gh_is_missing(self):
-        old = os.environ.get("PATH")
-        os.environ["PATH"] = self.root  # nothing on PATH
-        try:
-            self.assertIsNone(fp._default_gh_runner(["pr", "list"], self.root))
-        finally:
-            if old is None:
-                del os.environ["PATH"]
-            else:
-                os.environ["PATH"] = old
+    def test_the_module_owns_no_process_launcher_at_all(self):
+        """g-5. The default runners were raw `subprocess.run` calls, outside
+        FlexFactor's command chokepoint - so a purpose gather could start a
+        process that no policy classified and no containment claim covered."""
+        self.assertFalse(hasattr(fp, "_default_gh_runner"))
+        self.assertFalse(hasattr(fp, "_default_git_runner"))
+        with open(fp.__file__, encoding="utf-8") as fh:
+            source = fh.read()
+        for banned in ("subprocess.run(", "subprocess.Popen(", "os.system(",
+                       "os.popen("):
+            self.assertNotIn(banned, source,
+                             f"{banned} reappeared in flexfactor_purpose.py")
+
+    def test_gather_refuses_to_run_without_injected_runners(self):
+        """An unbrokered gather must be impossible to express, not merely
+        discouraged: omitting a runner is a TypeError, never a raw process."""
+        with self.assertRaises(TypeError):
+            fp.gather_purpose_evidence(self.root)
+        with self.assertRaises(TypeError):
+            fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh)
+        with self.assertRaises(TypeError):
+            fp.gather_purpose_evidence(self.root, git_runner=_real_git)
+
+    def test_an_absent_runner_yields_unknowns_never_a_subprocess(self):
+        ev = fp.gather_purpose_evidence(self.root, git_runner=None, gh_runner=None)
+        self.assertTrue(any("no brokered git runner" in u for u in ev["unknowns"]),
+                        ev["unknowns"])
+        self.assertTrue(any("no brokered gh runner" in u for u in ev["unknowns"]),
+                        ev["unknowns"])
 
 
 class ContradictionTests(_TempRepo):
@@ -308,8 +339,7 @@ class ContradictionTests(_TempRepo):
          "description": "A command-line tool that prints invoices",
          "dependencies": {"express": "^4.19.0"}}
         """)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_absent_gh)
         kinds = [c for c in ev["contradictions"] if c["kind"] == "program-kind"]
         self.assertEqual(len(kinds), 1)
         c = kinds[0]
@@ -328,8 +358,7 @@ class ContradictionTests(_TempRepo):
 
         Invoicer is a web app that lets businesses send invoices and texts reminders via Twilio.
         """)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_absent_gh)
         hits = [c for c in ev["contradictions"] if c["kind"] == "claimed-integration-not-wired"]
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["a"]["says"], ["Twilio"])
@@ -338,16 +367,14 @@ class ContradictionTests(_TempRepo):
 class ConfidenceLadderTests(_TempRepo):
     def test_readme_only_is_weakly_inferred(self):
         _w(self.root, "README.md", "# Thing\n\nThing is a web app that does a thing.\n")
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_absent_gh)
         self.assertEqual(fp.purpose_confidence(None, ev), "weakly-inferred")
         ok, why = fp.mutation_authorized_by_purpose("weakly-inferred")
         self.assertFalse(ok)
         self.assertIn("weakly", why)
 
     def test_empty_dir_is_unresolved(self):
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_absent_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_absent_gh)
         self.assertEqual(ev["sources"], [])
         self.assertEqual(fp.purpose_confidence(None, ev), "unresolved")
         self.assertTrue(any("no README prose" in u for u in ev["unknowns"]))
@@ -357,7 +384,7 @@ class ConfidenceLadderTests(_TempRepo):
         self.assertIn("unresolved", why)
 
     def test_missing_dir_is_unresolved_not_a_crash(self):
-        ev = fp.gather_purpose_evidence(os.path.join(self.root, "nope"), gh_runner=_absent_gh)
+        ev = fp.gather_purpose_evidence(os.path.join(self.root, "nope"), git_runner=_real_git, gh_runner=_absent_gh)
         self.assertEqual(fp.purpose_confidence(None, ev), "unresolved")
         self.assertTrue(any("does not exist" in u for u in ev["unknowns"]))
 
@@ -378,8 +405,7 @@ class ConfidenceLadderTests(_TempRepo):
 class RenderBlockTests(_TempRepo):
     def test_render_cites_paths_and_respects_limit(self):
         build_full_fixture(self.root)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_fake_gh)
         block = fp.render_purpose_evidence_block(ev)
         self.assertTrue(block.startswith("```purpose-evidence"))
         self.assertTrue(block.endswith("\n```"))
@@ -392,8 +418,7 @@ class RenderBlockTests(_TempRepo):
 
     def test_render_truncates_but_keeps_fence(self):
         build_full_fixture(self.root)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_fake_gh)
         block = fp.render_purpose_evidence_block(ev, limit_chars=400)
         self.assertLessEqual(len(block), 400)
         self.assertTrue(block.endswith("\n```"))
@@ -418,8 +443,7 @@ class InferredRecordTests(_TempRepo):
 
     def test_inferred_contract_with_evidence_carries_ledger_and_confidence(self):
         build_full_fixture(self.root)
-        ev = fp.gather_purpose_evidence(self.root, gh_runner=_fake_gh,
-                                        git_runner=lambda a, c: None)
+        ev = fp.gather_purpose_evidence(self.root, git_runner=_real_git, gh_runner=_fake_gh)
         c = fp.inferred_contract("invoicer", "send invoices", ["c1"], evidence=ev)
         self.assertFalse(c.authored)
         self.assertEqual(c.confidence, "strongly-inferred")

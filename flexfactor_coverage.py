@@ -728,37 +728,201 @@ def direct_function_rows(index: dict, coverage: dict) -> list[dict]:
     return rows
 
 
-def direct_function_gate(rows: list[dict], *, blocked: dict[str, str] | None = None) -> dict:
+# --------------------------------------------------------------------------- #
+# Blocked functions: a declaration that CANNOT omit its reason
+# --------------------------------------------------------------------------- #
+#: Filename an audited repository uses to declare functions it cannot execute.
+BLOCKED_DECLARATION_FILE = ".flexfactor-coverage-blocked.json"
+
+#: A reason has to be something a reader can act on. "n/a", "-" and "" are not
+#: reasons; they are a way of marking a function proven without proving it.
+BLOCKED_REASON_MIN_CHARS = 10
+
+
+class BlockedDeclarationError(ValueError):
+    """A block was declared without a usable reason, or without an id."""
+
+
+class BlockedFunction:
+    """One function the owner declares unexecutable, WITH the reason.
+
+    The reason is validated in the CONSTRUCTOR, so an unreasoned block is
+    unrepresentable rather than merely ignored: there is no way to hand the
+    coverage gate a blocked entry that has no reason attached, because the only
+    object that can carry one refuses to exist without it.
+
+    That distinction matters because both alternatives are failures the
+    governing contract rejects by name. A reason-less block that is silently
+    DROPPED under-reports (the owner declared something and nothing recorded
+    it); a reason-less block that is silently ACCEPTED produces false
+    confidence (a function counts as accounted-for with no account given).
+    """
+
+    __slots__ = ("id", "reason")
+
+    def __init__(self, id: str, reason: str) -> None:  # noqa: A002 - the field IS "id"
+        ident = str(id or "").strip()
+        if not ident:
+            raise BlockedDeclarationError("a blocked declaration needs a symbol id")
+        text = " ".join(str(reason or "").split())
+        if len(text) < BLOCKED_REASON_MIN_CHARS:
+            raise BlockedDeclarationError(
+                f"blocked {ident!r} has no usable reason: a block must say WHY the "
+                f"function cannot be executed (at least {BLOCKED_REASON_MIN_CHARS} "
+                f"characters); got {text!r}")
+        object.__setattr__(self, "id", ident)
+        object.__setattr__(self, "reason", text)
+
+    def __setattr__(self, *_a):  # pragma: no cover - immutability guard
+        raise AttributeError("BlockedFunction is immutable")
+
+    def __eq__(self, other):
+        return (isinstance(other, BlockedFunction)
+                and (self.id, self.reason) == (other.id, other.reason))
+
+    def __hash__(self):
+        return hash((self.id, self.reason))
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"BlockedFunction(id={self.id!r}, reason={self.reason!r})"
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "reason": self.reason}
+
+
+def blocked_declarations(raw) -> tuple[list["BlockedFunction"], list[dict]]:
+    """Turn a raw `{id: reason}` mapping into (accepted, rejected).
+
+    NOTHING is dropped: every entry that cannot become a `BlockedFunction`
+    comes back in `rejected` as {"id", "raw_reason", "why"}, so a malformed
+    declaration is REPORTED rather than disappearing between the file and the
+    gate. A non-mapping payload is one rejection naming the type it got.
+    """
+    accepted: list[BlockedFunction] = []
+    rejected: list[dict] = []
+    if raw is None:
+        return accepted, rejected
+    if not isinstance(raw, dict):
+        rejected.append({"id": None, "raw_reason": None,
+                         "why": f"expected an object of {{id: reason}}, got "
+                                f"{type(raw).__name__}"})
+        return accepted, rejected
+    for key, value in raw.items():
+        try:
+            accepted.append(BlockedFunction(key, value))
+        except BlockedDeclarationError as ex:
+            rejected.append({"id": str(key), "raw_reason": value, "why": str(ex)})
+    return accepted, rejected
+
+
+def load_blocked_declarations(project_dir: str,
+                              filename: str = BLOCKED_DECLARATION_FILE
+                              ) -> tuple[list["BlockedFunction"], list[dict], dict]:
+    """Read `<project_dir>/<filename>`. Returns (accepted, rejected, meta).
+
+    A missing file is not a problem (`meta["present"] = False`); an unreadable
+    or unparseable one IS, and says so. Reading never raises and never invents
+    a block.
+    """
+    path = os.path.join(project_dir, filename)
+    meta = {"path": path, "present": False, "declared": 0,
+            "accepted": 0, "rejected": 0}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return [], [], meta
+    except (OSError, ValueError) as ex:
+        meta["present"] = True
+        meta["error"] = f"{type(ex).__name__}: {ex}"
+        return [], [{"id": None, "raw_reason": None,
+                     "why": f"{filename} could not be read: {meta['error']}"}], meta
+    meta["present"] = True
+    accepted, rejected = blocked_declarations(raw)
+    meta["declared"] = len(raw) if isinstance(raw, dict) else 1
+    meta["accepted"] = len(accepted)
+    meta["rejected"] = len(rejected)
+    return accepted, rejected, meta
+
+
+def direct_function_gate(rows: list[dict], *, blocked=None) -> dict:
     """Fail-closed gate: complete ONLY when every first-party function is
     either directly proven or explicitly blocked WITH a reason. Module-level
-    execution is never counted — rows only carry "direct" or "unproven"."""
-    blocked = {str(k): str(v or "").strip() for k, v in (blocked or {}).items()}
+    execution is never counted - rows only carry "direct" or "unproven".
+
+    `blocked` is a sequence of `BlockedFunction`, or the raw `{id: reason}`
+    mapping, which is put THROUGH `BlockedFunction` here. Either way an entry
+    without a usable reason cannot become a block; it is named in
+    `blocked_without_reason` instead.
+
+    EVERY declared entry is accounted for, because a declaration that vanishes
+    is indistinguishable from one that was never made:
+
+        blocked_declared == blocked
+                          + len(blocked_without_reason)
+                          + len(unknown_blocked_ids)
+                          + len(blocked_superseded_by_direct)
+
+    and that identity is asserted, not merely documented.
+    """
+    accepted, rejected = ([], [])
+    if isinstance(blocked, dict):
+        accepted, rejected = blocked_declarations(blocked)
+        declared = len(blocked)
+    else:
+        items = list(blocked or [])
+        for item in items:
+            if isinstance(item, BlockedFunction):
+                accepted.append(item)
+            else:  # a raw pair still has to survive the constructor
+                try:
+                    accepted.append(BlockedFunction(*item))
+                except (BlockedDeclarationError, TypeError, ValueError) as ex:
+                    rejected.append({"id": None, "raw_reason": None, "why": str(ex)})
+        declared = len(items)
+    blocked_without_reason = [r["id"] for r in rejected if r.get("id")]
+    unreadable = [r for r in rejected if not r.get("id")]
+
     ids = [r.get("id") for r in rows]
     direct_ids = [r["id"] for r in rows if r.get("status") == "direct"]
     direct_set = set(direct_ids)
-    blocked_ids, blocked_without_reason, unknown_blocked = [], [], []
-    for bid, reason in blocked.items():
-        if bid not in ids:
-            unknown_blocked.append(bid)
-        elif bid in direct_set:
-            continue  # proven beats blocked; count it once, as direct
-        elif not reason:
-            blocked_without_reason.append(bid)
+    blocked_ids, unknown_blocked, superseded = [], [], []
+    reasons: dict[str, str] = {}
+    for decl in accepted:
+        if decl.id not in ids:
+            unknown_blocked.append(decl.id)
+        elif decl.id in direct_set:
+            # Proven beats blocked - counted once, as direct. Recorded, NOT
+            # dropped: an owner who declared a block deserves to see that the
+            # tool proved the function instead.
+            superseded.append(decl.id)
         else:
-            blocked_ids.append(bid)
+            blocked_ids.append(decl.id)
+            reasons[decl.id] = decl.reason
     blocked_set = set(blocked_ids)
     unproven_ids = [r["id"] for r in rows
                     if r.get("status") != "direct" and r["id"] not in blocked_set]
     total = len(rows)
+    accounted = (len(blocked_ids) + len(blocked_without_reason)
+                 + len(unknown_blocked) + len(superseded) + len(unreadable))
+    if declared != accounted:  # pragma: no cover - the identity is the point
+        raise AssertionError(
+            f"blocked declarations lost items: declared={declared} "
+            f"blocked={len(blocked_ids)} without_reason={len(blocked_without_reason)} "
+            f"unknown={len(unknown_blocked)} superseded={len(superseded)} "
+            f"unreadable={len(unreadable)}")
     return {
         "schema": COVERAGE_ROWS_SCHEMA,
         "total": total, "direct": len(direct_ids), "unproven": len(unproven_ids),
         "blocked": len(blocked_ids),
         "complete": total == len(direct_ids) + len(blocked_ids),
         "unproven_ids": unproven_ids, "blocked_ids": blocked_ids,
-        "blocked_reasons": {b: blocked[b] for b in blocked_ids},
+        "blocked_reasons": reasons,
         "blocked_without_reason": blocked_without_reason,
         "unknown_blocked_ids": unknown_blocked,
+        "blocked_superseded_by_direct": superseded,
+        "blocked_declared": declared,
+        "blocked_rejected": rejected,
     }
 
 
@@ -794,7 +958,21 @@ def merge_into_function_coverage(fc: dict, rows: list[dict], *,
     merged["function_total"] = len(functions)
     merged["function_direct_coverage_total"] = sum(
         bool(f.get("direct_function_coverage")) for f in functions)
-    merged["direct_gate"] = direct_function_gate(gate_rows, blocked=blocked)
+    gate = direct_function_gate(gate_rows, blocked=blocked)
+    merged["direct_gate"] = gate
+    # Blocked is a THIRD state, and every surface that reports coverage has to
+    # be able to say so without digging into the gate: a blocked function is
+    # not covered, and it is not merely missing either.
+    merged["function_blocked_total"] = gate["blocked"]
+    merged["function_blocked_without_reason_total"] = len(gate["blocked_without_reason"])
+    for fn in merged["functions"]:
+        if fn.get("id") in set(gate["blocked_ids"]):
+            fn["coverage_state"] = "blocked-with-reason"
+            fn["blocked_reason"] = gate["blocked_reasons"].get(fn.get("id"))
+        elif fn.get("direct_function_coverage"):
+            fn["coverage_state"] = "direct"
+        else:
+            fn["coverage_state"] = "unproven"
     merged["function_coverage_basis"] = (
         "direct-tool-evidence" if merged["function_direct_coverage_total"] > 0
         else "module-execution-only (NOT direct)")
@@ -805,4 +983,7 @@ __all__ = [
     "detect_coverage_artifacts", "parse_coverage", "merge_coverage",
     "coverage_commands", "direct_function_rows", "direct_function_gate",
     "merge_into_function_coverage",
+    "BlockedFunction", "BlockedDeclarationError", "BLOCKED_DECLARATION_FILE",
+    "BLOCKED_REASON_MIN_CHARS", "blocked_declarations",
+    "load_blocked_declarations",
 ]

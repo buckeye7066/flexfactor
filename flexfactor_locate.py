@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 DEFAULT_OWNER = "buckeye7066"
 
@@ -52,19 +51,22 @@ _SKIP_DIR_NAMES = {
 
 TIMEOUT_S = 120
 
+#: What `_no_runner` reports when nobody wired the command chokepoint.
+NO_RUNNER_NOTE = ("no brokered command runner was supplied: this module never "
+                  "launches a process of its own, so the GitHub lookup could "
+                  "not be performed (this is NOT 'no repo has this file')")
 
-def _run_default(cmd, cwd=None, timeout=TIMEOUT_S):
-    """Run a command; return (exit_code, combined_output). Never raises."""
-    try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout, encoding="utf-8", errors="replace")
-        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
-    except FileNotFoundError:
-        return 127, str(cmd[0]) + ": not found"
-    except subprocess.TimeoutExpired:
-        return 124, " ".join(cmd) + ": timed out after " + str(timeout) + "s"
-    except Exception as exc:                                  # pragma: no cover
-        return 1, " ".join(cmd) + ": " + str(exc)
+
+def _no_runner(cmd, cwd=None, timeout=TIMEOUT_S):
+    """The runner used when the caller wired nothing.
+
+    It runs NOTHING. This module used to fall back to a raw `subprocess.run`,
+    which is the same containment hole the purpose-evidence gatherer had (g-5):
+    a process started here is outside `flexfactor._run`, so no command policy
+    classifies it and no containment claim covers it. A missing runner is now
+    reported as a note - never conflated with a negative answer.
+    """
+    return 1, NO_RUNNER_NOTE
 
 
 def canon_rel(raw):
@@ -158,7 +160,7 @@ def github_repos_with_file(rel, owner=DEFAULT_OWNER, run=None):
     Returns (repo_full_names, note). `note` is non-empty when the lookup could
     not be performed - never conflated with "no repo has this file".
     """
-    runner = run or _run_default
+    runner = run or _no_runner
     code, out = runner([
         "gh", "api", "-X", "GET", "search/code",
         "-f", "q=" + _search_query(rel, owner),
@@ -186,7 +188,7 @@ def local_clone_of(repo_full_name, roots):
 
 def clone_repo(repo_full_name, dest_parent, run=None):
     """Clone `owner/repo` under `dest_parent`. Returns (path, note)."""
-    runner = run or _run_default
+    runner = run or _no_runner
     name = repo_full_name.split("/")[-1]
     dest = os.path.join(dest_parent, name)
     if os.path.exists(dest):
