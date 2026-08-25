@@ -57,6 +57,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             findings = policy.scan_repository(root)
         self.assertIn("prohibited:manual_gate:tracked.md", findings)
 
+    def test_empty_exact_git_index_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            findings = policy.scan_repository(directory)
+        self.assertEqual(
+            findings, ["infrastructure:exact Git index contains no files"]
+        )
+
     def test_current_repository_passes_the_binding_policy(self):
         root = Path(__file__).resolve().parent
         self.assertEqual(policy.scan_repository(root), [])

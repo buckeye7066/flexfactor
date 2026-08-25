@@ -42,6 +42,10 @@ _PROHIBITED_FRAGMENTS = (
 )
 
 
+class PolicyInfrastructureError(RuntimeError):
+    """The exact repository exists, but its tracked contents cannot be read."""
+
+
 def normalize_language(value: str) -> str:
     """Normalize line wrapping and separator variants before matching."""
     return re.sub(r"[-_\s]+", " ", value.lower())
@@ -105,34 +109,39 @@ def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
     """Enumerate the exact index, or an exported workspace when no index fits."""
     root = root.resolve()
     try:
-        git_root = Path(
-            subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                check=True,
-                text=True,
-            ).stdout.strip()
-        ).resolve()
-        if os.path.normcase(str(git_root)) != os.path.normcase(str(root)):
-            raise RuntimeError("enclosing Git index belongs to another repository")
-        tracked = subprocess.run(
+        git_probe = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return _workspace_entries(root)
+    if git_probe.returncode != 0:
+        return _workspace_entries(root)
+    git_root = Path(git_probe.stdout.strip()).resolve()
+    if os.path.normcase(str(git_root)) != os.path.normcase(str(root)):
+        return _workspace_entries(root)
+
+    try:
+        tracked_result = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z"],
             capture_output=True,
             check=True,
-        ).stdout
-        relative_paths = [
-            value.decode("utf-8", "surrogateescape")
-            for value in tracked.split(b"\0")
-            if value
-        ]
-        if not relative_paths:
-            raise RuntimeError("Git index contains no files")
-        return [
-            (relative_path, root / relative_path, True)
-            for relative_path in relative_paths
-        ]
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        return _workspace_entries(root)
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PolicyInfrastructureError("exact Git index is unreadable") from error
+    relative_paths = [
+        value.decode("utf-8", "surrogateescape")
+        for value in tracked_result.stdout.split(b"\0")
+        if value
+    ]
+    if not relative_paths:
+        raise PolicyInfrastructureError("exact Git index contains no files")
+    return [
+        (relative_path, root / relative_path, True)
+        for relative_path in relative_paths
+    ]
 
 
 def _read_entry(root: Path, relative_path: str, path: Path, tracked: bool) -> bytes:
@@ -170,7 +179,11 @@ def scan_repository(root: Path | str) -> list[str]:
     """Return deterministic findings; an unreadable tracked blob is a failure."""
     resolved_root = Path(root).resolve()
     findings: list[str] = []
-    for relative_path, path, tracked in repository_entries(resolved_root):
+    try:
+        entries = repository_entries(resolved_root)
+    except PolicyInfrastructureError as error:
+        return [f"infrastructure:{error}"]
+    for relative_path, path, tracked in entries:
         try:
             raw = _read_entry(resolved_root, relative_path, path, tracked)
         except OSError as error:
