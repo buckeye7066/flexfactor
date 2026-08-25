@@ -2305,6 +2305,61 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
             self.assertEqual(res.status, "skipped-unverified")
             self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
 
+    def test_python_project_uses_its_real_test_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "pyproject.toml"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("[project]\nname='fixture'\nversion='0.0.1'\n")
+            os.makedirs(os.path.join(project, "tests"))
+            with open(os.path.join(project, "tests", "test_app.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("def test_ok():\n    assert True\n")
+            is_node, commands = ff._detect_verify(project)
+            self.assertFalse(is_node)
+            self.assertIn(["python", "-m", "pytest", "-q"], commands)
+
+    def test_no_verifier_refuses_before_provider_generation(self):
+        import argparse
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        repo = {"fullName": "x/y", "htmlUrl": "https://example.com/x/y",
+                "licenseSpdx": "MIT"}
+        evaluation = {
+            "need": "n", "repo": repo, "result": {"repo": repo},
+            "benefit": {"benefit_score": 90}, "recommendation": "ADOPT",
+            "evidence": {"license": "MIT", "commit_sha": "a" * 40,
+                         "commit_pin_source": "test"},
+            "verdicts": {"safe_to_integrate": True},
+        }
+        calls = {"generate": 0}
+
+        def generated(*args, **kwargs):
+            calls["generate"] += 1
+            return None, "must not run"
+
+        with tempfile.TemporaryDirectory() as project:
+            args = argparse.Namespace(
+                apply=True, apply_tier="adopt", clone_inspect=False,
+                program=project, verify=True, legacy_inline_apply=True,
+                allow_scripts=False, isolate_verify=True)
+            with mock.patch.object(ff, "resolve_project_dir",
+                                   lambda *a: project), \
+                 mock.patch.object(ff, "_approve_candidate",
+                                   lambda *a: True), \
+                 mock.patch.object(ff._scout_contract,
+                                   "scout_may_mutate_target",
+                                   lambda *a: (True, "test approval")), \
+                 mock.patch.object(ff, "generate_integration", generated):
+                with redirect_stdout(io.StringIO()):
+                    results = ff._apply_phase(
+                        args, "P", {"summary": "s"}, [evaluation], object())
+        self.assertEqual(results[0].status, "skipped-unverified")
+        self.assertEqual(calls["generate"], 0)
+
     def test_disabled_verification_retains_nothing(self):
         import tempfile
         with tempfile.TemporaryDirectory() as project:
@@ -6576,13 +6631,15 @@ class VerifyDisclosureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             note = ff._verify_disclosure(self._args(verify=False), tmp)
             self.assertIn("DISABLED", note)
-            self.assertIn("WITHOUT any build check", note)
+            self.assertIn("REFUSED", note)
+            self.assertIn("before generation", note)
 
     def test_no_verifier_detected_disclosed(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:  # no package.json at all
             note = ff._verify_disclosure(self._args(), tmp)
-            self.assertIn("no build/lint script detected", note)
+            self.assertIn("no build/test/lint/typecheck command detected", note)
+            self.assertIn("REFUSED", note)
 
     def test_real_verifier_disclosed_with_command(self):
         import tempfile
@@ -8763,7 +8820,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             finally:
                 for n, fn in saved.items():
                     setattr(ff, n, fn)
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 4,
+                             "--apply with zero landed changes must fail visibly")
             branches = subprocess.run(
                 ["git", "-C", tmp, "branch", "--list"],
                 capture_output=True, text=True).stdout
@@ -9612,8 +9670,8 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
         ff._git = fake_git
         ff._git_has_remote = lambda pd: True
         ff._full_gate = lambda pd, st: (True, "")
-        ff._gh_pr_automerge = lambda pd, br, base: (pr_calls.append((br, base))
-                                                   or "PR opened with auto-merge")
+        ff._gh_pr_automerge = lambda pd, br, base, stack: (
+            pr_calls.append((br, base)) or "PR opened with auto-merge")
         ff._git_current_branch = lambda pd: "flexfactor/prodready-x"
         args = types.SimpleNamespace(push=True, merge=True)
         try:
@@ -10836,7 +10894,7 @@ class VacuousGateTests(unittest.TestCase):
                  "_git_has_remote": lambda pd: True,
                  "_git_current_branch": lambda pd: "main",
                  "_full_gate": lambda pd, st: (True, "log"),
-                 "_gh_pr_automerge": lambda pd, br, base: (
+                 "_gh_pr_automerge": lambda pd, br, base, stack: (
                      gh_calls.append((br, base)) or
                      f"PR opened with auto-merge - lands on {base} when checks pass")}
         for name, fn in stubs.items():
