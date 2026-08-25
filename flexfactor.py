@@ -6461,6 +6461,19 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         return ApplyResult(repo_name, "skipped-dirty",
                            "Working tree is not clean - commit/stash changes or pass --allow-dirty.")
 
+    # A generated integration is not allowed to survive merely because the
+    # target exposes no command we know how to run (or the caller disabled the
+    # gate). Disclosure is necessary, but it is not verification. Refuse before
+    # the first write/package install so "applied" always means target code was
+    # actually exercised and a verifier loss leaves the repository unchanged.
+    if not opts.verify:
+        return ApplyResult(repo_name, "skipped-unverified",
+                           "verification was disabled; refusing to retain generated changes")
+    if not verify_cmds:
+        return ApplyResult(repo_name, "skipped-unverified",
+                           "no build/lint/typecheck command was detected; refusing to retain "
+                           "generated changes that nothing can verify")
+
     prev_branch = _git_current_branch(project_dir) if git else None
     branch = prev_branch  # no sandbox branch: apply onto the current branch
     # Backups are keyed by REPO-RELATIVE path and read/written through the contained
@@ -13619,7 +13632,8 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     if not runnable:
         meta["reason"] = ("no grounded coverage tool for this stack (nothing was invented); "
                           "every first-party function remains UNPROVEN")
-    return {"rows": rows, "blocked": blocked, "meta": meta}
+    return {"rows": rows, "blocked": blocked,
+            "blocked_rejected": blocked_rejected, "meta": meta}
 
 
 # Orphan-WIP snapshots attached to running programs: normcase(project_dir) ->
@@ -15734,7 +15748,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # kept for context but can no longer satisfy the gate.
                 coverage_run = _direct_coverage_evidence(project_dir, stack, final_index, pfx)
                 coverage_evidence = _ff_coverage.merge_into_function_coverage(
-                    coverage_evidence, coverage_run["rows"], blocked=coverage_run["blocked"])
+                    coverage_evidence, coverage_run["rows"],
+                    blocked=coverage_run["blocked"],
+                    blocked_rejected=coverage_run["blocked_rejected"])
                 coverage_evidence["coverage_run"] = coverage_run["meta"]
                 graph_evidence = evidence_mod.purpose_graph(
                     result.get("purpose_contract"), purpose_gap,
