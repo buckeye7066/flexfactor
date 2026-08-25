@@ -49,6 +49,7 @@ py-modules = [
   "flexfactor_prodready",
   "flexfactor_prodready_engine",
   "flexfactor_prodready_persist",
+  "flexfactor_product_invariants",
   "flexfactor_purpose",
   "flexfactor_rotation",
   "flexfactor_run",
@@ -73,4 +74,4 @@ include = ["providers*", "competitors*", "tests*", "flexfactor_assets*"]
 # or, if pytest is installed:
 #   pytest flexfactor_tests.py
 [tool.pytest.ini_options]
-python_files = ["flexfactor_tests.py"]
+python_files = ["flexfactor_tests.py", "flexfactor_product_invariants_tests.py"]
