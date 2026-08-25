@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import codecs
+from html import unescape
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
 from typing import Iterable
+import unicodedata
 
 
 _EXCLUDED_DIRECTORIES = {
@@ -69,7 +71,12 @@ class PolicyInfrastructureError(RuntimeError):
 
 def normalize_language(value: str) -> str:
     """Normalize line wrapping and separator variants before matching."""
-    return re.sub(r"[-_\s]+", " ", value.lower())
+    without_format_controls = "".join(
+        character
+        for character in value.lower()
+        if unicodedata.category(character) != "Cf"
+    )
+    return re.sub(r"[-_\s]+", " ", without_format_controls)
 
 
 def contains_language_fragment(value: str, target: str) -> bool:
@@ -152,7 +159,9 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     """Approximate user-visible JSX and adjacent static string expressions."""
     if Path(relative_path).suffix.lower() not in _RENDERED_SOURCE_SUFFIXES:
         return ()
-    candidates = [re.sub(r"<\s*/?\s*[A-Za-z][^>]*>", " ", value)]
+    candidates = [
+        unescape(re.sub(r"<\s*/?\s*[A-Za-z][^>]*>", " ", value))
+    ]
     previous: re.Match[str] | None = None
     chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):

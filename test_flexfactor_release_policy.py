@@ -69,6 +69,20 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), "component.jsx"),
                 )
 
+    def test_html_character_references_are_decoded_before_matching(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            f"{first}&#32;{second}",
+            f"<span>{first}</span>&nbsp;<span>{second}</span>",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "page.html"),
+                )
+
     def test_phrase_substring_inside_words_is_not_detected(self):
         raw = "Assign officer duties".encode()
         self.assertEqual(policy.matching_labels(raw), ())
