@@ -6878,7 +6878,7 @@ class ScoutEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._make_target(tmp)
             rc = self._run_scenario(tmp, verify_rc=1)
-            self.assertEqual(rc, 0)  # scout completes; the APPLY was rolled back
+            self.assertEqual(rc, 4)  # zero work landed; supervisors must see failure
             branches = self._git_out(tmp, "branch", "--list")
             self.assertNotIn("flexfactor/adopt-good-widget", branches)
             self.assertFalse(os.path.exists(os.path.join(tmp, "widget_integration.js")))
