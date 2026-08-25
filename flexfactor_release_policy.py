@@ -79,7 +79,8 @@ def _looks_like_text(value: str | None) -> bool:
         ord(character) < 32 and character not in "\t\r\n"
         for character in value
     )
-    return controls / len(value) <= 0.05
+    replacements = value.count("\ufffd")
+    return controls / len(value) <= 0.05 and replacements / len(value) <= 0.02
 
 
 def _decode_strict(raw: bytes, encoding: str) -> str | None:
@@ -104,7 +105,8 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
             return (decoded,) if _looks_like_text(decoded) else ()
 
     if b"\0" not in raw:
-        return (raw.decode("utf-8", "replace"),) if raw else ()
+        decoded = raw.decode("utf-8", "replace") if raw else ""
+        return (decoded,) if _looks_like_text(decoded) else ()
 
     candidates: list[str] = []
     for encoding in ("utf-32-le", "utf-32-be", "utf-16-le", "utf-16-be"):
