@@ -46,6 +46,7 @@ flexfactor_prodready.py.
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import html
 import json
 import os
@@ -366,7 +367,11 @@ IDEA_SYSTEM = (
     "is in the abstract. Ground every claim in the evidence supplied; if the "
     "evidence does not establish that the competitor has this capability, say "
     "so in `evidence_basis` and lower confidence. Never describe the "
-    "competitor's source code - you have not read it. EVERY field is REQUIRED "
+    "competitor's source code - you have not read it. Determine whether the "
+    "audited program already has the behavior; a duplicate must set "
+    "`already_present=true` and `accept=false`. Record an adoption risk level, "
+    "a concrete risk reason, mitigation for medium/high risk, the end-to-end "
+    "wiring plan, and an executable verification plan. EVERY field is REQUIRED "
     "and must be short and concrete: an answer with an empty `idea_title`, "
     "`why_valuable` or `purpose_reason` is a FAILED answer and is discarded. "
     "Respond with JSON only."
@@ -388,6 +393,18 @@ IDEA_SCHEMA = {
                            "description": "Why it does or does not serve the stated purpose."},
         "acceptance_ref": {"type": "string",
                            "description": "The acceptance criterion it serves, or '' if none."},
+        "already_present": {"type": "boolean",
+                            "description": "true when the audited program already delivers this behavior."},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high"],
+                       "description": "Adoption risk to the audited program."},
+        "risk_reason": {"type": "string",
+                        "description": "Concrete compatibility, security, UX, or maintenance risk."},
+        "risk_mitigation": {"type": "string",
+                            "description": "Required mitigation for medium/high risk; empty only for low risk."},
+        "wiring_plan": {"type": "string",
+                        "description": "How the behavior reaches real callers, routes, storage, or UI."},
+        "verification_plan": {"type": "string",
+                              "description": "Executable regression evidence that proves the capability."},
         "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"],
                      "description": "How badly the program needs this to do its job."},
         "code_fixable": {"type": "boolean",
@@ -398,8 +415,10 @@ IDEA_SCHEMA = {
                        "description": "Confidence that the competitor really has this capability."},
     },
     "required": ["idea_title", "what_it_does", "why_valuable", "evidence_basis",
-                 "accept", "purpose_reason", "acceptance_ref", "severity",
-                 "code_fixable", "file", "confidence"],
+                 "accept", "purpose_reason", "acceptance_ref", "already_present",
+                 "risk_level", "risk_reason", "risk_mitigation", "wiring_plan",
+                 "verification_plan", "severity", "code_fixable", "file",
+                 "confidence"],
     "additionalProperties": False,
 }
 
@@ -534,6 +553,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     opener = opener or _default_opener
     stack = stack or []
     research: dict = {
+        "researched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "target": target, "competitors": [], "sources_used": [],
         "sources_skipped": {}, "rr_endpoint": rr_endpoint or "(not used)",
         "verified": 0, "unverified": 0, "accepted": 0, "rejected": 0,
@@ -777,6 +797,11 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         # An idea missing its own substance is not an idea; it is forced to
         # accept=False and named, never rendered as "ACCEPTED - (none)".
         idea, incomplete = _normalize_idea(raw, c["name"])
+        if idea.get("already_present") is True and idea.get("accept"):
+            idea["accept"] = False
+            idea["purpose_reason"] = (
+                "REJECTED AS DUPLICATE: the audited program already delivers this behavior. "
+                + str(idea.get("purpose_reason") or ""))
         c["idea"] = idea
         if incomplete:
             research["sources_skipped"].setdefault(f"idea:{c['name']}", incomplete)
@@ -910,7 +935,12 @@ def competitor_findings(research: dict, max_findings: int = DEFAULT_FIX_STREAM_C
             continue
         problem = (f"{idea.get('what_it_does')}\n\nWhy it matters here: "
                    f"{idea.get('why_valuable')}\n\nPurpose justification: "
-                   f"{idea.get('purpose_reason')}\n\nREUSE MODE: {c['reuse_mode']} "
+                   f"{idea.get('purpose_reason')}\n\nWiring plan: "
+                   f"{idea.get('wiring_plan')}\n\nVerification plan: "
+                   f"{idea.get('verification_plan')}\n\nAdoption risk "
+                   f"({idea.get('risk_level')}): {idea.get('risk_reason')}. "
+                   f"Mitigation: {idea.get('risk_mitigation') or 'not required (low risk)'}. "
+                   f"\n\nREUSE MODE: {c['reuse_mode']} "
                    f"({c['reuse_reason']}). "
                    + ("You MAY consult the competitor's source."
                       if may_copy_source(c["reuse_mode"])
@@ -976,8 +1006,8 @@ def report_lines(research: dict) -> list[str]:
               "This is reported as a gap in the research, NOT as evidence that "
               "the program has no competitors._", ""]
         return L
-    L += ["| Competitor | Kind | Licence | Reuse mode | Purpose mapping | Verdict | Fix stream | Adoptable idea |",
-          "|---|---|---|---|---|---|---|---|"]
+    L += ["| Competitor | Kind | Licence | Reuse mode | Purpose mapping | Risk | Verdict | Fix stream | Adoptable idea |",
+          "|---|---|---|---|---|---|---|---|---|"]
     for c in research["competitors"]:
         idea = c.get("idea") or {}
         verdict = ("ACCEPT" if idea.get("accept") else "reject")
@@ -993,7 +1023,8 @@ def report_lines(research: dict) -> list[str]:
         else:
             bridge = "not evaluated for fix-stream entry"
         L.append(f"| {name} | {c.get('kind')} | `{c.get('license')}` "
-                 f"| `{c.get('reuse_mode')}` | {mapping} | {verdict} "
+                 f"| `{c.get('reuse_mode')}` | {mapping} "
+                 f"| {idea.get('risk_level', 'unreviewed')} | {verdict} "
                  f"| {bridge} | {idea.get('idea_title', '(none)')} |")
     L.append("")
     for c in research["competitors"]:
@@ -1011,6 +1042,13 @@ def report_lines(research: dict) -> list[str]:
               + f" - {idea.get('purpose_reason', '')}",
               f"- **Purpose verdict:** {'ACCEPTED' if idea.get('accept') else 'REJECTED'} - "
               f"{idea.get('purpose_reason', '')}",
+              f"- **Duplicate review:** {'already present' if idea.get('already_present') else 'missing capability'}",
+              f"- **Adoption risk:** {idea.get('risk_level', 'unreviewed')} - "
+              f"{idea.get('risk_reason', '')}",
+              f"- **Risk mitigation:** {idea.get('risk_mitigation') or 'not recorded'}",
+              f"- **Wiring plan:** {idea.get('wiring_plan', '')}",
+              f"- **Verification plan:** {idea.get('verification_plan', '')}",
+              f"- **Implementation status:** {c.get('implementation_status', 'not applied')}",
               f"- **Fix-stream decision:** "
               + ((f"{'ENTERED the gated fix stream' if c.get('entered_fix_stream') else 'DID NOT enter the fix stream'}"
                   + (f" - {c.get('bridge_reason')}" if c.get('bridge_reason') else ""))
