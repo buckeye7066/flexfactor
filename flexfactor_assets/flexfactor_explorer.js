@@ -579,17 +579,30 @@ function sampleValue(kind, field) {
 
   async function performLoginQuiet(role, ctx) {
     if (!role.login) return true;
+    let page = null;
     try {
-      const page = await ctx.newPage();
+      // newPage()/close() are Playwright protocol calls too: leaving either
+      // unbounded let a finished login consume the outer 60s journey budget.
+      page = await act(ctx.newPage(), `login new page ${role.name}`);
       page.removeAllListeners('dialog');
       page.on('dialog', (d) => d.dismiss().catch(() => {}));
       await act(page.goto(normalize(role.login.url), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }), 'login goto');
-      for (const [sel, val] of Object.entries(role.login.fields || {})) await page.fill(sel, String(val), { timeout: 10000 });
-      const settle = page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
-      if (role.login.submit) await page.click(role.login.submit, { timeout: 10000 }); else await page.keyboard.press('Enter');
-      await settle; await page.close();
+      for (const [sel, val] of Object.entries(role.login.fields || {})) {
+        await act(page.fill(sel, String(val), { timeout: ACTION_TIMEOUT_MS }), `login fill ${sel}`);
+      }
+      const settle = page.waitForLoadState('load', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+      if (role.login.submit) {
+        await act(page.click(role.login.submit, { timeout: ACTION_TIMEOUT_MS }), 'login submit');
+      } else {
+        await act(page.keyboard.press('Enter'), 'login submit');
+      }
+      await act(settle, 'login settle');
       return true;
-    } catch { return false; }
+    } catch {
+      return false;
+    } finally {
+      if (page) await act(page.close(), `login close ${role.name}`).catch(() => {});
+    }
   }
 
   async function runDuplicate(role, ctx, form) {
