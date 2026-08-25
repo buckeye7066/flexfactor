@@ -205,14 +205,24 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
     or account failure is surfaced by :func:`web_search` as a named skip before
     the keyless fallbacks run.  No synthetic result is ever substituted.
     """
-    endpoint = (os.environ.get("FLEXFACTOR_FIRECRAWL_URL") or
-                _FIRECRAWL_SEARCH_URL).strip()
+    custom_endpoint = (os.environ.get("FLEXFACTOR_FIRECRAWL_URL") or "").strip()
+    endpoint = custom_endpoint or _FIRECRAWL_SEARCH_URL
     if not endpoint.startswith(("https://", "http://")):
         raise RuntimeError("FLEXFACTOR_FIRECRAWL_URL must be an http(s) URL")
 
     headers = {"Content-Type": "application/json",
                "Accept": "application/json"}
-    key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    # Never forward the general Firecrawl cloud credential to an arbitrary
+    # operator-configured host. Custom/self-hosted endpoints have an explicitly
+    # scoped credential; they can also be keyless. The official cloud endpoint
+    # requires its documented bearer token, so fail locally rather than spend
+    # an HTTP timeout on a request that cannot authenticate.
+    if custom_endpoint:
+        key = (os.environ.get("FLEXFACTOR_FIRECRAWL_API_KEY") or "").strip()
+    else:
+        key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("FIRECRAWL_API_KEY is not set")
     if key:
         headers["Authorization"] = f"Bearer {key}"
     payload = json.dumps({

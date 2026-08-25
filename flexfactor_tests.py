@@ -20,6 +20,7 @@ import threading
 import time
 import tomllib
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location("flexfactor", os.path.join(_HERE, "flexfactor.py"))
@@ -13224,15 +13225,11 @@ class CompetitorSearchBackendTests(unittest.TestCase):
             calls.append((url, data, headers or {}))
             return _FIRECRAWL_FIXTURE
 
-        old = os.environ.get("FIRECRAWL_API_KEY")
-        os.environ["FIRECRAWL_API_KEY"] = "fc-test"
-        try:
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False):
             hits, backend, skipped = fc.web_search("sermon software", opener=opener)
-        finally:
-            if old is None:
-                os.environ.pop("FIRECRAWL_API_KEY", None)
-            else:
-                os.environ["FIRECRAWL_API_KEY"] = old
 
         self.assertEqual(backend, "firecrawl")
         self.assertEqual(hits[0]["url"], "https://www.logos.com/")
@@ -13246,11 +13243,47 @@ class CompetitorSearchBackendTests(unittest.TestCase):
     def test_firecrawl_failure_is_named_before_keyless_fallback(self):
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE},
                          fail={"api.firecrawl.dev"})
-        hits, backend, skipped = fc.web_search("sermon software", opener=op)
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False):
+            hits, backend, skipped = fc.web_search("sermon software", opener=op)
         self.assertEqual(backend, "duckduckgo")
         self.assertTrue(hits)
         self.assertIn("firecrawl", skipped)
         self.assertIn("simulated outage", skipped["firecrawl"])
+
+    def test_cloud_key_is_never_forwarded_to_a_custom_endpoint(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "cloud-secret",
+            "FLEXFACTOR_FIRECRAWL_URL": "https://firecrawl.internal/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }, clear=False):
+            hits = fc._firecrawl("competitors", 5, opener)
+        self.assertTrue(hits)
+        self.assertEqual(calls[0][0], "https://firecrawl.internal/v2/search")
+        self.assertNotIn("Authorization", calls[0][1])
+
+    def test_custom_endpoint_uses_only_its_scoped_key(self):
+        headers = []
+
+        def opener(url, data=None, request_headers=None, timeout=None):
+            headers.append(request_headers or {})
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "cloud-secret",
+            "FLEXFACTOR_FIRECRAWL_URL": "https://firecrawl.internal/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "internal-secret",
+        }, clear=False):
+            fc._firecrawl("competitors", 5, opener)
+        self.assertEqual(headers[0].get("Authorization"), "Bearer internal-secret")
 
     def test_duckduckgo_lite_results_are_parsed_and_ads_dropped(self):
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE})
