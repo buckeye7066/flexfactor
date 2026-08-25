@@ -140,15 +140,26 @@ eval_fixtures/{coverage,journeys}/. Baseline for "AS OF BASELINE" = `736bb2a`
 
 ## 2. Contradictions found by reading
 
+> **Re-measured 2026-08-25.** Rows 1-7 are the six contradictions the
+> purpose contract carried as `verified` and OPEN. Every one of them was in
+> fact already closed in code by commit `9191e77` - *the same commit that
+> wrote the contract listing them*. The contract was therefore the seventh
+> instance of the defect it exists to catch: documentation that lies about
+> code. Closing them properly turned up three REAL defects that were not on
+> the list (containment-claim truncation, two fail-open reads of
+> `verification_is_real`, and a scout apply that reported an unverified
+> commit identically to a verified one). Rows 8-17 below have NOT been
+> re-measured in that pass.
+
 | # | Where | Says | Reality in code |
 |---|---|---|---|
 | 1 | `flexfactor audit/prodready --help` `--allow-dirty` | "pre-existing changes get swept into the cycle commits" | orphan snapshot + restore (`audit_one_program`) - **FIXED**: help text on every parser now describes the orphan snapshot |
-| 2 | `flexfactor scout --help` `--allow-dirty` | "snapshotted to an orphan ref ... restored byte-for-byte" | `run_scout`/`apply_integration` never call `capture_orphan_wip_snapshot`; scout only skips-or-proceeds |
-| 3 | `--trust-repo` | help says run-level authorization | defined only on the scout parser; `audit_one_program` reads `args.trust_repo` which audit/prodready argparse never sets (`audit --help` has 0 matches) |
+| 2 | `flexfactor scout --help` `--allow-dirty` | "snapshotted to an orphan ref ... restored byte-for-byte" | **FIXED** (re-measured 2026-08-25): `apply_integration` captures `capture_orphan_wip_snapshot` before `_apply_integration_impl`, refuses `skipped-dirty` if the snapshot fails, and restores in a `finally`. The help text was right and the code was wrong - i-3 protects owner WIP on every mutation path, not just audit's |
+| 3 | `--trust-repo` | help says run-level authorization | **FIXED** (re-measured 2026-08-25 by running the CLI): `audit --help`, `prodready --help` and `scout --help` all list `--trust-repo` |
 | 4 | `flexfactor_trust.trust_decision` reason text | "pass --allow-untrusted-exec" | no parser defines that flag - **FIXED**: text now names `--trust-repo`, which audit/prodready/scout all accept |
-| 5 | `flexfactor_trust.containment_claim()` | "FlexFactor does not provide an OS sandbox" | `flexfactor_sandbox.capability_report()["claim"]` reports Job Object / bwrap; only the sandbox sentence reaches the manifest |
+| 5 | `flexfactor_trust.containment_claim()` | "FlexFactor does not provide an OS sandbox" | **FIXED, and a REAL defect found underneath it** (2026-08-25): `containment_claim()` now *delegates* to `flexfactor_sandbox.capability_report()["claim"]`, so there is ONE answer. But that claim is 279 chars and was being recorded `[:160]` and rendered `[:110]` - both cuts landed before "raw-socket egress is NOT prevented", so every surface showed the OS-enforced half and hid the unenforced half. `capability_report()` now also returns `claim_headline` (built negative-first, 78 chars) and nothing slices `claim` |
 | 6 | `pyproject.toml`, `TOOL_VERSION`, CI `assert inst["tool_version"] == "0.5.0"` | 0.5.0 | **FIXED**: bumped together with the CI parity assertion |
-| 7 | README "scout ... on a `flexfactor/adopt-<repo>` branch" | sandbox branch | CLI: `--branch-prefix` "ACCEPTED BUT INERT" |
+| 7 | README "scout ... on a `flexfactor/adopt-<repo>` branch" | sandbox branch | **FIXED** (re-measured 2026-08-25): the string `adopt-` appears nowhere in README.md. The CLI is correct; `--branch-prefix` stays ACCEPTED-BUT-INERT on purpose, because deleting it is argparse exit 2 for every existing launcher |
 | 8 | README "Dual-provider (Anthropic + OpenAI)" | two fixed providers | pool-first rotation is the default provider when AI Time's catalog is usable |
 | 9 | `flexfactor_launch.ps1` line ~117 comment | "flexfactor_run.py installs directed orchestration" | `flexfactor_run.py` is a shim; directed is a hard import in flexfactor.py |
 | 10 | `audit_one_program` comment above the dirty-tree gate | describes `--snapshot-dirty` and a sandbox branch first commit | both removed; orphan ref is the mechanism |

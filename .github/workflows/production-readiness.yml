@@ -65,6 +65,7 @@ jobs:
         run: |
           set -e
           for t in flexfactor_tests.py \
+                   flexfactor_invariant_sweep_tests.py \
                    flexfactor_entrypoint_tests.py \
                    flexfactor_node_lock_tests.py \
                    flexfactor_prodready_persistence_tests.py \
@@ -84,6 +85,11 @@ jobs:
                    flexfactor_ledger_routing_tests.py \
                    flexfactor_dashboard_tests.py \
                    flexfactor_purpose_wiring_tests.py \
+                   flexfactor_model_mode_tests.py \
+                   flexfactor_route_fault_tests.py \
+                   flexfactor_baseline_ledger_tests.py \
+                   flexfactor_project_lookup_tests.py \
+                   flexfactor_wip_removal_guard_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \
                    test_flexfactor_wip.py \

@@ -235,6 +235,29 @@ def _unquote_porcelain_path(raw: str) -> str:
     return rel[:-1] if rel.endswith("/") else rel
 
 
+def _is_rooted_anywhere(rel: str) -> bool:
+    r"""True for a path that is rooted on EITHER platform's rules.
+
+    `os.path.isabs` and `os.path.splitdrive` answer for the HOST, and that made
+    this containment guard mean different things on different machines: on
+    Linux, `C:\Windows\System32` has no drive and no leading slash, so it sailed
+    through as an ordinary relative filename (caught by CI 2026-08-25, when the
+    Windows-only test that asserted otherwise finally ran on ubuntu).
+
+    A containment rule whose answer depends on the host is the same family of
+    defect as claiming containment the host cannot enforce. Nothing legitimate
+    that `git status --porcelain` reports as untracked is spelled `X:\...`,
+    `\\server\share` or `\rooted`, so refusing all three everywhere costs
+    nothing and keeps one answer.
+    """
+    if rel[:1] in ("/", "\\"):
+        return True                      # POSIX-absolute, UNC, or drive-relative
+    return bool(_DRIVE_PREFIX_RE.match(rel))
+
+
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def refuse_removal_reason(project_dir: str, rel: str) -> str:
     """'' when `rel` is a safe removal target under `project_dir`, else WHY not.
 
@@ -258,7 +281,7 @@ def refuse_removal_reason(project_dir: str, rel: str) -> str:
     """
     if not rel:
         return "empty path"
-    if os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
+    if os.path.isabs(rel) or os.path.splitdrive(rel)[0] or _is_rooted_anywhere(rel):
         return f"absolute path refused: {rel!r}"
     parts = [q for q in rel.replace("\\", "/").split("/") if q not in ("", ".")]
     if not parts:

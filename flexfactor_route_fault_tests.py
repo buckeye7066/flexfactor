@@ -355,14 +355,33 @@ class OllamaErrorBodyTests(unittest.TestCase):
 
 # The exact body, from the ledgers. Note what it hands us and nobody read:
 # `limit_source: openrouter_free_tier_daily` (the SCOPE is the account, not the
-# model) and `X-RateLimit-Reset: 1787616000000` (the exact epoch-ms reset).
-OPENROUTER_DAILY = (
-    "Error code: 429 - {'error': {'message': 'Rate limit exceeded: "
-    "free-models-per-day. Add 10 credits to unlock 1000 free model requests per "
-    "day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', "
-    "'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1787616000000'}, "
-    "'limit_source': 'openrouter_free_tier_daily', 'remedy_hint': 'Wait for the "
-    "daily reset (see X-RateLimit-Reset)'}}}")
+# model) and `X-RateLimit-Reset: <epoch ms>` (the exact reset instant).
+#
+# TIME BOMB, FIXED 2026-08-25: the reset was frozen at the literal
+# `1787616000000` (== 2026-08-25T00:00:00Z) that the live ledger happened to
+# carry, and `limit_scope` deliberately trusts only a reset that is IN THE
+# FUTURE and within 25 hours -- a bogus far-future stamp must not bench an
+# allowance for a decade. So the fixture silently expired the moment real time
+# passed it, and `test_the_reset_timestamp_in_the_message_is_used` began
+# failing with `until is None`: the test aged out, the code did not change.
+# The reset is now computed relative to now, which is what the assertion was
+# always about (that the stamp in the body is READ), and the 25-hour window
+# itself gets its own explicit test below.
+_DAILY_RESET_EPOCH_S = int(time.time()) + 6 * 3600
+
+
+def _openrouter_daily(reset_epoch_ms: int) -> str:
+    return (
+        "Error code: 429 - {'error': {'message': 'Rate limit exceeded: "
+        "free-models-per-day. Add 10 credits to unlock 1000 free model requests "
+        "per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': "
+        "'50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': "
+        + repr(str(reset_epoch_ms)) +
+        "}, 'limit_source': 'openrouter_free_tier_daily', 'remedy_hint': 'Wait "
+        "for the daily reset (see X-RateLimit-Reset)'}}}")
+
+
+OPENROUTER_DAILY = _openrouter_daily(_DAILY_RESET_EPOCH_S * 1000)
 
 # Groq's, for contrast: a per-model tokens-per-minute limit that names its own
 # ten-second retry. Nothing account-wide about it.
@@ -406,9 +425,21 @@ class AccountWideAllowanceTests(RouteFaultTestCase):
 
     def test_the_reset_timestamp_in_the_message_is_used(self):
         _scope, until = R.limit_scope(Limited(OPENROUTER_DAILY))
-        self.assertIsNotNone(until)
-        # 1787616000000 ms == 2026-08-25T00:00:00Z, the daily reset.
-        self.assertEqual(int(until), 1787616000)
+        self.assertIsNotNone(until, "the epoch-ms reset in the body was ignored")
+        self.assertEqual(int(until), _DAILY_RESET_EPOCH_S)
+
+    def test_a_reset_already_in_the_past_is_not_trusted(self):
+        # The other half of the window, and the half that made the frozen
+        # fixture above fail as a "bug" for a year: a stale stamp must produce
+        # no bench at all, not a bench that ended before it started.
+        _scope, until = R.limit_scope(
+            Limited(_openrouter_daily((int(time.time()) - 3600) * 1000)))
+        self.assertIsNone(until)
+
+    def test_a_bogus_far_future_reset_is_not_trusted(self):
+        _scope, until = R.limit_scope(
+            Limited(_openrouter_daily((int(time.time()) + 400 * 86400) * 1000)))
+        self.assertIsNone(until, "a far-future stamp would bench for a decade")
 
     def test_one_daily_429_benches_every_route_on_that_allowance(self):
         """The 574-entry storm: 18 synthetic pools, one dead allowance."""

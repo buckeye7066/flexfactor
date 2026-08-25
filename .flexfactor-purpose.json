@@ -1,551 +1,643 @@
 {
-  "schema": "flexfactor.purpose_contract.v2",
-  "name": "FlexFactor",
-  "historical_purpose": "Local dual-provider code tool (refactor/scout/audit) driven from desktop shortcuts; grew into a purpose-driven autonomous audit, repair, behavioral verification and evidence tool.",
-  "purpose": "A trustworthy local code auditor/refactorer that reads why a program exists, inventories and reviews every file against that purpose, runs and tries to break the program, applies only verified corrections, never retains unverified changes, never leaks sensitive source, fails closed on verifier loss, contains untrusted installs/builds to the strongest mechanism the host can enforce and says truthfully what that is, produces reproducible evidence, and offers deterministic rollback of the owner's work.",
-  "current_behavior": [
-    {
-      "id": "cb-1",
-      "text": "Every install/build/test of target-controlled code crosses _run/_spawn; on a host without an OS sandbox it runs only for a trusted repository (policy.json trusted_repos, FLEXFACTOR_TRUSTED_REPOS, or scout --trust-repo) and is otherwise refused rc 126.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        4,
-        5
-      ]
-    },
-    {
-      "id": "cb-2",
-      "text": "Windows containment is a Job Object (process-tree kill, memory, process count, CPU time); network isolation on Windows is best-effort proxy poisoning only.",
-      "confidence": "verified",
-      "evidence_refs": [
-        4,
-        15
-      ]
-    },
-    {
-      "id": "cb-3",
-      "text": "A dirty tree under --allow-dirty (audit/prodready) is captured as an orphan commit under refs/flexfactor-wip/*, the worktree reset to HEAD, publication refused while separation is unproven, and the WIP restored with a fingerprint check at the end.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        6,
-        14
-      ]
-    },
-    {
-      "id": "cb-4",
-      "text": "Salvaged (truncated/malformed) structured output is stamped partial; _judge downgrades any clean/keep/approve/ready/pass verdict; an empty salvaged review raises PartialOutputError.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        7
-      ]
-    },
-    {
-      "id": "cb-5",
-      "text": "The independent final review sends the COMPLETE patch in content-addressed chunks; a missing, blocked or partial chunk, a reviewer naming another commit, or HEAD moving after review blocks approval.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        8
-      ]
-    },
-    {
-      "id": "cb-6",
-      "text": "Function-coverage evidence comes from real coverage artifacts; module import alone never satisfies the gate; the basis is labelled.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        9,
-        12
-      ]
-    },
-    {
-      "id": "cb-7",
-      "text": "Push and merge require final_ok is True from the build gate plus the project's strongest test suite; None and False both refuse publication; nothing is force-pushed.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "cb-8",
-      "text": "The release status is one of QUEUED / IN PROGRESS / BLOCKED / RELEASE CANDIDATE / PRODUCTION READY; DONE is banned; an unknown critical condition blocks.",
-      "confidence": "verified",
-      "evidence_refs": [
-        11
-      ]
-    },
-    {
-      "id": "cb-9",
-      "text": "Scout apply does NOT use the orphan-WIP transaction; it uses per-file byte backups with rollback and skips a dirty tree unless --allow-dirty.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "cb-10",
-      "text": "head_matches builds argv ['git','rev-parse','HEAD'] but the audit path calls it with _git, which prepends 'git' again; the commit-race guard therefore always reports a mismatch and REVOKES approval (fail-closed, but the independent-final-review gate cannot pass on the audit path).",
-      "confidence": "contradicted",
-      "evidence_refs": [
-        3,
-        8,
-        13
-      ]
-    }
-  ],
-  "aspirations": [
-    {
-      "id": "asp-1",
-      "text": "OS-enforced network isolation on Windows via AppContainer (ISOLATION_SPIKE option D).",
-      "confidence": "unknown",
-      "evidence_refs": [
-        4
-      ]
-    },
-    {
-      "id": "asp-2",
-      "text": "Linux bwrap/unshare/rlimit paths verified on a real Linux host (CI records the probe; no pass is claimed from it).",
-      "confidence": "unknown",
-      "evidence_refs": [
-        4,
-        16
-      ]
-    },
-    {
-      "id": "asp-3",
-      "text": "Dashboard panels for chunk ledger, direct coverage and journey matrix.",
-      "confidence": "unknown",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "asp-4",
-      "text": "Version bumped to 0.5.0 in pyproject, TOOL_VERSION and the CI parity assertion.",
-      "confidence": "unknown",
-      "evidence_refs": [
-        16,
-        17
-      ]
-    }
-  ],
-  "users": [
-    {
-      "id": "u-1",
-      "text": "The owner, running audit/prodready/scout/refactor on their own repositories from the desktop launchers or the CLI, unattended overnight.",
-      "confidence": "verified",
-      "evidence_refs": [
-        1,
-        3
-      ]
-    },
-    {
-      "id": "u-2",
-      "text": "Supervisors and agents (Factory Deck, Purpose Foundry, schtasks) that read exit codes, run manifests and evidence bundles.",
-      "confidence": "supported",
-      "evidence_refs": [
-        3,
-        16
-      ]
-    }
-  ],
-  "outcomes": [
-    {
-      "id": "o-1",
-      "text": "A target repository whose verified corrections are committed and published only on green build + suite evidence, and whose owner WIP is returned byte-for-byte.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        6
-      ]
-    },
-    {
-      "id": "o-2",
-      "text": "An immutable run manifest and evidence bundle stating what ran, under which containment, what was reviewed chunk-by-chunk, which coverage basis applies, and which release status the evidence supports.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        12
-      ]
-    },
-    {
-      "id": "o-3",
-      "text": "A truthful BLOCKED / IN PROGRESS status instead of a fake success when cost, provider, verifier or containment stops the work.",
-      "confidence": "verified",
-      "evidence_refs": [
-        0,
-        11
-      ]
-    }
-  ],
-  "workflows": [
-    {
-      "id": "w-1",
-      "text": "audit: inventory -> purpose baseline -> competitor research -> review/fix cycles (build-gated, adversarial verify) -> native suite -> live UI journeys -> evidence/gates -> independent final review -> commit/push/merge.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "w-2",
-      "text": "prodready: audit with --fix-severity medium, readiness rubric on, zero questions.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "w-3",
-      "text": "scout: profile -> Repo Rewards search -> benefit judging -> proposals; mutation only with --apply and the separate apply approval (.flexfactor-apply-approval.json).",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "w-4",
-      "text": "refactor: rewrite -> grade -> accept one file toward a goal.",
-      "confidence": "supported",
-      "evidence_refs": [
-        3
-      ]
-    }
-  ],
-  "invariants": [
-    {
-      "id": "i-1",
-      "text": "No review-only / dry-run mode exists in audit or prodready; argparse exits 2 on the old flags.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "i-2",
-      "text": "A verifier outage leaves the target byte-for-byte unchanged and creates no success commit.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        16
-      ]
-    },
-    {
-      "id": "i-3",
-      "text": "Owner WIP never becomes an ancestor of a pushed branch.",
-      "confidence": "verified",
-      "evidence_refs": [
-        6,
-        3
-      ]
-    },
-    {
-      "id": "i-4",
-      "text": "Partial output never authorizes CLEAN, READY, approval, merge or push.",
-      "confidence": "verified",
-      "evidence_refs": [
-        7,
-        3
-      ]
-    },
-    {
-      "id": "i-5",
-      "text": "A capability the host cannot enforce is named as best-effort, never claimed as contained.",
-      "confidence": "verified",
-      "evidence_refs": [
-        4
-      ]
-    },
-    {
-      "id": "i-6",
-      "text": "Every claimed gate must have run; None is not a pass.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        12
-      ]
-    }
-  ],
-  "acceptance_criteria": [
-    "A. Complete inventory: every tracked/relevant file is accounted for (analyzed, analyzed-in-chunks, or blocked with a reason); no silent exclusion.",
-    "B. Purpose determination cites evidence (path:line or ref), lists contradictions and unknowns, and grades confidence; a weak/unresolved purpose never drives gap-bridging mutation.",
-    "C. Every file is reviewed line by line in numbered chunks; a truncated/partial review never marks a file clean.",
-    "D. Every target-code execution (install/build/test/dev server) crosses the broker and is recorded in execution_ledger with mechanism and basis.",
-    "E. On a host without an OS sandbox, an untrusted repository's install/build/test is REFUSED (rc 126) with the exact authorization steps named.",
-    "F. The containment claim sentence never says contained unless network isolation and process-tree kill are both OS-enforced.",
-    "G. A forced verifier outage leaves the target byte-for-byte unchanged and creates no success commit.",
-    "H. Owner WIP under --allow-dirty is captured as an orphan ref, never enters FlexFactor commits, blocks publication until separation is proven, and is restored with a verified fingerprint or retained under the ref.",
-    "I. Snapshot trees are secret-scanned before any publishable operation; a finding refuses publish.",
-    "J. Push and merge happen only when the build gate AND the project's strongest suite are green (final_ok is True); None/False refuse; never force-push.",
-    "K. The independent final review covers the COMPLETE patch in content-addressed chunks; missing/blocked/partial chunks, a different named commit, or a moved HEAD block approval.",
-    "L. Large files are indexed in a complete chunk ledger, never labelled too-large and skipped (the 64 MiB hard cap is named as blocked).",
-    "M. Function coverage is DIRECT tool evidence per first-party function or explicitly blocked with a reason; module execution alone never passes the gate; the basis label is in the manifest.",
-    "N. Live UI journeys run per role and viewport; every page/control/form not exercised is named and forces complete=false; destructive controls run only under FLEXFACTOR_E2E_ISOLATED=1.",
-    "O. The run manifest records partial_output_events, execution_ledger, containment, wip_snapshot_ref/wip_restore, purpose_confidence, purpose_mutation_authorized, trust_repo_override.",
-    "P. Release status uses only the owner's vocabulary; PRODUCTION READY requires every applicable condition to pass; a critical unknown blocks; forbidden phrases are tripwired.",
-    "Q. Exit codes carry the truth: EXIT_APPLIED_NOTHING=3 for zero work; candidates == acted_on + skipped_by_reason + failed.",
-    "R. A clean wheel installed outside the checkout reports the same runtime manifest (modes, wired, exit codes) as the source tree and ships every runtime module and the explorer asset.",
-    "S. Windows AND Linux evidence for containment, or a named external blocker packet for the missing platform.",
-    "T. Every claim in docs/PURPOSE.md and the run reports is either VERIFIED on the final revision or labelled UNKNOWN/BLOCKED; no docs-only claim counts."
-  ],
-  "contradictions": [
-    {
-      "id": "x-1",
-      "text": "--trust-repo is exposed only by the scout parser; audit/prodready read args.trust_repo but cannot receive it from the CLI (audit --help has no --trust-repo).",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "x-2",
-      "text": "audit/prodready --allow-dirty help text still says pre-existing changes are swept into cycle commits; the implementation snapshots them to an orphan ref.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "x-3",
-      "text": "scout --allow-dirty help text promises an orphan snapshot; run_scout/apply_integration never call capture_orphan_wip_snapshot.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        6
-      ]
-    },
-    {
-      "id": "x-4",
-      "text": "flexfactor_trust.trust_decision names a flag --allow-untrusted-exec that no parser exposes; flexfactor_trust.containment_claim() says FlexFactor provides no OS sandbox while flexfactor_sandbox reports Job Object/bwrap mechanisms.",
-      "confidence": "verified",
-      "evidence_refs": [
-        4,
-        5
-      ]
-    },
-    {
-      "id": "x-5",
-      "text": "pyproject/TOOL_VERSION/CI assert 0.4.1 while the migration notes describe 0.5.0.",
-      "confidence": "verified",
-      "evidence_refs": [
-        16,
-        17
-      ]
-    },
-    {
-      "id": "x-6",
-      "text": "README says scout --apply works on a flexfactor/adopt-<repo> branch; the CLI marks --branch-prefix ACCEPTED BUT INERT.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    }
-  ],
-  "gaps": [
-    {
-      "id": "g-1",
-      "text": "Windows OS network isolation (AppContainer) not built.",
-      "confidence": "verified",
-      "evidence_refs": [
-        4
-      ]
-    },
-    {
-      "id": "g-2",
-      "text": "Linux sandbox paths are written but unverified on this host (2 skipped tests).",
-      "confidence": "verified",
-      "evidence_refs": [
-        15
-      ]
-    },
-    {
-      "id": "g-3",
-      "text": "Dashboard shows no chunk-ledger, direct-coverage or journey panels.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3
-      ]
-    },
-    {
-      "id": "g-4",
-      "text": "Direct-coverage gate has no way to declare blocked functions with reasons from the audit path (blocked is always {}).",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        9
-      ]
-    },
-    {
-      "id": "g-5",
-      "text": "gather_purpose_evidence's gh runner uses subprocess.run directly (bypasses _run); the git runner is injected through _git.",
-      "confidence": "verified",
-      "evidence_refs": [
-        3,
-        11
-      ]
-    },
-    {
-      "id": "g-6",
-      "text": "Main unit suite on this working tree: 887 collected, 9 failures, 8 skipped at the time of writing.",
-      "confidence": "verified",
-      "evidence_refs": [
-        13
-      ]
-    }
-  ],
-  "evidence": [
-    {
-      "kind": "documentation",
-      "locator": "memory/doctrine/flexfactor-governing-purpose-and-completion-contract.md",
-      "content_hash": "95c1a8cf75061dd58f76a7420c40d8e4b7d609314af49dc8cd6923a4f17a6db2",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Governing purpose and completion contract, sections 1-8."
-    },
-    {
-      "kind": "documentation",
-      "locator": "PROJECT-BRIEF.md",
-      "content_hash": "9ea06762e11a0763cd24605ec1759aee58e15c0c72ecca32bac174d533ea26d0",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Trustworthy local code auditor/refactorer: never retains unverified changes, never leaks sensitive source, fails closed on verifier loss, contains untrusted installs/builds, reproducible evidence, deterministic rollback."
-    },
-    {
-      "kind": "documentation",
-      "locator": "docs/purpose-contract.md",
-      "content_hash": "174423fed42f04f88bb50d313057317a50f66883a7d5d577eb3ea04c2e4de215",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Acceptance 1-5 and forbidden substitutes."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor.py",
-      "content_hash": "4306003f753f36fa2b1ae0090931f1cc0b161c9eda448f4ad1e17da2197bd3fe",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "run_cli -> main; _run/_spawn broker; _judge partial refusal; _publication_gate; _commit_and_sync; _wip_publish_guard; _independent_final_review; _write_run_manifest."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_sandbox.py",
-      "content_hash": "d715ccba3748415640cd5502a9a09c970a5798ca7f968000e0bfb73ed12f3d8c",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "capability_report / require_containment_or_trust: Windows Job Object; network best-effort on Windows; bwrap/unshare/rlimit on Linux."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_trust.py",
-      "content_hash": "c12f5579ca5aa010ced80c1e0c7b59c1d4219191397776b4ef6465245de9d685",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "trusted_repos from ~/.flexfactor/policy.json or FLEXFACTOR_TRUSTED_REPOS; frozen installs; lifecycle scripts off unless --allow-scripts."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_wip.py",
-      "content_hash": "be9202d021350ce59b1b9abb8a4f2485e4fff30ad8561552b8fac91d69069141",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Orphan WIP snapshot under refs/flexfactor-wip/*; secret scan; byte-for-byte restore; fingerprint."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_partial.py",
-      "content_hash": "555c851952d3f392befde660eec18f6b41178f682cff48ad0a24358959dcb40e",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Partial structured output is first-class evidence; may never authorize CLEAN/READY/approve/merge/push."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_ledger.py",
-      "content_hash": "92f2c63fd21743b7b5ff7ecdc19ed8134c5d333654246c920898cde284b1933e",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Content-addressed chunking + ReviewLedger; verdict_allowed; head_matches commit-race guard."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_coverage.py",
-      "content_hash": "8c8fbb7d2ef60c83a84ad2fde52b9b766a3c0bfbabb9ab0055dfedbbf4dc01aa",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Per-function DIRECT coverage rows from real coverage artifacts; direct_function_gate fail-closed; function_coverage_basis label."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_journeys.py",
-      "content_hash": "006a89d468ef2c6d57025c352b4a21760da2c41afbdc1eae22977fb3505c90c8",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Journey engine glue: FLEXFACTOR_E2E_ROLES/VIEWPORTS/MAX_PAGES/ISOLATED; completeness() names every gap."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_purpose.py",
-      "content_hash": "a362509cee3b2fe372c79e397255336d756f506a6d09d1059d35acaad89f0345",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "find_contract resolution order; production_ready_status; purpose_confidence; mutation_authorized_by_purpose; gather_purpose_evidence."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_evidence.py",
-      "content_hash": "e1b61bfe7ece470a248ee44426e3d36be8ab8c958d66a3ebad7530d230e0f5d2",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "quality_gates; _index_large_file_in_chunks."
-    },
-    {
-      "kind": "test",
-      "locator": "flexfactor_tests.py",
-      "content_hash": "d1b5c27885ddeb9ca531a95720a2f0ea18845cb56811184c0be9e9e01889c72b",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Main unit suite: 887 collected on this tree, 9 failures, 8 skipped at the 2026-08-22 run recorded in docs/CURRENT_STATE_GAP.md."
-    },
-    {
-      "kind": "test",
-      "locator": "test_flexfactor_wip.py",
-      "content_hash": "ea4383d1059efcdfcfd76bb9b87f7ff8261b097971dde4dd9224b0c89f58fd1c",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "19 tests; found and fixed 5 bugs in the wip module."
-    },
-    {
-      "kind": "test",
-      "locator": "test_flexfactor_sandbox.py",
-      "content_hash": "5f276956928c35dc107fa94445b1bb5f027f435aba42a81512376f0a924ae86e",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "20 tests, 2 BLOCKED skips on Windows (Linux-only mechanisms)."
-    },
-    {
-      "kind": "source",
-      "locator": ".github/workflows/production-readiness.yml",
-      "content_hash": "d697213636f3b6924dc4f9e562e0f57bf901b06b8d5556406d2053d5ed353697",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Windows + Linux matrix; wheel installed outside the checkout; entry-point parity; forced verifier-outage regression; containment probe recorded, never a pass by itself."
-    },
-    {
-      "kind": "source",
-      "locator": "pyproject.toml",
-      "content_hash": "7248a595e881feb6c9ec0746b3f1038170ea6a00aee451d778115c3bd4c7f467",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "version 0.4.1 (NOT yet 0.5.0); py-modules include sandbox/ledger/coverage/journeys; flexfactor_assets package data."
-    },
-    {
-      "kind": "source",
-      "locator": "flexfactor_assets/flexfactor_explorer.js",
-      "content_hash": "268223a8837f6feff1d283ecdc181badb340bcd76246839b36df2bbcbd6df5af",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "Standalone Playwright journey engine; one FLEXFACTOR_E2E_RESULT= line; anything not executed is named and forces complete=false."
-    },
-    {
-      "kind": "history",
-      "locator": "git:HEAD=98754207772404dfc675d7938d8133cc236311d1",
-      "content_hash": "4f9b9131d65e5866072f050967a6efd53104863b59db1464bb8f20851b4bba38",
-      "observed_at": "2026-08-22T02:50:20Z",
-      "excerpt": "feat(runtime): one canonical packaged runtime; directed orchestration is native (on top of 736bb2a v0.4.1). Working tree carries uncommitted sandbox/trust/wip/partial/ledger/coverage/journeys/purpose wiring."
-    }
-  ],
-  "false_substitutes": [
-    "the build passes",
-    "the page loads / HTTP 200",
-    "tests exist",
-    "the branch was merged",
-    "a module is importable (module execution is not direct function evidence)",
-    "a model said it is clean (a partial/salvaged answer is a provider failure)",
-    "proxy-poisoned environment (best-effort env is not OS containment)",
-    "a checkpoint exists (resume must hash-verify under the same purpose contract)"
-  ]
+ "schema": "flexfactor.purpose_contract.v2",
+ "name": "FlexFactor",
+ "historical_purpose": "Local dual-provider code tool (refactor/scout/audit) driven from desktop shortcuts; grew into a purpose-driven autonomous audit, repair, behavioral verification and evidence tool.",
+ "purpose": "A trustworthy local code auditor/refactorer that reads why a program exists, inventories and reviews every file against that purpose, runs and tries to break the program, applies only verified corrections, never retains unverified changes, never leaks sensitive source, fails closed on verifier loss, contains untrusted installs/builds to the strongest mechanism the host can enforce and says truthfully what that is, produces reproducible evidence, and offers deterministic rollback of the owner's work.",
+ "current_behavior": [
+  {
+   "id": "cb-1",
+   "text": "Every install/build/test of target-controlled code crosses _run/_spawn; on a host without an OS sandbox it runs only for a trusted repository (policy.json trusted_repos, FLEXFACTOR_TRUSTED_REPOS, or scout --trust-repo) and is otherwise refused rc 126.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    4,
+    5
+   ]
+  },
+  {
+   "id": "cb-2",
+   "text": "Windows containment is a Job Object (process-tree kill, memory, process count, CPU time); network isolation on Windows is best-effort proxy poisoning only.",
+   "confidence": "verified",
+   "evidence_refs": [
+    4,
+    15
+   ]
+  },
+  {
+   "id": "cb-3",
+   "text": "A dirty tree under --allow-dirty (audit/prodready) is captured as an orphan commit under refs/flexfactor-wip/*, the worktree reset to HEAD, publication refused while separation is unproven, and the WIP restored with a fingerprint check at the end.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    6,
+    14
+   ]
+  },
+  {
+   "id": "cb-4",
+   "text": "Salvaged (truncated/malformed) structured output is stamped partial; _judge downgrades any clean/keep/approve/ready/pass verdict; an empty salvaged review raises PartialOutputError.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    7
+   ]
+  },
+  {
+   "id": "cb-5",
+   "text": "The independent final review sends the COMPLETE patch in content-addressed chunks; a missing, blocked or partial chunk, a reviewer naming another commit, or HEAD moving after review blocks approval.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    8
+   ]
+  },
+  {
+   "id": "cb-6",
+   "text": "Function-coverage evidence comes from real coverage artifacts; module import alone never satisfies the gate; the basis is labelled.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    9,
+    12
+   ]
+  },
+  {
+   "id": "cb-7",
+   "text": "Push and merge require final_ok is True from the build gate plus the project's strongest test suite; None and False both refuse publication; nothing is force-pushed.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "cb-8",
+   "text": "The release status is one of QUEUED / IN PROGRESS / BLOCKED / RELEASE CANDIDATE / PRODUCTION READY; DONE is banned; an unknown critical condition blocks.",
+   "confidence": "verified",
+   "evidence_refs": [
+    11
+   ]
+  },
+  {
+   "id": "cb-9",
+   "text": "Scout apply does NOT use the orphan-WIP transaction; it uses per-file byte backups with rollback and skips a dirty tree unless --allow-dirty.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "cb-10",
+   "text": "head_matches builds argv ['git','rev-parse','HEAD'] but the audit path calls it with _git, which prepends 'git' again; the commit-race guard therefore always reports a mismatch and REVOKES approval (fail-closed, but the independent-final-review gate cannot pass on the audit path).",
+   "confidence": "contradicted",
+   "evidence_refs": [
+    3,
+    8,
+    13
+   ]
+  }
+ ],
+ "aspirations": [
+  {
+   "id": "asp-1",
+   "text": "OS-enforced network isolation on Windows via AppContainer (ISOLATION_SPIKE option D).",
+   "confidence": "unknown",
+   "evidence_refs": [
+    4
+   ]
+  },
+  {
+   "id": "asp-2",
+   "text": "Linux bwrap/unshare/rlimit paths verified on a real Linux host (CI records the probe; no pass is claimed from it).",
+   "confidence": "unknown",
+   "evidence_refs": [
+    4,
+    16
+   ]
+  },
+  {
+   "id": "asp-3",
+   "text": "Dashboard panels for chunk ledger, direct coverage and journey matrix.",
+   "confidence": "unknown",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "asp-4",
+   "text": "Version bumped to 0.5.0 in pyproject, TOOL_VERSION and the CI parity assertion.",
+   "confidence": "unknown",
+   "evidence_refs": [
+    16,
+    17
+   ]
+  }
+ ],
+ "users": [
+  {
+   "id": "u-1",
+   "text": "The owner, running audit/prodready/scout/refactor on their own repositories from the desktop launchers or the CLI, unattended overnight.",
+   "confidence": "verified",
+   "evidence_refs": [
+    1,
+    3
+   ]
+  },
+  {
+   "id": "u-2",
+   "text": "Supervisors and agents (Factory Deck, Purpose Foundry, schtasks) that read exit codes, run manifests and evidence bundles.",
+   "confidence": "supported",
+   "evidence_refs": [
+    3,
+    16
+   ]
+  }
+ ],
+ "outcomes": [
+  {
+   "id": "o-1",
+   "text": "A target repository whose verified corrections are committed and published only on green build + suite evidence, and whose owner WIP is returned byte-for-byte.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    6
+   ]
+  },
+  {
+   "id": "o-2",
+   "text": "An immutable run manifest and evidence bundle stating what ran, under which containment, what was reviewed chunk-by-chunk, which coverage basis applies, and which release status the evidence supports.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    12
+   ]
+  },
+  {
+   "id": "o-3",
+   "text": "A truthful BLOCKED / IN PROGRESS status instead of a fake success when cost, provider, verifier or containment stops the work.",
+   "confidence": "verified",
+   "evidence_refs": [
+    0,
+    11
+   ]
+  }
+ ],
+ "workflows": [
+  {
+   "id": "w-1",
+   "text": "audit: inventory -> purpose baseline -> competitor research -> review/fix cycles (build-gated, adversarial verify) -> native suite -> live UI journeys -> evidence/gates -> independent final review -> commit/push/merge.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "w-2",
+   "text": "prodready: audit with --fix-severity medium, readiness rubric on, zero questions.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "w-3",
+   "text": "scout: profile -> Repo Rewards search -> benefit judging -> proposals; mutation only with --apply and the separate apply approval (.flexfactor-apply-approval.json).",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "w-4",
+   "text": "refactor: rewrite -> grade -> accept one file toward a goal.",
+   "confidence": "supported",
+   "evidence_refs": [
+    3
+   ]
+  }
+ ],
+ "invariants": [
+  {
+   "id": "i-1",
+   "text": "No review-only / dry-run mode exists in audit or prodready; argparse exits 2 on the old flags.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    26
+   ]
+  },
+  {
+   "id": "i-2",
+   "text": "A verifier outage leaves the target byte-for-byte unchanged and creates no success commit.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    16,
+    26
+   ]
+  },
+  {
+   "id": "i-3",
+   "text": "Owner WIP never becomes an ancestor of a pushed branch.",
+   "confidence": "verified",
+   "evidence_refs": [
+    6,
+    3,
+    26
+   ]
+  },
+  {
+   "id": "i-4",
+   "text": "Partial output never authorizes CLEAN, READY, approval, merge or push.",
+   "confidence": "verified",
+   "evidence_refs": [
+    7,
+    3,
+    26
+   ]
+  },
+  {
+   "id": "i-5",
+   "text": "A capability the host cannot enforce is named as best-effort, never claimed as contained.",
+   "confidence": "verified",
+   "evidence_refs": [
+    4,
+    26,
+    22
+   ]
+  },
+  {
+   "id": "i-6",
+   "text": "Every claimed gate must have run; None is not a pass.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    12,
+    26,
+    24
+   ]
+  }
+ ],
+ "acceptance_criteria": [
+  "A. Complete inventory: every tracked/relevant file is accounted for (analyzed, analyzed-in-chunks, or blocked with a reason); no silent exclusion.",
+  "B. Purpose determination cites evidence (path:line or ref), lists contradictions and unknowns, and grades confidence; a weak/unresolved purpose never drives gap-bridging mutation.",
+  "C. Every file is reviewed line by line in numbered chunks; a truncated/partial review never marks a file clean.",
+  "D. Every target-code execution (install/build/test/dev server) crosses the broker and is recorded in execution_ledger with mechanism and basis.",
+  "E. On a host without an OS sandbox, an untrusted repository's install/build/test is REFUSED (rc 126) with the exact authorization steps named.",
+  "F. The containment claim sentence never says contained unless network isolation and process-tree kill are both OS-enforced.",
+  "G. A forced verifier outage leaves the target byte-for-byte unchanged and creates no success commit.",
+  "H. Owner WIP under --allow-dirty is captured as an orphan ref, never enters FlexFactor commits, blocks publication until separation is proven, and is restored with a verified fingerprint or retained under the ref.",
+  "I. Snapshot trees are secret-scanned before any publishable operation; a finding refuses publish.",
+  "J. Push and merge happen only when the build gate AND the project's strongest suite are green (final_ok is True); None/False refuse; never force-push.",
+  "K. The independent final review covers the COMPLETE patch in content-addressed chunks; missing/blocked/partial chunks, a different named commit, or a moved HEAD block approval.",
+  "L. Large files are indexed in a complete chunk ledger, never labelled too-large and skipped (the 64 MiB hard cap is named as blocked).",
+  "M. Function coverage is DIRECT tool evidence per first-party function or explicitly blocked with a reason; module execution alone never passes the gate; the basis label is in the manifest.",
+  "N. Live UI journeys run per role and viewport; every page/control/form not exercised is named and forces complete=false; destructive controls run only under FLEXFACTOR_E2E_ISOLATED=1.",
+  "O. The run manifest records partial_output_events, execution_ledger, containment, wip_snapshot_ref/wip_restore, purpose_confidence, purpose_mutation_authorized, trust_repo_override.",
+  "P. Release status uses only the owner's vocabulary; PRODUCTION READY requires every applicable condition to pass; a critical unknown blocks; forbidden phrases are tripwired.",
+  "Q. Exit codes carry the truth: EXIT_APPLIED_NOTHING=3 for zero work; candidates == acted_on + skipped_by_reason + failed.",
+  "R. A clean wheel installed outside the checkout reports the same runtime manifest (modes, wired, exit codes) as the source tree and ships every runtime module and the explorer asset.",
+  "S. Windows AND Linux evidence for containment, or a named external blocker packet for the missing platform.",
+  "T. Every claim in docs/PURPOSE.md and the run reports is either VERIFIED on the final revision or labelled UNKNOWN/BLOCKED; no docs-only claim counts."
+ ],
+ "contradictions": [],
+ "gaps": [
+  {
+   "id": "g-1",
+   "text": "Windows OS network isolation (AppContainer) not built.",
+   "confidence": "verified",
+   "evidence_refs": [
+    4
+   ]
+  },
+  {
+   "id": "g-2",
+   "text": "Linux sandbox paths are written but unverified on this host (2 skipped tests).",
+   "confidence": "verified",
+   "evidence_refs": [
+    15
+   ]
+  },
+  {
+   "id": "g-3",
+   "text": "Dashboard shows no chunk-ledger, direct-coverage or journey panels.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3
+   ]
+  },
+  {
+   "id": "g-4",
+   "text": "Direct-coverage gate has no way to declare blocked functions with reasons from the audit path (blocked is always {}).",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    9
+   ]
+  },
+  {
+   "id": "g-5",
+   "text": "gather_purpose_evidence's gh runner uses subprocess.run directly (bypasses _run); the git runner is injected through _git.",
+   "confidence": "verified",
+   "evidence_refs": [
+    3,
+    11
+   ]
+  },
+  {
+   "id": "g-6",
+   "text": "Main unit suite, RE-MEASURED 2026-08-25 in a proper checkout (Python 3.14.6, openai 2.44.0 installed, real .git present): python flexfactor_tests.py -> Ran 889 tests, OK (skipped=8), exit 0. Zero failures, zero errors. The previous entry (887 collected, 9 failures, 8 skipped) measured a checkout with missing dependencies and no .git; every one of those failures was environmental, not a defect.",
+   "confidence": "verified",
+   "evidence_refs": [
+    27
+   ]
+  },
+  {
+   "id": "g-7",
+   "text": "Scout apply can still COMMIT a change no command verified, when the target exposes no build/lint/typecheck script. The owner is told twice - on the approval card before approving and in the ApplyResult afterwards - and a FAILING verify command still rolls back, but 'never retains unverified changes' is satisfied here by DISCLOSURE rather than by refusal, unlike the audit path where _commit_and_sync hard-resets on any non-True gate. Whether scout should refuse instead is an owner design decision with real blast radius: it would block every repo that has no build script.",
+   "confidence": "verified",
+   "evidence_refs": [
+    25
+   ]
+  },
+  {
+   "id": "g-8",
+   "text": "The invariant sweep reads the tree statically. It proves that no call site READS a tri-state gate with truthiness and that no undeclared function issues git commit/push/merge; it does not prove the declared gates behave correctly at runtime. That remains the job of the behavioural tests in flexfactor_tests.VacuousGateTests and the forced verifier-outage CI step.",
+   "confidence": "verified",
+   "evidence_refs": [
+    26
+   ]
+  }
+ ],
+ "evidence": [
+  {
+   "kind": "documentation",
+   "locator": "memory/doctrine/flexfactor-governing-purpose-and-completion-contract.md",
+   "content_hash": "95c1a8cf75061dd58f76a7420c40d8e4b7d609314af49dc8cd6923a4f17a6db2",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Governing purpose and completion contract, sections 1-8."
+  },
+  {
+   "kind": "documentation",
+   "locator": "PROJECT-BRIEF.md",
+   "content_hash": "9ea06762e11a0763cd24605ec1759aee58e15c0c72ecca32bac174d533ea26d0",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Trustworthy local code auditor/refactorer: never retains unverified changes, never leaks sensitive source, fails closed on verifier loss, contains untrusted installs/builds, reproducible evidence, deterministic rollback."
+  },
+  {
+   "kind": "documentation",
+   "locator": "docs/purpose-contract.md",
+   "content_hash": "174423fed42f04f88bb50d313057317a50f66883a7d5d577eb3ea04c2e4de215",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Acceptance 1-5 and forbidden substitutes."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor.py",
+   "content_hash": "4306003f753f36fa2b1ae0090931f1cc0b161c9eda448f4ad1e17da2197bd3fe",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "run_cli -> main; _run/_spawn broker; _judge partial refusal; _publication_gate; _commit_and_sync; _wip_publish_guard; _independent_final_review; _write_run_manifest."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_sandbox.py",
+   "content_hash": "d715ccba3748415640cd5502a9a09c970a5798ca7f968000e0bfb73ed12f3d8c",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "capability_report / require_containment_or_trust: Windows Job Object; network best-effort on Windows; bwrap/unshare/rlimit on Linux."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_trust.py",
+   "content_hash": "c12f5579ca5aa010ced80c1e0c7b59c1d4219191397776b4ef6465245de9d685",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "trusted_repos from ~/.flexfactor/policy.json or FLEXFACTOR_TRUSTED_REPOS; frozen installs; lifecycle scripts off unless --allow-scripts."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_wip.py",
+   "content_hash": "be9202d021350ce59b1b9abb8a4f2485e4fff30ad8561552b8fac91d69069141",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Orphan WIP snapshot under refs/flexfactor-wip/*; secret scan; byte-for-byte restore; fingerprint."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_partial.py",
+   "content_hash": "555c851952d3f392befde660eec18f6b41178f682cff48ad0a24358959dcb40e",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Partial structured output is first-class evidence; may never authorize CLEAN/READY/approve/merge/push."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_ledger.py",
+   "content_hash": "92f2c63fd21743b7b5ff7ecdc19ed8134c5d333654246c920898cde284b1933e",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Content-addressed chunking + ReviewLedger; verdict_allowed; head_matches commit-race guard."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_coverage.py",
+   "content_hash": "8c8fbb7d2ef60c83a84ad2fde52b9b766a3c0bfbabb9ab0055dfedbbf4dc01aa",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Per-function DIRECT coverage rows from real coverage artifacts; direct_function_gate fail-closed; function_coverage_basis label."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_journeys.py",
+   "content_hash": "006a89d468ef2c6d57025c352b4a21760da2c41afbdc1eae22977fb3505c90c8",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Journey engine glue: FLEXFACTOR_E2E_ROLES/VIEWPORTS/MAX_PAGES/ISOLATED; completeness() names every gap."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_purpose.py",
+   "content_hash": "a362509cee3b2fe372c79e397255336d756f506a6d09d1059d35acaad89f0345",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "find_contract resolution order; production_ready_status; purpose_confidence; mutation_authorized_by_purpose; gather_purpose_evidence."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_evidence.py",
+   "content_hash": "e1b61bfe7ece470a248ee44426e3d36be8ab8c958d66a3ebad7530d230e0f5d2",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "quality_gates; _index_large_file_in_chunks."
+  },
+  {
+   "kind": "test",
+   "locator": "flexfactor_tests.py",
+   "content_hash": "d1b5c27885ddeb9ca531a95720a2f0ea18845cb56811184c0be9e9e01889c72b",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Main unit suite: 887 collected on this tree, 9 failures, 8 skipped at the 2026-08-22 run recorded in docs/CURRENT_STATE_GAP.md."
+  },
+  {
+   "kind": "test",
+   "locator": "test_flexfactor_wip.py",
+   "content_hash": "ea4383d1059efcdfcfd76bb9b87f7ff8261b097971dde4dd9224b0c89f58fd1c",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "19 tests; found and fixed 5 bugs in the wip module."
+  },
+  {
+   "kind": "test",
+   "locator": "test_flexfactor_sandbox.py",
+   "content_hash": "5f276956928c35dc107fa94445b1bb5f027f435aba42a81512376f0a924ae86e",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "20 tests, 2 BLOCKED skips on Windows (Linux-only mechanisms)."
+  },
+  {
+   "kind": "source",
+   "locator": ".github/workflows/production-readiness.yml",
+   "content_hash": "d697213636f3b6924dc4f9e562e0f57bf901b06b8d5556406d2053d5ed353697",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Windows + Linux matrix; wheel installed outside the checkout; entry-point parity; forced verifier-outage regression; containment probe recorded, never a pass by itself."
+  },
+  {
+   "kind": "source",
+   "locator": "pyproject.toml",
+   "content_hash": "fe7c56fecf0a66232b303ddb9e0ca2cd91d5a9dd884bb638217037a030db3868",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "version 0.5.0, matching TOOL_VERSION and the CI parity assertion in .github/workflows/production-readiness.yml (measured 2026-08-25)."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor_assets/flexfactor_explorer.js",
+   "content_hash": "268223a8837f6feff1d283ecdc181badb340bcd76246839b36df2bbcbd6df5af",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "Standalone Playwright journey engine; one FLEXFACTOR_E2E_RESULT= line; anything not executed is named and forces complete=false."
+  },
+  {
+   "kind": "history",
+   "locator": "git:HEAD=98754207772404dfc675d7938d8133cc236311d1",
+   "content_hash": "4f9b9131d65e5866072f050967a6efd53104863b59db1464bb8f20851b4bba38",
+   "observed_at": "2026-08-22T02:50:20Z",
+   "excerpt": "feat(runtime): one canonical packaged runtime; directed orchestration is native (on top of 736bb2a v0.4.1). Working tree carries uncommitted sandbox/trust/wip/partial/ledger/coverage/journeys/purpose wiring."
+  },
+  {
+   "kind": "runtime",
+   "locator": "cli:python flexfactor.py {audit,prodready,scout} --help",
+   "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "EXECUTED 2026-08-25 on Python 3.14.6/win32. All THREE parsers list --trust-repo, and audit/prodready --allow-dirty help text describes the ORPHAN snapshot. x-1 and x-2 are closed in code; the contract entries were stale."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor.py:apply_integration (scout WIP transaction)",
+   "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "apply_integration captures capture_orphan_wip_snapshot before _apply_integration_impl and restores it in a finally via _restore_wip_if_active(pfx='[scout] '). Landed in 9191e77, the same commit that WROTE this contract listing x-3 as open. i-3 holds on the scout path."
+  },
+  {
+   "kind": "runtime",
+   "locator": "python -c 'import flexfactor_sandbox; capability_report()'",
+   "content_hash": "ab8af50aa36fc25debe6ba9e5d1e30d5e0b26f977ab0a70c124d70c407240aa6",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "MEASURED on this host (win32): win32-job-object AVAILABLE (process-tree-kill, memory, process-count, cpu-time - os-enforced; the probe ran a job-assigned child to exit 0); win32-appcontainer NOT implemented; network isolation is best-effort-env only (proxy poisoning; raw sockets bypass it). flexfactor_trust.containment_claim() delegates to this ONE report, so x-4's two-answers half is closed; the flag it names is --trust-repo, and --allow-untrusted-exec exists nowhere in the tree."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor.py dashboard_evidence['containment'] (was [:160])",
+   "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "REAL i-5 defect found while closing x-4 and FIXED 2026-08-25: the containment claim is 279 chars and was recorded sliced to 160, cutting mid-word at 'raw-socket e' and deleting 'gress is NOT prevented and third-party code can still reach the network.' The dashboard rendered a further [:110] slice. capability_report() now also returns claim_headline (78 chars, built NEGATIVE-FIRST); the evidence record carries the FULL claim and surfaces render the headline. Pinned by flexfactor_invariant_sweep_tests.ContainmentClaimSingleSourceTests."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor.py verification_is_real reads (2 sites)",
+   "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "Two fail-OPEN reads found by the new sweep and FIXED 2026-08-25: stack.get('verification_is_real', True) suppressed the 'no build verification' warning whenever the probe key was absent, and the audit report gated its 'Build verification: NOT AVAILABLE' line on `is False`, so a MISSING key (None) printed no disclosure at all. Both now fail closed (default False / `is not True`). i-6: None is not a pass."
+  },
+  {
+   "kind": "source",
+   "locator": "flexfactor.py _apply_integration_impl verify_note",
+   "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "Scout apply reported status 'applied' / 'committed on branch X' identically whether the project's build had proven the change or NO verify command existed at all (_detect_verify returns [] for a repo with no build/lint/typecheck script, and for a non-node repo). The approval card already disclosed it (_verify_disclosure); the RESULT did not. ApplyResult.detail now carries 'NOT VERIFIED - ...' in both the no-command and --no-verify cases. Fixed 2026-08-25."
+  },
+  {
+   "kind": "test",
+   "locator": "flexfactor_invariant_sweep_tests.py",
+   "content_hash": "cef462bdffa2c3e259c1612ee421a29dcba3d08a355831f5c49315041ac7180c",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "Slice 1: 24 executable pins for i-1..i-6. AST sweeps for (a) truthiness reads of any bool|None gate - producers discovered from return annotations, with narrowing so an already-collapsed bool is not flagged; (b) every git commit/push/merge site against a registry of declared gated functions; (c) fail-open reads of verification availability; (d) the eight false_substitutes; plus a wiring test that the module is in the workflow CI runs. CANARY-VERIFIED against the REAL tree: a synthetic `if final_ok:` + ungated push + `.get(...,True)` appended to flexfactor.py made three sweeps fail with exact file:line, and removing it returned all 24 to green."
+  },
+  {
+   "kind": "runtime",
+   "locator": "cli:python flexfactor_tests.py",
+   "content_hash": "ca7a321b0a5843346465053859ce9fff67b028784aa6e8e3ab4d4c251b54f0f0",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "EXECUTED 2026-08-25, Python 3.14.6, openai 2.44.0 installed, real .git present: Ran 889 tests in 575.107s - OK (skipped=8), exit 0. Zero failures, zero errors. This replaces g-6's '887 collected, 9 failures, 8 skipped'."
+  },
+  {
+   "kind": "history",
+   "locator": "git:HEAD=1efcb47b17f966f1e59bab0b6d6f38de2da35e2d",
+   "content_hash": "d73520a01bdd7a9189a061a4e43c00f59ee9eb7c25d10b128e6b3398c7cbacc0",
+   "observed_at": "2026-08-25T00:00:00Z",
+   "excerpt": "Baseline for the 2026-08-25 slice-0/slice-1 pass: main at 1efcb47 (PR #63, two model modes), working tree clean before the changes recorded above."
+  }
+ ],
+ "false_substitutes": [
+  "the build passes",
+  "the page loads / HTTP 200",
+  "tests exist",
+  "the branch was merged",
+  "a module is importable (module execution is not direct function evidence)",
+  "a model said it is clean (a partial/salvaged answer is a provider failure)",
+  "proxy-poisoned environment (best-effort env is not OS containment)",
+  "a checkpoint exists (resume must hash-verify under the same purpose contract)"
+ ],
+ "resolved_contradictions": [
+  {
+   "id": "x-1",
+   "text": "--trust-repo was said to reach only the scout parser while audit/prodready read args.trust_repo.",
+   "resolution": "DOCUMENTED BEHAVIOUR WAS CORRECT AND THE CODE ALREADY AGREES. Measured by execution: audit --help, prodready --help and scout --help all list --trust-repo. Run-level authorization is the intended design (recorded in the manifest, explicitly not a sandbox), so the flag belongs on every mutating mode. The contract entry was stale - written by the same commit (9191e77) that had already fixed it.",
+   "confidence": "verified",
+   "evidence_refs": [
+    20
+   ]
+  },
+  {
+   "id": "x-2",
+   "text": "audit/prodready --allow-dirty help text was said to promise that pre-existing changes are swept into cycle commits.",
+   "resolution": "IMPLEMENTED BEHAVIOUR IS CORRECT AND THE TEXT ALREADY DESCRIBES IT. Measured: the live help says the tree is snapshotted to an orphan ref, never part of FlexFactor's commits, never pushed, and restored byte-for-byte at the end. Sweeping owner WIP into a cycle commit would violate i-3, so the orphan snapshot is the behaviour to keep and the text to state. Stale contract entry.",
+   "confidence": "verified",
+   "evidence_refs": [
+    20
+   ]
+  },
+  {
+   "id": "x-3",
+   "text": "scout --allow-dirty promised an orphan snapshot that run_scout/apply_integration never took.",
+   "resolution": "DOCUMENTED BEHAVIOUR WAS CORRECT; THE IMPLEMENTATION WAS THE BUG, AND IT IS ALREADY FIXED. i-3 protects owner WIP on every mutation path, not only audit's, so the fix had to be in code rather than in the help text. apply_integration (the scout mutation entry) captures capture_orphan_wip_snapshot, refuses with skipped-dirty if the snapshot fails, and restores in a finally. run_scout without --apply mutates nothing and needs no snapshot.",
+   "confidence": "verified",
+   "evidence_refs": [
+    21
+   ]
+  },
+  {
+   "id": "x-4",
+   "text": "trust_decision named a flag no parser exposed, and containment_claim() disagreed with flexfactor_sandbox about whether untrusted code is contained.",
+   "resolution": "CODE WAS WRONG ON BOTH HALVES; BOTH ARE CLOSED, AND A REAL i-5 DEFECT WAS FOUND WHILE CLOSING THE SECOND. (a) --allow-untrusted-exec appears nowhere in the tree; trust_decision names --trust-repo, which every mutating parser accepts. (b) There is ONE source of truth - flexfactor_sandbox.capability_report() - and flexfactor_trust.containment_claim() delegates to its claim string. The two components were not describing different layers; they were two answers, and the sandbox probe is the one that MEASURES. (c) NEW DEFECT, fixed here: the claim was recorded and rendered SLICED (160 and 110 characters), which cut off the only sentence saying the network is NOT contained. capability_report() now emits claim_headline, built negative-first, and no surface slices the claim.",
+   "confidence": "verified",
+   "evidence_refs": [
+    22,
+    23
+   ]
+  },
+  {
+   "id": "x-5",
+   "text": "pyproject / TOOL_VERSION / CI were said to assert 0.4.1 while the migration notes describe 0.5.0.",
+   "resolution": "THE 0.5.0 SIDE IS CORRECT AND THE CODE ALREADY SAYS SO. Measured: pyproject version = 0.5.0, TOOL_VERSION = 0.5.0, and the CI parity step asserts the installed wheel and the source agree on 0.5.0. Stale contract entry; the pyproject.toml evidence record has been re-observed.",
+   "confidence": "verified",
+   "evidence_refs": [
+    20
+   ]
+  },
+  {
+   "id": "x-6",
+   "text": "README was said to claim scout --apply works on a flexfactor/adopt-<repo> branch while --branch-prefix is ACCEPTED BUT INERT.",
+   "resolution": "THE CLI IS CORRECT AND THE README NO LONGER MAKES THE CLAIM. Sandbox branches were removed 2026-08-11 and nothing runs git checkout -b (pinned by ScoutApplyBannerNamesNoBranchTests). Measured: the string adopt- appears nowhere in README.md. --branch-prefix stays ACCEPTED-BUT-INERT on purpose - deleting it is argparse exit 2 for every existing launcher (the launcher-drift trap). Stale contract entry.",
+   "confidence": "verified",
+   "evidence_refs": [
+    20
+   ]
+  }
+ ]
 }

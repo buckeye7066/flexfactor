@@ -475,7 +475,32 @@ def _build_report() -> dict:
            "process_count": process_count, "cpu_time": cpu_time,
            "credential_scrub": "applied"}
     rep["claim"] = _claim_sentence(rep)
+    rep["claim_headline"] = _claim_headline(rep)
     return rep
+
+
+def _claim_headline(rep: dict) -> str:
+    """A SHORT containment line for surfaces that cannot render the full claim.
+
+    Truncating ``claim`` to fit a UI row is how the honest half disappears: the
+    long sentence opens with the OS-enforced mechanisms and only names what is
+    NOT contained near the end, so a 110- or 160-character slice showed a
+    reader every guarantee and none of the holes (measured 2026-08-25: the
+    dashboard evidence record cut the string mid-word at "raw-socket e", losing
+    "gress is NOT prevented and third-party code can still reach the network").
+    Callers must render THIS instead of slicing ``claim`` - it is built
+    negative-first and is short by construction, so nothing has to be cut.
+    """
+    unenforced = [name for name, value in (("network", rep["network_isolation"]),
+                                           ("process-tree", rep["process_tree"]),
+                                           ("memory", rep["memory"]),
+                                           ("cpu", rep["cpu_time"]))
+                  if value != "os-enforced"]
+    mech = rep["strongest"] or "env-only"
+    if not unenforced:
+        return f"contained by {mech}: network, process-tree, memory, cpu all OS-enforced"
+    return (f"NOT contained: {', '.join(unenforced)} NOT OS-enforced "
+            f"(strongest mechanism: {mech})")
 
 
 def _claim_sentence(rep: dict) -> str:

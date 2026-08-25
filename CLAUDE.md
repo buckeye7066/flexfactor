@@ -1655,3 +1655,130 @@ now.
 - **OPEN: `--parallel 10`** points ten concurrent audits at ONE shared free
   allowance and ONE shared rotation state file. Every fix above is a
   per-failure remedy; the contention itself is untouched.
+
+## The contract that lied about its own code (2026-08-25, slice 0 + slice 1)
+
+`.flexfactor-purpose.json` carried SIX contradictions, all `confidence:
+verified`, all describing FlexFactor's docs disagreeing with FlexFactor's code.
+Re-measured by execution, **every one of them was already closed** - and closed
+by commit `9191e77`, *the same commit that wrote the contract listing them*. The
+contract was therefore the seventh instance of the exact defect this tool exists
+to detect: documentation that lies about code. **Regenerate the contract when
+you fix what it describes; a stale `verified` is worse than an absent one.**
+The closures are kept in a new `resolved_contradictions` block (schema updated),
+because deleting a contradiction is indistinguishable from never having found it.
+
+| id | decision | measured |
+|---|---|---|
+| x-1 | doc right, code already agreed | `audit`/`prodready`/`scout --help` all list `--trust-repo` |
+| x-2 | implementation right, text already matched | help says "snapshotted to an orphan ref ... restored byte-for-byte" |
+| x-3 | doc right, **code was the bug - already fixed** | `apply_integration` captures/restores the orphan WIP snapshot |
+| x-4 | **code was wrong on both halves; both closed** | see below |
+| x-5 | 0.5.0 side right, code already says it | pyproject + `TOOL_VERSION` + CI parity all 0.5.0 |
+| x-6 | CLI right, README no longer claims it | `adopt-` appears nowhere in README.md |
+
+`--branch-prefix` stays ACCEPTED-BUT-INERT deliberately: deleting it is argparse
+exit 2 for every existing launcher (the launcher-drift trap).
+
+### x-4: what this host ACTUALLY enforces, and the truncation that hid it
+
+There is ONE containment answer - `flexfactor_sandbox.capability_report()` -
+and `flexfactor_trust.containment_claim()` delegates to it. The two components
+were never describing different layers; they were two answers, and only one
+MEASURES. `--allow-untrusted-exec` exists nowhere in the tree.
+
+Measured live on this host (win32, 2026-08-25): **`win32-job-object` AVAILABLE**
+- process-tree kill, memory, process count and CPU time OS-enforced (the probe
+ran a job-assigned child to exit 0); `win32-appcontainer` NOT implemented;
+**network isolation `best-effort-env` only** (proxy poisoning; raw sockets
+bypass it).
+
+**REAL DEFECT found while closing this, now fixed.** The claim is 279 chars and
+was recorded `[:160]` in the dashboard evidence record and rendered `[:110]` in
+the v2 dashboard. Both cuts land inside `raw-socket e|gress is NOT prevented` -
+so every surface showed the four OS-enforced guarantees and hid the one hole.
+That is precisely the i-5 failure the claim exists to prevent, produced by a
+slice. `capability_report()` now also returns **`claim_headline`**, built
+NEGATIVE-FIRST and short by construction (78 chars here:
+`NOT contained: network NOT OS-enforced (strongest mechanism: win32-job-object)`),
+so a caller needing one row renders that instead of truncating. **Never slice
+`claim` - the sweep fails the build on any new slice.**
+
+### Three more real defects the new sweep found on its first run
+
+1. **`stack.get("verification_is_real", True)`** - the default was TRUE, so a
+   stack dict that never received the probe suppressed the "no build
+   verification available" warning entirely. Absence of evidence read as
+   verification. Now `False`.
+2. **`if a.get("verification_is_real") is False:`** in `_write_audit_report` -
+   a MISSING key is `None`, so the "Build verification: NOT AVAILABLE"
+   disclosure was omitted for any run whose stack never recorded the probe,
+   while "Baseline build: passed" stayed. Now `is not True`. (i-6: `None` is
+   not a pass - and that applies to the *report*, not only the gate.)
+3. **Scout apply reported an unverified commit identically to a verified one.**
+   `_detect_verify` returns `[]` - not the `None` refusal sentinel - for a repo
+   with no build/lint/typecheck script AND for a non-node repo, so
+   `if opts.verify and verify_cmds:` simply skipped verification and the result
+   was `status="applied", detail="committed on branch X"`. The approval card
+   already told the truth up front (`_verify_disclosure`); the RESULT did not.
+   `ApplyResult.detail` now carries `NOT VERIFIED - ...` for both the
+   no-command and the `--no-verify` case. **OPEN (g-7):** scout still commits
+   there rather than refusing, unlike `_commit_and_sync`, which hard-resets on
+   a non-`True` gate. Making scout refuse would block every repo with no build
+   script - an owner design decision, not a unilateral one.
+
+## `flexfactor_invariant_sweep_tests.py` - the invariants are executable now
+
+25 tests, in the CI module list, canary-verified against the REAL tree (a
+synthetic `if final_ok:` + ungated `_git(["push"...])` + `.get(..., True)`
+appended to `flexfactor.py` made three sweeps fail with exact `file:line`;
+removing it returned all 25 to green).
+
+- **Tri-state truthiness (i-6).** Producers are discovered from RETURN
+  ANNOTATIONS (`bool | None`, incl. inside a `tuple[...]`), so a new gate is
+  covered the moment it is written - 13 found today. Every boolean-context read
+  of such a value is a failure. **NARROWING is what keeps it precise**: a name
+  stops being tri-state after `x = y is True` / `bool(y)`, or inside a branch
+  that excluded `None` (`if x is None: ... else:`). Without narrowing the first
+  run flagged five sites - ONE real (`'PASS' if ok else ...`, now `ok is True`)
+  and FOUR already-correct. Those four are NOT allowlisted; the analyser
+  understands them. A sweep that cries wolf gets muted.
+- **Git mutation registry (i-2/i-4).** Only `_commit_and_sync` and
+  `_apply_integration_impl` may issue `git commit|push|merge`, each with its
+  gate written down (`is not True` rollback; exception-based rollback +
+  disclosure). A new mutation site ANYWHERE fails, which forces whoever adds
+  one to declare its gate instead of inheriting trust by proximity. The
+  registry must also not rot: a declared site that no longer exists fails too.
+- **Fail-open verification reads.** `.get("verification_is_real", True)` and
+  `... is False` are both build failures now.
+- **The eight `false_substitutes`**, each its own named check - several
+  behavioural rather than greps (a salvaged answer really is fed to
+  `may_authorize_clean`; the capability probe really is run).
+- **CI wiring, generalized.** `test_EVERY_test_module_is_in_the_workflow_test_list`.
+  Five test modules existed and passed locally while CI ran NONE of them -
+  `flexfactor_model_mode_tests`, `flexfactor_route_fault_tests`,
+  `flexfactor_baseline_ledger_tests`, `flexfactor_project_lookup_tests`,
+  `flexfactor_wip_removal_guard_tests`. **A suite CI does not run is a suite
+  that does not exist**, and it hid a red test (below). All five are wired now;
+  exclusions require an entry in `_NOT_IN_CI` with a reason.
+
+### TIME-BOMB FIXTURE: a test that expired instead of failing
+
+`flexfactor_route_fault_tests.AccountWideAllowanceTests.test_the_reset_timestamp_in_the_message_is_used`
+froze the live ledger's literal `X-RateLimit-Reset: 1787616000000`
+(== 2026-08-25T00:00:00Z). `limit_scope` deliberately trusts a reset only when
+it is IN THE FUTURE and within 25 hours, so on 2026-08-25 the fixture aged past
+its own assertion and the test began failing with `until is None` - **the test
+aged out, the code did not change**, and because the module was not in CI
+nobody saw it. The reset is now computed relative to `time.time()`, and both
+edges of the 25-hour window (a past stamp, a far-future stamp) got their own
+tests. **Never freeze an absolute timestamp into a fixture whose code compares
+it against now.**
+
+### Measured, 2026-08-25 (replaces the contract's stale `g-6`)
+
+`python flexfactor_tests.py` on Python 3.14.6 with `openai` installed and a real
+`.git`: **Ran 889 tests - OK (skipped=8), exit 0.** Zero failures, zero errors.
+The old entry ("887 collected, 9 failures, 8 skipped") measured a checkout with
+missing dependencies and no `.git`; every one of those failures was
+environmental.

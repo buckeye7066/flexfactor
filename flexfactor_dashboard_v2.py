@@ -387,9 +387,16 @@ def main() -> None:
                                              else "  gap-fixes NOT authorized"))),
                                    fill=TEXT, font=("Segoe UI", 9))
                 y += 16
+                # Render the sandbox's own SHORT headline, never a slice of the
+                # long claim: the long form names the OS-enforced mechanisms
+                # first, so cutting it to fit this row deleted the "network is
+                # NOT contained" half. Older evidence records (written before
+                # `containment_headline` existed) fall back to the full claim.
+                _contain = str(evidence.get("containment_headline")
+                               or evidence.get("containment") or "unknown")
                 canvas.create_text(L, y + 34, anchor="w",
-                                   text=("containment: " + str(evidence.get("containment") or "unknown"))[:110],
-                                   fill=WARN if "NOT" in str(evidence.get("containment") or "") else TEXT,
+                                   text="containment: " + _contain,
+                                   fill=WARN if "NOT" in _contain else TEXT,
                                    font=("Segoe UI", 9))
                 wip = evidence.get("wip") or {}
                 if wip.get("snapshot_ref"):

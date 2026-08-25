@@ -6529,6 +6529,23 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         # By default the verify subprocess runs under _no_network_env (the
         # candidate's code executes here; env-level isolation stops the common
         # HTTP exfil paths - ISOLATION_SPIKE.md). --no-isolate-verify opts out.
+        #
+        # TRI-STATE, like the audit path's _full_gate: a verify command that RAN
+        # and exited 0 is verified; a verify command that failed raises and rolls
+        # back; NO verify command at all verified NOTHING. The third case used to
+        # be indistinguishable from the first in the result - status "applied",
+        # detail "committed on branch X" - so an integration nothing executed
+        # read exactly like one the project's own build had proven. The approval
+        # card already discloses the state up front (_verify_disclosure); this
+        # carries the same truth into the RESULT, which is what the apply summary
+        # and the scout report render afterwards.
+        verify_note = ""
+        if not opts.verify:
+            verify_note = ("NOT VERIFIED - verification disabled (--no-verify); "
+                           "nothing executed the project's code")
+        elif not verify_cmds:
+            verify_note = ("NOT VERIFIED - no build/lint/typecheck script detected, "
+                           "so no command ran and nothing executed the project's code")
         if opts.verify and verify_cmds:
             verify_env = (_no_network_env()
                           if getattr(opts, "isolate_verify", True) else None)
@@ -6627,13 +6644,17 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                         _git(["merge", "--abort"], project_dir)
                         _git(["checkout", branch], project_dir)
                         detail += f"; auto-merge into {prev_branch} skipped (conflicts)"
+            if verify_note:
+                detail += "; " + verify_note
             return ApplyResult(repo_name, status, detail, branch=branch, files=file_list,
                                packages=packages, commit_message=msg,
                                post_steps=patch.get("post_steps") or [],
                                manifest=manifest)
 
-        return ApplyResult(repo_name, "applied-local",
-                           f"wrote {len(file_list)} file(s); .bak backups kept",
+        local_detail = f"wrote {len(file_list)} file(s); .bak backups kept"
+        if verify_note:
+            local_detail += "; " + verify_note
+        return ApplyResult(repo_name, "applied-local", local_detail,
                            files=file_list, packages=packages,
                            post_steps=patch.get("post_steps") or [],
                            manifest=manifest)
@@ -14127,10 +14148,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 + "\n\n"
                 + purpose_blob
             )
-        if not stack.get("verification_is_real", True):
-            # Say it out loud. _full_gate returns True when it has no commands,
-            # which reads as a pass; without this line the run would report a
-            # green build it never performed.
+        if not stack.get("verification_is_real", False):
+            # Say it out loud. A vacuous build gate reads as a pass to anyone
+            # downstream; without this line the run would report a green build
+            # it never performed. The default is FALSE on purpose: the previous
+            # default of True meant a stack dict that never got the key (any
+            # path that skips _detect_stack's verification probe) suppressed
+            # the warning entirely - absence of evidence read as verification.
             print(f"{pfx}WARNING: {stack.get('verification_note', 'no build verification available')}.")
 
         # The file LIST is enumerated once; each cycle RE-READS contents (which the
@@ -15383,7 +15407,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if test_files:
                 ok, log = _run_unit_tests(project_dir, stack)
                 test_status = ok
-                print(f"{pfx}unit tests: {'PASS' if ok else 'FAIL' if ok is False else 'n/a'}")
+                # `ok` is TRI-STATE (_run_unit_tests -> bool | None). Read it
+                # with `is True`, never truthiness: the two happen to agree for
+                # a bool|None today, but the rule in _full_gate's docstring is
+                # what stops the next None-producing return value from silently
+                # printing PASS.
+                print(f"{pfx}unit tests: "
+                      f"{'PASS' if ok is True else 'FAIL' if ok is False else 'n/a'}")
                 if ok is False:
                     all_findings.append({
                         "file": "(unit tests)", "line": 0, "severity": "high", "category": "bug",
@@ -16060,7 +16090,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                              "controls_executed": _cov.get("executed_control_total", 0)},
                 "purpose_confidence": result.get("purpose_confidence"),
                 "purpose_mutation_authorized": result.get("purpose_mutation_authorized"),
-                "containment": (_ff_sandbox.capability_report().get("claim") or "")[:160],
+                # The FULL claim, never a slice. A 160-character cut landed
+                # mid-word at "raw-socket e" and deleted the only sentence that
+                # said the network is NOT contained (i-5: an unenforceable
+                # capability must be named, not trimmed off the end). Surfaces
+                # that need one short row render `containment_headline`, which
+                # flexfactor_sandbox builds negative-first for exactly that.
+                "containment": (_ff_sandbox.capability_report().get("claim") or ""),
+                "containment_headline": (
+                    _ff_sandbox.capability_report().get("claim_headline") or ""),
                 "wip": {"snapshot_ref": result.get("wip_snapshot_ref"),
                         "restore": result.get("wip_restore")},
                 "blocked_reason": (result.get("error") or result.get("stop_reason") or "")[:200],
@@ -16697,10 +16735,16 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
 
     if a.get("ecosystems"):
         L.insert(4, f"- **Toolchains:** {', '.join(a['ecosystems'])}")
-    # State the verification status explicitly. _full_gate returns True when it
-    # has no commands to run, so a reader who sees "Baseline build: passed"
-    # without this line can reasonably believe a build happened when none did.
-    if a.get("verification_is_real") is False:
+    # State the verification status explicitly. A baseline gate that had no
+    # command to run proved nothing, so a reader who sees "Baseline build:
+    # passed" without this line can reasonably believe a build happened when
+    # none did. (_full_gate used to RETURN True in that case; it returns None
+    # now, and this line is what turns that None into a sentence.)
+    # `is not True`, not `is False`: a MISSING key is None, and `is False`
+    # silently omitted the whole disclosure for any run whose stack never
+    # recorded the probe - the reader then sees "Baseline build: passed" with
+    # nothing telling them no build ran (i-6: None is not a pass).
+    if a.get("verification_is_real") is not True:
         L.insert(5, f"- **Build verification:** NOT AVAILABLE — "
                     f"{a.get('verification_note', 'no build system detected')}. "
                     f"Fixes in this run were NOT build-verified.")
