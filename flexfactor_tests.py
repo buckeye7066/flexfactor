@@ -15016,7 +15016,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
         for kv in (["user.email", "t@example.com"], ["user.name", "T"]):
             subprocess.run(["git", "-C", proj, "config"] + kv, check=True)
         with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-            fh.write('{"name":"x","version":"1.0.0"}')
+            fh.write('{"name":"x","version":"1.0.0","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
         subprocess.run(["git", "-C", proj, "add", "-A"], check=True)
         subprocess.run(["git", "-C", proj, "commit", "-qm", "seed"], check=True)
         subprocess.run(["git", "-C", proj, "remote", "add", "origin", remote], check=True)
