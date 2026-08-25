@@ -321,9 +321,9 @@ _MUTATION_SITES = {
         "Any failure raises ApplyError and restores every touched file."
     ),
     "_gh_pr_automerge": (
-        "protected-base publication helper. It is reached only from "
-        "_commit_and_sync after final_ok is exactly True and enables GitHub "
-        "auto-merge, leaving required branch checks authoritative."
+        "protected-base publication helper. The helper itself reruns "
+        "_publication_gate and requires final_ok is exactly True before any "
+        "gh pr merge call, so a new caller cannot bypass verification."
     ),
 }
 
@@ -741,6 +741,18 @@ class GitMutationGateSweepTests(unittest.TestCase):
         self.assertIn("final_ok is not True", src,
                       "the publication gate stopped distinguishing None "
                       "(nothing ran) from True (verified)")
+
+    def test_the_auto_merge_helper_has_its_own_gate(self):
+        import inspect
+        import flexfactor as ff
+        src = inspect.getsource(ff._gh_pr_automerge)
+        gate = src.index("_publication_gate(")
+        exact = src.index("final_ok is not True")
+        mutation = src.index('"gh", "pr", "merge"')
+        self.assertLess(gate, exact)
+        self.assertLess(exact, mutation,
+                        "auto-merge mutation must stay behind the helper's own "
+                        "exact-True publication gate")
 
     def test_canary_a_new_mutation_site_IS_caught(self):
         canary = (
