@@ -180,6 +180,26 @@ class ProductInvariantTests(unittest.TestCase):
             item["implementation_status"], "applied-verification-incomplete"
         )
 
+    def test_capability_test_must_exist_in_global_and_target_test_ledgers(self):
+        ledger = research(competitor(applied=False))
+        ledger["competitors"][0]["bridge_status"] = "bridged"
+        ledger["competitors"][0]["entered_fix_stream"] = True
+        capability_id = competitor_capability_id(ledger["competitors"][0], 0)
+        stamp_competitor_implementation(
+            competitor_research=ledger,
+            applied_files=["src/recovery.py"],
+            unverified_files=[],
+            test_files=["tests/test_real.py"],
+            tests_by_source={"src/other.py": ["tests/test_real.py"]},
+            tests_by_capability={capability_id: ["tests/test_forged.py"]},
+            verification_passed=True,
+        )
+        item = ledger["competitors"][0]
+        self.assertEqual(
+            item["implementation_status"], "applied-verification-incomplete"
+        )
+        self.assertEqual(item["implementation_evidence"]["test_files"], [])
+
     def test_unrelated_test_never_certifies_a_selected_capability(self):
         ledger = research(competitor(applied=False))
         ledger["competitors"][0]["bridge_status"] = "bridged"
@@ -292,6 +312,24 @@ class ProductInvariantTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertIn("purpose-fulfilled", {g["id"] for g in result["blockers"]})
 
+    def test_owner_authored_label_cannot_replace_actual_authored_provenance(self):
+        forged = evaluate(
+            purpose_contract={"authored": False},
+            purpose_confidence="owner-authored",
+        )
+        self.assertIn(
+            "purpose-authority",
+            {gate["id"] for gate in forged["blockers"]},
+        )
+        inferred = evaluate(
+            purpose_contract={"authored": False},
+            purpose_confidence="strongly-inferred",
+        )
+        self.assertNotIn(
+            "purpose-authority",
+            {gate["id"] for gate in inferred["blockers"]},
+        )
+
     def test_disabled_or_incomplete_research_is_a_blocker(self):
         disabled = evaluate(competitors_enabled=False)
         self.assertFalse(disabled["ready"])
@@ -311,6 +349,17 @@ class ProductInvariantTests(unittest.TestCase):
         )
         self.assertIn("corroborated=1/5", coverage["evidence"])
         self.assertIn("reported=5", coverage["evidence"])
+
+    def test_duplicate_records_and_sources_cannot_pad_competitor_coverage(self):
+        duplicated = research()
+        for item in duplicated["competitors"]:
+            item["name"] = "Same rival"
+            item["evidence_urls"] = ["https://example.com/same-rival"]
+        result = evaluate(competitor_research=duplicated)
+        self.assertIn(
+            "competitive-coverage",
+            {gate["id"] for gate in result["blockers"]},
+        )
 
     def test_research_older_than_exactly_thirty_days_is_stale(self):
         stale = research()
@@ -370,6 +419,14 @@ class ProductInvariantTests(unittest.TestCase):
         for forged_license in ("UNKNOWN", "GPL-3.0"):
             item = deepcopy(valid)
             item["license"] = forged_license
+            result = evaluate(competitor_research=research(item))
+            self.assertIn(
+                "no-blind-competitor-copying",
+                {gate["id"] for gate in result["blockers"]},
+            )
+        for forged_source in ("UNKNOWN", "unverified"):
+            item = deepcopy(valid)
+            item["license_source"] = forged_source
             result = evaluate(competitor_research=research(item))
             self.assertIn(
                 "no-blind-competitor-copying",
