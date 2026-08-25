@@ -2283,6 +2283,44 @@ class ProviderReservationChokepointTests(unittest.TestCase):
         self.assertLessEqual(m.usd, 0.20)
 
 
+class ScoutUnverifiedRetentionTests(unittest.TestCase):
+    """Scout must stop before its first mutation when no verifier can run."""
+
+    @staticmethod
+    def _opts(verify):
+        import types
+        return types.SimpleNamespace(
+            dry_run=False, allow_dirty=True, verify=verify,
+            push=False, merge=False, branch_prefix="flexfactor/adopt-",
+            allow_scripts=False, isolate_verify=True)
+
+    def test_no_detected_verify_command_retains_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            res = ff.apply_integration(
+                project, "demo",
+                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                 "packages": []},
+                self._opts(True))
+            self.assertEqual(res.status, "skipped-unverified")
+            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+
+    def test_disabled_verification_retains_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as project:
+            with open(os.path.join(project, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            before = open(os.path.join(project, "package.json"), "rb").read()
+            res = ff.apply_integration(
+                project, "demo",
+                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                 "packages": []},
+                self._opts(False))
+            self.assertEqual(res.status, "skipped-unverified")
+            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertEqual(open(os.path.join(project, "package.json"), "rb").read(), before)
+
+
 class PathContainmentTests(unittest.TestCase):
     """Round-3 defect 2: model-generated paths must be contained to the repo; a
     write outside project_dir is a sandbox escape."""
@@ -2308,7 +2346,7 @@ class PathContainmentTests(unittest.TestCase):
         class Opts:
             dry_run = False
             allow_dirty = True
-            verify = False
+            verify = True
             branch_prefix = "flexfactor/adopt-"
             push = False
             merge = False
@@ -2316,6 +2354,8 @@ class PathContainmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"scripts":{"build":"node -e \\"process.exit(0)\\""}}')
             outside = os.path.join(tmp, "OUTSIDE.txt")
             patch = {"files": [{"path": r"..\OUTSIDE.txt", "contents": "pwned"}],
                      "packages": []}
@@ -4403,7 +4443,7 @@ class SnapshotTriStateTests(unittest.TestCase):
     class _Opts:
         dry_run = False
         allow_dirty = True
-        verify = False
+        verify = True
         push = False
         merge = False
         branch_prefix = "flexfactor/adopt-"
@@ -4414,7 +4454,7 @@ class SnapshotTriStateTests(unittest.TestCase):
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
             with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"name":"x"}')
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
             outside = os.path.join(tmp, "outside-lock.json")
             with open(outside, "w", encoding="utf-8") as fh:
                 fh.write("LOCKDATA")
@@ -4444,7 +4484,7 @@ class SnapshotTriStateTests(unittest.TestCase):
             proj = os.path.join(tmp, "proj")
             os.makedirs(proj)
             with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"name":"x"}')  # no package-lock.json -> genuinely missing
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')  # no package-lock.json -> genuinely missing
             real_run = ff._run
             ff._run = lambda cmd, cwd, timeout=900: ff.subprocess.CompletedProcess(cmd, 1, "", "npm mock fail")
             patch = {"files": [{"path": "new.js", "contents": "console.log(1)"}],
@@ -14962,7 +15002,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
     class _Opts:
         dry_run = False
         allow_dirty = True
-        verify = False
+        verify = True
         push = True
         merge = True
         branch_prefix = "flexfactor/adopt-"
