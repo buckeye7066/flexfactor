@@ -31,9 +31,34 @@ environment." The sentence lands in the run manifest as `containment.claim` and
 in each broker basis as `claim` (trusted-repo basis appends "Execution
 authorized by owner trust: <reason>").
 
-Note: `flexfactor_trust.containment_claim()` still says "FlexFactor does not
-provide an OS sandbox" - stale relative to the sandbox module; not used on the
-manifest path.
+`flexfactor_trust.containment_claim()` is NOT a second answer: it delegates to
+`flexfactor_sandbox.capability_report()["claim"]`, and only falls back to its own
+truthful "could not probe" sentence if the import fails. There is exactly one
+containment claim in this product, and it is the measured one.
+
+### `claim_headline` - and why slicing `claim` is forbidden (2026-08-25)
+
+The long claim names the OS-enforced mechanisms FIRST and what is not contained
+LAST. Two surfaces were cutting it to fit - the dashboard evidence record at
+`[:160]` and the v2 dashboard row at `[:110]` - and on this host (claim length
+279) both cuts landed inside "raw-socket e|gress is NOT prevented". A reader saw
+every guarantee and none of the holes, which is precisely the i-5 failure the
+claim exists to prevent.
+
+`capability_report()` therefore also returns `claim_headline`: short by
+construction (78 chars measured here), built NEGATIVE-FIRST -
+`NOT contained: network NOT OS-enforced (strongest mechanism: win32-job-object)`
+- so a caller that needs one row renders it instead of truncating the claim.
+`flexfactor_invariant_sweep_tests.ContainmentClaimSingleSourceTests` fails the
+build on any new slice of `claim`, and on any divergence between the trust
+module's answer and the sandbox probe's.
+
+Measured on this host, 2026-08-25 (`win32`): `win32-job-object` AVAILABLE -
+process-tree kill, memory, process count and CPU time are OS-enforced (the probe
+ran a job-assigned child to exit 0); `win32-appcontainer` NOT implemented;
+network isolation is `best-effort-env` only. So: process/memory/CPU containment
+is real and OS-enforced here; NETWORK containment is not, and is named
+best-effort everywhere it appears.
 
 ## 3. Authorization rule (`require_containment_or_trust`)
 

@@ -18,6 +18,8 @@
     "invariants": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/claim" } },
     "acceptance_criteria": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
     "contradictions": { "type": "array", "items": { "$ref": "#/$defs/claim" } },
+    "resolved_contradictions": { "type": "array", "items": { "$ref": "#/$defs/resolved_claim" },
+                                 "description": "Contradictions that HAVE been closed, kept together with the decision that closed them. An empty `contradictions` list is only trustworthy if the closures are auditable - deleting an entry is indistinguishable from never having found it." },
     "gaps": { "type": "array", "items": { "$ref": "#/$defs/claim" } },
     "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evidence" } },
     "false_substitutes": { "type": "array", "items": { "type": "string", "minLength": 1 },
@@ -45,6 +47,19 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "text": { "type": "string", "minLength": 1 },
+        "confidence": { "enum": ["verified", "supported", "inferred", "contradicted", "unknown"] },
+        "evidence_refs": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "resolved_claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "resolution", "confidence", "evidence_refs"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "text": { "type": "string", "minLength": 1 },
+        "resolution": { "type": "string", "minLength": 1,
+                        "description": "Which side was correct - the DOCUMENTED behaviour or the IMPLEMENTED behaviour - and why. A contradiction is not closed by deleting it; the reader must be able to audit the decision." },
         "confidence": { "enum": ["verified", "supported", "inferred", "contradicted", "unknown"] },
         "evidence_refs": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
       }
