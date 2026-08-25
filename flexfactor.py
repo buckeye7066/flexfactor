@@ -14726,6 +14726,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         fix_notes += notes_c
                         bridged_early = sorted(set(bridged_early) | set(applied_c))
                         competitor_research["applied_files"] = sorted(set(applied_c))
+                        competitor_research["unverified_files"] = sorted(set(unver_c))
                         if git and applied_c:
                             s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                                  "competitor-derived improvements (phase 1b)",
@@ -15423,6 +15424,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # covered by native-suite/import-path evidence; changed behavior without
         # such evidence is targeted here and remains blocked by the final ledger.
         test_files: list[str] = []
+        tests_by_source: dict[str, list[str]] = {}
         test_status = None
         if (args.tests and stack.get("test_cmd") and not dirty_abort
                 and not infrastructure_abort):
@@ -15486,7 +15488,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
                         manual_review.add(rel)
                         continue
-                    test_files.append(os.path.relpath(written, project_dir))
+                    _test_rel = os.path.relpath(written, project_dir).replace("\\", "/")
+                    test_files.append(_test_rel)
+                    tests_by_source.setdefault(rel.replace("\\", "/"), []).append(_test_rel)
             if test_files:
                 ok, log = _run_unit_tests(project_dir, stack)
                 test_status = ok
@@ -15523,6 +15527,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             f"rejected and removed {len(rejected)} generated test "
                             "file(s) after the native test command failed")
                         test_files = []
+                        tests_by_source = {}
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
@@ -15929,11 +15934,18 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             suite_status is True
             and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
         )
+        _competitor_applied = set(
+            (competitor_research or {}).get("applied_files") or []
+        )
+        _competitor_unverified = set(
+            (competitor_research or {}).get("unverified_files") or []
+        )
         competitor_research = _ff_product_invariants.stamp_competitor_implementation(
             competitor_research=competitor_research,
-            applied_files=applied_set,
-            unverified_files=unverified_set,
+            applied_files=_competitor_applied,
+            unverified_files=_competitor_unverified,
             test_files=test_files,
+            tests_by_source=tests_by_source,
             verification_passed=_verification_passed,
         )
 
@@ -15950,7 +15962,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             competitor_research=competitor_research,
             competitor_target=max(
                 1, int(getattr(args, "competitor_count", 5) or 5)),
-            applied_files=applied_set,
+            applied_files=_competitor_applied,
             test_files=test_files,
             verification_passed=_verification_passed,
         )
