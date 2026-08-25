@@ -13178,6 +13178,22 @@ class CompetitorCoverageHonestyTests(unittest.TestCase):
 class ReleaseLanguagePolicyTests(unittest.TestCase):
     """Keep organizational gate language out without weakening safety controls."""
 
+    @staticmethod
+    def _candidate_paths(root):
+        tracked = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z"], capture_output=True,
+            text=False, check=False)
+        if tracked.returncode == 0:
+            return [os.path.join(root, p.decode("utf-8", "surrogateescape"))
+                    for p in tracked.stdout.split(b"\0") if p]
+        paths = []
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in {
+                ".git", ".venv", "__pycache__", "build", "dist",
+            }]
+            paths.extend(os.path.join(current, name) for name in files)
+        return paths
+
     def test_repository_has_no_organizational_gate_language(self):
         fragments = (
             "sign" + " off",
@@ -13197,24 +13213,29 @@ class ReleaseLanguagePolicyTests(unittest.TestCase):
             ".ps1", ".sh", ".ini",
         }
         violations = []
-        for root, dirs, files in os.walk(_HERE):
-            dirs[:] = [d for d in dirs if d not in {
-                ".git", ".venv", "__pycache__", "build", "dist",
-            }]
-            for name in files:
-                if os.path.splitext(name)[1].lower() not in text_extensions:
-                    continue
-                path = os.path.join(root, name)
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    for line_no, line in enumerate(fh, 1):
-                        normalized = re.sub(r"[-_]+", " ", line.lower())
-                        for fragment in fragments:
-                            if fragment in normalized:
-                                violations.append(
-                                    f"{os.path.relpath(path, _HERE)}:{line_no}: {fragment}"
-                                )
+        for path in self._candidate_paths(_HERE):
+            if os.path.splitext(path)[1].lower() not in text_extensions:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                normalized = re.sub(r"[-_\s]+", " ", fh.read().lower())
+            for fragment in fragments:
+                if fragment in normalized:
+                    violations.append(f"{os.path.relpath(path, _HERE)}: {fragment}")
         self.assertEqual(violations, [], "organizational gate language found:\n" +
                          "\n".join(violations))
+
+    def test_tracked_file_enumeration_excludes_workspace_artifacts(self):
+        root = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        subprocess.run(["git", "-C", root, "init", "-q"], check=True)
+        tracked = os.path.join(root, "tracked.md")
+        untracked = os.path.join(root, "generated_audit_report.md")
+        with open(tracked, "w", encoding="utf-8") as fh:
+            fh.write("tracked\n")
+        with open(untracked, "w", encoding="utf-8") as fh:
+            fh.write("generated\n")
+        subprocess.run(["git", "-C", root, "add", "tracked.md"], check=True)
+        self.assertEqual(self._candidate_paths(root), [tracked])
 
 
 class CompetitorSearchBackendTests(unittest.TestCase):
@@ -13284,6 +13305,43 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         }, clear=False):
             fc._firecrawl("competitors", 5, opener)
         self.assertEqual(headers[0].get("Authorization"), "Bearer internal-secret")
+
+    def test_credentialed_custom_endpoint_requires_tls(self):
+        called = []
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_FIRECRAWL_URL": "http://firecrawl.example/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "internal-secret",
+        }, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "require HTTPS"):
+                fc._firecrawl("competitors", 5, lambda *a, **k: called.append(a))
+        self.assertEqual(called, [])
+
+    def test_default_firecrawl_transport_refuses_redirects(self):
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False), mock.patch.object(
+            fc, "_default_firecrawl_opener", return_value=_FIRECRAWL_FIXTURE,
+        ) as safe_opener:
+            fc._firecrawl("competitors", 5, fc._default_opener)
+        safe_opener.assert_called_once()
+        self.assertIsNone(
+            fc._NoRedirectHandler().redirect_request(None, None, 302, "moved", {},
+                                                      "https://other.example"))
+
+    def test_keyless_loopback_endpoint_can_remain_http(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_FIRECRAWL_URL": "http://127.0.0.1:3002/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }, clear=False):
+            fc._firecrawl("competitors", 5, opener)
+        self.assertNotIn("Authorization", calls[0][1])
 
     def test_duckduckgo_lite_results_are_parsed_and_ads_dropped(self):
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE})

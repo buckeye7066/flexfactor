@@ -197,6 +197,25 @@ def _default_opener(url: str, data: bytes | None = None,
     return raw.decode("utf-8", "replace")
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep bearer credentials bound to the explicitly configured origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _default_firecrawl_opener(url: str, data: bytes | None = None,
+                              headers: dict | None = None,
+                              timeout: float = _HTTP_TIMEOUT) -> str:
+    req = urllib.request.Request(
+        url, data=data, headers={"User-Agent": _UA, **(headers or {})},
+        method="POST" if data else "GET")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read(400_000)
+    return raw.decode("utf-8", "replace")
+
+
 def _firecrawl(query: str, limit: int, opener) -> list[dict]:
     """Firecrawl v2 search, authenticated when a key is configured.
 
@@ -223,6 +242,8 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
         key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
         if not key:
             raise RuntimeError("FIRECRAWL_API_KEY is not set")
+    if key and not endpoint.startswith("https://"):
+        raise RuntimeError("credentialed Firecrawl endpoints require HTTPS")
     if key:
         headers["Authorization"] = f"Bearer {key}"
     payload = json.dumps({
@@ -231,7 +252,8 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
         "sources": ["web"],
         "safe": True,
     }).encode("utf-8")
-    root = json.loads(opener(endpoint, payload, headers))
+    request = _default_firecrawl_opener if opener is _default_opener else opener
+    root = json.loads(request(endpoint, payload, headers))
     if not isinstance(root, dict) or root.get("success") is False:
         raise RuntimeError("Firecrawl v2 reported failure or invalid JSON shape")
 
