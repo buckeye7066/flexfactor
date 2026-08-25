@@ -142,10 +142,12 @@ except ImportError:
 try:
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
+    import flexfactor_product_invariants as _ff_product_invariants
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
+    import flexfactor_product_invariants as _ff_product_invariants
 
 # Scout production bridge (94-100): separate risk model / report schema,
 # metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
@@ -15919,6 +15921,63 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             converged = False
             stop_reason = "deterministic code-intelligence runtime unavailable"
 
+        # 7.6 PRODUCT INVARIANTS. Purpose is the authority; competitor research
+        # is a bounded, provenance-aware gap analysis, never a roadmap-copying
+        # mandate. Selected capabilities only count after the target changed and
+        # the repository's executable suite verified the result.
+        _verification_passed = bool(
+            suite_status is True
+            and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+        )
+        competitor_research = _ff_product_invariants.stamp_competitor_implementation(
+            competitor_research=competitor_research,
+            applied_files=applied_set,
+            unverified_files=unverified_set,
+            test_files=test_files,
+            verification_passed=_verification_passed,
+        )
+
+        _contract_evidence = dict(result.get("purpose_contract") or {})
+        _contract_evidence["authored"] = purpose_contract is not None
+        product_invariants = _ff_product_invariants.evaluate_product_invariants(
+            purpose_enabled=bool(getattr(args, "purpose_gap", True)),
+            purpose_contract=_contract_evidence,
+            purpose_confidence=purpose_confidence,
+            purpose_before=purpose_before,
+            purpose_after=purpose_gap,
+            purpose_errors=purpose_assessment_errors,
+            competitors_enabled=bool(getattr(args, "competitors", True)),
+            competitor_research=competitor_research,
+            competitor_target=max(
+                1, int(getattr(args, "competitor_count", 5) or 5)),
+            applied_files=applied_set,
+            test_files=test_files,
+            verification_passed=_verification_passed,
+        )
+        if not product_invariants.get("ready"):
+            converged = False
+            _open_invariants = [
+                str(gate.get("id") or "unknown")
+                for gate in product_invariants.get("blockers") or []
+            ]
+            _invariant_reason = (
+                "purpose/competitive product invariants remain open: "
+                + "; ".join(_open_invariants)
+            )
+            if stop_reason and stop_reason != "converged: found == fixed":
+                stop_reason += "; additionally, " + _invariant_reason
+            else:
+                stop_reason = _invariant_reason
+            for _gate in product_invariants.get("blockers") or []:
+                all_findings.append({
+                    "file": "(product invariants)", "line": 0,
+                    "severity": "high", "category": "product-purpose",
+                    "title": str(_gate.get("id") or "Product invariant failed"),
+                    "problem": str(_gate.get("evidence") or "Required evidence is missing."),
+                    "fix": str(_gate.get("remediation") or
+                               "Complete the invariant with executable evidence."),
+                })
+
         print(f"{pfx}Git: {commit_status}")
         suite_txt = ("GREEN" if suite_status else "RED" if suite_status is False else "not run")
         print(f"{pfx}Outcome: {stop_reason} | full suite: {suite_txt} | "
@@ -15966,6 +16025,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "purpose_assessment_errors": list(purpose_assessment_errors),
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
+            "product_invariants": product_invariants,
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
@@ -16059,6 +16119,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_fulfillment_pct=(purpose_gap or {}).get("fulfillment_pct"),
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
+            product_invariants_ready=product_invariants.get("ready") is True,
+            product_invariant_blockers=len(product_invariants.get("blockers") or []),
             review_incomplete=len(all_review_incomplete),
             # The accounting identity travels with the RESULT, not just the
             # report, because `_audit_exit_code` is the layer supervisors read.
@@ -16107,6 +16169,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         run_complete = (converged
                         and suite_status is not False
                         and (readiness is None or readiness.get("ready") is not False)
+                        and product_invariants.get("ready") is True
                         and ((evidence or {}).get("quality_gates") or {}).get("passed") is True)
         if evidence_ledger is not None:
             with contextlib.suppress(Exception):
@@ -16180,6 +16243,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                              "controls_executed": _cov.get("executed_control_total", 0)},
                 "purpose_confidence": result.get("purpose_confidence"),
                 "purpose_mutation_authorized": result.get("purpose_mutation_authorized"),
+                "product_invariants": {
+                    "ready": product_invariants.get("ready") is True,
+                    "blockers": [gate.get("id")
+                                 for gate in product_invariants.get("blockers") or []],
+                },
                 # The FULL claim, never a slice. A 160-character cut landed
                 # mid-word at "raw-socket e" and deleted the only sentence that
                 # said the network is NOT contained (i-5: an unenforceable
@@ -16593,6 +16661,13 @@ def _release_status(a: dict) -> tuple[str | None, list[str]]:
     blocked = None
     if a.get("error"):
         blocked = str(a["error"])
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants.get("ready") is not True:
+        ids = [str(gate.get("id") or "unknown")
+               for gate in product_invariants.get("blockers") or []]
+        invariant_block = ("purpose/competitive product invariants are not satisfied"
+                           + (": " + ", ".join(ids) if ids else ""))
+        blocked = f"{blocked}; {invariant_block}" if blocked else invariant_block
     return fp.production_ready_status(evidence, has_open_gaps=bool(gaps),
                                       blocked_reason=blocked)
 
@@ -16644,6 +16719,11 @@ def _print_audit_summary(a: dict) -> None:
               f"{prog.get('gaps_before', 0)}; "
               f"{prog.get('criteria_blocked_after', 0)} acceptance criterion(s) "
               "still blocked")
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants:
+        print(f"  product invariants: "
+              f"{'PASS' if product_invariants.get('ready') else 'BLOCKED'} "
+              f"({len(product_invariants.get('blockers') or [])} blocker(s))")
     status, unmet = _release_status(a)
     if status:
         print(f"  release status:   {status}"
@@ -16739,6 +16819,7 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "purpose_criteria_noise_band": (a.get("purpose_gap") or {}).get("criteria_noise_band"),
         "criteria_closed": a.get("criteria_closed"),
         "criteria_movement_is_real": a.get("criteria_movement_is_real"),
+        "product_invariants": a.get("product_invariants") or {},
         "release_status": _release_status(a)[0],
         "release_status_unmet": _release_status(a)[1],
         "paid_rescue": paid_rescue_stats(),
@@ -16902,6 +16983,21 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                 if b.get("remediation"):
                     L.append(f"  - Fix: {b['remediation']}")
             L.append("")
+
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants:
+        L += ["## Purpose and competitive-fit invariant", "",
+              f"**{'PASS' if product_invariants.get('ready') else 'BLOCKED'}** — "
+              f"{len(product_invariants.get('blockers') or [])} blocker(s).", ""]
+        for gate in product_invariants.get("gates") or []:
+            L.append(
+                f"- **{gate.get('id')}**: "
+                f"{'pass' if gate.get('passed') else 'BLOCKED'} — "
+                f"{gate.get('evidence', '')}"
+            )
+            if not gate.get("passed") and gate.get("remediation"):
+                L.append(f"  - Fix: {gate['remediation']}")
+        L.append("")
 
     # Competitor research. Absence is reported explicitly: a missing section
     # would read as "this program has no competitors", which is never what a
@@ -17898,7 +17994,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_runstate", "flexfactor_evidence", "flexfactor_purpose",
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
-                 "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
+                 "flexfactor_product_invariants", "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
                  "flexfactor_errors",
                  "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",
@@ -17915,6 +18011,11 @@ def runtime_manifest() -> dict:
         "egress": _egress.__name__ == "flexfactor_egress",
         "directed": _ff_directed.__name__ == "flexfactor_directed"
                     and _unfit_for_code_reason is _ff_directed.unfit_for_code_reason,
+        "product_invariants": (
+            _ff_product_invariants.__name__ == "flexfactor_product_invariants"
+            and callable(_ff_product_invariants.evaluate_product_invariants)
+            and callable(_ff_product_invariants.stamp_competitor_implementation)
+        ),
     }
     for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
         fn = globals().get("_WIRED_" + hook.upper())
