@@ -6,13 +6,13 @@ FlexFactor preserves the app's created purpose as the authority for every change
 
 A run cannot report convergence, finish its resumable checkpoint, or claim production readiness unless `flexfactor.product-invariants.v1` passes all of these gates:
 
-1. Purpose analysis is enabled and grounded in an owner-authored or strongly inferred purpose.
+1. Purpose analysis is enabled and grounded in an actually owner-authored contract (carrying its authored provenance bit) or a separately recorded strongly inferred purpose; inferred/generated text is never relabeled as authored.
 2. Baseline and final purpose assessments completed without provider or sampling errors.
 3. Every purpose criterion is fulfilled with no unknown or open gap.
-4. Competitor research ran within the last 30 days and corroborated the configured target count with source URLs.
+4. Competitor research ran within the last 30 days and the actual provenance-bearing records (not a reported counter) meet at least the configured target count; a snapshot cannot lower that target.
 5. Every candidate has a purpose-fit, duplicate, provenance, wiring, verification, and adoption-risk decision.
-6. Reuse mode is mechanically bounded by source ownership and license provenance; reference-only evidence cannot drive code changes.
-7. Every selected capability entered the normal build-gated fix stream, changed its named target in that competitor phase, was wired through the described boundary, gained focused executable tests mapped to that exact source target, and passed the repository's full verification suite and exact-tree quality gates.
+6. Reuse mode is mechanically bounded by source ownership and attributable license provenance; reference-only evidence cannot drive code changes, and direct reuse requires a known compatible-license record.
+7. Every selected capability entered the normal build-gated fix stream, changed its named target in that competitor phase, was wired through the described boundary, gained focused executable tests carrying that capability's stable evidence ID (so two features sharing a source file cannot certify each other), and passed the repository's full verification suite and exact-tree quality gates.
 
 It is valid to reject every competitor feature when the recorded purpose-fit, duplication, provenance, or risk review supports that decision. It is not valid to copy a competitor roadmap, silently drop an accepted candidate, or report a selected capability as delivered when only research or scaffolding exists.
 
