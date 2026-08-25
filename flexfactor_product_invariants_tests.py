@@ -41,6 +41,7 @@ def competitor(*, accept=True, applied=True, risk="low", mitigation=""):
             "target_applied": applied,
             "target_verified": applied,
             "test_files": ["tests/test_recovery.py"] if applied else [],
+            "all_generated_test_files": ["tests/test_recovery.py"] if applied else [],
             "verification_passed": applied,
         },
         "idea": {
@@ -69,6 +70,7 @@ def research(item=None, *, verified=5, target=5):
         "target": target,
         "verified": verified,
         "coverage_note": f"{verified}/{target}",
+        "implementation_evidence_version": "flexfactor.product-invariants.v1",
         "competitors": [item or competitor()],
     }
 
@@ -102,6 +104,7 @@ class ProductInvariantTests(unittest.TestCase):
             applied_files=["src/recovery.py"],
             unverified_files=[],
             test_files=["tests/test_recovery.py"],
+            tests_by_source={"src/recovery.py": ["tests/test_recovery.py"]},
             verification_passed=True,
         )
         item = ledger["competitors"][0]
@@ -113,6 +116,7 @@ class ProductInvariantTests(unittest.TestCase):
                 "target_applied": True,
                 "target_verified": True,
                 "test_files": ["tests/test_recovery.py"],
+                "all_generated_test_files": ["tests/test_recovery.py"],
                 "verification_passed": True,
             },
         )
@@ -122,10 +126,40 @@ class ProductInvariantTests(unittest.TestCase):
             applied_files=["src/recovery.py"],
             unverified_files=["src/recovery.py"],
             test_files=["tests/test_recovery.py"],
+            tests_by_source={"src/recovery.py": ["tests/test_recovery.py"]},
             verification_passed=True,
         )
         self.assertEqual(
             item["implementation_status"], "applied-verification-incomplete"
+        )
+
+    def test_unrelated_test_never_certifies_a_selected_capability(self):
+        ledger = research(competitor(applied=False))
+        ledger["competitors"][0]["bridge_status"] = "bridged"
+        ledger["competitors"][0]["entered_fix_stream"] = True
+        stamp_competitor_implementation(
+            competitor_research=ledger,
+            applied_files=["src/recovery.py"],
+            unverified_files=[],
+            test_files=["tests/test_other.py"],
+            tests_by_source={"src/other.py": ["tests/test_other.py"]},
+            verification_passed=True,
+        )
+        item = ledger["competitors"][0]
+        self.assertEqual(
+            item["implementation_status"], "applied-verification-incomplete"
+        )
+        self.assertEqual(item["implementation_evidence"]["test_files"], [])
+        result = evaluate(
+            competitor_research=ledger,
+            applied_files=["src/recovery.py"],
+            test_files=["tests/test_other.py"],
+            verification_passed=True,
+        )
+        self.assertFalse(result["ready"])
+        self.assertIn(
+            "no executable test artifact",
+            " ".join(gate["evidence"] for gate in result["blockers"]),
         )
 
     def test_complete_purpose_and_verified_selected_capability_pass(self):
@@ -202,6 +236,8 @@ class ProductInvariantTests(unittest.TestCase):
         market = competitors.read_text(encoding="utf-8")
         self.assertIn("evaluate_product_invariants(", source)
         self.assertIn("stamp_competitor_implementation(", source)
+        self.assertIn("tests_by_source=tests_by_source", source)
+        self.assertIn('competitor_research["unverified_files"]', source)
         self.assertIn("applied_c, unver_c, notes_c = _fix_files(", source)
         self.assertIn('competitor_research["applied_files"]', source)
         self.assertIn('and product_invariants.get("ready") is True', source)
