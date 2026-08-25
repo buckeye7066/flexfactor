@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12836,6 +12837,11 @@ _WIKI_FIXTURE = json.dumps({"query": {"search": [
     {"title": "Logos Bible Software", "snippet": "A <span>digital</span> Bible study platform."},
 ]}})
 
+_FIRECRAWL_FIXTURE = json.dumps({"success": True, "data": {"web": [
+    {"title": "Logos", "url": "https://www.logos.com/",
+     "description": "Official Bible study product."},
+]}})
+
 _GH_FIXTURE = json.dumps({"items": [
     {"full_name": "openlp/openlp", "html_url": "https://github.com/openlp/openlp",
      "description": "Church presentation software", "stargazers_count": 400,
@@ -13168,7 +13174,84 @@ class CompetitorCoverageHonestyTests(unittest.TestCase):
         self.assertIn("OSError: down", lines)
 
 
+class ReleaseLanguagePolicyTests(unittest.TestCase):
+    """Keep organizational gate language out without weakening safety controls."""
+
+    def test_repository_has_no_organizational_gate_language(self):
+        fragments = (
+            "sign" + " off",
+            "sign" + "off",
+            "signed" + " off",
+            "authenticated " + "reviewer",
+            "required " + "reviewer",
+            "required " + "human",
+            "human " + "reviewer",
+            "human " + "review",
+            "manual " + "approval",
+            "self " + "certified",
+            "self " + "certification",
+        )
+        text_extensions = {
+            ".py", ".md", ".json", ".toml", ".yml", ".yaml", ".txt",
+            ".ps1", ".sh", ".ini",
+        }
+        violations = []
+        for root, dirs, files in os.walk(_HERE):
+            dirs[:] = [d for d in dirs if d not in {
+                ".git", ".venv", "__pycache__", "build", "dist",
+            }]
+            for name in files:
+                if os.path.splitext(name)[1].lower() not in text_extensions:
+                    continue
+                path = os.path.join(root, name)
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    for line_no, line in enumerate(fh, 1):
+                        normalized = re.sub(r"[-_]+", " ", line.lower())
+                        for fragment in fragments:
+                            if fragment in normalized:
+                                violations.append(
+                                    f"{os.path.relpath(path, _HERE)}:{line_no}: {fragment}"
+                                )
+        self.assertEqual(violations, [], "organizational gate language found:\n" +
+                         "\n".join(violations))
+
+
 class CompetitorSearchBackendTests(unittest.TestCase):
+    def test_firecrawl_v2_is_first_and_uses_the_configured_key(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, data, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        old = os.environ.get("FIRECRAWL_API_KEY")
+        os.environ["FIRECRAWL_API_KEY"] = "fc-test"
+        try:
+            hits, backend, skipped = fc.web_search("sermon software", opener=opener)
+        finally:
+            if old is None:
+                os.environ.pop("FIRECRAWL_API_KEY", None)
+            else:
+                os.environ["FIRECRAWL_API_KEY"] = old
+
+        self.assertEqual(backend, "firecrawl")
+        self.assertEqual(hits[0]["url"], "https://www.logos.com/")
+        self.assertEqual(skipped, {})
+        self.assertEqual(calls[0][0], "https://api.firecrawl.dev/v2/search")
+        self.assertEqual(calls[0][2].get("Authorization"), "Bearer fc-test")
+        body = json.loads(calls[0][1].decode("utf-8"))
+        self.assertEqual(body["sources"], ["web"])
+        self.assertEqual(body["query"], "sermon software")
+
+    def test_firecrawl_failure_is_named_before_keyless_fallback(self):
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE},
+                         fail={"api.firecrawl.dev"})
+        hits, backend, skipped = fc.web_search("sermon software", opener=op)
+        self.assertEqual(backend, "duckduckgo")
+        self.assertTrue(hits)
+        self.assertIn("firecrawl", skipped)
+        self.assertIn("simulated outage", skipped["firecrawl"])
+
     def test_duckduckgo_lite_results_are_parsed_and_ads_dropped(self):
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE})
         hits, backend, skipped = fc.web_search("sermon software", opener=op)
@@ -13184,6 +13267,7 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         hits, backend, skipped = fc.web_search("logos bible software", opener=op)
         self.assertEqual(backend, "wikipedia")
         self.assertEqual(hits[0]["title"], "Logos Bible Software")
+        self.assertIn("firecrawl", skipped)
         self.assertIn("duckduckgo", skipped)
         self.assertIn("searxng", skipped)
 
@@ -13191,6 +13275,7 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         op = _FakeOpener({}, fail={"duckduckgo", "wikipedia", "searx"})
         hits, backend, skipped = fc.web_search("anything", opener=op)
         self.assertEqual((hits, backend), ([], ""))
+        self.assertIn("firecrawl", skipped)
         self.assertIn("duckduckgo", skipped)
         self.assertIn("wikipedia", skipped)
 

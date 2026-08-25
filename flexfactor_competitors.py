@@ -66,6 +66,7 @@ DEFAULT_TARGET = 5
 DEFAULT_FIX_STREAM_CAP = 5
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlexFactor-competitor-research"
 _HTTP_TIMEOUT = 25.0
+_FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
 
 # The caller may install flexfactor's own licence oracle (`_license_compatible`)
 # so there is a SINGLE source of truth at runtime and the scout integrate gate
@@ -196,6 +197,62 @@ def _default_opener(url: str, data: bytes | None = None,
     return raw.decode("utf-8", "replace")
 
 
+def _firecrawl(query: str, limit: int, opener) -> list[dict]:
+    """Firecrawl v2 search, authenticated when a key is configured.
+
+    Firecrawl is the freshest evidence source in the search ladder, but it is
+    optional.  A missing key still gets one keyless attempt; any HTTP, schema,
+    or account failure is surfaced by :func:`web_search` as a named skip before
+    the keyless fallbacks run.  No synthetic result is ever substituted.
+    """
+    endpoint = (os.environ.get("FLEXFACTOR_FIRECRAWL_URL") or
+                _FIRECRAWL_SEARCH_URL).strip()
+    if not endpoint.startswith(("https://", "http://")):
+        raise RuntimeError("FLEXFACTOR_FIRECRAWL_URL must be an http(s) URL")
+
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json"}
+    key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = json.dumps({
+        "query": query,
+        "limit": max(1, min(int(limit), 20)),
+        "sources": ["web"],
+        "safe": True,
+    }).encode("utf-8")
+    root = json.loads(opener(endpoint, payload, headers))
+    if not isinstance(root, dict) or root.get("success") is False:
+        raise RuntimeError("Firecrawl v2 reported failure or invalid JSON shape")
+
+    data = root.get("data")
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and isinstance(data.get("web"), list):
+        items = data["web"]
+    elif isinstance(root.get("web"), list):
+        items = root["web"]
+    else:
+        items = []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("https://", "http://")) or url in seen:
+            continue
+        seen.add(url)
+        title = str(item.get("title") or url).strip()
+        snippet = str(item.get("description") or item.get("snippet") or
+                      item.get("markdown") or "").strip()
+        out.append({"title": title, "url": url, "snippet": snippet[:4000]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 _DDG_AD_MARKERS = ("duckduckgo.com/y.js", "duckduckgo.com/duckduckgo-help-pages")
 
 
@@ -256,9 +313,11 @@ def _searxng(query: str, limit: int, opener) -> list[dict]:
             for r in (data.get("results") or [])[:limit] if r.get("url")]
 
 
-# Ordered ladder. SearXNG first when configured (owner-hosted, no rate limit),
-# then DDG Lite (real organic web results), then Wikipedia (narrow but reliable).
-_WEB_BACKENDS = (("searxng", _searxng), ("duckduckgo", _ddg_lite),
+# Ordered ladder. Firecrawl supplies current market evidence first (with or
+# without an account key), then the owner-hosted/keyless fallbacks preserve an
+# offline-capable path instead of turning a provider outage into fake coverage.
+_WEB_BACKENDS = (("firecrawl", _firecrawl), ("searxng", _searxng),
+                 ("duckduckgo", _ddg_lite),
                  ("wikipedia", _wikipedia))
 
 
