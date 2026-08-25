@@ -91,6 +91,7 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
             str(path).replace("\\", "/")
             for path in (paths or [])
             if str(path).strip()
+            and str(path).replace("\\", "/") in tests
         })
         for capability, paths in (tests_by_capability or {}).items()
     }
@@ -101,7 +102,10 @@ def stamp_competitor_implementation(*, competitor_research: dict | None,
         target = str(idea.get("file") or "").replace("\\", "/")
         target_applied = bool(target and target in applied)
         target_verified = bool(target_applied and target not in unverified)
-        target_tests = capability_tests.get(capability_id, [])
+        target_tests = sorted(
+            set(capability_tests.get(capability_id, []))
+            & set(source_tests.get(target, []))
+        )
         implementation_evidence = {
             "capability_id": capability_id,
             "target_file": target,
@@ -139,6 +143,12 @@ def _value(item: Any, key: str, default=None):
 
 def _text(value: Any) -> str:
     return " ".join(str(value or "").split())
+
+
+def _attributable(value: Any) -> bool:
+    return _text(value).lower() not in {
+        "", "unknown", "unverified", "none", "n/a", "not recorded", "missing",
+    }
 
 
 def _utc_timestamp_is_current(value: Any, max_age_days: int = 30) -> bool:
@@ -189,7 +199,7 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     gates: list[dict] = []
     confidence = _text(purpose_confidence).lower()
     authored = bool(_value(purpose_contract, "authored", False))
-    authoritative = authored or confidence in {"owner-authored", "strongly-inferred"}
+    authoritative = authored or confidence == "strongly-inferred"
     gates.append(_gate(
         "purpose-authority",
         purpose_enabled and authoritative,
@@ -230,15 +240,22 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     reported_target = max(1, int(research.get("target") or configured_target))
     target = max(configured_target, reported_target)
     reported_verified = int(research.get("verified") or 0)
-    verified = sum(
-        1
-        for competitor in competitors
-        if competitor.get("evidence_status") == "verified"
-        and any(
-            _text(url).startswith(("https://", "http://"))
+    verified = 0
+    verified_names: set[str] = set()
+    verified_sources: set[str] = set()
+    for competitor in competitors:
+        name_key = _text(competitor.get("name")).lower()
+        source_keys = {
+            _text(url).lower()
             for url in (competitor.get("evidence_urls") or [])
-        )
-    )
+            if _text(url).startswith(("https://", "http://"))
+        }
+        if (competitor.get("evidence_status") == "verified"
+                and name_key and name_key not in verified_names
+                and source_keys - verified_sources):
+            verified += 1
+            verified_names.add(name_key)
+            verified_sources.update(source_keys)
     current = _utc_timestamp_is_current(research.get("researched_at"))
     gates.append(_gate(
         "competitive-research-current",
@@ -284,7 +301,9 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
                 )
             except Exception:
                 compatible = None
-            if not license_name or not license_source or compatible is not True:
+            if (not _attributable(license_name)
+                    or not _attributable(license_source)
+                    or compatible is not True):
                 copying_failures.append(
                     f"{name}: direct reuse without an attributable compatible-license record"
                 )
