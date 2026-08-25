@@ -8090,7 +8090,9 @@ TEST_GEN_SCHEMA = {
 }
 
 
-def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") -> dict:
+def _gen_unit_tests(author, rel: str, text: str, test_cmd: list,
+                    pfx: str = "",
+                    required_capabilities: list[dict] | None = None) -> dict:
     """Generate unit tests for ONE module, with one bounded budget retry.
 
     Live Family Castle Clash 2026-08-14: large modules (server/index.js,
@@ -8102,8 +8104,37 @@ def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") 
     the most critical functions, so the largest modules get their most
     important tests instead of none at all. Any other failure, and a second
     budget failure, still raise (the caller records the [skip])."""
+    capability_prompt = ""
+    if required_capabilities:
+        capability_rows = []
+        for capability in required_capabilities:
+            capability_id = str(capability.get("capability_id") or "").strip()
+            if not capability_id:
+                continue
+            capability_rows.append({
+                "capability_id": capability_id,
+                "marker": f"FLEXFACTOR_CAPABILITY:{capability_id}",
+                "title": str(capability.get("title") or ""),
+                "behavior": str(capability.get("behavior") or ""),
+                "verification_plan": str(capability.get("verification_plan") or ""),
+            })
+        if capability_rows:
+            capability_prompt = (
+                "\n\nREQUIRED COMPETITOR CAPABILITY REGRESSIONS:\n"
+                "For EACH row below, write a distinct executable regression test "
+                "that proves the described behavior and follows its verification "
+                "plan. Put that row's exact FLEXFACTOR_CAPABILITY marker in the "
+                "test name when the framework permits it, or in a comment directly "
+                "adjacent to that test. A marker without executable assertions is "
+                "invalid, and one capability's test cannot certify another.\n"
+                + _fence_untrusted(
+                    "capability-regressions",
+                    json.dumps(capability_rows, sort_keys=True),
+                )
+            )
     prompt = (f"MODULE: {rel}\nTest framework command: {' '.join(test_cmd)}\n\n"
               "SOURCE:\n" + _fence_untrusted("source", text)
+              + capability_prompt
               + "\n\nWrite runnable unit tests for this module's functions.")
     try:
         return author.structured(UNIT_TEST_SYSTEM, prompt, TEST_GEN_SCHEMA,
@@ -15423,8 +15454,26 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # the tree and hid the native failures behind it.  Unchanged code is
         # covered by native-suite/import-path evidence; changed behavior without
         # such evidence is targeted here and remains blocked by the final ledger.
+        competitor_capabilities_by_source: dict[str, list[dict]] = {}
+        for _cap_index, _competitor in enumerate(
+                (competitor_research or {}).get("competitors") or []):
+            _idea = _competitor.get("idea") or {}
+            _capability_id = _ff_product_invariants.competitor_capability_id(
+                _competitor, _cap_index)
+            _competitor["capability_id"] = _capability_id
+            _target = str(_idea.get("file") or "").replace("\\", "/")
+            if (_idea.get("accept") is True
+                    and _competitor.get("entered_fix_stream") is True
+                    and _target):
+                competitor_capabilities_by_source.setdefault(_target, []).append({
+                    "capability_id": _capability_id,
+                    "title": str(_idea.get("idea_title") or ""),
+                    "behavior": str(_idea.get("what_it_does") or ""),
+                    "verification_plan": str(_idea.get("verification_plan") or ""),
+                })
         test_files: list[str] = []
         tests_by_source: dict[str, list[str]] = {}
+        tests_by_capability: dict[str, list[str]] = {}
         test_status = None
         if (args.tests and stack.get("test_cmd") and not dirty_abort
                 and not infrastructure_abort):
@@ -15459,8 +15508,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     continue
                 if read_status == "empty":
                     continue  # a GENUINELY empty module -> nothing to test-gen, skip quietly
+                _required_capabilities = competitor_capabilities_by_source.get(
+                    rel.replace("\\", "/"), [])
                 try:
-                    gen = _gen_unit_tests(author, rel, text, stack["test_cmd"], pfx=pfx)
+                    gen = _gen_unit_tests(
+                        author, rel, text, stack["test_cmd"], pfx=pfx,
+                        required_capabilities=_required_capabilities)
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     manual_review.add(rel)
@@ -15491,6 +15544,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     _test_rel = os.path.relpath(written, project_dir).replace("\\", "/")
                     test_files.append(_test_rel)
                     tests_by_source.setdefault(rel.replace("\\", "/"), []).append(_test_rel)
+                    _capability_test_evidence = (
+                        _ff_product_invariants.collect_capability_test_evidence(
+                            test_path=_test_rel,
+                            contents=str(f.get("contents") or ""),
+                            required_capabilities=_required_capabilities,
+                        )
+                    )
+                    for _capability_id, _paths in _capability_test_evidence.items():
+                        tests_by_capability.setdefault(
+                            _capability_id, []).extend(_paths)
             if test_files:
                 ok, log = _run_unit_tests(project_dir, stack)
                 test_status = ok
@@ -15528,6 +15591,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             "file(s) after the native test command failed")
                         test_files = []
                         tests_by_source = {}
+                        tests_by_capability = {}
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
@@ -15946,11 +16010,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             unverified_files=_competitor_unverified,
             test_files=test_files,
             tests_by_source=tests_by_source,
+            tests_by_capability=tests_by_capability,
             verification_passed=_verification_passed,
         )
 
         _contract_evidence = dict(result.get("purpose_contract") or {})
-        _contract_evidence["authored"] = purpose_contract is not None
+        _contract_evidence["authored"] = bool(
+            purpose_contract is not None
+            and getattr(purpose_contract, "authored", False)
+        )
         product_invariants = _ff_product_invariants.evaluate_product_invariants(
             purpose_enabled=bool(getattr(args, "purpose_gap", True)),
             purpose_contract=_contract_evidence,
@@ -15965,6 +16033,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             applied_files=_competitor_applied,
             test_files=test_files,
             verification_passed=_verification_passed,
+            license_compatible=_license_compatible,
         )
         if not product_invariants.get("ready"):
             converged = False
@@ -18027,6 +18096,7 @@ def runtime_manifest() -> dict:
             _ff_product_invariants.__name__ == "flexfactor_product_invariants"
             and callable(_ff_product_invariants.evaluate_product_invariants)
             and callable(_ff_product_invariants.stamp_competitor_implementation)
+            and callable(_ff_product_invariants.collect_capability_test_evidence)
         ),
     }
     for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
