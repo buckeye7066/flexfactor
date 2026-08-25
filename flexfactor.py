@@ -6266,23 +6266,28 @@ def _version_conflict(finding: dict, versions: dict) -> str | None:
 
 
 def _detect_verify(project_dir: str) -> tuple[bool, list[list[str]] | None]:
-    """Return (is_node, verify_commands). `verify_commands is None` is the REFUSED
-    sentinel: package.json exists but couldn't be safely read, so the caller must NOT
-    proceed with verification silently off (a refused build config fails closed)."""
-    status, raw_pkg = _read_package_json(project_dir)
+    """Return (is_node, executable verification commands).
+
+    `None` is the REFUSED sentinel for an unreadable package configuration.
+    Verification is repository-wide: Node scripts, Python tests, and detected
+    Go/Rust/Java/.NET/etc. toolchains all count. An empty list therefore means
+    no target command was found, not merely "no package.json build script".
+    """
+    status, _raw_pkg = _read_package_json(project_dir)
     if status == "refused":
-        return True, None  # refused sentinel -> caller fails closed (checked FIRST)
-    if status == "missing" or not raw_pkg:
-        return False, []
-    scripts = {}
-    try:
-        scripts = (json.loads(raw_pkg).get("scripts") or {})
-    except ValueError:
-        pass
-    for name in ("build", "lint", "typecheck"):
-        if name in scripts:
-            return True, [["npm", "run", name]]
-    return True, []  # node project but no verify script -> install-only check
+        return True, None
+    stack = _detect_stack(project_dir)
+    if stack.get("config_refused"):
+        return bool(stack.get("is_node")), None
+    commands: list[list[str]] = []
+    for cmd in stack.get("verify_cmds") or []:
+        if cmd and cmd not in commands:
+            commands.append(cmd)
+    for key in ("full_suite_cmd", "test_cmd"):
+        cmd = stack.get(key)
+        if cmd and cmd not in commands:
+            commands.append(cmd)
+    return bool(stack.get("is_node")), commands
 
 
 def generate_integration(provider, project_dir: str, profile_blob: str,
@@ -6471,7 +6476,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                            "verification was disabled; refusing to retain generated changes")
     if not verify_cmds:
         return ApplyResult(repo_name, "skipped-unverified",
-                           "no build/lint/typecheck command was detected; refusing to retain "
+                           "no build/test/lint/typecheck command was detected; refusing to retain "
                            "generated changes that nothing can verify")
 
     prev_branch = _git_current_branch(project_dir) if git else None
@@ -6574,7 +6579,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             verify_note = ("NOT VERIFIED - verification disabled (--no-verify); "
                            "nothing executed the project's code")
         elif not verify_cmds:
-            verify_note = ("NOT VERIFIED - no build/lint/typecheck script detected, "
+            verify_note = ("NOT VERIFIED - no build/test/lint/typecheck command detected, "
                            "so no command ran and nothing executed the project's code")
         if opts.verify and verify_cmds:
             verify_env = (_no_network_env()
@@ -7442,6 +7447,15 @@ def run_scout(args) -> int:
     print(f"Integration proposals:   {artifacts['proposals_json']}")
     print("Target mutation requires separate FlexFactor apply approval "
           f"({_scout_contract.FLEXFACTOR_APPLY_APPROVAL_FILE}).")
+    qualifying = [e for e in evaluations
+                  if _qualifies_for_apply(e, args.apply_tier)]
+    if (getattr(args, "apply", False)
+            and qualifying
+            and not any(r.status.startswith("applied") for r in applied)):
+        print("error: --apply requested mutations, but every qualifying result "
+              "was skipped, refused, proposal-only, or failed; zero changes landed.",
+              file=sys.stderr)
+        return 4
     return 0
 
 
@@ -7569,15 +7583,15 @@ def _verify_disclosure(args, project_dir: str) -> str:
     (or will not) execute for THIS run - enabled with detected commands,
     enabled with none detected, disabled by --no-verify, or refused config."""
     if not getattr(args, "verify", True):
-        return ("  Verify:    DISABLED (--no-verify) - the generated files are "
-                "committed WITHOUT any build check; nothing executes them")
+        return ("  Verify:    DISABLED (--no-verify) - apply will be REFUSED "
+                "before generation; no files will be written or committed")
     is_node, cmds = _detect_verify(project_dir)
     if cmds is None:
         return ("  Verify:    package.json unreadable (containment) - the apply "
                 "will be REFUSED fail-closed; nothing will run")
     if not cmds:
-        return ("  Verify:    no build/lint script detected - the change is "
-                "committed WITHOUT executing the project's code")
+        return ("  Verify:    no build/test/lint/typecheck command detected - "
+                "apply will be REFUSED before generation; nothing will mutate")
     joined = "; ".join(" ".join(c) for c in cmds)
     iso = ("under best-effort network isolation (proxy-poisoned env; raw "
            "sockets NOT blocked)"
@@ -7706,6 +7720,28 @@ def _apply_phase(args, profile_name: str, profile: dict,
         if not may:
             print(f"   proposal-only: {why}")
             results.append(ApplyResult(name, "proposal-only", why))
+            continue
+        # Refuse a guaranteed no-land result before either paid generation pass.
+        # The apply implementation repeats this immediately before mutation as
+        # defense in depth, but billing must not occur for an unverifiable target.
+        if not getattr(args, "verify", True):
+            detail = ("verification was disabled; refusing before generation "
+                      "because generated changes could not be retained")
+            print(f"   skipped-unverified: {detail}")
+            results.append(ApplyResult(name, "skipped-unverified", detail))
+            continue
+        _is_node, preflight_cmds = _detect_verify(project_dir)
+        if preflight_cmds is None:
+            detail = ("package.json could not be safely read; refusing before "
+                      "generation without a trustworthy verification gate")
+            print(f"   skipped-config-refused: {detail}")
+            results.append(ApplyResult(name, "skipped-config-refused", detail))
+            continue
+        if not preflight_cmds:
+            detail = ("no build/test/lint/typecheck command was detected; "
+                      "refusing before generation")
+            print(f"   skipped-unverified: {detail}")
+            results.append(ApplyResult(name, "skipped-unverified", detail))
             continue
         try:
             patch, plan = generate_integration(provider, project_dir, blob, e["need"], e["result"])
@@ -13234,12 +13270,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     return applied, unverified, notes
 
 
-def _gh_pr_automerge(project_dir: str, branch: str, base: str) -> str:
-    """Protected-base fallback: land `branch` on `base` via a GitHub PR with
-    auto-merge, for remotes that refuse direct pushes (required checks /
-    enforce_admins - e.g. a production main). The work still reaches `base`,
-    just through the repo's own gate instead of around it. Returns a human
-    status fragment; never raises."""
+def _gh_pr_automerge(project_dir: str, branch: str, base: str,
+                     stack: dict) -> str:
+    """Protected-base fallback with its own fail-closed publication gate.
+
+    The gate lives inside this mutation helper, so adding a new caller cannot
+    bypass it. Only an exact True may reach `gh pr merge --auto`; False and
+    None both refuse before PR creation.
+    """
+    final_ok, gate_log = _publication_gate(project_dir, stack)
+    if final_ok is not True:
+        state = ("failed" if final_ok is False else
+                 "did not run (no build/verify command exists)")
+        return (f"PR auto-merge REFUSED - publication verification {state}: "
+                f"{_tail(gate_log, 3)}")
     if not shutil.which("gh"):
         return (f"gh CLI not available - branch {branch} is pushed; "
                 f"open a PR to land it on {base}")
@@ -13414,7 +13458,7 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                     land = f"flexfactor/land-{head[:8]}"
                     lp = _git(["push", "origin", f"HEAD:refs/heads/{land}"], project_dir)
                     if lp.returncode == 0:
-                        status += f"; {_gh_pr_automerge(project_dir, land, branch)}"
+                        status += f"; {_gh_pr_automerge(project_dir, land, branch, stack)}"
                     else:
                         status += (f"; could not publish {land}: {_tail(lp.stderr, 2)}"
                                    f" - the work is committed locally on {branch}")
@@ -13465,7 +13509,7 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                         # the repo's own gate: a PR with auto-merge.
                         _git(["reset", "--hard", base_sha], project_dir)
                         status += (f" (direct push to {prev_branch} rejected; local merge "
-                                   f"undone; {_gh_pr_automerge(project_dir, branch, prev_branch)})")
+                                   f"undone; {_gh_pr_automerge(project_dir, branch, prev_branch, stack)})")
                     else:
                         status += f" (main push failed: {_tail(mp.stderr, 2)})"
             else:
@@ -17413,7 +17457,8 @@ def main(argv=None) -> int:
                             dest="apply_tier",
                             help="Which recommendations to apply: 'adopt' (default) or also 'consider'.")
         parser.add_argument("--no-verify", action="store_false", dest="verify",
-                            help="Skip the build-verify gate before committing (not recommended).")
+                            help="Disable verification; --apply will refuse before "
+                                 "generation and will not mutate the target.")
         parser.add_argument("--no-isolate-verify", action="store_false",
                             dest="isolate_verify", default=True,
                             help="Run the build-verify step WITHOUT the best-effort "
