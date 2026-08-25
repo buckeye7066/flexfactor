@@ -79,7 +79,7 @@
     },
     {
       "id": "cb-9",
-      "text": "Scout apply does NOT use the orphan-WIP transaction; it uses per-file byte backups with rollback and skips a dirty tree unless --allow-dirty.",
+      "text": "Scout apply uses the same orphan-WIP transaction as audit for --allow-dirty, restores the owner's exact pre-run state in a finally, and separately snapshots generated-edit targets for rollback.",
       "confidence": "verified",
       "evidence_refs": [
         3
@@ -87,8 +87,8 @@
     },
     {
       "id": "cb-10",
-      "text": "head_matches builds argv ['git','rev-parse','HEAD'] but the audit path calls it with _git, which prepends 'git' again; the commit-race guard therefore always reports a mismatch and REVOKES approval (fail-closed, but the independent-final-review gate cannot pass on the audit path).",
-      "confidence": "contradicted",
+      "text": "The independent-review commit-race guard calls head_matches with _git_argv, which supplies one complete git argv; approval is revoked if the exact reviewed SHA no longer matches HEAD.",
+      "confidence": "verified",
       "evidence_refs": [
         3,
         8,
@@ -335,14 +335,6 @@
       ]
     },
     {
-      "id": "g-7",
-      "text": "Scout apply can still COMMIT a change no command verified, when the target exposes no build/lint/typecheck script. The owner is told twice - on the approval card before approving and in the ApplyResult afterwards - and a FAILING verify command still rolls back, but 'never retains unverified changes' is satisfied here by DISCLOSURE rather than by refusal, unlike the audit path where _commit_and_sync hard-resets on any non-True gate. Whether scout should refuse instead is an owner design decision with real blast radius: it would block every repo that has no build script.",
-      "confidence": "verified",
-      "evidence_refs": [
-        25
-      ]
-    },
-    {
       "id": "g-8",
       "text": "The invariant sweep reads the tree statically. It proves that no call site READS a tri-state gate with truthiness and that no undeclared function issues git commit/push/merge; it does not prove the declared gates behave correctly at runtime. That remains the job of the behavioural tests in flexfactor_tests.VacuousGateTests and the forced verifier-outage CI step.",
       "confidence": "verified",
@@ -547,8 +539,8 @@
       "kind": "source",
       "locator": "flexfactor.py _apply_integration_impl verify_note",
       "content_hash": "933731594aaa4de860e0d1653b7122b907a638377c3de5578effdb9b5c496f00",
-      "observed_at": "2026-08-25T00:00:00Z",
-      "excerpt": "Scout apply reported status 'applied' / 'committed on branch X' identically whether the project's build had proven the change or NO verify command existed at all (_detect_verify returns [] for a repo with no build/lint/typecheck script, and for a non-node repo). The approval card already disclosed it (_verify_disclosure); the RESULT did not. ApplyResult.detail now carries 'NOT VERIFIED - ...' in both the no-command and --no-verify cases. Fixed 2026-08-25."
+      "observed_at": "2026-08-25T16:45:00Z",
+      "excerpt": "Scout apply now refuses with skipped-unverified before its first mutation when verification is disabled or no build/lint/typecheck command is detected. A failing executed command still rolls back. Pinned by ScoutUnverifiedRetentionTests."
     },
     {
       "kind": "test",
