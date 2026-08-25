@@ -13208,16 +13208,14 @@ class ReleaseLanguagePolicyTests(unittest.TestCase):
             "self " + "certified",
             "self " + "certification",
         )
-        text_extensions = {
-            ".py", ".md", ".json", ".toml", ".yml", ".yaml", ".txt",
-            ".ps1", ".sh", ".ini",
-        }
         violations = []
         for path in self._candidate_paths(_HERE):
-            if os.path.splitext(path)[1].lower() not in text_extensions:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            if b"\0" in raw:
                 continue
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                normalized = re.sub(r"[-_\s]+", " ", fh.read().lower())
+            normalized = re.sub(
+                r"[-_\s]+", " ", raw.decode("utf-8", "replace").lower())
             for fragment in fragments:
                 if fragment in normalized:
                     violations.append(f"{os.path.relpath(path, _HERE)}: {fragment}")
