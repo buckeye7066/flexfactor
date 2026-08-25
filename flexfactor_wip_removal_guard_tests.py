@@ -81,9 +81,36 @@ class RefusalReasonTests(unittest.TestCase):
             self.assertTrue(wip.refuse_removal_reason(self.root, rel),
                             f"{rel!r} must be refused")
 
-    def test_absolute_paths_are_refused(self):
-        self.assertTrue(wip.refuse_removal_reason(self.root, r"C:\Windows\System32"))
-        self.assertTrue(wip.refuse_removal_reason(self.root, "/etc/passwd"))
+    def test_absolute_paths_are_refused_on_EVERY_platform(self):
+        r"""Rooted on either platform's rules, refused on both.
+
+        This test asserted `C:\Windows\System32` unconditionally while running
+        only on Windows. Wired into CI on 2026-08-25 it failed on ubuntu, and
+        the failure was real: `os.path.isabs` / `os.path.splitdrive` answer for
+        the HOST, so on Linux a drive-letter path was an ordinary relative
+        filename and sailed through a containment guard. A rule whose answer
+        depends on the host is not one rule.
+        """
+        for rel in (r"C:\Windows\System32", "D:/x", "/etc/passwd",
+                    "\\\\server\\share", "\\rooted"):
+            self.assertTrue(wip.refuse_removal_reason(self.root, rel),
+                            f"{rel!r} must be refused on every platform")
+
+    def test_the_rooted_check_does_not_consult_the_host(self):
+        """Prove the OTHER platform's answer from this one.
+
+        The test above exercises whichever branch this host happens to take, so
+        on Windows it would stay green even if the cross-platform branch were
+        deleted. `_is_rooted_anywhere` is pure string logic with no os.path in
+        it, which is exactly why it can be checked here and hold there.
+        """
+        for rel in (r"C:\Windows\System32", "D:/x", "/etc/passwd",
+                    "\\\\server\\share", "\\rooted", "/"):
+            self.assertTrue(wip._is_rooted_anywhere(rel), repr(rel))
+        for rel in ("scratch.txt", "sub/dir/file.txt", "a:b.txt", "C:relative",
+                    "..", "x\\y"):
+            self.assertFalse(wip._is_rooted_anywhere(rel),
+                             f"{rel!r} is a legitimate relative path")
 
     def test_the_project_root_itself_is_refused(self):
         for rel in (".", "./", ""):
