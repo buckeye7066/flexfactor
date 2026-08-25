@@ -216,6 +216,13 @@ class _TriStateScanner(ast.NodeVisitor):
         if isinstance(expr, ast.Name):
             if expr.id in self._tri and expr.id not in self._narrowed:
                 self.violations.append((expr.lineno, expr.id, why))
+        elif isinstance(expr, ast.Call):
+            # Direct boolean reads never create an assignment for visit_Assign
+            # to mark. A scalar tri-state call can treat None as false, while a
+            # tuple-returning gate is always truthy regardless of its verdict.
+            callee = self._callee(expr)
+            if callee in self.producers:
+                self.violations.append((expr.lineno, callee + "()", why))
         elif isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
             self._flag(expr.operand, why + "/not")
         elif isinstance(expr, ast.BoolOp):
@@ -309,12 +316,14 @@ _MUTATION_SITES = {
         "flexfactor_cmdpolicy classifies it like every other process."
     ),
     "_apply_integration_impl": (
-        "scout apply. Gate is exception-based, not tri-state: a failing verify "
-        "command raises ApplyError, which rolls every touched file back before "
-        "any commit. The no-command case cannot raise, so it is disclosed "
-        "instead - _verify_disclosure on the approval card BEFORE the owner "
-        "approves, and `verify_note` in the ApplyResult AFTER, so an "
-        "integration nothing executed can never read as a verified one."
+        "scout apply. It refuses before mutation unless at least one detected "
+        "verify command is enabled; every command must exit zero before commit. "
+        "Any failure raises ApplyError and restores every touched file."
+    ),
+    "_gh_pr_automerge": (
+        "protected-base publication helper. It is reached only from "
+        "_commit_and_sync after final_ok is exactly True and enables GitHub "
+        "auto-merge, leaving required branch checks authoritative."
     ),
 }
 
@@ -342,10 +351,17 @@ def scan_git_mutation_sites(source: str) -> dict[str, list[int]]:
                 # real `run(["git", "commit", ...])` was not - and
                 # flexfactor_autoclean's commit of the owner's working tree sat
                 # outside the registry, undeclared, for exactly that reason.
-                if isinstance(elts[0], ast.Constant) and elts[0].value in ("git", "gh"):
-                    elts = elts[1:]
-                if (elts and isinstance(elts[0], ast.Constant)
-                        and elts[0].value in _GIT_MUTATIONS):
+                values = [e.value if isinstance(e, ast.Constant) else None
+                          for e in elts]
+                mutates = (
+                    bool(values) and values[0] in _GIT_MUTATIONS
+                ) or (
+                    len(values) > 1 and values[0] == "git"
+                    and values[1] in _GIT_MUTATIONS
+                ) or (
+                    len(values) > 2 and values[:3] == ["gh", "pr", "merge"]
+                )
+                if mutates:
                     found.setdefault(stack[-1] if stack else "<module>",
                                      []).append(node.lineno)
             self.generic_visit(node)
@@ -644,6 +660,30 @@ class TriStateTruthinessSweepTests(unittest.TestCase):
         hits = scan_tristate_truthiness(canary, producers)
         self.assertTrue(hits, "`if not ok:` on a tri-state was not caught")
 
+    def test_canary_a_direct_gate_call_IS_caught(self):
+        canary = (
+            "def _gate(p) -> bool | None:\n"
+            "    return None\n"
+            "def publish(p):\n"
+            "    if _gate(p):\n"
+            "        push()\n"
+        )
+        producers = discover_tristate_producers({"<canary>": canary})
+        hits = scan_tristate_truthiness(canary, producers)
+        self.assertTrue(any(name == "_gate()" for _, name, _ in hits), hits)
+
+    def test_canary_a_direct_tuple_gate_call_IS_caught(self):
+        canary = (
+            "def _gate(p) -> tuple[bool | None, str]:\n"
+            "    return None, ''\n"
+            "def publish(p):\n"
+            "    if _gate(p):\n"
+            "        push()\n"
+        )
+        producers = discover_tristate_producers({"<canary>": canary})
+        hits = scan_tristate_truthiness(canary, producers)
+        self.assertTrue(any(name == "_gate()" for _, name, _ in hits), hits)
+
     def test_canary_an_already_narrowed_read_is_NOT_flagged(self):
         # The other half of "does not cry wolf": code that has already
         # collapsed the tri-state to a bool must stay green, or the rule gets
@@ -723,6 +763,14 @@ class GitMutationGateSweepTests(unittest.TestCase):
         )
         self.assertEqual(scan_git_mutation_sites(canary).get("ship"), [2],
                          "a git-prefixed argv must be seen as a mutation site")
+
+    def test_canary_a_gh_pr_merge_IS_caught(self):
+        canary = (
+            "def ship(p):\n"
+            "    run(['gh', 'pr', 'merge', 'branch', '--auto'], p)\n"
+        )
+        self.assertEqual(scan_git_mutation_sites(canary).get("ship"), [2],
+                         "gh pr merge must be seen as a mutation site")
 
     def test_canary_a_non_mutating_git_command_is_NOT_flagged(self):
         canary = "def look(p):\n    run(['git', 'status'], p)\n"
@@ -1126,6 +1174,18 @@ class BlockedCoverageDeclarationWiringTests(unittest.TestCase):
         self.assertEqual(out["meta"]["blocked_file"]["declared"], 1)
         self.assertEqual(out["meta"]["blocked_file"]["accepted"], 0)
 
+    def test_a_rejected_declaration_reaches_and_blocks_the_merged_gate(self):
+        import flexfactor_coverage as cov
+        merged = cov.merge_into_function_coverage(
+            {"functions": [{"id": "sym:1", "name": "f"}]},
+            [{"id": "sym:1", "status": "direct", "evidence": {"ran": True}}],
+            blocked=[],
+            blocked_rejected=[{"id": "sym:1", "raw_reason": "",
+                               "why": "reason is required"}])
+        self.assertFalse(merged["direct_gate"]["complete"])
+        self.assertEqual(merged["direct_gate"]["blocked_without_reason"], ["sym:1"])
+        self.assertEqual(merged["direct_gate"]["blocked_declared"], 1)
+
     def test_an_unreasoned_block_is_unrepresentable_not_merely_ignored(self):
         import flexfactor_coverage as cov
         with self.assertRaises(cov.BlockedDeclarationError):
@@ -1201,8 +1261,9 @@ class SweepIsWiredIntoCITests(unittest.TestCase):
         """
         wf = _read(self._WORKFLOW)
         modules = sorted(
-            f for f in os.listdir(_HERE)
-            if f.endswith(".py") and _is_test_module(f))
+            os.path.relpath(path, _HERE).replace(os.sep, "/")
+            for path in repo_python_files(include_tests=True)
+            if _is_test_module(os.path.basename(path)))
         missing = [m for m in modules
                    if m not in wf and m not in self._NOT_IN_CI]
         self.assertEqual(missing, [], (
