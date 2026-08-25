@@ -44,6 +44,20 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         raw = ("manual" + "\n_-" + "approval").encode()
         self.assertIn("manual_gate", policy.matching_labels(raw))
 
+    def test_jsx_and_static_string_boundaries_are_detected(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            f"<span>{first}</span><span>{second}</span>",
+            f'"{first}" + " {second}"',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "component.jsx"),
+                )
+
     def test_sparse_tracked_blob_is_read_from_the_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

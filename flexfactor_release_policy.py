@@ -27,6 +27,23 @@ _EXCLUDED_DIRECTORIES = {
     "node_modules",
 }
 
+_RENDERED_SOURCE_SUFFIXES = {
+    ".htm",
+    ".html",
+    ".js",
+    ".jsx",
+    ".mdx",
+    ".svelte",
+    ".ts",
+    ".tsx",
+    ".vue",
+}
+
+_STATIC_LITERAL = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`',
+    re.DOTALL,
+)
+
 _PROHIBITED_FRAGMENTS = (
     ("organizational_gate", "sign" + " off"),
     ("organizational_gate_compact", "sign" + "off"),
@@ -90,6 +107,36 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
         decoded = _decode_strict(raw, encoding)
         if _looks_like_text(decoded) and decoded not in candidates:
             candidates.append(decoded)
+    return tuple(candidates)
+
+
+def _unquote_static_literal(literal: str) -> str:
+    return (
+        literal[1:-1]
+        .replace("\\r\\n", "\r\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\'", "'")
+        .replace("\\`", "`")
+        .replace("\\\\", "\\")
+    )
+
+
+def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...]:
+    """Approximate user-visible JSX and adjacent static string expressions."""
+    if Path(relative_path).suffix.lower() not in _RENDERED_SOURCE_SUFFIXES:
+        return ()
+    candidates = [re.sub(r"<\s*/?\s*[A-Za-z][^>]*>", " ", value)]
+    previous: re.Match[str] | None = None
+    for match in _STATIC_LITERAL.finditer(value):
+        if previous and re.fullmatch(r"\s*\+\s*", value[previous.end() : match.start()]):
+            candidates.append(
+                _unquote_static_literal(previous.group())
+                + _unquote_static_literal(match.group())
+            )
+        previous = match
     return tuple(candidates)
 
 
@@ -163,10 +210,15 @@ def _read_entry(root: Path, relative_path: str, path: Path, tracked: bool) -> by
     return result.stdout
 
 
-def matching_labels(raw: bytes) -> tuple[str, ...]:
+def matching_labels(raw: bytes, relative_path: str = "") -> tuple[str, ...]:
     """Return each policy label found in at least one plausible decoding."""
     normalized_candidates = tuple(
-        normalize_language(candidate) for candidate in decode_text_candidates(raw)
+        normalize_language(variant)
+        for candidate in decode_text_candidates(raw)
+        for variant in (
+            candidate,
+            *rendered_source_candidates(candidate, relative_path),
+        )
     )
     return tuple(
         label
@@ -190,7 +242,8 @@ def scan_repository(root: Path | str) -> list[str]:
             findings.append(f"unreadable:{relative_path}:{error}")
             continue
         findings.extend(
-            f"prohibited:{label}:{relative_path}" for label in matching_labels(raw)
+            f"prohibited:{label}:{relative_path}"
+            for label in matching_labels(raw, relative_path)
         )
     return sorted(findings)
 
