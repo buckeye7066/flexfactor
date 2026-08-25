@@ -156,9 +156,11 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     previous: re.Match[str] | None = None
     chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):
-        if previous and re.fullmatch(r"\s*\+\s*", value[previous.end() : match.start()]):
+        gap = value[previous.end() : match.start()] if previous else ""
+        if previous and re.fullmatch(r"\s*\+\s*", gap):
+            first_literal = _unquote_static_literal(previous.group())
             chain = (
-                (chain if chain is not None else _unquote_static_literal(previous.group()))
+                (chain if chain is not None else first_literal)
                 + _unquote_static_literal(match.group())
             )
             candidates.append(chain)
