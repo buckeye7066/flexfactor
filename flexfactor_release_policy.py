@@ -72,6 +72,24 @@ def normalize_language(value: str) -> str:
     return re.sub(r"[-_\s]+", " ", value.lower())
 
 
+def contains_language_fragment(value: str, target: str) -> bool:
+    """Match a normalized phrase only at lexical word boundaries."""
+    offset = 0
+    while offset <= len(value) - len(target):
+        index = value.find(target, offset)
+        if index < 0:
+            return False
+        before = value[index - 1] if index else ""
+        after_index = index + len(target)
+        after = value[after_index] if after_index < len(value) else ""
+        before_is_word = bool(before) and (before.isalnum() or before == "_")
+        after_is_word = bool(after) and (after.isalnum() or after == "_")
+        if not before_is_word and not after_is_word:
+            return True
+        offset = index + 1
+    return False
+
+
 def _looks_like_text(value: str | None) -> bool:
     if not value or "\0" in value:
         return False
@@ -136,12 +154,16 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         return ()
     candidates = [re.sub(r"<\s*/?\s*[A-Za-z][^>]*>", " ", value)]
     previous: re.Match[str] | None = None
+    chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):
         if previous and re.fullmatch(r"\s*\+\s*", value[previous.end() : match.start()]):
-            candidates.append(
-                _unquote_static_literal(previous.group())
+            chain = (
+                (chain if chain is not None else _unquote_static_literal(previous.group()))
                 + _unquote_static_literal(match.group())
             )
+            candidates.append(chain)
+        else:
+            chain = None
         previous = match
     return tuple(candidates)
 
@@ -198,22 +220,22 @@ def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
 
 
 def _read_entry(root: Path, relative_path: str, path: Path, tracked: bool) -> bytes:
+    if tracked:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f":{relative_path}"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise OSError("tracked blob is unavailable from the Git index")
+        return result.stdout
     try:
         mode = path.lstat().st_mode
     except OSError:
         mode = 0
     if stat.S_ISREG(mode):
         return path.read_bytes()
-    if not tracked:
-        raise OSError("workspace entry is unavailable")
-    result = subprocess.run(
-        ["git", "-C", str(root), "show", f":{relative_path}"],
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise OSError("tracked blob is unavailable from the Git index")
-    return result.stdout
+    raise OSError("workspace entry is unavailable")
 
 
 def matching_labels(raw: bytes, relative_path: str = "") -> tuple[str, ...]:
@@ -229,7 +251,10 @@ def matching_labels(raw: bytes, relative_path: str = "") -> tuple[str, ...]:
     return tuple(
         label
         for label, fragment in _PROHIBITED_FRAGMENTS
-        if any(fragment in normalized for normalized in normalized_candidates)
+        if any(
+            contains_language_fragment(normalized, fragment)
+            for normalized in normalized_candidates
+        )
     )
 
 

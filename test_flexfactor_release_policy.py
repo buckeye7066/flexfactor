@@ -60,7 +60,7 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
         sources = (
             f"<span>{first}</span><span>{second}</span>",
-            f'"{first}" + " {second}"',
+            f'"{first}" + " " + "{second}"',
         )
         for source in sources:
             with self.subTest(source=source):
@@ -68,6 +68,10 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     "manual_gate",
                     policy.matching_labels(source.encode(), "component.jsx"),
                 )
+
+    def test_phrase_substring_inside_words_is_not_detected(self):
+        raw = "Assign officer duties".encode()
+        self.assertEqual(policy.matching_labels(raw), ())
 
     def test_sparse_tracked_blob_is_read_from_the_index(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -79,6 +83,19 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 ["git", "-C", directory, "add", "tracked.md"], check=True
             )
             tracked.unlink()
+            findings = policy.scan_repository(root)
+        self.assertIn("prohibited:manual_gate:tracked.md", findings)
+
+    def test_present_tracked_file_uses_staged_blob(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            tracked = root / "tracked.md"
+            tracked.write_text("manual " + "approval", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", directory, "add", "tracked.md"], check=True
+            )
+            tracked.write_text("ordinary workspace text", encoding="utf-8")
             findings = policy.scan_repository(root)
         self.assertIn("prohibited:manual_gate:tracked.md", findings)
 
