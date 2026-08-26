@@ -227,6 +227,21 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_non_rendered_element_bodies_do_not_split_visible_copy(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        for element in ("script", "style", "template"):
+            source = (
+                f"<span>{first} </span>"
+                f"<{element}>ignored()</{element}>"
+                f"<span>{second}</span>"
+            )
+            with self.subTest(element=element):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "page.html"),
+                )
+
     def test_literal_markdown_and_separate_python_statements_stay_distinct(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
@@ -348,7 +363,10 @@ class FirecrawlTransportTests(unittest.TestCase):
                  "_default_firecrawl_opener",
                  side_effect=AssertionError("injected transport was bypassed"),
              ):
-            hits, backend, skipped = competitors.web_search("competitors")
+            hits, backend, skipped = competitors.web_search(
+                "competitors",
+                allow_credentialed_firecrawl=True,
+            )
 
         self.assertTrue(hits)
         self.assertEqual(backend, "firecrawl")
@@ -410,6 +428,19 @@ class FirecrawlTransportTests(unittest.TestCase):
                 lambda url, *args, **kwargs: calls.append(url),
                 allow_credentials=False,
             )
+        self.assertEqual(calls, [])
+
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            competitors,
+            "_WEB_BACKENDS",
+            (("firecrawl", competitors._firecrawl),),
+        ):
+            hits, backend, skipped = competitors.web_search(
+                "competitors",
+                opener=lambda url, *args, **kwargs: calls.append(url),
+            )
+        self.assertEqual((hits, backend), ([], ""))
+        self.assertIn("paid research is explicit", skipped["firecrawl"])
         self.assertEqual(calls, [])
 
 

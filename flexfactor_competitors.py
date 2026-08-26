@@ -377,7 +377,7 @@ _WEB_BACKENDS = (("firecrawl", _firecrawl), ("searxng", _searxng),
 
 
 def web_search(query: str, limit: int = 6, opener=None, *,
-               allow_credentialed_firecrawl: bool = True
+               allow_credentialed_firecrawl: bool = False
                ) -> tuple[list[dict], str, dict]:
     """(results, backend_used, skipped{backend: reason}).
 

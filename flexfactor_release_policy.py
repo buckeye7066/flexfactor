@@ -75,6 +75,10 @@ _JSX_WHITESPACE_EXPRESSION = re.compile(
 _JSX_COMMENT_EXPRESSION = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
 
 _HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
+_NON_RENDERED_ELEMENT = re.compile(
+    r"<(?P<tag>script|style|template)\b[^>]*>[\s\S]*?</(?P=tag)\s*>",
+    re.IGNORECASE,
+)
 _HTML_TAG = re.compile(
     r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*?)?\s*/?>",
     re.DOTALL,
@@ -331,7 +335,9 @@ def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
 
 
 def _strip_markup(value: str) -> str:
-    return _HTML_TAG.sub(" ", _HTML_COMMENT.sub("", value))
+    without_comments = _HTML_COMMENT.sub("", value)
+    without_non_rendered = _NON_RENDERED_ELEMENT.sub("", without_comments)
+    return _HTML_TAG.sub(" ", without_non_rendered)
 
 
 def _render_markdown(value: str) -> str:

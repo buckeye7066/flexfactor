@@ -13223,7 +13223,11 @@ class CompetitorSearchBackendTests(unittest.TestCase):
             "FIRECRAWL_API_KEY": "fc-test",
             "FLEXFACTOR_FIRECRAWL_URL": "",
         }, clear=False):
-            hits, backend, skipped = fc.web_search("sermon software", opener=opener)
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                opener=opener,
+                allow_credentialed_firecrawl=True,
+            )
 
         self.assertEqual(backend, "firecrawl")
         self.assertEqual(hits[0]["url"], "https://www.logos.com/")
@@ -13241,7 +13245,11 @@ class CompetitorSearchBackendTests(unittest.TestCase):
             "FIRECRAWL_API_KEY": "fc-test",
             "FLEXFACTOR_FIRECRAWL_URL": "",
         }, clear=False):
-            hits, backend, skipped = fc.web_search("sermon software", opener=op)
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                opener=op,
+                allow_credentialed_firecrawl=True,
+            )
         self.assertEqual(backend, "duckduckgo")
         self.assertTrue(hits)
         self.assertIn("firecrawl", skipped)
@@ -13317,7 +13325,10 @@ class CompetitorSearchBackendTests(unittest.TestCase):
                  "FIRECRAWL_API_KEY": "fc-test",
                  "FLEXFACTOR_FIRECRAWL_URL": "",
              }, clear=False):
-            hits, backend, skipped = fc.web_search("sermon software")
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                allow_credentialed_firecrawl=True,
+            )
 
         self.assertEqual(backend, "firecrawl")
         self.assertTrue(hits)
