@@ -143,11 +143,13 @@ try:
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
     import flexfactor_product_invariants as _ff_product_invariants
+    import flexfactor_steering as _ff_steering
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
     import flexfactor_product_invariants as _ff_product_invariants
+    import flexfactor_steering as _ff_steering
 
 # Scout production bridge (94-100): separate risk model / report schema,
 # metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
@@ -14007,6 +14009,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             )
             + ("\n\n" + purpose_blob if purpose_blob else "")
         )
+        steering_run_id = str(getattr(checkpoint, "run_id", "") or evidence_run_id)
+        purpose_blob, steering_ids, steering_new = _ff_steering.refresh_context(
+            purpose_blob, display_name, project_dir, steering_run_id)
+        result["steering_comment_ids"] = steering_ids
+        if steering_new:
+            print(f"{pfx}Operator steering: accepted {len(steering_new)} new "
+                  "comment(s) for interpretation and build-gated implementation.")
+        report(steering=_ff_steering.summary(display_name, project_dir))
         result["purpose_contract"] = (purpose_contract.to_dict()
                                       if purpose_contract is not None else None)
         # PURPOSE CONFIDENCE gates purpose-driven mutation (section 8): owner-
@@ -14796,6 +14806,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # ================== END PHASE 1 =======================================
 
         for cycle in range(1, cycle_cap + 1):
+            purpose_blob, steering_ids, steering_new = _ff_steering.refresh_context(
+                purpose_blob, display_name, project_dir, steering_run_id)
+            result["steering_comment_ids"] = steering_ids
+            if steering_new:
+                print(f"{pfx}Operator steering: received {len(steering_new)} comment(s) "
+                      f"during the run; cycle {cycle} and final purpose assessment "
+                      "will interpret them.")
+                _set_rotation_purpose(
+                    providers, display_name, purpose_contract, purpose_blob, pfx)
+                report(steering=_ff_steering.summary(display_name, project_dir))
             print(f"{pfx}--- cycle {cycle}/{cycle_cap} ---")
             cycles_run = cycle
             # Only the per-cycle REVIEW bar resets; fix/done progress is cumulative.
@@ -15226,6 +15246,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     "does what it exists to do".
         purpose_gap = None
         bridged_files: list[str] = []
+        purpose_blob, steering_ids, steering_new = _ff_steering.refresh_context(
+            purpose_blob, display_name, project_dir, steering_run_id)
+        result["steering_comment_ids"] = steering_ids
+        if steering_new:
+            print(f"{pfx}Operator steering: received {len(steering_new)} late "
+                  "comment(s); including them in the final purpose gap and repair pass.")
+            _set_rotation_purpose(
+                providers, display_name, purpose_contract, purpose_blob, pfx)
+            report(steering=_ff_steering.summary(display_name, project_dir))
         if (getattr(args, "purpose_gap", True) and purpose_blob and not dirty_abort
                 and not infrastructure_abort):
             report(phase="purpose-gap assessment")
@@ -16350,6 +16379,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                            "tests": len(_blast.get("test_impact") or [])},
                 "artifacts": evidence_paths or {},
             }
+        if steering_ids:
+            steering_detail = (
+                "exact run completed with all binding gates satisfied"
+                if run_complete else
+                "run ended partial; inspect blockers and resubmit or rerun if needed")
+            _ff_steering.finish(
+                display_name, project_dir, steering_run_id, steering_ids,
+                completed=bool(run_complete), detail=steering_detail)
+            result["steering"] = _ff_steering.summary(display_name, project_dir)
         report(phase=("done - verified" if run_complete else "done - partial"), done=True,
                fix_done=len(done_set), fix_total=total_to_review, fixed=len(done_set),
                defects=len(all_findings), errors=errors_total, cost=round(meter.usd, 4),
