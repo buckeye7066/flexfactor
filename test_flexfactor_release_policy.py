@@ -124,6 +124,7 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         sources = (
             f"{first}&#32;{second}",
             f"<span>{first}</span>&nbsp;<span>{second}</span>",
+            f"<span>{first}&nbsp{second}</span>",
         )
         for source in sources:
             with self.subTest(source=source):
@@ -165,6 +166,15 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_quoted_javascript_comment_does_not_break_literal_chain(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        source = f'"{first} " + /* "decoy" */ "{second}"'
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(source.encode(), "copy.js"),
+        )
+
     def test_plain_javascript_comparison_is_not_treated_as_markup(self):
         first = "".join(map(chr, (115, 105, 103, 110)))
         second = "".join(map(chr, (111, 102, 102)))
@@ -198,6 +208,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 + ' ${" " /* "hidden" */ + ""}'
                 + second
                 + "`",
+                "copy.js",
+            ),
+            (
+                "`" + first + ' ${(``)}' + second + "`",
+                "copy.js",
+            ),
+            (
+                f'"{first} " + ("{second}")',
                 "copy.js",
             ),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
@@ -290,6 +308,40 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_css_terminators_inside_strings_do_not_truncate_content(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        for embedded in (";", "}"):
+            source = (
+                f'.status::after {{ content: "x{embedded}{first}\\20 '
+                f'{second}"; }}'
+            )
+            with self.subTest(embedded=embedded):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "style.css"),
+                )
+
+    def test_markdown_reference_identity_preserves_punctuation(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        unresolved = (
+            f"{first} [{second}][foo_bar]\n\n"
+            "[foo-bar]: https://example.test"
+        )
+        resolved = (
+            f"{first} [{second}][foo_bar]\n\n"
+            "[foo_bar]: https://example.test"
+        )
+        self.assertNotIn(
+            "manual_gate",
+            policy.matching_labels(unresolved.encode(), "README.md"),
+        )
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(resolved.encode(), "README.md"),
+        )
+
     def test_projection_keeps_distinct_rendered_branches_separate(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
@@ -297,6 +349,10 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         sources = (
             (
                 f'<div data-policy="{first}&#32;{second}"></div>',
+                "page.html",
+            ),
+            (
+                f'<div aria-label="{first}&nbsp{second}"></div>',
                 "page.html",
             ),
             (
@@ -326,16 +382,25 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
     def test_executable_inline_script_copy_is_projected(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
-        source = (
-            '<span id="copy"></span><script>'
-            'document.querySelector("#copy").textContent = '
-            f'"{first}" + "\\u0020{second}";'
-            "</script>"
+        sources = (
+            (
+                '<span id="copy"></span><script>'
+                'document.querySelector("#copy").textContent = '
+                f'"{first}" + "\\u0020{second}";'
+                "</script>"
+            ),
+            (
+                '<script type="text&#47;javascript">'
+                f'out.textContent = "{first}" + " {second}";'
+                "</script>"
+            ),
         )
-        self.assertIn(
-            "manual_gate",
-            policy.matching_labels(source.encode(), "page.html"),
-        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "page.html"),
+                )
 
     def test_attributes_embedded_css_and_python_literals_are_rendered(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
@@ -372,6 +437,48 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     "manual_gate",
                     policy.matching_labels(source.encode(), relative_path),
                 )
+
+    def test_constant_f_string_replacement_field_is_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        source = f'message = f"{first}' + "{' '}" + f'{second}"'
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(source.encode(), "messages.py"),
+        )
+
+    def test_grouped_jsx_static_whitespace_is_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            f'<span>{first}</span>{{" " + ""}}<span>{second}</span>',
+            f'<span>{first}</span>{{((" " + ""))}}<span>{second}</span>',
+            f"<span>{first}</span>{{null}}<span> {second}</span>",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "view.jsx"),
+                )
+
+    def test_quoted_angle_bracket_in_html_attribute_is_parsed(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        source = f"<span>{first} </span><span title='>'>{second}</span>"
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(source.encode(), "page.html"),
+        )
+
+    def test_standalone_svg_visible_text_is_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        source = f"<text>{first}<tspan> {second}</tspan></text>"
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(source.encode(), "graphic.svg"),
+        )
 
     def test_non_rendered_element_bodies_do_not_split_visible_copy(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
@@ -483,6 +590,39 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             tracked_copy.write_text("manual " + "approval", encoding="utf-8")
             findings = policy.scan_repository(root)
         self.assertIn("prohibited:manual_gate:dist/copy.html", findings)
+
+    def test_invalid_or_unenumerable_exported_root_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing"
+            self.assertEqual(
+                policy.scan_repository(missing),
+                ["infrastructure:exported root cannot be enumerated"],
+            )
+            exported_file = root / "tree.txt"
+            exported_file.write_text("ordinary", encoding="utf-8")
+            self.assertEqual(
+                policy.scan_repository(exported_file),
+                ["infrastructure:exported root is not a directory"],
+            )
+            empty = root / "empty"
+            empty.mkdir()
+            self.assertEqual(
+                policy.scan_repository(empty),
+                ["infrastructure:exported tree contains no files"],
+            )
+            populated = root / "populated"
+            populated.mkdir()
+            (populated / "source.py").write_text("ordinary", encoding="utf-8")
+            with mock.patch.object(
+                policy.os,
+                "walk",
+                side_effect=OSError("blocked"),
+            ):
+                self.assertEqual(
+                    policy.scan_repository(populated),
+                    ["infrastructure:exported root cannot be enumerated"],
+                )
 
     def test_current_repository_passes_the_binding_policy(self):
         root = Path(__file__).resolve().parent

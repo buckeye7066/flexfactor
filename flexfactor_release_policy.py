@@ -11,6 +11,7 @@ import argparse
 import ast
 import codecs
 from html import unescape
+from html.entities import html5
 import io
 import os
 from pathlib import Path
@@ -86,6 +87,7 @@ _MARKUP_SOURCE_SUFFIXES = {
     ".html",
     ".jsx",
     ".mdx",
+    ".svg",
     ".svelte",
     ".tsx",
     ".vue",
@@ -95,25 +97,31 @@ _MARKDOWN_SOURCE_SUFFIXES = {".md", ".mdx"}
 _JSX_SOURCE_SUFFIXES = {".jsx", ".mdx", ".tsx"}
 _CSS_SOURCE_SUFFIXES = {".css", ".less", ".sass", ".scss"}
 
-_STATIC_LITERAL = re.compile(
-    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`',
-    re.DOTALL,
+_STATIC_QUOTED_LITERAL_SOURCE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+_STATIC_TEMPLATE_OPERAND_SOURCE = r'''`(?:\\.|[^`\\$]|\$(?!\{))*`'''
+_STATIC_TEMPLATE_LITERAL_SOURCE = (
+    r'''`(?:\\.|[^`\\$]|\$(?!\{)|\$\{(?:\\.|[^}`\\]|'''
+    + _STATIC_TEMPLATE_OPERAND_SOURCE
+    + r''')*\})*`'''
 )
-
-_JSX_WHITESPACE_EXPRESSION = re.compile(
-    r'''\{\s*(?:"(?P<double>(?:\\.|[^"\\])*)"'''
-    r'''|'(?P<single>(?:\\.|[^'\\])*)'|`(?P<template>(?:\\.|[^`\\])*)`)\s*\}''',
-    re.DOTALL,
+_STATIC_LITERAL_SOURCE = (
+    rf"(?:{_STATIC_QUOTED_LITERAL_SOURCE}|{_STATIC_TEMPLATE_LITERAL_SOURCE})"
 )
+_STATIC_LITERAL = re.compile(_STATIC_LITERAL_SOURCE, re.DOTALL)
 _JSX_COMMENT_EXPRESSION = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
+_JSX_NON_RENDERING_EXPRESSION = re.compile(
+    r"\{\s*(?:false|null|true|undefined)\s*\}"
+)
 
 _HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
 _NON_RENDERED_ELEMENT = re.compile(
-    r"<(?P<tag>script|style|template)\b[^>]*>[\s\S]*?</(?P=tag)\s*>",
+    r'''<(?P<tag>script|style|template)\b'''
+    r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>'''
+    r'''[\s\S]*?</(?P=tag)\s*>''',
     re.IGNORECASE,
 )
 _HTML_TAG = re.compile(
-    r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*?)?\s*/?>",
+    r'''</?[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*/?>''',
     re.DOTALL,
 )
 _HTML_OPEN_TAG = re.compile(
@@ -135,7 +143,9 @@ _EXPOSED_MARKUP_ATTRIBUTES = {
     "title",
 }
 _SCRIPT_BLOCK = re.compile(
-    r"<script\b(?P<attributes>[^>]*)>(?P<body>[\s\S]*?)</script\s*>",
+    r'''<script\b(?P<attributes>'''
+    r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?)\s*>'''
+    r'''(?P<body>[\s\S]*?)</script\s*>''',
     re.IGNORECASE,
 )
 _STYLE_BLOCK = re.compile(
@@ -159,20 +169,36 @@ _SOURCE_GROUPING = (
     r"(?:(?:\s+)|/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*"
     r"(?:\r\n|[\r\n\u2028\u2029])|[()])*"
 )
-_STATIC_QUOTED_LITERAL_SOURCE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
-_STATIC_QUOTED_LITERAL = re.compile(_STATIC_QUOTED_LITERAL_SOURCE, re.DOTALL)
-_TEMPLATE_INTERPOLATION = re.compile(
-    rf"(?<!\\)\$\{{(?P<expression>{_SOURCE_GROUPING}{_STATIC_QUOTED_LITERAL_SOURCE}"
-    rf"(?:{_SOURCE_GROUPING}\+{_SOURCE_GROUPING}{_STATIC_QUOTED_LITERAL_SOURCE})*"
+_JSX_WHITESPACE_EXPRESSION = re.compile(
+    rf"\{{(?P<expression>{_SOURCE_GROUPING}{_STATIC_LITERAL_SOURCE}"
+    rf"(?:{_SOURCE_GROUPING}\+{_SOURCE_GROUPING}{_STATIC_LITERAL_SOURCE})*"
     rf"{_SOURCE_GROUPING})\}}",
     re.DOTALL,
 )
-_CSS_CONTENT_DECLARATION = re.compile(r"\bcontent\s*:\s*([^;}]+)", re.IGNORECASE)
+_TEMPLATE_INTERPOLATION = re.compile(
+    rf"(?<!\\)\$\{{(?P<expression>{_SOURCE_GROUPING}"
+    rf"(?:{_STATIC_QUOTED_LITERAL_SOURCE}|{_STATIC_TEMPLATE_OPERAND_SOURCE})"
+    rf"(?:{_SOURCE_GROUPING}\+{_SOURCE_GROUPING}"
+    rf"(?:{_STATIC_QUOTED_LITERAL_SOURCE}|{_STATIC_TEMPLATE_OPERAND_SOURCE}))*"
+    rf"{_SOURCE_GROUPING})\}}",
+    re.DOTALL,
+)
 _CSS_STRING = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' ''', re.X | re.DOTALL)
 _CSS_ESCAPE = re.compile(
     r"\\(?P<hexadecimal>[0-9A-Fa-f]{1,6})(?:\r\n|[\t\n\f\r ])?"
     r"|\\(?P<continuation>\r\n|[\n\f\r])"
     r"|\\(?P<character>[\s\S])"
+)
+_AMBIGUOUS_LEGACY_HTML_REFERENCE = re.compile(
+    r"&(?P<name>"
+    + "|".join(
+        sorted(
+            (re.escape(name) for name in html5 if not name.endswith(";")),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")(?=[A-Za-z0-9=])"
 )
 
 _PROHIBITED_FRAGMENTS = (
@@ -365,9 +391,11 @@ def _unquote_static_literal(literal: str) -> str:
 
 def _constant_expression_literals(expression: str) -> tuple[str, ...]:
     literals: list[str] = []
+    parentheses = 0
+    expect_operand = True
     index = 0
     while index < len(expression):
-        if expression[index].isspace() or expression[index] in "+()":
+        if expression[index].isspace():
             index += 1
             continue
         if expression.startswith("/*", index):
@@ -379,29 +407,54 @@ def _constant_expression_literals(expression: str) -> tuple[str, ...]:
         if expression.startswith("//", index):
             terminator = re.search(r"[\r\n\u2028\u2029]", expression[index + 2 :])
             if terminator is None:
-                return tuple(literals)
+                return ()
             index += 2 + terminator.end()
             continue
-        match = _STATIC_QUOTED_LITERAL.match(expression, index)
+        if expression[index] == "(":
+            if not expect_operand:
+                return ()
+            parentheses += 1
+            index += 1
+            continue
+        if expression[index] == ")":
+            if not parentheses or expect_operand:
+                return ()
+            parentheses -= 1
+            index += 1
+            continue
+        if expression[index] == "+":
+            if expect_operand:
+                return ()
+            expect_operand = True
+            index += 1
+            continue
+        if not expect_operand:
+            return ()
+        match = _STATIC_LITERAL.match(expression, index)
         if match is None:
             return ()
         literals.append(match.group())
+        expect_operand = False
         index = match.end()
-    return tuple(literals)
+    return (
+        tuple(literals)
+        if literals and not expect_operand and not parentheses
+        else ()
+    )
 
 
 def _render_static_literal(literal: str) -> str:
     if not literal.startswith("`"):
         return _unquote_static_literal(literal)
-    body = _TEMPLATE_INTERPOLATION.sub(
-        lambda match: "".join(
-            _unquote_static_literal(operand)
-            for operand in _constant_expression_literals(
-                match.group("expression")
-            )
-        ).replace("\\", "\\\\"),
-        literal[1:-1],
-    )
+    def replace_interpolation(match: re.Match[str]) -> str:
+        operands = _constant_expression_literals(match.group("expression"))
+        if not operands:
+            return match.group()
+        return "".join(
+            _unquote_static_literal(operand) for operand in operands
+        ).replace("\\", "\\\\")
+
+    body = _TEMPLATE_INTERPOLATION.sub(replace_interpolation, literal[1:-1])
     return _unquote_static_literal(f"`{body}`")
 
 
@@ -422,11 +475,74 @@ def _decode_css_string(literal: str) -> str:
     return _CSS_ESCAPE.sub(replace_escape, literal[1:-1])
 
 
+def _iter_css_content_values(value: str) -> Iterable[str]:
+    """Yield content declarations with terminators located outside strings."""
+    index = 0
+    while index < len(value):
+        if value[index] in {'"', "'"}:
+            quote = value[index]
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                index += 1
+                if value[index - 1] == quote:
+                    break
+            continue
+        if value[index : index + 7].lower() != "content":
+            index += 1
+            continue
+        before = value[index - 1] if index else ""
+        after = value[index + 7] if index + 7 < len(value) else ""
+        if (before and (before.isalnum() or before in "_-")) or (
+            after and (after.isalnum() or after in "_-")
+        ):
+            index += 7
+            continue
+        cursor = index + 7
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor >= len(value) or value[cursor] != ":":
+            index += 7
+            continue
+        start = cursor + 1
+        cursor = start
+        quote = ""
+        escaped = False
+        parentheses = 0
+        while cursor < len(value):
+            character = value[cursor]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+                cursor += 1
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character == "\\":
+                cursor += 2
+                continue
+            elif character == "(":
+                parentheses += 1
+            elif character == ")" and parentheses:
+                parentheses -= 1
+            elif character in ";}" and not parentheses:
+                break
+            cursor += 1
+        yield value[start:cursor]
+        index = cursor + 1
+
+
 def _render_css_content(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     without_comments = _strip_css_comments(value)
-    for declaration in _CSS_CONTENT_DECLARATION.finditer(without_comments):
-        for branch in _split_css_alternative_content(declaration.group(1)):
+    for declaration in _iter_css_content_values(without_comments):
+        for branch in _split_css_alternative_content(declaration):
             combined = ""
             for literal in _CSS_STRING.finditer(branch):
                 rendered = _decode_css_string(literal.group())
@@ -499,6 +615,19 @@ def _render_embedded_css_content(value: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+def _decode_html_character_references(
+    value: str,
+    *,
+    in_attribute: bool = False,
+) -> str:
+    if in_attribute:
+        value = _AMBIGUOUS_LEGACY_HTML_REFERENCE.sub(
+            lambda match: f"&amp;{match.group('name')}",
+            value,
+        )
+    return unescape(value)
+
+
 def _render_markup_attributes(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for tag in _HTML_OPEN_TAG.finditer(value):
@@ -514,7 +643,9 @@ def _render_markup_attributes(value: str) -> tuple[str, ...]:
                 )
                 if value is not None
             )
-            candidates.append(unescape(candidate))
+            candidates.append(
+                _decode_html_character_references(candidate, in_attribute=True)
+            )
     return tuple(candidates)
 
 
@@ -542,21 +673,28 @@ def _render_inline_executable_scripts(value: str) -> tuple[str, ...]:
             ),
             "",
         )
-        script_type = script_type.strip().lower().split(";", 1)[0].strip()
+        script_type = (
+            _decode_html_character_references(
+                script_type,
+                in_attribute=True,
+            )
+            .strip()
+            .lower()
+            .split(";", 1)[0]
+            .strip()
+        )
         if script_type in executable_types:
             candidates.extend(_render_javascript_literals(script.group("body")))
     return tuple(candidates)
 
 
 def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
-    for quote, group_name in (("\"", "double"), ("'", "single"), ("`", "template")):
-        body = match.group(group_name)
-        if body is None:
-            continue
-        rendered = _render_static_literal(f"{quote}{body}{quote}")
-        if rendered and rendered.isspace():
-            return rendered
-        break
+    rendered = "".join(
+        _render_static_literal(literal)
+        for literal in _constant_expression_literals(match.group("expression"))
+    )
+    if rendered and rendered.isspace():
+        return rendered
     return match.group()
 
 
@@ -564,6 +702,11 @@ def _strip_markup(value: str) -> str:
     without_comments = _HTML_COMMENT.sub("", value)
     without_non_rendered = _NON_RENDERED_ELEMENT.sub("", without_comments)
     return _HTML_TAG.sub(" ", without_non_rendered)
+
+
+def _normalize_markdown_reference_label(value: str) -> str:
+    """Apply Markdown's case-folding and whitespace-only label identity."""
+    return " ".join(value.split()).casefold()
 
 
 def _render_markdown(value: str) -> str:
@@ -583,7 +726,7 @@ def _render_markdown(value: str) -> str:
     )
     value = re.sub(r"(`+)([^\r\n]*?)\1", shield, value)
     reference_ids = {
-        normalize_language(match.group(1))
+        _normalize_markdown_reference_label(match.group(1))
         for match in re.finditer(r"^\s{0,3}\[([^\]]+)\]:\s+\S+.*$", value, re.M)
     }
     value = re.sub(r"^\s{0,3}\[[^\]]+\]:\s+\S+.*$", "", value, flags=re.M)
@@ -596,7 +739,7 @@ def _render_markdown(value: str) -> str:
         reference = match.group("reference") or label
         return (
             label
-            if normalize_language(reference) in reference_ids
+            if _normalize_markdown_reference_label(reference) in reference_ids
             else match.group()
         )
 
@@ -609,7 +752,8 @@ def _render_markdown(value: str) -> str:
         r"!?\[(?P<label>[^\]]+)\]",
         lambda match: (
             match.group("label")
-            if normalize_language(match.group("label")) in reference_ids
+            if _normalize_markdown_reference_label(match.group("label"))
+            in reference_ids
             else match.group()
         ),
         rendered,
@@ -630,15 +774,33 @@ def _static_python_ast_string(node: ast.AST) -> str | None:
         if isinstance(node.value, bytes):
             return node.value.decode("latin-1")
         return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.FormattedValue):
+        value = _static_python_ast_string(node.value)
+        if value is None or node.conversion not in {-1, ord("a"), ord("r"), ord("s")}:
+            return None
+        if node.conversion == ord("a"):
+            value = ascii(value)
+        elif node.conversion == ord("r"):
+            value = repr(value)
+        elif node.conversion == ord("s"):
+            value = str(value)
+        format_spec = ""
+        if node.format_spec is not None:
+            rendered_spec = _static_python_ast_string(node.format_spec)
+            if rendered_spec is None:
+                return None
+            format_spec = rendered_spec
+        try:
+            return format(value, format_spec)
+        except (TypeError, ValueError):
+            return None
     if isinstance(node, ast.JoinedStr):
         parts: list[str] = []
         for part in node.values:
-            if not isinstance(part, ast.Constant) or not isinstance(
-                part.value,
-                str,
-            ):
+            rendered = _static_python_ast_string(part)
+            if rendered is None:
                 return None
-            parts.append(part.value)
+            parts.append(rendered)
         return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _static_python_ast_string(node.left)
@@ -693,21 +855,63 @@ def _render_python_literals(
     return tuple(dict.fromkeys(candidates))
 
 
+def _mask_javascript_comments(value: str) -> str:
+    """Blank source comments while preserving literal offsets and line breaks."""
+    rendered = list(value)
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            index += 1
+            continue
+        if character in {'"', "'", "`"}:
+            quote = character
+            index += 1
+            continue
+        end = -1
+        if value.startswith("/*", index):
+            closing = value.find("*/", index + 2)
+            end = len(value) if closing < 0 else closing + 2
+        elif value.startswith("//", index):
+            terminator = re.search(r"[\r\n\u2028\u2029]", value[index + 2 :])
+            end = (
+                len(value)
+                if terminator is None
+                else index + 2 + terminator.start()
+            )
+        if end < 0:
+            index += 1
+            continue
+        for offset in range(index, end):
+            if not value[offset].isspace():
+                rendered[offset] = " "
+        index = end
+    return "".join(rendered)
+
+
 def _render_javascript_literals(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     previous: re.Match[str] | None = None
     chain: str | None = None
-    for match in _STATIC_LITERAL.finditer(value):
-        rendered_literal = _render_static_literal(match.group())
+    projected = _mask_javascript_comments(value)
+    for match in _STATIC_LITERAL.finditer(projected):
+        literal = value[match.start() : match.end()]
+        rendered_literal = _render_static_literal(literal)
         candidates.append(rendered_literal)
-        gap = value[previous.end() : match.start()] if previous else ""
-        gap_without_comments = re.sub(
-            r"/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*",
-            "",
-            gap,
-        )
-        if previous and re.fullmatch(r"\s*\+\s*", gap_without_comments):
-            first_literal = _render_static_literal(previous.group())
+        gap = projected[previous.end() : match.start()] if previous else ""
+        gap_without_grouping = gap.replace("(", "").replace(")", "")
+        if previous and re.fullmatch(r"\s*\+\s*", gap_without_grouping):
+            first_literal = _render_static_literal(
+                value[previous.start() : previous.end()]
+            )
             chain = (
                 (chain if chain is not None else first_literal)
                 + rendered_literal
@@ -726,6 +930,7 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     visible_value = value
     if suffix in _JSX_SOURCE_SUFFIXES:
         visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
+        visible_value = _JSX_NON_RENDERING_EXPRESSION.sub("", visible_value)
         visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
             _replace_jsx_whitespace_expression,
             visible_value,
@@ -760,14 +965,35 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
 
 
 def _workspace_entries(root: Path) -> list[tuple[str, Path, bool]]:
+    try:
+        root_mode = root.stat().st_mode
+    except OSError as error:
+        raise PolicyInfrastructureError(
+            "exported root cannot be enumerated"
+        ) from error
+    if not stat.S_ISDIR(root_mode):
+        raise PolicyInfrastructureError("exported root is not a directory")
+
+    def traversal_error(error: OSError) -> None:
+        raise PolicyInfrastructureError(
+            "exported root cannot be enumerated"
+        ) from error
+
     entries: list[tuple[str, Path, bool]] = []
-    for current, directories, files in os.walk(root):
-        directories[:] = [
-            name for name in directories if name not in _EXCLUDED_DIRECTORIES
-        ]
-        for name in files:
-            path = Path(current, name)
-            entries.append((path.relative_to(root).as_posix(), path, False))
+    try:
+        for current, directories, files in os.walk(root, onerror=traversal_error):
+            directories[:] = [
+                name for name in directories if name not in _EXCLUDED_DIRECTORIES
+            ]
+            for name in files:
+                path = Path(current, name)
+                entries.append((path.relative_to(root).as_posix(), path, False))
+    except OSError as error:
+        raise PolicyInfrastructureError(
+            "exported root cannot be enumerated"
+        ) from error
+    if not entries:
+        raise PolicyInfrastructureError("exported tree contains no files")
     return entries
 
 
