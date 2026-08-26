@@ -1,5 +1,8 @@
 name: rotation-extensions
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -10,18 +13,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      run_integration:
-        description: "Set to 1 to run heavy integration tests (requires real Cursor / ai-time)"
-        required: false
-        default: "0"
 
 jobs:
   unit-tests:
     name: unit-tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -64,11 +60,8 @@ jobs:
         run: python tests/test_cursor_provider.py
 
   integration-tests:
-    name: integration-tests
+    name: offline-integration-tests
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    if: ${{ github.event.inputs.run_integration == '1' || vars.CI_INTEGRATION == '1' }}
     env:
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
 
@@ -87,28 +80,52 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install .
 
-      - name: Run discovery (no network, no secrets)
+      - name: Run AI-time discovery fixture end to end (no network, no secrets)
         run: |
-          python flexfactor_discovery.py || true
+          python - <<'PY'
+          import json
+          import os
+          import tempfile
 
-      - name: Validate auto catalog shape
-        run: |
-          python -c "
-          import flexfactor_rotation as R, os
-          cat_path = 'catalog.auto.json'
-          if os.path.exists(cat_path):
-              cat = R.load_catalog(cat_path)
-              assert cat is not None, 'catalog.auto.json loaded as None'
-              print(f'catalog.auto.json: {len(cat.routes)} routes')
-          else:
-              print('catalog.auto.json not produced (no sources available) — OK')
-          "
+          import flexfactor_discovery as discovery
+
+          secret = "sk-fixture-must-not-leak-1234567890"
+          with tempfile.TemporaryDirectory() as tmp:
+              config = os.path.join(tmp, "config.json")
+              output = os.path.join(tmp, "catalog.auto.json")
+              with open(config, "w", encoding="utf-8") as handle:
+                  json.dump({"providers": [{
+                      "name": "cursor-ci",
+                      "model": "cursor-small",
+                      "api_type": "cursor",
+                      "base_url": "http://127.0.0.1:9/v1",
+                      "pool": "cursor:subscription",
+                      "cost_class": "subscription",
+                      "tier": "strong",
+                      "api_key": secret,
+                  }]}, handle)
+              os.environ["FLEXFACTOR_AITIME_CONFIG"] = config
+              routes = discovery.discover_from_aitime()
+              assert len(routes) == 1, routes
+              assert routes[0]["id"] == "cursor-ci/cursor-small", routes[0]
+              assert routes[0]["api"] == "cursor", routes[0]
+              assert routes[0]["pool"] == "cursor:subscription", routes[0]
+              assert secret not in json.dumps(routes), routes
+              written = discovery.write_auto_catalog(routes, output)
+              assert written == output and os.path.isfile(output), written
+              with open(output, encoding="utf-8") as handle:
+                  catalog = json.load(handle)
+              assert catalog["schema"] == 1, catalog
+              assert [row["id"] for row in catalog["routes"]] == [
+                  "cursor-ci/cursor-small"
+              ], catalog
+              assert secret not in json.dumps(catalog), catalog
+              print("fixture route discovered, serialized, scoped, and secret-free")
+          PY
 
   lint:
     name: lint
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:

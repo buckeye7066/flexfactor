@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,7 @@ ENTRY_POINTS = {
 }
 
 LAUNCHERS = ("flexfactor_launch.ps1", "flexfactor_audit_launch.ps1",
-             "flexfactor_scout_launch.ps1")
+             "flexfactor_scout_launch.ps1", "flexfactor_glimmer_launch.ps1")
 
 PARITY_KEYS = ("tool_version", "modes", "wired", "exit_codes")
 
@@ -113,7 +114,11 @@ class EntryPointParityTests(unittest.TestCase):
         for name in LAUNCHERS:
             with open(os.path.join(HERE, name), encoding="utf-8") as fh:
                 src = fh.read()
-            self.assertIn('Join-Path $PSScriptRoot "flexfactor_run.py"', src, name)
+            self.assertRegex(
+                src,
+                re.compile(r"Join-Path\s+\$PSScriptRoot\s+['\"]flexfactor_run\.py['\"]"),
+                name,
+            )
             self.assertNotIn(r"C:\Users\firer\flexfactor\flexfactor_run.py", src, name)
             # ASCII-only launcher constraint (WinPS 5.1 without a BOM mangles UTF-8).
             src.encode("ascii")

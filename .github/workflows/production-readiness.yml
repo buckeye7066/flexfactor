@@ -53,13 +53,20 @@ jobs:
           assert not bad, bad
           print("imported", len(mods), "modules")
           PY
-      - name: Playwright for the real browser-journey integration test (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Playwright package for the real browser journeys
         shell: bash
         run: |
           npm init -y > /dev/null
           npm install --no-audit --no-fund playwright@1.62.1
+      - name: Install Playwright Chromium (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
           npx playwright install --with-deps chromium
+      - name: Install Playwright Chromium (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: npx playwright install chromium
       - name: Unit + integration suites (every test module; zero collected = failure)
         shell: bash
         run: |
@@ -105,7 +112,11 @@ jobs:
                    tests/test_cursor_provider.py; do
             if [ ! -f "$t" ]; then echo "MISSING required test module: $t"; exit 1; fi
             echo "=== $t"
-            python "$t" 2>&1 | tee "/tmp/$(basename "$t").log"
+            if [ "$t" = "flexfactor_dashboard_tests.py" ] && [ "$RUNNER_OS" = "Linux" ]; then
+              xvfb-run -a python "$t" 2>&1 | tee "/tmp/$(basename "$t").log"
+            else
+              python "$t" 2>&1 | tee "/tmp/$(basename "$t").log"
+            fi
             rc=${PIPESTATUS[0]}
             if [ "$rc" -ne 0 ]; then echo "FAILED: $t (rc=$rc)"; exit "$rc"; fi
             if grep -q "^Ran 0 tests" "/tmp/$(basename "$t").log"; then echo "ZERO TESTS COLLECTED: $t"; exit 1; fi

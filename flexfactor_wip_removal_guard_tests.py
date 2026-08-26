@@ -22,9 +22,9 @@ relative paths. The guard costs nothing in a correct run - git never reports
 `.git` as untracked - so it only ever fires when something has already gone
 wrong, which is what a safety invariant is for.
 
-REGRESSION PROOF: `PreFixBehaviourTests` loads the PRE-FIX copy of this module
-from the pristine clone and shows it deletes `.git/HEAD` outright. If that copy
-is unavailable the test SKIPS loudly rather than passing quietly.
+REGRESSION PROOF: `PreFixBehaviourTests` loads the committed PRE-FIX fixture and
+shows it deletes `.git/HEAD` outright. The fixture is part of the repository so
+the proof runs identically on developer machines and CI.
 """
 from __future__ import annotations
 
@@ -36,10 +36,8 @@ import unittest
 
 import flexfactor_wip as wip
 
-_PREFIX_COPY = os.path.join(
-    os.environ.get("TEMP", tempfile.gettempdir()),
-    "claude", "C--Users-firer", "919c7aa0-ac3f-4606-86a9-3a1c1a699ebe",
-    "scratchpad", "ffclone2", "flexfactor_wip.py")
+_PREFIX_COPY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "eval_fixtures", "wip_pre_fix.py")
 
 
 def _make_repo(root: str) -> None:
@@ -170,9 +168,7 @@ class PreFixBehaviourTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not os.path.isfile(_PREFIX_COPY):
-            raise unittest.SkipTest(
-                f"pre-fix copy not available at {_PREFIX_COPY}; "
-                "regression proof skipped (NOT passed)")
+            raise AssertionError(f"required pre-fix fixture missing: {_PREFIX_COPY}")
         spec = importlib.util.spec_from_file_location("wip_prefix", _PREFIX_COPY)
         cls.old = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.old)
