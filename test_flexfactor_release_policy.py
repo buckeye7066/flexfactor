@@ -141,6 +141,45 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         source = f"{first} < threshold > {second}"
         self.assertEqual(policy.matching_labels(source.encode(), "logic.js"), ())
 
+    def test_constant_templates_and_json_escapes_are_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            ("`" + first + ' ${""}' + second + "`", "copy.js"),
+            (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_markdown_references_and_css_generated_content_are_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (
+                f"{first} [{second}][policy]\n\n"
+                "[policy]: https://example.test/policy",
+                "README.md",
+            ),
+            (
+                f'.status::after {{ content: "{first}\\20 {second}"; }}',
+                "style.css",
+            ),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_utf8_text_with_a_nul_remains_a_candidate(self):
+        raw = ("manual " + "approval").encode() + b"\0"
+        self.assertIn("manual_gate", policy.matching_labels(raw, "page.html"))
+
     def test_plural_variants_are_detected(self):
         self.assertIn(
             "manual_gate_plural",
