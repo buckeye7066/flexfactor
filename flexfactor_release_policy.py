@@ -363,13 +363,40 @@ def _unquote_static_literal(literal: str) -> str:
     return _JS_ESCAPE.sub(replace_escape, literal[1:-1])
 
 
+def _constant_expression_literals(expression: str) -> tuple[str, ...]:
+    literals: list[str] = []
+    index = 0
+    while index < len(expression):
+        if expression[index].isspace() or expression[index] in "+()":
+            index += 1
+            continue
+        if expression.startswith("/*", index):
+            end = expression.find("*/", index + 2)
+            if end < 0:
+                return ()
+            index = end + 2
+            continue
+        if expression.startswith("//", index):
+            terminator = re.search(r"[\r\n\u2028\u2029]", expression[index + 2 :])
+            if terminator is None:
+                return tuple(literals)
+            index += 2 + terminator.end()
+            continue
+        match = _STATIC_QUOTED_LITERAL.match(expression, index)
+        if match is None:
+            return ()
+        literals.append(match.group())
+        index = match.end()
+    return tuple(literals)
+
+
 def _render_static_literal(literal: str) -> str:
     if not literal.startswith("`"):
         return _unquote_static_literal(literal)
     body = _TEMPLATE_INTERPOLATION.sub(
         lambda match: "".join(
-            _unquote_static_literal(literal_match.group())
-            for literal_match in _STATIC_QUOTED_LITERAL.finditer(
+            _unquote_static_literal(operand)
+            for operand in _constant_expression_literals(
                 match.group("expression")
             )
         ).replace("\\", "\\\\"),
@@ -397,7 +424,7 @@ def _decode_css_string(literal: str) -> str:
 
 def _render_css_content(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
-    without_comments = re.sub(r"/\*[\s\S]*?\*/", "", value)
+    without_comments = _strip_css_comments(value)
     for declaration in _CSS_CONTENT_DECLARATION.finditer(without_comments):
         for branch in _split_css_alternative_content(declaration.group(1)):
             combined = ""
@@ -408,6 +435,37 @@ def _render_css_content(value: str) -> tuple[str, ...]:
             if combined:
                 candidates.append(combined)
     return tuple(candidates)
+
+
+def _strip_css_comments(value: str) -> str:
+    rendered: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote:
+            rendered.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            rendered.append(character)
+            index += 1
+            continue
+        if value.startswith("/*", index):
+            end = value.find("*/", index + 2)
+            index = len(value) if end < 0 else end + 2
+            continue
+        rendered.append(character)
+        index += 1
+    return "".join(rendered)
 
 
 def _split_css_alternative_content(value: str) -> tuple[str, ...]:
@@ -561,12 +619,38 @@ def _render_markdown(value: str) -> str:
     rendered = re.sub(r"__(?=\S)([\s\S]*?\S)__", r"\1", rendered)
     rendered = re.sub(r"\*(?=\S)([^*\r\n]*?\S)\*", r"\1", rendered)
     rendered = re.sub(r"_(?=\S)([^_\r\n]*?\S)_", r"\1", rendered)
+    rendered = re.sub(r"\\(?:\r\n|[\r\n])", " ", rendered)
     for placeholder, segment in code_segments:
         rendered = rendered.replace(placeholder, segment)
     return rendered
 
 
-def _render_python_literals(value: str) -> tuple[str, ...]:
+def _static_python_ast_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bytes):
+            return node.value.decode("latin-1")
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for part in node.values:
+            if not isinstance(part, ast.Constant) or not isinstance(
+                part.value,
+                str,
+            ):
+                return None
+            parts.append(part.value)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_python_ast_string(node.left)
+        right = _static_python_ast_string(node.right)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _render_python_literals(
+    value: str,
+    project_explicit_addition: bool = True,
+) -> tuple[str, ...]:
     """Render safe Python literals and the language's implicit concatenation."""
     candidates: list[str] = []
     chain: str | None = None
@@ -595,6 +679,17 @@ def _render_python_literals(value: str) -> tuple[str, ...]:
         # Keep every candidate produced before malformed source interrupted the
         # tokenizer; raw-text matching still covers the complete file.
         pass
+    try:
+        tree = ast.parse(value)
+    except (SyntaxError, ValueError):
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and not project_explicit_addition:
+                continue
+            rendered = _static_python_ast_string(node)
+            if rendered is not None:
+                candidates.append(rendered)
     return tuple(dict.fromkeys(candidates))
 
 
@@ -645,7 +740,18 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     if suffix in _CSS_SOURCE_SUFFIXES:
         candidates.extend(_render_css_content(value))
     if suffix in {".py", ".pyw"}:
-        candidates.extend(_render_python_literals(value))
+        path = Path(relative_path)
+        is_policy_or_test = path.name in {
+            "flexfactor_release_policy.py",
+            "flexfactor_tests.py",
+            "test_flexfactor_release_policy.py",
+        }
+        candidates.extend(
+            _render_python_literals(
+                value,
+                project_explicit_addition=not is_policy_or_test,
+            )
+        )
         return tuple(candidates)
     if suffix not in _LITERAL_SOURCE_SUFFIXES:
         return tuple(candidates)
@@ -668,6 +774,12 @@ def _workspace_entries(root: Path) -> list[tuple[str, Path, bool]]:
 def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
     """Enumerate the exact index, or an exported workspace when no index fits."""
     root = root.resolve()
+    git_metadata = root / ".git"
+    has_git_metadata = (
+        git_metadata.is_dir()
+        or git_metadata.is_file()
+        or git_metadata.is_symlink()
+    )
     try:
         git_probe = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
@@ -675,12 +787,24 @@ def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
             check=False,
             text=True,
         )
-    except OSError:
+    except OSError as error:
+        if has_git_metadata:
+            raise PolicyInfrastructureError(
+                "Git metadata exists but the exact index cannot be probed"
+            ) from error
         return _workspace_entries(root)
     if git_probe.returncode != 0:
+        if has_git_metadata:
+            raise PolicyInfrastructureError(
+                "Git metadata exists but the exact index cannot be probed"
+            )
         return _workspace_entries(root)
     git_root = Path(git_probe.stdout.strip()).resolve()
     if os.path.normcase(str(git_root)) != os.path.normcase(str(root)):
+        if has_git_metadata:
+            raise PolicyInfrastructureError(
+                "Git metadata resolved outside the requested repository"
+            )
         return _workspace_entries(root)
 
     try:

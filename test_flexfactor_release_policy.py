@@ -192,6 +192,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 + "`",
                 "copy.js",
             ),
+            (
+                "`"
+                + first
+                + ' ${" " /* "hidden" */ + ""}'
+                + second
+                + "`",
+                "copy.js",
+            ),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
             (f'"\\u{{000006d}}{first[1:]} {second}"', "copy.js"),
             (f'"{first[:1]}\\{first[1:]} {second}"', "copy.js"),
@@ -273,6 +281,7 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 f'.status::after {{ content: "{first}\\20 {second}"; }}',
                 "style.css",
             ),
+            (f"{first}\\\n{second}", "README.md"),
         )
         for source, relative_path in sources:
             with self.subTest(relative_path=relative_path):
@@ -300,6 +309,10 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             ),
             (
                 f'.status::after {{ content: "{compact[:4]}" / "{compact[4:]}"; }}',
+                "style.css",
+            ),
+            (
+                f'.status::after {{ content: "{first}/*note*/ {second}"; }}',
                 "style.css",
             ),
         )
@@ -342,6 +355,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             ),
             (
                 f'message = ("{first} "\n# static copy\n"{second}")',
+                "messages.py",
+            ),
+            (
+                f'message = f"{first}\\x20{second}"',
+                "messages.py",
+            ),
+            (
+                f'message = "{first} " + "{second}"',
                 "messages.py",
             ),
         )
@@ -428,6 +449,29 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             findings = policy.scan_repository(directory)
         self.assertEqual(
             findings, ["infrastructure:exact Git index contains no files"]
+        )
+
+    def test_git_probe_failure_with_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            failed_probe = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=128,
+                stdout="",
+                stderr="unsafe repository",
+            )
+            with mock.patch.object(
+                policy.subprocess,
+                "run",
+                return_value=failed_probe,
+            ):
+                findings = policy.scan_repository(directory)
+        self.assertEqual(
+            findings,
+            [
+                "infrastructure:Git metadata exists but the exact index "
+                "cannot be probed"
+            ],
         )
 
     def test_exported_tree_scans_output_named_directories(self):
