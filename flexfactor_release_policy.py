@@ -34,6 +34,7 @@ _LITERAL_SOURCE_SUFFIXES = {
     ".cts",
     ".js",
     ".jsx",
+    ".json",
     ".mjs",
     ".mts",
     ".svelte",
@@ -54,6 +55,7 @@ _MARKUP_SOURCE_SUFFIXES = {
 
 _MARKDOWN_SOURCE_SUFFIXES = {".md", ".mdx"}
 _JSX_SOURCE_SUFFIXES = {".jsx", ".mdx", ".tsx"}
+_CSS_SOURCE_SUFFIXES = {".css", ".less", ".sass", ".scss"}
 
 _STATIC_LITERAL = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`',
@@ -77,6 +79,18 @@ _JS_ESCAPE = re.compile(
     r'''|x(?P<hexadecimal>[0-9A-Fa-f]{2})'''
     r'''|(?P<continuation>\r\n|[\r\n])'''
     r'''|(?P<simple>[0btnvfr"'`\\]))''',
+)
+_TEMPLATE_INTERPOLATION = re.compile(
+    r'''(?<!\\)\$\{\s*(?P<literal>"(?:\\.|[^"\\])*"'''
+    r'''|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)\s*\}''',
+    re.DOTALL,
+)
+_CSS_CONTENT_DECLARATION = re.compile(r"\bcontent\s*:\s*([^;}]+)", re.IGNORECASE)
+_CSS_STRING = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' ''', re.X | re.DOTALL)
+_CSS_ESCAPE = re.compile(
+    r"\\(?P<hexadecimal>[0-9A-Fa-f]{1,6})(?:\r\n|[\t\n\f\r ])?"
+    r"|\\(?P<continuation>\r\n|[\n\f\r])"
+    r"|\\(?P<character>[\s\S])"
 )
 
 _PROHIBITED_FRAGMENTS = (
@@ -136,15 +150,16 @@ def contains_language_fragment(value: str, target: str) -> bool:
 
 
 def _looks_like_text(value: str | None) -> bool:
-    if not value or "\0" in value:
+    if not value:
         return False
     controls = sum(
         ord(character) < 32 and character not in "\t\r\n"
         for character in value
     )
     replacements = value.count("\ufffd")
+    control_limit = max(1, len(value) // 20)
     replacement_limit = max(1, len(value) // 50)
-    return controls / len(value) <= 0.05 and replacements <= replacement_limit
+    return controls <= control_limit and replacements <= replacement_limit
 
 
 def _decode_strict(raw: bytes, encoding: str) -> str | None:
@@ -179,11 +194,13 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
             decoded = _decode_with_replacement(raw, encoding)
             return (decoded,) if _looks_like_text(decoded) else ()
 
-    if b"\0" not in raw:
-        decoded = raw.decode("utf-8", "replace") if raw else ""
-        return (decoded,) if _looks_like_text(decoded) else ()
-
     candidates: list[str] = []
+    decoded_utf8 = raw.decode("utf-8", "replace") if raw else ""
+    if _looks_like_text(decoded_utf8):
+        candidates.append(decoded_utf8)
+    if b"\0" not in raw:
+        return tuple(candidates)
+
     for encoding in ("utf-32-le", "utf-32-be", "utf-16-le", "utf-16-be"):
         decoded = _decode_strict(raw, encoding)
         if _looks_like_text(decoded) and decoded not in candidates:
@@ -224,12 +241,53 @@ def _unquote_static_literal(literal: str) -> str:
     return _JS_ESCAPE.sub(replace_escape, literal[1:-1])
 
 
+def _render_static_literal(literal: str) -> str:
+    if not literal.startswith("`"):
+        return _unquote_static_literal(literal)
+    body = _TEMPLATE_INTERPOLATION.sub(
+        lambda match: _unquote_static_literal(match.group("literal")),
+        literal[1:-1],
+    )
+    return _unquote_static_literal(f"`{body}`")
+
+
+def _decode_css_string(literal: str) -> str:
+    def replace_escape(match: re.Match[str]) -> str:
+        hexadecimal = match.group("hexadecimal")
+        if hexadecimal is not None:
+            code_point = int(hexadecimal, 16)
+            if code_point and code_point <= 0x10FFFF and not (
+                0xD800 <= code_point <= 0xDFFF
+            ):
+                return chr(code_point)
+            return "\ufffd"
+        if match.group("continuation") is not None:
+            return ""
+        return match.group("character") or ""
+
+    return _CSS_ESCAPE.sub(replace_escape, literal[1:-1])
+
+
+def _render_css_content(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    without_comments = re.sub(r"/\*[\s\S]*?\*/", "", value)
+    for declaration in _CSS_CONTENT_DECLARATION.finditer(without_comments):
+        combined = ""
+        for literal in _CSS_STRING.finditer(declaration.group(1)):
+            rendered = _decode_css_string(literal.group())
+            candidates.append(rendered)
+            combined += rendered
+        if combined:
+            candidates.append(combined)
+    return tuple(candidates)
+
+
 def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
     for quote, group_name in (("\"", "double"), ("'", "single"), ("`", "template")):
         body = match.group(group_name)
         if body is None:
             continue
-        rendered = _unquote_static_literal(f"{quote}{body}{quote}")
+        rendered = _render_static_literal(f"{quote}{body}{quote}")
         if rendered and rendered.isspace():
             return rendered
         break
@@ -241,9 +299,34 @@ def _strip_markup(value: str) -> str:
 
 
 def _render_markdown(value: str) -> str:
+    reference_ids = {
+        normalize_language(match.group(1))
+        for match in re.finditer(r"^\s{0,3}\[([^\]]+)\]:\s+\S+.*$", value, re.M)
+    }
+    value = re.sub(r"^\s{0,3}\[[^\]]+\]:\s+\S+.*$", "", value, flags=re.M)
     rendered = _strip_markup(value)
     rendered = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", rendered)
     rendered = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", rendered)
+
+    def replace_reference(match: re.Match[str]) -> str:
+        label = match.group("label")
+        reference = match.group("reference") or label
+        return label if normalize_language(reference) in reference_ids else match.group()
+
+    rendered = re.sub(
+        r"!?\[(?P<label>[^\]]+)\]\[(?P<reference>[^\]]*)\]",
+        replace_reference,
+        rendered,
+    )
+    rendered = re.sub(
+        r"!?\[(?P<label>[^\]]+)\]",
+        lambda match: (
+            match.group("label")
+            if normalize_language(match.group("label")) in reference_ids
+            else match.group()
+        ),
+        rendered,
+    )
     return re.sub(r"[*~`]+", "", rendered)
 
 
@@ -261,16 +344,18 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         candidates.append(unescape(_strip_markup(visible_value)))
     if suffix in _MARKDOWN_SOURCE_SUFFIXES:
         candidates.append(unescape(_render_markdown(visible_value)))
+    if suffix in _CSS_SOURCE_SUFFIXES:
+        candidates.extend(_render_css_content(value))
     if suffix not in _LITERAL_SOURCE_SUFFIXES:
         return tuple(candidates)
     previous: re.Match[str] | None = None
     chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):
-        rendered_literal = _unquote_static_literal(match.group())
+        rendered_literal = _render_static_literal(match.group())
         candidates.append(rendered_literal)
         gap = value[previous.end() : match.start()] if previous else ""
         if previous and re.fullmatch(r"\s*\+\s*", gap):
-            first_literal = _unquote_static_literal(previous.group())
+            first_literal = _render_static_literal(previous.group())
             chain = (
                 (chain if chain is not None else first_literal)
                 + rendered_literal
