@@ -11,6 +11,11 @@ class SkipPolicyTests(unittest.TestCase):
                 "'POSIX openat component-walk unavailable on this platform'")
         self.assertEqual(policy.verify("Windows", text), [])
 
+    def test_unittest_escaped_windows_catalog_path_is_allowed(self):
+        text = ("setUpClass (T) ... skipped "
+                r"'no live catalog at C:\\Users\\runneradmin\\AppData\\Local\\AITime\\routes.json'")
+        self.assertEqual(policy.verify("Windows", text), [])
+
     def test_capability_gain_may_remove_an_allowed_skip(self):
         self.assertEqual(policy.verify("Linux", "Ran 1 test\nOK"), [])
 
