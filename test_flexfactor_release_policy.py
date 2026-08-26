@@ -85,6 +85,11 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn("manual_gate", policy.matching_labels(raw))
 
+    def test_truncated_utf16be_retains_complete_code_units(self):
+        fragment = "manual " + "approval"
+        raw = codecs.BOM_UTF16_BE + fragment.encode("utf-16-be") + b"\x00"
+        self.assertIn("manual_gate", policy.matching_labels(raw, "page.html"))
+
     def test_lightly_malformed_bomless_unicode_is_still_scanned(self):
         fragment = "manual " + "approval"
         prefix = "ordinary text " * 20
@@ -399,6 +404,16 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 f'"{first}\\20 {second}"; }}',
                 "style.css",
             ),
+            (
+                '<div id="out"></div><script>'
+                'document.getElementById("out").innerHTML = '
+                f'"{first}" + "&#32;{second}";</script>',
+                "page.html",
+            ),
+            (
+                f"{first} [{second}][ς]\n\n[Σ]: https://example.test",
+                "README.md",
+            ),
         )
         for source, relative_path in sources:
             with self.subTest(relative_path=relative_path, source=source):
@@ -431,6 +446,17 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             (
                 f'<input type="text" value="{first}&#32;{second}">',
                 "page.html",
+            ),
+            (
+                f'@supports (content: "{first}\\20 {second}") '
+                "{ .x { display: block; } }",
+                "style.css",
+            ),
+            (
+                ".x { counter-reset: item 7 } "
+                f'.x::after {{ content: "{first} " counter(item) '
+                f'"{second}"; }}',
+                "style.css",
             ),
             (
                 f'function copy() {{ "{first} " }}\n{second}();',

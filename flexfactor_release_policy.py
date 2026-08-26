@@ -501,6 +501,9 @@ def _decode_css_string(literal: str) -> str:
 def _iter_css_content_values(value: str) -> Iterable[str]:
     """Yield content declarations with terminators located outside strings."""
     index = 0
+    statement_start = 0
+    nesting = 0
+    block_kinds: list[str] = []
     while index < len(value):
         if value[index] in {'"', "'"}:
             quote = value[index]
@@ -513,6 +516,32 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
                 if value[index - 1] == quote:
                     break
             continue
+        if value[index] == "(":
+            nesting += 1
+            index += 1
+            continue
+        if value[index] == ")" and nesting:
+            nesting -= 1
+            index += 1
+            continue
+        if value[index] == "{" and not nesting:
+            header = value[statement_start:index].lstrip()
+            block_kinds.append(
+                "at-rule" if header.startswith("@") else "style-rule"
+            )
+            statement_start = index + 1
+            index += 1
+            continue
+        if value[index] == "}" and not nesting:
+            if block_kinds:
+                block_kinds.pop()
+            statement_start = index + 1
+            index += 1
+            continue
+        if value[index] == ";" and not nesting:
+            statement_start = index + 1
+            index += 1
+            continue
         if value[index : index + 7].lower() != "content":
             index += 1
             continue
@@ -520,6 +549,13 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
         after = value[index + 7] if index + 7 < len(value) else ""
         if (before and (before.isalnum() or before in "_-")) or (
             after and (after.isalnum() or after in "_-")
+        ):
+            index += 7
+            continue
+        if (
+            not block_kinds
+            or block_kinds[-1] != "style-rule"
+            or value[statement_start:index].strip()
         ):
             index += 7
             continue
@@ -533,7 +569,7 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
         cursor = start
         quote = ""
         escaped = False
-        parentheses = 0
+        value_parentheses = 0
         while cursor < len(value):
             character = value[cursor]
             if quote:
@@ -551,14 +587,17 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
                 cursor += 2
                 continue
             elif character == "(":
-                parentheses += 1
-            elif character == ")" and parentheses:
-                parentheses -= 1
-            elif character in ";}" and not parentheses:
+                value_parentheses += 1
+            elif character == ")" and value_parentheses:
+                value_parentheses -= 1
+            elif character in ";}" and not value_parentheses:
                 break
             cursor += 1
         yield value[start:cursor]
+        if cursor < len(value) and value[cursor] == "}" and block_kinds:
+            block_kinds.pop()
         index = cursor + 1
+        statement_start = index
 
 
 def _render_css_content(value: str) -> tuple[str, ...]:
@@ -567,7 +606,8 @@ def _render_css_content(value: str) -> tuple[str, ...]:
     for declaration in _iter_css_content_values(without_comments):
         for branch in _split_css_alternative_content(declaration):
             url_ranges = _css_url_argument_ranges(branch)
-            combined = ""
+            chain = ""
+            previous_end: int | None = None
             for literal in _CSS_STRING.finditer(branch):
                 if any(
                     start <= literal.start() < end
@@ -576,9 +616,15 @@ def _render_css_content(value: str) -> tuple[str, ...]:
                     continue
                 rendered = _decode_css_string(literal.group())
                 candidates.append(rendered)
-                combined += rendered
-            if combined:
-                candidates.append(combined)
+                chain = (
+                    chain + rendered
+                    if previous_end is not None
+                    and not branch[previous_end : literal.start()].strip()
+                    else rendered
+                )
+                if chain != rendered:
+                    candidates.append(chain)
+                previous_end = literal.end()
     return tuple(candidates)
 
 
@@ -826,6 +872,73 @@ def _render_inline_executable_scripts(value: str) -> tuple[str, ...]:
         )
         if script_type in executable_types:
             candidates.extend(_render_javascript_literals(script.group("body")))
+            candidates.extend(_render_inline_html_assignments(script.group("body")))
+    return tuple(candidates)
+
+
+def _javascript_expression_end(value: str, start: int) -> int:
+    parentheses = brackets = braces = 0
+    index = start
+    while index < len(value):
+        if value.startswith("/*", index):
+            end = value.find("*/", index + 2)
+            index = len(value) if end < 0 else end + 2
+            continue
+        if value.startswith("//", index):
+            end = re.search(r"[\r\n\u2028\u2029]", value[index + 2 :])
+            index = len(value) if end is None else index + 2 + end.end()
+            continue
+        if value[index] in {'"', "'", "`"}:
+            quote = value[index]
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                index += 1
+                if value[index - 1] == quote:
+                    break
+            continue
+        character = value[index]
+        if character == "(":
+            parentheses += 1
+        elif character == ")" and parentheses:
+            parentheses -= 1
+        elif character == "[":
+            brackets += 1
+        elif character == "]" and brackets:
+            brackets -= 1
+        elif character == "{":
+            braces += 1
+        elif character == "}" and braces:
+            braces -= 1
+        elif character == ";" and not (parentheses or brackets or braces):
+            return index
+        index += 1
+    return len(value)
+
+
+def _render_html_fragment_candidates(value: str) -> tuple[str, ...]:
+    executable_markup = _mask_markup_rcdata_bodies(value)
+    return (
+        unescape(_strip_markup(value)),
+        *_render_markup_attributes(executable_markup),
+        *_render_embedded_css_content(executable_markup),
+        *_render_inline_event_handlers(executable_markup),
+    )
+
+
+def _render_inline_html_assignments(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    pattern = re.compile(r"\.(?:innerHTML|outerHTML)\s*=\s*")
+    for assignment in pattern.finditer(value):
+        start = assignment.end()
+        end = _javascript_expression_end(value, start)
+        operands = _constant_expression_literals(value[start:end])
+        if not operands:
+            continue
+        rendered = "".join(_render_static_literal(item) for item in operands)
+        candidates.extend(_render_html_fragment_candidates(rendered))
     return tuple(candidates)
 
 
