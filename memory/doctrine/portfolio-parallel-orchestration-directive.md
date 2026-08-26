@@ -453,7 +453,7 @@ Do not fabricate:
 - Regulatory status
 - Production test results
 - Security certification
-- The existence or outcome of a review attributed to a named person
+- The existence or outcome of any review claimed to have been performed by a person
 Do not bypass:
 - Authentication
 - Authorization
