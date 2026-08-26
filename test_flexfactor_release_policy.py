@@ -169,6 +169,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
         sources = (
             ("`" + first + ' ${""}' + second + "`", "copy.js"),
+            (
+                "`"
+                + first
+                + ' ${/* split */ " " /* split */ + ""}'
+                + second
+                + "`",
+                "copy.js",
+            ),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
             (f'"\\u{{000006d}}{first[1:]} {second}"', "copy.js"),
             (f'"{first[:1]}\\{first[1:]} {second}"', "copy.js"),
@@ -187,6 +195,27 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     "manual_gate",
                     policy.matching_labels(source.encode(), relative_path),
                 )
+
+        dynamic_template = "`" + first + " ${separator}" + second + "`"
+        self.assertNotIn(
+            "manual_gate",
+            policy.matching_labels(dynamic_template.encode(), "copy.js"),
+        )
+
+        compact = "".join(map(chr, (115, 105, 103, 110, 111, 102, 102)))
+        preserved_backslash = (
+            "`"
+            + compact[:2]
+            + '${"\\\\'
+            + compact[2]
+            + '"}'
+            + compact[3:]
+            + "`"
+        )
+        self.assertNotIn(
+            "organizational_gate_compact",
+            policy.matching_labels(preserved_backslash.encode(), "copy.js"),
+        )
 
     def test_nfkc_and_default_ignorables_are_normalized(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))

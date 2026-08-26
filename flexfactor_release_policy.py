@@ -103,9 +103,16 @@ _JS_ESCAPE = re.compile(
     r'''|(?P<continuation>\r\n|[\r\n\u2028\u2029])'''
     r'''|(?P<simple>0|[^\d\r\n\u2028\u2029]))''',
 )
+_SOURCE_TRIVIA = (
+    r"(?:(?:\s+)|/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*"
+    r"(?:\r\n|[\r\n\u2028\u2029]))*"
+)
+_STATIC_QUOTED_LITERAL_SOURCE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+_STATIC_QUOTED_LITERAL = re.compile(_STATIC_QUOTED_LITERAL_SOURCE, re.DOTALL)
 _TEMPLATE_INTERPOLATION = re.compile(
-    r'''(?<!\\)\$\{\s*(?P<literal>"(?:\\.|[^"\\])*"'''
-    r'''|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)\s*\}''',
+    rf"(?<!\\)\$\{{(?P<expression>{_SOURCE_TRIVIA}{_STATIC_QUOTED_LITERAL_SOURCE}"
+    rf"(?:{_SOURCE_TRIVIA}\+{_SOURCE_TRIVIA}{_STATIC_QUOTED_LITERAL_SOURCE})*"
+    rf"{_SOURCE_TRIVIA})\}}",
     re.DOTALL,
 )
 _CSS_CONTENT_DECLARATION = re.compile(r"\bcontent\s*:\s*([^;}]+)", re.IGNORECASE)
@@ -291,7 +298,12 @@ def _render_static_literal(literal: str) -> str:
     if not literal.startswith("`"):
         return _unquote_static_literal(literal)
     body = _TEMPLATE_INTERPOLATION.sub(
-        lambda match: _unquote_static_literal(match.group("literal")),
+        lambda match: "".join(
+            _unquote_static_literal(literal_match.group())
+            for literal_match in _STATIC_QUOTED_LITERAL.finditer(
+                match.group("expression")
+            )
+        ).replace("\\", "\\\\"),
         literal[1:-1],
     )
     return _unquote_static_literal(f"`{body}`")
