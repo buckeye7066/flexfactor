@@ -110,17 +110,26 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
         which is where the 2026-08-21 "leave no routes blocked" order lives now.
         """
         import shutil
-        if not shutil.which("claude"):
-            # Buildability is a real PATH probe; without the CLI the route is
-            # correctly refused, which is not what this test measures.
-            self.skipTest("BLOCKED: `claude` CLI not on PATH on this host")
-        route = Route("claude-code", is_free=False, backend="claude-code",
-                      cost_class="subscription")
-        self.assertEqual(ff._route_unusable_reason(route, "paid"), "")
-        # ...and free still refuses it: a flat-rate plan bills nothing extra per
-        # call, but it is an account the owner PAYS FOR, and 'free' is a promise
-        # about whose money is at stake, not about marginal cost.
-        self.assertNotEqual(ff._route_unusable_reason(route, "free"), "")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, "claude.bat" if os.name == "nt" else "claude")
+            with open(binary, "w", encoding="utf-8") as handle:
+                handle.write("@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n")
+            if os.name != "nt":
+                os.chmod(binary, 0o755)
+            prior_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = tmp + os.pathsep + prior_path
+            try:
+                self.assertIsNotNone(shutil.which("claude"),
+                                     "controlled claude executable was not resolved")
+                route = Route("claude-code", is_free=False, backend="claude-code",
+                              cost_class="subscription")
+                self.assertEqual(ff._route_unusable_reason(route, "paid"), "")
+                # ...and free still refuses it: a flat-rate plan bills nothing
+                # extra per call, but it is an account the owner PAYS FOR.
+                self.assertNotEqual(ff._route_unusable_reason(route, "free"), "")
+            finally:
+                os.environ["PATH"] = prior_path
 
     def test_extensions_off_disables_the_cli_routes(self):
         os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"

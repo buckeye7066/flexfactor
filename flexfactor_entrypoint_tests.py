@@ -41,6 +41,59 @@ def _manifest(argv0: list[str], cwd: str = HERE, env: dict | None = None) -> dic
     return json.loads(cp.stdout)
 
 
+def _ps_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _run_launcher(name: str, launcher_args: list[str], answers: list[str],
+                  extra_env: dict[str, str]) -> list[str]:
+    """Execute a launcher while replacing only its external side effects."""
+    ps = shutil.which("pwsh") or shutil.which("powershell")
+    if not ps:
+        raise unittest.SkipTest(
+            "no PowerShell on this host: launcher execution UNVERIFIED (blocked, not passed)")
+    answer_load = "\n".join(
+        f"$global:FlexFactorTestAnswers.Enqueue({_ps_literal(answer)})"
+        for answer in answers)
+    invoke = " ".join(_ps_literal(arg) for arg in launcher_args)
+    harness = f"""
+$ErrorActionPreference = 'Stop'
+$global:FlexFactorTestAnswers = [System.Collections.Generic.Queue[string]]::new()
+{answer_load}
+function global:Read-Host {{
+    param([string]$Prompt)
+    if ($global:FlexFactorTestAnswers.Count -gt 0) {{
+        return $global:FlexFactorTestAnswers.Dequeue()
+    }}
+    return ''
+}}
+function global:Invoke-WebRequest {{
+    param([string]$Uri, [int]$TimeoutSec, [switch]$UseBasicParsing)
+    return [pscustomobject]@{{
+        StatusCode = 200
+        Content = '{{"models":[{{"name":"muse-glimmer:30b"}}]}}'
+    }}
+}}
+function global:python {{
+    [CmdletBinding()]
+    param([Parameter(ValueFromRemainingArguments = $true)][object[]]$PythonArgs)
+    Write-Output ('FLEXFACTOR_TEST_PYTHON_ARGS=' + ($PythonArgs -join [char]31))
+    $global:LASTEXITCODE = 0
+}}
+& {_ps_literal(os.path.join(HERE, name))} {invoke}
+"""
+    env = dict(os.environ)
+    env.update(extra_env)
+    cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", harness],
+                        cwd=HERE, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=120)
+    marker = "FLEXFACTOR_TEST_PYTHON_ARGS="
+    rows = [line for line in cp.stdout.splitlines() if line.startswith(marker)]
+    if cp.returncode != 0 or len(rows) != 1:
+        raise AssertionError((name, cp.returncode, cp.stdout[-3000:], cp.stderr[-3000:]))
+    return rows[0][len(marker):].split(chr(31))
+
+
 class EntryPointParityTests(unittest.TestCase):
     def test_every_source_entry_point_reports_one_runtime(self):
         manifests = {name: _manifest(argv) for name, argv in ENTRY_POINTS.items()}
@@ -135,6 +188,33 @@ class EntryPointParityTests(unittest.TestCase):
             cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script],
                                 capture_output=True, text=True, timeout=120)
             self.assertEqual(cp.returncode, 0, (name, cp.stderr[-1000:]))
+
+    def test_launchers_execute_and_forward_the_expected_arguments(self):
+        """Run real PowerShell control flow; stub only network/model processes."""
+        script = os.path.join(HERE, "flexfactor_run.py")
+        target = "portfolio-target"
+        cases = (
+            ("flexfactor_launch.ps1", [target], ["2", "anthropic", ""],
+             {"ANTHROPIC_API_KEY": "test-placeholder", "OPENAI_API_KEY": ""},
+             [script, "scout", "--program", target, "--provider", "anthropic"]),
+            ("flexfactor_audit_launch.ps1", [target], ["n", ""],
+             {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
+              "OPENAI_API_KEY": "test-placeholder"},
+             [script, "audit", "--provider", "openai", "--program", target,
+              "--apply", "--yes", "--allow-dirty", "--auto-clean"]),
+            ("flexfactor_scout_launch.ps1", [target], ["openai", "YES", "report", ""],
+             {"OPENAI_API_KEY": "test-placeholder",
+              "FLEXFACTOR_REPO_REWARDS_URL": "http://127.0.0.1:3000"},
+             [script, "scout", "--program", target, "--provider", "openai",
+              "--repo-rewards-url", "http://127.0.0.1:3000", "--no-auto-start",
+              "--allow-remote-program-context"]),
+            ("flexfactor_glimmer_launch.ps1", ["audit", "--program", target], [], {},
+             [script, "audit", "--program", target, "--provider", "ollama",
+              "--model", "muse-glimmer:30b"]),
+        )
+        for name, args, answers, env, expected in cases:
+            with self.subTest(launcher=name):
+                self.assertEqual(_run_launcher(name, args, answers, env), expected)
 
 
 class CleanInstallTests(unittest.TestCase):
