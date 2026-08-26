@@ -29,21 +29,54 @@ _EXCLUDED_DIRECTORIES = {
     "node_modules",
 }
 
-_RENDERED_SOURCE_SUFFIXES = {
-    ".htm",
-    ".html",
+_LITERAL_SOURCE_SUFFIXES = {
+    ".cjs",
+    ".cts",
     ".js",
     ".jsx",
-    ".mdx",
+    ".mjs",
+    ".mts",
     ".svelte",
     ".ts",
     ".tsx",
     ".vue",
 }
 
+_MARKUP_SOURCE_SUFFIXES = {
+    ".htm",
+    ".html",
+    ".jsx",
+    ".mdx",
+    ".svelte",
+    ".tsx",
+    ".vue",
+}
+
+_MARKDOWN_SOURCE_SUFFIXES = {".md", ".mdx"}
+_JSX_SOURCE_SUFFIXES = {".jsx", ".mdx", ".tsx"}
+
 _STATIC_LITERAL = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`',
     re.DOTALL,
+)
+
+_JSX_WHITESPACE_EXPRESSION = re.compile(
+    r'''\{\s*(?:"(?P<double>(?:\\.|[^"\\])*)"'''
+    r'''|'(?P<single>(?:\\.|[^'\\])*)'|`(?P<template>(?:\\.|[^`\\])*)`)\s*\}''',
+    re.DOTALL,
+)
+
+_HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
+_HTML_TAG = re.compile(
+    r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*?)?\s*/?>",
+    re.DOTALL,
+)
+_JS_ESCAPE = re.compile(
+    r'''\\(?:u\{(?P<braced>[0-9A-Fa-f]{1,6})\}'''
+    r'''|u(?P<fixed>[0-9A-Fa-f]{4})'''
+    r'''|x(?P<hexadecimal>[0-9A-Fa-f]{2})'''
+    r'''|(?P<continuation>\r\n|[\r\n])'''
+    r'''|(?P<simple>[0btnvfr"'`\\]))''',
 )
 
 _PROHIBITED_FRAGMENTS = (
@@ -55,11 +88,16 @@ _PROHIBITED_FRAGMENTS = (
     ("organizational_gate_compact_plural", "sign" + "offs"),
     ("completed_organizational_gate", "signed" + " off"),
     ("identity_gate", "authenticated " + "reviewer"),
+    ("identity_gate_plural", "authenticated " + "reviewers"),
     ("mandatory_reviewer_gate", "required " + "reviewer"),
+    ("mandatory_reviewer_gate_plural", "required " + "reviewers"),
     ("mandatory_person_gate", "required " + "human"),
     ("person_reviewer_gate", "human " + "reviewer"),
+    ("person_reviewer_gate_plural", "human " + "reviewers"),
     ("person_review_gate", "human " + "review"),
+    ("person_review_gate_plural", "human " + "reviews"),
     ("manual_gate", "manual " + "approval"),
+    ("manual_gate_plural", "manual " + "approvals"),
     ("implementation_claim", "self " + "certified"),
     ("implementation_claim_noun", "self " + "certification"),
 )
@@ -105,12 +143,20 @@ def _looks_like_text(value: str | None) -> bool:
         for character in value
     )
     replacements = value.count("\ufffd")
-    return controls / len(value) <= 0.05 and replacements / len(value) <= 0.02
+    replacement_limit = max(1, len(value) // 50)
+    return controls / len(value) <= 0.05 and replacements <= replacement_limit
 
 
 def _decode_strict(raw: bytes, encoding: str) -> str | None:
     try:
         return raw.decode(encoding, "strict")
+    except (UnicodeDecodeError, UnicodeError):
+        return None
+
+
+def _decode_with_replacement(raw: bytes, encoding: str) -> str | None:
+    try:
+        return raw.decode(encoding, "replace")
     except (UnicodeDecodeError, UnicodeError):
         return None
 
@@ -126,7 +172,11 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
     )
     for bom, encoding in bom_encodings:
         if raw.startswith(bom):
-            decoded = _decode_strict(raw, encoding)
+            # A single damaged unit must not make the rest of a BOM-tagged text
+            # file disappear from policy scanning. The same bounded
+            # replacement-character rule used for UTF-8 decides whether the
+            # tolerant decoding still looks textual.
+            decoded = _decode_with_replacement(raw, encoding)
             return (decoded,) if _looks_like_text(decoded) else ()
 
     if b"\0" not in raw:
@@ -142,35 +192,88 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
 
 
 def _unquote_static_literal(literal: str) -> str:
-    return (
-        literal[1:-1]
-        .replace("\\r\\n", "\r\n")
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\`", "`")
-        .replace("\\\\", "\\")
-    )
+    def replace_escape(match: re.Match[str]) -> str:
+        if match.group("braced") is not None:
+            code_point = int(match.group("braced"), 16)
+            if code_point <= 0x10FFFF and not 0xD800 <= code_point <= 0xDFFF:
+                return chr(code_point)
+            return match.group()
+        if match.group("fixed") is not None:
+            code_point = int(match.group("fixed"), 16)
+            if not 0xD800 <= code_point <= 0xDFFF:
+                return chr(code_point)
+            return match.group()
+        if match.group("hexadecimal") is not None:
+            return chr(int(match.group("hexadecimal"), 16))
+        if match.group("continuation") is not None:
+            return ""
+        return {
+            "0": "\0",
+            "b": "\b",
+            "t": "\t",
+            "n": "\n",
+            "v": "\v",
+            "f": "\f",
+            "r": "\r",
+            '"': '"',
+            "'": "'",
+            "`": "`",
+            "\\": "\\",
+        }.get(match.group("simple") or "", match.group())
+
+    return _JS_ESCAPE.sub(replace_escape, literal[1:-1])
+
+
+def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
+    for quote, group_name in (("\"", "double"), ("'", "single"), ("`", "template")):
+        body = match.group(group_name)
+        if body is None:
+            continue
+        rendered = _unquote_static_literal(f"{quote}{body}{quote}")
+        if rendered and rendered.isspace():
+            return rendered
+        break
+    return match.group()
+
+
+def _strip_markup(value: str) -> str:
+    return _HTML_TAG.sub(" ", _HTML_COMMENT.sub("", value))
+
+
+def _render_markdown(value: str) -> str:
+    rendered = _strip_markup(value)
+    rendered = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", rendered)
+    rendered = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", rendered)
+    return re.sub(r"[*~`]+", "", rendered)
 
 
 def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...]:
     """Approximate user-visible JSX and adjacent static string expressions."""
-    if Path(relative_path).suffix.lower() not in _RENDERED_SOURCE_SUFFIXES:
-        return ()
-    candidates = [
-        unescape(re.sub(r"<\s*/?\s*[A-Za-z][^>]*>", " ", value))
-    ]
+    suffix = Path(relative_path).suffix.lower()
+    candidates: list[str] = []
+    visible_value = value
+    if suffix in _JSX_SOURCE_SUFFIXES:
+        visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
+            _replace_jsx_whitespace_expression,
+            visible_value,
+        )
+    if suffix in _MARKUP_SOURCE_SUFFIXES:
+        candidates.append(unescape(_strip_markup(visible_value)))
+    if suffix in _MARKDOWN_SOURCE_SUFFIXES:
+        candidates.append(unescape(_render_markdown(visible_value)))
+    if suffix not in _LITERAL_SOURCE_SUFFIXES:
+        return tuple(candidates)
     previous: re.Match[str] | None = None
     chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):
+        rendered_literal = _unquote_static_literal(match.group())
+        candidates.append(rendered_literal)
         gap = value[previous.end() : match.start()] if previous else ""
         if previous and re.fullmatch(r"\s*\+\s*", gap):
             first_literal = _unquote_static_literal(previous.group())
             chain = (
                 (chain if chain is not None else first_literal)
-                + _unquote_static_literal(match.group())
+                + rendered_literal
             )
             candidates.append(chain)
         else:
