@@ -223,7 +223,16 @@ def _default_firecrawl_opener(url: str, data: bytes | None = None,
     return raw.decode("utf-8", "replace")
 
 
-def _firecrawl(query: str, limit: int, opener) -> list[dict]:
+def _http_url_has_host(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def _firecrawl(query: str, limit: int, opener, *,
+               allow_credentials: bool = True) -> list[dict]:
     """Firecrawl v2 search, authenticated when a key is configured.
 
     Firecrawl is the freshest evidence source in the search ladder, but it is
@@ -249,6 +258,10 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
         key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
         if not key:
             raise RuntimeError("FIRECRAWL_API_KEY is not set")
+    if key and not allow_credentials:
+        raise RuntimeError(
+            "credentialed Firecrawl is disabled unless paid research is explicit"
+        )
     if key and not endpoint.startswith("https://"):
         raise RuntimeError("credentialed Firecrawl endpoints require HTTPS")
     if key:
@@ -281,7 +294,7 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
         if not isinstance(item, dict):
             raise RuntimeError("Firecrawl v2 returned a non-object result")
         url = str(item.get("url") or "").strip()
-        if not url.startswith(("https://", "http://")):
+        if not _http_url_has_host(url):
             raise RuntimeError("Firecrawl v2 returned a result without a valid URL")
         if url in seen:
             continue
@@ -363,7 +376,9 @@ _WEB_BACKENDS = (("firecrawl", _firecrawl), ("searxng", _searxng),
                  ("wikipedia", _wikipedia))
 
 
-def web_search(query: str, limit: int = 6, opener=None) -> tuple[list[dict], str, dict]:
+def web_search(query: str, limit: int = 6, opener=None, *,
+               allow_credentialed_firecrawl: bool = True
+               ) -> tuple[list[dict], str, dict]:
     """(results, backend_used, skipped{backend: reason}).
 
     Tries each keyless backend in order and returns the FIRST that yields
@@ -375,7 +390,15 @@ def web_search(query: str, limit: int = 6, opener=None) -> tuple[list[dict], str
     skipped: dict[str, str] = {}
     for name, fn in _WEB_BACKENDS:
         try:
-            hits = fn(query, limit, opener)
+            if name == "firecrawl":
+                hits = fn(
+                    query,
+                    limit,
+                    opener,
+                    allow_credentials=allow_credentialed_firecrawl,
+                )
+            else:
+                hits = fn(query, limit, opener)
         except Exception as ex:  # any transport/parse failure -> named skip
             skipped[name] = f"{type(ex).__name__}: {ex}"
             continue
@@ -533,7 +556,7 @@ _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo
 
 
 def _is_evidence_url(url: str | None) -> bool:
-    if not url or not url.startswith("http"):
+    if not url or not _http_url_has_host(url):
         return False
     host = urllib.parse.urlparse(url).hostname or ""
     return host.lower() not in _NON_EVIDENCE_HOSTS
@@ -614,7 +637,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          stack=None, *, rr_search=None, rr_endpoint: str = "",
                          target: int = DEFAULT_TARGET, opener=None,
                          log=print, max_workers: int = 4,
-                         file_list=None, author=None) -> dict:
+                         file_list=None, author=None,
+                         allow_credentialed_firecrawl: bool = False) -> dict:
     """Find competitors, extract one adoptable idea each, judge against purpose.
 
     `judge(system, prompt, schema) -> dict` is injected (flexfactor routes it to
@@ -697,7 +721,12 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         if not query:
             continue
         research["queries"].append(query)
-        hits, backend, skips = web_search(query, limit=4, opener=opener)
+        hits, backend, skips = web_search(
+            query,
+            limit=4,
+            opener=opener,
+            allow_credentialed_firecrawl=allow_credentialed_firecrawl,
+        )
         web_skips.update({k: v for k, v in skips.items() if k not in web_skips})
         if backend and f"web:{backend}" not in research["sources_used"]:
             research["sources_used"].append(f"web:{backend}")
