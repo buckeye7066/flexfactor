@@ -1496,7 +1496,8 @@ def _workspace_entries(root: Path) -> list[tuple[str, Path, bool]]:
 
 def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
     """Enumerate the exact index, or an exported workspace when no index fits."""
-    root = root.resolve()
+    root = Path(root)
+    resolved_root = root.resolve()
     git_metadata = root / ".git"
     has_git_metadata = (
         git_metadata.is_dir()
@@ -1523,7 +1524,7 @@ def repository_entries(root: Path) -> list[tuple[str, Path, bool]]:
             )
         return _workspace_entries(root)
     git_root = Path(git_probe.stdout.strip()).resolve()
-    if os.path.normcase(str(git_root)) != os.path.normcase(str(root)):
+    if os.path.normcase(str(git_root)) != os.path.normcase(str(resolved_root)):
         if has_git_metadata:
             raise PolicyInfrastructureError(
                 "Git metadata resolved outside the requested repository"

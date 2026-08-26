@@ -467,6 +467,16 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "flexfactor_release_policy.py::repository_entries": (
+        "Runs only fixed, read-only Git metadata commands (rev-parse and "
+        "ls-files) so the release-language scanner can enumerate the exact "
+        "index. No target-controlled command or executable is launched."
+    ),
+    "flexfactor_release_policy.py::_read_entry": (
+        "Runs only fixed, read-only git show against an index path already "
+        "returned by git ls-files. It reads policy input and cannot execute "
+        "repository code or mutate the repository."
+    ),
     "flexfactor.py::_run": (
         "THE chokepoint. This is the call every audited process funnels into: "
         "it classifies the command, hands install/build/test to the execution "
