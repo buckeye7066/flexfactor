@@ -8,13 +8,16 @@ is examined so byte order cannot hide a policy violation.
 from __future__ import annotations
 
 import argparse
+import ast
 import codecs
 from html import unescape
+import io
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
+import tokenize
 from typing import Iterable
 import unicodedata
 
@@ -37,6 +40,8 @@ _LITERAL_SOURCE_SUFFIXES = {
     ".json",
     ".mjs",
     ".mts",
+    ".py",
+    ".pyw",
     ".svelte",
     ".ts",
     ".tsx",
@@ -73,6 +78,19 @@ _HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
 _HTML_TAG = re.compile(
     r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*?)?\s*/?>",
     re.DOTALL,
+)
+_HTML_OPEN_TAG = re.compile(
+    r'''<[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*/?>''',
+    re.DOTALL,
+)
+_HTML_ATTRIBUTE = re.compile(
+    r'''(?:^|\s)[^\s"'=<>`]+\s*=\s*(?:"(?P<double>[^"]*)"'''
+    r'''|'(?P<single>[^']*)'|(?P<bare>[^\s"'=<>`]+))'''
+)
+_STYLE_BLOCK = re.compile(
+    r'''<style(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>'''
+    r'''(?P<body>[\s\S]*?)</style\s*>''',
+    re.IGNORECASE,
 )
 _JS_ESCAPE = re.compile(
     r'''\\(?:u\{(?P<braced>[0-9A-Fa-f]{1,6})\}'''
@@ -276,6 +294,30 @@ def _render_css_content(value: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+def _render_embedded_css_content(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for match in _STYLE_BLOCK.finditer(value):
+        candidates.extend(_render_css_content(match.group("body")))
+    return tuple(candidates)
+
+
+def _render_markup_attributes(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for tag in _HTML_OPEN_TAG.finditer(value):
+        for attribute in _HTML_ATTRIBUTE.finditer(tag.group()):
+            candidate = next(
+                value
+                for value in (
+                    attribute.group("double"),
+                    attribute.group("single"),
+                    attribute.group("bare"),
+                )
+                if value is not None
+            )
+            candidates.append(unescape(candidate))
+    return tuple(candidates)
+
+
 def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
     for quote, group_name in (("\"", "double"), ("'", "single"), ("`", "template")):
         body = match.group(group_name)
@@ -321,7 +363,44 @@ def _render_markdown(value: str) -> str:
         ),
         rendered,
     )
-    return re.sub(r"[*~`]+", "", rendered)
+    rendered = re.sub(r"(`+)([\s\S]*?)\1", r"\2", rendered)
+    rendered = re.sub(r"~~(?=\S)([\s\S]*?\S)~~", r"\1", rendered)
+    rendered = re.sub(r"\*\*(?=\S)([\s\S]*?\S)\*\*", r"\1", rendered)
+    rendered = re.sub(r"__(?=\S)([\s\S]*?\S)__", r"\1", rendered)
+    rendered = re.sub(r"\*(?=\S)([^*\r\n]*?\S)\*", r"\1", rendered)
+    return re.sub(r"_(?=\S)([^_\r\n]*?\S)_", r"\1", rendered)
+
+
+def _render_python_literals(value: str) -> tuple[str, ...]:
+    """Render safe Python literals and the language's implicit concatenation."""
+    candidates: list[str] = []
+    chain: str | None = None
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(value).readline)
+        for current in tokens:
+            if current.type == tokenize.STRING:
+                try:
+                    rendered_value = ast.literal_eval(current.string)
+                except (SyntaxError, ValueError):
+                    chain = None
+                    continue
+                if isinstance(rendered_value, bytes):
+                    rendered = rendered_value.decode("latin-1")
+                elif isinstance(rendered_value, str):
+                    rendered = rendered_value
+                else:
+                    chain = None
+                    continue
+                candidates.append(rendered)
+                chain = (chain or "") + rendered
+                candidates.append(chain)
+            elif current.type not in {tokenize.COMMENT, tokenize.NL}:
+                chain = None
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        # Keep every candidate produced before malformed source interrupted the
+        # tokenizer; raw-text matching still covers the complete file.
+        pass
+    return tuple(dict.fromkeys(candidates))
 
 
 def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...]:
@@ -337,10 +416,15 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         )
     if suffix in _MARKUP_SOURCE_SUFFIXES:
         candidates.append(unescape(_strip_markup(visible_value)))
+        candidates.extend(_render_markup_attributes(visible_value))
+        candidates.extend(_render_embedded_css_content(visible_value))
     if suffix in _MARKDOWN_SOURCE_SUFFIXES:
         candidates.append(unescape(_render_markdown(visible_value)))
     if suffix in _CSS_SOURCE_SUFFIXES:
         candidates.extend(_render_css_content(value))
+    if suffix in {".py", ".pyw"}:
+        candidates.extend(_render_python_literals(value))
+        return tuple(candidates)
     if suffix not in _LITERAL_SOURCE_SUFFIXES:
         return tuple(candidates)
     previous: re.Match[str] | None = None

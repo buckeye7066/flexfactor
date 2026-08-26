@@ -199,6 +199,48 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_attributes_embedded_css_and_python_literals_are_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (
+                f'<input aria-label="{first}&#32;{second}">',
+                "page.html",
+            ),
+            (
+                f'<style>.status::after {{ content: "{first}\\20 {second}"; }}</style>',
+                "page.html",
+            ),
+            (
+                f'message = ("{first} " "{second}")',
+                "messages.py",
+            ),
+            (
+                f'message = ("{first} "\n# static copy\n"{second}")',
+                "messages.py",
+            ),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_literal_markdown_and_separate_python_statements_stay_distinct(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (f"{first} * {second}", "README.md"),
+            (f'first = "{first} "\nsecond = "{second}"', "messages.py"),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertEqual(
+                    policy.matching_labels(source.encode(), relative_path),
+                    (),
+                )
+
     def test_utf8_text_with_a_nul_remains_a_candidate(self):
         raw = ("manual " + "approval").encode() + b"\0"
         self.assertIn("manual_gate", policy.matching_labels(raw, "page.html"))
