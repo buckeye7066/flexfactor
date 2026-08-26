@@ -35,10 +35,25 @@ silently treated as clean.
 """
 from __future__ import annotations
 
+import datetime
 import json
 
-#: Check states that do not block a merge.
-_OK_CHECK = {"SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED", None, ""}
+#: Check conclusions that do not block a merge. A check that has NOT REACHED a
+#: conclusion is deliberately absent: see `_pr_blocking_checks`.
+_OK_CHECK = {"SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED"}
+
+#: A CheckRun's `status` when GitHub has finished running it. Anything else
+#: (QUEUED, IN_PROGRESS, WAITING, PENDING, REQUESTED) means no verdict exists.
+_COMPLETED = "COMPLETED"
+
+#: A workflow job that "failed" faster than this ran no steps. GitHub reports an
+#: account-wide Actions billing halt as an ordinary job FAILURE that starts and
+#: completes within a couple of seconds with zero steps executed. Measured on
+#: buckeye7066/GrantFlow PR #1401 (2026-08-26): 11 FAILURE jobs, every one 2-3s.
+#: Duration NEVER changes the verdict - a red check blocks either way. It only
+#: changes what the skip reason SAYS, so "CI never ran" is not reported to the
+#: owner as "your code failed CI".
+_NEVER_RAN_SECONDS = 5.0
 
 TIMEOUT_S = 300
 
@@ -124,14 +139,88 @@ def commit_pending_changes(project_dir, *, run):
 # --------------------------------------------------------------------------
 # Step 2: open pull requests
 # --------------------------------------------------------------------------
+def _check_seconds(c):
+    """Wall-clock seconds a CheckRun took, or None if GitHub did not say."""
+    started, completed = c.get("startedAt"), c.get("completedAt")
+    if not started or not completed:
+        return None
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    try:
+        return (datetime.datetime.strptime(completed, fmt)
+                - datetime.datetime.strptime(started, fmt)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _ci_never_ran(rollup):
+    """True when the whole rollup carries the zero-step signature.
+
+    An account-wide GitHub Actions billing halt does not look like an outage: it
+    looks like every workflow job failing. The distinguishing evidence is that
+    each one starts and completes within seconds having executed no steps.
+
+    The test is deliberately on the WHOLE rollup, never a single check: one lint
+    that legitimately fails in two seconds is a real failure, whereas EVERY
+    workflow job failing in two seconds is CI not running at all. Fewer than two
+    failures is never enough evidence to make this claim.
+    """
+    fast = 0
+    for c in rollup or []:
+        if c.get("__typename") == "StatusContext":
+            continue  # third-party contexts have no duration to judge
+        if (c.get("conclusion") or "") not in ("FAILURE", "TIMED_OUT",
+                                               "STARTUP_FAILURE", "CANCELLED"):
+            continue
+        secs = _check_seconds(c)
+        if secs is None or secs > _NEVER_RAN_SECONDS:
+            return False  # a real, measurable failure exists -> CI did run
+        fast += 1
+    return fast >= 2
+
+
 def _pr_blocking_checks(pr):
-    """Names of checks on this PR that are not passing."""
+    """Names of checks on this PR that are not passing OR not finished.
+
+    THREE STATES, NOT TWO. A check that has not reached a conclusion is NOT a
+    passing check. `_OK_CHECK` used to contain None and "", so a CheckRun that
+    was still QUEUED or IN_PROGRESS - `conclusion` empty until it completes, and
+    no `state` key at all on that GraphQL type - read as green and the PR was
+    merged with its CI still running. That is the "never ran counted as passed"
+    shape this codebase treats as unacceptable, and it was reachable from every
+    audit/prodready run through `clean_repo`.
+
+    A never-run check is reported as `name=NOT RUN (status)` so the reason the
+    owner reads is the true one.
+    """
+    rollup = pr.get("statusCheckRollup") or []
+    never_ran = _ci_never_ran(rollup)
     bad = []
-    for c in pr.get("statusCheckRollup") or []:
-        state = c.get("conclusion") or c.get("state")
-        if state not in _OK_CHECK:
-            name = c.get("name") or c.get("context") or "?"
-            bad.append(str(name) + "=" + str(state))
+    for c in rollup:
+        name = c.get("name") or c.get("context") or "?"
+        if "status" in c or "conclusion" in c:  # CheckRun
+            status = str(c.get("status") or "").upper()
+            conclusion = str(c.get("conclusion") or "").upper()
+            if status and status != _COMPLETED:
+                bad.append(f"{name}=NOT RUN ({status or 'no status'})")
+                continue
+            if not conclusion:
+                bad.append(f"{name}=NOT RUN (no conclusion reported)")
+                continue
+            if conclusion not in _OK_CHECK:
+                if never_ran:
+                    secs = _check_seconds(c)
+                    bad.append(f"{name}={conclusion} (CI NEVER RAN: zero steps in "
+                               f"{'?' if secs is None else int(secs)}s - Actions "
+                               "billing halt or workflow startup failure, NOT a "
+                               "code failure)")
+                else:
+                    bad.append(f"{name}={conclusion}")
+            continue
+        state = str(c.get("state") or "").upper()  # StatusContext
+        if not state:
+            bad.append(f"{name}=NOT RUN (no state reported)")
+        elif state not in _OK_CHECK:
+            bad.append(f"{name}={state}")
     return bad
 
 
