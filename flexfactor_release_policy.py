@@ -67,6 +67,7 @@ _JSX_WHITESPACE_EXPRESSION = re.compile(
     r'''|'(?P<single>(?:\\.|[^'\\])*)'|`(?P<template>(?:\\.|[^`\\])*)`)\s*\}''',
     re.DOTALL,
 )
+_JSX_COMMENT_EXPRESSION = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
 
 _HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
 _HTML_TAG = re.compile(
@@ -162,13 +163,6 @@ def _looks_like_text(value: str | None) -> bool:
     return controls <= control_limit and replacements <= replacement_limit
 
 
-def _decode_strict(raw: bytes, encoding: str) -> str | None:
-    try:
-        return raw.decode(encoding, "strict")
-    except (UnicodeDecodeError, UnicodeError):
-        return None
-
-
 def _decode_with_replacement(raw: bytes, encoding: str) -> str | None:
     try:
         return raw.decode(encoding, "replace")
@@ -202,7 +196,7 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
         return tuple(candidates)
 
     for encoding in ("utf-32-le", "utf-32-be", "utf-16-le", "utf-16-be"):
-        decoded = _decode_strict(raw, encoding)
+        decoded = _decode_with_replacement(raw, encoding)
         if _looks_like_text(decoded) and decoded not in candidates:
             candidates.append(decoded)
     return tuple(candidates)
@@ -336,6 +330,7 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     candidates: list[str] = []
     visible_value = value
     if suffix in _JSX_SOURCE_SUFFIXES:
+        visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
         visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
             _replace_jsx_whitespace_expression,
             visible_value,
