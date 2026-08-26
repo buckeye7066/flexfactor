@@ -432,6 +432,10 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 f'<input type="text" value="{first}&#32;{second}">',
                 "page.html",
             ),
+            (
+                f'function copy() {{ "{first} " }}\n{second}();',
+                "view.tsx",
+            ),
         )
         for source, relative_path in sources:
             with self.subTest(relative_path=relative_path, source=source):

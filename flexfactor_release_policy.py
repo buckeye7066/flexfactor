@@ -112,6 +112,22 @@ _JSX_COMMENT_EXPRESSION = re.compile(r"\{\s*/\*[\s\S]*?\*/\s*\}")
 _JSX_NON_RENDERING_EXPRESSION = re.compile(
     r"\{\s*(?:false|null|true|undefined)\s*\}"
 )
+_JSX_VOID_ELEMENTS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 
 _HTML_COMMENT = re.compile(r"<!--[\s\S]*?-->")
 _NON_RENDERED_ELEMENT = re.compile(
@@ -821,6 +837,106 @@ def _replace_jsx_static_expression(match: re.Match[str]) -> str:
     return rendered if rendered is not None else match.group()
 
 
+def _scan_jsx_tag(
+    value: str,
+    start: int,
+) -> tuple[int, bool, bool, str] | None:
+    if value.startswith("<>", start):
+        return start + 2, False, False, ""
+    if value.startswith("</>", start):
+        return start + 3, True, False, ""
+    opening = re.match(r"</?([A-Za-z][A-Za-z0-9:.-]*)", value[start:])
+    if opening is None:
+        return None
+    quote = ""
+    escaped = False
+    index = start + opening.end()
+    while index < len(value):
+        character = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == ">":
+            closing = value[start + 1 : start + 2] == "/"
+            self_closing = value[start:index].rstrip().endswith("/")
+            return index + 1, closing, self_closing, opening.group(1).lower()
+        index += 1
+    return None
+
+
+def _jsx_element_depth_at(value: str, position: int) -> int:
+    depth = 0
+    index = 0
+    while index < position:
+        if value.startswith("/*", index):
+            end = value.find("*/", index + 2)
+            index = position if end < 0 else end + 2
+            continue
+        if value.startswith("//", index):
+            end = re.search(r"[\r\n\u2028\u2029]", value[index + 2 :])
+            index = position if end is None else index + 2 + end.end()
+            continue
+        if value[index] in {'"', "'", "`"}:
+            quote = value[index]
+            index += 1
+            while index < position:
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                index += 1
+                if value[index - 1] == quote:
+                    break
+            continue
+        if value[index] == "<":
+            tag = _scan_jsx_tag(value, index)
+            if tag is not None:
+                end, closing, self_closing, name = tag
+                if closing:
+                    depth = max(0, depth - 1)
+                elif not self_closing and name not in _JSX_VOID_ELEMENTS:
+                    depth += 1
+                index = end
+                continue
+        index += 1
+    return depth
+
+
+def _is_likely_jsx_child_expression(
+    value: str,
+    start: int,
+    end: int,
+) -> bool:
+    if _jsx_element_depth_at(value, start):
+        return True
+    before = value[:start].rstrip()
+    after = value[end:].lstrip()
+    return bool(
+        re.search(r"</[A-Za-z][A-Za-z0-9:.-]*\s*>$", before)
+        and re.match(r"(?:<|\{)", after)
+    )
+
+
+def _project_static_jsx_expressions(value: str) -> str:
+    return _JSX_STATIC_EXPRESSION.sub(
+        lambda match: (
+            _replace_jsx_static_expression(match)
+            if _is_likely_jsx_child_expression(
+                value,
+                match.start(),
+                match.end(),
+            )
+            else match.group()
+        ),
+        value,
+    )
+
+
 def _strip_markup(value: str) -> str:
     rcdata_segments: list[tuple[str, str]] = []
 
@@ -1163,10 +1279,7 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     if suffix in _JSX_SOURCE_SUFFIXES:
         visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
         visible_value = _JSX_NON_RENDERING_EXPRESSION.sub("", visible_value)
-        visible_value = _JSX_STATIC_EXPRESSION.sub(
-            _replace_jsx_static_expression,
-            visible_value,
-        )
+        visible_value = _project_static_jsx_expressions(visible_value)
     if suffix in _MARKUP_SOURCE_SUFFIXES:
         executable_markup = _mask_markup_rcdata_bodies(visible_value)
         candidates.append(unescape(_strip_markup(visible_value)))
