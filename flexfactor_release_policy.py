@@ -125,7 +125,8 @@ _HTML_TAG = re.compile(
     re.DOTALL,
 )
 _HTML_OPEN_TAG = re.compile(
-    r'''<[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*/?>''',
+    r'''<(?P<tag>[A-Za-z][A-Za-z0-9:-]*)'''
+    r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*/?>''',
     re.DOTALL,
 )
 _HTML_ATTRIBUTE = re.compile(
@@ -153,6 +154,12 @@ _STYLE_BLOCK = re.compile(
     r'''(?P<body>[\s\S]*?)</style\s*>''',
     re.IGNORECASE,
 )
+_RCDATA_ELEMENT = re.compile(
+    r'''(?P<opening><(?P<tag>textarea|title)\b'''
+    r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>)'''
+    r'''(?P<body>[\s\S]*?)(?P<closing></(?P=tag)\s*>)''',
+    re.IGNORECASE,
+)
 _JS_ESCAPE = re.compile(
     r'''\\(?:u\{(?P<braced>0*[0-9A-Fa-f]{1,6})\}'''
     r'''|u(?P<fixed>[0-9A-Fa-f]{4})'''
@@ -169,7 +176,7 @@ _SOURCE_GROUPING = (
     r"(?:(?:\s+)|/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*"
     r"(?:\r\n|[\r\n\u2028\u2029])|[()])*"
 )
-_JSX_WHITESPACE_EXPRESSION = re.compile(
+_JSX_STATIC_EXPRESSION = re.compile(
     rf"\{{(?P<expression>{_SOURCE_GROUPING}{_STATIC_LITERAL_SOURCE}"
     rf"(?:{_SOURCE_GROUPING}\+{_SOURCE_GROUPING}{_STATIC_LITERAL_SOURCE})*"
     rf"{_SOURCE_GROUPING})\}}",
@@ -543,14 +550,77 @@ def _render_css_content(value: str) -> tuple[str, ...]:
     without_comments = _strip_css_comments(value)
     for declaration in _iter_css_content_values(without_comments):
         for branch in _split_css_alternative_content(declaration):
+            url_ranges = _css_url_argument_ranges(branch)
             combined = ""
             for literal in _CSS_STRING.finditer(branch):
+                if any(
+                    start <= literal.start() < end
+                    for start, end in url_ranges
+                ):
+                    continue
                 rendered = _decode_css_string(literal.group())
                 candidates.append(rendered)
                 combined += rendered
             if combined:
                 candidates.append(combined)
     return tuple(candidates)
+
+
+def _css_url_argument_ranges(value: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(value):
+        if value[index] in {'"', "'"}:
+            quote = value[index]
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                index += 1
+                if value[index - 1] == quote:
+                    break
+            continue
+        if value[index : index + 3].lower() != "url":
+            index += 1
+            continue
+        before = value[index - 1] if index else ""
+        after = value[index + 3] if index + 3 < len(value) else ""
+        if (before and (before.isalnum() or before in "_-")) or (
+            after and (after.isalnum() or after in "_-")
+        ):
+            index += 3
+            continue
+        cursor = index + 3
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor >= len(value) or value[cursor] != "(":
+            index += 3
+            continue
+        start = cursor + 1
+        cursor = start
+        quote = ""
+        escaped = False
+        parentheses = 1
+        while cursor < len(value) and parentheses:
+            character = value[cursor]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+            elif character in {'"', "'"}:
+                quote = character
+            elif character == "(":
+                parentheses += 1
+            elif character == ")":
+                parentheses -= 1
+            cursor += 1
+        ranges.append((start, cursor - 1 if not parentheses else len(value)))
+        index = cursor
+    return tuple(ranges)
 
 
 def _strip_css_comments(value: str) -> str:
@@ -631,20 +701,75 @@ def _decode_html_character_references(
 def _render_markup_attributes(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for tag in _HTML_OPEN_TAG.finditer(value):
+        attributes = tuple(
+            (
+                attribute.group("name").lower(),
+                _decode_html_character_references(
+                    next(
+                        item
+                        for item in (
+                            attribute.group("double"),
+                            attribute.group("single"),
+                            attribute.group("bare"),
+                        )
+                        if item is not None
+                    ),
+                    in_attribute=True,
+                ),
+            )
+            for attribute in _HTML_ATTRIBUTE.finditer(tag.group())
+        )
+        input_type = next(
+            (item for name, item in attributes if name == "type"),
+            "",
+        ).strip().lower()
+        for name, candidate in attributes:
+            visible_input_value = (
+                tag.group("tag").lower() == "input"
+                and name == "value"
+                and input_type in {"button", "reset", "submit"}
+            )
+            if name in _EXPOSED_MARKUP_ATTRIBUTES or visible_input_value:
+                candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _mask_markup_rcdata_bodies(value: str) -> str:
+    return _RCDATA_ELEMENT.sub(
+        lambda match: (
+            match.group("opening")
+            + "".join(
+                character if character in "\r\n" else " "
+                for character in match.group("body")
+            )
+            + match.group("closing")
+        ),
+        value,
+    )
+
+
+def _render_inline_event_handlers(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for tag in _HTML_OPEN_TAG.finditer(value):
         for attribute in _HTML_ATTRIBUTE.finditer(tag.group()):
-            if attribute.group("name").lower() not in _EXPOSED_MARKUP_ATTRIBUTES:
+            if re.fullmatch(r"on[a-z]+", attribute.group("name"), re.I) is None:
                 continue
-            candidate = next(
-                value
-                for value in (
+            source = next(
+                item
+                for item in (
                     attribute.group("double"),
                     attribute.group("single"),
                     attribute.group("bare"),
                 )
-                if value is not None
+                if item is not None
             )
-            candidates.append(
-                _decode_html_character_references(candidate, in_attribute=True)
+            candidates.extend(
+                _render_javascript_literals(
+                    _decode_html_character_references(
+                        source,
+                        in_attribute=True,
+                    )
+                )
             )
     return tuple(candidates)
 
@@ -688,20 +813,29 @@ def _render_inline_executable_scripts(value: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
-def _replace_jsx_whitespace_expression(match: re.Match[str]) -> str:
+def _replace_jsx_static_expression(match: re.Match[str]) -> str:
     rendered = "".join(
         _render_static_literal(literal)
         for literal in _constant_expression_literals(match.group("expression"))
     )
-    if rendered and rendered.isspace():
-        return rendered
-    return match.group()
+    return rendered if rendered is not None else match.group()
 
 
 def _strip_markup(value: str) -> str:
-    without_comments = _HTML_COMMENT.sub("", value)
+    rcdata_segments: list[tuple[str, str]] = []
+
+    def shield_rcdata(match: re.Match[str]) -> str:
+        placeholder = f"\0RCDATA{len(rcdata_segments)}\0"
+        rcdata_segments.append((placeholder, match.group("body")))
+        return placeholder
+
+    shielded = _RCDATA_ELEMENT.sub(shield_rcdata, value)
+    without_comments = _HTML_COMMENT.sub("", shielded)
     without_non_rendered = _NON_RENDERED_ELEMENT.sub("", without_comments)
-    return _HTML_TAG.sub(" ", without_non_rendered)
+    rendered = _HTML_TAG.sub(" ", without_non_rendered)
+    for placeholder, segment in rcdata_segments:
+        rendered = rendered.replace(placeholder, segment)
+    return rendered
 
 
 def _normalize_markdown_reference_label(value: str) -> str:
@@ -764,6 +898,7 @@ def _render_markdown(value: str) -> str:
     rendered = re.sub(r"\*(?=\S)([^*\r\n]*?\S)\*", r"\1", rendered)
     rendered = re.sub(r"_(?=\S)([^_\r\n]*?\S)_", r"\1", rendered)
     rendered = re.sub(r"\\(?:\r\n|[\r\n])", " ", rendered)
+    rendered = unescape(rendered)
     for placeholder, segment in code_segments:
         rendered = rendered.replace(placeholder, segment)
     return rendered
@@ -897,29 +1032,126 @@ def _mask_javascript_comments(value: str) -> str:
     return "".join(rendered)
 
 
+def _javascript_regex_can_start(value: str, index: int) -> bool:
+    prefix = value[:index].rstrip()
+    if not prefix or prefix.endswith("=>"):
+        return True
+    if prefix[-1] in "([{,:;=!?~%&|^*+-<>":
+        return True
+    word = re.search(r"([A-Za-z_$][\w$]*)$", prefix)
+    return bool(
+        word
+        and word.group(1)
+        in {
+            "await",
+            "case",
+            "delete",
+            "in",
+            "instanceof",
+            "of",
+            "return",
+            "throw",
+            "typeof",
+            "void",
+            "yield",
+        }
+    )
+
+
+def _javascript_regex_end(value: str, start: int) -> int | None:
+    escaped = False
+    character_class = False
+    index = start + 1
+    while index < len(value):
+        character = value[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "[":
+            character_class = True
+        elif character == "]":
+            character_class = False
+        elif character in "\r\n\u2028\u2029":
+            return None
+        elif character == "/" and not character_class:
+            index += 1
+            while index < len(value) and value[index].isalpha():
+                index += 1
+            return index
+        index += 1
+    return None
+
+
+def _mask_javascript_regex_literals(value: str) -> str:
+    rendered = list(value)
+    index = 0
+    while index < len(value):
+        if value[index] in {'"', "'", "`"}:
+            quote = value[index]
+            index += 1
+            while index < len(value):
+                if value[index] == "\\":
+                    index += 2
+                    continue
+                index += 1
+                if value[index - 1] == quote:
+                    break
+            continue
+        if value[index] == "/" and _javascript_regex_can_start(value, index):
+            end = _javascript_regex_end(value, index)
+            if end is not None:
+                for offset in range(index, end):
+                    if not value[offset].isspace():
+                        rendered[offset] = " "
+                index = end
+                continue
+        index += 1
+    return "".join(rendered)
+
+
+def _render_static_raw_template(literal: str) -> str:
+    def replace_interpolation(match: re.Match[str]) -> str:
+        operands = _constant_expression_literals(match.group("expression"))
+        if not operands:
+            return match.group()
+        return "".join(_render_static_literal(operand) for operand in operands)
+
+    return _TEMPLATE_INTERPOLATION.sub(replace_interpolation, literal[1:-1])
+
+
 def _render_javascript_literals(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     previous: re.Match[str] | None = None
+    previous_rendered = ""
     chain: str | None = None
-    projected = _mask_javascript_comments(value)
+    projected = _mask_javascript_regex_literals(
+        _mask_javascript_comments(value)
+    )
     for match in _STATIC_LITERAL.finditer(projected):
         literal = value[match.start() : match.end()]
-        rendered_literal = _render_static_literal(literal)
+        is_raw_template = literal.startswith("`") and re.search(
+            r"String\s*\.\s*raw\s*$",
+            projected[: match.start()],
+        )
+        rendered_literal = (
+            _render_static_raw_template(literal)
+            if is_raw_template
+            else _render_static_literal(literal)
+        )
         candidates.append(rendered_literal)
         gap = projected[previous.end() : match.start()] if previous else ""
         gap_without_grouping = gap.replace("(", "").replace(")", "")
         if previous and re.fullmatch(r"\s*\+\s*", gap_without_grouping):
-            first_literal = _render_static_literal(
-                value[previous.start() : previous.end()]
-            )
             chain = (
-                (chain if chain is not None else first_literal)
+                (chain if chain is not None else previous_rendered)
                 + rendered_literal
             )
             candidates.append(chain)
         else:
             chain = None
         previous = match
+        previous_rendered = rendered_literal
     return tuple(candidates)
 
 
@@ -931,17 +1163,19 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
     if suffix in _JSX_SOURCE_SUFFIXES:
         visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
         visible_value = _JSX_NON_RENDERING_EXPRESSION.sub("", visible_value)
-        visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
-            _replace_jsx_whitespace_expression,
+        visible_value = _JSX_STATIC_EXPRESSION.sub(
+            _replace_jsx_static_expression,
             visible_value,
         )
     if suffix in _MARKUP_SOURCE_SUFFIXES:
+        executable_markup = _mask_markup_rcdata_bodies(visible_value)
         candidates.append(unescape(_strip_markup(visible_value)))
-        candidates.extend(_render_markup_attributes(visible_value))
-        candidates.extend(_render_embedded_css_content(visible_value))
-        candidates.extend(_render_inline_executable_scripts(visible_value))
+        candidates.extend(_render_markup_attributes(executable_markup))
+        candidates.extend(_render_embedded_css_content(executable_markup))
+        candidates.extend(_render_inline_executable_scripts(executable_markup))
+        candidates.extend(_render_inline_event_handlers(executable_markup))
     if suffix in _MARKDOWN_SOURCE_SUFFIXES:
-        candidates.append(unescape(_render_markdown(visible_value)))
+        candidates.append(_render_markdown(visible_value))
     if suffix in _CSS_SOURCE_SUFFIXES:
         candidates.extend(_render_css_content(value))
     if suffix in {".py", ".pyw"}:

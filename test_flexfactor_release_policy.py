@@ -379,6 +379,67 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     (),
                 )
 
+    def test_cross_format_runtime_copy_is_projected(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (f'<p>{{"{first} "}}{second}</p>', "view.jsx"),
+            (
+                f'<input type="button" value="{first}&#32;{second}">',
+                "page.html",
+            ),
+            (
+                '<button onclick="this.textContent='
+                f"'{first}'+' {second}'"
+                '">Go</button>',
+                "page.html",
+            ),
+            (
+                '.x::after { content: url("icon.svg") / '
+                f'"{first}\\20 {second}"; }}',
+                "style.css",
+            ),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path, source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_non_rendering_runtime_syntax_stays_distinct(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (
+                f'const pattern = /"{first} " + "{second}"/;',
+                "copy.js",
+            ),
+            (
+                f'.x::after {{ content: url("{first}\\20 {second}"); }}',
+                "style.css",
+            ),
+            (
+                f"<textarea>{first}<span> {second}</textarea>",
+                "page.html",
+            ),
+            (f"`{first}&#32;{second}`", "README.md"),
+            (
+                f"const value = String.raw`{first}\\u0020{second}`;",
+                "copy.js",
+            ),
+            (
+                f'<input type="text" value="{first}&#32;{second}">',
+                "page.html",
+            ),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path, source=source):
+                self.assertEqual(
+                    policy.matching_labels(source.encode(), relative_path),
+                    (),
+                )
+
     def test_executable_inline_script_copy_is_projected(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
