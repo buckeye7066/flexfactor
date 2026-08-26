@@ -422,6 +422,39 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_reviewed_rendering_boundaries(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        positive = (
+            (f'<style>.x {{ @media all {{ content: "{first} " "{second}"; }} }}</style>', "page.html"),
+            (f'<script>node["innerHTML"] = "{first} " + "{second}"</script>', "page.html"),
+            (f'element.innerHTML = "{first} " + "{second}"', "copy.js"),
+            (f'element.outerHTML = "{first} " + "{second}"\nnext("safe")', "copy.ts"),
+            (f'.x::after {{ c\\6f ntent: "{first} " "{second}"; }}', "style.css"),
+            (f"{first} [{second}][foo&amp;bar]\n\n[foo&bar]: /policy", "README.md"),
+        )
+        for source, relative_path in positive:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+        negative = (
+            (f'// node.innerHTML = "{first} " + "{second}"', "copy.js"),
+            (f'node.innerHTML = "{first}"\n" {second}"', "copy.js"),
+            (f'.x {{ content: image-set("{first} " 1x, "{second}" 2x); }}', "style.css"),
+            (f'<p hidden>{first} {second}</p><p>safe</p>', "page.html"),
+            (f'<style type="text/less">.x {{ content: "{first} {second}"; }}</style>', "page.html"),
+            (f'const label = "{first} {second}\u0301x"', "copy.js"),
+        )
+        for source, relative_path in negative:
+            with self.subTest(source=source):
+                self.assertNotIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
     def test_non_rendering_runtime_syntax_stays_distinct(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))

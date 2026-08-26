@@ -136,6 +136,12 @@ _NON_RENDERED_ELEMENT = re.compile(
     r'''[\s\S]*?</(?P=tag)\s*>''',
     re.IGNORECASE,
 )
+_HIDDEN_ELEMENT = re.compile(
+    r'''<(?P<tag>[A-Za-z][A-Za-z0-9:-]*)\b(?=[^>]*\bhidden(?:\s*=|\s|/?>))'''
+    r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>'''
+    r'''[\s\S]*?</(?P=tag)\s*>''',
+    re.IGNORECASE,
+)
 _HTML_TAG = re.compile(
     r'''</?[A-Za-z][A-Za-z0-9:-]*(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*/?>''',
     re.DOTALL,
@@ -166,7 +172,7 @@ _SCRIPT_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _STYLE_BLOCK = re.compile(
-    r'''<style(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>'''
+    r'''<style\b(?P<attributes>(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?)\s*>'''
     r'''(?P<body>[\s\S]*?)</style\s*>''',
     re.IGNORECASE,
 )
@@ -301,8 +307,12 @@ def contains_language_fragment(value: str, target: str) -> bool:
         before = value[index - 1] if index else ""
         after_index = index + len(target)
         after = value[after_index] if after_index < len(value) else ""
-        before_is_word = bool(before) and (before.isalnum() or before == "_")
-        after_is_word = bool(after) and (after.isalnum() or after == "_")
+        before_is_word = bool(before) and (
+            before.isalnum() or before == "_" or unicodedata.category(before)[0] == "M"
+        )
+        after_is_word = bool(after) and (
+            after.isalnum() or after == "_" or unicodedata.category(after)[0] == "M"
+        )
         if not before_is_word and not after_is_word:
             return True
         offset = index + 1
@@ -498,6 +508,10 @@ def _decode_css_string(literal: str) -> str:
     return _CSS_ESCAPE.sub(replace_escape, literal[1:-1])
 
 
+def _decode_css_escapes(value: str) -> str:
+    return _decode_css_string(f'"{value}"')
+
+
 def _iter_css_content_values(value: str) -> Iterable[str]:
     """Yield content declarations with terminators located outside strings."""
     index = 0
@@ -554,7 +568,7 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
             continue
         if (
             not block_kinds
-            or block_kinds[-1] != "style-rule"
+            or "style-rule" not in block_kinds
             or value[statement_start:index].strip()
         ):
             index += 7
@@ -602,7 +616,7 @@ def _iter_css_content_values(value: str) -> Iterable[str]:
 
 def _render_css_content(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
-    without_comments = _strip_css_comments(value)
+    without_comments = _decode_css_escapes(_strip_css_comments(value))
     for declaration in _iter_css_content_values(without_comments):
         for branch in _split_css_alternative_content(declaration):
             url_ranges = _css_url_argument_ranges(branch)
@@ -743,6 +757,26 @@ def _split_css_alternative_content(value: str) -> tuple[str, ...]:
 def _render_embedded_css_content(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for match in _STYLE_BLOCK.finditer(value):
+        style_type = ""
+        for attribute in _HTML_ATTRIBUTE.finditer(
+            "<style" + match.group("attributes") + ">"
+        ):
+            if attribute.group("name").lower() != "type":
+                continue
+            style_type = next(
+                item
+                for item in (
+                    attribute.group("double"),
+                    attribute.group("single"),
+                    attribute.group("bare"),
+                )
+                if item is not None
+            )
+        style_type = _decode_html_character_references(
+            style_type, in_attribute=True
+        ).strip().lower().split(";", 1)[0].strip()
+        if style_type not in {"", "text/css"}:
+            continue
         candidates.extend(_render_css_content(match.group("body")))
     return tuple(candidates)
 
@@ -1060,6 +1094,7 @@ def _strip_markup(value: str) -> str:
 
     shielded = _RCDATA_ELEMENT.sub(shield_rcdata, value)
     without_comments = _HTML_COMMENT.sub("", shielded)
+    without_comments = _HIDDEN_ELEMENT.sub("", without_comments)
     without_non_rendered = _NON_RENDERED_ELEMENT.sub("", without_comments)
     rendered = _HTML_TAG.sub(" ", without_non_rendered)
     for placeholder, segment in rcdata_segments:
@@ -1069,6 +1104,8 @@ def _strip_markup(value: str) -> str:
 
 def _normalize_markdown_reference_label(value: str) -> str:
     """Apply Markdown's case-folding and whitespace-only label identity."""
+    value = unescape(value)
+    value = re.sub(r"\\\\([!\"#$%&'()*+,./:;<=>?@\[\\\]^_{|}~-])", r"\1", value)
     return " ".join(value.split()).casefold()
 
 
@@ -1537,11 +1574,17 @@ def _read_entry(root: Path, relative_path: str, path: Path, tracked: bool) -> by
 
 def matching_labels(raw: bytes, relative_path: str = "") -> tuple[str, ...]:
     """Return each policy label found in at least one plausible decoding."""
+    suffix = Path(relative_path).suffix.lower()
+    rendered_only = suffix in (
+        _MARKUP_SOURCE_SUFFIXES
+        | _MARKDOWN_SOURCE_SUFFIXES
+        | _CSS_SOURCE_SUFFIXES
+    )
     normalized_candidates = tuple(
         normalize_language(variant)
         for candidate in decode_text_candidates(raw, relative_path)
         for variant in (
-            candidate,
+            *((candidate,) if not rendered_only else ()),
             *rendered_source_candidates(candidate, relative_path),
         )
     )
