@@ -56,6 +56,13 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         self.assertEqual(policy.decode_text_candidates(raw), ())
         self.assertEqual(policy.matching_labels(raw), ())
 
+    def test_known_source_retains_malformed_utf8_candidate(self):
+        raw = ("manual " + "approval").encode() + (b"\xff" * 4)
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(raw, "page.html"),
+        )
+
     def test_lightly_malformed_bom_text_is_still_scanned(self):
         fragment = "manual " + "approval"
         prefix = "ordinary text " * 20
@@ -274,6 +281,49 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), relative_path),
                 )
 
+    def test_projection_keeps_distinct_rendered_branches_separate(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        compact = "".join(map(chr, (115, 105, 103, 110, 111, 102, 102)))
+        sources = (
+            (
+                f'<div data-policy="{first}&#32;{second}"></div>',
+                "page.html",
+            ),
+            (
+                "`<span>"
+                + compact[:4]
+                + "</span><span>"
+                + compact[4:]
+                + "</span>`",
+                "README.md",
+            ),
+            (
+                f'.status::after {{ content: "{compact[:4]}" / "{compact[4:]}"; }}',
+                "style.css",
+            ),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertEqual(
+                    policy.matching_labels(source.encode(), relative_path),
+                    (),
+                )
+
+    def test_executable_inline_script_copy_is_projected(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        source = (
+            '<span id="copy"></span><script>'
+            'document.querySelector("#copy").textContent = '
+            f'"{first}" + "\\u0020{second}";'
+            "</script>"
+        )
+        self.assertIn(
+            "manual_gate",
+            policy.matching_labels(source.encode(), "page.html"),
+        )
+
     def test_attributes_embedded_css_and_python_literals_are_rendered(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
@@ -379,6 +429,16 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         self.assertEqual(
             findings, ["infrastructure:exact Git index contains no files"]
         )
+
+    def test_exported_tree_scans_output_named_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "dist"
+            output.mkdir()
+            tracked_copy = output / "copy.html"
+            tracked_copy.write_text("manual " + "approval", encoding="utf-8")
+            findings = policy.scan_repository(root)
+        self.assertIn("prohibited:manual_gate:dist/copy.html", findings)
 
     def test_current_repository_passes_the_binding_policy(self):
         root = Path(__file__).resolve().parent

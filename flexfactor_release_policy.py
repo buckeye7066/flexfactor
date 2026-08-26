@@ -22,14 +22,47 @@ from typing import Iterable
 import unicodedata
 
 
-_EXCLUDED_DIRECTORIES = {
-    ".git",
-    ".venv",
-    "__pycache__",
-    "build",
-    "coverage",
-    "dist",
-    "node_modules",
+_EXCLUDED_DIRECTORIES = {".git"}
+
+_BINARY_SOURCE_SUFFIXES = {
+    ".7z",
+    ".a",
+    ".avi",
+    ".bmp",
+    ".bz2",
+    ".class",
+    ".dll",
+    ".dylib",
+    ".eot",
+    ".exe",
+    ".flac",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jar",
+    ".jpeg",
+    ".jpg",
+    ".m4a",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".o",
+    ".ogg",
+    ".otf",
+    ".pdf",
+    ".png",
+    ".pyc",
+    ".so",
+    ".tar",
+    ".tgz",
+    ".ttf",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".xz",
+    ".zip",
 }
 
 _LITERAL_SOURCE_SUFFIXES = {
@@ -88,8 +121,22 @@ _HTML_OPEN_TAG = re.compile(
     re.DOTALL,
 )
 _HTML_ATTRIBUTE = re.compile(
-    r'''(?:^|\s)[^\s"'=<>`]+\s*=\s*(?:"(?P<double>[^"]*)"'''
+    r'''(?:^|\s)(?P<name>[^\s"'=<>`]+)\s*=\s*(?:"(?P<double>[^"]*)"'''
     r'''|'(?P<single>[^']*)'|(?P<bare>[^\s"'=<>`]+))'''
+)
+_EXPOSED_MARKUP_ATTRIBUTES = {
+    "alt",
+    "aria-description",
+    "aria-label",
+    "aria-placeholder",
+    "aria-roledescription",
+    "aria-valuetext",
+    "placeholder",
+    "title",
+}
+_SCRIPT_BLOCK = re.compile(
+    r"<script\b(?P<attributes>[^>]*)>(?P<body>[\s\S]*?)</script\s*>",
+    re.IGNORECASE,
 )
 _STYLE_BLOCK = re.compile(
     r'''<style(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?\s*>'''
@@ -233,8 +280,16 @@ def _decode_with_replacement(raw: bytes, encoding: str) -> str | None:
         return None
 
 
-def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
+def decode_text_candidates(
+    raw: bytes,
+    relative_path: str = "",
+) -> tuple[str, ...]:
     """Return every plausible textual interpretation of repository bytes."""
+    if (
+        relative_path
+        and Path(relative_path).suffix.lower() in _BINARY_SOURCE_SUFFIXES
+    ):
+        return ()
     bom_encodings = (
         (codecs.BOM_UTF32_LE, "utf-32"),
         (codecs.BOM_UTF32_BE, "utf-32"),
@@ -253,7 +308,10 @@ def decode_text_candidates(raw: bytes) -> tuple[str, ...]:
 
     candidates: list[str] = []
     decoded_utf8 = raw.decode("utf-8", "replace") if raw else ""
-    if _looks_like_text(decoded_utf8):
+    retain_utf8 = bool(relative_path) and (
+        Path(relative_path).suffix.lower() not in _BINARY_SOURCE_SUFFIXES
+    )
+    if retain_utf8 or _looks_like_text(decoded_utf8):
         candidates.append(decoded_utf8)
     if b"\0" not in raw:
         return tuple(candidates)
@@ -341,14 +399,39 @@ def _render_css_content(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     without_comments = re.sub(r"/\*[\s\S]*?\*/", "", value)
     for declaration in _CSS_CONTENT_DECLARATION.finditer(without_comments):
-        combined = ""
-        for literal in _CSS_STRING.finditer(declaration.group(1)):
-            rendered = _decode_css_string(literal.group())
-            candidates.append(rendered)
-            combined += rendered
-        if combined:
-            candidates.append(combined)
+        for branch in _split_css_alternative_content(declaration.group(1)):
+            combined = ""
+            for literal in _CSS_STRING.finditer(branch):
+                rendered = _decode_css_string(literal.group())
+                candidates.append(rendered)
+                combined += rendered
+            if combined:
+                candidates.append(combined)
     return tuple(candidates)
+
+
+def _split_css_alternative_content(value: str) -> tuple[str, ...]:
+    quote = ""
+    escaped = False
+    parentheses = 0
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            parentheses += 1
+        elif character == ")" and parentheses:
+            parentheses -= 1
+        elif character == "/" and not parentheses:
+            return value[:index], value[index + 1 :]
+    return (value,)
 
 
 def _render_embedded_css_content(value: str) -> tuple[str, ...]:
@@ -362,6 +445,8 @@ def _render_markup_attributes(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for tag in _HTML_OPEN_TAG.finditer(value):
         for attribute in _HTML_ATTRIBUTE.finditer(tag.group()):
+            if attribute.group("name").lower() not in _EXPOSED_MARKUP_ATTRIBUTES:
+                continue
             candidate = next(
                 value
                 for value in (
@@ -372,6 +457,36 @@ def _render_markup_attributes(value: str) -> tuple[str, ...]:
                 if value is not None
             )
             candidates.append(unescape(candidate))
+    return tuple(candidates)
+
+
+def _render_inline_executable_scripts(value: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    executable_types = {
+        "",
+        "application/ecmascript",
+        "application/javascript",
+        "module",
+        "text/ecmascript",
+        "text/javascript",
+    }
+    type_pattern = re.compile(
+        r'''(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))''',
+        re.IGNORECASE,
+    )
+    for script in _SCRIPT_BLOCK.finditer(value):
+        type_match = type_pattern.search(script.group("attributes"))
+        script_type = next(
+            (
+                item
+                for item in (type_match.groups() if type_match else ("",))
+                if item is not None
+            ),
+            "",
+        )
+        script_type = script_type.strip().lower().split(";", 1)[0].strip()
+        if script_type in executable_types:
+            candidates.extend(_render_javascript_literals(script.group("body")))
     return tuple(candidates)
 
 
@@ -394,6 +509,21 @@ def _strip_markup(value: str) -> str:
 
 
 def _render_markdown(value: str) -> str:
+    code_segments: list[tuple[str, str]] = []
+
+    def shield(match: re.Match[str]) -> str:
+        placeholder = f"\0MARKDOWNCODE{len(code_segments)}\0"
+        code_segments.append((placeholder, match.group()))
+        return placeholder
+
+    value = re.sub(
+        r"^ {0,3}(`{3,}|~{3,})[^\r\n]*(?:\r\n|[\r\n])"
+        r"[\s\S]*?^ {0,3}\1[ \t]*$",
+        shield,
+        value,
+        flags=re.M,
+    )
+    value = re.sub(r"(`+)([^\r\n]*?)\1", shield, value)
     reference_ids = {
         normalize_language(match.group(1))
         for match in re.finditer(r"^\s{0,3}\[([^\]]+)\]:\s+\S+.*$", value, re.M)
@@ -406,7 +536,11 @@ def _render_markdown(value: str) -> str:
     def replace_reference(match: re.Match[str]) -> str:
         label = match.group("label")
         reference = match.group("reference") or label
-        return label if normalize_language(reference) in reference_ids else match.group()
+        return (
+            label
+            if normalize_language(reference) in reference_ids
+            else match.group()
+        )
 
     rendered = re.sub(
         r"!?\[(?P<label>[^\]]+)\]\[(?P<reference>[^\]]*)\]",
@@ -422,12 +556,14 @@ def _render_markdown(value: str) -> str:
         ),
         rendered,
     )
-    rendered = re.sub(r"(`+)([\s\S]*?)\1", r"\2", rendered)
     rendered = re.sub(r"~~(?=\S)([\s\S]*?\S)~~", r"\1", rendered)
     rendered = re.sub(r"\*\*(?=\S)([\s\S]*?\S)\*\*", r"\1", rendered)
     rendered = re.sub(r"__(?=\S)([\s\S]*?\S)__", r"\1", rendered)
     rendered = re.sub(r"\*(?=\S)([^*\r\n]*?\S)\*", r"\1", rendered)
-    return re.sub(r"_(?=\S)([^_\r\n]*?\S)_", r"\1", rendered)
+    rendered = re.sub(r"_(?=\S)([^_\r\n]*?\S)_", r"\1", rendered)
+    for placeholder, segment in code_segments:
+        rendered = rendered.replace(placeholder, segment)
+    return rendered
 
 
 def _render_python_literals(value: str) -> tuple[str, ...]:
@@ -462,30 +598,8 @@ def _render_python_literals(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
-def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...]:
-    """Approximate user-visible JSX and adjacent static string expressions."""
-    suffix = Path(relative_path).suffix.lower()
+def _render_javascript_literals(value: str) -> tuple[str, ...]:
     candidates: list[str] = []
-    visible_value = value
-    if suffix in _JSX_SOURCE_SUFFIXES:
-        visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
-        visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
-            _replace_jsx_whitespace_expression,
-            visible_value,
-        )
-    if suffix in _MARKUP_SOURCE_SUFFIXES:
-        candidates.append(unescape(_strip_markup(visible_value)))
-        candidates.extend(_render_markup_attributes(visible_value))
-        candidates.extend(_render_embedded_css_content(visible_value))
-    if suffix in _MARKDOWN_SOURCE_SUFFIXES:
-        candidates.append(unescape(_render_markdown(visible_value)))
-    if suffix in _CSS_SOURCE_SUFFIXES:
-        candidates.extend(_render_css_content(value))
-    if suffix in {".py", ".pyw"}:
-        candidates.extend(_render_python_literals(value))
-        return tuple(candidates)
-    if suffix not in _LITERAL_SOURCE_SUFFIXES:
-        return tuple(candidates)
     previous: re.Match[str] | None = None
     chain: str | None = None
     for match in _STATIC_LITERAL.finditer(value):
@@ -507,6 +621,35 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         else:
             chain = None
         previous = match
+    return tuple(candidates)
+
+
+def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...]:
+    """Approximate user-visible JSX and adjacent static string expressions."""
+    suffix = Path(relative_path).suffix.lower()
+    candidates: list[str] = []
+    visible_value = value
+    if suffix in _JSX_SOURCE_SUFFIXES:
+        visible_value = _JSX_COMMENT_EXPRESSION.sub("", visible_value)
+        visible_value = _JSX_WHITESPACE_EXPRESSION.sub(
+            _replace_jsx_whitespace_expression,
+            visible_value,
+        )
+    if suffix in _MARKUP_SOURCE_SUFFIXES:
+        candidates.append(unescape(_strip_markup(visible_value)))
+        candidates.extend(_render_markup_attributes(visible_value))
+        candidates.extend(_render_embedded_css_content(visible_value))
+        candidates.extend(_render_inline_executable_scripts(visible_value))
+    if suffix in _MARKDOWN_SOURCE_SUFFIXES:
+        candidates.append(unescape(_render_markdown(visible_value)))
+    if suffix in _CSS_SOURCE_SUFFIXES:
+        candidates.extend(_render_css_content(value))
+    if suffix in {".py", ".pyw"}:
+        candidates.extend(_render_python_literals(value))
+        return tuple(candidates)
+    if suffix not in _LITERAL_SOURCE_SUFFIXES:
+        return tuple(candidates)
+    candidates.extend(_render_javascript_literals(value))
     return tuple(candidates)
 
 
@@ -577,6 +720,8 @@ def _read_entry(root: Path, relative_path: str, path: Path, tracked: bool) -> by
         mode = 0
     if stat.S_ISREG(mode):
         return path.read_bytes()
+    if stat.S_ISLNK(mode):
+        return os.readlink(path).encode("utf-8", "surrogateescape")
     raise OSError("workspace entry is unavailable")
 
 
@@ -584,7 +729,7 @@ def matching_labels(raw: bytes, relative_path: str = "") -> tuple[str, ...]:
     """Return each policy label found in at least one plausible decoding."""
     normalized_candidates = tuple(
         normalize_language(variant)
-        for candidate in decode_text_candidates(raw)
+        for candidate in decode_text_candidates(raw, relative_path)
         for variant in (
             candidate,
             *rendered_source_candidates(candidate, relative_path),
