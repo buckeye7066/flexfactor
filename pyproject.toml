@@ -20,7 +20,7 @@ dependencies = []
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=2,<3"]
 # Everything needed to run BOTH providers plus the test/dev workflow.
-all = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
+all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
