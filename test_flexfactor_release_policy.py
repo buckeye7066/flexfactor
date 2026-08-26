@@ -78,6 +78,25 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIn("manual_gate", policy.matching_labels(raw))
 
+    def test_lightly_malformed_bomless_unicode_is_still_scanned(self):
+        fragment = "manual " + "approval"
+        prefix = "ordinary text " * 20
+        encoded = {
+            "utf16le": (
+                prefix.encode("utf-16-le")
+                + b"\x00\xd8"
+                + fragment.encode("utf-16-le")
+            ),
+            "utf32le": (
+                prefix.encode("utf-32-le")
+                + b"\x00\xd8\x00\x00"
+                + fragment.encode("utf-32-le")
+            ),
+        }
+        for label, raw in encoded.items():
+            with self.subTest(label=label):
+                self.assertIn("manual_gate", policy.matching_labels(raw))
+
     def test_jsx_and_static_string_boundaries_are_detected(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
@@ -126,6 +145,10 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
         sources = (
             (f"<p>{first}<!-- split --> {second}</p>", "page.html"),
+            (
+                f"<span>{first} </span>{{/* note */}}<span>{second}</span>",
+                "view.jsx",
+            ),
             (f'"{first}" + "\\u0020" + "{second}"', "copy.js"),
         )
         for source, relative_path in sources:
@@ -294,6 +317,10 @@ class FirecrawlTransportTests(unittest.TestCase):
         responses = (
             {"error": "authentication failed"},
             {"success": True, "data": {"documents": []}},
+            {
+                "success": True,
+                "data": {"web": [{"title": "broken", "url": "https://"}]},
+            },
         )
         environment = {
             "FIRECRAWL_API_KEY": "test-key",
@@ -324,6 +351,24 @@ class FirecrawlTransportTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(hits, [])
+
+    def test_credentialed_firecrawl_requires_explicit_paid_research(self):
+        calls: list[str] = []
+        environment = {
+            "FIRECRAWL_API_KEY": "test-key",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }
+        with mock.patch.dict(os.environ, environment), self.assertRaisesRegex(
+            RuntimeError, "paid research is explicit"
+        ):
+            competitors._firecrawl(
+                "competitors",
+                5,
+                lambda url, *args, **kwargs: calls.append(url),
+                allow_credentials=False,
+            )
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
