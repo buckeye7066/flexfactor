@@ -177,6 +177,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                 + "`",
                 "copy.js",
             ),
+            (
+                "`"
+                + first
+                + ' ${((/* split */ " " + ""))}'
+                + second
+                + "`",
+                "copy.js",
+            ),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
             (f'"\\u{{000006d}}{first[1:]} {second}"', "copy.js"),
             (f'"{first[:1]}\\{first[1:]} {second}"', "copy.js"),
@@ -186,6 +194,14 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             ),
             (
                 f'"{first}" /* split */ + " " /* split */ + "{second}"',
+                "copy.js",
+            ),
+            (
+                '"\\155' + first[1:] + " " + second + '"',
+                "copy.js",
+            ),
+            (
+                f'"{first}" // split{chr(0x2028)} + " " + "{second}"',
                 "copy.js",
             ),
         )

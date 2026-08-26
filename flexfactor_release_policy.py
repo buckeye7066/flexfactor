@@ -100,6 +100,7 @@ _JS_ESCAPE = re.compile(
     r'''\\(?:u\{(?P<braced>0*[0-9A-Fa-f]{1,6})\}'''
     r'''|u(?P<fixed>[0-9A-Fa-f]{4})'''
     r'''|x(?P<hexadecimal>[0-9A-Fa-f]{2})'''
+    r'''|(?P<octal>[0-3][0-7]{0,2}|[4-7][0-7]?)'''
     r'''|(?P<continuation>\r\n|[\r\n\u2028\u2029])'''
     r'''|(?P<simple>0|[^\d\r\n\u2028\u2029]))''',
 )
@@ -107,12 +108,16 @@ _SOURCE_TRIVIA = (
     r"(?:(?:\s+)|/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*"
     r"(?:\r\n|[\r\n\u2028\u2029]))*"
 )
+_SOURCE_GROUPING = (
+    r"(?:(?:\s+)|/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*"
+    r"(?:\r\n|[\r\n\u2028\u2029])|[()])*"
+)
 _STATIC_QUOTED_LITERAL_SOURCE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
 _STATIC_QUOTED_LITERAL = re.compile(_STATIC_QUOTED_LITERAL_SOURCE, re.DOTALL)
 _TEMPLATE_INTERPOLATION = re.compile(
-    rf"(?<!\\)\$\{{(?P<expression>{_SOURCE_TRIVIA}{_STATIC_QUOTED_LITERAL_SOURCE}"
-    rf"(?:{_SOURCE_TRIVIA}\+{_SOURCE_TRIVIA}{_STATIC_QUOTED_LITERAL_SOURCE})*"
-    rf"{_SOURCE_TRIVIA})\}}",
+    rf"(?<!\\)\$\{{(?P<expression>{_SOURCE_GROUPING}{_STATIC_QUOTED_LITERAL_SOURCE}"
+    rf"(?:{_SOURCE_GROUPING}\+{_SOURCE_GROUPING}{_STATIC_QUOTED_LITERAL_SOURCE})*"
+    rf"{_SOURCE_GROUPING})\}}",
     re.DOTALL,
 )
 _CSS_CONTENT_DECLARATION = re.compile(r"\bcontent\s*:\s*([^;}]+)", re.IGNORECASE)
@@ -274,6 +279,12 @@ def _unquote_static_literal(literal: str) -> str:
             return match.group()
         if match.group("hexadecimal") is not None:
             return chr(int(match.group("hexadecimal"), 16))
+        if match.group("octal") is not None:
+            return (
+                match.group()
+                if literal.startswith("`")
+                else chr(int(match.group("octal"), 8))
+            )
         if match.group("continuation") is not None:
             return ""
         simple = match.group("simple") or ""
@@ -482,7 +493,7 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         candidates.append(rendered_literal)
         gap = value[previous.end() : match.start()] if previous else ""
         gap_without_comments = re.sub(
-            r"/\*[\s\S]*?\*/|//[^\r\n]*",
+            r"/\*[\s\S]*?\*/|//[^\r\n\u2028\u2029]*",
             "",
             gap,
         )
