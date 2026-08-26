@@ -262,7 +262,7 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
     request = (_default_firecrawl_opener
                if opener is _PRODUCTION_OPENER else opener)
     root = json.loads(request(endpoint, payload, headers))
-    if not isinstance(root, dict) or root.get("success") is False:
+    if not isinstance(root, dict) or root.get("success") is not True:
         raise RuntimeError("Firecrawl v2 reported failure or invalid JSON shape")
 
     data = root.get("data")
@@ -273,15 +273,17 @@ def _firecrawl(query: str, limit: int, opener) -> list[dict]:
     elif isinstance(root.get("web"), list):
         items = root["web"]
     else:
-        items = []
+        raise RuntimeError("Firecrawl v2 returned an unrecognized result shape")
 
     out: list[dict] = []
     seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
-            continue
+            raise RuntimeError("Firecrawl v2 returned a non-object result")
         url = str(item.get("url") or "").strip()
-        if not url.startswith(("https://", "http://")) or url in seen:
+        if not url.startswith(("https://", "http://")):
+            raise RuntimeError("Firecrawl v2 returned a result without a valid URL")
+        if url in seen:
             continue
         seen.add(url)
         title = str(item.get("title") or url).strip()
