@@ -77,21 +77,26 @@ function global:Invoke-WebRequest {{
 function global:python {{
     [CmdletBinding()]
     param([Parameter(ValueFromRemainingArguments = $true)][object[]]$PythonArgs)
-    Write-Output ('FLEXFACTOR_TEST_PYTHON_ARGS=' + ($PythonArgs -join [char]31))
+    [System.IO.File]::WriteAllText(
+        $env:FLEXFACTOR_LAUNCHER_CAPTURE,
+        ($PythonArgs -join [char]31),
+        [System.Text.UTF8Encoding]::new($false))
     $global:LASTEXITCODE = 0
 }}
 & {_ps_literal(os.path.join(HERE, name))} {invoke}
 """
-    env = dict(os.environ)
-    env.update(extra_env)
-    cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", harness],
-                        cwd=HERE, env=env, capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", timeout=120)
-    marker = "FLEXFACTOR_TEST_PYTHON_ARGS="
-    rows = [line for line in cp.stdout.splitlines() if line.startswith(marker)]
-    if cp.returncode != 0 or len(rows) != 1:
-        raise AssertionError((name, cp.returncode, cp.stdout[-3000:], cp.stderr[-3000:]))
-    return rows[0][len(marker):].split(chr(31))
+    with tempfile.TemporaryDirectory(prefix="ff-launcher-") as tmp:
+        capture = os.path.join(tmp, "python-args.txt")
+        env = dict(os.environ)
+        env.update(extra_env)
+        env["FLEXFACTOR_LAUNCHER_CAPTURE"] = capture
+        cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", harness],
+                            cwd=HERE, env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=120)
+        if cp.returncode != 0 or not os.path.isfile(capture):
+            raise AssertionError((name, cp.returncode, cp.stdout[-3000:], cp.stderr[-3000:]))
+        with open(capture, encoding="utf-8") as handle:
+            return handle.read().split(chr(31))
 
 
 class EntryPointParityTests(unittest.TestCase):
