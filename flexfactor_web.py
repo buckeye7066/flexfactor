@@ -18,9 +18,10 @@ v2 design rules verbatim - see flexfactor_dashboard_v2's docstring:
   6. Is anything going wrong?                 -> errors/timeouts, called out
   7. What is it costing?                      -> spend vs cap
 
-READ-ONLY, exactly like v2: it only ever reads status.json, the run checkpoints
-and `git log`. It can never disturb a running audit. The single file it writes
-is its own auth token, which lives outside the audit's state.
+READ-MOSTLY: status remains observational, while one authenticated endpoint queues
+operator steering comments. It reads status.json, the run checkpoints
+and `git log`. Steering is append-only and consumed at audit phase boundaries; it
+never mutates target code directly. Auth and steering journals live outside the target.
 
     python flexfactor_web.py                     # 127.0.0.1:8765, local only
     python flexfactor_web.py --host 100.95.159.8 # reachable over the tailnet
@@ -38,6 +39,8 @@ import secrets
 import sys
 import threading
 import time
+
+import flexfactor_steering as steering
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FLEX_DIR = os.path.join(os.path.expanduser("~"), ".flexfactor")
@@ -320,6 +323,7 @@ def build_state(sampler: Sampler) -> dict:
 
             "rate_per_min": round(rate, 2),
             "velocity": [round(v, 2) for v in sampler.velocity(name)],
+            "steering": steering.summary(name, str(p.get("dir") or "")),
         })
 
     return {
@@ -384,12 +388,29 @@ svg{display:block;width:100%;height:38px}
 .warnbox{background:#3a1d1d;border:1px solid #f85149;color:#ffb4ae;
  padding:9px 11px;border-radius:10px;font-size:12px;margin-top:10px}
 .empty{text-align:center;color:#7d8590;padding:44px 12px}
+.steer{width:100%;min-height:86px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:9px;font:14px/1.4 inherit}
+.steerbtn{margin-top:7px;background:#238636;color:white;border:0;border-radius:7px;padding:8px 12px;font-weight:650}
+.steerbtn:disabled{opacity:.55}.steerrow{border-left:3px solid #30363d;padding:5px 8px;margin-top:6px}
+.s-pending{border-color:#d29922}.s-active{border-color:#58a6ff}.s-completed{border-color:#3fb950}.s-needs-attention{border-color:#f85149}
 </style></head><body>
 <h1>FlexFactor</h1>
 <div class="sub" id="sub">connecting...</div>
 <div id="app"></div>
 <script>
 var TOKEN = new URLSearchParams(location.search).get("t") || "";
+var STEER_DRAFTS = {};
+function steerDraft(name,value){STEER_DRAFTS[name]=value;}
+function submitSteering(name,dir,button){
+  var text=STEER_DRAFTS[name]||""; if(!text.trim()) return;
+  button.disabled=true; button.textContent="Sending…";
+  fetch("/api/steering?t="+encodeURIComponent(TOKEN),{method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":"Bearer "+TOKEN},
+    body:JSON.stringify({program:name,project_dir:dir,comment:text})})
+   .then(function(r){return r.json().then(function(d){if(!r.ok) throw new Error(d.error||("HTTP "+r.status));return d;});})
+   .then(function(){STEER_DRAFTS[name]="";tick();})
+   .catch(function(e){alert("Could not send comment: "+e.message);})
+   .finally(function(){button.disabled=false;button.textContent="Send to FlexFactor";});
+}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
 function dur(s){ if(s==null) return "?";
@@ -512,7 +533,13 @@ function card(p){
     }
   }
 
-  // 7. right now
+  // 7. authenticated operator steering
+  var st=p.steering||{}, latest=st.latest||[];
+  h+='<div class="lbl">Steer this build</div><div class="dim">Tell FlexFactor what you want changed in this target app. It will interpret the request and route it through the normal build and test gates.</div>'+
+     '<textarea class="steer" maxlength="4000" placeholder="Example: Keep the current login, but add a printable family report." oninput="steerDraft('+JSON.stringify(p.name)+',this.value)">'+esc(STEER_DRAFTS[p.name]||"")+'</textarea>'+
+     '<button class="steerbtn" onclick="submitSteering('+JSON.stringify(p.name)+','+JSON.stringify(p.dir)+',this)">Send to FlexFactor</button>';
+  latest.forEach(function(s){h+='<div class="steerrow s-'+esc(s.status)+'"><div>'+esc(s.comment)+'</div><div class="dim">'+esc(s.status)+(s.detail?' · '+esc(s.detail):'')+'</div></div>';});
+  // 8. right now
   if(p.current_file){
     h+='<div class="lbl">Working on</div><div class="file">'+
        esc(p.current_file)+'</div>';
@@ -598,6 +625,34 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # phone navigated away mid-response; not an error worth noise
 
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if not self._authorized():
+            self._send(401, b'{"error":"bad or missing token"}', "application/json")
+            return
+        if path != "/api/steering":
+            self._send(404, b'{"error":"not found"}', "application/json")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 8192:
+            self._send(413, b'{"error":"invalid request size"}', "application/json")
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            program = str(body.get("program") or "")
+            project_dir = str(body.get("project_dir") or "")
+            active = build_state(self.sampler).get("programs") or []
+            match = next((p for p in active if p.get("name") == program and p.get("dir") == project_dir), None)
+            if match is None:
+                raise ValueError("target is not an active FlexFactor program")
+            item = steering.submit(program, project_dir, body.get("comment") or "", source="web-dashboard")
+            self._send(201, json.dumps({"ok": True, "comment": item}).encode("utf-8"), "application/json")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
 
@@ -624,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="FlexFactor web dashboard (read-only)")
+    ap = argparse.ArgumentParser(description="FlexFactor web dashboard with authenticated steering")
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address; use the Tailscale IP to reach phones")
     ap.add_argument("--port", type=int, default=8765)
@@ -648,7 +703,7 @@ def main() -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     print("[flexfactor-web] serving {}".format(url))
-    print("[flexfactor-web] read-only; token in {}".format(TOKEN_PATH))
+    print("[flexfactor-web] authenticated steering enabled; token in {}".format(TOKEN_PATH))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

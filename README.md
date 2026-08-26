@@ -274,3 +274,8 @@ Architecture and operations: [execution architecture](docs/architecture.md),
 [purpose-contract schema](docs/purpose-contract.schema.json),
 [troubleshooting](docs/troubleshooting.md), and
 [migration notes](docs/migration-notes-0.3.md).
+
+
+## Live operator steering
+
+The authenticated web dashboard includes a **Steer this build** comment box for each active target app. A comment is durably queued, scoped to that exact program and repository, and picked up at audit phase boundaries. FlexFactor adds it to the target's purpose context, interprets it as concrete testable requirements, and routes feasible changes through the same containment, build, adversarial-review, and commit gates as every other repair. The dashboard shows whether each comment is pending, active, completed, or needs attention. Interrupted-run comments are reclaimed by the next run rather than silently lost.
