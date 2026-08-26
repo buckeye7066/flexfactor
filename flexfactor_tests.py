@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -132,6 +133,7 @@ os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
 # they all already do, via `opener=` or `_patched(ff, "_server_is_up", ...)`.
 # --------------------------------------------------------------------------- #
 import flexfactor_competitors as _ffc  # noqa: E402
+import flexfactor_release_policy as release_policy  # noqa: E402
 
 
 def _no_network_opener(*a, **k):
@@ -13176,51 +13178,10 @@ class CompetitorCoverageHonestyTests(unittest.TestCase):
 
 
 class ReleaseLanguagePolicyTests(unittest.TestCase):
-    """Keep organizational gate language out without weakening safety controls."""
-
-    @staticmethod
-    def _candidate_paths(root):
-        tracked = subprocess.run(
-            ["git", "-C", root, "ls-files", "-z"], capture_output=True,
-            text=False, check=False)
-        if tracked.returncode == 0:
-            return [os.path.join(root, p.decode("utf-8", "surrogateescape"))
-                    for p in tracked.stdout.split(b"\0") if p]
-        paths = []
-        for current, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in {
-                ".git", ".venv", "__pycache__", "build", "dist",
-            }]
-            paths.extend(os.path.join(current, name) for name in files)
-        return paths
+    """Bind the full suite to the executable repository-language policy."""
 
     def test_repository_has_no_organizational_gate_language(self):
-        fragments = (
-            "sign" + " off",
-            "sign" + "off",
-            "signed" + " off",
-            "authenticated " + "reviewer",
-            "required " + "reviewer",
-            "required " + "human",
-            "human " + "reviewer",
-            "human " + "review",
-            "manual " + "approval",
-            "self " + "certified",
-            "self " + "certification",
-        )
-        violations = []
-        for path in self._candidate_paths(_HERE):
-            with open(path, "rb") as fh:
-                raw = fh.read()
-            if b"\0" in raw:
-                continue
-            normalized = re.sub(
-                r"[-_\s]+", " ", raw.decode("utf-8", "replace").lower())
-            for fragment in fragments:
-                if fragment in normalized:
-                    violations.append(f"{os.path.relpath(path, _HERE)}: {fragment}")
-        self.assertEqual(violations, [], "organizational gate language found:\n" +
-                         "\n".join(violations))
+        self.assertEqual(release_policy.scan_repository(_HERE), [])
 
     def test_tracked_file_enumeration_excludes_workspace_artifacts(self):
         root = _tempfile.mkdtemp()
@@ -13233,7 +13194,18 @@ class ReleaseLanguagePolicyTests(unittest.TestCase):
         with open(untracked, "w", encoding="utf-8") as fh:
             fh.write("generated\n")
         subprocess.run(["git", "-C", root, "add", "tracked.md"], check=True)
-        self.assertEqual(self._candidate_paths(root), [tracked])
+        entries = release_policy.repository_entries(Path(root))
+        self.assertEqual(entries, [("tracked.md", Path(tracked), True)])
+
+    def test_utf16_and_utf32_policy_text_is_decoded(self):
+        fragment = "manual " + "approval"
+        for encoding in ("utf-16", "utf-32", "utf-16-le", "utf-32-be"):
+            raw = ("prefix " + fragment + " suffix").encode(encoding)
+            self.assertIn(
+                "manual_gate",
+                release_policy.matching_labels(raw),
+                encoding,
+            )
 
 
 class CompetitorSearchBackendTests(unittest.TestCase):
@@ -13321,7 +13293,7 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         }, clear=False), mock.patch.object(
             fc, "_default_firecrawl_opener", return_value=_FIRECRAWL_FIXTURE,
         ) as safe_opener:
-            fc._firecrawl("competitors", 5, fc._default_opener)
+            fc._firecrawl("competitors", 5, fc._PRODUCTION_OPENER)
         safe_opener.assert_called_once()
         self.assertIsNone(
             fc._NoRedirectHandler().redirect_request(None, None, 302, "moved", {},
