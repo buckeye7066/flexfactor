@@ -97,10 +97,10 @@ _STYLE_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _JS_ESCAPE = re.compile(
-    r'''\\(?:u\{(?P<braced>[0-9A-Fa-f]{1,6})\}'''
+    r'''\\(?:u\{(?P<braced>0*[0-9A-Fa-f]{1,6})\}'''
     r'''|u(?P<fixed>[0-9A-Fa-f]{4})'''
     r'''|x(?P<hexadecimal>[0-9A-Fa-f]{2})'''
-    r'''|(?P<continuation>\r\n|[\r\n])'''
+    r'''|(?P<continuation>\r\n|[\r\n\u2028\u2029])'''
     r'''|(?P<simple>[0btnvfr"'`\\]))''',
 )
 _TEMPLATE_INTERPOLATION = re.compile(
@@ -139,6 +139,26 @@ _PROHIBITED_FRAGMENTS = (
     ("implementation_claim_noun", "self " + "certification"),
 )
 
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
 
 class PolicyInfrastructureError(RuntimeError):
     """The exact repository exists, but its tracked contents cannot be read."""
@@ -146,12 +166,21 @@ class PolicyInfrastructureError(RuntimeError):
 
 def normalize_language(value: str) -> str:
     """Normalize line wrapping and separator variants before matching."""
+    value = unicodedata.normalize("NFKC", value)
     without_format_controls = "".join(
         character
         for character in value.lower()
-        if unicodedata.category(character) != "Cf"
+        if not _is_default_ignorable(character)
     )
     return re.sub(r"[-_\s]+", " ", without_format_controls)
+
+
+def _is_default_ignorable(character: str) -> bool:
+    code_point = ord(character)
+    return unicodedata.category(character) == "Cf" or any(
+        first <= code_point <= last
+        for first, last in _DEFAULT_IGNORABLE_RANGES
+    )
 
 
 def contains_language_fragment(value: str, target: str) -> bool:
@@ -439,7 +468,12 @@ def rendered_source_candidates(value: str, relative_path: str) -> tuple[str, ...
         rendered_literal = _render_static_literal(match.group())
         candidates.append(rendered_literal)
         gap = value[previous.end() : match.start()] if previous else ""
-        if previous and re.fullmatch(r"\s*\+\s*", gap):
+        gap_without_comments = re.sub(
+            r"/\*[\s\S]*?\*/|//[^\r\n]*",
+            "",
+            gap,
+        )
+        if previous and re.fullmatch(r"\s*\+\s*", gap_without_comments):
             first_literal = _render_static_literal(previous.group())
             chain = (
                 (chain if chain is not None else first_literal)

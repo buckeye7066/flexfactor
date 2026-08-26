@@ -170,12 +170,41 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         sources = (
             ("`" + first + ' ${""}' + second + "`", "copy.js"),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
+            (f'"\\u{{000006d}}{first[1:]} {second}"', "copy.js"),
+            (
+                f'"{first}\\{chr(0x2028)} {second}"',
+                "copy.js",
+            ),
+            (
+                f'"{first}" /* split */ + " " /* split */ + "{second}"',
+                "copy.js",
+            ),
         )
         for source, relative_path in sources:
             with self.subTest(relative_path=relative_path):
                 self.assertIn(
                     "manual_gate",
                     policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_nfkc_and_default_ignorables_are_normalized(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        fullwidth_first = "".join(
+            chr(ord(character) + 0xFEE0) for character in first
+        )
+        fullwidth_second = "".join(
+            chr(ord(character) + 0xFEE0) for character in second
+        )
+        sources = (
+            first[:4] + chr(0xFE0F) + first[4:] + " " + second,
+            fullwidth_first + " " + fullwidth_second,
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), "copy.html"),
                 )
 
     def test_markdown_references_and_css_generated_content_are_rendered(self):
