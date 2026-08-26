@@ -1,6 +1,7 @@
 """Regression coverage for release language and competitor transports."""
 from __future__ import annotations
 
+import codecs
 import json
 import os
 from pathlib import Path
@@ -55,6 +56,28 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         self.assertEqual(policy.decode_text_candidates(raw), ())
         self.assertEqual(policy.matching_labels(raw), ())
 
+    def test_lightly_malformed_bom_text_is_still_scanned(self):
+        fragment = "manual " + "approval"
+        prefix = "ordinary text " * 20
+        encoded = {
+            "utf8": codecs.BOM_UTF8 + prefix.encode() + b"\xff" + fragment.encode(),
+            "utf16le": (
+                codecs.BOM_UTF16_LE
+                + prefix.encode("utf-16-le")
+                + b"\x00\xd8"
+                + fragment.encode("utf-16-le")
+            ),
+            "utf32le": (
+                codecs.BOM_UTF32_LE
+                + prefix.encode("utf-32-le")
+                + b"\x00\xd8\x00\x00"
+                + fragment.encode("utf-32-le")
+            ),
+        }
+        for label, raw in encoded.items():
+            with self.subTest(label=label):
+                self.assertIn("manual_gate", policy.matching_labels(raw))
+
     def test_jsx_and_static_string_boundaries_are_detected(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
@@ -82,6 +105,47 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     "manual_gate",
                     policy.matching_labels(source.encode(), "page.html"),
                 )
+
+    def test_jsx_whitespace_and_markdown_inline_html_are_rendered(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (f"<span>{first}</span>{{' '}}<span>{second}</span>", "view.jsx"),
+            (f"<span>{first}</span> <span>{second}</span>", "README.md"),
+            (f"{first} **{second}**", "README.md"),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path, source=source):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_comments_and_unicode_escapes_cannot_split_rendered_copy(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        sources = (
+            (f"<p>{first}<!-- split --> {second}</p>", "page.html"),
+            (f'"{first}" + "\\u0020" + "{second}"', "copy.js"),
+        )
+        for source, relative_path in sources:
+            with self.subTest(relative_path=relative_path):
+                self.assertIn(
+                    "manual_gate",
+                    policy.matching_labels(source.encode(), relative_path),
+                )
+
+    def test_plain_javascript_comparison_is_not_treated_as_markup(self):
+        first = "".join(map(chr, (115, 105, 103, 110)))
+        second = "".join(map(chr, (111, 102, 102)))
+        source = f"{first} < threshold > {second}"
+        self.assertEqual(policy.matching_labels(source.encode(), "logic.js"), ())
+
+    def test_plural_variants_are_detected(self):
+        self.assertIn(
+            "manual_gate_plural",
+            policy.matching_labels(("manual " + "approvals").encode()),
+        )
 
     def test_phrase_substring_inside_words_is_not_detected(self):
         raw = "Assign officer duties".encode()
@@ -145,7 +209,11 @@ class FirecrawlTransportTests(unittest.TestCase):
         )
 
     def test_production_transport_uses_the_no_redirect_opener(self):
-        with mock.patch.dict(os.environ, {"FIRECRAWL_API_KEY": "test-key"}), \
+        with mock.patch.dict(os.environ, {
+                 "FIRECRAWL_API_KEY": "test-key",
+                 "FLEXFACTOR_FIRECRAWL_URL": "",
+                 "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+             }), \
              mock.patch.object(
                  competitors,
                  "_default_firecrawl_opener",
@@ -164,7 +232,11 @@ class FirecrawlTransportTests(unittest.TestCase):
             calls.append(url)
             return self._fixture()
 
-        with mock.patch.dict(os.environ, {"FIRECRAWL_API_KEY": "test-key"}), \
+        with mock.patch.dict(os.environ, {
+                 "FIRECRAWL_API_KEY": "test-key",
+                 "FLEXFACTOR_FIRECRAWL_URL": "",
+                 "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+             }), \
              mock.patch.object(
                  competitors, "_default_opener", offline_transport
              ), mock.patch.object(
@@ -178,6 +250,41 @@ class FirecrawlTransportTests(unittest.TestCase):
         self.assertEqual(backend, "firecrawl")
         self.assertEqual(skipped, {})
         self.assertEqual(calls, ["https://api.firecrawl.dev/v2/search"])
+
+    def test_unrecognized_firecrawl_shapes_fail_closed(self):
+        responses = (
+            {"error": "authentication failed"},
+            {"success": True, "data": {"documents": []}},
+        )
+        environment = {
+            "FIRECRAWL_API_KEY": "test-key",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }
+        with mock.patch.dict(os.environ, environment):
+            for response in responses:
+                with self.subTest(response=response), self.assertRaises(RuntimeError):
+                    competitors._firecrawl(
+                        "competitors",
+                        5,
+                        lambda *args, response=response, **kwargs: json.dumps(response),
+                    )
+
+    def test_recognized_empty_firecrawl_collection_remains_empty(self):
+        environment = {
+            "FIRECRAWL_API_KEY": "test-key",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }
+        with mock.patch.dict(os.environ, environment):
+            hits = competitors._firecrawl(
+                "competitors",
+                5,
+                lambda *args, **kwargs: json.dumps(
+                    {"success": True, "data": {"web": []}}
+                ),
+            )
+        self.assertEqual(hits, [])
 
 
 if __name__ == "__main__":
