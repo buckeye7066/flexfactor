@@ -8406,10 +8406,13 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertGreater(res["defects"], 0,
                                "readiness blockers never reached the findings list")
 
-    def test_readiness_can_be_switched_off(self):
+    def test_readiness_switch_does_not_disable_product_invariants(self):
         with self._run_one({"package.json": "{}"}, ("--no-readiness",)) as (res, _r):
             self.assertIsNone(res.get("readiness_ready"))
-            self.assertEqual(res["defects"], 0)
+            self.assertFalse(res.get("product_invariants_ready"))
+            self.assertGreater(res.get("product_invariant_blockers") or 0, 0)
+            self.assertGreater(res["defects"], 0)
+            self.assertIn("purpose-authority", res.get("stop_reason") or "")
 
     def test_project_with_no_manifest_is_honestly_unverifiable(self):
         # A loose .py with no pyproject/requirements/setup.py is not a detectable

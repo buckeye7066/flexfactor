@@ -67,6 +67,7 @@ jobs:
           python flexfactor_release_policy.py
           for t in flexfactor_tests.py \
                    test_flexfactor_release_policy.py \
+                   flexfactor_product_invariants_tests.py \
                    flexfactor_invariant_sweep_tests.py \
                    flexfactor_entrypoint_tests.py \
                    flexfactor_node_lock_tests.py \
