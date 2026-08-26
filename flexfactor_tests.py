@@ -13154,6 +13154,9 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
         self.assertIn("purpose_reviewer.structured", call,
                       "author= must route to the provider's STRONG tier, "
                       "not through _judge")
+        self.assertIn("allow_credentialed_firecrawl=", call)
+        self.assertIn("normalize_model_mode", call,
+                      "free-mode competitor research must not consume credits")
 
 
 class CompetitorCoverageHonestyTests(unittest.TestCase):
@@ -13178,7 +13181,7 @@ class CompetitorCoverageHonestyTests(unittest.TestCase):
 
 
 class ReleaseLanguagePolicyTests(unittest.TestCase):
-    """Bind the full suite to the executable repository-language policy."""
+    """Keep organizational gate language out without weakening safety controls."""
 
     def test_repository_has_no_organizational_gate_language(self):
         self.assertEqual(release_policy.scan_repository(_HERE), [])
@@ -13298,6 +13301,28 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         self.assertIsNone(
             fc._NoRedirectHandler().redirect_request(None, None, 302, "moved", {},
                                                       "https://other.example"))
+
+    def test_injected_module_default_transport_is_preserved(self):
+        calls = []
+
+        def offline_transport(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.object(fc, "_default_opener", offline_transport), \
+             mock.patch.object(
+                 fc, "_default_firecrawl_opener",
+                 side_effect=AssertionError("injected transport was bypassed"),
+             ), mock.patch.dict(os.environ, {
+                 "FIRECRAWL_API_KEY": "fc-test",
+                 "FLEXFACTOR_FIRECRAWL_URL": "",
+             }, clear=False):
+            hits, backend, skipped = fc.web_search("sermon software")
+
+        self.assertEqual(backend, "firecrawl")
+        self.assertTrue(hits)
+        self.assertEqual(skipped, {})
+        self.assertEqual(calls[0][0], "https://api.firecrawl.dev/v2/search")
 
     def test_keyless_loopback_endpoint_can_remain_http(self):
         calls = []
