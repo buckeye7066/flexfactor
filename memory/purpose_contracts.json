@@ -786,7 +786,7 @@
    "default_branch": "main",
    "locator": "Repo buckeye7066/sermonsmith, default main; deployed app and Railway API must be reverified.",
    "local_path": "C:\\Users\\firer\\sermonsmith",
-   "purpose": "a pastor-led sermon workspace from passage to review-ready outline while preserving prayer, exegesis, pastoral judgment, denominational context, exact provider-sourced Scripture text, and explicit human review across supported surfaces.",
+   "purpose": "a pastor-led sermon workspace from passage to finalized outline while preserving prayer, exegesis, pastoral judgment, denominational context, exact provider-sourced Scripture text, and user control across supported surfaces.",
    "acceptance_criteria": [
     "public routes",
     "account/recovery",

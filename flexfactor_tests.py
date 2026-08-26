@@ -12,6 +12,8 @@ import inspect
 import io
 import json
 import os
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import threading
 import time
 import tomllib
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location("flexfactor", os.path.join(_HERE, "flexfactor.py"))
@@ -130,6 +133,7 @@ os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
 # they all already do, via `opener=` or `_patched(ff, "_server_is_up", ...)`.
 # --------------------------------------------------------------------------- #
 import flexfactor_competitors as _ffc  # noqa: E402
+import flexfactor_release_policy as release_policy  # noqa: E402
 
 
 def _no_network_opener(*a, **k):
@@ -12836,6 +12840,11 @@ _WIKI_FIXTURE = json.dumps({"query": {"search": [
     {"title": "Logos Bible Software", "snippet": "A <span>digital</span> Bible study platform."},
 ]}})
 
+_FIRECRAWL_FIXTURE = json.dumps({"success": True, "data": {"web": [
+    {"title": "Logos", "url": "https://www.logos.com/",
+     "description": "Official Bible study product."},
+]}})
+
 _GH_FIXTURE = json.dumps({"items": [
     {"full_name": "openlp/openlp", "html_url": "https://github.com/openlp/openlp",
      "description": "Church presentation software", "stargazers_count": 400,
@@ -13145,6 +13154,9 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
         self.assertIn("purpose_reviewer.structured", call,
                       "author= must route to the provider's STRONG tier, "
                       "not through _judge")
+        self.assertIn("allow_credentialed_firecrawl=", call)
+        self.assertIn("normalize_model_mode", call,
+                      "free-mode competitor research must not consume credits")
 
 
 class CompetitorCoverageHonestyTests(unittest.TestCase):
@@ -13168,7 +13180,175 @@ class CompetitorCoverageHonestyTests(unittest.TestCase):
         self.assertIn("OSError: down", lines)
 
 
+class ReleaseLanguagePolicyTests(unittest.TestCase):
+    """Keep organizational gate language out without weakening safety controls."""
+
+    def test_repository_has_no_organizational_gate_language(self):
+        self.assertEqual(release_policy.scan_repository(_HERE), [])
+
+    def test_tracked_file_enumeration_excludes_workspace_artifacts(self):
+        root = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        subprocess.run(["git", "-C", root, "init", "-q"], check=True)
+        tracked = os.path.join(root, "tracked.md")
+        untracked = os.path.join(root, "generated_audit_report.md")
+        with open(tracked, "w", encoding="utf-8") as fh:
+            fh.write("tracked\n")
+        with open(untracked, "w", encoding="utf-8") as fh:
+            fh.write("generated\n")
+        subprocess.run(["git", "-C", root, "add", "tracked.md"], check=True)
+        entries = release_policy.repository_entries(Path(root))
+        self.assertEqual(entries, [("tracked.md", Path(tracked), True)])
+
+    def test_utf16_and_utf32_policy_text_is_decoded(self):
+        fragment = "manual " + "approval"
+        for encoding in ("utf-16", "utf-32", "utf-16-le", "utf-32-be"):
+            raw = ("prefix " + fragment + " suffix").encode(encoding)
+            self.assertIn(
+                "manual_gate",
+                release_policy.matching_labels(raw),
+                encoding,
+            )
+
+
 class CompetitorSearchBackendTests(unittest.TestCase):
+    def test_firecrawl_v2_is_first_and_uses_the_configured_key(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, data, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False):
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                opener=opener,
+                allow_credentialed_firecrawl=True,
+            )
+
+        self.assertEqual(backend, "firecrawl")
+        self.assertEqual(hits[0]["url"], "https://www.logos.com/")
+        self.assertEqual(skipped, {})
+        self.assertEqual(calls[0][0], "https://api.firecrawl.dev/v2/search")
+        self.assertEqual(calls[0][2].get("Authorization"), "Bearer fc-test")
+        body = json.loads(calls[0][1].decode("utf-8"))
+        self.assertEqual(body["sources"], ["web"])
+        self.assertEqual(body["query"], "sermon software")
+
+    def test_firecrawl_failure_is_named_before_keyless_fallback(self):
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE},
+                         fail={"api.firecrawl.dev"})
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False):
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                opener=op,
+                allow_credentialed_firecrawl=True,
+            )
+        self.assertEqual(backend, "duckduckgo")
+        self.assertTrue(hits)
+        self.assertIn("firecrawl", skipped)
+        self.assertIn("simulated outage", skipped["firecrawl"])
+
+    def test_cloud_key_is_never_forwarded_to_a_custom_endpoint(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "cloud-secret",
+            "FLEXFACTOR_FIRECRAWL_URL": "https://firecrawl.internal/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }, clear=False):
+            hits = fc._firecrawl("competitors", 5, opener)
+        self.assertTrue(hits)
+        self.assertEqual(calls[0][0], "https://firecrawl.internal/v2/search")
+        self.assertNotIn("Authorization", calls[0][1])
+
+    def test_custom_endpoint_uses_only_its_scoped_key(self):
+        headers = []
+
+        def opener(url, data=None, request_headers=None, timeout=None):
+            headers.append(request_headers or {})
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "cloud-secret",
+            "FLEXFACTOR_FIRECRAWL_URL": "https://firecrawl.internal/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "internal-secret",
+        }, clear=False):
+            fc._firecrawl("competitors", 5, opener)
+        self.assertEqual(headers[0].get("Authorization"), "Bearer internal-secret")
+
+    def test_credentialed_custom_endpoint_requires_tls(self):
+        called = []
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_FIRECRAWL_URL": "http://firecrawl.example/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "internal-secret",
+        }, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "require HTTPS"):
+                fc._firecrawl("competitors", 5, lambda *a, **k: called.append(a))
+        self.assertEqual(called, [])
+
+    def test_default_firecrawl_transport_refuses_redirects(self):
+        with mock.patch.dict(os.environ, {
+            "FIRECRAWL_API_KEY": "fc-test",
+            "FLEXFACTOR_FIRECRAWL_URL": "",
+        }, clear=False), mock.patch.object(
+            fc, "_default_firecrawl_opener", return_value=_FIRECRAWL_FIXTURE,
+        ) as safe_opener:
+            fc._firecrawl("competitors", 5, fc._PRODUCTION_OPENER)
+        safe_opener.assert_called_once()
+        self.assertIsNone(
+            fc._NoRedirectHandler().redirect_request(None, None, 302, "moved", {},
+                                                      "https://other.example"))
+
+    def test_injected_module_default_transport_is_preserved(self):
+        calls = []
+
+        def offline_transport(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.object(fc, "_default_opener", offline_transport), \
+             mock.patch.object(
+                 fc, "_default_firecrawl_opener",
+                 side_effect=AssertionError("injected transport was bypassed"),
+             ), mock.patch.dict(os.environ, {
+                 "FIRECRAWL_API_KEY": "fc-test",
+                 "FLEXFACTOR_FIRECRAWL_URL": "",
+             }, clear=False):
+            hits, backend, skipped = fc.web_search(
+                "sermon software",
+                allow_credentialed_firecrawl=True,
+            )
+
+        self.assertEqual(backend, "firecrawl")
+        self.assertTrue(hits)
+        self.assertEqual(skipped, {})
+        self.assertEqual(calls[0][0], "https://api.firecrawl.dev/v2/search")
+
+    def test_keyless_loopback_endpoint_can_remain_http(self):
+        calls = []
+
+        def opener(url, data=None, headers=None, timeout=None):
+            calls.append((url, headers or {}))
+            return _FIRECRAWL_FIXTURE
+
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_FIRECRAWL_URL": "http://127.0.0.1:3002/v2/search",
+            "FLEXFACTOR_FIRECRAWL_API_KEY": "",
+        }, clear=False):
+            fc._firecrawl("competitors", 5, opener)
+        self.assertNotIn("Authorization", calls[0][1])
+
     def test_duckduckgo_lite_results_are_parsed_and_ads_dropped(self):
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE})
         hits, backend, skipped = fc.web_search("sermon software", opener=op)
@@ -13184,6 +13364,7 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         hits, backend, skipped = fc.web_search("logos bible software", opener=op)
         self.assertEqual(backend, "wikipedia")
         self.assertEqual(hits[0]["title"], "Logos Bible Software")
+        self.assertIn("firecrawl", skipped)
         self.assertIn("duckduckgo", skipped)
         self.assertIn("searxng", skipped)
 
@@ -13191,6 +13372,7 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         op = _FakeOpener({}, fail={"duckduckgo", "wikipedia", "searx"})
         hits, backend, skipped = fc.web_search("anything", opener=op)
         self.assertEqual((hits, backend), ([], ""))
+        self.assertIn("firecrawl", skipped)
         self.assertIn("duckduckgo", skipped)
         self.assertIn("wikipedia", skipped)
 

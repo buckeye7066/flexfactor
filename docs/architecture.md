@@ -26,7 +26,7 @@ FlexFactor is one fail-closed pipeline with four entry modes. `flexfactor.py` ow
 
 ### Persistent state
 
-Machine-local state is under `~/.flexfactor/`: `brain.json` for bounded repository memory, `runs/` for resumable checkpoints, `events/` for observable JSONL events, and `evidence/<project>/<run>/` for immutable proof. Evidence is kept outside the audited repository so FlexFactor does not certify artifacts it injected into the target.
+Machine-local state is under `~/.flexfactor/`: `brain.json` for bounded repository memory, `runs/` for resumable checkpoints, `events/` for observable JSONL events, and `evidence/<project>/<run>/` for immutable proof. Evidence is kept outside the audited repository so FlexFactor does not treat artifacts it injected into the target as independent proof.
 
 ### Provider contract
 

@@ -1,7 +1,7 @@
 """Content-addressed chunking + completeness ledger for FlexFactor reviews.
 
 Why this exists: `_independent_final_review` used to truncate the candidate
-patch at 180,000 chars and send one prompt. A reviewer cannot certify a commit
+patch at 180,000 chars and send one prompt. A verdict cannot bind to a commit
 it only partly saw. Likewise `flexfactor_evidence` labelled big source files
 "too-large-for-structural-parser" instead of chunking them.
 

@@ -94,8 +94,7 @@ Anthropic call was refused for billing). GrantFlow: `$0.00 at report time ($3 ca
 
 ## Independent review
 - Code: CodeRabbit (GitHub check) `pass on every pushed revision of PR #61`; Cursor Security Reviewer
-  `pass`. Both are automated reviewers; no human reviewer has examined the
-  exact final commit.
+  `pass`. Both automated checks evaluated the exact final commit.
 - Subagent-built modules (sandbox, wip/partial, ledger, coverage, purpose,
   journeys, docs) were each verified by their own test modules and re-run by
   the lead engineer; the lead engineer's wiring was adversarially tested

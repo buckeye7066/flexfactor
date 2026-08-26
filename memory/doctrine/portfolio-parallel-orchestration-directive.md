@@ -417,7 +417,7 @@ MINISTRY OR SCRIPTURE-BASED PROGRAMS
 - Distinguish pastoral assistance from spiritual or doctrinal authority.
 - Verify references and citations.
 - Preserve denominational and pastoral context.
-- Ensure the pastor remains the final human reviewer.
+- Ensure the pastor retains final editorial control.
 GAMES AND FAMILY APPLICATIONS
 - Test complete gameplay loops.
 - Verify onboarding, progression, controls, persistence, balance, and recovery.
@@ -449,11 +449,11 @@ Do not fabricate:
 - Clinical validation
 - Curriculum approval
 - Privacy approval
-- Security certification
 - Payment validation
-- Human review
 - Regulatory status
 - Production test results
+- Security certification
+- The existence or outcome of any review claimed to have been performed by a person
 Do not bypass:
 - Authentication
 - Authorization
@@ -581,4 +581,3 @@ Do not choose only the easiest programs.
 Do not stop after launching the agents.
 Do not confuse delegation with completion.
 The portfolio is complete only when the agents’ work has been integrated, verified, and reconciled against the original purpose of every program.
-

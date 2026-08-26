@@ -66,6 +66,7 @@ DEFAULT_TARGET = 5
 DEFAULT_FIX_STREAM_CAP = 5
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlexFactor-competitor-research"
 _HTTP_TIMEOUT = 25.0
+_FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
 
 # The caller may install flexfactor's own licence oracle (`_license_compatible`)
 # so there is a SINGLE source of truth at runtime and the scout integrate gate
@@ -196,6 +197,117 @@ def _default_opener(url: str, data: bytes | None = None,
     return raw.decode("utf-8", "replace")
 
 
+# Keep an immutable identity for the production transport. Test harnesses and
+# callers deliberately replace ``_default_opener`` with an offline/instrumented
+# transport; comparing against the mutable module global would mistake that
+# injection for production and silently route around it.
+_PRODUCTION_OPENER = _default_opener
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep bearer credentials bound to the explicitly configured origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _default_firecrawl_opener(url: str, data: bytes | None = None,
+                              headers: dict | None = None,
+                              timeout: float = _HTTP_TIMEOUT) -> str:
+    req = urllib.request.Request(
+        url, data=data, headers={"User-Agent": _UA, **(headers or {})},
+        method="POST" if data else "GET")
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read(400_000)
+    return raw.decode("utf-8", "replace")
+
+
+def _http_url_has_host(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def _firecrawl(query: str, limit: int, opener, *,
+               allow_credentials: bool = True) -> list[dict]:
+    """Firecrawl v2 search, authenticated when a key is configured.
+
+    Firecrawl is the freshest evidence source in the search ladder, but it is
+    optional.  A missing key still gets one keyless attempt; any HTTP, schema,
+    or account failure is surfaced by :func:`web_search` as a named skip before
+    the keyless fallbacks run.  No synthetic result is ever substituted.
+    """
+    custom_endpoint = (os.environ.get("FLEXFACTOR_FIRECRAWL_URL") or "").strip()
+    endpoint = custom_endpoint or _FIRECRAWL_SEARCH_URL
+    if not endpoint.startswith(("https://", "http://")):
+        raise RuntimeError("FLEXFACTOR_FIRECRAWL_URL must be an http(s) URL")
+
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json"}
+    # Never forward the general Firecrawl cloud credential to an arbitrary
+    # operator-configured host. Custom/self-hosted endpoints have an explicitly
+    # scoped credential; they can also be keyless. The official cloud endpoint
+    # requires its documented bearer token, so fail locally rather than spend
+    # an HTTP timeout on a request that cannot authenticate.
+    if custom_endpoint:
+        key = (os.environ.get("FLEXFACTOR_FIRECRAWL_API_KEY") or "").strip()
+    else:
+        key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("FIRECRAWL_API_KEY is not set")
+    if key and not allow_credentials:
+        raise RuntimeError(
+            "credentialed Firecrawl is disabled unless paid research is explicit"
+        )
+    if key and not endpoint.startswith("https://"):
+        raise RuntimeError("credentialed Firecrawl endpoints require HTTPS")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload = json.dumps({
+        "query": query,
+        "limit": max(1, min(int(limit), 20)),
+        "sources": ["web"],
+        "safe": True,
+    }).encode("utf-8")
+    request = (_default_firecrawl_opener
+               if opener is _PRODUCTION_OPENER else opener)
+    root = json.loads(request(endpoint, payload, headers))
+    if not isinstance(root, dict) or root.get("success") is not True:
+        raise RuntimeError("Firecrawl v2 reported failure or invalid JSON shape")
+
+    data = root.get("data")
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict) and isinstance(data.get("web"), list):
+        items = data["web"]
+    elif isinstance(root.get("web"), list):
+        items = root["web"]
+    else:
+        raise RuntimeError("Firecrawl v2 returned an unrecognized result shape")
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("Firecrawl v2 returned a non-object result")
+        url = str(item.get("url") or "").strip()
+        if not _http_url_has_host(url):
+            raise RuntimeError("Firecrawl v2 returned a result without a valid URL")
+        if url in seen:
+            continue
+        seen.add(url)
+        title = str(item.get("title") or url).strip()
+        snippet = str(item.get("description") or item.get("snippet") or
+                      item.get("markdown") or "").strip()
+        out.append({"title": title, "url": url, "snippet": snippet[:4000]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 _DDG_AD_MARKERS = ("duckduckgo.com/y.js", "duckduckgo.com/duckduckgo-help-pages")
 
 
@@ -256,13 +368,17 @@ def _searxng(query: str, limit: int, opener) -> list[dict]:
             for r in (data.get("results") or [])[:limit] if r.get("url")]
 
 
-# Ordered ladder. SearXNG first when configured (owner-hosted, no rate limit),
-# then DDG Lite (real organic web results), then Wikipedia (narrow but reliable).
-_WEB_BACKENDS = (("searxng", _searxng), ("duckduckgo", _ddg_lite),
+# Ordered ladder. Firecrawl supplies current market evidence first (with or
+# without an account key), then the owner-hosted/keyless fallbacks preserve an
+# offline-capable path instead of turning a provider outage into fake coverage.
+_WEB_BACKENDS = (("firecrawl", _firecrawl), ("searxng", _searxng),
+                 ("duckduckgo", _ddg_lite),
                  ("wikipedia", _wikipedia))
 
 
-def web_search(query: str, limit: int = 6, opener=None) -> tuple[list[dict], str, dict]:
+def web_search(query: str, limit: int = 6, opener=None, *,
+               allow_credentialed_firecrawl: bool = False
+               ) -> tuple[list[dict], str, dict]:
     """(results, backend_used, skipped{backend: reason}).
 
     Tries each keyless backend in order and returns the FIRST that yields
@@ -274,7 +390,15 @@ def web_search(query: str, limit: int = 6, opener=None) -> tuple[list[dict], str
     skipped: dict[str, str] = {}
     for name, fn in _WEB_BACKENDS:
         try:
-            hits = fn(query, limit, opener)
+            if name == "firecrawl":
+                hits = fn(
+                    query,
+                    limit,
+                    opener,
+                    allow_credentials=allow_credentialed_firecrawl,
+                )
+            else:
+                hits = fn(query, limit, opener)
         except Exception as ex:  # any transport/parse failure -> named skip
             skipped[name] = f"{type(ex).__name__}: {ex}"
             continue
@@ -432,7 +556,7 @@ _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo
 
 
 def _is_evidence_url(url: str | None) -> bool:
-    if not url or not url.startswith("http"):
+    if not url or not _http_url_has_host(url):
         return False
     host = urllib.parse.urlparse(url).hostname or ""
     return host.lower() not in _NON_EVIDENCE_HOSTS
@@ -513,7 +637,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          stack=None, *, rr_search=None, rr_endpoint: str = "",
                          target: int = DEFAULT_TARGET, opener=None,
                          log=print, max_workers: int = 4,
-                         file_list=None, author=None) -> dict:
+                         file_list=None, author=None,
+                         allow_credentialed_firecrawl: bool = False) -> dict:
     """Find competitors, extract one adoptable idea each, judge against purpose.
 
     `judge(system, prompt, schema) -> dict` is injected (flexfactor routes it to
@@ -596,7 +721,12 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         if not query:
             continue
         research["queries"].append(query)
-        hits, backend, skips = web_search(query, limit=4, opener=opener)
+        hits, backend, skips = web_search(
+            query,
+            limit=4,
+            opener=opener,
+            allow_credentialed_firecrawl=allow_credentialed_firecrawl,
+        )
         web_skips.update({k: v for k, v in skips.items() if k not in web_skips})
         if backend and f"web:{backend}" not in research["sources_used"]:
             research["sources_used"].append(f"web:{backend}")

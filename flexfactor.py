@@ -12074,7 +12074,7 @@ def _review_all(reviewers: list, project_dir: str,
     """Review every file with EVERY reviewer (in parallel), union + dedupe findings
     per file. Returns (file_findings, flat, unreadable, reviewed_clean):
       - unreadable: rels the contained read REFUSED (never clean - manual review).
-      - reviewed_clean: {rel: reviewed_sha} - files whose EVERY required reviewer COMPLETED
+      - reviewed_clean: {rel: reviewed_sha} - files whose configured verification passes COMPLETED
         SUCCESSFULLY with empty findings, mapped to the sha256 of the EXACT bytes reviewed.
         'clean' is an ALLOWLIST of these: a file SKIPPED by the budget/stop cutoff, or one
         whose review ABORTED (BudgetExceededError / any reviewer exception), is NEVER clean.
@@ -14641,6 +14641,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         rr_search=rr_fn,
                         rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
                         target=max(1, int(getattr(args, "competitor_count", 5) or 5)),
+                        allow_credentialed_firecrawl=(
+                            normalize_model_mode(
+                                getattr(args, "model_mode", "free")
+                            ) == "paid"
+                        ),
                         log=lambda m: print(f"{pfx}{m}"),
                         file_list=all_files)
                 except BudgetExceededError:

@@ -135,6 +135,24 @@ function sampleValue(kind, field) {
     return Promise.race([Promise.resolve(promise), gate]).finally(() => clearTimeout(timer));
   }
   const act = (promise, label) => withDeadline(promise, ACTION_TIMEOUT_MS, label);
+  // Browser/page/context close is teardown, not product behavior. Chromium can
+  // occasionally leave a close protocol request unresolved after a navigation
+  // has already disposed the page. Bound that cleanup without adding a false
+  // journey timeout to otherwise complete evidence.
+  async function bestEffortClose(target, label, ms = 1500) {
+    if (!target) return;
+    let timer;
+    const close = Promise.resolve()
+      .then(() => target.close())
+      .catch((error) => progress(`cleanup close ignored (${label}): ${error.message}`));
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        progress(`cleanup close deadline (${label})`);
+        resolve();
+      }, ms);
+    });
+    await Promise.race([close, deadline]).finally(() => clearTimeout(timer));
+  }
 
   const addJourney = (row) => { const j = { id: `j${++journeyId}`, ...row }; journeys.push(j); return j; };
   const shot = async (page, name) => {
@@ -222,7 +240,7 @@ function sampleValue(kind, field) {
     const screenshot = await shot(page, `login-${role.name}`);
     addJourney({ kind: 'login', role: role.name, viewport: viewports[0].label, target, status: ok ? 'passed' : 'failed', reason, screenshot, durationMs: Date.now() - started, postUrl: page.url() });
     if (!ok) errors.push(reason);
-    await page.close();
+    await bestEffortClose(page, `login page ${role.name}`);
     return ok;
   }
 
@@ -351,7 +369,7 @@ function sampleValue(kind, field) {
     if (state.dialogs && state.dialogs.length) row.dialogs = state.dialogs;
     routeEvidence.push(row);
     addJourney({ kind: crawl ? 'route' : 'authz', role: role.name, viewport: viewports[0].label, target: url, status: row.status, reason: state.errors[0] || null, screenshot, outcome, httpStatus });
-    await act(page.close(), `close ${url}`).catch(() => {});
+    await bestEffortClose(page, `route page ${url}`);
   }
   // per-page deadline: a hung page becomes a failed journey + timeout finding, the run moves on
   async function guardedVisit(role, ctx, url, opts) {
@@ -489,11 +507,11 @@ function sampleValue(kind, field) {
       if (!await loc.count()) throw new Error(`form index ${form.index} no longer present on ${form.url}`);
       const filled = await fillForm(page, loc, mode);
       if (mode === 'malformed-email' && !filled.malformedDone) {
-        await page.close();
+        await bestEffortClose(page, `form page ${form.action || form.url}`);
         return { mode, status: 'not-applicable', reason: `form ${form.action || form.url}: no email field for malformed-email case` };
       }
       if (mode === 'oversized' && !filled.oversizedDone) {
-        await page.close();
+        await bestEffortClose(page, `form page ${form.action || form.url}`);
         return { mode, status: 'not-applicable', reason: `form ${form.action || form.url}: no free-text field for oversized case` };
       }
       const obs = await submitAndObserve(page, loc, form);
@@ -515,7 +533,7 @@ function sampleValue(kind, field) {
     result.screenshot = await shot(page, `form-${mode}`);
     result.durationMs = Date.now() - started;
     for (const e of state.errors) errors.push(`${form.url} form ${form.action} [${mode}]: ${e}`);
-    await page.close();
+    await bestEffortClose(page, `form page ${form.action || form.url}`);
     return result;
   }
 
@@ -570,7 +588,7 @@ function sampleValue(kind, field) {
       const ok = await withDeadline(performLoginQuiet(role, fresh), PAGE_TIMEOUT_MS, `re-login ${role.name}`).catch(() => false);
       const c = ok ? await withDeadline(runFormCase(role, fresh, form, 'valid'), PAGE_TIMEOUT_MS, `destructive form ${form.action || form.url}`).catch((e) => ({ mode: 'valid', status: 'failed', reason: e.message })) : { mode: 'valid', status: 'failed', reason: `could not re-login role ${role.name} in fresh context` };
       if (!ok) errors.push(c.reason);
-      await fresh.close().catch(() => {});
+      await bestEffortClose(fresh, `destructive form context ${role.name}`);
       row.status = 'submitted-destructive'; row.cases.push(c);
       formEvidence.push(row);
       addJourney({ kind: 'destructive', role: role.name, viewport: viewports[0].label, target: `${form.method} ${form.action || form.url} "${form.submitLabel}"`, status: c.status, reason: c.reason || null, screenshot: c.screenshot || null, httpStatus: c.httpStatus ?? null });
@@ -601,7 +619,7 @@ function sampleValue(kind, field) {
     } catch {
       return false;
     } finally {
-      if (page) await act(page.close(), `login close ${role.name}`).catch(() => {});
+      await bestEffortClose(page, `quiet login page ${role.name}`);
     }
   }
 
@@ -628,7 +646,7 @@ function sampleValue(kind, field) {
     } catch (e) { result = { mode: 'duplicate', status: 'failed', reason: e.message }; }
     result.screenshot = await shot(page, 'form-duplicate');
     for (const e of state.errors) errors.push(`${form.url} form ${form.action} [duplicate]: ${e}`);
-    await page.close();
+    await bestEffortClose(page, `duplicate form page ${form.action || form.url}`);
     return result;
   }
   function CSS_escape(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`); }
@@ -659,7 +677,7 @@ function sampleValue(kind, field) {
       controlEvidence.push({ ...item.target, status: status === 'passed' ? 'executed-destructive' : 'failed', error, responses: responses.slice(0, 20), screenshotBefore: before, screenshotAfter: after });
       addJourney({ kind: 'destructive', role: item.role.name, viewport: viewports[0].label, target: `${item.url} "${item.label}"`, status, reason: error, screenshot: after || before, responses: responses.slice(0, 10) });
       if (state.dialogs.length) controlEvidence[controlEvidence.length - 1].dialogs = state.dialogs;
-      await act(fresh.close(), 'close destructive context').catch(() => {});
+      await bestEffortClose(fresh, 'destructive control context');
     }
   }
 
@@ -686,7 +704,8 @@ function sampleValue(kind, field) {
         for (const e of state.errors) errors.push(`${url} @${vp.label} [${role.name}]: ${e}`);
         if (state.errors.length && status === 'passed') { status = 'failed'; reason = state.errors[0]; }
         addJourney({ kind: 'viewport', role: role.name, viewport: vp.label, target: url, status, reason, screenshot, overflow });
-        await act(page.close(), 'close viewport page').catch(() => {}); await act(ctx.close(), 'close viewport context').catch(() => {});
+        await bestEffortClose(page, `viewport page ${vp.label} ${url}`);
+        await bestEffortClose(ctx, `viewport context ${vp.label} ${url}`);
       }
     }
   }
@@ -739,9 +758,9 @@ function sampleValue(kind, field) {
     for (const [name, ctx] of contexts) {
       const file = `playwright-trace-${name}.zip`;
       await withDeadline(ctx.tracing.stop({ path: path.join(artifactDir, file) }), Math.max(ACTION_TIMEOUT_MS, 30000), `tracing.stop ${name}`).then(() => artifacts.push(file)).catch((e) => errors.push(`trace ${name}: ${e.message}`));
-      await act(ctx.close(), `context.close ${name}`).catch(() => {});
+      await bestEffortClose(ctx, `role context ${name}`);
     }
-    if (browser) await act(browser.close(), 'browser.close').catch((e) => { errors.push(`browser.close: ${e.message}`); });
+    await bestEffortClose(browser, 'browser', 3000);
     clearTimeout(watchdog);
   }
 

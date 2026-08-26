@@ -72,10 +72,12 @@ real competitors - commercial products AND inspectable open-source projects -
 extracts the single most valuable adoptable idea from each, and judges that idea
 against the program's OWN purpose contract.
 
-- **Sources.** Scout's Repo Rewards search plus FlexFactor's own keyless web
-  search (self-hosted SearXNG when `FLEXFACTOR_SEARXNG_URL` is set, then
-  DuckDuckGo Lite, then Wikipedia) plus GitHub repository search, which supplies
-  the SPDX licence id. Every backend that fails is a NAMED skip in the report -
+- **Sources.** Scout's Repo Rewards search plus Firecrawl v2 (the official cloud
+  uses `FIRECRAWL_API_KEY`; a custom `FLEXFACTOR_FIRECRAWL_URL` can be keyless
+  or use its separately scoped `FLEXFACTOR_FIRECRAWL_API_KEY`), followed by
+  self-hosted SearXNG, DuckDuckGo Lite, and Wikipedia fallbacks, plus GitHub
+  repository search, which supplies the SPDX licence id. A cloud credential is
+  never forwarded to a custom host. Every backend that fails is a NAMED skip in the report -
   "no reachable source" is reported as a research gap, never as "this program
   has no competitors", and a name nothing corroborates is marked `unverified`
   and never acted on.
