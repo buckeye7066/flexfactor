@@ -101,7 +101,7 @@ _JS_ESCAPE = re.compile(
     r'''|u(?P<fixed>[0-9A-Fa-f]{4})'''
     r'''|x(?P<hexadecimal>[0-9A-Fa-f]{2})'''
     r'''|(?P<continuation>\r\n|[\r\n\u2028\u2029])'''
-    r'''|(?P<simple>[0btnvfr"'`\\]))''',
+    r'''|(?P<simple>0|[^\d\r\n\u2028\u2029]))''',
 )
 _TEMPLATE_INTERPOLATION = re.compile(
     r'''(?<!\\)\$\{\s*(?P<literal>"(?:\\.|[^"\\])*"'''
@@ -269,6 +269,7 @@ def _unquote_static_literal(literal: str) -> str:
             return chr(int(match.group("hexadecimal"), 16))
         if match.group("continuation") is not None:
             return ""
+        simple = match.group("simple") or ""
         return {
             "0": "\0",
             "b": "\b",
@@ -281,7 +282,7 @@ def _unquote_static_literal(literal: str) -> str:
             "'": "'",
             "`": "`",
             "\\": "\\",
-        }.get(match.group("simple") or "", match.group())
+        }.get(simple, simple)
 
     return _JS_ESCAPE.sub(replace_escape, literal[1:-1])
 

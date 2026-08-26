@@ -171,6 +171,7 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
             ("`" + first + ' ${""}' + second + "`", "copy.js"),
             (f'{{"copy":"{first}\\u0020{second}"}}', "copy.json"),
             (f'"\\u{{000006d}}{first[1:]} {second}"', "copy.js"),
+            (f'"{first[:1]}\\{first[1:]} {second}"', "copy.js"),
             (
                 f'"{first}\\{chr(0x2028)} {second}"',
                 "copy.js",
@@ -277,6 +278,7 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
         sources = (
             (f"{first} * {second}", "README.md"),
             (f'first = "{first} "\nsecond = "{second}"', "messages.py"),
+            (f'"{first[:1]}\\\\{first[1:]} {second}"', "copy.js"),
         )
         for source, relative_path in sources:
             with self.subTest(relative_path=relative_path):
