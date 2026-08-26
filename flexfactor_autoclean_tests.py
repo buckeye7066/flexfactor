@@ -11,6 +11,7 @@ force-merged.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import subprocess
 import tempfile
@@ -168,6 +169,150 @@ class PullRequestPolicyTests(unittest.TestCase):
         self.assertEqual(res["candidates"], 1)
         self.assertEqual(len(res["failed"]), 1)
         ac.summarise([res])
+
+
+class UnfinishedChecksAreNotGreenTests(unittest.TestCase):
+    """2026-08-25. `_OK_CHECK` contained None and "", so a CheckRun that had not
+    finished read as a passing check and the PR was MERGED with its CI still
+    running. Reproduced against the real `gh pr list --json statusCheckRollup`
+    shape: an unfinished CheckRun reports `conclusion: ""` and carries no
+    `state` key at all, so `c.get("conclusion") or c.get("state")` was None.
+
+    "Never ran" is not "passed". This is the same class of defect as the build
+    gate's tri-state `final_ok is None`."""
+
+    _IN_PROGRESS = {"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS",
+                    "conclusion": "", "startedAt": "2026-08-26T02:40:29Z",
+                    "completedAt": "", "workflowName": "CI"}
+    _QUEUED = {"__typename": "CheckRun", "name": "build", "status": "QUEUED",
+               "conclusion": "", "startedAt": "", "completedAt": "",
+               "workflowName": "CI"}
+
+    def test_unfinished_check_runs_block_and_are_named_NOT_RUN(self):
+        blocking = ac._pr_blocking_checks(
+            {"statusCheckRollup": [self._IN_PROGRESS, self._QUEUED]})
+        self.assertEqual(blocking, ["test=NOT RUN (IN_PROGRESS)",
+                                    "build=NOT RUN (QUEUED)"])
+
+    def test_a_pr_whose_ci_is_still_running_is_NOT_merged(self):
+        prs = [{"number": 42, "isDraft": False, "mergeable": "MERGEABLE",
+                "statusCheckRollup": [self._IN_PROGRESS, self._QUEUED]}]
+        merged = []
+
+        def fake_run(cmd, cwd, timeout=ac.TIMEOUT_S):
+            merged.append(cmd)
+            return 0, "merged"
+
+        orig = ac._gh_json
+        ac._gh_json = lambda args, cwd, run=None: (prs, "")
+        try:
+            res = ac.land_open_prs("/nonexistent", repo="o/r", run=fake_run)
+        finally:
+            ac._gh_json = orig
+        self.assertEqual(merged, [], "a merge was issued while CI was unfinished")
+        self.assertEqual(res["acted_on"], [])
+        self.assertIn("NOT RUN", res["skipped"][0]["reason"])
+        ac.summarise([res])
+
+    def test_a_completed_check_that_reported_no_conclusion_is_not_green(self):
+        """The status guard and the conclusion guard are SEPARATE defences. A
+        check GitHub marks COMPLETED while reporting no conclusion has still
+        produced no verdict, and only this second guard catches it - which the
+        mutation harness proved by leaving the first one intact."""
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+             "conclusion": ""}]})
+        self.assertEqual(blocking, ["test=NOT RUN (no conclusion reported)"])
+
+    def test_a_check_run_with_neither_status_nor_conclusion_is_not_green(self):
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "ghost", "conclusion": ""}]})
+        self.assertEqual(blocking, ["ghost=NOT RUN (no conclusion reported)"])
+
+    def test_a_pending_status_context_blocks(self):
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "Vercel", "state": "PENDING"}]})
+        self.assertEqual(blocking, ["Vercel=PENDING"])
+
+    def test_a_status_context_with_no_state_is_not_silently_green(self):
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "CodeRabbit"}]})
+        self.assertEqual(blocking, ["CodeRabbit=NOT RUN (no state reported)"])
+
+
+class CiNeverRanIsNotACodeFailureTests(unittest.TestCase):
+    """An account-wide GitHub Actions billing halt fails every workflow job in
+    about two seconds having executed zero steps. Reported as an ordinary check
+    failure it reads as "your code broke CI", which is false and sends whoever
+    reads it to debug code that was never compiled.
+
+    Measured shape: buckeye7066/GrantFlow PR #1401, 2026-08-26 - 11 FAILURE
+    jobs, every one 2-3 seconds.
+
+    Duration NEVER changes the VERDICT: a red check blocks either way. It only
+    changes the reason text."""
+
+    _START = "2026-08-26T02:40:29Z"
+
+    @classmethod
+    def _job(cls, name, conclusion, seconds):
+        # Carry properly. A naive "%02d" % (29 + seconds) produced "02:40:69Z",
+        # which strptime rejects, which made _check_seconds return None, which
+        # silently disarmed the very assertion the fixture existed to make. The
+        # mutation harness caught it; a passing test did not.
+        start = _dt.datetime.strptime(cls._START, "%Y-%m-%dT%H:%M:%SZ")
+        end = start + _dt.timedelta(seconds=seconds)
+        return {"__typename": "CheckRun", "name": name, "status": "COMPLETED",
+                "conclusion": conclusion, "startedAt": cls._START,
+                "completedAt": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "workflowName": "CI"}
+
+    def test_the_fixture_really_produces_the_durations_it_claims(self):
+        """The fixture is load-bearing: if it emits an unparseable timestamp,
+        every duration reads as None and the never-ran tests pass vacuously."""
+        self.assertEqual(ac._check_seconds(self._job("x", "FAILURE", 2)), 2.0)
+        self.assertEqual(ac._check_seconds(self._job("x", "FAILURE", 40)), 40.0)
+
+    def test_whole_rollup_failing_in_seconds_is_reported_as_never_ran(self):
+        rollup = [self._job("test", "FAILURE", 2), self._job("lint", "FAILURE", 2)]
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": rollup})
+        self.assertTrue(all("CI NEVER RAN" in b for b in blocking), blocking)
+        self.assertTrue(all("NOT a code failure" in b for b in blocking), blocking)
+
+    def test_never_ran_still_blocks_the_merge(self):
+        prs = [{"number": 5, "isDraft": False, "mergeable": "MERGEABLE",
+                "statusCheckRollup": [self._job("test", "FAILURE", 2),
+                                      self._job("lint", "FAILURE", 2)]}]
+        merged = []
+        orig = ac._gh_json
+        ac._gh_json = lambda args, cwd, run=None: (prs, "")
+        try:
+            res = ac.land_open_prs(
+                "/nonexistent", repo="o/r",
+                run=lambda cmd, cwd, timeout=ac.TIMEOUT_S: (merged.append(cmd), (0, "m"))[1])
+        finally:
+            ac._gh_json = orig
+        self.assertEqual(merged, [], "a never-ran CI must never be merged through")
+        self.assertEqual(res["acted_on"], [])
+
+    def test_one_genuinely_fast_failure_is_still_a_real_failure(self):
+        """A lint that legitimately fails in two seconds while a real test job
+        fails in four minutes is NOT a billing halt. The claim needs the WHOLE
+        rollup, or it slanders real red builds as infrastructure."""
+        rollup = [self._job("lint", "FAILURE", 2), self._job("test", "FAILURE", 40)]
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": rollup})
+        self.assertEqual(blocking, ["lint=FAILURE", "test=FAILURE"])
+
+    def test_a_single_fast_failure_alone_is_not_enough_evidence(self):
+        blocking = ac._pr_blocking_checks(
+            {"statusCheckRollup": [self._job("lint", "FAILURE", 2)]})
+        self.assertEqual(blocking, ["lint=FAILURE"])
+
+    def test_failures_without_timestamps_are_never_called_never_ran(self):
+        blocking = ac._pr_blocking_checks({"statusCheckRollup": [
+            {"name": "ci", "conclusion": "FAILURE"},
+            {"name": "cd", "conclusion": "FAILURE"}]})
+        self.assertEqual(blocking, ["ci=FAILURE", "cd=FAILURE"])
 
 
 class ReportingStepsTests(unittest.TestCase):
