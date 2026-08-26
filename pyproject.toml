@@ -49,6 +49,7 @@ py-modules = [
   "flexfactor_prodready",
   "flexfactor_prodready_engine",
   "flexfactor_prodready_persist",
+  "flexfactor_product_invariants",
   "flexfactor_purpose",
   "flexfactor_release_policy",
   "flexfactor_rotation",

@@ -142,10 +142,12 @@ except ImportError:
 try:
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
+    import flexfactor_product_invariants as _ff_product_invariants
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_ledger as _ff_ledger
     import flexfactor_coverage as _ff_coverage
+    import flexfactor_product_invariants as _ff_product_invariants
 
 # Scout production bridge (94-100): separate risk model / report schema,
 # metadata-screened-only contract, SHA pin, sandbox eval, proposal gate.
@@ -8088,7 +8090,9 @@ TEST_GEN_SCHEMA = {
 }
 
 
-def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") -> dict:
+def _gen_unit_tests(author, rel: str, text: str, test_cmd: list,
+                    pfx: str = "",
+                    required_capabilities: list[dict] | None = None) -> dict:
     """Generate unit tests for ONE module, with one bounded budget retry.
 
     Live Family Castle Clash 2026-08-14: large modules (server/index.js,
@@ -8100,8 +8104,37 @@ def _gen_unit_tests(author, rel: str, text: str, test_cmd: list, pfx: str = "") 
     the most critical functions, so the largest modules get their most
     important tests instead of none at all. Any other failure, and a second
     budget failure, still raise (the caller records the [skip])."""
+    capability_prompt = ""
+    if required_capabilities:
+        capability_rows = []
+        for capability in required_capabilities:
+            capability_id = str(capability.get("capability_id") or "").strip()
+            if not capability_id:
+                continue
+            capability_rows.append({
+                "capability_id": capability_id,
+                "marker": f"FLEXFACTOR_CAPABILITY:{capability_id}",
+                "title": str(capability.get("title") or ""),
+                "behavior": str(capability.get("behavior") or ""),
+                "verification_plan": str(capability.get("verification_plan") or ""),
+            })
+        if capability_rows:
+            capability_prompt = (
+                "\n\nREQUIRED COMPETITOR CAPABILITY REGRESSIONS:\n"
+                "For EACH row below, write a distinct executable regression test "
+                "that proves the described behavior and follows its verification "
+                "plan. Put that row's exact FLEXFACTOR_CAPABILITY marker in the "
+                "test name when the framework permits it, or in a comment directly "
+                "adjacent to that test. A marker without executable assertions is "
+                "invalid, and one capability's test cannot certify another.\n"
+                + _fence_untrusted(
+                    "capability-regressions",
+                    json.dumps(capability_rows, sort_keys=True),
+                )
+            )
     prompt = (f"MODULE: {rel}\nTest framework command: {' '.join(test_cmd)}\n\n"
               "SOURCE:\n" + _fence_untrusted("source", text)
+              + capability_prompt
               + "\n\nWrite runnable unit tests for this module's functions.")
     try:
         return author.structured(UNIT_TEST_SYSTEM, prompt, TEST_GEN_SCHEMA,
@@ -14729,6 +14762,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         fix_notes += notes_c
                         bridged_early = sorted(set(bridged_early) | set(applied_c))
                         competitor_research["applied_files"] = sorted(set(applied_c))
+                        competitor_research["unverified_files"] = sorted(set(unver_c))
                         if git and applied_c:
                             s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                                  "competitor-derived improvements (phase 1b)",
@@ -15425,7 +15459,26 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # the tree and hid the native failures behind it.  Unchanged code is
         # covered by native-suite/import-path evidence; changed behavior without
         # such evidence is targeted here and remains blocked by the final ledger.
+        competitor_capabilities_by_source: dict[str, list[dict]] = {}
+        for _cap_index, _competitor in enumerate(
+                (competitor_research or {}).get("competitors") or []):
+            _idea = _competitor.get("idea") or {}
+            _capability_id = _ff_product_invariants.competitor_capability_id(
+                _competitor, _cap_index)
+            _competitor["capability_id"] = _capability_id
+            _target = str(_idea.get("file") or "").replace("\\", "/")
+            if (_idea.get("accept") is True
+                    and _competitor.get("entered_fix_stream") is True
+                    and _target):
+                competitor_capabilities_by_source.setdefault(_target, []).append({
+                    "capability_id": _capability_id,
+                    "title": str(_idea.get("idea_title") or ""),
+                    "behavior": str(_idea.get("what_it_does") or ""),
+                    "verification_plan": str(_idea.get("verification_plan") or ""),
+                })
         test_files: list[str] = []
+        tests_by_source: dict[str, list[str]] = {}
+        tests_by_capability: dict[str, list[str]] = {}
         test_status = None
         if (args.tests and stack.get("test_cmd") and not dirty_abort
                 and not infrastructure_abort):
@@ -15460,8 +15513,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     continue
                 if read_status == "empty":
                     continue  # a GENUINELY empty module -> nothing to test-gen, skip quietly
+                _required_capabilities = competitor_capabilities_by_source.get(
+                    rel.replace("\\", "/"), [])
                 try:
-                    gen = _gen_unit_tests(author, rel, text, stack["test_cmd"], pfx=pfx)
+                    gen = _gen_unit_tests(
+                        author, rel, text, stack["test_cmd"], pfx=pfx,
+                        required_capabilities=_required_capabilities)
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     manual_review.add(rel)
@@ -15489,7 +15546,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
                         manual_review.add(rel)
                         continue
-                    test_files.append(os.path.relpath(written, project_dir))
+                    _test_rel = os.path.relpath(written, project_dir).replace("\\", "/")
+                    test_files.append(_test_rel)
+                    tests_by_source.setdefault(rel.replace("\\", "/"), []).append(_test_rel)
+                    _capability_test_evidence = (
+                        _ff_product_invariants.collect_capability_test_evidence(
+                            test_path=_test_rel,
+                            contents=str(f.get("contents") or ""),
+                            required_capabilities=_required_capabilities,
+                        )
+                    )
+                    for _capability_id, _paths in _capability_test_evidence.items():
+                        tests_by_capability.setdefault(
+                            _capability_id, []).extend(_paths)
             if test_files:
                 ok, log = _run_unit_tests(project_dir, stack)
                 test_status = ok
@@ -15526,6 +15595,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             f"rejected and removed {len(rejected)} generated test "
                             "file(s) after the native test command failed")
                         test_files = []
+                        tests_by_source = {}
+                        tests_by_capability = {}
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
@@ -15924,6 +15995,75 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             converged = False
             stop_reason = "deterministic code-intelligence runtime unavailable"
 
+        # 7.6 PRODUCT INVARIANTS. Purpose is the authority; competitor research
+        # is a bounded, provenance-aware gap analysis, never a roadmap-copying
+        # mandate. Selected capabilities only count after the target changed and
+        # the repository's executable suite verified the result.
+        _verification_passed = bool(
+            suite_status is True
+            and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+        )
+        _competitor_applied = set(
+            (competitor_research or {}).get("applied_files") or []
+        )
+        _competitor_unverified = set(
+            (competitor_research or {}).get("unverified_files") or []
+        )
+        competitor_research = _ff_product_invariants.stamp_competitor_implementation(
+            competitor_research=competitor_research,
+            applied_files=_competitor_applied,
+            unverified_files=_competitor_unverified,
+            test_files=test_files,
+            tests_by_source=tests_by_source,
+            tests_by_capability=tests_by_capability,
+            verification_passed=_verification_passed,
+        )
+
+        _contract_evidence = dict(result.get("purpose_contract") or {})
+        _contract_evidence["authored"] = bool(
+            purpose_contract is not None
+            and getattr(purpose_contract, "authored", False)
+        )
+        product_invariants = _ff_product_invariants.evaluate_product_invariants(
+            purpose_enabled=bool(getattr(args, "purpose_gap", True)),
+            purpose_contract=_contract_evidence,
+            purpose_confidence=purpose_confidence,
+            purpose_before=purpose_before,
+            purpose_after=purpose_gap,
+            purpose_errors=purpose_assessment_errors,
+            competitors_enabled=bool(getattr(args, "competitors", True)),
+            competitor_research=competitor_research,
+            competitor_target=max(
+                1, int(getattr(args, "competitor_count", 5) or 5)),
+            applied_files=_competitor_applied,
+            test_files=test_files,
+            verification_passed=_verification_passed,
+            license_compatible=_license_compatible,
+        )
+        if not product_invariants.get("ready"):
+            converged = False
+            _open_invariants = [
+                str(gate.get("id") or "unknown")
+                for gate in product_invariants.get("blockers") or []
+            ]
+            _invariant_reason = (
+                "purpose/competitive product invariants remain open: "
+                + "; ".join(_open_invariants)
+            )
+            if stop_reason and stop_reason != "converged: found == fixed":
+                stop_reason += "; additionally, " + _invariant_reason
+            else:
+                stop_reason = _invariant_reason
+            for _gate in product_invariants.get("blockers") or []:
+                all_findings.append({
+                    "file": "(product invariants)", "line": 0,
+                    "severity": "high", "category": "product-purpose",
+                    "title": str(_gate.get("id") or "Product invariant failed"),
+                    "problem": str(_gate.get("evidence") or "Required evidence is missing."),
+                    "fix": str(_gate.get("remediation") or
+                               "Complete the invariant with executable evidence."),
+                })
+
         print(f"{pfx}Git: {commit_status}")
         suite_txt = ("GREEN" if suite_status else "RED" if suite_status is False else "not run")
         print(f"{pfx}Outcome: {stop_reason} | full suite: {suite_txt} | "
@@ -15971,6 +16111,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "purpose_assessment_errors": list(purpose_assessment_errors),
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
+            "product_invariants": product_invariants,
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
@@ -16064,6 +16205,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_fulfillment_pct=(purpose_gap or {}).get("fulfillment_pct"),
             purpose_gaps=len((purpose_gap or {}).get("gaps") or []),
             purpose_bridged=len(bridged_files),
+            product_invariants_ready=product_invariants.get("ready") is True,
+            product_invariant_blockers=len(product_invariants.get("blockers") or []),
             review_incomplete=len(all_review_incomplete),
             # The accounting identity travels with the RESULT, not just the
             # report, because `_audit_exit_code` is the layer supervisors read.
@@ -16112,6 +16255,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         run_complete = (converged
                         and suite_status is not False
                         and (readiness is None or readiness.get("ready") is not False)
+                        and product_invariants.get("ready") is True
                         and ((evidence or {}).get("quality_gates") or {}).get("passed") is True)
         if evidence_ledger is not None:
             with contextlib.suppress(Exception):
@@ -16185,6 +16329,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                              "controls_executed": _cov.get("executed_control_total", 0)},
                 "purpose_confidence": result.get("purpose_confidence"),
                 "purpose_mutation_authorized": result.get("purpose_mutation_authorized"),
+                "product_invariants": {
+                    "ready": product_invariants.get("ready") is True,
+                    "blockers": [gate.get("id")
+                                 for gate in product_invariants.get("blockers") or []],
+                },
                 # The FULL claim, never a slice. A 160-character cut landed
                 # mid-word at "raw-socket e" and deleted the only sentence that
                 # said the network is NOT contained (i-5: an unenforceable
@@ -16598,6 +16747,13 @@ def _release_status(a: dict) -> tuple[str | None, list[str]]:
     blocked = None
     if a.get("error"):
         blocked = str(a["error"])
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants.get("ready") is not True:
+        ids = [str(gate.get("id") or "unknown")
+               for gate in product_invariants.get("blockers") or []]
+        invariant_block = ("purpose/competitive product invariants are not satisfied"
+                           + (": " + ", ".join(ids) if ids else ""))
+        blocked = f"{blocked}; {invariant_block}" if blocked else invariant_block
     return fp.production_ready_status(evidence, has_open_gaps=bool(gaps),
                                       blocked_reason=blocked)
 
@@ -16649,6 +16805,11 @@ def _print_audit_summary(a: dict) -> None:
               f"{prog.get('gaps_before', 0)}; "
               f"{prog.get('criteria_blocked_after', 0)} acceptance criterion(s) "
               "still blocked")
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants:
+        print(f"  product invariants: "
+              f"{'PASS' if product_invariants.get('ready') else 'BLOCKED'} "
+              f"({len(product_invariants.get('blockers') or [])} blocker(s))")
     status, unmet = _release_status(a)
     if status:
         print(f"  release status:   {status}"
@@ -16744,6 +16905,7 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "purpose_criteria_noise_band": (a.get("purpose_gap") or {}).get("criteria_noise_band"),
         "criteria_closed": a.get("criteria_closed"),
         "criteria_movement_is_real": a.get("criteria_movement_is_real"),
+        "product_invariants": a.get("product_invariants") or {},
         "release_status": _release_status(a)[0],
         "release_status_unmet": _release_status(a)[1],
         "paid_rescue": paid_rescue_stats(),
@@ -16907,6 +17069,21 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                 if b.get("remediation"):
                     L.append(f"  - Fix: {b['remediation']}")
             L.append("")
+
+    product_invariants = a.get("product_invariants") or {}
+    if product_invariants:
+        L += ["## Purpose and competitive-fit invariant", "",
+              f"**{'PASS' if product_invariants.get('ready') else 'BLOCKED'}** — "
+              f"{len(product_invariants.get('blockers') or [])} blocker(s).", ""]
+        for gate in product_invariants.get("gates") or []:
+            L.append(
+                f"- **{gate.get('id')}**: "
+                f"{'pass' if gate.get('passed') else 'BLOCKED'} — "
+                f"{gate.get('evidence', '')}"
+            )
+            if not gate.get("passed") and gate.get("remediation"):
+                L.append(f"  - Fix: {gate['remediation']}")
+        L.append("")
 
     # Competitor research. Absence is reported explicitly: a missing section
     # would read as "this program has no competitors", which is never what a
@@ -17903,7 +18080,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_runstate", "flexfactor_evidence", "flexfactor_purpose",
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
-                 "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
+                 "flexfactor_product_invariants", "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
                  "flexfactor_errors",
                  "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",
@@ -17920,6 +18097,12 @@ def runtime_manifest() -> dict:
         "egress": _egress.__name__ == "flexfactor_egress",
         "directed": _ff_directed.__name__ == "flexfactor_directed"
                     and _unfit_for_code_reason is _ff_directed.unfit_for_code_reason,
+        "product_invariants": (
+            _ff_product_invariants.__name__ == "flexfactor_product_invariants"
+            and callable(_ff_product_invariants.evaluate_product_invariants)
+            and callable(_ff_product_invariants.stamp_competitor_implementation)
+            and callable(_ff_product_invariants.collect_capability_test_evidence)
+        ),
     }
     for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
         fn = globals().get("_WIRED_" + hook.upper())
