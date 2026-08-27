@@ -7994,6 +7994,45 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
+# --------------------------------------------------------------------------- #
+# NON-CODE VERDICTS (owner order 2026-08-25)
+#
+# THE CASE THAT FORCED THIS.  A live GrantFlow complaint ("can't log in") had
+# two root causes.  The first was not code at all: the user's session was the
+# Facebook in-app browser (user_agent contains FB_IAB), which drops a
+# sameSite:strict refresh cookie, so she was bounced every 3 hours - proven by
+# comparing refresh-rotation counts per client in prod (0 vs 10).  NO CODE WAS
+# WRONG.  Every category FlexFactor could emit was a CODE category, so its only
+# possible output was a patch - and a tool that can only emit patches will
+# INVENT one.
+#
+# A finding in one of these categories, or carrying evidence_source
+# 'runtime-data', is REPORTED TO THE OWNER AS A BRIEF and never enters the fix
+# pipeline.  The refusal lives in `should_fix_finding`, the single chokepoint
+# every fix path already crosses, so no future call site can bypass it.
+NON_CODE_FINDING_CATEGORIES = frozenset({
+    "data",           # the stored rows are wrong / missing / mass-mutated
+    "environment",    # deployment or platform: region, proxy, TLS, clock, limits
+    "client",         # the user's browser/app/device: in-app webview, cookies
+    "configuration",  # a setting/flag/env var the system does not handle
+})
+FINDING_EVIDENCE_SOURCES = ("code", "runtime-data")
+
+
+def finding_is_non_code(finding: dict) -> bool:
+    """True when this finding's root cause is NOT in the source code.
+
+    Either signal is sufficient and they are deliberately OR-ed: a model that
+    picks the category but forgets the discriminator (or the reverse) still gets
+    the safe answer, because the failure mode being prevented is a non-code
+    conclusion silently acquiring a patch.
+    """
+    if not isinstance(finding, dict):
+        return False
+    category = str(finding.get("category") or "").strip().lower()
+    source = str(finding.get("evidence_source") or "").strip().lower()
+    return category in NON_CODE_FINDING_CATEGORIES or source == "runtime-data"
+
 # One file's worth of line-by-line findings.
 AUDIT_FINDINGS_SCHEMA = {
     "type": "object",
@@ -8024,7 +8063,21 @@ AUDIT_FINDINGS_SCHEMA = {
                                      "that don't occur on real inputs are AT MOST low (usually info) - "
                                      "NEVER high or critical. When unsure between two levels, pick the LOWER.")},
                     "category": {"type": "string",
-                                 "description": "bug|security|error-handling|edge-case|concurrency|performance|correctness|dead-code|a11y|style"},
+                                 "description": (
+                                     "CODE verdicts (a patch can resolve them): bug|security|"
+                                     "error-handling|edge-case|concurrency|performance|correctness|"
+                                     "dead-code|a11y|style.\n"
+                                     "NON-CODE verdicts (NO code is wrong; a patch would be an "
+                                     "INVENTION): data|environment|client|configuration. Use one of "
+                                     "these ONLY with evidence_source='runtime-data' - a source file "
+                                     "read line by line cannot prove one.")},
+                    "evidence_source": {"type": "string",
+                                        "enum": ["code", "runtime-data"],
+                                        "description": (
+                                            "'code' = the defect is proven by the source text you "
+                                            "were shown; this is ALWAYS the answer when reviewing a "
+                                            "file. 'runtime-data' = proven by observed live data or "
+                                            "environment state, never by reading source.")},
                     "title": {"type": "string", "description": "Short defect title."},
                     "problem": {"type": "string", "description": "Exactly what is wrong and how it manifests."},
                     "fix": {"type": "string", "description": "The concrete change that resolves it."},
@@ -8032,7 +8085,8 @@ AUDIT_FINDINGS_SCHEMA = {
                     "trigger": {"type": "string", "description": "A concrete reachable input or execution path that triggers the defect."},
                     "observable_failure": {"type": "string", "description": "The externally observable wrong result, crash, leak, or security consequence."},
                 },
-                "required": ["line", "severity", "category", "title", "problem", "fix",
+                "required": ["line", "severity", "category", "evidence_source",
+                             "title", "problem", "fix",
                              "source_excerpt", "trigger", "observable_failure"],
                 "additionalProperties": False,
             },
@@ -8264,12 +8318,15 @@ AUDIT_SYSTEM = (
     "{\"findings\": [{\"line\": <integer, 1-based line the defect starts on (0 if "
     "file-wide)>, \"severity\": \"critical\"|\"high\"|\"medium\"|\"low\"|\"info\", "
     "\"category\": \"bug\"|\"security\"|\"error-handling\"|\"edge-case\"|\"concurrency\"|"
-    "\"performance\"|\"correctness\"|\"dead-code\"|\"a11y\"|\"style\", \"title\": <short "
+    "\"performance\"|\"correctness\"|\"dead-code\"|\"a11y\"|\"style\", "
+    "\"evidence_source\": \"code\" (a file review is always \"code\": a source file "
+    "cannot prove a data/environment/client/configuration cause), \"title\": <short "
     "defect title>, \"problem\": <exactly what is wrong and how it manifests>, \"fix\": "
     "<the concrete change that resolves it>, \"source_excerpt\": <exact verbatim source>, "
     "\"trigger\": <reachable execution path>, \"observable_failure\": <observable bad "
     "result>}], \"summary\": <one sentence on the file's overall health>}. EVERY finding "
-    "object MUST contain all nine keys - line, severity, category, title, problem, fix, "
+    "object MUST contain all ten keys - line, severity, category, evidence_source, "
+    "title, problem, fix, "
     "source_excerpt, trigger, observable_failure - with non-empty string values (line is "
     "an integer). "
     "If the file is genuinely clean, return {\"findings\": [], \"summary\": \"...\"}. "
@@ -9420,6 +9477,12 @@ def _enrich_stack_with_toolchains(project_dir: str, info: dict) -> None:
 # 'high'/'critical' to touch only the scariest defects.
 # --------------------------------------------------------------------------- #
 def should_fix_finding(finding: dict, min_severity: str) -> bool:
+    # A NON-CODE FINDING NEVER BECOMES A PATCH (owner order 2026-08-25).
+    # This is the single chokepoint every fix path crosses, so refusing here is
+    # what makes "reported, never auto-applied" a property of the code rather
+    # than a habit. See finding_is_non_code for why the distinction exists.
+    if finding_is_non_code(finding):
+        return False
     rank = SEVERITY_RANK.get(str(finding.get("severity", "")).lower(), 0)
     floor = max(1, SEVERITY_RANK.get(min_severity.lower(), 1))  # never below 'low'
     return rank >= floor
@@ -9502,6 +9565,21 @@ def _normalize_finding(f: dict) -> dict:
         f["fix"] = cand or ("See problem description." if (blob or _has("problem")) else "")
     if not _has("category"):
         f["category"] = "uncategorized"
+    # evidence_source is REQUIRED by the schema but must never be load-bearing on
+    # a model remembering to emit it. A finding produced by reading a file is a
+    # CODE finding; anything else has to say so explicitly. Defaulting to 'code'
+    # here fails SAFE: the wrong default would let an omission turn a code defect
+    # into an unfixable "brief".
+    source = str(f.get("evidence_source") or "").strip().lower()
+    if source not in FINDING_EVIDENCE_SOURCES:
+        source = "code"
+    f["evidence_source"] = source
+    # A non-code finding carries the gap shape (code_fixable=false + next_step)
+    # so the report renders an owner ACTION, not a pretend code edit.
+    if finding_is_non_code(f):
+        f["code_fixable"] = False
+        if not _has("next_step"):
+            f["next_step"] = f.get("fix") or ""
     return f
 
 
@@ -9975,6 +10053,20 @@ def _competitors_module():
         import flexfactor_competitors as _fc
         _fc.set_license_oracle(_license_compatible)
         return _fc
+    except Exception:
+        return None
+
+
+def _prodevidence_module():
+    """Lazy import of flexfactor_prodevidence (read-only production evidence).
+
+    A missing module is a NAMED skip in the report, never a silent absence -
+    the whole point of the subsystem is that "we could not look" and "we looked
+    and found nothing" are different sentences.
+    """
+    try:
+        import flexfactor_prodevidence as _pe
+        return _pe
     except Exception:
         return None
 
@@ -11818,6 +11910,14 @@ def _residual_is_material(r: dict) -> bool:
     'residuals' ('returns None is not ideal', NaN-validation wishes) that named no
     failing case - those are suggestions, not defects. A residual missing ALL
     classification keys stays MATERIAL (fail-safe for malformed/legacy verdicts)."""
+    # A NON-CODE residual is never MATERIAL to a code fix. The adversarial
+    # verifier feeds material residuals back to the author as new fix targets;
+    # a residual whose root cause is data/environment/client/configuration has
+    # no in-file edit that resolves it, so treating it as material would burn
+    # rounds and end in an invented patch. It is not dropped: the caller
+    # documents every residual, material or not, in the report notes.
+    if finding_is_non_code(r):
+        return False
     if ("realistic_input" not in r and "affects_core" not in r
             and "repro" not in r):
         return True
@@ -14566,6 +14666,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # says which, because a silent absence reads as "no competitors exist".
         competitor_research: dict | None = None
         competitor_bridged_findings: list[dict] = []
+        # Phase 1c. None is never a valid end state: the phase always writes a
+        # record, because "unavailable" has to be a printed verdict rather than
+        # an absence that reads as a clean data bill of health.
+        runtime_evidence: dict | None = None
+        runtime_evidence_findings: list[dict] = []
         if getattr(args, "purpose_gap", True) and purpose_blob:
             report(phase="purpose gap (baseline)")
             if checkpoint is not None:
@@ -14850,6 +14955,67 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}competitor research SKIPPED: "
                   + ("cost cap reached" if meter.over_limit() else "run aborted earlier"))
         # ================== END PHASE 1b ======================================
+
+        # ================== PHASE 1c - RUNTIME-DATA EVIDENCE ==================
+        # Owner order 2026-08-25. Reading source can only ever produce a CODE
+        # verdict. The motivating case had none: a Facebook in-app browser
+        # dropping a sameSite:strict refresh cookie bounced a real user every 3
+        # hours, provable ONLY by querying prod `user_sessions` and comparing
+        # refresh-rotation counts per client. So: introspect the live schema
+        # FIRST (never guess a column name), run guarded read-only SELECTs, and
+        # turn what the ROWS demonstrate into NON-CODE findings that go to the
+        # owner as a brief - never into a patch.
+        #
+        # Authority is NOT widened to get here: `railway` remains a blocked
+        # deploy exe in flexfactor_cmdpolicy and no process is launched. The
+        # connection string comes from FLEXFACTOR_READONLY_DATABASE_URL, which
+        # the owner sets. Absent -> the phase reports UNAVAILABLE and says so.
+        _pe = _prodevidence_module()
+        if _pe is None:
+            runtime_evidence = {
+                "available": False, "driver": None, "tables": 0,
+                "queries": [], "rejected": [], "findings": [],
+                "errors": ["flexfactor_prodevidence could not be imported"],
+                "reason": "flexfactor_prodevidence module could not be imported - "
+                          "no read path to production data was attempted"}
+            print(f"{pfx}runtime-data evidence UNAVAILABLE: "
+                  f"{runtime_evidence['reason']}")
+        else:
+            report(phase="runtime-data evidence")
+            if checkpoint is not None:
+                checkpoint.set_phase("runtime-data evidence")
+            try:
+                runtime_evidence = _pe.collect_runtime_evidence(
+                    lambda system, prompt, schema: _judge(
+                        purpose_reviewer, system, prompt, schema),
+                    purpose_blob or f"Program: {display_name}",
+                    log=lambda m: print(f"{pfx}PHASE 1c - {m}"))
+            except BudgetExceededError:
+                runtime_evidence = {
+                    "available": False, "driver": None, "tables": 0,
+                    "queries": [], "rejected": [], "findings": [],
+                    "errors": ["cost cap reached"],
+                    "reason": "runtime-data evidence stopped at the cost cap - "
+                              "production data was NOT examined"}
+                print(f"{pfx}runtime-data evidence stopped at the cost cap")
+            except Exception as ex:   # never abort an audit over evidence gathering
+                runtime_evidence = {
+                    "available": False, "driver": None, "tables": 0,
+                    "queries": [], "rejected": [], "findings": [],
+                    "errors": [f"{type(ex).__name__}: {ex}"],
+                    "reason": f"runtime-data evidence failed: {type(ex).__name__}: "
+                              f"{ex} - production data was NOT examined"}
+                print(f"{pfx}runtime-data evidence failed (non-fatal): {ex}")
+            for _rf in _pe.runtime_findings(runtime_evidence):
+                # Merged into the finding record AFTER the cycle loop (the loop
+                # reassigns all_findings wholesale), exactly like the phase-1b
+                # competitor findings. should_fix_finding refuses every one of
+                # them, so none can reach the fixer.
+                runtime_evidence_findings.append(_normalize_finding(_rf))
+            if runtime_evidence_findings:
+                print(f"{pfx}PHASE 1c - {len(runtime_evidence_findings)} NON-CODE "
+                      "finding(s) from live data; reported to the owner, never patched")
+        # ================== END PHASE 1c ======================================
 
         if purpose_files and not dirty_abort:
             # Purpose-critical files lead the sweep, so even a run that stops at
@@ -15290,6 +15456,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # each cycle's review output, so anything appended earlier is discarded.
         if competitor_bridged_findings:
             all_findings = list(all_findings) + competitor_bridged_findings
+
+        # Phase 1c NON-CODE findings join the record here for the same reason.
+        # They are deliberately NOT added to file_findings: that map drives the
+        # per-file fix/report machinery and a runtime-data verdict has no file.
+        if runtime_evidence_findings:
+            all_findings = list(all_findings) + runtime_evidence_findings
 
         # 4b. PURPOSE GAP: infer what this program was created FOR from its own
         #     metadata and measure the distance between that purpose and what the
@@ -16197,6 +16369,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
             "product_invariants": product_invariants,
+            "runtime_evidence": runtime_evidence,
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
@@ -17365,9 +17538,63 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     floor = SEVERITY_RANK.get(str(a.get("fix_severity", "high")).lower(), 3)
     applied = set(a.get("applied_files") or [])
     unresolved = set(a.get("unresolved_files") or [])
+    # RUNTIME-DATA EVIDENCE: what was actually read from production, or the
+    # NAMED reason nothing was. Printed unconditionally and BEFORE the brief:
+    # "no data findings" and "no read path to look" are opposite statements and
+    # must never render identically.
+    _re = a.get("runtime_evidence")
+    if _re is not None:
+        L += ["## Runtime-data evidence (read-only production)", ""]
+        if not _re.get("available"):
+            L += [f"**UNAVAILABLE** - {_re.get('reason')}", "",
+                  "_This is NOT a clean data bill of health: no data-shaped or "
+                  "environment-shaped root cause could be looked for._", ""]
+        else:
+            L += [f"- Driver: `{_re.get('driver')}`; "
+                  f"{_re.get('tables', 0)} table(s) introspected from "
+                  "`information_schema.columns` BEFORE any query was written.",
+                  f"- Probes executed: {len(_re.get('queries') or [])}; "
+                  f"rejected before execution: {len(_re.get('rejected') or [])}.", ""]
+            for q in _re.get("queries") or []:
+                L.append(f"  - `{q.get('name')}` ({q.get('row_count')} row(s)) - "
+                         f"{q.get('question')}")
+            for r in _re.get("rejected") or []:
+                L.append(f"  - REJECTED `{r.get('name')}`: {r.get('reason')}")
+            for e in _re.get("errors") or []:
+                L.append(f"  - ERROR: {e}")
+            L.append("")
+
+    # THE OWNER BRIEF for non-code root causes (owner order 2026-08-25). These
+    # findings are NEVER patched (should_fix_finding refuses them), so if they
+    # were not printed HERE they would vanish - the exact silent-drop this
+    # section exists to prevent. The runtime-evidence section below states
+    # separately whether the capability could run at all, so an empty brief is
+    # never readable as "no data problems found".
+    non_code = [f for f in a["findings"] if finding_is_non_code(f)]
+    if non_code:
+        L += ["## Non-code root causes - OWNER BRIEF (never auto-applied)", "",
+              "_No code is wrong in these. A patch would be an invention, so "
+              "FlexFactor reports them and stops. Each names the evidence it "
+              "rests on and the concrete non-code action that resolves it._", ""]
+        for f in sorted(non_code, key=lambda x: -SEVERITY_RANK.get(
+                str(x.get("severity")).lower(), 0)):
+            L.append(f"- **[{f.get('severity')}] {f.get('category')}** "
+                     f"(evidence: {f.get('evidence_source', 'runtime-data')}"
+                     + (f", probe `{f.get('query_name')}`" if f.get("query_name") else "")
+                     + f") - **{f.get('title')}**: {f.get('problem')}")
+            if f.get("evidence"):
+                L.append(f"  - Evidence: {f.get('evidence')}")
+            L.append(f"  - Next step (owner): {f.get('next_step') or f.get('fix') or '(none given)'}")
+        L.append("")
+
     remaining: dict[str, list[dict]] = {}
     for f in a["findings"]:
         if f.get("file") in ("(e2e)", "(unit tests)", "(full suite)", "(readiness)"):
+            continue
+        # Already rendered in the owner brief above, and structurally unfixable
+        # by a patch - listing it as a "defect not auto-fixed" would read as a
+        # code backlog item.
+        if finding_is_non_code(f):
             continue
         rank = SEVERITY_RANK.get(str(f.get("severity")).lower(), 0)
         below_floor = rank < floor
@@ -18173,6 +18400,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_trust", "flexfactor_partial", "flexfactor_wip",
                  "flexfactor_runstate", "flexfactor_evidence", "flexfactor_purpose",
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
+                 "flexfactor_prodevidence",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
                  "flexfactor_product_invariants", "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
@@ -18201,6 +18429,12 @@ def runtime_manifest() -> dict:
     for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
         fn = globals().get("_WIRED_" + hook.upper())
         wired[hook] = bool(fn)
+    # A BEHAVIOURAL probe, not a flag: it drives the real chokepoint with a real
+    # non-code finding at the most permissive severity floor. "The constant
+    # exists" is exactly the kind of evidence this manifest refuses to accept.
+    wired["non_code_findings_never_patched"] = (
+        should_fix_finding({"category": "client", "severity": "critical",
+                            "evidence_source": "runtime-data"}, "info") is False)
     return {
         "tool_version": TOOL_VERSION,
         "modes": ["refactor", "scout", "audit", "prodready", "policy"],

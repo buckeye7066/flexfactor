@@ -47,6 +47,7 @@ py-modules = [
   "flexfactor_locate",
   "flexfactor_node_lock",
   "flexfactor_partial",
+  "flexfactor_prodevidence",
   "flexfactor_prodready",
   "flexfactor_prodready_engine",
   "flexfactor_prodready_persist",
