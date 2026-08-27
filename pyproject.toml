@@ -30,6 +30,7 @@ flexfactor = "flexfactor:run_cli"
 py-modules = [
   "flexfactor",
   "flexfactor_autoclean",
+  "flexfactor_capacity",
   "flexfactor_cmdpolicy",
   "flexfactor_competitors",
   "flexfactor_coverage",
