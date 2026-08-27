@@ -8,7 +8,8 @@ real provider allowance as though each worker owned a private credential.
 Properties:
 - one persistent ledger across threads/processes/restarts;
 - FIFO admission per real allowance key;
-- stale-lease recovery after crashes;
+- OS-backed cross-process locking, never stale-file lock stealing;
+- renewable leases with stale-lease recovery after crashes;
 - bounded exponential waits with jitter instead of provider stampedes;
 - account-wide Retry-After/quota cooldowns survive restarts;
 - per-route/per-pool throttles remain scoped to rotation, never widened here;
@@ -33,7 +34,6 @@ SCHEMA = 1
 LEASE_TTL_S = 15 * 60.0
 WAITER_TTL_S = 24 * 60 * 60.0
 DEFAULT_WAIT_MAX_S = 12 * 60 * 60.0
-LOCK_STALE_S = 30.0
 
 
 def state_path() -> str:
@@ -55,7 +55,7 @@ def _empty() -> dict:
 
 
 class CapacityState:
-    """Small atomic JSON store with a cross-process sidecar lock."""
+    """Atomic JSON store protected by an OS-owned cross-process file lock."""
 
     def __init__(self, path: Optional[str] = None):
         self.path = path or state_path()
@@ -74,34 +74,62 @@ class CapacityState:
         data["next_ticket"] = max(1, int(data.get("next_ticket") or 1))
         return data
 
-    def _lock(self) -> str:
+    def _lock_path(self) -> str:
         return self.path + ".lock"
 
-    def _acquire(self, timeout: float = 10.0) -> bool:
+    def _try_os_lock(self, fh) -> bool:
+        """Acquire an exclusive nonblocking lock on an already-open handle."""
+        if os.name == "nt":
+            import msvcrt
+            try:
+                fh.seek(0)
+                if os.fstat(fh.fileno()).st_size < 1:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        import fcntl
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+
+    def _unlock_os(self, fh) -> None:
+        """Release the OS lock held by ``fh``; closing is the final fallback."""
+        if os.name == "nt":
+            import msvcrt
+            with contextlib.suppress(OSError):
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+        with contextlib.suppress(OSError):
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    def _acquire(self, timeout: float = 10.0):
+        """Return a locked file handle; never unlink another process's lock."""
         parent = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(parent, exist_ok=True)
         deadline = time.time() + timeout
         delay = 0.001
         while True:
-            try:
-                fd = os.open(self._lock(), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                try:
-                    os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
-                finally:
-                    os.close(fd)
-                return True
-            except FileExistsError:
-                with contextlib.suppress(OSError):
-                    if time.time() - os.stat(self._lock()).st_mtime > LOCK_STALE_S:
-                        os.unlink(self._lock())
-                        continue
+            fh = open(self._lock_path(), "a+b")
+            if self._try_os_lock(fh):
+                return fh
+            fh.close()
             if time.time() >= deadline:
-                return False
+                return None
             time.sleep(delay + random.random() * delay)
             delay = min(0.05, delay * 2)
 
     def update(self, fn: Callable[[dict], Any]) -> Any:
-        if not self._acquire():
+        """Read-modify-replace the ledger while holding one OS lock handle."""
+        lock_handle = self._acquire()
+        if lock_handle is None:
             raise TimeoutError("provider capacity state lock unavailable")
         try:
             data = self.read()
@@ -123,8 +151,8 @@ class CapacityState:
                         os.unlink(tmp)
             return result
         finally:
-            with contextlib.suppress(OSError):
-                os.unlink(self._lock())
+            self._unlock_os(lock_handle)
+            lock_handle.close()
 
 
 @dataclass(frozen=True)
@@ -135,10 +163,12 @@ class Lease:
 
 
 class CapacityTimeout(RuntimeError):
-    pass
+    """Raised when qualified provider capacity cannot be acquired in time."""
 
 
 class CapacityManager:
+    """Coordinate fair, persistent provider allowance admission."""
+
     def __init__(self, store: Optional[CapacityState] = None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.time):
@@ -216,11 +246,9 @@ class CapacityManager:
                     return
                 active = [row for row in data.setdefault("leases", {}).values()
                           if row.get("allowance") == allowance]
-                ahead = [
-                    row for wid, row in waiters.items()
-                    if wid != ident and row.get("allowance") == allowance
-                    and int(row.get("ticket") or 0) < ticket
-                ]
+                ahead = [row for wid, row in waiters.items()
+                         if wid != ident and row.get("allowance") == allowance
+                         and int(row.get("ticket") or 0) < ticket]
                 if len(active) < self.limit(route) and not ahead:
                     data["leases"][ident] = {
                         "allowance": allowance, "app": app, "pid": os.getpid(),
@@ -255,8 +283,27 @@ class CapacityManager:
         with contextlib.suppress(Exception):
             self.store.update(mutate)
 
+    def renew(self, lease: Lease) -> bool:
+        """Extend a live lease so a long provider call cannot be double-admitted."""
+        now = self.clock()
+        renewed = {"ok": False}
+
+        def mutate(data: dict) -> None:
+            row = data.setdefault("leases", {}).get(lease.ident)
+            if not row or row.get("allowance") != lease.allowance:
+                return
+            row["expires_at"] = now + LEASE_TTL_S
+            renewed["ok"] = True
+
+        try:
+            self.store.update(mutate)
+        except Exception:
+            return False
+        return renewed["ok"]
+
     def release(self, lease: Lease) -> None:
         now = self.clock()
+
         def mutate(data: dict) -> None:
             self._cleanup(data, now)
             data.setdefault("leases", {}).pop(lease.ident, None)
@@ -268,13 +315,7 @@ class CapacityManager:
 
     def note_outcome(self, route, outcome: str, retry_after_seconds: Optional[float] = None,
                      *, scope: str = "pool", reset_at: Optional[float] = None) -> None:
-        """Persist only account-wide exhaustion at allowance scope.
-
-        flexfactor_rotation already owns route/pool cooldowns. Widening a
-        model-specific 429 into an account-wide cooldown would bench healthy
-        pools on the same provider, so only the provider's account-wide
-        classification crosses that boundary here.
-        """
+        """Persist only account-wide exhaustion at allowance scope."""
         if outcome not in ("rate_limited", "quota_exhausted"):
             return
         now = self.clock()
@@ -311,6 +352,7 @@ class CapacityManager:
 
     def snapshot(self) -> dict:
         now = self.clock()
+
         def mutate(data: dict) -> dict:
             self._cleanup(data, now)
             return json.loads(json.dumps(data))
@@ -338,115 +380,4 @@ def recommended_program_parallelism(requested: int, model_mode: str = "free") ->
         if catalog is None:
             return 1
         state = rotation.StateStore().read()
-        now = time.time()
-        capacities: Dict[str, int] = {}
-        for route in catalog.enabled():
-            if not route.is_free or route.tier not in (rotation.FRONTIER, rotation.STRONG):
-                continue
-            if rotation._cooling(state, route.pool, now):
-                continue
-            if rotation._cooling(state, f"route:{route.id}", now):
-                continue
-            if rotation._cooling(state, f"allowance:{rotation.allowance_key(route)}", now):
-                continue
-            key = rotation.allowance_key(route)
-            capacities[key] = max(capacities.get(key, 0), CapacityManager.limit(route))
-        capacity = sum(capacities.values())
-        return max(1, min(requested, capacity or 1))
-    except Exception:
-        return 1
-
-
-def _waitable_rotation_error(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__} {exc}".lower()
-    return any(token in text for token in (
-        "no strong route available", "no frontier route available",
-        "no light route available", "every strong pool failed",
-        "every frontier pool failed", "every light pool failed",
-        "rate limit", "quota", "allowance", "cooling down",
-    ))
-
-
-def install() -> None:
-    """Install capacity guards into flexfactor_rotation once per interpreter."""
-    global _INSTALLED
-    with _INSTALL_LOCK:
-        if _INSTALLED:
-            return
-        import flexfactor_rotation as rotation
-
-        prior_provider_for = rotation.RotatingProvider._provider_for
-        prior_report = rotation.Rotator.report
-        prior_init = rotation.RotatingProvider.__init__
-        prior_run = rotation.RotatingProvider._run
-
-        def guarded_provider_for(self, route):
-            provider = prior_provider_for(self, route)
-            if getattr(provider, "_flexfactor_capacity_wrapped", False):
-                return provider
-            with _PROVIDER_WRAP_LOCK:
-                if getattr(provider, "_flexfactor_capacity_wrapped", False):
-                    return provider
-                for method_name in ("complete", "structured", "grade", "ping"):
-                    original = getattr(provider, method_name, None)
-                    if not callable(original):
-                        continue
-
-                    def make_guard(fn):
-                        def guarded(*args, **kwargs):
-                            app = str(getattr(self, "_purpose", "") or self.rotator.app)
-                            lease = _MANAGER.acquire(route, app=app)
-                            try:
-                                return fn(*args, **kwargs)
-                            finally:
-                                _MANAGER.release(lease)
-                        return guarded
-
-                    setattr(provider, method_name, make_guard(original))
-                setattr(provider, "_flexfactor_capacity_wrapped", True)
-            return provider
-
-        def report(self, route, outcome, retry_after_seconds=None, now=None,
-                   scope="pool", reset_at=None):
-            _MANAGER.note_outcome(route, outcome, retry_after_seconds,
-                                  scope=scope, reset_at=reset_at)
-            return prior_report(self, route, outcome, retry_after_seconds, now,
-                                scope=scope, reset_at=reset_at)
-
-        def init(self, *args, **kwargs):
-            prior_init(self, *args, **kwargs)
-            original_error = getattr(self, "_on_error", None)
-            if original_error is not None:
-                def infrastructure_aware_error(route, exc):
-                    outcome = rotation._classify(exc)
-                    if outcome in ("rate_limited", "quota_exhausted"):
-                        scope, reset_at = rotation.limit_scope(exc)
-                        _MANAGER.note_outcome(route, outcome, rotation._retry_after(exc),
-                                              scope=scope, reset_at=reset_at)
-                        return
-                    return original_error(route, exc)
-                self._on_error = infrastructure_aware_error
-
-        def run(self, method, tier, *args, **kwargs):
-            wait_max = float(os.environ.get(
-                "FLEXFACTOR_PROVIDER_WAIT_MAX_S", DEFAULT_WAIT_MAX_S))
-            deadline = time.time() + max(0.0, wait_max)
-            delay = 1.0
-            while True:
-                try:
-                    return prior_run(self, method, tier, *args, **kwargs)
-                except rotation.RotationError as exc:
-                    if not _waitable_rotation_error(exc) or time.time() >= deadline:
-                        raise
-                    snap = _MANAGER.snapshot()
-                    rt = snap.get("runtime") or {}
-                    detail = rt.get("detail") or str(exc)
-                    print(f"  [capacity] waiting for provider: {detail}")
-                    time.sleep(min(30.0, delay) + random.random() * 0.25)
-                    delay = min(30.0, delay * 2)
-
-        rotation.RotatingProvider._provider_for = guarded_provider_for
-        rotation.Rotator.report = report
-        rotation.RotatingProvider.__init__ = init
-        rotation.RotatingProvider._run = run
-        _INSTALLED = True
+        now = time
