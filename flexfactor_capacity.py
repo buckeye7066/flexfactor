@@ -1,22 +1,20 @@
 """Global provider-capacity orchestration for concurrent FlexFactor programs.
 
-This module owns the *shared* traffic-control layer that sits above route
-selection. flexfactor_rotation already knows how to choose healthy pools and
-persist provider cooldowns; this module prevents several simultaneous programs
-from consuming the same allowance as though each had a private copy.
+This module owns the shared traffic-control layer above route selection.
+``flexfactor_rotation`` already chooses healthy pools and persists route/pool
+cooldowns; this module prevents simultaneous programs from consuming the same
+real provider allowance as though each worker owned a private credential.
 
-Design goals:
+Properties:
 - one persistent ledger across threads/processes/restarts;
 - FIFO admission per real allowance key;
 - stale-lease recovery after crashes;
-- bounded waits with jitter instead of provider stampedes;
-- 429/quota cooldowns that are infrastructure state, not target-app defects;
+- bounded exponential waits with jitter instead of provider stampedes;
+- account-wide Retry-After/quota cooldowns survive restarts;
+- per-route/per-pool throttles remain scoped to rotation, never widened here;
+- provider exhaustion is infrastructure state, not a target-app defect;
 - free mode never expands into paid capacity;
-- no weakening of route-quality or verification gates.
-
-The runtime integration is deliberately installed by ``install()`` so the
-policy remains independently unit-testable and flexfactor_rotation stays usable
-as a standalone library.
+- no weakening of route-quality, build, containment, or verification gates.
 """
 from __future__ import annotations
 
@@ -33,8 +31,8 @@ from typing import Any, Callable, Dict, Optional
 
 SCHEMA = 1
 LEASE_TTL_S = 15 * 60.0
-WAITER_TTL_S = 60 * 60.0
-DEFAULT_WAIT_MAX_S = 30 * 60.0
+WAITER_TTL_S = 24 * 60 * 60.0
+DEFAULT_WAIT_MAX_S = 12 * 60 * 60.0
 LOCK_STALE_S = 30.0
 
 
@@ -80,7 +78,8 @@ class CapacityState:
         return self.path + ".lock"
 
     def _acquire(self, timeout: float = 10.0) -> bool:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
         deadline = time.time() + timeout
         delay = 0.001
         while True:
@@ -107,9 +106,9 @@ class CapacityState:
         try:
             data = self.read()
             result = fn(data)
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix="capacity-", suffix=".json",
-                                       dir=os.path.dirname(self.path))
+            parent = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="capacity-", suffix=".json", dir=parent)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump(data, fh, indent=1, sort_keys=True)
@@ -162,9 +161,6 @@ class CapacityManager:
             with contextlib.suppress(ValueError):
                 return max(1, int(explicit))
         cost = str(getattr(route, "cost_class", ""))
-        # Free cloud allowances are the fragile resource exposed by the six-app
-        # overnight run. Local inference can safely sustain a little parallelism;
-        # paid routes are not used in free mode and retain a wider default.
         if cost in ("free-tier", "subscription"):
             return 1
         if cost == "local-unlimited":
@@ -192,7 +188,6 @@ class CapacityManager:
         ident = uuid.uuid4().hex
         created = self.clock()
         deadline = created + max(0.0, timeout)
-        ticket_box: Dict[str, int] = {}
         delay = 0.05
 
         while True:
@@ -209,19 +204,23 @@ class CapacityManager:
                         "ticket": ticket, "allowance": allowance, "app": app,
                         "created_at": created, "pid": os.getpid(),
                     }
-                    ticket_box["value"] = ticket
                 ticket = int(waiters[ident]["ticket"])
                 cooldown = float(data.setdefault("cooldowns", {}).get(allowance) or 0)
                 if cooldown > now:
                     outcome["wait"] = max(0.05, min(30.0, cooldown - now))
+                    data["runtime"] = {
+                        "state": "waiting-for-provider",
+                        "detail": f"{app} waiting for shared allowance {allowance} cooldown",
+                        "updated_at": now,
+                    }
                     return
                 active = [row for row in data.setdefault("leases", {}).values()
                           if row.get("allowance") == allowance]
-                ahead = sorted(
-                    (row for wid, row in waiters.items()
-                     if wid != ident and row.get("allowance") == allowance
-                     and int(row.get("ticket") or 0) < ticket),
-                    key=lambda row: int(row.get("ticket") or 0))
+                ahead = [
+                    row for wid, row in waiters.items()
+                    if wid != ident and row.get("allowance") == allowance
+                    and int(row.get("ticket") or 0) < ticket
+                ]
                 if len(active) < self.limit(route) and not ahead:
                     data["leases"][ident] = {
                         "allowance": allowance, "app": app, "pid": os.getpid(),
@@ -246,8 +245,6 @@ class CapacityManager:
                 self.cancel_waiter(ident)
                 raise CapacityTimeout(
                     f"provider capacity wait exceeded {timeout:.0f}s for {allowance}")
-            # Bounded exponential delay + jitter. The persistent FIFO ticket is
-            # what enforces fairness; jitter only prevents lock-step wakeups.
             sleep_for = min(outcome["wait"], delay, max(0.0, deadline - now))
             self.sleep(max(0.01, sleep_for + random.random() * min(0.05, sleep_for)))
             delay = min(5.0, delay * 2)
@@ -271,21 +268,35 @@ class CapacityManager:
 
     def note_outcome(self, route, outcome: str, retry_after_seconds: Optional[float] = None,
                      *, scope: str = "pool", reset_at: Optional[float] = None) -> None:
+        """Persist only account-wide exhaustion at allowance scope.
+
+        flexfactor_rotation already owns route/pool cooldowns. Widening a
+        model-specific 429 into an account-wide cooldown would bench healthy
+        pools on the same provider, so only the provider's account-wide
+        classification crosses that boundary here.
+        """
         if outcome not in ("rate_limited", "quota_exhausted"):
             return
         now = self.clock()
         allowance = self.allowance(route)
+        if scope != "account":
+            def mark_wait(data: dict) -> None:
+                self._cleanup(data, now)
+                data["runtime"] = {
+                    "state": "waiting-for-provider",
+                    "detail": f"{outcome}: route/pool cooldown remains scoped in rotation",
+                    "updated_at": now,
+                }
+            with contextlib.suppress(Exception):
+                self.store.update(mark_wait)
+            return
         if reset_at and reset_at > now:
             until = float(reset_at)
         elif retry_after_seconds:
             until = now + max(1.0, float(retry_after_seconds))
         else:
             until = now + (3600.0 if outcome == "quota_exhausted" else 60.0)
-        # Account-wide limits always cool the real allowance. Pool-scoped 429s
-        # are also serialized by the allowance semaphore, but do not receive a
-        # long account cooldown unless the provider said they are account-wide.
-        if scope != "account" and outcome == "rate_limited":
-            until = min(until, now + 300.0)
+
         def mutate(data: dict) -> None:
             self._cleanup(data, now)
             data.setdefault("cooldowns", {})[allowance] = max(
@@ -309,6 +320,7 @@ class CapacityManager:
 _MANAGER = CapacityManager()
 _INSTALLED = False
 _INSTALL_LOCK = threading.Lock()
+_PROVIDER_WRAP_LOCK = threading.Lock()
 
 
 def manager() -> CapacityManager:
@@ -339,8 +351,6 @@ def recommended_program_parallelism(requested: int, model_mode: str = "free") ->
                 continue
             key = rotation.allowance_key(route)
             capacities[key] = max(capacities.get(key, 0), CapacityManager.limit(route))
-        # Keep at least one lane. More programs remain queued in run_audit rather
-        # than being allowed to create six independent provider storms.
         capacity = sum(capacities.values())
         return max(1, min(requested, capacity or 1))
     except Exception:
@@ -374,14 +384,14 @@ def install() -> None:
             provider = prior_provider_for(self, route)
             if getattr(provider, "_flexfactor_capacity_wrapped", False):
                 return provider
-            lock = threading.Lock()
-            with lock:
+            with _PROVIDER_WRAP_LOCK:
                 if getattr(provider, "_flexfactor_capacity_wrapped", False):
                     return provider
                 for method_name in ("complete", "structured", "grade", "ping"):
                     original = getattr(provider, method_name, None)
                     if not callable(original):
                         continue
+
                     def make_guard(fn):
                         def guarded(*args, **kwargs):
                             app = str(getattr(self, "_purpose", "") or self.rotator.app)
@@ -391,6 +401,7 @@ def install() -> None:
                             finally:
                                 _MANAGER.release(lease)
                         return guarded
+
                     setattr(provider, method_name, make_guard(original))
                 setattr(provider, "_flexfactor_capacity_wrapped", True)
             return provider
@@ -412,7 +423,7 @@ def install() -> None:
                         scope, reset_at = rotation.limit_scope(exc)
                         _MANAGER.note_outcome(route, outcome, rotation._retry_after(exc),
                                               scope=scope, reset_at=reset_at)
-                        return  # provider capacity problem, not target-app defect
+                        return
                     return original_error(route, exc)
                 self._on_error = infrastructure_aware_error
 
@@ -427,8 +438,6 @@ def install() -> None:
                 except rotation.RotationError as exc:
                     if not _waitable_rotation_error(exc) or time.time() >= deadline:
                         raise
-                    # Temporary provider exhaustion is a durable wait state. Do
-                    # not burn target-app error budget and do not spin.
                     snap = _MANAGER.snapshot()
                     rt = snap.get("runtime") or {}
                     detail = rt.get("detail") or str(exc)
