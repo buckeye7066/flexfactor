@@ -1,0 +1,96 @@
+name: Bug report
+description: Report a reproducible FlexFactor defect without sensitive data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use the private reporting
+        link under **Security** in the issue chooser.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials, tokens, personal data, and private logs.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: FlexFactor commit SHA or version
+      description: Use the exact 40-character Git commit SHA when possible.
+      placeholder: e630b42b553d0cd89d2bd22c7b02ad68d5f17c12
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating_system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python version, installation method, launcher, and relevant provider mode.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest deterministic sequence that reproduces the defect.
+      placeholder: |
+        1. Run ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Paste relevant command output, stack traces, or CI links after removing secrets and personal data.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Include regression range, frequency, and workarounds if known.
+    validations:
+      required: false
