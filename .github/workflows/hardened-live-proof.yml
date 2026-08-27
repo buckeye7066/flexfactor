@@ -1,0 +1,80 @@
+name: hardened-live-cursor-aitime-proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-proof:
+    name: hardened-live-cursor-aitime-proof
+    runs-on: [self-hosted, linux, x64, flexfactor-hardened]
+    environment: production-live
+    timeout-minutes: 15
+
+    steps:
+      - name: Require the protected main ref
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main" || {
+            echo "live proof is authorized only for refs/heads/main" >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact checkout
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install .
+          python -m pip check
+
+      - name: Require full OS-enforced containment
+        run: |
+          python - <<'PY' > containment-report.json
+          import json
+          import flexfactor_sandbox as sandbox
+
+          report = sandbox.capability_report(refresh=True)
+          print(json.dumps(report, indent=2))
+          if not sandbox.os_sandbox_sufficient(report):
+              raise SystemExit(
+                  "runner is not hardened: network, process-tree, and memory "
+                  "must all be OS-enforced"
+              )
+          PY
+
+      - name: Exercise enforced process, memory, and raw-network boundaries
+        run: |
+          python -m unittest \
+            test_flexfactor_sandbox.RunContainedTests \
+            test_flexfactor_sandbox.ResourceAbuseTests \
+            test_flexfactor_sandbox.RawSocketExfilTests \
+            test_flexfactor_sandbox.SpawnContainedTests \
+            test_flexfactor_sandbox.TrustGateTests.test_os_sandbox_basis_when_host_is_sufficient \
+            -v
+
+      - name: Prove unauthenticated rejection and authenticated live inference
+        env:
+          FLEXFACTOR_CURSOR_BASE_URL: ${{ secrets.FLEXFACTOR_CURSOR_BASE_URL }}
+          FLEXFACTOR_CURSOR_API_KEY: ${{ secrets.FLEXFACTOR_CURSOR_API_KEY }}
+          AI_ROTATE_CATALOG: ${{ vars.AI_ROTATE_CATALOG }}
+          FLEXFACTOR_CURSOR_ROUTE_ID: ${{ vars.FLEXFACTOR_CURSOR_ROUTE_ID }}
+        run: python scripts/live_cursor_aitime_proof.py > live-proof.json
+
+      - name: Upload redacted live proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: live-cursor-aitime-proof-${{ github.sha }}
+          path: |
+            containment-report.json
+            live-proof.json
+          if-no-files-found: error
+          retention-days: 30
