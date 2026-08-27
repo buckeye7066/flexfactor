@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""flexfactor_run.py - COMPATIBILITY SHIM. The canonical entry is flexfactor.run_cli.
+"""flexfactor_run.py - launcher/compatibility shim for the canonical runtime.
 
-Directed orchestration used to be monkey-patched in here because the monolith
-could not be rewritten through the GitHub Contents API. It is now part of the
-runtime itself (flexfactor.py hard-imports flexfactor_directed), so this file
-only forwards to the same entry point the installed `flexfactor` command and
-`python -m flexfactor` use. It MUST NOT alter any runtime guarantee.
+The canonical implementation remains ``flexfactor.run_cli``. This shim arms the
+idempotent directed-runtime hooks before forwarding, so desktop/PowerShell
+launches get the same provider-capacity admission and truthful partial-run status
+semantics without duplicating audit logic here.
 """
 from __future__ import annotations
 
@@ -14,7 +13,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flexfactor import run_cli  # noqa: E402
+import flexfactor as _flexfactor  # noqa: E402
+import flexfactor_directed as _directed  # noqa: E402
+
+_directed.install(vars(_flexfactor))
+run_cli = _flexfactor.run_cli
 
 if __name__ == "__main__":
     raise SystemExit(run_cli())
