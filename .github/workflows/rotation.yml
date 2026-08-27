@@ -57,7 +57,9 @@ jobs:
 
       - name: Run cursor provider tests
         shell: bash
-        run: python tests/test_cursor_provider.py
+        run: |
+          python tests/test_cursor_provider.py
+          python test_live_cursor_aitime_proof.py
 
   integration-tests:
     name: offline-integration-tests
@@ -142,3 +144,5 @@ jobs:
           python -m py_compile providers/cursor_provider.py
           python -m py_compile tests/test_rotation_extensions.py
           python -m py_compile tests/test_cursor_provider.py
+          python -m py_compile scripts/live_cursor_aitime_proof.py
+          python -m py_compile test_live_cursor_aitime_proof.py
