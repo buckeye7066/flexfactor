@@ -196,7 +196,7 @@ def install():
                     if not callable(original): continue
                     def make_guard(fn):
                         def guarded(*a,**kw):
-                            app=str(getattr(self,"_purpose","") or self.rotator.app); lease=_MANAGER.acquire(route,app=app)
+                            app=str(getattr(self,"_purpose","") or getattr(self.rotator,"app","flexfactor")); lease=_MANAGER.acquire(route,app=app)
                             try: return _renewing_call(_MANAGER,lease,fn,*a,**kw)
                             finally: _MANAGER.release(lease)
                         return guarded
