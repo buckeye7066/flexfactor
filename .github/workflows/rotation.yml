@@ -42,12 +42,16 @@ jobs:
       - name: Smoke-import new modules
         shell: bash
         run: |
-          python -c "import flexfactor_discovery; import flexfactor_rotation"
+          python -c "import flexfactor_capacity; import flexfactor_discovery; import flexfactor_rotation"
           python -c "from providers.cursor_provider import CursorProvider, make_cursor_provider, CursorUnavailable"
 
       - name: Run existing rotation tests (must stay green)
         shell: bash
         run: python flexfactor_rotation_tests.py
+
+      - name: Run shared provider-capacity tests
+        shell: bash
+        run: python test_flexfactor_capacity.py
 
       - name: Run rotation-extension tests
         shell: bash
@@ -139,10 +143,12 @@ jobs:
 
       - name: Check syntax (py_compile)
         run: |
+          python -m py_compile flexfactor_capacity.py
           python -m py_compile flexfactor_discovery.py
           python -m py_compile providers/__init__.py
           python -m py_compile providers/cursor_provider.py
           python -m py_compile tests/test_rotation_extensions.py
           python -m py_compile tests/test_cursor_provider.py
           python -m py_compile scripts/live_cursor_aitime_proof.py
+          python -m py_compile test_flexfactor_capacity.py
           python -m py_compile test_live_cursor_aitime_proof.py
