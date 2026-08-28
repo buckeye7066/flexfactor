@@ -514,16 +514,22 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertIn("/api/provider/install", web.PAGE)
         self.assertNotIn("if(providerKey&&providerKey.value) return", web.PAGE)
 
-    def test_android_webview_enables_launcher_dialogs(self):
+    def test_android_launcher_is_native_and_standalone(self):
         path = os.path.join(
             os.path.dirname(__file__), "android", "app", "src", "main", "java",
             "com", "firer", "console", "flexfactor", "MainActivity.java",
         )
         with open(path, encoding="utf-8") as fh:
             activity = fh.read()
-        self.assertIn("import android.webkit.WebChromeClient;", activity)
-        self.assertIn(
-            "web.setWebChromeClient(new WebChromeClient());", activity)
+        self.assertNotIn("android.webkit", activity)
+        self.assertNotIn("WebView", activity)
+        self.assertNotIn("com.termux", activity)
+        self.assertNotIn("RUN_COMMAND", activity)
+        self.assertIn('button("Credentials")', activity)
+        self.assertIn('addMode("1 · Refactor a file"', activity)
+        self.assertIn('addMode("2 · Scout improvements"', activity)
+        self.assertIn('addMode("3 · Audit and repair"', activity)
+        self.assertIn('addMode("4 · Make production ready"', activity)
 
     def test_android_main_release_creates_the_exact_version_tag(self):
         path = os.path.join(
