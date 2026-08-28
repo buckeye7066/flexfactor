@@ -140,13 +140,25 @@ jobs:
           release_dir="android/app/build/outputs/apk/release/publish"
           version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
             "android/app/build/outputs/apk/release/app-release.apk")
-          gh release create "$GITHUB_REF_NAME" \
-            "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
-            "$release_dir/android-update.json#Signed update manifest" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "FlexFactor Android ${version_name}" \
-            --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
+              "$release_dir/android-update.json#Signed update manifest" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
+              "$release_dir/android-update.json#Signed update manifest" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          fi
       - name: Upload signed exact-commit Android release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
