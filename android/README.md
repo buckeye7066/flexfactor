@@ -1,6 +1,6 @@
 # FlexFactor Android app
 
-Version 3.0 is a standalone Android control plane. Tapping the FlexFactor icon
+Version 3.1 is a standalone Android control plane. Tapping the FlexFactor icon
 opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
 Ollama are not part of its runtime.
 
@@ -14,11 +14,13 @@ sandbox.
 
 Open **Credentials** and enter:
 
-1. A GitHub token for the owner account with `repo` and `workflow` access.
-2. An OpenAI API key.
+1. A GitHub token for the owner account with repository/workflow access and a
+   usable GitHub Copilot entitlement.
+2. Optionally, an OpenAI API key if OpenAI should be used instead of Copilot.
 
-FlexFactor validates the GitHub account and makes a live authenticated OpenAI
-request before saving anything. Both values are encrypted at rest with a
+FlexFactor validates the GitHub account before saving anything. Copilot is
+preflighted by the disposable Actions runner before a long run begins; an
+optional OpenAI key is validated live when saved. Values are encrypted at rest with a
 non-exportable Android Keystore key. The app then encrypts them with the
 repository's GitHub Actions public key and writes them to protected Actions
 secrets; neither value is sent as a workflow input, URL, command argument,
@@ -48,7 +50,7 @@ it over HTTPS, and verifies the package name, version, SHA-256, and signing
 certificate lineage before opening Android's installer. Android requires the
 user to enable **Allow from this source** once and confirm each installation.
 
-Version 2.2.0 and later use the permanent release key, so 3.0 installs in place
+Version 2.2.0 and later use the permanent release key, so 3.1 installs in place
 without uninstalling the existing app.
 
 ## Build
@@ -61,7 +63,7 @@ gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
 ```
 
 CI publishes an exact-commit debug artifact for every pull request. Merging a
-versioned Android change to `main` creates `android-v3.0.0` and publishes the
+versioned Android change to `main` creates the matching release tag and publishes the
 signed production APK plus its update manifest.
 
 ## Release signing
@@ -73,7 +75,7 @@ signing value is absent; it never falls back to a debug key.
 
 ## Boundaries
 
-- The Android app connects only to HTTPS GitHub and OpenAI endpoints plus the
+- The Android app connects only to HTTPS GitHub and, when selected, OpenAI endpoints plus the
   HTTPS allowlist used by the signed updater.
 - Credentials are masked in the UI, encrypted locally, and transferred to
   GitHub only through the official LibSodium-sealed Actions secrets API.

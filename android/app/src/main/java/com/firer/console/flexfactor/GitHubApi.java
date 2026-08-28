@@ -63,13 +63,15 @@ final class GitHubApi {
 
     ConfigurationResult configure(String githubToken, String openAiKey) throws Exception {
         String token = requireSecret(githubToken, "GitHub token");
-        String provider = requireSecret(openAiKey, "OpenAI key");
         JSONObject user = github(token, "GET", "/user", null);
         String login = user.optString("login", "").trim();
         if (login.isEmpty()) throw new ApiException("GitHub did not identify this account.");
-        verifyOpenAi(provider);
         putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN", token);
-        putRepositorySecret(token, "OPENAI_API_KEY", provider);
+        String provider = openAiKey == null ? "" : openAiKey.trim();
+        if (!provider.isEmpty()) {
+            verifyOpenAi(provider);
+            putRepositorySecret(token, "OPENAI_API_KEY", provider);
+        }
         return new ConfigurationResult(login);
     }
 

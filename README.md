@@ -202,15 +202,17 @@ python flexfactor_web.py --print-url                    # same view, phone-reach
 
 ### Android: standalone phone app
 
-The Android app is in [`android/`](android/). Version 3.0 opens the complete
+The Android app is in [`android/`](android/). Version 3.1 opens the complete
 four-option FlexFactor launcher directly from the phone icon: Refactor, Scout,
 Audit, and Production Ready. It requires neither a PC nor Termux/Ollama. The
 signed APK is the native control plane and a disposable GitHub Actions runner
 provides the multi-toolchain execution environment.
 
-The first-launch Credentials screen verifies a GitHub token and OpenAI key,
-encrypts both with Android Keystore, and installs LibSodium-sealed copies as
-protected GitHub Actions secrets. Provider keys are never workflow inputs.
+The first-launch Credentials screen verifies a GitHub token and uses its GitHub
+Copilot entitlement by default, so no OpenAI API key is required. An optional
+OpenAI key switches the provider to OpenAI. Credentials are encrypted with
+Android Keystore and installed as LibSodium-sealed GitHub Actions secrets; they
+are never workflow inputs.
 Choose a writable public repository, select one of the four modes, and monitor the
 exact correlated Actions run from the same app. See
 [`android/README.md`](android/README.md) for the operating and release model.

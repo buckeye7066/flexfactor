@@ -14,6 +14,12 @@ on:
         required: true
         type: choice
         options: [refactor, scout, audit, prodready]
+      provider:
+        description: Model provider selected by the signed Android app
+        required: true
+        default: copilot
+        type: choice
+        options: [copilot, openai]
       target_repository:
         description: Target owner/repository
         required: true
@@ -44,6 +50,7 @@ on:
 
 permissions:
   contents: read
+  copilot-requests: write
 
 concurrency:
   group: mobile-flexfactor-${{ inputs.target_repository }}
@@ -57,6 +64,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       PYTHONUTF8: "1"
 
@@ -70,6 +78,7 @@ jobs:
               inputs = json.load(fh).get("inputs", {})
           request_id = str(inputs.get("request_id", ""))
           mode = str(inputs.get("mode", ""))
+          provider = str(inputs.get("provider", ""))
           repository = str(inputs.get("target_repository", ""))
           ref = str(inputs.get("target_ref", ""))
           file = str(inputs.get("file", ""))
@@ -77,6 +86,8 @@ jobs:
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
+          if provider not in {"copilot", "openai"}:
+              raise SystemExit("unsupported provider")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
                               repository):
               raise SystemExit("invalid repository")
@@ -117,7 +128,11 @@ jobs:
         shell: bash
         run: |
           test -n "$GH_TOKEN" || { echo "FLEXFACTOR_MOBILE_GITHUB_TOKEN is missing" >&2; exit 1; }
-          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
+          if [ "${{ inputs.provider }}" = openai ]; then
+            test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
+          else
+            test -n "$COPILOT_GITHUB_TOKEN" || { echo "GitHub token for Copilot is missing" >&2; exit 1; }
+          fi
 
       - name: Check out the exact FlexFactor engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -147,6 +162,13 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install GitHub Copilot provider
+        if: inputs.provider == 'copilot'
+        shell: bash
+        run: |
+          npm install --global @github/copilot
+          copilot --version
+
       - name: Install the engine and browser runtime
         shell: bash
         run: |
@@ -167,6 +189,7 @@ jobs:
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
+          PROVIDER: ${{ inputs.provider }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
@@ -199,7 +222,7 @@ jobs:
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
                 --goal "$TARGET_GOAL" \
-                --provider openai 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
+                --provider "$PROVIDER" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
               rm -f -- "$backup_path"
             fi
             if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
@@ -218,7 +241,7 @@ jobs:
               fi
             fi
           elif [ "$MODE" = scout ]; then
-            args=(scout --program "$GITHUB_WORKSPACE/target" --provider openai
+            args=(scout --program "$GITHUB_WORKSPACE/target" --provider "$PROVIDER"
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards)
@@ -228,7 +251,7 @@ jobs:
           else
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              --provider openai --model-mode paid --single \
+              --provider "$PROVIDER" --model-mode paid --single \
               --max-cost "$MAX_COST" --no-dashboard --yes --apply \
               --trust-repo --no-auto-clean 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
