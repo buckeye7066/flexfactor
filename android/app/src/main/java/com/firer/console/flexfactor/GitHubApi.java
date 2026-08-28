@@ -74,18 +74,23 @@ final class GitHubApi {
     }
 
     List<Repository> repositories(String token) throws Exception {
-        JSONObject result = github(requireSecret(token, "GitHub token"), "GET",
-                "/user/repos?affiliation=owner,collaborator,organization_member"
-                        + "&sort=updated&direction=desc&per_page=100", null);
-        JSONArray rows = result.getJSONArray("_array");
+        String cleanToken = requireSecret(token, "GitHub token");
         List<Repository> repositories = new ArrayList<>();
-        for (int i = 0; i < rows.length(); i++) {
-            JSONObject row = rows.getJSONObject(i);
-            JSONObject permissions = row.optJSONObject("permissions");
-            if (permissions != null && !permissions.optBoolean("push", false)) continue;
-            String fullName = row.optString("full_name", "");
-            String branch = row.optString("default_branch", "main");
-            if (!fullName.isEmpty()) repositories.add(new Repository(fullName, branch));
+        for (int page = 1; page <= 100; page++) {
+            JSONObject result = github(cleanToken, "GET",
+                    "/user/repos?affiliation=owner,collaborator,organization_member"
+                            + "&sort=updated&direction=desc&per_page=100&page=" + page, null);
+            JSONArray rows = result.getJSONArray("_array");
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                if (row.optBoolean("private", true)) continue;
+                JSONObject permissions = row.optJSONObject("permissions");
+                if (permissions != null && !permissions.optBoolean("push", false)) continue;
+                String fullName = row.optString("full_name", "");
+                String branch = row.optString("default_branch", "main");
+                if (!fullName.isEmpty()) repositories.add(new Repository(fullName, branch));
+            }
+            if (rows.length() < 100) break;
         }
         return repositories;
     }
