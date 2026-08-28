@@ -1,6 +1,6 @@
 # FlexFactor Android app
 
-Version 3.1 is a standalone Android control plane. Tapping the FlexFactor icon
+Version 3.2 is a standalone Android control plane. Tapping the FlexFactor icon
 opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
 an on-phone model server are not part of its runtime.
 
@@ -15,21 +15,22 @@ sandbox.
 Open **Credentials** and enter:
 
 1. A GitHub token for the owner account with repository/workflow access.
-2. Optionally, an OpenAI API key if OpenAI should be used instead of the hosted
-   open-source model.
+2. Optionally, an OpenAI and/or Anthropic API key. GitHub Copilot and the hosted
+   open-source model use no separate vendor key.
 
 FlexFactor validates the GitHub account before saving anything. A pinned Ollama
 runtime and coding model run in the disposable Actions runner by default; an
 optional OpenAI key is validated live when saved. Values are encrypted at rest with a
-non-exportable Android Keystore key. The app then encrypts them with the
-repository's GitHub Actions public key and writes them to protected Actions
-secrets; neither value is sent as a workflow input, URL, command argument,
-artifact, or log field.
+non-exportable Android Keystore key. Vendor keys are encrypted with the
+repository's GitHub Actions public key and written to protected Actions secrets;
+they are never workflow inputs, URLs, command arguments, artifacts, or log fields.
+The owner GitHub token is not copied into repositories: each run uses GitHub's
+short-lived, repository-scoped `GITHUB_TOKEN`, including for Copilot requests.
 
-After setup, choose a writable **public** repository and use any original mode.
-Private targets are intentionally excluded because this release uses the public
-FlexFactor repository as its control plane; this prevents private names or
-source-derived output from appearing in public Actions metadata and logs.
+After setup, choose any writable public or private repository and use any original
+mode. FlexFactor installs a small pinned caller workflow into that selected
+repository and runs there, so private names, inputs, logs, and artifacts stay in
+the private repository rather than crossing the public control repository.
 
 1. **Refactor a file** — improve a selected file toward a stated goal and open a
    publication PR when the verified output changes it.
@@ -39,9 +40,17 @@ source-derived output from appearing in public Actions metadata and logs.
 4. **Make production ready** — run the complete purpose, build, browser, test,
    competitive-gap, and readiness pipeline.
 
+Audit and Production Ready can select up to ten repositories and launch their
+independent workflows in parallel, matching the desktop multi-program path.
+**Active and recent runs** preserves and polls each correlated run rather than
+discarding the earlier run when another starts.
+
 The latest run is polled by ID and survives activity recreation or process
-restart. **Open run details** opens the authoritative GitHub Actions record.
-Every run uploads a correlated `mobile-result-<request UUID>` artifact.
+restart. **View results and error ledger** reads a bounded, correlated result
+artifact directly inside the app; **Open run details** opens the authoritative
+GitHub Actions record. During Audit or Production Ready, **Steer this build**
+queues an authenticated owner comment that the engine consumes at its next audit
+phase boundary through the same containment and verification gates as desktop.
 
 ## In-app updates
 
@@ -50,7 +59,7 @@ it over HTTPS, and verifies the package name, version, SHA-256, and signing
 certificate lineage before opening Android's installer. Android requires the
 user to enable **Allow from this source** once and confirm each installation.
 
-Version 2.2.0 and later use the permanent release key, so 3.1 installs in place
+Version 2.2.0 and later use the permanent release key, so 3.2 installs in place
 without uninstalling the existing app.
 
 ## Build
@@ -77,10 +86,12 @@ signing value is absent; it never falls back to a debug key.
 
 - The Android app connects only to HTTPS GitHub and, when selected, OpenAI endpoints plus the
   HTTPS allowlist used by the signed updater.
-- Credentials are masked in the UI, encrypted locally, and transferred to
-  GitHub only through the official LibSodium-sealed Actions secrets API.
+- Credentials are masked in the UI and encrypted locally. Optional vendor keys
+  use the official LibSodium-sealed Actions secrets API; the owner PAT remains
+  only on the phone.
 - Target code executes on an ephemeral GitHub-hosted runner, not on the phone.
-- The public mobile control plane accepts public target repositories only.
+- Public and private targets run from the pinned caller workflow installed in
+  the selected target repository; private metadata remains in that repository.
 - Workflow inputs are validated again on the runner before checkout or
   execution.
 - The legacy `scripts/phone/` Termux engine remains available for command-line

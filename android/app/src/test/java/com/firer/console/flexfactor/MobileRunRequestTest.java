@@ -34,6 +34,18 @@ public final class MobileRunRequestTest {
         assertEquals("25", values.get("max_cost"));
         assertEquals("false", values.get("scout_apply"));
         assertEquals("ollama", values.get("provider"));
+        assertEquals("90", values.get("threshold"));
+        assertEquals("5", values.get("max_iterations"));
+        assertEquals("true", values.get("economy"));
+        assertEquals("true", values.get("use_both"));
+    }
+
+    @Test
+    public void everyDesktopProviderHasAStableWorkflowValue() {
+        assertEquals("openai", provider(MobileRunRequest.Provider.OPENAI));
+        assertEquals("anthropic", provider(MobileRunRequest.Provider.ANTHROPIC));
+        assertEquals("copilot", provider(MobileRunRequest.Provider.COPILOT));
+        assertEquals("ollama", provider(MobileRunRequest.Provider.OLLAMA));
     }
 
     @Test
@@ -69,6 +81,24 @@ public final class MobileRunRequestTest {
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
                 ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
                 "owner/repo", "main", "", "", false, 151));
+    }
+
+    @Test
+    public void invalidRefactorControlsFailClosed() {
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                MobileRunRequest.Mode.REFACTOR, MobileRunRequest.Provider.OPENAI,
+                "owner/repo", "main", "src/app.py", "Improve it", false, 25,
+                101, 5, true, true));
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                MobileRunRequest.Mode.REFACTOR, MobileRunRequest.Provider.OPENAI,
+                "owner/repo", "main", "src/app.py", "Improve it", false, 25,
+                90, 0, true, true));
+    }
+
+    private String provider(MobileRunRequest.Provider provider) {
+        return new MobileRunRequest(ID, MobileRunRequest.Mode.AUDIT, provider,
+                "owner/repo", "main", "", "", false, 25)
+                .workflowInputs().get("provider");
     }
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file,

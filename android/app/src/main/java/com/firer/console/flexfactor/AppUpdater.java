@@ -40,12 +40,43 @@ final class AppUpdater {
         void onError(String message);
     }
 
+    interface CheckCallback {
+        void onUpToDate(String versionName);
+        void onUpdateAvailable(String versionName);
+        void onError(String message);
+    }
+
     private final Context context;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     AppUpdater(Context context) {
         this.context = context.getApplicationContext();
+    }
+
+    void check(CheckCallback callback) {
+        worker.execute(() -> {
+            try {
+                UpdateInfo update = fetchManifest();
+                PackageInfo installed = installedPackage();
+                if (UpdatePolicy.isNewer(update.versionCode, versionCode(installed))) {
+                    post(() -> callback.onUpdateAvailable(update.versionName));
+                } else {
+                    String installedName = installed.versionName == null
+                            ? "unknown" : installed.versionName;
+                    post(() -> callback.onUpToDate(installedName));
+                }
+            } catch (Exception failed) {
+                String detail = failed.getMessage();
+                if (detail == null || detail.trim().isEmpty()) {
+                    detail = failed.getClass().getSimpleName();
+                }
+                String message = detail;
+                post(() -> callback.onError(message));
+            } finally {
+                worker.shutdown();
+            }
+        });
     }
 
     void checkAndInstall(Callback callback) {
