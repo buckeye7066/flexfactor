@@ -140,13 +140,56 @@ jobs:
           release_dir="android/app/build/outputs/apk/release/publish"
           version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
             "android/app/build/outputs/apk/release/app-release.apk")
-          gh release create "$GITHUB_REF_NAME" \
-            "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
-            "$release_dir/android-update.json#Signed update manifest" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "FlexFactor Android ${version_name}" \
-            --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_dir="$RUNNER_TEMP/existing-release-assets"
+            mkdir -p "$existing_dir"
+            asset_names=$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name')
+            ensure_asset() {
+              local asset_path="$1"
+              local asset_name="$2"
+              local asset_label="$3"
+              if printf '%s\n' "$asset_names" | grep -Fqx "$asset_name"; then
+                gh release download "$GITHUB_REF_NAME" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --pattern "$asset_name" \
+                  --dir "$existing_dir"
+                if ! cmp -s "$asset_path" "$existing_dir/$asset_name"; then
+                  echo "Existing release asset $asset_name does not match this exact build" >&2
+                  exit 1
+                fi
+              else
+                gh release upload "$GITHUB_REF_NAME" \
+                  "$asset_path#$asset_label" \
+                  --repo "$GITHUB_REPOSITORY"
+              fi
+            }
+            ensure_asset \
+              "$release_dir/flexfactor-${version_name}.apk" \
+              "flexfactor-${version_name}.apk" \
+              "FlexFactor Android ${version_name}"
+            ensure_asset \
+              "$release_dir/android-update.json" \
+              "android-update.json" \
+              "Signed update manifest"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --prerelease=false \
+              --latest \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
+              "$release_dir/android-update.json#Signed update manifest" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+          fi
       - name: Upload signed exact-commit Android release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
