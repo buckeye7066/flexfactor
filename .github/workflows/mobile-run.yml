@@ -64,7 +64,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+      COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       PYTHONUTF8: "1"
 

@@ -50,6 +50,7 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         for mode in ("refactor", "scout", "audit", "prodready"):
             self.assertIn(mode, workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("github.token", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("copilot-requests: write", workflow)
         self.assertIn("@github/copilot", workflow)
@@ -76,7 +77,7 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" /
                     "android-client.yml").read_text(encoding="utf-8")
         self.assertIn("copilot-requests: write", workflow)
-        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("github.token", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
         self.assertIn("@github/copilot", workflow)
 

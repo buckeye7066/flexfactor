@@ -50,9 +50,9 @@ jobs:
       - name: Verify the default phone model provider
         shell: bash
         env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          test -n "$COPILOT_GITHUB_TOKEN" || { echo "Mobile GitHub token is not configured" >&2; exit 1; }
+          test -n "$COPILOT_GITHUB_TOKEN" || { echo "GitHub Actions token is unavailable" >&2; exit 1; }
           npm install --global @github/copilot
           result=$(printf 'Reply with FLEXFACTOR_READY only.\n' | \
             copilot -s --no-ask-user --no-auto-update --no-color --no-custom-instructions)
