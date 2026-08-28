@@ -177,9 +177,10 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("FLEXFACTOR_READY", workflow)
         self.assertIn("bundlePlay", workflow)
         self.assertIn("app-play.aab", workflow)
-        self.assertIn('jarsigner -verify "$aab"', workflow)
-        self.assertIn('grep -Fq "jar verified."', workflow)
-        self.assertIn('grep -Fq "jar is unsigned."', workflow)
+        self.assertIn("Prove strict bundle signature policy", workflow)
+        self.assertIn("Strict verification accepted a partially signed archive", workflow)
+        self.assertIn("jarsigner -verify -strict", workflow)
+        self.assertIn("-storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD", workflow)
         self.assertNotIn("jarsigner -verify -strict", workflow)
         self.assertNotIn("bundle/play/app-release.aab", workflow)
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
