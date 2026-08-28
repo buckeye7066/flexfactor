@@ -55,6 +55,7 @@ PHONE_RUN_DIR = os.path.join(os.path.expanduser("~"), ".phone-console")
 PHONE_PROVIDER_PATH = os.path.join(PHONE_RUN_DIR, "providers.json")
 PROVIDER_INSTALL_PID_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.pid")
 PROVIDER_INSTALL_LOG_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.log")
+PROVIDER_INSTALL_STATUS_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.json")
 AUDIT_PID_PATH = os.path.join(PHONE_RUN_DIR, "audit.pid")
 AUDIT_LOG_PATH = os.path.join(PHONE_RUN_DIR, "flexfactor-audit.log")
 AUDIT_LOCK_PATH = os.path.join(PHONE_RUN_DIR, "audit.lock")
@@ -66,6 +67,7 @@ CLOUD_PROVIDER_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
 }
 LAUNCH_LOCK = threading.Lock()
+PROVIDER_CONFIG_LOCK = threading.Lock()
 
 # Inherited from flexfactor_dashboard_v2: quiet longer than this is worth
 # SAYING, but it is explicitly NOT death - long fix loops legitimately go
@@ -481,42 +483,44 @@ def save_phone_provider(body: dict, *, env=None,
     if any(ord(char) < 32 or ord(char) == 127 for char in api_key):
         raise ValueError("API key has an invalid format")
 
-    existing = _load_phone_provider_env(provider_path)
-    providers = {}
-    for name, env_name in CLOUD_PROVIDER_ENV.items():
-        value = existing.get(env_name)
-        if value:
-            providers[name] = value
-    providers[provider] = api_key
-    parent = os.path.dirname(provider_path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(parent, 0o700)
-    except OSError:
-        pass
-    temporary = provider_path + ".tmp-" + secrets.token_hex(8)
-    descriptor = None
-    try:
-        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
-            descriptor = None
-            json.dump({"version": 1, "providers": providers}, fh,
-                      separators=(",", ":"), sort_keys=True)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(temporary, provider_path)
+    with PROVIDER_CONFIG_LOCK:
+        existing = _load_phone_provider_env(provider_path)
+        providers = {}
+        for name, env_name in CLOUD_PROVIDER_ENV.items():
+            value = existing.get(env_name)
+            if value:
+                providers[name] = value
+        providers[provider] = api_key
+        parent = os.path.dirname(provider_path)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
         try:
-            os.chmod(provider_path, 0o600)
+            os.chmod(parent, 0o700)
         except OSError:
             pass
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        temporary = provider_path + ".tmp-" + secrets.token_hex(8)
+        descriptor = None
         try:
-            os.unlink(temporary)
-        except OSError:
-            pass
+            descriptor = os.open(
+                temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                descriptor = None
+                json.dump({"version": 1, "providers": providers}, fh,
+                          separators=(",", ":"), sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, provider_path)
+            try:
+                os.chmod(provider_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
     effective = _effective_provider_env(env, provider_path)
     state = next(item for item in _provider_readiness(effective)
@@ -528,6 +532,8 @@ def save_phone_provider(body: dict, *, env=None,
 def start_phone_provider_install(body: dict, *, env=None,
                                  pid_path=PROVIDER_INSTALL_PID_PATH,
                                  log_path=PROVIDER_INSTALL_LOG_PATH,
+                                 status_path=PROVIDER_INSTALL_STATUS_PATH,
+                                 audit_pid_path=AUDIT_PID_PATH,
                                  popen=subprocess.Popen,
                                  start_reaper=None) -> dict:
     """Start one fixed, allowlisted SDK install without accepting shell input."""
@@ -541,13 +547,23 @@ def start_phone_provider_install(body: dict, *, env=None,
     if not os.path.isfile(script):
         raise OSError("provider installer is missing")
     with LAUNCH_LOCK:
+        audit_pid = _running_audit_pid(audit_pid_path)
+        if audit_pid:
+            raise ValueError(
+                "provider support cannot be installed while audit pid {} is running".format(
+                    audit_pid))
         running = _running_audit_pid(pid_path)
         if running:
             return {"ok": True, "provider": provider, "pid": running,
                     "installing": True}
         os.makedirs(os.path.dirname(pid_path), exist_ok=True)
         command = ["bash", script, provider]
-        child_env = dict(env)
+        install_env_names = (
+            "PATH", "HOME", "PREFIX", "TMPDIR", "LANG", "LC_ALL",
+            "TERMUX_VERSION", "ANDROID_ROOT", "ANDROID_DATA",
+        )
+        child_env = {name: str(env[name]) for name in install_env_names
+                     if env.get(name) is not None}
         with open(log_path, "a", encoding="utf-8") as log:
             log.write("\n--- {} installing {} support ---\n".format(
                 time.strftime("%Y-%m-%dT%H:%M:%S%z"), provider))
@@ -562,12 +578,27 @@ def start_phone_provider_install(body: dict, *, env=None,
             with open(temporary, "w", encoding="utf-8") as fh:
                 fh.write(str(process.pid) + "\n")
             os.replace(temporary, pid_path)
+            try:
+                os.unlink(status_path)
+            except OSError:
+                pass
+        except OSError:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - preserve the PID-write failure
+                pass
+            raise
         finally:
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
-    (start_reaper or _start_audit_reaper)(process, pid_path)
+    if start_reaper is None:
+        _start_provider_install_reaper(
+            process, pid_path, status_path, provider)
+    else:
+        start_reaper(process, pid_path)
     return {"ok": True, "provider": provider, "pid": process.pid,
             "installing": True}
 
@@ -691,6 +722,69 @@ def _start_audit_reaper(process, pid_path: str) -> None:
     threading.Thread(target=reap, name="flexfactor-audit-reaper", daemon=True).start()
 
 
+def _load_provider_install_status(status_path=PROVIDER_INSTALL_STATUS_PATH) -> dict:
+    try:
+        with open(status_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    provider = payload.get("provider")
+    state = payload.get("state")
+    if provider not in CLOUD_PROVIDER_ENV or state not in ("installed", "failed"):
+        return {}
+    return {"provider": provider, "state": state,
+            "detail": ("Provider support installed."
+                       if state == "installed" else
+                       "Provider installation failed. In Termux, run "
+                       "flexfactor-engine provider-log for details.")}
+
+
+def _start_provider_install_reaper(process, pid_path: str, status_path: str,
+                                   provider: str) -> None:
+    """Record a sanitized installer outcome and clear only this child PID."""
+    def reap() -> None:
+        try:
+            return_code = process.wait()
+        except Exception:  # noqa: BLE001 - a lost child is a failed install
+            return_code = -1
+        parent = os.path.dirname(status_path)
+        os.makedirs(parent, exist_ok=True)
+        temporary = status_path + ".tmp-" + secrets.token_hex(8)
+        try:
+            descriptor = os.open(
+                temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                json.dump({"provider": provider,
+                           "state": "installed" if return_code == 0 else "failed"},
+                          fh, separators=(",", ":"), sort_keys=True)
+                fh.write("\n")
+            os.replace(temporary, status_path)
+            try:
+                os.chmod(status_path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        with LAUNCH_LOCK:
+            try:
+                with open(pid_path, "r", encoding="utf-8") as fh:
+                    recorded = int(fh.read().strip())
+                if recorded == process.pid:
+                    os.unlink(pid_path)
+            except (OSError, TypeError, ValueError):
+                pass
+
+    threading.Thread(target=reap, name="flexfactor-provider-install-reaper",
+                     daemon=True).start()
+
+
 def phone_launch_state(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict:
     env = os.environ if env is None else env
     phone = _is_phone_environment(env)
@@ -701,6 +795,8 @@ def phone_launch_state(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict:
         "providers": _provider_readiness(effective) if phone else [],
         "provider_install_pid": (_running_audit_pid(PROVIDER_INSTALL_PID_PATH)
                                  if phone else None),
+        "provider_install": (_load_provider_install_status()
+                             if phone else {}),
         "running_pid": _running_audit_pid() if phone else None,
         "default_max_cost": 10,
         "policy": "Changes stay on this phone; launch never pushes or merges.",
@@ -710,6 +806,7 @@ def phone_launch_state(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict:
 def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                     pid_path=AUDIT_PID_PATH, log_path=AUDIT_LOG_PATH,
                     lock_path=AUDIT_LOCK_PATH, provider_path=PHONE_PROVIDER_PATH,
+                    provider_install_pid_path=PROVIDER_INSTALL_PID_PATH,
                     popen=subprocess.Popen,
                     start_reaper=_start_audit_reaper) -> dict:
     """Validate and spawn one detached phone run without invoking a shell."""
@@ -743,6 +840,11 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
         raise ValueError(provider + " is not ready: " + detail)
 
     with LAUNCH_LOCK:
+        installing = _running_audit_pid(provider_install_pid_path)
+        if installing:
+            raise ValueError(
+                "an audit cannot start while provider installation pid {} is running".format(
+                    installing))
         os.makedirs(os.path.dirname(pid_path), exist_ok=True)
         _acquire_audit_start_lock(lock_path, pid_path)
         try:
@@ -862,6 +964,7 @@ function launchHtml(l){
   if(!l||!l.available) return "";
   var providers=l.providers||[], programs=l.programs||[], running=l.running_pid;
   var installing=l.provider_install_pid;
+  var installStatus=l.provider_install||{};
   if(!LAUNCH_DRAFT.program&&programs.length) LAUNCH_DRAFT.program=programs[0].path;
   var selectedProvider=providers.find(function(p){return p.name===LAUNCH_DRAFT.provider;});
   if(!selectedProvider){
@@ -893,6 +996,7 @@ function launchHtml(l){
     '<div class="dim">This run may edit the selected repository locally. It cannot push or merge.</div>'+
     (running?'<div class="dim" style="margin-top:8px">Audit process '+running+' is already running.</div>':'')+
     (!programs.length?'<div class="warnbox">No Git repositories were found in the phone project roots.</div>':'')+
+    (!installing&&installStatus.state==='failed'&&installStatus.provider===LAUNCH_DRAFT.provider?'<div class="warnbox">'+esc(installStatus.detail)+'</div>':'')+
     (!selectedProvider.ready?'<div class="warnbox">Provider setup needed: '+esc(selectedProvider.detail||'none is ready')+'. Save a key above; if the SDK is missing, use the app setup action once.</div>':'')+
     '<button class="launchbtn" '+(disabled?'disabled':'')+' onclick="submitLaunch(this)">Start FlexFactor</button></div>';
   return h;
@@ -1081,8 +1185,6 @@ function card(p){
   return h;
 }
 function tick(){
-  var providerKey=document.getElementById('providerKey');
-  if(providerKey&&providerKey.value) return;
   fetch("/api/state?t="+encodeURIComponent(TOKEN),{cache:"no-store"})
    .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
    .then(function(d){
@@ -1090,13 +1192,19 @@ function tick(){
        d.host+" · status "+(d.status_quiet_s==null?"never seen":
        "updated "+dur(d.status_quiet_s)+" ago");
      var a=document.getElementById("app");
+     var oldKey=document.getElementById('providerKey');
+     var keyValue=oldKey?oldKey.value:'';
      var launcher=launchHtml(d.launch);
      if(!d.programs.length){
        a.innerHTML=launcher+'<div class="empty">No active programs.<br>'+
          '<span style="font-size:12px">FlexFactor writes status.json when a run starts.</span></div>';
+       var restoredEmpty=document.getElementById('providerKey');
+       if(restoredEmpty) restoredEmpty.value=keyValue;
        return;
      }
      a.innerHTML = launcher+d.programs.map(card).join("");
+     var restored=document.getElementById('providerKey');
+     if(restored) restored.value=keyValue;
    })
    .catch(function(e){
      document.getElementById("sub").textContent = "offline — "+e.message;
