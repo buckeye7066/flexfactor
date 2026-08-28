@@ -39,7 +39,9 @@ jobs:
           gradle-version: "8.13"
       - name: Install Android SDK 36
         shell: bash
-        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;35.0.0"
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
       - name: Unit tests, lint, and debug APK
         shell: bash
         run: gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
@@ -75,7 +77,9 @@ jobs:
           gradle-version: "8.13"
       - name: Install Android SDK 36
         shell: bash
-        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;35.0.0"
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
       - name: Materialize protected release key
         shell: bash
         env:
