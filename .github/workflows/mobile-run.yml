@@ -61,7 +61,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+      # The app-managed token enables other owner repositories. The scoped
+      # Actions token keeps the control repository usable before first setup
+      # and gives same-repository report-only runs a least-surprise recovery path.
+      GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
@@ -127,7 +130,7 @@ jobs:
       - name: Require protected mobile credentials
         shell: bash
         run: |
-          test -n "$GH_TOKEN" || { echo "FLEXFACTOR_MOBILE_GITHUB_TOKEN is missing" >&2; exit 1; }
+          test -n "$GH_TOKEN" || { echo "GitHub workflow credential is unavailable" >&2; exit 1; }
           if [ "${{ inputs.provider }}" = openai ]; then
             test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
           fi
@@ -143,7 +146,7 @@ jobs:
         with:
           repository: ${{ inputs.target_repository }}
           ref: ${{ inputs.target_ref }}
-          token: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+          token: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
           path: target
           fetch-depth: 0
           persist-credentials: true
