@@ -40,11 +40,15 @@ public final class MainActivity extends Activity {
     public static final String ENDPOINT_KEY = "local_endpoint";
     public static final String PENDING_ENDPOINT_KEY = "pending_local_endpoint";
     public static final String RECOVERY_STATUS_KEY = "recovery_status";
+    public static final String RECOVERY_NONCE_KEY = "recovery_nonce";
     private static final String RECOVERED_VERSION_KEY = "recovered_version";
+    private static final String RECOVERY_IN_FLIGHT_KEY = "recovery_in_flight";
+    private static final String RECOVERY_STARTED_KEY = "recovery_started_at";
+    private static final String RECOVERY_IS_REPAIR_KEY = "recovery_is_repair";
     private static final int RUN_COMMAND_PERMISSION_REQUEST = 410;
     private static final long RECOVERY_POLL_MS = 1000L;
     private static final long COMMAND_ACCEPT_TIMEOUT_MS = 12000L;
-    private static final long RECOVERY_TIMEOUT_MS = 300000L;
+    private static final long RECOVERY_TIMEOUT_MS = 30L * 60L * 1000L;
 
     private FrameLayout root;
     private WebView web;
@@ -53,6 +57,7 @@ public final class MainActivity extends Activity {
     private boolean handoffDialogVisible;
     private boolean recoveryMode;
     private boolean permissionPromptShown;
+    private boolean permissionRequestInFlight;
     private boolean repairAfterPermission;
     private boolean externalSetupPending;
     private long recoveryStartedAt;
@@ -66,6 +71,7 @@ public final class MainActivity extends Activity {
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.rgb(11, 15, 20));
         setContentView(root);
+        restoreRecoveryState();
         acceptActivityHandoff();
         render();
         confirmPendingHandoff();
@@ -415,7 +421,12 @@ public final class MainActivity extends Activity {
         }
         if (checkSelfPermission(EngineRecoveryScript.TERMUX_PERMISSION)
                 != PackageManager.PERMISSION_GRANTED) {
-            repairAfterPermission = repair;
+            int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .getInt(RECOVERED_VERSION_KEY, 0);
+            repairAfterPermission = repairAfterPermission || repair
+                    || recovered < installedVersionCode();
+            if (permissionRequestInFlight) return;
+            permissionRequestInFlight = true;
             requestPermissions(new String[]{EngineRecoveryScript.TERMUX_PERMISSION},
                     RUN_COMMAND_PERMISSION_REQUEST);
             return;
@@ -428,8 +439,11 @@ public final class MainActivity extends Activity {
             int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode != RUN_COMMAND_PERMISSION_REQUEST) return;
+        permissionRequestInFlight = false;
         if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            runTermuxCommand(repairAfterPermission);
+            int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .getInt(RECOVERED_VERSION_KEY, 0);
+            runTermuxCommand(repairAfterPermission || recovered < installedVersionCode());
             return;
         }
         new AlertDialog.Builder(this)
@@ -443,10 +457,17 @@ public final class MainActivity extends Activity {
     }
 
     private void runTermuxCommand(boolean repair) {
+        String nonce = java.util.UUID.randomUUID().toString();
+        long started = System.currentTimeMillis();
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .putString(RECOVERY_STATUS_KEY, "requested").apply();
+                .putString(RECOVERY_STATUS_KEY, "requested")
+                .putString(RECOVERY_NONCE_KEY, nonce)
+                .putBoolean(RECOVERY_IN_FLIGHT_KEY, true)
+                .putBoolean(RECOVERY_IS_REPAIR_KEY, repair)
+                .putLong(RECOVERY_STARTED_KEY, started)
+                .apply();
         recoveryMode = true;
-        recoveryStartedAt = android.os.SystemClock.elapsedRealtime();
+        recoveryStartedAt = started;
         displayedRecoveryStatus = "requested";
         showRecovery(displayedRecoveryStatus);
 
@@ -457,7 +478,8 @@ public final class MainActivity extends Activity {
         command.putExtra("com.termux.RUN_COMMAND_PATH", EngineRecoveryScript.BASH);
         command.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"-s"});
         command.putExtra("com.termux.RUN_COMMAND_STDIN",
-                repair ? EngineRecoveryScript.repairScript() : EngineRecoveryScript.startScript());
+                repair ? EngineRecoveryScript.repairScript(nonce)
+                        : EngineRecoveryScript.startScript(nonce));
         command.putExtra("com.termux.RUN_COMMAND_WORKDIR", EngineRecoveryScript.HOME);
         command.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
         command.putExtra("com.termux.RUN_COMMAND_COMMAND_LABEL", "FlexFactor engine recovery");
@@ -478,10 +500,15 @@ public final class MainActivity extends Activity {
         confirmPendingHandoff();
         String status = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                 .getString(RECOVERY_STATUS_KEY, "requested");
-        long elapsed = android.os.SystemClock.elapsedRealtime() - recoveryStartedAt;
+        long elapsed = Math.max(0L, System.currentTimeMillis() - recoveryStartedAt);
         if ("ready".equals(status)) {
-            getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                    .putInt(RECOVERED_VERSION_KEY, installedVersionCode()).apply();
+            boolean wasRepair = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .getBoolean(RECOVERY_IS_REPAIR_KEY, false);
+            if (wasRepair) {
+                getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+                        .putInt(RECOVERED_VERSION_KEY, installedVersionCode()).apply();
+            }
+            clearRecoveryInFlight();
             recoveryMode = false;
             loadedEndpoint = "";
             render();
@@ -489,6 +516,7 @@ public final class MainActivity extends Activity {
             return;
         }
         if (isRecoveryFailure(status)) {
+            clearRecoveryInFlight();
             recoveryMode = false;
             displayedRecoveryStatus = status;
             showRecovery(status);
@@ -499,6 +527,7 @@ public final class MainActivity extends Activity {
             return;
         }
         if (elapsed >= RECOVERY_TIMEOUT_MS) {
+            clearRecoveryInFlight();
             recoveryMode = false;
             displayedRecoveryStatus = "timed-out";
             showRecovery(displayedRecoveryStatus);
@@ -566,6 +595,7 @@ public final class MainActivity extends Activity {
 
     private void showExternalAppsSetup() {
         handler.removeCallbacks(recoveryPoll);
+        clearRecoveryInFlight();
         recoveryMode = false;
         ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         new AlertDialog.Builder(this)
@@ -601,6 +631,34 @@ public final class MainActivity extends Activity {
         } catch (PackageManager.NameNotFoundException impossible) {
             return 0;
         }
+    }
+
+    private void restoreRecoveryState() {
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        if (!prefs.getBoolean(RECOVERY_IN_FLIGHT_KEY, false)) return;
+        long started = prefs.getLong(RECOVERY_STARTED_KEY, 0L);
+        long age = Math.max(0L, System.currentTimeMillis() - started);
+        if (started <= 0L || age >= RECOVERY_TIMEOUT_MS) {
+            clearRecoveryInFlight();
+            return;
+        }
+        String nonce = prefs.getString(RECOVERY_NONCE_KEY, "");
+        if (nonce.isEmpty()) {
+            clearRecoveryInFlight();
+            return;
+        }
+        recoveryMode = true;
+        recoveryStartedAt = started;
+        displayedRecoveryStatus = prefs.getString(RECOVERY_STATUS_KEY, "requested");
+    }
+
+    private void clearRecoveryInFlight() {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+                .remove(RECOVERY_IN_FLIGHT_KEY)
+                .remove(RECOVERY_STARTED_KEY)
+                .remove(RECOVERY_IS_REPAIR_KEY)
+                .remove(RECOVERY_NONCE_KEY)
+                .apply();
     }
 
     private TextView text(String value, int sp, int color) {
