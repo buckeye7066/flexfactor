@@ -154,6 +154,11 @@ cmd_run() {
   local mode="$1"; shift
   [ $# -ge 1 ] || { echo "usage: flexfactor-engine $mode <program> [args...]" >&2; exit 2; }
   [ -d "$APP_DIR" ] || { echo "not installed: $APP_DIR" >&2; exit 1; }
+  if [ -f "$RUN_DIR/provider-install.pid" ] && \
+     kill -0 "$(cat "$RUN_DIR/provider-install.pid")" 2>/dev/null; then
+    echo "provider support is still installing; wait for it to finish before starting an audit" >&2
+    exit 1
+  fi
   acquire_audit_lock || exit 1
   trap release_audit_lock EXIT
   if [ -f "$RUN_DIR/audit.pid" ] && kill -0 "$(cat "$RUN_DIR/audit.pid")" 2>/dev/null; then
@@ -178,8 +183,9 @@ case "${1:-status}" in
   restart)   cmd_stop; cmd_start ;;
   status)    cmd_status ;;
   logs)      tail -n "${2:-80}" "$LOG_FILE" ;;
+  provider-log) tail -n "${2:-80}" "$RUN_DIR/provider-install.log" ;;
   audit-log) tail -n "${2:-80}" "$AUDIT_LOG" ;;
   run|audit) shift; cmd_run audit "$@" ;;
   prodready) shift; cmd_run prodready "$@" ;;
-  *) echo "usage: flexfactor-engine start|stop|restart|status|logs|audit-log|run <program>|prodready <program>" >&2; exit 2 ;;
+  *) echo "usage: flexfactor-engine start|stop|restart|status|logs|provider-log|audit-log|run <program>|prodready <program>" >&2; exit 2 ;;
 esac
