@@ -8,7 +8,7 @@ import java.util.regex.Pattern;
 /** Immutable, validated input for the standalone GitHub Actions runner. */
 public final class MobileRunRequest {
     public enum Provider {
-        COPILOT("copilot"),
+        OLLAMA("ollama"),
         OPENAI("openai");
 
         final String wire;
