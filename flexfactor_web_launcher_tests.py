@@ -249,6 +249,17 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertIn("cannot push or merge", web.PAGE)
         self.assertIn("/api/launch", web.PAGE)
 
+    def test_android_webview_enables_launcher_dialogs(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "android", "app", "src", "main", "java",
+            "com", "firer", "console", "flexfactor", "MainActivity.java",
+        )
+        with open(path, encoding="utf-8") as fh:
+            activity = fh.read()
+        self.assertIn("import android.webkit.WebChromeClient;", activity)
+        self.assertIn(
+            "web.setWebChromeClient(new WebChromeClient());", activity)
+
 
 if __name__ == "__main__":
     unittest.main()
