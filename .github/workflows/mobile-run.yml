@@ -83,12 +83,12 @@ on:
       economy: {required: true, type: boolean}
       use_both: {required: true, type: boolean}
     secrets:
-      FLEXFACTOR_MOBILE_GITHUB_TOKEN: {required: false}
       OPENAI_API_KEY: {required: false}
       ANTHROPIC_API_KEY: {required: false}
 
 permissions:
   actions: read
+  copilot-requests: write
   contents: write
   issues: write
   pull-requests: write
@@ -103,13 +103,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      # The app-managed token enables other owner repositories. The scoped
-      # Actions token keeps the control repository usable before first setup
-      # and gives same-repository report-only runs a least-surprise recovery path.
-      GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
+      # Runs execute inside the selected repository. The short-lived scoped
+      # Actions token is sufficient; the owner's PAT is never persisted there.
+      GH_TOKEN: ${{ github.token }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
+      COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       FLEXFACTOR_PHONE_MODEL: qwen2.5-coder:7b
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
@@ -202,7 +201,7 @@ jobs:
         with:
           repository: ${{ inputs.target_repository }}
           ref: ${{ inputs.target_ref }}
-          token: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
+          token: ${{ github.token }}
           path: target
           fetch-depth: 0
           persist-credentials: true
@@ -333,6 +332,7 @@ jobs:
           fi
 
           if [ "$MODE" = refactor ]; then
+            if [ "$ECONOMY" = true ]; then provider_args+=(--economy); fi
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?
             backup_path="target/$TARGET_FILE.bak"

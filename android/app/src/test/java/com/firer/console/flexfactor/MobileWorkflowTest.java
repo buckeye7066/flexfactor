@@ -13,7 +13,8 @@ public final class MobileWorkflowTest {
         assertTrue(workflow.contains("target_repository: ${{ github.repository }}"));
         assertTrue(workflow.contains("contents: write"));
         assertTrue(workflow.contains("pull-requests: write"));
-        assertTrue(workflow.contains("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN"));
+        assertTrue(workflow.contains("copilot-requests: write"));
+        assertFalse(workflow.contains("FLEXFACTOR_MOBILE_GITHUB_TOKEN"));
         assertFalse(workflow.contains("buckeye7066/flexfactor/actions/workflows"));
     }
 

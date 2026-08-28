@@ -65,12 +65,18 @@ public final class MainActivity extends Activity {
     private TextView runState;
     private boolean destroyed;
     private boolean polling;
+    private boolean pendingStartupUpdate;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         secrets = new SecureStore(this);
+        if (preferences.getLong(LAST_RUN_ID, 0L) > 0L
+                && !preferences.contains(LAST_RUN_REPOSITORY)) {
+            preferences.edit().putString(
+                    LAST_RUN_REPOSITORY, GitHubApi.CONTROL_REPOSITORY).apply();
+        }
         renderHome();
         if (!configured()) main.postDelayed(this::showCredentialSetup, 350L);
         main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
@@ -82,6 +88,11 @@ public final class MainActivity extends Activity {
         super.onResume();
         refreshHeader();
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
+        if (pendingStartupUpdate && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                || getPackageManager().canRequestPackageInstalls())) {
+            pendingStartupUpdate = false;
+            startUpdate();
+        }
     }
 
     @Override
@@ -191,7 +202,7 @@ public final class MainActivity extends Activity {
                     + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
-            accountState.setText("One-time setup needed: GitHub token · OpenAI key optional");
+            accountState.setText("One-time setup needed: GitHub token · OpenAI/Anthropic optional");
             accountState.setTextColor(Color.rgb(248, 81, 73));
         }
         if (repositoryButton != null) {
@@ -677,8 +688,7 @@ public final class MainActivity extends Activity {
         List<RunRecord> records = runHistory();
         if (records.isEmpty()) {
             long id = preferences.getLong(LAST_RUN_ID, 0L);
-            String repository = preferences.getString(LAST_RUN_REPOSITORY,
-                    preferences.getString(REPOSITORY, ""));
+            String repository = lastRunRepository();
             if (id > 0 && !repository.isEmpty()) {
                 records.add(new RunRecord(id, repository,
                         preferences.getString(LAST_RUN_REQUEST_ID, ""),
@@ -880,8 +890,7 @@ public final class MainActivity extends Activity {
 
     private void viewLastRunResults() {
         long id = preferences.getLong(LAST_RUN_ID, 0L);
-        String repository = preferences.getString(LAST_RUN_REPOSITORY,
-                preferences.getString(REPOSITORY, ""));
+        String repository = lastRunRepository();
         if (id <= 0 || repository.isEmpty()) {
             Toast.makeText(this, "No FlexFactor run is available yet", Toast.LENGTH_LONG).show();
             return;
@@ -968,6 +977,13 @@ public final class MainActivity extends Activity {
         dialog.show();
     }
 
+    private String lastRunRepository() {
+        if (!preferences.contains(LAST_RUN_REPOSITORY)) {
+            return GitHubApi.CONTROL_REPOSITORY;
+        }
+        return preferences.getString(LAST_RUN_REPOSITORY, GitHubApi.CONTROL_REPOSITORY);
+    }
+
     private void startUpdate() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 && !getPackageManager().canRequestPackageInstalls()) {
@@ -1006,16 +1022,27 @@ public final class MainActivity extends Activity {
 
     private void checkForUpdateOnLaunch() {
         if (destroyed || isFinishing()) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                && !getPackageManager().canRequestPackageInstalls()) return;
-        new AppUpdater(this).checkAndInstall(new AppUpdater.Callback() {
+        new AppUpdater(this).check(new AppUpdater.CheckCallback() {
             @Override public void onUpToDate(String versionName) {
                 // Startup checks are silent when the installed package is current.
             }
-            @Override public void onInstallerReady(String versionName) {
-                Toast.makeText(MainActivity.this,
-                        "FlexFactor " + versionName + " is ready. Confirm the Android update.",
-                        Toast.LENGTH_LONG).show();
+            @Override public void onUpdateAvailable(String versionName) {
+                if (destroyed || isFinishing()) return;
+                pendingStartupUpdate = true;
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                        || getPackageManager().canRequestPackageInstalls()) {
+                    pendingStartupUpdate = false;
+                    startUpdate();
+                    return;
+                }
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("FlexFactor " + versionName + " is available")
+                        .setMessage("Android needs Allow from this source before FlexFactor can install its verified signed update.")
+                        .setNegativeButton("Later", null)
+                        .setPositiveButton("Allow updates", (dialog, which) -> startActivity(
+                                new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                        Uri.parse("package:" + getPackageName()))))
+                        .show();
             }
             @Override public void onError(String message) {
                 // The explicit Update button remains the visible recovery path.

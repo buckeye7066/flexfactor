@@ -58,6 +58,7 @@ final class MobileWorkflow {
                 "",
                 "permissions:",
                 "  actions: read",
+                "  copilot-requests: write",
                 "  contents: write",
                 "  issues: write",
                 "  pull-requests: write",
@@ -80,7 +81,6 @@ final class MobileWorkflow {
                 "      economy: ${{ inputs.economy }}",
                 "      use_both: ${{ inputs.use_both }}",
                 "    secrets:",
-                "      FLEXFACTOR_MOBILE_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}",
                 "      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}",
                 "      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}",
                 "");

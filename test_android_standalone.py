@@ -49,8 +49,9 @@ class StandaloneAndroidInvariants(unittest.TestCase):
                     "mobile-run.yml").read_text(encoding="utf-8")
         for mode in ("refactor", "scout", "audit", "prodready"):
             self.assertIn(mode, workflow)
-        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
-        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token", workflow)
+        self.assertNotIn("FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("copilot-requests: write", workflow)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
@@ -82,6 +83,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertNotIn('if (row.optBoolean("private"', api)
         self.assertIn("ensureTargetWorkflow", api)
         self.assertIn("MobileWorkflow.FILE_NAME", api)
+        self.assertIn("installWorkflowThroughPullRequest", api)
+        self.assertIn("GitHub's configured approvals", api)
 
     def test_credentials_are_validated_and_never_deleted_when_switching_provider(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -135,6 +138,12 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("Active and recent runs", activity)
         self.assertIn("RUN_HISTORY", activity)
 
+    def test_pre_32_run_ids_migrate_to_the_legacy_control_repository(self):
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        self.assertIn("!preferences.contains(LAST_RUN_REPOSITORY)", activity)
+        self.assertIn("GitHubApi.CONTROL_REPOSITORY", activity)
+
     def test_mobile_runner_matches_desktop_provider_and_verification_controls(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "mobile-run.yml").read_text(encoding="utf-8")
@@ -143,9 +152,21 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn('--threshold "$THRESHOLD"', workflow)
         self.assertIn('--max-iterations "$MAX_ITERATIONS"', workflow)
         self.assertIn("audit_args+=(--economy)", workflow)
+        self.assertIn("provider_args+=(--economy)", workflow)
         self.assertIn("audit_args+=(--single)", workflow)
         self.assertIn("--auto-clean", workflow)
         self.assertNotIn("--no-auto-clean", workflow)
+
+    def test_owner_pat_is_not_persisted_and_cross_model_keys_are_available(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        dispatch = api.split("RunState dispatch", 1)[1].split("RunState run", 1)[0]
+        self.assertNotIn('"FLEXFACTOR_MOBILE_GITHUB_TOKEN"', dispatch)
+        self.assertIn("request.useBoth", dispatch)
+        provider = api.split("private void prepareProviderSecret", 1)[1]
+        provider = provider.split("private boolean ensureTargetWorkflow", 1)[0]
+        self.assertIn('putRepositorySecret(token, repository, "OPENAI_API_KEY"', provider)
+        self.assertIn('putRepositorySecret(token, repository, "ANTHROPIC_API_KEY"', provider)
 
     def test_android_release_gate_proves_the_default_hosted_provider(self):
         workflow = (ROOT / ".github" / "workflows" /
@@ -154,6 +175,18 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
+
+    def test_startup_update_check_runs_before_installer_permission_gate(self):
+        updater = (ANDROID / "java" / "com" / "firer" / "console" /
+                   "flexfactor" / "AppUpdater.java").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        launch = activity.split("private void checkForUpdateOnLaunch", 1)[1]
+        launch = launch.split("private void resetUpdateButton", 1)[0]
+        self.assertIn("new AppUpdater(this).check", launch)
+        self.assertIn("onUpdateAvailable", launch)
+        self.assertIn("Allow updates", launch)
+        self.assertIn("void check(CheckCallback callback)", updater)
 
 
 if __name__ == "__main__":

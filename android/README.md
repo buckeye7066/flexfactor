@@ -21,10 +21,11 @@ Open **Credentials** and enter:
 FlexFactor validates the GitHub account before saving anything. A pinned Ollama
 runtime and coding model run in the disposable Actions runner by default; an
 optional OpenAI key is validated live when saved. Values are encrypted at rest with a
-non-exportable Android Keystore key. The app then encrypts them with the
-repository's GitHub Actions public key and writes them to protected Actions
-secrets; neither value is sent as a workflow input, URL, command argument,
-artifact, or log field.
+non-exportable Android Keystore key. Vendor keys are encrypted with the
+repository's GitHub Actions public key and written to protected Actions secrets;
+they are never workflow inputs, URLs, command arguments, artifacts, or log fields.
+The owner GitHub token is not copied into repositories: each run uses GitHub's
+short-lived, repository-scoped `GITHUB_TOKEN`, including for Copilot requests.
 
 After setup, choose any writable public or private repository and use any original
 mode. FlexFactor installs a small pinned caller workflow into that selected
@@ -85,8 +86,9 @@ signing value is absent; it never falls back to a debug key.
 
 - The Android app connects only to HTTPS GitHub and, when selected, OpenAI endpoints plus the
   HTTPS allowlist used by the signed updater.
-- Credentials are masked in the UI, encrypted locally, and transferred to
-  GitHub only through the official LibSodium-sealed Actions secrets API.
+- Credentials are masked in the UI and encrypted locally. Optional vendor keys
+  use the official LibSodium-sealed Actions secrets API; the owner PAT remains
+  only on the phone.
 - Target code executes on an ephemeral GitHub-hosted runner, not on the phone.
 - Public and private targets run from the pinned caller workflow installed in
   the selected target repository; private metadata remains in that repository.

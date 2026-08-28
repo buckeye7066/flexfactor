@@ -213,7 +213,8 @@ keys are optional. The provider selector also exposes GitHub Copilot and a hoste
 open model. Public and private targets run from a pinned caller installed into the
 selected repository, keeping private run metadata private. Credentials are encrypted with
 Android Keystore and installed as LibSodium-sealed GitHub Actions secrets; they
-are never workflow inputs.
+are never workflow inputs. The owner's GitHub token stays in Android Keystore and
+is never stored in a target repository; runs use GitHub's short-lived scoped token.
 Choose any writable public or private repository, select one of the four modes,
 monitor the exact correlated Actions run, view its error ledger, and submit live
 operator steering from the same app. See
