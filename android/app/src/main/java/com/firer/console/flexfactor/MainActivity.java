@@ -3,7 +3,10 @@ package com.firer.console.flexfactor;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.graphics.Color;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.webkit.WebResourceRequest;
@@ -31,6 +34,8 @@ public final class MainActivity extends Activity {
     private FrameLayout root;
     private WebView web;
     private String loadedEndpoint = "";
+    private Button updateButton;
+    private boolean handoffDialogVisible;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -92,19 +97,27 @@ public final class MainActivity extends Activity {
     private void confirmPendingHandoff() {
         String pending = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                 .getString(PENDING_ENDPOINT_KEY, "");
-        if (pending.isEmpty()) return;
-        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .remove(PENDING_ENDPOINT_KEY).apply();
-        new AlertDialog.Builder(this)
+        if (pending.isEmpty() || handoffDialogVisible) return;
+        handoffDialogVisible = true;
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("Use this phone's engine?")
                 .setMessage("FlexFactor received an authenticated loopback engine address from Termux. Approve this on-phone connection?")
-                .setNegativeButton("Reject", null)
+                .setCancelable(false)
+                .setNegativeButton("Reject", (ignored, which) -> clearPendingHandoff())
                 .setPositiveButton("Use engine", (dialog, which) -> {
+                    clearPendingHandoff();
                     saveEndpoint(pending);
                     loadedEndpoint = "";
                     render();
                 })
-                .show();
+                .create();
+        dialog.setOnDismissListener(ignored -> handoffDialogVisible = false);
+        dialog.show();
+    }
+
+    private void clearPendingHandoff() {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+                .remove(PENDING_ENDPOINT_KEY).apply();
     }
 
     private String storedEndpoint() {
@@ -129,6 +142,7 @@ public final class MainActivity extends Activity {
             showDashboard(endpoint);
         }
         addSettingsButton();
+        addUpdateButton();
     }
 
     private void showUnpaired() {
@@ -198,6 +212,73 @@ public final class MainActivity extends Activity {
         params.gravity = Gravity.END | Gravity.BOTTOM;
         params.setMargins(dp(12), dp(12), dp(12), dp(20));
         root.addView(settings, params);
+    }
+
+    private void addUpdateButton() {
+        updateButton = new Button(this);
+        updateButton.setText("Update");
+        updateButton.setTextSize(14);
+        updateButton.setContentDescription("Check for a FlexFactor update");
+        updateButton.setOnClickListener(view -> startUpdate());
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(116), dp(56));
+        params.gravity = Gravity.START | Gravity.BOTTOM;
+        params.setMargins(dp(12), dp(12), dp(12), dp(20));
+        root.addView(updateButton, params);
+    }
+
+    private void startUpdate() {
+        if (!getPackageManager().canRequestPackageInstalls()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Allow FlexFactor updates")
+                    .setMessage("Android needs permission for FlexFactor to open its signed update in the system installer. Enable Allow from this source, then tap Update again.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Open settings", (dialog, which) -> {
+                        Intent intent = new Intent(
+                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    })
+                    .show();
+            return;
+        }
+
+        updateButton.setEnabled(false);
+        updateButton.setText("Checking…");
+        new AppUpdater(this).checkAndInstall(new AppUpdater.Callback() {
+            @Override
+            public void onUpToDate(String versionName) {
+                resetUpdateButton();
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("FlexFactor is current")
+                        .setMessage("Version " + versionName + " is the latest signed release.")
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+
+            @Override
+            public void onInstallerReady(String versionName) {
+                resetUpdateButton();
+                Toast.makeText(MainActivity.this,
+                        "Version " + versionName + " verified. Confirm the Android install.",
+                        Toast.LENGTH_LONG).show();
+            }
+
+            @Override
+            public void onError(String message) {
+                resetUpdateButton();
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Update not installed")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+        });
+    }
+
+    private void resetUpdateButton() {
+        if (updateButton == null) return;
+        updateButton.setText("Update");
+        updateButton.setEnabled(true);
     }
 
     private void showSettings() {
