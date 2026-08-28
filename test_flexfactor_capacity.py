@@ -47,6 +47,12 @@ def real_catalog(route: rotation.Route) -> rotation.Catalog:
 
 class CapacityTests(unittest.TestCase):
     def setUp(self):
+        name = "FLEXFACTOR_PROVIDER_MAX_INFLIGHT"
+        prior = os.environ.pop(name, None)
+        if prior is None:
+            self.addCleanup(os.environ.pop, name, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, name, prior)
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, "capacity.json")
         self.store = cap.CapacityState(self.path)
@@ -161,6 +167,12 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
     """The real rotated call path must obey the same shared allowance."""
 
     def setUp(self):
+        name = "FLEXFACTOR_PROVIDER_MAX_INFLIGHT"
+        prior = os.environ.pop(name, None)
+        if prior is None:
+            self.addCleanup(os.environ.pop, name, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, name, prior)
         self.tmp = tempfile.TemporaryDirectory()
         self.capacity_path = os.path.join(self.tmp.name, "capacity.json")
         self.original_manager = cap._MANAGER
