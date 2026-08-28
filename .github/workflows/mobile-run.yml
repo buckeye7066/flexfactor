@@ -161,7 +161,7 @@ jobs:
         run: |
           archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
           curl --fail --location --silent --show-error --retry 3 \
-            https://github.com/ollama/ollama/releases/download/v0.33.0/ollama-linux-amd64.tar.zst \
+            https://github.com/ollama/ollama/releases/download/v0.33.1/ollama-linux-amd64.tar.zst \
             --output "$archive"
           printf '%s  %s\n' \
             88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d \
