@@ -37,6 +37,11 @@ android {
                 "proguard-rules.pro",
             )
         }
+        create("play") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+            signingConfig = signingConfigs.findByName("release")
+        }
     }
 
     compileOptions {
