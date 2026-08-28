@@ -8,7 +8,7 @@ name: production-readiness
 
 on:
   push:
-    branches: [main, "cursor/production-ready/**", "production-ready/**"]
+    branches: [main, "cursor/production-ready/**", "production-ready/**", "fix/provider-capacity-orchestration"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -81,6 +81,7 @@ jobs:
                    flexfactor_node_lock_tests.py \
                    flexfactor_prodready_persistence_tests.py \
                    flexfactor_rotation_tests.py \
+                   test_flexfactor_capacity.py \
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
                    flexfactor_cli_provider_tests.py \
@@ -126,14 +127,6 @@ jobs:
           python ci_skip_policy.py "$RUNNER_OS" /tmp/*.py.log
         env:
           FLEXFACTOR_ROTATION_EXTENSIONS: "1"
-          # The explorer races every browser action against a deadline so a hang
-          # becomes a named `timeout` finding instead of a stall, and a timeout
-          # blocks completeness (fail-closed, deliberately). The 15s default is
-          # tuned for a developer machine; a shared 2-core runner with a cold
-          # browser exceeded it on a re-login (ubuntu, run 32686466307) while all
-          # 40 journeys passed. Widening the budget HERE keeps the deadline
-          # measuring hangs rather than runner speed - the default, and the rule
-          # that a timeout blocks completeness, are both unchanged.
           FLEXFACTOR_E2E_ACTION_TIMEOUT_MS: "45000"
       - name: Rotation-extension tests
         shell: bash
