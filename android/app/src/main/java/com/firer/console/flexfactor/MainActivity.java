@@ -8,7 +8,9 @@ import android.content.ComponentName;
 import android.graphics.Color;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.PackageInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -376,7 +378,7 @@ public final class MainActivity extends Activity {
     private void maybeRecoverForThisVersion() {
         int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
                 .getInt(RECOVERED_VERSION_KEY, 0);
-        if (recovered >= BuildConfig.VERSION_CODE || !isTermuxInstalled()) return;
+        if (recovered >= installedVersionCode() || !isTermuxInstalled()) return;
         if (checkSelfPermission(EngineRecoveryScript.TERMUX_PERMISSION)
                 == PackageManager.PERMISSION_GRANTED) {
             requestEngineRecovery(true);
@@ -479,7 +481,7 @@ public final class MainActivity extends Activity {
         long elapsed = android.os.SystemClock.elapsedRealtime() - recoveryStartedAt;
         if ("ready".equals(status)) {
             getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                    .putInt(RECOVERED_VERSION_KEY, BuildConfig.VERSION_CODE).apply();
+                    .putInt(RECOVERED_VERSION_KEY, installedVersionCode()).apply();
             recoveryMode = false;
             loadedEndpoint = "";
             render();
@@ -587,6 +589,18 @@ public final class MainActivity extends Activity {
         Intent launch = getPackageManager().getLaunchIntentForPackage(
                 EngineRecoveryScript.TERMUX_PACKAGE);
         if (launch != null) startActivity(launch);
+    }
+
+    private int installedVersionCode() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            long code = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ? info.getLongVersionCode()
+                    : info.versionCode;
+            return code > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) code;
+        } catch (PackageManager.NameNotFoundException impossible) {
+            return 0;
+        }
     }
 
     private TextView text(String value, int sp, int color) {
