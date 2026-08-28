@@ -1,6 +1,6 @@
 # FlexFactor Android app
 
-Version 3.1 is a standalone Android control plane. Tapping the FlexFactor icon
+Version 3.2 is a standalone Android control plane. Tapping the FlexFactor icon
 opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
 an on-phone model server are not part of its runtime.
 
@@ -15,8 +15,8 @@ sandbox.
 Open **Credentials** and enter:
 
 1. A GitHub token for the owner account with repository/workflow access.
-2. Optionally, an OpenAI API key if OpenAI should be used instead of the hosted
-   open-source model.
+2. Optionally, an OpenAI and/or Anthropic API key. GitHub Copilot and the hosted
+   open-source model use no separate vendor key.
 
 FlexFactor validates the GitHub account before saving anything. A pinned Ollama
 runtime and coding model run in the disposable Actions runner by default; an
@@ -26,10 +26,10 @@ repository's GitHub Actions public key and writes them to protected Actions
 secrets; neither value is sent as a workflow input, URL, command argument,
 artifact, or log field.
 
-After setup, choose a writable **public** repository and use any original mode.
-Private targets are intentionally excluded because this release uses the public
-FlexFactor repository as its control plane; this prevents private names or
-source-derived output from appearing in public Actions metadata and logs.
+After setup, choose any writable public or private repository and use any original
+mode. FlexFactor installs a small pinned caller workflow into that selected
+repository and runs there, so private names, inputs, logs, and artifacts stay in
+the private repository rather than crossing the public control repository.
 
 1. **Refactor a file** — improve a selected file toward a stated goal and open a
    publication PR when the verified output changes it.
@@ -50,7 +50,7 @@ it over HTTPS, and verifies the package name, version, SHA-256, and signing
 certificate lineage before opening Android's installer. Android requires the
 user to enable **Allow from this source** once and confirm each installation.
 
-Version 2.2.0 and later use the permanent release key, so 3.1 installs in place
+Version 2.2.0 and later use the permanent release key, so 3.2 installs in place
 without uninstalling the existing app.
 
 ## Build

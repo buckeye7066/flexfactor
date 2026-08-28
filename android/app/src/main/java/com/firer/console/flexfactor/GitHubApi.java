@@ -14,8 +14,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URLEncoder;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -23,7 +25,6 @@ import java.util.Map;
 /** Minimal GitHub/OpenAI client for the standalone Android control plane. */
 final class GitHubApi {
     static final String CONTROL_REPOSITORY = "buckeye7066/flexfactor";
-    static final String MOBILE_WORKFLOW = "mobile-run.yml";
     static final String API_VERSION = "2026-03-10";
     private static final String GITHUB = "https://api.github.com";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
@@ -37,9 +38,11 @@ final class GitHubApi {
     static final class Repository {
         final String fullName;
         final String defaultBranch;
-        Repository(String fullName, String defaultBranch) {
+        final boolean isPrivate;
+        Repository(String fullName, String defaultBranch, boolean isPrivate) {
             this.fullName = fullName;
             this.defaultBranch = defaultBranch;
+            this.isPrivate = isPrivate;
         }
         @Override public String toString() { return fullName; }
     }
@@ -61,22 +64,16 @@ final class GitHubApi {
         boolean complete() { return "completed".equals(status); }
     }
 
-    ConfigurationResult configure(String githubToken, String openAiKey) throws Exception {
+    ConfigurationResult configure(String githubToken, String openAiKey, String anthropicKey)
+            throws Exception {
         String token = requireSecret(githubToken, "GitHub token");
         JSONObject user = github(token, "GET", "/user", null);
         String login = user.optString("login", "").trim();
         if (login.isEmpty()) throw new ApiException("GitHub did not identify this account.");
-        String provider = openAiKey == null ? "" : openAiKey.trim();
-        // Validate every supplied credential before mutating repository state.
-        // A rejected optional key must not leave the runner using a different
-        // GitHub token than the one retained by the phone.
-        if (!provider.isEmpty()) verifyOpenAi(provider);
-        putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN", token);
-        if (provider.isEmpty()) {
-            deleteRepositorySecretIfPresent(token, "OPENAI_API_KEY");
-        } else {
-            putRepositorySecret(token, "OPENAI_API_KEY", provider);
-        }
+        String openAi = cleanSecret(openAiKey);
+        String anthropic = cleanSecret(anthropicKey);
+        if (!openAi.isEmpty()) verifyOpenAi(openAi);
+        if (!anthropic.isEmpty()) verifyAnthropic(anthropic);
         return new ConfigurationResult(login);
     }
 
@@ -90,44 +87,66 @@ final class GitHubApi {
             JSONArray rows = result.getJSONArray("_array");
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject row = rows.getJSONObject(i);
-                if (row.optBoolean("private", true)) continue;
                 JSONObject permissions = row.optJSONObject("permissions");
                 if (permissions != null && !permissions.optBoolean("push", false)) continue;
                 String fullName = row.optString("full_name", "");
                 String branch = row.optString("default_branch", "main");
-                if (!fullName.isEmpty()) repositories.add(new Repository(fullName, branch));
+                if (!fullName.isEmpty()) repositories.add(new Repository(
+                        fullName, branch, row.optBoolean("private", false)));
             }
             if (rows.length() < 100) break;
         }
         return repositories;
     }
 
-    RunState dispatch(String token, MobileRunRequest request) throws Exception {
+    RunState dispatch(String token, String openAiKey, String anthropicKey,
+            MobileRunRequest request) throws Exception {
+        String cleanToken = requireSecret(token, "GitHub token");
+        boolean workflowChanged = ensureTargetWorkflow(
+                cleanToken, request.repository, request.ref);
+        putRepositorySecret(cleanToken, request.repository,
+                "FLEXFACTOR_MOBILE_GITHUB_TOKEN", cleanToken);
+        prepareProviderSecret(cleanToken, request.repository, request.provider,
+                openAiKey, anthropicKey);
         JSONObject inputs = new JSONObject();
         for (Map.Entry<String, String> entry : request.workflowInputs().entrySet()) {
+            if ("target_repository".equals(entry.getKey())) continue;
             inputs.put(entry.getKey(), entry.getValue());
         }
         JSONObject body = new JSONObject();
-        body.put("ref", "main");
+        body.put("ref", request.ref);
         body.put("inputs", inputs);
-        JSONObject response = github(requireSecret(token, "GitHub token"), "POST",
-                "/repos/" + CONTROL_REPOSITORY + "/actions/workflows/"
-                        + MOBILE_WORKFLOW + "/dispatches", body);
-        long id = response.optLong("workflow_run_id", 0L);
-        String htmlUrl = response.optString("html_url", "");
-        if (id <= 0) throw new ApiException("GitHub accepted the run but returned no run ID.");
-        return new RunState(id, "queued", "", htmlUrl, "Queued");
+        long submittedAt = System.currentTimeMillis();
+        String dispatchPath = "/repos/" + request.repository + "/actions/workflows/"
+                + MobileWorkflow.FILE_NAME + "/dispatches";
+        HttpResult dispatched = null;
+        for (int attempt = 0; attempt < (workflowChanged ? 15 : 1); attempt++) {
+            dispatched = rawGithub(cleanToken, "POST", dispatchPath, body);
+            if (dispatched.status >= 200 && dispatched.status < 300) break;
+            if (!workflowChanged || (dispatched.status != 404 && dispatched.status != 422)) {
+                throw new ApiException(githubError(dispatched));
+            }
+            Thread.sleep(1_000L);
+        }
+        if (dispatched == null || dispatched.status < 200 || dispatched.status >= 300) {
+            throw new ApiException(dispatched == null
+                    ? "The workflow dispatch was not attempted." : githubError(dispatched));
+        }
+        return locateDispatchedRun(cleanToken, request, submittedAt);
     }
 
-    RunState run(String token, long runId) throws Exception {
+    RunState run(String token, String repository, long runId) throws Exception {
         if (runId <= 0) throw new IllegalArgumentException("Run ID is invalid.");
+        if (!repository.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+            throw new IllegalArgumentException("Run repository is invalid.");
+        }
         JSONObject run = github(requireSecret(token, "GitHub token"), "GET",
-                "/repos/" + CONTROL_REPOSITORY + "/actions/runs/" + runId, null);
+                "/repos/" + repository + "/actions/runs/" + runId, null);
         String status = run.optString("status", "unknown");
         String conclusion = run.optString("conclusion", "");
         String step = status;
         if (!"completed".equals(status)) {
-            JSONObject jobs = github(token, "GET", "/repos/" + CONTROL_REPOSITORY
+            JSONObject jobs = github(token, "GET", "/repos/" + repository
                     + "/actions/runs/" + runId + "/jobs?per_page=20", null);
             JSONArray rows = jobs.optJSONArray("jobs");
             if (rows != null) {
@@ -158,8 +177,119 @@ final class GitHubApi {
         }
     }
 
-    private void putRepositorySecret(String token, String name, String value) throws Exception {
-        JSONObject key = github(token, "GET", "/repos/" + CONTROL_REPOSITORY
+    private void verifyAnthropic(String key) throws Exception {
+        HttpURLConnection connection = connection(new URL("https://api.anthropic.com/v1/models"));
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("x-api-key", key);
+        connection.setRequestProperty("anthropic-version", "2023-06-01");
+        HttpResult result = execute(connection, null);
+        if (result.status != 200) {
+            throw new ApiException("Anthropic rejected this key (HTTP " + result.status + ").");
+        }
+    }
+
+    private void prepareProviderSecret(String token, String repository,
+            MobileRunRequest.Provider provider, String openAiKey, String anthropicKey)
+            throws Exception {
+        if (provider == MobileRunRequest.Provider.OPENAI) {
+            String key = cleanSecret(openAiKey);
+            if (!key.isEmpty()) {
+                putRepositorySecret(token, repository, "OPENAI_API_KEY", key);
+            } else if (!hasRepositorySecret(token, repository, "OPENAI_API_KEY")) {
+                throw new ApiException("OpenAI is selected, but this repository has no "
+                        + "OPENAI_API_KEY. Save the key once in Credentials.");
+            }
+        }
+        if (provider == MobileRunRequest.Provider.ANTHROPIC) {
+            String key = cleanSecret(anthropicKey);
+            if (!key.isEmpty()) {
+                putRepositorySecret(token, repository, "ANTHROPIC_API_KEY", key);
+            } else if (!hasRepositorySecret(token, repository, "ANTHROPIC_API_KEY")) {
+                throw new ApiException("Anthropic is selected, but this repository has no "
+                        + "ANTHROPIC_API_KEY. Save the key once in Credentials.");
+            }
+        }
+    }
+
+    private boolean ensureTargetWorkflow(String token, String repository, String branch)
+            throws Exception {
+        String path = "/repos/" + repository + "/contents/" + MobileWorkflow.PATH
+                + "?ref=" + encode(branch);
+        HttpResult existing = rawGithub(token, "GET", path, null);
+        String sha = "";
+        String expected = MobileWorkflow.content();
+        if (existing.status == 200) {
+            JSONObject current = new JSONObject(new String(existing.body, StandardCharsets.UTF_8));
+            sha = current.optString("sha", "");
+            String encoded = current.optString("content", "").replace("\n", "");
+            if (!encoded.isEmpty()) {
+                String actual = new String(Base64.decode(encoded, Base64.DEFAULT),
+                        StandardCharsets.UTF_8);
+                if (expected.equals(actual)) return false;
+            }
+        } else if (existing.status != 404) {
+            throw new ApiException(githubError(existing));
+        }
+
+        JSONObject payload = new JSONObject();
+        payload.put("message", sha.isEmpty()
+                ? "Install FlexFactor Mobile runner" : "Update FlexFactor Mobile runner");
+        payload.put("content", Base64.encodeToString(
+                expected.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+        payload.put("branch", branch);
+        if (!sha.isEmpty()) payload.put("sha", sha);
+        github(token, "PUT", "/repos/" + repository + "/contents/"
+                + MobileWorkflow.PATH, payload);
+        return true;
+    }
+
+    private RunState locateDispatchedRun(String token, MobileRunRequest request,
+            long submittedAt) throws Exception {
+        String path = "/repos/" + request.repository + "/actions/workflows/"
+                + MobileWorkflow.FILE_NAME + "/runs?event=workflow_dispatch&branch="
+                + encode(request.ref) + "&per_page=30";
+        long earliest = submittedAt - 10_000L;
+        for (int attempt = 0; attempt < 30; attempt++) {
+            JSONObject page = github(token, "GET", path, null);
+            JSONArray runs = page.optJSONArray("workflow_runs");
+            if (runs != null) {
+                for (int i = 0; i < runs.length(); i++) {
+                    JSONObject run = runs.getJSONObject(i);
+                    String title = run.optString("display_title", "");
+                    long created = parseInstant(run.optString("created_at", ""));
+                    if (title.contains(request.requestId) && created >= earliest) {
+                        long id = run.optLong("id", 0L);
+                        if (id > 0) return new RunState(id,
+                                run.optString("status", "queued"),
+                                run.optString("conclusion", ""),
+                                run.optString("html_url", ""), "Queued");
+                    }
+                }
+            }
+            Thread.sleep(1_000L);
+        }
+        throw new ApiException("GitHub accepted the run, but FlexFactor could not correlate "
+                + "its run ID within 30 seconds.");
+    }
+
+    private boolean hasRepositorySecret(String token, String repository, String name)
+            throws Exception {
+        for (int page = 1; page <= 10; page++) {
+            JSONObject response = github(token, "GET", "/repos/" + repository
+                    + "/actions/secrets?per_page=100&page=" + page, null);
+            JSONArray secrets = response.optJSONArray("secrets");
+            if (secrets == null) return false;
+            for (int i = 0; i < secrets.length(); i++) {
+                if (name.equals(secrets.getJSONObject(i).optString("name"))) return true;
+            }
+            if (secrets.length() < 100) return false;
+        }
+        return false;
+    }
+
+    private void putRepositorySecret(String token, String repository, String name, String value)
+            throws Exception {
+        JSONObject key = github(token, "GET", "/repos/" + repository
                 + "/actions/secrets/public-key", null);
         byte[] publicKey = Base64.decode(key.getString("key"), Base64.DEFAULT);
         byte[] message = value.getBytes(StandardCharsets.UTF_8);
@@ -171,33 +301,13 @@ final class GitHubApi {
         JSONObject payload = new JSONObject();
         payload.put("encrypted_value", Base64.encodeToString(cipher, Base64.NO_WRAP));
         payload.put("key_id", key.getString("key_id"));
-        github(token, "PUT", "/repos/" + CONTROL_REPOSITORY
+        github(token, "PUT", "/repos/" + repository
                 + "/actions/secrets/" + name, payload);
-    }
-
-    private void deleteRepositorySecretIfPresent(String token, String name) throws Exception {
-        URL url = new URL(GITHUB + "/repos/" + CONTROL_REPOSITORY
-                + "/actions/secrets/" + name);
-        HttpURLConnection connection = connection(url);
-        connection.setRequestMethod("DELETE");
-        connection.setRequestProperty("Accept", "application/vnd.github+json");
-        connection.setRequestProperty("Authorization", "Bearer " + token);
-        connection.setRequestProperty("X-GitHub-Api-Version", API_VERSION);
-        HttpResult result = execute(connection, null);
-        if (result.status != 204 && result.status != 404) {
-            throw new ApiException(githubError(result));
-        }
     }
 
     private JSONObject github(String token, String method, String path, JSONObject body)
             throws Exception {
-        HttpURLConnection connection = connection(new URL(GITHUB + path));
-        connection.setRequestMethod(method);
-        connection.setRequestProperty("Accept", "application/vnd.github+json");
-        connection.setRequestProperty("Authorization", "Bearer " + token);
-        connection.setRequestProperty("X-GitHub-Api-Version", API_VERSION);
-        HttpResult result = execute(connection,
-                body == null ? null : body.toString().getBytes(StandardCharsets.UTF_8));
+        HttpResult result = rawGithub(token, method, path, body);
         if (result.status < 200 || result.status >= 300) {
             throw new ApiException(githubError(result));
         }
@@ -209,6 +319,17 @@ final class GitHubApi {
             return wrapper;
         }
         return new JSONObject(text);
+    }
+
+    private HttpResult rawGithub(String token, String method, String path, JSONObject body)
+            throws Exception {
+        HttpURLConnection connection = connection(new URL(GITHUB + path));
+        connection.setRequestMethod(method);
+        connection.setRequestProperty("Accept", "application/vnd.github+json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        connection.setRequestProperty("X-GitHub-Api-Version", API_VERSION);
+        return execute(connection,
+                body == null ? null : body.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     private static String githubError(HttpResult result) {
@@ -233,7 +354,7 @@ final class GitHubApi {
         connection.setReadTimeout(READ_TIMEOUT_MS);
         connection.setInstanceFollowRedirects(false);
         connection.setUseCaches(false);
-        connection.setRequestProperty("User-Agent", "FlexFactor-Android/3.0");
+        connection.setRequestProperty("User-Agent", "FlexFactor-Android/3.2");
         return connection;
     }
 
@@ -278,6 +399,26 @@ final class GitHubApi {
             throw new IllegalArgumentException(label + " contains an invalid line break.");
         }
         return clean;
+    }
+
+    private static String cleanSecret(String value) {
+        String clean = value == null ? "" : value.trim();
+        if (clean.indexOf('\n') >= 0 || clean.indexOf('\r') >= 0) {
+            throw new IllegalArgumentException("Credential contains an invalid line break.");
+        }
+        return clean;
+    }
+
+    private static String encode(String value) throws Exception {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20");
+    }
+
+    private static long parseInstant(String value) {
+        try {
+            return Instant.parse(value).toEpochMilli();
+        } catch (Exception ignored) {
+            return 0L;
+        }
     }
 
     private static final class HttpResult {

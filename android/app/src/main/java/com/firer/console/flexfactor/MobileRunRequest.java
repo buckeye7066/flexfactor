@@ -9,7 +9,9 @@ import java.util.regex.Pattern;
 public final class MobileRunRequest {
     public enum Provider {
         OLLAMA("ollama"),
-        OPENAI("openai");
+        OPENAI("openai"),
+        ANTHROPIC("anthropic"),
+        COPILOT("copilot");
 
         final String wire;
         Provider(String wire) { this.wire = wire; }
@@ -39,15 +41,33 @@ public final class MobileRunRequest {
     public final String goal;
     public final boolean scoutApply;
     public final double maxCost;
+    public final int threshold;
+    public final int maxIterations;
+    public final boolean economy;
+    public final boolean useBoth;
 
     public MobileRunRequest(Mode mode, Provider provider, String repository, String ref, String file,
             String goal, boolean scoutApply, double maxCost) {
         this(UUID.randomUUID().toString(), mode, provider, repository, ref, file, goal,
-                scoutApply, maxCost);
+                scoutApply, maxCost, 90, 5, true, true);
+    }
+
+    public MobileRunRequest(Mode mode, Provider provider, String repository, String ref, String file,
+            String goal, boolean scoutApply, double maxCost, int threshold, int maxIterations,
+            boolean economy, boolean useBoth) {
+        this(UUID.randomUUID().toString(), mode, provider, repository, ref, file, goal,
+                scoutApply, maxCost, threshold, maxIterations, economy, useBoth);
     }
 
     MobileRunRequest(String requestId, Mode mode, Provider provider, String repository, String ref,
             String file, String goal, boolean scoutApply, double maxCost) {
+        this(requestId, mode, provider, repository, ref, file, goal, scoutApply, maxCost,
+                90, 5, true, true);
+    }
+
+    MobileRunRequest(String requestId, Mode mode, Provider provider, String repository, String ref,
+            String file, String goal, boolean scoutApply, double maxCost, int threshold,
+            int maxIterations, boolean economy, boolean useBoth) {
         this.requestId = clean(requestId);
         this.mode = mode;
         this.provider = provider;
@@ -57,6 +77,10 @@ public final class MobileRunRequest {
         this.goal = clean(goal);
         this.scoutApply = scoutApply;
         this.maxCost = maxCost;
+        this.threshold = threshold;
+        this.maxIterations = maxIterations;
+        this.economy = economy;
+        this.useBoth = useBoth;
         validate();
     }
 
@@ -74,6 +98,12 @@ public final class MobileRunRequest {
         }
         if (!Double.isFinite(maxCost) || maxCost < 1 || maxCost > 150) {
             throw new IllegalArgumentException("The cost cap must be between $1 and $150.");
+        }
+        if (threshold < 0 || threshold > 100) {
+            throw new IllegalArgumentException("The acceptance threshold must be between 0 and 100.");
+        }
+        if (maxIterations < 1 || maxIterations > 20) {
+            throw new IllegalArgumentException("Refactor iterations must be between 1 and 20.");
         }
         if (mode == Mode.REFACTOR) {
             if (!FILE.matcher(file).matches()) {
@@ -102,6 +132,10 @@ public final class MobileRunRequest {
         values.put("goal", goal);
         values.put("scout_apply", Boolean.toString(scoutApply));
         values.put("max_cost", formatCost(maxCost));
+        values.put("threshold", Integer.toString(threshold));
+        values.put("max_iterations", Integer.toString(maxIterations));
+        values.put("economy", Boolean.toString(economy));
+        values.put("use_both", Boolean.toString(useBoth));
         return values;
     }
 

@@ -19,7 +19,7 @@ on:
         required: true
         default: ollama
         type: choice
-        options: [ollama, openai]
+        options: [ollama, openai, anthropic, copilot]
       target_repository:
         description: Target owner/repository
         required: true
@@ -47,9 +47,51 @@ on:
         required: true
         default: "50"
         type: string
+      threshold:
+        description: Refactor acceptance threshold
+        required: true
+        default: "90"
+        type: string
+      max_iterations:
+        description: Refactor iteration cap
+        required: true
+        default: "5"
+        type: string
+      economy:
+        description: Use the desktop economy author-model policy
+        required: true
+        default: true
+        type: boolean
+      use_both:
+        description: Use independent cross-model verification when available
+        required: true
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      request_id: {required: true, type: string}
+      mode: {required: true, type: string}
+      provider: {required: true, type: string}
+      target_repository: {required: true, type: string}
+      target_ref: {required: true, type: string}
+      file: {required: false, type: string, default: ""}
+      goal: {required: false, type: string, default: ""}
+      scout_apply: {required: true, type: boolean}
+      max_cost: {required: true, type: string}
+      threshold: {required: true, type: string}
+      max_iterations: {required: true, type: string}
+      economy: {required: true, type: boolean}
+      use_both: {required: true, type: boolean}
+    secrets:
+      FLEXFACTOR_MOBILE_GITHUB_TOKEN: {required: false}
+      OPENAI_API_KEY: {required: false}
+      ANTHROPIC_API_KEY: {required: false}
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: mobile-flexfactor-${{ inputs.target_repository }}
@@ -66,6 +108,8 @@ jobs:
       # and gives same-repository report-only runs a least-surprise recovery path.
       GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       FLEXFACTOR_PHONE_MODEL: qwen2.5-coder:7b
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
@@ -90,7 +134,7 @@ jobs:
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
-          if provider not in {"ollama", "openai"}:
+          if provider not in {"ollama", "openai", "anthropic", "copilot"}:
               raise SystemExit("unsupported provider")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
                               repository):
@@ -101,6 +145,12 @@ jobs:
           cost = float(inputs.get("max_cost", ""))
           if not math.isfinite(cost) or not 1 <= cost <= 150:
               raise SystemExit("cost cap must be between 1 and 150")
+          threshold = int(inputs.get("threshold", ""))
+          iterations = int(inputs.get("max_iterations", ""))
+          if not 0 <= threshold <= 100:
+              raise SystemExit("threshold must be between 0 and 100")
+          if not 1 <= iterations <= 20:
+              raise SystemExit("max iterations must be between 1 and 20")
           if mode == "refactor":
               candidate = pathlib.PurePosixPath(file)
               if (not file or candidate.is_absolute() or ".." in candidate.parts
@@ -124,9 +174,9 @@ jobs:
               with urllib.request.urlopen(request, timeout=20) as response:
                   metadata = json.load(response)
           except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-              raise SystemExit("target repository must be public and accessible") from None
-          if metadata.get("private") is not False:
-              raise SystemExit("private targets require a private control repository")
+              raise SystemExit("target repository is not accessible") from None
+          if metadata.get("private") is True and os.environ["GITHUB_REPOSITORY"] != repository:
+              raise SystemExit("private targets must run from their installed private workflow")
 
       - name: Require protected mobile credentials
         shell: bash
@@ -135,10 +185,15 @@ jobs:
           if [ "${{ inputs.provider }}" = openai ]; then
             test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
           fi
+          if [ "${{ inputs.provider }}" = anthropic ]; then
+            test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY is missing" >&2; exit 1; }
+          fi
 
       - name: Check out the exact FlexFactor engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          repository: buckeye7066/flexfactor
+          ref: android-v3.2.0
           path: engine
           persist-credentials: false
 
@@ -158,6 +213,11 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: engine/requirements.txt
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
 
       - name: Install and start the hosted open model
         if: inputs.provider == 'ollama'
@@ -179,6 +239,13 @@ jobs:
             sleep 1
           done
           ollama pull qwen2.5-coder:7b
+
+      - name: Install GitHub Copilot CLI
+        if: inputs.provider == 'copilot'
+        shell: bash
+        run: |
+          npm install --global @github/copilot@1.0.81
+          copilot --version
 
       - name: Install the engine and browser runtime
         shell: bash
@@ -206,6 +273,10 @@ jobs:
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
           SCOUT_APPLY: ${{ inputs.scout_apply }}
           MAX_COST: ${{ inputs.max_cost }}
+          THRESHOLD: ${{ inputs.threshold }}
+          MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          ECONOMY: ${{ inputs.economy }}
+          USE_BOTH: ${{ inputs.use_both }}
           TARGET_REF: ${{ inputs.target_ref }}
           REQUEST_ID: ${{ inputs.request_id }}
         run: |
@@ -217,6 +288,8 @@ jobs:
           if [ "$PROVIDER" = ollama ]; then
             provider_args+=(--model "$FLEXFACTOR_PHONE_MODEL"
               --judge-model "$FLEXFACTOR_PHONE_MODEL")
+          elif [ "$PROVIDER" = copilot ]; then
+            provider_args+=(--model auto --judge-model auto)
           fi
 
           if [ "$MODE" = refactor ]; then
@@ -238,6 +311,8 @@ jobs:
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
                 --goal "$TARGET_GOAL" \
+                --threshold "$THRESHOLD" \
+                --max-iterations "$MAX_ITERATIONS" \
                 "${provider_args[@]}" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
               rm -f -- "$backup_path"
             fi
@@ -267,11 +342,19 @@ jobs:
           else
             model_mode=paid
             if [ "$PROVIDER" = ollama ]; then model_mode=free; fi
+            audit_args=(--model-mode "$model_mode" --max-cost "$MAX_COST"
+              --no-dashboard --yes --apply --trust-repo --allow-dirty --auto-clean)
+            if [ "$ECONOMY" = true ]; then audit_args+=(--economy); fi
+            if [ "$USE_BOTH" != true ] || [ "$PROVIDER" = ollama ] || [ "$PROVIDER" = copilot ]; then
+              audit_args+=(--single)
+            elif [ "$PROVIDER" = openai ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+              audit_args+=(--single)
+            elif [ "$PROVIDER" = anthropic ] && [ -z "$OPENAI_API_KEY" ]; then
+              audit_args+=(--single)
+            fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              "${provider_args[@]}" --model-mode "$model_mode" --single \
-              --max-cost "$MAX_COST" --no-dashboard --yes --apply \
-              --trust-repo --no-auto-clean 2>&1 | tee mobile-run.log \
+              "${provider_args[@]}" "${audit_args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           fi
 

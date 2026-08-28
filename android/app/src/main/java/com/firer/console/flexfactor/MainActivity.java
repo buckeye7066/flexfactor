@@ -36,7 +36,9 @@ public final class MainActivity extends Activity {
     private static final String LOGIN = "github_login";
     private static final String REPOSITORY = "selected_repository";
     private static final String REF = "selected_ref";
+    private static final String PROVIDER = "selected_provider";
     private static final String LAST_RUN_ID = "last_run_id";
+    private static final String LAST_RUN_REPOSITORY = "last_run_repository";
     private static final String LAST_RUN_URL = "last_run_url";
     private static final String LAST_RUN_STATUS = "last_run_status";
     private static final long POLL_MS = 5_000L;
@@ -50,6 +52,7 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private LinearLayout content;
     private Button repositoryButton;
+    private Button providerButton;
     private Button updateButton;
     private TextView accountState;
     private TextView runState;
@@ -62,6 +65,7 @@ public final class MainActivity extends Activity {
         secrets = new SecureStore(this);
         renderHome();
         if (!configured()) main.postDelayed(this::showCredentialSetup, 350L);
+        main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
     }
 
@@ -115,6 +119,12 @@ public final class MainActivity extends Activity {
         repositoryButton.setOnClickListener(view -> chooseRepository());
         content.addView(repositoryButton, margins(0, 4, 0, 12));
 
+        content.addView(section("Model provider"));
+        providerButton = button("Choose provider");
+        providerButton.setContentDescription("Choose a model provider");
+        providerButton.setOnClickListener(view -> chooseProvider());
+        content.addView(providerButton, margins(0, 4, 0, 12));
+
         content.addView(section("What do you want FlexFactor to do?"));
         addMode("1 · Refactor a file",
                 "Improve one selected file toward a stated goal.",
@@ -160,8 +170,7 @@ public final class MainActivity extends Activity {
         String login = preferences.getString(LOGIN, "");
         if (configured()) {
             accountState.setText("GitHub: " + (login.isEmpty() ? "configured" : login)
-                    + (secrets.contains(SecureStore.OPENAI_KEY)
-                    ? " · Provider: OpenAI" : " · Provider: hosted open model")
+                    + " · Provider: " + providerLabel(selectedProvider())
                     + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
@@ -173,6 +182,49 @@ public final class MainActivity extends Activity {
             String ref = preferences.getString(REF, "main");
             repositoryButton.setText(repo.isEmpty() ? "Choose repository" : repo + " · " + ref);
         }
+        if (providerButton != null) providerButton.setText(providerLabel(selectedProvider()));
+    }
+
+    private MobileRunRequest.Provider selectedProvider() {
+        String saved = preferences.getString(PROVIDER, "");
+        for (MobileRunRequest.Provider provider : MobileRunRequest.Provider.values()) {
+            if (provider.wire.equals(saved)) return provider;
+        }
+        return secrets.contains(SecureStore.OPENAI_KEY)
+                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.OLLAMA;
+    }
+
+    private static String providerLabel(MobileRunRequest.Provider provider) {
+        if (provider == MobileRunRequest.Provider.OPENAI) return "OpenAI";
+        if (provider == MobileRunRequest.Provider.ANTHROPIC) return "Anthropic";
+        if (provider == MobileRunRequest.Provider.COPILOT) return "GitHub Copilot";
+        return "Hosted open model";
+    }
+
+    private void chooseProvider() {
+        String[] labels = {"OpenAI", "Anthropic", "GitHub Copilot", "Hosted open model"};
+        MobileRunRequest.Provider[] providers = {
+                MobileRunRequest.Provider.OPENAI,
+                MobileRunRequest.Provider.ANTHROPIC,
+                MobileRunRequest.Provider.COPILOT,
+                MobileRunRequest.Provider.OLLAMA,
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Choose provider")
+                .setSingleChoiceItems(labels, indexOfProvider(providers, selectedProvider()),
+                        (dialog, which) -> {
+                            preferences.edit().putString(PROVIDER, providers[which].wire).apply();
+                            dialog.dismiss();
+                            refreshHeader();
+                        })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private static int indexOfProvider(MobileRunRequest.Provider[] values,
+            MobileRunRequest.Provider selected) {
+        for (int i = 0; i < values.length; i++) if (values[i] == selected) return i;
+        return 0;
     }
 
     private boolean configured() {
@@ -182,20 +234,20 @@ public final class MainActivity extends Activity {
     private void showCredentialSetup() {
         LinearLayout form = form();
         TextView guidance = text(
-                "Enter your GitHub token once. FlexFactor runs its own open model in GitHub Actions by default. An OpenAI API key is optional and switches runs to OpenAI.",
+                "Enter your GitHub token once. OpenAI and Anthropic keys are optional; GitHub Copilot and the hosted open model need no vendor key.",
                 14, Color.rgb(170, 181, 194));
         EditText github = secretInput("GitHub token (repo and workflow access)");
         EditText openAi = secretInput("OpenAI API key (optional)");
-        CheckBox useHostedModel = new CheckBox(this);
-        useHostedModel.setText("Use hosted open model (no OpenAI key)");
-        useHostedModel.setTextColor(Color.WHITE);
-        useHostedModel.setChecked(!secrets.contains(SecureStore.OPENAI_KEY));
+        EditText anthropic = secretInput("Anthropic API key (optional)");
         if (secrets.contains(SecureStore.GITHUB_TOKEN)) github.setHint("GitHub token already saved");
         if (secrets.contains(SecureStore.OPENAI_KEY)) openAi.setHint("OpenAI key already saved");
+        if (secrets.contains(SecureStore.ANTHROPIC_KEY)) {
+            anthropic.setHint("Anthropic key already saved");
+        }
         form.addView(guidance);
         form.addView(github);
-        form.addView(useHostedModel);
         form.addView(openAi);
+        form.addView(anthropic);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("FlexFactor setup")
@@ -210,40 +262,37 @@ public final class MainActivity extends Activity {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 String githubValue = github.getText().toString().trim();
                 String openAiValue = openAi.getText().toString().trim();
+                String anthropicValue = anthropic.getText().toString().trim();
                 if (githubValue.isEmpty()) githubValue = secrets.get(SecureStore.GITHUB_TOKEN);
-                if (useHostedModel.isChecked()) {
-                    openAiValue = "";
-                } else if (openAiValue.isEmpty()) {
-                    openAiValue = secrets.get(SecureStore.OPENAI_KEY);
+                if (openAiValue.isEmpty()) openAiValue = secrets.get(SecureStore.OPENAI_KEY);
+                if (anthropicValue.isEmpty()) {
+                    anthropicValue = secrets.get(SecureStore.ANTHROPIC_KEY);
                 }
                 if (githubValue.isEmpty()) {
                     github.setError("GitHub token is required.");
                     return;
                 }
-                if (!useHostedModel.isChecked() && openAiValue.isEmpty()) {
-                    openAi.setError("Enter an OpenAI key or select the hosted open model.");
-                    return;
-                }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
-                configureCredentials(dialog, githubValue, openAiValue);
+                configureCredentials(dialog, githubValue, openAiValue, anthropicValue);
             });
         });
         dialog.show();
     }
 
-    private void configureCredentials(AlertDialog dialog, String github, String openAi) {
+    private void configureCredentials(AlertDialog dialog, String github, String openAi,
+            String anthropic) {
         worker.execute(() -> {
             try {
-                GitHubApi.ConfigurationResult result = api.configure(github, openAi);
+                GitHubApi.ConfigurationResult result = api.configure(github, openAi, anthropic);
                 secrets.put(SecureStore.GITHUB_TOKEN, github);
                 secrets.put(SecureStore.OPENAI_KEY, openAi);
+                secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
                 preferences.edit().putString(LOGIN, result.login).apply();
                 post(() -> {
                     dialog.dismiss();
                     refreshHeader();
-                    Toast.makeText(this, openAi.isEmpty()
-                            ? "Hosted open model is selected" : "GitHub and OpenAI are ready",
+                    Toast.makeText(this, "FlexFactor credentials are ready",
                             Toast.LENGTH_LONG).show();
                 });
             } catch (Exception failed) {
@@ -259,10 +308,12 @@ public final class MainActivity extends Activity {
     private void showCredentialLinks() {
         new AlertDialog.Builder(this)
                 .setTitle("Create credentials")
-                .setItems(new String[]{"Open GitHub token page", "Open OpenAI API key page"},
+                .setItems(new String[]{"Open GitHub token page", "Open OpenAI API key page",
+                                "Open Anthropic API key page"},
                         (dialog, which) -> openExternal(which == 0
                                 ? "https://github.com/settings/tokens/new?scopes=repo,workflow&description=FlexFactor%20Android"
-                                : "https://platform.openai.com/api-keys"))
+                                : which == 1 ? "https://platform.openai.com/api-keys"
+                                : "https://console.anthropic.com/settings/keys"))
                 .setNegativeButton("Cancel", null)
                 .show();
     }
@@ -290,12 +341,15 @@ public final class MainActivity extends Activity {
         repositoryButton.setEnabled(true);
         refreshHeader();
         if (repositories.isEmpty()) {
-            showError("No writable public repositories",
-                    "FlexFactor Mobile runs only public targets from its public control repository.");
+            showError("No writable repositories",
+                    "The GitHub token did not return a repository FlexFactor can update.");
             return;
         }
         String[] labels = new String[repositories.size()];
-        for (int i = 0; i < repositories.size(); i++) labels[i] = repositories.get(i).fullName;
+        for (int i = 0; i < repositories.size(); i++) {
+            GitHubApi.Repository repository = repositories.get(i);
+            labels[i] = repository.fullName + (repository.isPrivate ? " · private" : " · public");
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Choose repository")
                 .setItems(labels, (dialog, which) -> {
@@ -317,8 +371,16 @@ public final class MainActivity extends Activity {
         EditText goal = input("What should this file do better?");
         goal.setMinLines(3);
         goal.setSingleLine(false);
+        EditText threshold = input("Acceptance threshold (0–100)");
+        threshold.setInputType(InputType.TYPE_CLASS_NUMBER);
+        threshold.setText("90");
+        EditText iterations = input("Maximum refactor iterations (1–20)");
+        iterations.setInputType(InputType.TYPE_CLASS_NUMBER);
+        iterations.setText("5");
         form.addView(file);
         form.addView(goal);
+        form.addView(threshold);
+        form.addView(iterations);
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("Option 1 · Refactor")
                 .setMessage("FlexFactor will refactor this file, verify the result, and publish the green change.")
@@ -329,10 +391,18 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 .setOnClickListener(view -> {
                     try {
-                        MobileRunRequest request = request(MobileRunRequest.Mode.REFACTOR,
-                                file.getText().toString(), goal.getText().toString(), false, 25);
+                        MobileRunRequest request = new MobileRunRequest(
+                                MobileRunRequest.Mode.REFACTOR, selectedProvider(),
+                                preferences.getString(REPOSITORY, ""),
+                                preferences.getString(REF, "main"),
+                                file.getText().toString(), goal.getText().toString(), false, 25,
+                                Integer.parseInt(threshold.getText().toString().trim()),
+                                Integer.parseInt(iterations.getText().toString().trim()),
+                                true, true);
                         dialog.dismiss();
                         confirmAndDispatch(request);
+                    } catch (NumberFormatException rejected) {
+                        showError("Check refactor settings", "Threshold and iterations must be numbers.");
                     } catch (IllegalArgumentException rejected) {
                         showError("Check the run details", rejected.getMessage());
                     }
@@ -374,6 +444,16 @@ public final class MainActivity extends Activity {
         cost.setText(mode == MobileRunRequest.Mode.PRODREADY ? "150" : "50");
         LinearLayout form = form();
         form.addView(cost);
+        CheckBox economy = new CheckBox(this);
+        economy.setText("Economy author model (desktop default)");
+        economy.setTextColor(Color.WHITE);
+        economy.setChecked(true);
+        CheckBox useBoth = new CheckBox(this);
+        useBoth.setText("Use independent cross-model verification when available");
+        useBoth.setTextColor(Color.WHITE);
+        useBoth.setChecked(true);
+        form.addView(economy);
+        form.addView(useBoth);
         String title = mode == MobileRunRequest.Mode.AUDIT
                 ? "Option 3 · Audit and repair" : "Option 4 · Production ready";
         new AlertDialog.Builder(this)
@@ -384,7 +464,8 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("Run FlexFactor", (dialog, which) -> {
                     try {
                         double cap = Double.parseDouble(cost.getText().toString().trim());
-                        confirmAndDispatch(request(mode, "", "", false, cap));
+                        confirmAndDispatch(request(mode, "", "", false, cap,
+                                economy.isChecked(), useBoth.isChecked()));
                     } catch (NumberFormatException rejected) {
                         showError("Check the cost cap", "Enter a number from 1 through 150.");
                     } catch (IllegalArgumentException rejected) {
@@ -396,23 +477,25 @@ public final class MainActivity extends Activity {
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
             boolean scoutApply, double cost) {
-        MobileRunRequest.Provider provider = secrets.contains(SecureStore.OPENAI_KEY)
-                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.OLLAMA;
-        return new MobileRunRequest(mode, provider,
+        return request(mode, file, goal, scoutApply, cost, true, true);
+    }
+
+    private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
+            boolean scoutApply, double cost, boolean economy, boolean useBoth) {
+        return new MobileRunRequest(mode, selectedProvider(),
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
-                file, goal, scoutApply, cost);
+                file, goal, scoutApply, cost, 90, 5, economy, useBoth);
     }
 
     private void confirmAndDispatch(MobileRunRequest request) {
         String detail = request.repository + " · " + request.ref;
+        detail += "\nProvider: " + providerLabel(request.provider);
         if (request.mode == MobileRunRequest.Mode.AUDIT
                 || request.mode == MobileRunRequest.Mode.PRODREADY) {
             detail += "\nMaximum provider cost: $"
                     + String.format(Locale.US, "%.2f", request.maxCost);
-        } else {
-            detail += "\nProvider: " + (request.provider == MobileRunRequest.Provider.OLLAMA
-                    ? "Hosted open model" : "OpenAI");
+            detail += "\nCross-model verification: " + (request.useBoth ? "on" : "off");
         }
         new AlertDialog.Builder(this)
                 .setTitle("Start " + request.mode.wire + "?")
@@ -427,9 +510,12 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 GitHubApi.RunState state = api.dispatch(
-                        secrets.get(SecureStore.GITHUB_TOKEN), request);
+                        secrets.get(SecureStore.GITHUB_TOKEN),
+                        secrets.get(SecureStore.OPENAI_KEY),
+                        secrets.get(SecureStore.ANTHROPIC_KEY), request);
                 preferences.edit()
                         .putLong(LAST_RUN_ID, state.id)
+                        .putString(LAST_RUN_REPOSITORY, request.repository)
                         .putString(LAST_RUN_URL, state.htmlUrl)
                         .putString(LAST_RUN_STATUS, "Queued · " + request.repository)
                         .apply();
@@ -446,10 +532,13 @@ public final class MainActivity extends Activity {
     private void pollLastRun() {
         main.removeCallbacks(pollRun);
         long id = preferences.getLong(LAST_RUN_ID, 0L);
+        String repository = preferences.getString(LAST_RUN_REPOSITORY,
+                preferences.getString(REPOSITORY, ""));
         if (id <= 0 || !configured() || destroyed) return;
         worker.execute(() -> {
             try {
-                GitHubApi.RunState state = api.run(secrets.get(SecureStore.GITHUB_TOKEN), id);
+                GitHubApi.RunState state = api.run(
+                        secrets.get(SecureStore.GITHUB_TOKEN), repository, id);
                 String label = state.complete()
                         ? ("success".equals(state.conclusion) ? "Completed successfully" :
                         "Completed: " + state.conclusion)
@@ -543,6 +632,25 @@ public final class MainActivity extends Activity {
             @Override public void onError(String message) {
                 resetUpdateButton();
                 showError("Update not installed", message);
+            }
+        });
+    }
+
+    private void checkForUpdateOnLaunch() {
+        if (destroyed || isFinishing()) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) return;
+        new AppUpdater(this).checkAndInstall(new AppUpdater.Callback() {
+            @Override public void onUpToDate(String versionName) {
+                // Startup checks are silent when the installed package is current.
+            }
+            @Override public void onInstallerReady(String versionName) {
+                Toast.makeText(MainActivity.this,
+                        "FlexFactor " + versionName + " is ready. Confirm the Android update.",
+                        Toast.LENGTH_LONG).show();
+            }
+            @Override public void onError(String message) {
+                // The explicit Update button remains the visible recovery path.
             }
         });
     }

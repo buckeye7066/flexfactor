@@ -18,6 +18,7 @@ import javax.crypto.spec.GCMParameterSpec;
 final class SecureStore {
     static final String GITHUB_TOKEN = "github_token";
     static final String OPENAI_KEY = "openai_key";
+    static final String ANTHROPIC_KEY = "anthropic_key";
     private static final String KEY_ALIAS = "flexfactor.mobile.credentials.v1";
     private static final String PREFERENCES = "flexfactor_secure";
     private static final String TRANSFORMATION = "AES/GCM/NoPadding";

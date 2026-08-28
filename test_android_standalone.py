@@ -51,8 +51,10 @@ class StandaloneAndroidInvariants(unittest.TestCase):
             self.assertIn(mode, workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token", workflow)
-        self.assertIn("contents: read", workflow)
+        self.assertIn("contents: write", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
+        self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
+        self.assertIn("@github/copilot@1.0.81", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
         self.assertIn('--judge-model "$FLEXFACTOR_PHONE_MODEL"', workflow)
         self.assertIn("ollama serve", workflow)
@@ -70,21 +72,46 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         summary = summary.split("- name: Upload exact-run result", 1)[0]
         self.assertNotIn("${{ inputs.", summary)
 
-    def test_repository_picker_paginates_and_rejects_private_targets(self):
+    def test_repository_picker_paginates_and_supports_private_targets(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
         self.assertIn('per_page=100&page=" + page', api)
-        self.assertIn('row.optBoolean("private", true)', api)
+        self.assertIn('row.optBoolean("private", false)', api)
+        self.assertNotIn('if (row.optBoolean("private"', api)
+        self.assertIn("ensureTargetWorkflow", api)
+        self.assertIn("MobileWorkflow.FILE_NAME", api)
 
-    def test_credential_switch_validates_before_write_and_removes_old_openai_secret(self):
+    def test_credentials_are_validated_and_never_deleted_when_switching_provider(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
         configure = api.split("ConfigurationResult configure", 1)[1]
         configure = configure.split("List<Repository> repositories", 1)[0]
-        self.assertLess(configure.index("verifyOpenAi(provider)"),
-                        configure.index('putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN"'))
-        self.assertIn('deleteRepositorySecretIfPresent(token, "OPENAI_API_KEY")', configure)
-        self.assertIn("result.status != 204 && result.status != 404", api)
+        self.assertIn("verifyOpenAi(openAi)", configure)
+        self.assertIn("verifyAnthropic(anthropic)", configure)
+        self.assertNotIn("putRepositorySecret", configure)
+        self.assertNotIn("deleteRepositorySecret", api)
+
+    def test_dispatch_correlates_the_standard_empty_github_response(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        dispatch = api.split("RunState dispatch", 1)[1]
+        dispatch = dispatch.split("RunState run", 1)[0]
+        self.assertIn("locateDispatchedRun", dispatch)
+        self.assertNotIn("workflow_run_id", dispatch)
+        self.assertIn("display_title", api)
+        self.assertIn("request.requestId", api)
+
+    def test_mobile_runner_matches_desktop_provider_and_verification_controls(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "mobile-run.yml").read_text(encoding="utf-8")
+        for provider in ("ollama", "openai", "anthropic", "copilot"):
+            self.assertIn(provider, workflow)
+        self.assertIn('--threshold "$THRESHOLD"', workflow)
+        self.assertIn('--max-iterations "$MAX_ITERATIONS"', workflow)
+        self.assertIn("audit_args+=(--economy)", workflow)
+        self.assertIn("audit_args+=(--single)", workflow)
+        self.assertIn("--auto-clean", workflow)
+        self.assertNotIn("--no-auto-clean", workflow)
 
     def test_android_release_gate_proves_the_default_hosted_provider(self):
         workflow = (ROOT / ".github" / "workflows" /
