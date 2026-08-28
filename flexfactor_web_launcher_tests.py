@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -38,6 +39,21 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertFalse(any(os.path.samefile(outside, item["path"])
                              for item in programs))
 
+    def test_symlink_cannot_escape_configured_project_root(self):
+        project_root = os.path.join(self.root, "projects")
+        outside = os.path.join(self.root, "outside-repo")
+        os.makedirs(project_root)
+        os.makedirs(os.path.join(outside, ".git"))
+        link = os.path.join(project_root, "linked-outside")
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.assertFalse(web._path_within_root(
+                os.path.realpath(project_root), os.path.realpath(outside)))
+            return
+        env = dict(self.env, FLEXFACTOR_PROJECT_ROOTS=project_root)
+        self.assertEqual([], web._available_phone_programs(env))
+
     def test_provider_readiness_never_exposes_secret_values(self):
         readiness = web._provider_readiness(
             self.env,
@@ -57,6 +73,7 @@ class PhoneLauncherTests(unittest.TestCase):
 
         pid_path = os.path.join(self.root, "run", "audit.pid")
         log_path = os.path.join(self.root, "run", "audit.log")
+        lock_path = os.path.join(self.root, "run", "audit.lock")
         result = web.start_phone_run(
             {"program": self.project, "mode": "prodready", "provider": "openai",
              "max_cost": 7},
@@ -65,7 +82,9 @@ class PhoneLauncherTests(unittest.TestCase):
             readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
             pid_path=pid_path,
             log_path=log_path,
+            lock_path=lock_path,
             popen=fake_popen,
+            start_reaper=lambda process, path: captured.update(reaped=(process.pid, path)),
         )
         command = captured["command"]
         self.assertEqual(424242, result["pid"])
@@ -74,8 +93,11 @@ class PhoneLauncherTests(unittest.TestCase):
             self.project, command[command.index("--program") + 1]))
         self.assertIn("--no-push", command)
         self.assertIn("--no-merge", command)
+        self.assertIn("--no-auto-clean", command)
         self.assertIn("--single", command)
+        self.assertEqual("paid", command[command.index("--model-mode") + 1])
         self.assertNotIn("shell", captured["kwargs"])
+        self.assertEqual((424242, pid_path), captured["reaped"])
         with open(pid_path, encoding="utf-8") as fh:
             self.assertEqual("424242", fh.read().strip())
 
@@ -97,6 +119,7 @@ class PhoneLauncherTests(unittest.TestCase):
                     body, env=self.env, programs=allowed, readiness=readiness,
                     pid_path=os.path.join(self.root, "run", "audit.pid"),
                     log_path=os.path.join(self.root, "run", "audit.log"),
+                    lock_path=os.path.join(self.root, "run", "audit.lock"),
                 )
 
     def test_rejects_second_run_while_pid_is_alive(self):
@@ -112,8 +135,80 @@ class PhoneLauncherTests(unittest.TestCase):
                 readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
                 pid_path=pid_path,
                 log_path=os.path.join(self.root, "audit.log"),
+                lock_path=os.path.join(self.root, "audit.lock"),
                 popen=lambda *args, **kwargs: self.fail("must not spawn"),
             )
+
+    def test_process_start_lock_is_shared_across_processes(self):
+        lock_path = os.path.join(self.root, "audit.lock")
+        os.mkdir(lock_path)
+        with open(os.path.join(lock_path, "owner.pid"), "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        with self.assertRaisesRegex(ValueError, "already starting"):
+            web.start_phone_run(
+                {"program": self.project, "mode": "audit", "provider": "openai",
+                 "max_cost": 10},
+                env=self.env,
+                programs=[{"name": "target-app", "path": self.project}],
+                readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
+                pid_path=os.path.join(self.root, "audit.pid"),
+                log_path=os.path.join(self.root, "audit.log"),
+                lock_path=lock_path,
+                popen=lambda *args, **kwargs: self.fail("must not spawn"),
+            )
+
+    def test_ollama_launch_uses_free_model_mode(self):
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return SimpleNamespace(pid=989898)
+
+        run_dir = os.path.join(self.root, "ollama-run")
+        web.start_phone_run(
+            {"program": self.project, "mode": "audit", "provider": "ollama",
+             "max_cost": 2},
+            env=self.env,
+            programs=[{"name": "target-app", "path": self.project}],
+            readiness=[{"name": "ollama", "ready": True, "detail": "ready"}],
+            pid_path=os.path.join(run_dir, "audit.pid"),
+            log_path=os.path.join(run_dir, "audit.log"),
+            lock_path=os.path.join(run_dir, "audit.lock"),
+            popen=fake_popen,
+            start_reaper=lambda process, path: None,
+        )
+        command = captured["command"]
+        self.assertEqual("free", command[command.index("--model-mode") + 1])
+
+    def test_reaper_clears_only_the_exited_child_pid(self):
+        pid_path = os.path.join(self.root, "audit.pid")
+        with open(pid_path, "w", encoding="utf-8") as fh:
+            fh.write("31337\n")
+        waited = threading.Event()
+
+        class Process:
+            pid = 31337
+
+            @staticmethod
+            def wait():
+                waited.set()
+                return 0
+
+        web._start_audit_reaper(Process(), pid_path)
+        self.assertTrue(waited.wait(2))
+        for _ in range(20):
+            if not os.path.exists(pid_path):
+                break
+            time.sleep(0.01)
+        self.assertFalse(os.path.exists(pid_path))
+
+    def test_shell_launcher_uses_the_same_atomic_lock(self):
+        path = os.path.join(os.path.dirname(__file__), "scripts", "phone", "engine.sh")
+        with open(path, encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('AUDIT_LOCK="$RUN_DIR/audit.lock"', script)
+        self.assertIn('mkdir "$AUDIT_LOCK"', script)
+        self.assertIn("acquire_audit_lock || exit 1", script)
 
     def test_http_launch_requires_exact_token(self):
         original = web.start_phone_run
