@@ -52,13 +52,22 @@ STATUS_PATH = os.path.join(FLEX_DIR, "status.json")
 TOKEN_PATH = os.path.join(FLEX_DIR, "web-token.txt")
 ACCESS_LOG = os.path.join(FLEX_DIR, "web-access.log")
 PHONE_RUN_DIR = os.path.join(os.path.expanduser("~"), ".phone-console")
+PHONE_PROVIDER_PATH = os.path.join(PHONE_RUN_DIR, "providers.json")
+PROVIDER_INSTALL_PID_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.pid")
+PROVIDER_INSTALL_LOG_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.log")
+PROVIDER_INSTALL_STATUS_PATH = os.path.join(PHONE_RUN_DIR, "provider-install.json")
 AUDIT_PID_PATH = os.path.join(PHONE_RUN_DIR, "audit.pid")
 AUDIT_LOG_PATH = os.path.join(PHONE_RUN_DIR, "flexfactor-audit.log")
 AUDIT_LOCK_PATH = os.path.join(PHONE_RUN_DIR, "audit.lock")
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 LAUNCH_MODES = {"audit", "prodready"}
 LAUNCH_PROVIDERS = {"anthropic", "openai", "ollama"}
+CLOUD_PROVIDER_ENV = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
 LAUNCH_LOCK = threading.Lock()
+PROVIDER_CONFIG_LOCK = threading.Lock()
 
 # Inherited from flexfactor_dashboard_v2: quiet longer than this is worth
 # SAYING, but it is explicitly NOT death - long fix loops legitimately go
@@ -420,9 +429,178 @@ def _available_phone_programs(env=None) -> list[dict]:
 
 def _module_available(name: str) -> bool:
     try:
+        importlib.invalidate_caches()
         return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+def _load_phone_provider_env(provider_path=PHONE_PROVIDER_PATH) -> dict[str, str]:
+    """Load configured provider keys without ever returning them to the UI."""
+    try:
+        with open(provider_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    configured = {}
+    for provider, env_name in CLOUD_PROVIDER_ENV.items():
+        value = providers.get(provider)
+        if isinstance(value, str) and value.strip():
+            configured[env_name] = value
+    return configured
+
+
+def _effective_provider_env(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict[str, str]:
+    """Merge private phone configuration with explicit process environment."""
+    effective = dict(os.environ if env is None else env)
+    for env_name, value in _load_phone_provider_env(provider_path).items():
+        if not str(effective.get(env_name) or "").strip():
+            effective[env_name] = value
+    return effective
+
+
+def save_phone_provider(body: dict, *, env=None,
+                        provider_path=PHONE_PROVIDER_PATH) -> dict:
+    """Atomically persist one cloud key in Termux-private storage.
+
+    The response deliberately contains readiness metadata only. There is no API
+    for reading a stored key back out of the phone engine.
+    """
+    env = os.environ if env is None else env
+    if not _is_phone_environment(env):
+        raise ValueError("provider setup is only available on the phone")
+    provider = body.get("provider")
+    api_key = body.get("api_key")
+    if provider not in CLOUD_PROVIDER_ENV:
+        raise ValueError("provider must be openai or anthropic")
+    if not isinstance(api_key, str):
+        raise ValueError("API key must be text")
+    if api_key != api_key.strip() or len(api_key) < 16 or len(api_key) > 4096:
+        raise ValueError("API key has an invalid format")
+    if any(ord(char) < 32 or ord(char) == 127 for char in api_key):
+        raise ValueError("API key has an invalid format")
+
+    with PROVIDER_CONFIG_LOCK:
+        existing = _load_phone_provider_env(provider_path)
+        providers = {}
+        for name, env_name in CLOUD_PROVIDER_ENV.items():
+            value = existing.get(env_name)
+            if value:
+                providers[name] = value
+        providers[provider] = api_key
+        parent = os.path.dirname(provider_path)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
+        temporary = provider_path + ".tmp-" + secrets.token_hex(8)
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                descriptor = None
+                json.dump({"version": 1, "providers": providers}, fh,
+                          separators=(",", ":"), sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, provider_path)
+            try:
+                os.chmod(provider_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    effective = _effective_provider_env(env, provider_path)
+    state = next(item for item in _provider_readiness(effective)
+                 if item["name"] == provider)
+    return {"ok": True, "provider": provider, "configured": True,
+            "ready": state["ready"], "detail": state["detail"]}
+
+
+def start_phone_provider_install(body: dict, *, env=None,
+                                 pid_path=PROVIDER_INSTALL_PID_PATH,
+                                 log_path=PROVIDER_INSTALL_LOG_PATH,
+                                 status_path=PROVIDER_INSTALL_STATUS_PATH,
+                                 audit_pid_path=AUDIT_PID_PATH,
+                                 popen=subprocess.Popen,
+                                 start_reaper=None) -> dict:
+    """Start one fixed, allowlisted SDK install without accepting shell input."""
+    env = os.environ if env is None else env
+    if not _is_phone_environment(env):
+        raise ValueError("provider installation is only available on the phone")
+    provider = body.get("provider")
+    if provider not in CLOUD_PROVIDER_ENV:
+        raise ValueError("provider must be openai or anthropic")
+    script = os.path.join(APP_ROOT, "scripts", "phone", "install-provider.sh")
+    if not os.path.isfile(script):
+        raise OSError("provider installer is missing")
+    with LAUNCH_LOCK:
+        audit_pid = _running_audit_pid(audit_pid_path)
+        if audit_pid:
+            raise ValueError(
+                "provider support cannot be installed while audit pid {} is running".format(
+                    audit_pid))
+        running = _running_audit_pid(pid_path)
+        if running:
+            return {"ok": True, "provider": provider, "pid": running,
+                    "installing": True}
+        os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+        command = ["bash", script, provider]
+        install_env_names = (
+            "PATH", "HOME", "PREFIX", "TMPDIR", "LANG", "LC_ALL",
+            "TERMUX_VERSION", "ANDROID_ROOT", "ANDROID_DATA",
+        )
+        child_env = {name: str(env[name]) for name in install_env_names
+                     if env.get(name) is not None}
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write("\n--- {} installing {} support ---\n".format(
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), provider))
+            log.flush()
+            process = popen(
+                command, cwd=APP_ROOT, env=child_env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                close_fds=True,
+            )
+        temporary = pid_path + ".tmp-{}".format(os.getpid())
+        try:
+            with open(temporary, "w", encoding="utf-8") as fh:
+                fh.write(str(process.pid) + "\n")
+            os.replace(temporary, pid_path)
+            try:
+                os.unlink(status_path)
+            except OSError:
+                pass
+        except OSError:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - preserve the PID-write failure
+                pass
+            raise
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    if start_reaper is None:
+        _start_provider_install_reaper(
+            process, pid_path, status_path, provider)
+    else:
+        start_reaper(process, pid_path)
+    return {"ok": True, "provider": provider, "pid": process.pid,
+            "installing": True}
 
 
 def _ollama_reachable(env=None) -> bool:
@@ -544,13 +722,81 @@ def _start_audit_reaper(process, pid_path: str) -> None:
     threading.Thread(target=reap, name="flexfactor-audit-reaper", daemon=True).start()
 
 
-def phone_launch_state(env=None) -> dict:
+def _load_provider_install_status(status_path=PROVIDER_INSTALL_STATUS_PATH) -> dict:
+    try:
+        with open(status_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    provider = payload.get("provider")
+    state = payload.get("state")
+    if provider not in CLOUD_PROVIDER_ENV or state not in ("installed", "failed"):
+        return {}
+    return {"provider": provider, "state": state,
+            "detail": ("Provider support installed."
+                       if state == "installed" else
+                       "Provider installation failed. In Termux, run "
+                       "flexfactor-engine provider-log for details.")}
+
+
+def _start_provider_install_reaper(process, pid_path: str, status_path: str,
+                                   provider: str) -> None:
+    """Record a sanitized installer outcome and clear only this child PID."""
+    def reap() -> None:
+        try:
+            return_code = process.wait()
+        except Exception:  # noqa: BLE001 - a lost child is a failed install
+            return_code = -1
+        parent = os.path.dirname(status_path)
+        os.makedirs(parent, exist_ok=True)
+        temporary = status_path + ".tmp-" + secrets.token_hex(8)
+        try:
+            descriptor = os.open(
+                temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+                json.dump({"provider": provider,
+                           "state": "installed" if return_code == 0 else "failed"},
+                          fh, separators=(",", ":"), sort_keys=True)
+                fh.write("\n")
+            os.replace(temporary, status_path)
+            try:
+                os.chmod(status_path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        with LAUNCH_LOCK:
+            try:
+                with open(pid_path, "r", encoding="utf-8") as fh:
+                    recorded = int(fh.read().strip())
+                if recorded == process.pid:
+                    os.unlink(pid_path)
+            except (OSError, TypeError, ValueError):
+                pass
+
+    threading.Thread(target=reap, name="flexfactor-provider-install-reaper",
+                     daemon=True).start()
+
+
+def phone_launch_state(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict:
     env = os.environ if env is None else env
     phone = _is_phone_environment(env)
+    effective = _effective_provider_env(env, provider_path) if phone else env
     return {
         "available": phone,
         "programs": _available_phone_programs(env) if phone else [],
-        "providers": _provider_readiness(env) if phone else [],
+        "providers": _provider_readiness(effective) if phone else [],
+        "provider_install_pid": (_running_audit_pid(PROVIDER_INSTALL_PID_PATH)
+                                 if phone else None),
+        "provider_install": (_load_provider_install_status()
+                             if phone else {}),
         "running_pid": _running_audit_pid() if phone else None,
         "default_max_cost": 10,
         "policy": "Changes stay on this phone; launch never pushes or merges.",
@@ -559,7 +805,9 @@ def phone_launch_state(env=None) -> dict:
 
 def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                     pid_path=AUDIT_PID_PATH, log_path=AUDIT_LOG_PATH,
-                    lock_path=AUDIT_LOCK_PATH, popen=subprocess.Popen,
+                    lock_path=AUDIT_LOCK_PATH, provider_path=PHONE_PROVIDER_PATH,
+                    provider_install_pid_path=PROVIDER_INSTALL_PID_PATH,
+                    popen=subprocess.Popen,
                     start_reaper=_start_audit_reaper) -> dict:
     """Validate and spawn one detached phone run without invoking a shell."""
     env = os.environ if env is None else env
@@ -584,13 +832,19 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                   if os.path.realpath(str(item.get("path") or "")) == requested), None)
     if match is None:
         raise ValueError("program is not an allowed repository on this phone")
-    readiness = _provider_readiness(env) if readiness is None else readiness
+    effective_env = _effective_provider_env(env, provider_path)
+    readiness = _provider_readiness(effective_env) if readiness is None else readiness
     provider_state = next((item for item in readiness if item.get("name") == provider), None)
     if not provider_state or not provider_state.get("ready"):
         detail = str((provider_state or {}).get("detail") or "not configured")
         raise ValueError(provider + " is not ready: " + detail)
 
     with LAUNCH_LOCK:
+        installing = _running_audit_pid(provider_install_pid_path)
+        if installing:
+            raise ValueError(
+                "an audit cannot start while provider installation pid {} is running".format(
+                    installing))
         os.makedirs(os.path.dirname(pid_path), exist_ok=True)
         _acquire_audit_start_lock(lock_path, pid_path)
         try:
@@ -605,7 +859,7 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                 "--max-cost", "{:g}".format(max_cost),
                 "--no-push", "--no-merge", "--no-auto-clean",
             ]
-            child_env = dict(env)
+            child_env = dict(effective_env)
             child_env["FLEXFACTOR_HOST_LABEL"] = "this phone"
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write("\n--- {} app launch: {} {} (max ${:g}) ---\n".format(
@@ -696,6 +950,8 @@ svg{display:block;width:100%;height:38px}
  border:1px solid #30363d;border-radius:8px;padding:10px;margin:4px 0 8px;font:14px inherit}
 .launchbtn{width:100%;background:#238636;color:white;border:0;border-radius:8px;
  padding:11px 12px;font-weight:700;margin-top:6px}.launchbtn:disabled{opacity:.45}
+.providerbtn{width:100%;background:#1f6feb;color:white;border:0;border-radius:8px;
+ padding:10px 12px;font-weight:700;margin:0 0 8px}.providerbtn:disabled{opacity:.45}
 </style></head><body>
 <h1>FlexFactor</h1>
 <div class="sub" id="sub">connecting...</div>
@@ -707,9 +963,11 @@ var LAUNCH_DRAFT = {program:"",mode:"audit",provider:"openai",max_cost:10};
 function launchHtml(l){
   if(!l||!l.available) return "";
   var providers=l.providers||[], programs=l.programs||[], running=l.running_pid;
+  var installing=l.provider_install_pid;
+  var installStatus=l.provider_install||{};
   if(!LAUNCH_DRAFT.program&&programs.length) LAUNCH_DRAFT.program=programs[0].path;
   var selectedProvider=providers.find(function(p){return p.name===LAUNCH_DRAFT.provider;});
-  if(!selectedProvider||!selectedProvider.ready){
+  if(!selectedProvider){
     var first=providers.find(function(p){return p.ready;});
     if(first) LAUNCH_DRAFT.provider=first.name;
   }
@@ -725,13 +983,46 @@ function launchHtml(l){
     '<option value="prodready" '+(LAUNCH_DRAFT.mode==='prodready'?'selected':'')+'>Production readiness</option></select>'+
     '<div class="lbl">Provider</div><select onchange="LAUNCH_DRAFT.provider=this.value;tick()">';
   providers.forEach(function(p){h+='<option value="'+esc(p.name)+'" '+(p.name===LAUNCH_DRAFT.provider?'selected':'')+'>'+esc(p.name)+' — '+esc(p.detail)+'</option>';});
-  h+='</select><div class="lbl">Maximum provider cost (USD)</div><input type="number" min="1" max="150" step="1" value="'+esc(LAUNCH_DRAFT.max_cost)+'" onchange="LAUNCH_DRAFT.max_cost=this.value">'+
+  h+='</select>';
+  if(LAUNCH_DRAFT.provider==='openai'||LAUNCH_DRAFT.provider==='anthropic'){
+    h+='<div class="lbl">Provider API key</div><input id="providerKey" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Paste key — it is never shown again">'+
+      '<button class="providerbtn" onclick="submitProvider(this)">Save key on this phone</button>';
+    if(String(selectedProvider.detail||'').indexOf('SDK')>=0){
+      h+='<button class="providerbtn" '+(installing?'disabled':'')+' onclick="submitProviderInstall(this)">'+
+        (installing?'Installing provider support…':'Install provider support')+'</button>';
+    }
+  }
+  h+='<div class="lbl">Maximum provider cost (USD)</div><input type="number" min="1" max="150" step="1" value="'+esc(LAUNCH_DRAFT.max_cost)+'" onchange="LAUNCH_DRAFT.max_cost=this.value">'+
     '<div class="dim">This run may edit the selected repository locally. It cannot push or merge.</div>'+
     (running?'<div class="dim" style="margin-top:8px">Audit process '+running+' is already running.</div>':'')+
     (!programs.length?'<div class="warnbox">No Git repositories were found in the phone project roots.</div>':'')+
-    (!selectedProvider.ready?'<div class="warnbox">Configure a provider in Termux first: '+esc(selectedProvider.detail||'none is ready')+'.</div>':'')+
+    (!installing&&installStatus.state==='failed'&&installStatus.provider===LAUNCH_DRAFT.provider?'<div class="warnbox">'+esc(installStatus.detail)+'</div>':'')+
+    (!selectedProvider.ready?'<div class="warnbox">Provider setup needed: '+esc(selectedProvider.detail||'none is ready')+'. Save a key above; if the SDK is missing, use the app setup action once.</div>':'')+
     '<button class="launchbtn" '+(disabled?'disabled':'')+' onclick="submitLaunch(this)">Start FlexFactor</button></div>';
   return h;
+}
+function submitProvider(button){
+  var input=document.getElementById('providerKey');
+  var key=input?input.value:'';
+  if(!key){alert('Paste the provider API key first.');return;}
+  button.disabled=true;button.textContent='Saving…';
+  fetch('/api/provider?t='+encodeURIComponent(TOKEN),{method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+    body:JSON.stringify({provider:LAUNCH_DRAFT.provider,api_key:key})})
+   .then(function(r){return r.json().then(function(d){if(!r.ok) throw new Error(d.error||('HTTP '+r.status));return d;});})
+   .then(function(d){if(input) input.value='';alert(d.ready?'Provider is ready.':'Key saved. '+d.detail+'.');tick();})
+   .catch(function(e){alert('Could not save provider: '+e.message);})
+   .finally(function(){button.disabled=false;button.textContent='Save key on this phone';});
+}
+function submitProviderInstall(button){
+  if(!confirm('Install '+LAUNCH_DRAFT.provider+' provider support on this phone? This may take several minutes.')) return;
+  button.disabled=true;button.textContent='Starting installation…';
+  fetch('/api/provider/install?t='+encodeURIComponent(TOKEN),{method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+    body:JSON.stringify({provider:LAUNCH_DRAFT.provider})})
+   .then(function(r){return r.json().then(function(d){if(!r.ok) throw new Error(d.error||('HTTP '+r.status));return d;});})
+   .then(function(){alert('Provider installation started. FlexFactor will show ready when it finishes.');tick();})
+   .catch(function(e){alert('Could not install provider support: '+e.message);button.disabled=false;button.textContent='Install provider support';});
 }
 function submitLaunch(button){
   var name=(LAUNCH_DRAFT.program.split('/').pop()||LAUNCH_DRAFT.program);
@@ -901,13 +1192,19 @@ function tick(){
        d.host+" · status "+(d.status_quiet_s==null?"never seen":
        "updated "+dur(d.status_quiet_s)+" ago");
      var a=document.getElementById("app");
+     var oldKey=document.getElementById('providerKey');
+     var keyValue=oldKey?oldKey.value:'';
      var launcher=launchHtml(d.launch);
      if(!d.programs.length){
        a.innerHTML=launcher+'<div class="empty">No active programs.<br>'+
          '<span style="font-size:12px">FlexFactor writes status.json when a run starts.</span></div>';
+       var restoredEmpty=document.getElementById('providerKey');
+       if(restoredEmpty) restoredEmpty.value=keyValue;
        return;
      }
      a.innerHTML = launcher+d.programs.map(card).join("");
+     var restored=document.getElementById('providerKey');
+     if(restored) restored.value=keyValue;
    })
    .catch(function(e){
      document.getElementById("sub").textContent = "offline — "+e.message;
@@ -925,6 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "FlexFactorWeb/1.0"
     token = ""
     sampler: Sampler = None  # type: ignore[assignment]
+    provider_path = PHONE_PROVIDER_PATH
 
     def log_message(self, fmt, *args):
         """Append peer + request to an access log.
@@ -977,7 +1275,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send(401, b'{"error":"bad or missing token"}', "application/json")
             return
-        if path not in ("/api/steering", "/api/launch"):
+        if path not in ("/api/steering", "/api/launch", "/api/provider",
+                        "/api/provider/install"):
             self._send(404, b'{"error":"not found"}', "application/json")
             return
         try:
@@ -992,8 +1291,16 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("request body must be an object")
             if path == "/api/launch":
-                result = start_phone_run(body)
+                result = start_phone_run(body, provider_path=self.provider_path)
                 self._send(201, json.dumps(result).encode("utf-8"), "application/json")
+                return
+            if path == "/api/provider":
+                result = save_phone_provider(body, provider_path=self.provider_path)
+                self._send(201, json.dumps(result).encode("utf-8"), "application/json")
+                return
+            if path == "/api/provider/install":
+                result = start_phone_provider_install(body)
+                self._send(202, json.dumps(result).encode("utf-8"), "application/json")
                 return
             program = str(body.get("program") or "")
             project_dir = str(body.get("project_dir") or "")
@@ -1006,7 +1313,7 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError, UnicodeError) as exc:
             self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
         except OSError:
-            self._send(500, b'{"error":"the phone could not start the FlexFactor process"}',
+            self._send(500, b'{"error":"the phone could not complete the request"}',
                        "application/json")
 
     def do_GET(self) -> None:
