@@ -208,7 +208,13 @@ jobs:
           aab_dir="android/app/build/outputs/bundle/play"
           aab="$aab_dir/app-play.aab"
           test -s "$aab"
-          jarsigner -verify "$aab"
+          aab_signature=$(jarsigner -verify "$aab" 2>&1)
+          printf '%s\n' "$aab_signature"
+          printf '%s\n' "$aab_signature" | grep -Fq "jar verified."
+          if printf '%s\n' "$aab_signature" | grep -Fq "jar is unsigned."; then
+            echo "Play bundle is unsigned" >&2
+            exit 1
+          fi
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
           printf '%s\n' "${GITHUB_SHA}" > "$aab_dir/SOURCE_COMMIT"
       - name: Create signed update manifest
