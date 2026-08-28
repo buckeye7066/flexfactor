@@ -26,6 +26,14 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         ):
             self.assertIn(label, activity)
 
+    def test_android_network_policy_is_https_only(self):
+        policy = (ANDROID / "res" / "xml" /
+                  "network_security_config.xml").read_text(encoding="utf-8")
+        self.assertIn('cleartextTrafficPermitted="false"', policy)
+        self.assertNotIn('cleartextTrafficPermitted="true"', policy)
+        self.assertNotIn("localhost", policy)
+        self.assertNotIn("127.0.0.1", policy)
+
     def test_activity_has_no_loopback_or_shell_engine(self):
         source = "\n".join(
             path.read_text(encoding="utf-8")
