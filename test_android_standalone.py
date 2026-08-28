@@ -73,6 +73,16 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn('per_page=100&page=" + page', api)
         self.assertIn('row.optBoolean("private", true)', api)
 
+    def test_credential_switch_validates_before_write_and_removes_old_openai_secret(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        configure = api.split("ConfigurationResult configure", 1)[1]
+        configure = configure.split("List<Repository> repositories", 1)[0]
+        self.assertLess(configure.index("verifyOpenAi(provider)"),
+                        configure.index('putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN"'))
+        self.assertIn('deleteRepositorySecretIfPresent(token, "OPENAI_API_KEY")', configure)
+        self.assertIn("result.status != 204 && result.status != 404", api)
+
     def test_android_release_gate_proves_the_default_hosted_provider(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "android-client.yml").read_text(encoding="utf-8")
