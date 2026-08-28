@@ -53,6 +53,21 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertNotIn("${{ inputs.github_token }}", workflow)
         self.assertNotIn("${{ inputs.openai", workflow.lower())
+        self.assertNotIn("inputs.target_repository }} ·", workflow)
+        self.assertNotIn("find target -type f -name '*.bak'", workflow)
+        self.assertIn("args+=(--apply --yes)", workflow)
+        self.assertIn("target/*_repo_rewards_report.md", workflow)
+        self.assertIn("target/*_audit_report.md", workflow)
+        self.assertIn("target/*_readiness.md", workflow)
+        summary = workflow.split("- name: Write the phone-readable run summary", 1)[1]
+        summary = summary.split("- name: Upload exact-run result", 1)[0]
+        self.assertNotIn("${{ inputs.", summary)
+
+    def test_repository_picker_paginates_and_rejects_private_targets(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        self.assertIn('per_page=100&page=" + page', api)
+        self.assertIn('row.optBoolean("private", true)', api)
 
 
 if __name__ == "__main__":
