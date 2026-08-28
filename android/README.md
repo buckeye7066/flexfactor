@@ -24,7 +24,10 @@ repository's GitHub Actions public key and writes them to protected Actions
 secrets; neither value is sent as a workflow input, URL, command argument,
 artifact, or log field.
 
-After setup, choose a writable repository and use any original mode:
+After setup, choose a writable **public** repository and use any original mode.
+Private targets are intentionally excluded because this release uses the public
+FlexFactor repository as its control plane; this prevents private names or
+source-derived output from appearing in public Actions metadata and logs.
 
 1. **Refactor a file** — improve a selected file toward a stated goal and open a
    publication PR when the verified output changes it.
@@ -75,6 +78,7 @@ signing value is absent; it never falls back to a debug key.
 - Credentials are masked in the UI, encrypted locally, and transferred to
   GitHub only through the official LibSodium-sealed Actions secrets API.
 - Target code executes on an ephemeral GitHub-hosted runner, not on the phone.
+- The public mobile control plane accepts public target repositories only.
 - Workflow inputs are validated again on the runner before checkout or
   execution.
 - The legacy `scripts/phone/` Termux engine remains available for command-line
