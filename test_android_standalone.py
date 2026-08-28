@@ -54,6 +54,7 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("contents: read", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn('--judge-model "$FLEXFACTOR_PHONE_MODEL"', workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
         self.assertIn('--provider "$PROVIDER"', workflow)
