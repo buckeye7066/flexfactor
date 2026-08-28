@@ -177,6 +177,10 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("FLEXFACTOR_READY", workflow)
         self.assertIn("bundlePlay", workflow)
         self.assertIn("app-play.aab", workflow)
+        build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
+        build_gate = build_gate.split("- name: Verify the default phone model provider live", 1)[0]
+        self.assertIn("testPlayUnitTest", build_gate)
+        self.assertIn("bundlePlay", build_gate)
 
     def test_play_bundle_omits_the_direct_apk_self_installer(self):
         play_manifest = (ROOT / "android" / "app" / "src" / "play" /
