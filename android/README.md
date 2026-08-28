@@ -50,7 +50,8 @@ without uninstalling the existing app.
 
 ## Build
 
-JDK 17, Android SDK 36, and Gradle 8.13 are required:
+JDK 21, Android SDK 36, and Gradle 8.13 are required. The app itself still
+targets Java 17 bytecode for Android compatibility:
 
 ```bash
 gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
