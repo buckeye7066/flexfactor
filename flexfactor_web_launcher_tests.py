@@ -154,8 +154,11 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertEqual(838383, result["pid"])
         self.assertEqual("openai", captured["command"][-1])
         self.assertEqual("bash", captured["command"][0])
-        self.assertTrue(captured["command"][1].endswith(
-            "scripts/phone/install-provider.sh"))
+        self.assertTrue(os.path.samefile(
+            captured["command"][1],
+            os.path.join(os.path.dirname(__file__), "scripts", "phone",
+                         "install-provider.sh"),
+        ))
         self.assertNotIn("shell", captured["kwargs"])
         self.assertEqual((838383, os.path.join(run_dir, "provider.pid")),
                          captured["reaped"])
