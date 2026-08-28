@@ -17,9 +17,9 @@ on:
       provider:
         description: Model provider selected by the signed Android app
         required: true
-        default: copilot
+        default: ollama
         type: choice
-        options: [copilot, openai]
+        options: [ollama, openai]
       target_repository:
         description: Target owner/repository
         required: true
@@ -50,7 +50,6 @@ on:
 
 permissions:
   contents: read
-  copilot-requests: write
 
 concurrency:
   group: mobile-flexfactor-${{ inputs.target_repository }}
@@ -64,8 +63,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
+      FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
+      FLEXFACTOR_OLLAMA_TIMEOUT: "1800"
       PYTHONUTF8: "1"
 
     steps:
@@ -86,7 +86,7 @@ jobs:
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
-          if provider not in {"copilot", "openai"}:
+          if provider not in {"ollama", "openai"}:
               raise SystemExit("unsupported provider")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
                               repository):
@@ -130,8 +130,6 @@ jobs:
           test -n "$GH_TOKEN" || { echo "FLEXFACTOR_MOBILE_GITHUB_TOKEN is missing" >&2; exit 1; }
           if [ "${{ inputs.provider }}" = openai ]; then
             test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
-          else
-            test -n "$COPILOT_GITHUB_TOKEN" || { echo "GitHub token for Copilot is missing" >&2; exit 1; }
           fi
 
       - name: Check out the exact FlexFactor engine
@@ -157,17 +155,26 @@ jobs:
           cache: pip
           cache-dependency-path: engine/requirements.txt
 
-      - name: Set up Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-
-      - name: Install GitHub Copilot provider
-        if: inputs.provider == 'copilot'
+      - name: Install and start the hosted open model
+        if: inputs.provider == 'ollama'
         shell: bash
         run: |
-          npm install --global @github/copilot
-          copilot --version
+          archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+          curl --fail --location --silent --show-error --retry 3 \
+            https://github.com/ollama/ollama/releases/download/v0.33.0/ollama-linux-amd64.tar.zst \
+            --output "$archive"
+          printf '%s  %s\n' \
+            88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d \
+            "$archive" | sha256sum --check --strict
+          sudo tar --zstd -xf "$archive" -C /usr
+          ollama --version
+          ollama serve >"$RUNNER_TEMP/ollama.log" 2>&1 &
+          for attempt in {1..60}; do
+            curl --fail --silent http://127.0.0.1:11434/api/version && break
+            if [ "$attempt" -eq 60 ]; then cat "$RUNNER_TEMP/ollama.log"; exit 1; fi
+            sleep 1
+          done
+          ollama pull qwen2.5-coder:7b
 
       - name: Install the engine and browser runtime
         shell: bash
@@ -249,9 +256,11 @@ jobs:
             python engine/flexfactor.py "${args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           else
+            model_mode=paid
+            if [ "$PROVIDER" = ollama ]; then model_mode=free; fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              --provider "$PROVIDER" --model-mode paid --single \
+              --provider "$PROVIDER" --model-mode "$model_mode" --single \
               --max-cost "$MAX_COST" --no-dashboard --yes --apply \
               --trust-repo --no-auto-clean 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
