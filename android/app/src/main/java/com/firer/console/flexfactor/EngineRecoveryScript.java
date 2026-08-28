@@ -20,7 +20,11 @@ final class EngineRecoveryScript {
             "fi",
             "termux-reload-settings");
 
-    private static final String PRELUDE = String.join("\n",
+    private static String prelude(String nonce) {
+        if (nonce == null || !nonce.matches("[0-9a-f-]{36}")) {
+            throw new IllegalArgumentException("invalid recovery nonce");
+        }
+        return String.join("\n",
             "set -eu",
             "umask 077",
             "export HOME=/data/data/com.termux/files/home",
@@ -30,48 +34,63 @@ final class EngineRecoveryScript {
             "mkdir -p \"$run_dir\"",
             "log=\"$run_dir/app-recovery.log\"",
             "exec >>\"$log\" 2>&1",
+            "nonce=\"" + nonce + "\"",
+            "status_sent=0",
             "notify() {",
             "  /system/bin/am broadcast -W -n com.firer.console.flexfactor/.ConfigReceiver \\",
-            "    --es recovery_status \"$1\" >/dev/null 2>&1 || true",
-            "}");
+            "    --es recovery_status \"$1\" --es recovery_nonce \"$nonce\" >/dev/null 2>&1 || true",
+            "}",
+            "terminal() { notify \"$1\"; status_sent=1; }",
+            "finish() {",
+            "  code=$?",
+            "  trap - EXIT",
+            "  if [ \"$code\" -ne 0 ] && [ \"$status_sent\" -eq 0 ]; then notify failed; fi",
+            "  exit \"$code\"",
+            "}",
+            "trap finish EXIT");
+    }
 
     private EngineRecoveryScript() {}
 
-    static String startScript() {
+    static String startScript(String nonce) {
         return String.join("\n",
-                PRELUDE,
+                prelude(nonce),
                 "app=\"$HOME/phone-console/flexfactor\"",
                 "if [ ! -f \"$app/scripts/phone/engine.sh\" ]; then",
-                "  notify missing-engine",
+                "  terminal missing-engine",
                 "  exit 21",
                 "fi",
                 "notify starting",
                 "if bash \"$app/scripts/phone/engine.sh\" start; then",
-                "  notify ready",
+                "  terminal ready",
                 "else",
-                "  notify failed",
+                "  terminal failed",
                 "  exit 22",
                 "fi");
     }
 
-    static String repairScript() {
+    static String repairScript(String nonce) {
         return String.join("\n",
-                PRELUDE,
+                prelude(nonce),
                 "app=\"$HOME/phone-console/flexfactor\"",
                 "notify updating",
-                "if ! command -v git >/dev/null || ! command -v gh >/dev/null || ! command -v python >/dev/null; then",
+                "if ! command -v git >/dev/null || ! command -v gh >/dev/null || \\",
+                "   ! command -v python >/dev/null || ! command -v node >/dev/null || \\",
+                "   ! command -v npm >/dev/null || ! command -v ssh >/dev/null || \\",
+                "   ! command -v which >/dev/null || ! command -v curl >/dev/null || \\",
+                "   ! command -v termux-wake-lock >/dev/null; then",
                 "  pkg update -y",
-                "  pkg install -y python git gh nodejs-lts openssh which termux-api",
+                "  pkg install -y python git gh nodejs-lts openssh which curl termux-api",
                 "fi",
                 "if ! gh auth status >/dev/null 2>&1; then",
-                "  notify github-auth-required",
+                "  terminal github-auth-required",
                 "  exit 23",
                 "fi",
                 "gh auth setup-git",
                 "mkdir -p \"$HOME/phone-console\"",
                 "if [ -d \"$app/.git\" ]; then",
                 "  if [ -n \"$(git -C \"$app\" status --porcelain)\" ]; then",
-                "    notify checkout-dirty",
+                "    terminal checkout-dirty",
                 "    exit 24",
                 "  fi",
                 "  git -C \"$app\" fetch --prune origin",
@@ -83,9 +102,9 @@ final class EngineRecoveryScript {
                 "FLEXFACTOR_SKIP_PACKAGES=1 FLEXFACTOR_NONINTERACTIVE=1 \\",
                 "  bash \"$app/scripts/phone/setup.sh\"",
                 "if bash \"$app/scripts/phone/engine.sh\" restart; then",
-                "  notify ready",
+                "  terminal ready",
                 "else",
-                "  notify failed",
+                "  terminal failed",
                 "  exit 25",
                 "fi");
     }
