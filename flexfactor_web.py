@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import importlib.util
 import json
+import math
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 import flexfactor_steering as steering
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +51,13 @@ FLEX_DIR = os.path.join(os.path.expanduser("~"), ".flexfactor")
 STATUS_PATH = os.path.join(FLEX_DIR, "status.json")
 TOKEN_PATH = os.path.join(FLEX_DIR, "web-token.txt")
 ACCESS_LOG = os.path.join(FLEX_DIR, "web-access.log")
+PHONE_RUN_DIR = os.path.join(os.path.expanduser("~"), ".phone-console")
+AUDIT_PID_PATH = os.path.join(PHONE_RUN_DIR, "audit.pid")
+AUDIT_LOG_PATH = os.path.join(PHONE_RUN_DIR, "flexfactor-audit.log")
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+LAUNCH_MODES = {"audit", "prodready"}
+LAUNCH_PROVIDERS = {"anthropic", "openai", "ollama"}
+LAUNCH_LOCK = threading.Lock()
 
 # Inherited from flexfactor_dashboard_v2: quiet longer than this is worth
 # SAYING, but it is explicitly NOT death - long fix loops legitimately go
@@ -332,6 +343,7 @@ def build_state(sampler: Sampler) -> dict:
         "status_quiet_s": round(quiet_s) if quiet_s is not None else None,
         "programs": out,
         "host": _host_label(),
+        "launch": phone_launch_state(),
     }
 
 
@@ -351,6 +363,182 @@ def _host_label(env=None):
     if env.get("TERMUX_VERSION") or prefix.startswith("/data/data/com.termux/"):
         return "this phone"
     return str(env.get("COMPUTERNAME") or env.get("HOSTNAME") or "pc")
+
+
+# --------------------------------------------------------- phone launcher
+
+def _is_phone_environment(env=None) -> bool:
+    env = os.environ if env is None else env
+    prefix = str(env.get("PREFIX") or "")
+    return bool(env.get("TERMUX_VERSION")) or prefix.startswith("/data/data/com.termux/")
+
+
+def _available_phone_programs(env=None) -> list[dict]:
+    """Return exact, already-cloned git repositories the phone may launch.
+
+    Only configured roots and their immediate children are considered. The
+    endpoint later matches a canonical path against this result, so a caller
+    cannot use ``..`` or an arbitrary path to escape the owner's project roots.
+    """
+    env = os.environ if env is None else env
+    configured = str(env.get("FLEXFACTOR_PROJECT_ROOTS") or "").strip()
+    roots = configured.split(os.pathsep) if configured else [
+        os.path.join(os.path.expanduser("~"), "phone-console"),
+        os.path.expanduser("~"),
+    ]
+    found: dict[str, dict] = {}
+    for raw_root in roots:
+        raw_root = raw_root.strip()
+        if not raw_root:
+            continue
+        root = os.path.realpath(os.path.expanduser(raw_root))
+        if not os.path.isdir(root):
+            continue
+        candidates = [root]
+        try:
+            candidates.extend(os.path.join(root, name) for name in os.listdir(root))
+        except OSError:
+            pass
+        for candidate in candidates:
+            path = os.path.realpath(candidate)
+            if not os.path.isdir(path) or not os.path.exists(os.path.join(path, ".git")):
+                continue
+            found[path] = {"name": os.path.basename(path) or path, "path": path}
+    return sorted(found.values(), key=lambda item: (item["name"].lower(), item["path"]))
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _ollama_reachable(env=None) -> bool:
+    env = os.environ if env is None else env
+    base = str(env.get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+    if not (base.startswith("http://127.0.0.1:") or base.startswith("http://localhost:")):
+        return False
+    try:
+        with urllib.request.urlopen(base + "/api/tags", timeout=0.25) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001 - a readiness probe must fail closed
+        return False
+
+
+def _provider_readiness(env=None, module_available=None,
+                        ollama_reachable=None) -> list[dict]:
+    """Report capability booleans and guidance, never credential values."""
+    env = os.environ if env is None else env
+    module_available = module_available or _module_available
+    ollama_reachable = ollama_reachable or (lambda: _ollama_reachable(env))
+    specs = [
+        ("openai", bool(str(env.get("OPENAI_API_KEY") or "").strip()),
+         module_available("openai"), "OPENAI_API_KEY"),
+        ("anthropic", bool(str(env.get("ANTHROPIC_API_KEY") or
+                               env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()),
+         module_available("anthropic"), "ANTHROPIC_API_KEY"),
+    ]
+    out = []
+    for name, has_key, has_sdk, key_name in specs:
+        missing = []
+        if not has_key:
+            missing.append(key_name)
+        if not has_sdk:
+            missing.append(name + " SDK")
+        out.append({"name": name, "ready": not missing,
+                    "detail": "ready" if not missing else "missing " + " and ".join(missing)})
+    ollama_ok = bool(ollama_reachable())
+    out.append({"name": "ollama", "ready": ollama_ok,
+                "detail": "ready" if ollama_ok else "local Ollama is not answering"})
+    return out
+
+
+def _running_audit_pid(pid_path=AUDIT_PID_PATH) -> int | None:
+    try:
+        with open(pid_path, "r", encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+        if pid <= 0:
+            return None
+        os.kill(pid, 0)
+        return pid
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def phone_launch_state(env=None) -> dict:
+    env = os.environ if env is None else env
+    phone = _is_phone_environment(env)
+    return {
+        "available": phone,
+        "programs": _available_phone_programs(env) if phone else [],
+        "providers": _provider_readiness(env) if phone else [],
+        "running_pid": _running_audit_pid() if phone else None,
+        "default_max_cost": 10,
+        "policy": "Changes stay on this phone; launch never pushes or merges.",
+    }
+
+
+def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
+                    pid_path=AUDIT_PID_PATH, log_path=AUDIT_LOG_PATH,
+                    popen=subprocess.Popen) -> dict:
+    """Validate and spawn one detached phone run without invoking a shell."""
+    env = os.environ if env is None else env
+    if not _is_phone_environment(env):
+        raise ValueError("runs can only be started from the on-phone engine")
+    mode = str(body.get("mode") or "")
+    provider = str(body.get("provider") or "")
+    if mode not in LAUNCH_MODES:
+        raise ValueError("mode must be audit or prodready")
+    if provider not in LAUNCH_PROVIDERS:
+        raise ValueError("provider is not allowed")
+    try:
+        max_cost = float(body.get("max_cost", 10))
+    except (TypeError, ValueError):
+        raise ValueError("cost cap must be a number") from None
+    if not math.isfinite(max_cost) or max_cost < 1 or max_cost > 150:
+        raise ValueError("cost cap must be between 1 and 150 USD")
+
+    programs = _available_phone_programs(env) if programs is None else programs
+    requested = os.path.realpath(str(body.get("program") or ""))
+    match = next((item for item in programs
+                  if os.path.realpath(str(item.get("path") or "")) == requested), None)
+    if match is None:
+        raise ValueError("program is not an allowed repository on this phone")
+    readiness = _provider_readiness(env) if readiness is None else readiness
+    provider_state = next((item for item in readiness if item.get("name") == provider), None)
+    if not provider_state or not provider_state.get("ready"):
+        detail = str((provider_state or {}).get("detail") or "not configured")
+        raise ValueError(provider + " is not ready: " + detail)
+
+    with LAUNCH_LOCK:
+        running = _running_audit_pid(pid_path)
+        if running:
+            raise ValueError("an audit is already running (pid {})".format(running))
+        os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+        command = [
+            sys.executable, os.path.join(APP_ROOT, "flexfactor.py"), mode,
+            "--program", requested, "--no-dashboard", "--provider", provider,
+            "--single", "--max-cost", "{:g}".format(max_cost),
+            "--no-push", "--no-merge",
+        ]
+        child_env = dict(env)
+        child_env["FLEXFACTOR_HOST_LABEL"] = "this phone"
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write("\n--- {} app launch: {} {} (max ${:g}) ---\n".format(
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"), mode, requested, max_cost))
+            log.flush()
+            process = popen(
+                command, cwd=APP_ROOT, env=child_env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                close_fds=True,
+            )
+        temporary = pid_path + ".tmp-{}".format(os.getpid())
+        with open(temporary, "w", encoding="utf-8") as fh:
+            fh.write(str(process.pid) + "\n")
+        os.replace(temporary, pid_path)
+    return {"ok": True, "pid": process.pid, "program": match["name"],
+            "mode": mode, "provider": provider, "max_cost": max_cost}
 
 
 # --------------------------------------------------------------- HTTP
@@ -410,6 +598,10 @@ svg{display:block;width:100%;height:38px}
 .steerbtn{margin-top:7px;background:#238636;color:white;border:0;border-radius:7px;padding:8px 12px;font-weight:650}
 .steerbtn:disabled{opacity:.55}.steerrow{border-left:3px solid #30363d;padding:5px 8px;margin-top:6px}
 .s-pending{border-color:#d29922}.s-active{border-color:#58a6ff}.s-completed{border-color:#3fb950}.s-needs-attention{border-color:#f85149}
+.launcher select,.launcher input{width:100%;background:#0d1117;color:#e6edf3;
+ border:1px solid #30363d;border-radius:8px;padding:10px;margin:4px 0 8px;font:14px inherit}
+.launchbtn{width:100%;background:#238636;color:white;border:0;border-radius:8px;
+ padding:11px 12px;font-weight:700;margin-top:6px}.launchbtn:disabled{opacity:.45}
 </style></head><body>
 <h1>FlexFactor</h1>
 <div class="sub" id="sub">connecting...</div>
@@ -417,6 +609,48 @@ svg{display:block;width:100%;height:38px}
 <script>
 var TOKEN = new URLSearchParams(location.search).get("t") || "";
 var STEER_DRAFTS = {};
+var LAUNCH_DRAFT = {program:"",mode:"audit",provider:"openai",max_cost:10};
+function launchHtml(l){
+  if(!l||!l.available) return "";
+  var providers=l.providers||[], programs=l.programs||[], running=l.running_pid;
+  if(!LAUNCH_DRAFT.program&&programs.length) LAUNCH_DRAFT.program=programs[0].path;
+  var selectedProvider=providers.find(function(p){return p.name===LAUNCH_DRAFT.provider;});
+  if(!selectedProvider||!selectedProvider.ready){
+    var first=providers.find(function(p){return p.ready;});
+    if(first) LAUNCH_DRAFT.provider=first.name;
+  }
+  selectedProvider=providers.find(function(p){return p.name===LAUNCH_DRAFT.provider;})||{};
+  var disabled=running||!programs.length||!selectedProvider.ready;
+  var h='<div class="card launcher"><div class="row"><div class="name">Start on this phone</div>'+
+    (running?'<div class="pill live">running</div>':'')+'</div>'+
+    '<div class="dim">Choose a repository already downloaded to this phone. '+esc(l.policy||'')+'</div>'+
+    '<div class="lbl">Repository</div><select onchange="LAUNCH_DRAFT.program=this.value">';
+  programs.forEach(function(p){h+='<option value="'+esc(p.path)+'" '+(p.path===LAUNCH_DRAFT.program?'selected':'')+'>'+esc(p.name)+'</option>';});
+  h+='</select><div class="lbl">Run</div><select onchange="LAUNCH_DRAFT.mode=this.value">'+
+    '<option value="audit" '+(LAUNCH_DRAFT.mode==='audit'?'selected':'')+'>Audit and fix</option>'+
+    '<option value="prodready" '+(LAUNCH_DRAFT.mode==='prodready'?'selected':'')+'>Production readiness</option></select>'+
+    '<div class="lbl">Provider</div><select onchange="LAUNCH_DRAFT.provider=this.value;tick()">';
+  providers.forEach(function(p){h+='<option value="'+esc(p.name)+'" '+(p.name===LAUNCH_DRAFT.provider?'selected':'')+'>'+esc(p.name)+' — '+esc(p.detail)+'</option>';});
+  h+='</select><div class="lbl">Maximum provider cost (USD)</div><input type="number" min="1" max="150" step="1" value="'+esc(LAUNCH_DRAFT.max_cost)+'" onchange="LAUNCH_DRAFT.max_cost=this.value">'+
+    '<div class="dim">This run may edit the selected repository locally. It cannot push or merge.</div>'+
+    (running?'<div class="dim" style="margin-top:8px">Audit process '+running+' is already running.</div>':'')+
+    (!programs.length?'<div class="warnbox">No Git repositories were found in the phone project roots.</div>':'')+
+    (!selectedProvider.ready?'<div class="warnbox">Configure a provider in Termux first: '+esc(selectedProvider.detail||'none is ready')+'.</div>':'')+
+    '<button class="launchbtn" '+(disabled?'disabled':'')+' onclick="submitLaunch(this)">Start FlexFactor</button></div>';
+  return h;
+}
+function submitLaunch(button){
+  var name=(LAUNCH_DRAFT.program.split('/').pop()||LAUNCH_DRAFT.program);
+  if(!confirm('Start FlexFactor on '+name+'? It may edit that repository locally, but will not push or merge.')) return;
+  button.disabled=true;button.textContent='Starting…';
+  fetch('/api/launch?t='+encodeURIComponent(TOKEN),{method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+    body:JSON.stringify(LAUNCH_DRAFT)})
+   .then(function(r){return r.json().then(function(d){if(!r.ok) throw new Error(d.error||('HTTP '+r.status));return d;});})
+   .then(function(d){alert('FlexFactor '+d.mode+' started on '+d.program+'.');tick();})
+   .catch(function(e){alert('Could not start FlexFactor: '+e.message);})
+   .finally(function(){button.disabled=false;button.textContent='Start FlexFactor';});
+}
 function steerDraft(name,value){STEER_DRAFTS[name]=value;}
 function submitSteering(name,dir,button){
   var text=STEER_DRAFTS[name]||""; if(!text.trim()) return;
@@ -573,12 +807,13 @@ function tick(){
        d.host+" · status "+(d.status_quiet_s==null?"never seen":
        "updated "+dur(d.status_quiet_s)+" ago");
      var a=document.getElementById("app");
+     var launcher=launchHtml(d.launch);
      if(!d.programs.length){
-       a.innerHTML='<div class="empty">No active programs.<br>'+
+       a.innerHTML=launcher+'<div class="empty">No active programs.<br>'+
          '<span style="font-size:12px">FlexFactor writes status.json when a run starts.</span></div>';
        return;
      }
-     a.innerHTML = d.programs.map(card).join("");
+     a.innerHTML = launcher+d.programs.map(card).join("");
    })
    .catch(function(e){
      document.getElementById("sub").textContent = "offline — "+e.message;
@@ -648,7 +883,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send(401, b'{"error":"bad or missing token"}', "application/json")
             return
-        if path != "/api/steering":
+        if path not in ("/api/steering", "/api/launch"):
             self._send(404, b'{"error":"not found"}', "application/json")
             return
         try:
@@ -660,6 +895,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            if path == "/api/launch":
+                result = start_phone_run(body)
+                self._send(201, json.dumps(result).encode("utf-8"), "application/json")
+                return
             program = str(body.get("program") or "")
             project_dir = str(body.get("project_dir") or "")
             active = build_state(self.sampler).get("programs") or []
@@ -670,6 +911,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(201, json.dumps({"ok": True, "comment": item}).encode("utf-8"), "application/json")
         except (TypeError, ValueError, UnicodeError) as exc:
             self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
+        except OSError:
+            self._send(500, b'{"error":"the phone could not start the FlexFactor process"}',
+                       "application/json")
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
