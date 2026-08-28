@@ -53,8 +53,10 @@ final class AppUpdater {
             File apk = null;
             try {
                 UpdateInfo update = fetchManifest();
-                if (!UpdatePolicy.isNewer(update.versionCode, BuildConfig.VERSION_CODE)) {
-                    post(() -> callback.onUpToDate(BuildConfig.VERSION_NAME));
+                PackageInfo installed = installedPackage();
+                if (!UpdatePolicy.isNewer(update.versionCode, installed.getLongVersionCode())) {
+                    String installedName = installed.versionName == null ? "unknown" : installed.versionName;
+                    post(() -> callback.onUpToDate(installedName));
                     return;
                 }
                 apk = File.createTempFile("flexfactor-update-", ".apk", context.getCacheDir());
@@ -123,7 +125,7 @@ final class AppUpdater {
             connection.setReadTimeout(30_000);
             connection.setInstanceFollowRedirects(false);
             connection.setRequestProperty("Accept", "application/octet-stream, application/json");
-            connection.setRequestProperty("User-Agent", "FlexFactor-Android/" + BuildConfig.VERSION_NAME);
+            connection.setRequestProperty("User-Agent", "FlexFactor-Android");
             int status = connection.getResponseCode();
             if (status >= 300 && status < 400) {
                 String location = connection.getHeaderField("Location");
@@ -180,8 +182,7 @@ final class AppUpdater {
                 || !archive.versionName.equals(update.versionName)) {
             throw new SecurityException("The downloaded APK version does not match its manifest.");
         }
-        PackageInfo installed = manager.getPackageInfo(
-                context.getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+        PackageInfo installed = installedPackage();
         Set<String> installedCertificates = certificateDigests(installed);
         Set<String> archiveCertificates = certificateDigests(archive);
         archiveCertificates.retainAll(installedCertificates);
@@ -205,6 +206,11 @@ final class AppUpdater {
         return result;
     }
 
+    private PackageInfo installedPackage() throws PackageManager.NameNotFoundException {
+        return context.getPackageManager().getPackageInfo(
+                context.getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+    }
+
     private void install(File apk) throws Exception {
         PackageInstaller installer = context.getPackageManager().getPackageInstaller();
         PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
@@ -222,7 +228,7 @@ final class AppUpdater {
                 session.fsync(output);
             }
             Intent result = new Intent(context, UpdateResultReceiver.class)
-                    .setAction(BuildConfig.APPLICATION_ID + ".UPDATE_STATUS." + sessionId);
+                    .setAction(UpdatePolicy.PACKAGE_NAME + ".UPDATE_STATUS." + sessionId);
             PendingIntent pending = PendingIntent.getBroadcast(
                     context,
                     sessionId,
