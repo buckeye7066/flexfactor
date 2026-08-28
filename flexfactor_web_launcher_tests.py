@@ -260,6 +260,19 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertIn(
             "web.setWebChromeClient(new WebChromeClient());", activity)
 
+    def test_android_main_release_creates_the_exact_version_tag(self):
+        path = os.path.join(
+            os.path.dirname(__file__), ".github", "workflows",
+            "android-client.yml",
+        )
+        with open(path, encoding="utf-8") as fh:
+            workflow = fh.read()
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn('release_tag="android-v${version_name}"', workflow)
+        self.assertIn('create_ref_args=(--target "$GITHUB_SHA")', workflow)
+        self.assertIn('create_ref_args=(--verify-tag)', workflow)
+        self.assertIn('gh release create "$RELEASE_TAG"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
