@@ -104,7 +104,7 @@ public final class MainActivity extends Activity {
                 .setMessage("FlexFactor received an authenticated loopback engine address from Termux. Approve this on-phone connection?")
                 .setCancelable(false)
                 .setNegativeButton("Reject", (ignored, which) -> clearPendingHandoff())
-                .setPositiveButton("Use engine", (dialog, which) -> {
+                .setPositiveButton("Use engine", (ignored, which) -> {
                     clearPendingHandoff();
                     saveEndpoint(pending);
                     loadedEndpoint = "";
