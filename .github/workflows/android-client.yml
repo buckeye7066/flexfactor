@@ -64,16 +64,55 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  release:
-    name: android-release
+  release-plan:
+    name: android-release-plan
     if: >-
       startsWith(github.ref, 'refs/tags/android-v') ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      should_publish: ${{ steps.plan.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Require an Android version change on main
+        id: plan
+        shell: bash
+        run: |
+          read_version() {
+            sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p'
+          }
+          version_name=$(read_version < android/app/build.gradle.kts)
+          test -n "$version_name"
+          release_tag="android-v${version_name}"
+          should_publish=false
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "$GITHUB_REF_NAME" = "$release_tag"
+            should_publish=true
+          else
+            previous_version=$(git show "${GITHUB_SHA}^:android/app/build.gradle.kts" | read_version)
+            test -n "$previous_version"
+            if [ "$version_name" != "$previous_version" ]; then
+              should_publish=true
+            fi
+          fi
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: android-release
+    needs: release-plan
+    if: needs.release-plan.outputs.should_publish == 'true'
     permissions:
       contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: android-release
+    env:
+      RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -125,16 +164,12 @@ jobs:
           release_dir="android/app/build/outputs/apk/release/publish"
           version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name "$apk")
           version_code=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-code "$apk")
-          release_tag="android-v${version_name}"
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            test "$GITHUB_REF_NAME" = "$release_tag"
-          fi
-          printf 'RELEASE_TAG=%s\n' "$release_tag" >> "$GITHUB_ENV"
+          test "$RELEASE_TAG" = "android-v${version_name}"
           mkdir -p "$release_dir"
           release_apk="$release_dir/flexfactor-${version_name}.apk"
           cp "$apk" "$release_apk"
           apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
-          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/flexfactor-${version_name}.apk"
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
           printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
             "$version_code" "$version_name" "$apk_url" "$apk_sha" \
             > "$release_dir/android-update.json"
@@ -146,7 +181,28 @@ jobs:
           release_dir="android/app/build/outputs/apk/release/publish"
           version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
             "android/app/build/outputs/apk/release/app-release.apk")
+          resolve_tag_commit() {
+            local object_type object_sha
+            object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')
+            object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+            while [ "$object_type" = "tag" ]; do
+              object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')
+              object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')
+            done
+            test "$object_type" = "commit"
+            printf '%s\n' "$object_sha"
+          }
+          tag_exists=false
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            tag_exists=true
+            tag_commit=$(resolve_tag_commit)
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "Existing tag $RELEASE_TAG targets $tag_commit, not exact source $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$tag_exists" = true
             existing_dir="$RUNNER_TEMP/existing-release-assets"
             mkdir -p "$existing_dir"
             asset_names=$(gh release view "$RELEASE_TAG" \
@@ -189,7 +245,7 @@ jobs:
               --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
           else
             create_ref_args=(--target "$GITHUB_SHA")
-            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$tag_exists" = true ]; then
               create_ref_args=(--verify-tag)
             fi
             gh release create "$RELEASE_TAG" \
