@@ -69,11 +69,13 @@ key.
 Never commit a keystore or its passwords. Release signing belongs in protected
 CI secrets. Configure the `android-release` GitHub environment with
 `ANDROID_KEYSTORE_BASE64`, `ANDROID_STORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
-`ANDROID_KEY_PASSWORD`, then push an `android-v*` tag. The release workflow
-publishes the exact source commit, APK SHA-256, signing-certificate digest,
-release APK, and update manifest. The tag must match the app version (for
-example, `android-v2.2.1`). Missing signing material fails the release; it never
-falls back to a debug key.
+`ANDROID_KEY_PASSWORD`. Merging a versioned Android change to `main` creates
+the matching `android-v*` tag and publishes the signed release. A matching tag
+push remains supported for deliberate reruns. The release workflow publishes
+the exact source commit, APK SHA-256, signing-certificate digest, release APK,
+and update manifest. The tag must match the app version (for example,
+`android-v2.2.1`). Missing signing material fails the release; it never falls
+back to a debug key.
 
 ## Security boundary
 
