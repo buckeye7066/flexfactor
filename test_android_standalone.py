@@ -175,6 +175,29 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
+        self.assertIn("bundlePlay", workflow)
+        self.assertIn("app-play.aab", workflow)
+        self.assertIn("Prove strict bundle signature policy", workflow)
+        self.assertIn("Strict verification accepted a partially signed archive", workflow)
+        self.assertIn("jarsigner -verify -strict", workflow)
+        self.assertIn("-storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD", workflow)
+        self.assertNotIn("bundle/play/app-release.aab", workflow)
+        build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
+        build_gate = build_gate.split("- name: Verify the default phone model provider live", 1)[0]
+        self.assertIn("testPlayUnitTest", build_gate)
+        self.assertIn("bundlePlay", build_gate)
+
+    def test_play_bundle_omits_the_direct_apk_self_installer(self):
+        play_manifest = (ROOT / "android" / "app" / "src" / "play" /
+                         "AndroidManifest.xml").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        gradle = (ROOT / "android" / "app" /
+                  "build.gradle.kts").read_text(encoding="utf-8")
+        self.assertIn("REQUEST_INSTALL_PACKAGES", play_manifest)
+        self.assertIn('tools:node="remove"', play_manifest)
+        self.assertIn('create("play")', gradle)
+        self.assertIn('!"play".equals(BuildConfig.BUILD_TYPE)', activity)
 
     def test_startup_update_check_runs_before_installer_permission_gate(self):
         updater = (ANDROID / "java" / "com" / "firer" / "console" /

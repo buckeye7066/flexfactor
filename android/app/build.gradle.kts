@@ -6,12 +6,16 @@ android {
     namespace = "com.firer.console.flexfactor"
     compileSdk = 36
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "com.firer.console.flexfactor"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30200
-        versionName = "3.2.0"
+        versionCode = 30201
+        versionName = "3.2.1"
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
@@ -36,6 +40,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+        }
+        create("play") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
