@@ -50,6 +50,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         for mode in ("refactor", "scout", "audit", "prodready"):
             self.assertIn(mode, workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token", workflow)
+        self.assertIn("contents: read", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
         self.assertIn("ollama serve", workflow)
