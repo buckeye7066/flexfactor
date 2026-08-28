@@ -79,7 +79,9 @@ public final class MainActivity extends Activity {
         }
         renderHome();
         if (!configured()) main.postDelayed(this::showCredentialSetup, 350L);
-        main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
+        if (directUpdatesEnabled()) {
+            main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
+        }
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
     }
 
@@ -88,7 +90,8 @@ public final class MainActivity extends Activity {
         super.onResume();
         refreshHeader();
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
-        if (pendingStartupUpdate && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+        if (directUpdatesEnabled() && pendingStartupUpdate
+                && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
                 || getPackageManager().canRequestPackageInstalls())) {
             pendingStartupUpdate = false;
             startUpdate();
@@ -126,7 +129,7 @@ public final class MainActivity extends Activity {
         updateButton = button("Update");
         updateButton.setOnClickListener(view -> startUpdate());
         top.addView(settingsButton, weighted());
-        top.addView(updateButton, weighted());
+        if (directUpdatesEnabled()) top.addView(updateButton, weighted());
         content.addView(top, margins(0, 12, 0, 8));
 
         accountState = text("", 14, Color.rgb(170, 181, 194));
@@ -985,6 +988,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startUpdate() {
+        if (!directUpdatesEnabled()) return;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 && !getPackageManager().canRequestPackageInstalls()) {
             new AlertDialog.Builder(this)
@@ -1021,6 +1025,7 @@ public final class MainActivity extends Activity {
     }
 
     private void checkForUpdateOnLaunch() {
+        if (!directUpdatesEnabled()) return;
         if (destroyed || isFinishing()) return;
         new AppUpdater(this).check(new AppUpdater.CheckCallback() {
             @Override public void onUpToDate(String versionName) {
@@ -1055,6 +1060,10 @@ public final class MainActivity extends Activity {
             updateButton.setText("Update");
             updateButton.setEnabled(true);
         }
+    }
+
+    private static boolean directUpdatesEnabled() {
+        return !"play".equals(BuildConfig.BUILD_TYPE);
     }
 
     private void showError(String title, String message) {
