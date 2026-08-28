@@ -268,9 +268,13 @@ class PhoneLauncherTests(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             workflow = fh.read()
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn('release_tag="android-v${version_name}"', workflow)
+        self.assertIn('previous_version=$(git show', workflow)
+        self.assertIn('if [ "$version_name" != "$previous_version" ]', workflow)
+        self.assertIn("needs.release-plan.outputs.should_publish == 'true'", workflow)
         self.assertIn('create_ref_args=(--target "$GITHUB_SHA")', workflow)
         self.assertIn('create_ref_args=(--verify-tag)', workflow)
+        self.assertIn('tag_commit=$(resolve_tag_commit)', workflow)
+        self.assertIn('if [ "$tag_commit" != "$GITHUB_SHA" ]', workflow)
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
 
 
