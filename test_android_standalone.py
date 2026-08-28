@@ -175,8 +175,20 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
-        self.assertIn("bundleRelease", workflow)
-        self.assertIn("app-release.aab", workflow)
+        self.assertIn("bundlePlay", workflow)
+        self.assertIn("app-play.aab", workflow)
+
+    def test_play_bundle_omits_the_direct_apk_self_installer(self):
+        play_manifest = (ROOT / "android" / "app" / "src" / "play" /
+                         "AndroidManifest.xml").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        gradle = (ROOT / "android" / "app" /
+                  "build.gradle.kts").read_text(encoding="utf-8")
+        self.assertIn("REQUEST_INSTALL_PACKAGES", play_manifest)
+        self.assertIn('tools:node="remove"', play_manifest)
+        self.assertIn('create("play")', gradle)
+        self.assertIn('!"play".equals(BuildConfig.BUILD_TYPE)', activity)
 
     def test_startup_update_check_runs_before_installer_permission_gate(self):
         updater = (ANDROID / "java" / "com" / "firer" / "console" /
