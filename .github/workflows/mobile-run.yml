@@ -1,6 +1,6 @@
 name: mobile-flexfactor-run
 
-run-name: "Mobile ${{ inputs.mode }} · ${{ inputs.target_repository }} · ${{ inputs.request_id }}"
+run-name: "Mobile FlexFactor · ${{ inputs.request_id }}"
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ on:
         default: false
         type: boolean
       max_cost:
-        description: Hard OpenAI cost cap in USD
+        description: OpenAI cost cap in USD (audit and prodready only)
         required: true
         default: "50"
         type: string
@@ -51,7 +51,7 @@ concurrency:
 
 jobs:
   run:
-    name: ${{ inputs.mode }} · ${{ inputs.target_repository }}
+    name: mobile-flexfactor
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -63,33 +63,29 @@ jobs:
     steps:
       - name: Validate the mobile request
         shell: python
-        env:
-          REQUEST_ID: ${{ inputs.request_id }}
-          MODE: ${{ inputs.mode }}
-          TARGET_REPOSITORY: ${{ inputs.target_repository }}
-          TARGET_REF: ${{ inputs.target_ref }}
-          TARGET_FILE: ${{ inputs.file }}
-          TARGET_GOAL: ${{ inputs.goal }}
-          MAX_COST: ${{ inputs.max_cost }}
         run: |
-          import math, os, pathlib, re, uuid
+          import json, math, os, pathlib, re, urllib.error, urllib.request, uuid
 
-          uuid.UUID(os.environ["REQUEST_ID"])
-          mode = os.environ["MODE"]
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+              inputs = json.load(fh).get("inputs", {})
+          request_id = str(inputs.get("request_id", ""))
+          mode = str(inputs.get("mode", ""))
+          repository = str(inputs.get("target_repository", ""))
+          ref = str(inputs.get("target_ref", ""))
+          file = str(inputs.get("file", ""))
+          goal = str(inputs.get("goal", "")).strip()
+          uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
-                              os.environ["TARGET_REPOSITORY"]):
+                              repository):
               raise SystemExit("invalid repository")
-          ref = os.environ["TARGET_REF"]
           if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", ref)
                   or ".." in ref or ref.endswith("/")):
               raise SystemExit("invalid ref")
-          cost = float(os.environ["MAX_COST"])
+          cost = float(inputs.get("max_cost", ""))
           if not math.isfinite(cost) or not 1 <= cost <= 150:
               raise SystemExit("cost cap must be between 1 and 150")
-          file = os.environ["TARGET_FILE"]
-          goal = os.environ["TARGET_GOAL"].strip()
           if mode == "refactor":
               candidate = pathlib.PurePosixPath(file)
               if (not file or candidate.is_absolute() or ".." in candidate.parts
@@ -99,6 +95,23 @@ jobs:
                   raise SystemExit("refactor goal is missing or too long")
           elif file or goal:
               raise SystemExit("file and goal are only valid in refactor mode")
+
+          request = urllib.request.Request(
+              "https://api.github.com/repos/" + repository,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "X-GitHub-Api-Version": "2026-03-10",
+                  "User-Agent": "FlexFactor-Mobile-Workflow",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  metadata = json.load(response)
+          except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+              raise SystemExit("target repository must be public and accessible") from None
+          if metadata.get("private") is not False:
+              raise SystemExit("private targets require a private control repository")
 
       - name: Require protected mobile credentials
         shell: bash
@@ -156,6 +169,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
           SCOUT_APPLY: ${{ inputs.scout_apply }}
           MAX_COST: ${{ inputs.max_cost }}
           TARGET_REF: ${{ inputs.target_ref }}
@@ -168,28 +182,47 @@ jobs:
 
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
-            git -C target switch -c "$branch"
-            python engine/flexfactor.py refactor \
-              --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
-              --goal "$TARGET_GOAL" \
-              --provider openai 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
-            find target -type f -name '*.bak' -delete
+            git -C target switch -c "$branch" || rc=$?
+            backup_path="target/$TARGET_FILE.bak"
+            saved_backup="$RUNNER_TEMP/refactor-existing.bak"
+            had_backup=false
+            if [ "$rc" -eq 0 ] && { [ -e "$backup_path" ] || [ -L "$backup_path" ]; }; then
+              if [ ! -f "$backup_path" ] && [ ! -L "$backup_path" ]; then
+                echo "Existing refactor backup path is not a file" >&2
+                rc=1
+              else
+                mv -- "$backup_path" "$saved_backup"
+                had_backup=true
+              fi
+            fi
+            if [ "$rc" -eq 0 ]; then
+              python engine/flexfactor.py refactor \
+                --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
+                --goal "$TARGET_GOAL" \
+                --provider openai 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
+              rm -f -- "$backup_path"
+            fi
+            if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
             if [ "$rc" -eq 0 ] && ! git -C target diff --quiet; then
-              git -C target add -A
-              git -C target commit -m "Refactor $TARGET_FILE with FlexFactor"
-              git -C target push -u origin "$branch"
-              gh pr create --repo "${{ inputs.target_repository }}" \
-                --base "$TARGET_REF" --head "$branch" \
-                --title "Refactor $TARGET_FILE with FlexFactor" \
-                --body "Created by FlexFactor Android Option 1. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-                | tee mobile-publication.txt
+              git -C target add -A || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                git -C target commit -m "Refactor $TARGET_FILE with FlexFactor" || rc=$?
+              fi
+              if [ "$rc" -eq 0 ]; then git -C target push -u origin "$branch" || rc=$?; fi
+              if [ "$rc" -eq 0 ]; then
+                gh pr create --repo "$TARGET_REPOSITORY" \
+                  --base "$TARGET_REF" --head "$branch" \
+                  --title "Refactor $TARGET_FILE with FlexFactor" \
+                  --body "Created by FlexFactor Android Option 1. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                  2>&1 | tee mobile-publication.txt || rc=${PIPESTATUS[0]}
+              fi
             fi
           elif [ "$MODE" = scout ]; then
             args=(scout --program "$GITHUB_WORKSPACE/target" --provider openai
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards)
-            if [ "$SCOUT_APPLY" = true ]; then args+=(--apply); fi
+            if [ "$SCOUT_APPLY" = true ]; then args+=(--apply --yes); fi
             python engine/flexfactor.py "${args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           else
@@ -212,7 +245,7 @@ jobs:
                   "request_id": os.environ["REQUEST_ID"],
                   "mode": os.environ["MODE"],
                   "repository": os.environ.get("GITHUB_REPOSITORY", ""),
-                  "target_repository": "${{ inputs.target_repository }}",
+                  "target_repository": os.environ["TARGET_REPOSITORY"],
                   "target_ref": os.environ["TARGET_REF"],
                   "source_before": before,
                   "source_after": after,
@@ -233,11 +266,10 @@ jobs:
           {
             echo "## FlexFactor mobile run"
             echo
-            echo "- Mode: \`${{ inputs.mode }}\`"
-            echo "- Target: \`${{ inputs.target_repository }}@${{ inputs.target_ref }}\`"
-            echo "- Request: \`${{ inputs.request_id }}\`"
             if [ -f mobile-result.json ]; then
-              echo "- Result artifact: \`mobile-result-${{ inputs.request_id }}\`"
+              echo "- A validated result artifact is attached to this run."
+            else
+              echo "- The request was rejected before execution."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -252,8 +284,10 @@ jobs:
             mobile-publication.txt
             mobile-before.txt
             mobile-after.txt
-            target/flexfactor-scout-report.md
-            target/FLEXFACTOR-AUDIT.md
-            target/FLEXFACTOR-PRODREADY.md
+            target/*_repo_rewards_report.md
+            target/_scout_report.json
+            target/.flexfactor-scout-proposals.json
+            target/*_audit_report.md
+            target/*_readiness.md
           if-no-files-found: warn
           retention-days: 30
