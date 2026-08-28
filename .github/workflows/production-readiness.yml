@@ -77,6 +77,7 @@ jobs:
                    flexfactor_product_invariants_tests.py \
                    flexfactor_steering_tests.py \
                    flexfactor_web_launcher_tests.py \
+                   test_android_standalone.py \
                    flexfactor_invariant_sweep_tests.py \
                    flexfactor_entrypoint_tests.py \
                    flexfactor_node_lock_tests.py \

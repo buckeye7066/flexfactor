@@ -2,663 +2,617 @@ package com.firer.console.flexfactor;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.ComponentName;
-import android.graphics.Color;
 import android.content.Intent;
-import android.content.pm.PackageManager;
+import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.text.InputType;
 import android.view.Gravity;
+import android.view.View;
 import android.view.ViewGroup;
-import android.webkit.WebChromeClient;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebResourceResponse;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.ByteArrayInputStream;
-import java.net.URI;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+/** Standalone Android control plane for all four FlexFactor modes. */
 public final class MainActivity extends Activity {
-    public static final String PREFERENCES = "flexfactor";
-    public static final String ENDPOINT_KEY = "local_endpoint";
-    public static final String PENDING_ENDPOINT_KEY = "pending_local_endpoint";
-    public static final String RECOVERY_STATUS_KEY = "recovery_status";
-    public static final String RECOVERY_NONCE_KEY = "recovery_nonce";
-    private static final String RECOVERED_VERSION_KEY = "recovered_version";
-    private static final String RECOVERY_IN_FLIGHT_KEY = "recovery_in_flight";
-    private static final String RECOVERY_STARTED_KEY = "recovery_started_at";
-    private static final String RECOVERY_IS_REPAIR_KEY = "recovery_is_repair";
-    private static final int RUN_COMMAND_PERMISSION_REQUEST = 410;
-    private static final long RECOVERY_POLL_MS = 1000L;
-    private static final long COMMAND_ACCEPT_TIMEOUT_MS = 12000L;
-    private static final long RECOVERY_TIMEOUT_MS = 30L * 60L * 1000L;
+    private static final String PREFERENCES = "flexfactor_mobile";
+    private static final String LOGIN = "github_login";
+    private static final String REPOSITORY = "selected_repository";
+    private static final String REF = "selected_ref";
+    private static final String LAST_RUN_ID = "last_run_id";
+    private static final String LAST_RUN_URL = "last_run_url";
+    private static final String LAST_RUN_STATUS = "last_run_status";
+    private static final long POLL_MS = 5_000L;
 
-    private FrameLayout root;
-    private WebView web;
-    private String loadedEndpoint = "";
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final GitHubApi api = new GitHubApi();
+    private final Runnable pollRun = this::pollLastRun;
+
+    private SecureStore secrets;
+    private SharedPreferences preferences;
+    private LinearLayout content;
+    private Button repositoryButton;
     private Button updateButton;
-    private boolean handoffDialogVisible;
-    private boolean recoveryMode;
-    private boolean permissionPromptShown;
-    private boolean permissionRequestInFlight;
-    private boolean repairAfterPermission;
-    private boolean externalSetupPending;
-    private long recoveryStartedAt;
-    private String displayedRecoveryStatus = "";
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable recoveryPoll = this::pollRecovery;
+    private TextView accountState;
+    private TextView runState;
+    private boolean destroyed;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        root = new FrameLayout(this);
-        root.setBackgroundColor(Color.rgb(11, 15, 20));
-        setContentView(root);
-        restoreRecoveryState();
-        acceptActivityHandoff();
-        render();
-        confirmPendingHandoff();
-        maybeRecoverForThisVersion();
-    }
-
-    @Override
-    protected void onNewIntent(android.content.Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        acceptActivityHandoff();
-        loadedEndpoint = "";
-        render();
-        confirmPendingHandoff();
+        preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        secrets = new SecureStore(this);
+        renderHome();
+        if (!configured()) main.postDelayed(this::showCredentialSetup, 350L);
+        if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (externalSetupPending) {
-            externalSetupPending = false;
-            handler.postDelayed(() -> requestEngineRecovery(true), 500L);
-        }
-        String current = storedEndpoint();
-        if (!current.equals(loadedEndpoint)) render();
-        confirmPendingHandoff();
-        if (recoveryMode) pollRecovery();
+        refreshHeader();
+        if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
     }
 
     @Override
     protected void onDestroy() {
-        handler.removeCallbacks(recoveryPoll);
-        destroyWebView();
+        destroyed = true;
+        main.removeCallbacks(pollRun);
+        worker.shutdownNow();
         super.onDestroy();
     }
 
-    private void destroyWebView() {
-        if (web != null) {
-            web.stopLoading();
-            web.destroy();
-            web = null;
+    private void renderHome() {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setBackgroundColor(Color.rgb(11, 15, 20));
+        content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(20), dp(24), dp(20), dp(28));
+        scroll.addView(content, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        setContentView(scroll);
+
+        content.addView(text("FlexFactor", 30, Color.WHITE));
+        content.addView(text("Standalone phone app · version " + installedVersion(),
+                14, Color.rgb(139, 151, 165)));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        Button settingsButton = button("Credentials");
+        settingsButton.setOnClickListener(view -> showCredentialSetup());
+        updateButton = button("Update");
+        updateButton.setOnClickListener(view -> startUpdate());
+        top.addView(settingsButton, weighted());
+        top.addView(updateButton, weighted());
+        content.addView(top, margins(0, 12, 0, 8));
+
+        accountState = text("", 14, Color.rgb(170, 181, 194));
+        content.addView(accountState);
+
+        content.addView(section("Repository"));
+        repositoryButton = button("Choose repository");
+        repositoryButton.setContentDescription("Choose a GitHub repository");
+        repositoryButton.setOnClickListener(view -> chooseRepository());
+        content.addView(repositoryButton, margins(0, 4, 0, 12));
+
+        content.addView(section("What do you want FlexFactor to do?"));
+        addMode("1 · Refactor a file",
+                "Improve one selected file toward a stated goal.",
+                () -> showRefactorDialog());
+        addMode("2 · Scout improvements",
+                "Find useful competitive and open-source capabilities.",
+                () -> showScoutDialog());
+        addMode("3 · Audit and repair",
+                "Review the repository, fix verified defects, test, and land green work.",
+                () -> showRunDialog(MobileRunRequest.Mode.AUDIT));
+        addMode("4 · Make production ready",
+                "Run the complete purpose, build, test, UX, and readiness pipeline.",
+                () -> showRunDialog(MobileRunRequest.Mode.PRODREADY));
+
+        content.addView(section("Latest run"));
+        runState = text("No run has been started from this phone.", 15,
+                Color.rgb(170, 181, 194));
+        content.addView(runState);
+        Button openRun = button("Open run details");
+        openRun.setOnClickListener(view -> openLastRun());
+        content.addView(openRun, margins(0, 6, 0, 0));
+        refreshHeader();
+        refreshRunLabel();
+    }
+
+    private void addMode(String title, String description, Runnable action) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(10), dp(16), dp(12));
+        card.setBackgroundColor(Color.rgb(19, 26, 34));
+        TextView heading = text(title, 18, Color.WHITE);
+        TextView detail = text(description, 14, Color.rgb(156, 168, 181));
+        Button launch = button("Open");
+        launch.setOnClickListener(view -> action.run());
+        card.addView(heading);
+        card.addView(detail);
+        card.addView(launch);
+        content.addView(card, margins(0, 5, 0, 8));
+    }
+
+    private void refreshHeader() {
+        if (accountState == null) return;
+        String login = preferences.getString(LOGIN, "");
+        if (configured()) {
+            accountState.setText("GitHub: " + (login.isEmpty() ? "configured" : login)
+                    + " · OpenAI: verified · No PC or Termux required");
+            accountState.setTextColor(Color.rgb(63, 185, 80));
+        } else {
+            accountState.setText("One-time setup needed: GitHub token and OpenAI key");
+            accountState.setTextColor(Color.rgb(248, 81, 73));
+        }
+        if (repositoryButton != null) {
+            String repo = preferences.getString(REPOSITORY, "");
+            String ref = preferences.getString(REF, "main");
+            repositoryButton.setText(repo.isEmpty() ? "Choose repository" : repo + " · " + ref);
         }
     }
 
-    private void acceptActivityHandoff() {
-        String endpoint = getIntent() == null ? null : getIntent().getStringExtra("local");
-        if (endpoint == null) return;
-        try {
-            String normalized = EndpointPolicy.parseLocalEndpoint(endpoint).toString();
-            getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                    .putString(PENDING_ENDPOINT_KEY, normalized).apply();
-        } catch (IllegalArgumentException rejected) {
-            Toast.makeText(this, rejected.getMessage(), Toast.LENGTH_LONG).show();
-        } finally {
-            getIntent().removeExtra("local");
-        }
+    private boolean configured() {
+        return secrets.contains(SecureStore.GITHUB_TOKEN)
+                && secrets.contains(SecureStore.OPENAI_KEY);
     }
 
-    private void confirmPendingHandoff() {
-        String pending = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                .getString(PENDING_ENDPOINT_KEY, "");
-        if (pending.isEmpty() || handoffDialogVisible) return;
-        if (pending.equals(storedEndpoint())) {
-            clearPendingHandoff();
-            return;
-        }
-        handoffDialogVisible = true;
+    private void showCredentialSetup() {
+        LinearLayout form = form();
+        TextView guidance = text(
+                "Enter each credential once. FlexFactor verifies both, encrypts them on this phone, and installs encrypted copies into the protected GitHub Actions runner.",
+                14, Color.rgb(170, 181, 194));
+        EditText github = secretInput("GitHub token (repo and workflow access)");
+        EditText openAi = secretInput("OpenAI API key");
+        if (secrets.contains(SecureStore.GITHUB_TOKEN)) github.setHint("GitHub token already saved");
+        if (secrets.contains(SecureStore.OPENAI_KEY)) openAi.setHint("OpenAI key already saved");
+        form.addView(guidance);
+        form.addView(github);
+        form.addView(openAi);
+
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("Use this phone's engine?")
-                .setMessage("FlexFactor received an authenticated loopback engine address from Termux. Approve this on-phone connection?")
-                .setCancelable(false)
-                .setNegativeButton("Reject", (ignored, which) -> clearPendingHandoff())
-                .setPositiveButton("Use engine", (ignored, which) -> {
-                    clearPendingHandoff();
-                    saveEndpoint(pending);
-                    loadedEndpoint = "";
-                    render();
-                })
+                .setTitle("FlexFactor setup")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Credential pages", null)
+                .setPositiveButton("Verify and save", null)
                 .create();
-        dialog.setOnDismissListener(ignored -> handoffDialogVisible = false);
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view ->
+                    showCredentialLinks());
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                String githubValue = github.getText().toString().trim();
+                String openAiValue = openAi.getText().toString().trim();
+                if (githubValue.isEmpty()) githubValue = secrets.get(SecureStore.GITHUB_TOKEN);
+                if (openAiValue.isEmpty()) openAiValue = secrets.get(SecureStore.OPENAI_KEY);
+                if (githubValue.isEmpty()) {
+                    github.setError("GitHub token is required.");
+                    return;
+                }
+                if (openAiValue.isEmpty()) {
+                    openAi.setError("OpenAI key is required.");
+                    return;
+                }
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
+                configureCredentials(dialog, githubValue, openAiValue);
+            });
+        });
         dialog.show();
     }
 
-    private void clearPendingHandoff() {
-        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .remove(PENDING_ENDPOINT_KEY).apply();
-    }
-
-    private String storedEndpoint() {
-        return getSharedPreferences(PREFERENCES, MODE_PRIVATE).getString(ENDPOINT_KEY, "");
-    }
-
-    private void saveEndpoint(String endpoint) {
-        String normalized = EndpointPolicy.parseLocalEndpoint(endpoint).toString();
-        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .putString(ENDPOINT_KEY, normalized).apply();
-    }
-
-    private void render() {
-        if (recoveryMode) {
-            showRecovery(displayedRecoveryStatus);
-            return;
-        }
-        String endpoint = storedEndpoint();
-        if (endpoint.equals(loadedEndpoint) && root.getChildCount() > 0) return;
-        loadedEndpoint = endpoint;
-        destroyWebView();
-        root.removeAllViews();
-        if (endpoint.isEmpty()) {
-            showUnpaired();
-        } else {
-            showDashboard(endpoint);
-        }
-        addSettingsButton();
-        addUpdateButton();
-    }
-
-    private void showUnpaired() {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setGravity(Gravity.CENTER);
-        content.setPadding(dp(28), dp(28), dp(28), dp(28));
-
-        TextView title = text("FlexFactor", 28, Color.WHITE);
-        TextView detail = text(
-                "No on-phone engine is paired yet. FlexFactor can install, update, and start it on this phone.",
-                16,
-                Color.rgb(170, 181, 194));
-        detail.setGravity(Gravity.CENTER);
-        content.addView(title);
-        content.addView(detail, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        Button start = new Button(this);
-        start.setText("Start on this phone");
-        start.setOnClickListener(view -> requestEngineRecovery(true));
-        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        buttonParams.setMargins(0, dp(20), 0, 0);
-        content.addView(start, buttonParams);
-        root.addView(content, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-    }
-
-    private void showDashboard(String endpoint) {
-        final URI trusted = EndpointPolicy.parseLocalEndpoint(endpoint);
-        web = new WebView(this);
-        WebSettings settings = web.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(false);
-        settings.setAllowFileAccess(false);
-        settings.setAllowContentAccess(false);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        settings.setSafeBrowsingEnabled(true);
-        web.setBackgroundColor(Color.rgb(11, 15, 20));
-        // The launcher uses JavaScript confirm() before starting a run and
-        // alert() for the result. Without a WebChromeClient, WebView cancels
-        // confirm() by default, so the launch request is never sent.
-        web.setWebChromeClient(new WebChromeClient());
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return !EndpointPolicy.sameOrigin(trusted, request.getUrl().toString());
-            }
-
-            @Override
-            public WebResourceResponse shouldInterceptRequest(
-                    WebView view, WebResourceRequest request) {
-                String candidate = request.getUrl().toString();
-                if (EndpointPolicy.sameOrigin(trusted, candidate)) return null;
-                return blockedResponse();
-            }
-
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request,
-                    android.webkit.WebResourceError error) {
-                if (request.isForMainFrame()) requestEngineRecovery(false);
+    private void configureCredentials(AlertDialog dialog, String github, String openAi) {
+        worker.execute(() -> {
+            try {
+                GitHubApi.ConfigurationResult result = api.configure(github, openAi);
+                secrets.put(SecureStore.GITHUB_TOKEN, github);
+                secrets.put(SecureStore.OPENAI_KEY, openAi);
+                preferences.edit().putString(LOGIN, result.login).apply();
+                post(() -> {
+                    dialog.dismiss();
+                    refreshHeader();
+                    Toast.makeText(this, "GitHub and OpenAI are ready", Toast.LENGTH_LONG).show();
+                });
+            } catch (Exception failed) {
+                post(() -> {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verify and save");
+                    showError("Setup was not saved", safeMessage(failed));
+                });
             }
         });
-        root.addView(web, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        web.loadUrl(endpoint);
     }
 
-    private WebResourceResponse blockedResponse() {
-        byte[] body = "Blocked: the FlexFactor app only connects to this phone."
-                .getBytes(StandardCharsets.UTF_8);
-        return new WebResourceResponse(
-                "text/plain", "utf-8", 403, "Blocked", Collections.emptyMap(),
-                new ByteArrayInputStream(body));
+    private void showCredentialLinks() {
+        new AlertDialog.Builder(this)
+                .setTitle("Create credentials")
+                .setItems(new String[]{"Open GitHub token page", "Open OpenAI API key page"},
+                        (dialog, which) -> openExternal(which == 0
+                                ? "https://github.com/settings/tokens/new?scopes=repo,workflow&description=FlexFactor%20Android"
+                                : "https://platform.openai.com/api-keys"))
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
-    private void addSettingsButton() {
-        Button settings = new Button(this);
-        settings.setText("⚙");
-        settings.setTextSize(22);
-        settings.setContentDescription("Engine settings");
-        settings.setOnClickListener(view -> showSettings());
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(56), dp(56));
-        params.gravity = Gravity.END | Gravity.BOTTOM;
-        params.setMargins(dp(12), dp(12), dp(12), dp(20));
-        root.addView(settings, params);
+    private void chooseRepository() {
+        if (!requireConfiguration()) return;
+        repositoryButton.setEnabled(false);
+        repositoryButton.setText("Loading repositories…");
+        worker.execute(() -> {
+            try {
+                List<GitHubApi.Repository> repos = api.repositories(
+                        secrets.get(SecureStore.GITHUB_TOKEN));
+                post(() -> showRepositoryList(repos));
+            } catch (Exception failed) {
+                post(() -> {
+                    repositoryButton.setEnabled(true);
+                    refreshHeader();
+                    showError("Repositories could not be loaded", safeMessage(failed));
+                });
+            }
+        });
     }
 
-    private void addUpdateButton() {
-        updateButton = new Button(this);
-        updateButton.setText("Update");
-        updateButton.setTextSize(14);
-        updateButton.setContentDescription("Check for a FlexFactor update");
-        updateButton.setOnClickListener(view -> startUpdate());
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(116), dp(56));
-        params.gravity = Gravity.START | Gravity.BOTTOM;
-        params.setMargins(dp(12), dp(12), dp(12), dp(20));
-        root.addView(updateButton, params);
+    private void showRepositoryList(List<GitHubApi.Repository> repositories) {
+        repositoryButton.setEnabled(true);
+        refreshHeader();
+        if (repositories.isEmpty()) {
+            showError("No writable public repositories",
+                    "FlexFactor Mobile runs only public targets from its public control repository.");
+            return;
+        }
+        String[] labels = new String[repositories.size()];
+        for (int i = 0; i < repositories.size(); i++) labels[i] = repositories.get(i).fullName;
+        new AlertDialog.Builder(this)
+                .setTitle("Choose repository")
+                .setItems(labels, (dialog, which) -> {
+                    GitHubApi.Repository selected = repositories.get(which);
+                    preferences.edit()
+                            .putString(REPOSITORY, selected.fullName)
+                            .putString(REF, selected.defaultBranch)
+                            .apply();
+                    refreshHeader();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showRefactorDialog() {
+        if (!requireReadyTarget()) return;
+        LinearLayout form = form();
+        EditText file = input("Repository-relative file, for example src/app.ts");
+        EditText goal = input("What should this file do better?");
+        goal.setMinLines(3);
+        goal.setSingleLine(false);
+        form.addView(file);
+        form.addView(goal);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Option 1 · Refactor")
+                .setMessage("FlexFactor will refactor this file, verify the result, and publish the green change.")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Run FlexFactor", null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(view -> {
+                    try {
+                        MobileRunRequest request = request(MobileRunRequest.Mode.REFACTOR,
+                                file.getText().toString(), goal.getText().toString(), false, 25);
+                        dialog.dismiss();
+                        confirmAndDispatch(request);
+                    } catch (IllegalArgumentException rejected) {
+                        showError("Check the run details", rejected.getMessage());
+                    }
+                }));
+        dialog.show();
+    }
+
+    private void showScoutDialog() {
+        if (!requireReadyTarget()) return;
+        LinearLayout form = form();
+        CheckBox apply = new CheckBox(this);
+        apply.setText("Prepare and apply approved integration proposals");
+        apply.setTextColor(Color.WHITE);
+        apply.setChecked(false);
+        form.addView(text("Report mode researches improvements without changing the target. Enable apply to process proposals through FlexFactor's approval and verification gates.",
+                14, Color.rgb(170, 181, 194)));
+        form.addView(apply);
+        new AlertDialog.Builder(this)
+                .setTitle("Option 2 · Scout")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Run FlexFactor", (dialog, which) -> {
+                    try {
+                        confirmAndDispatch(request(MobileRunRequest.Mode.SCOUT,
+                                "", "", apply.isChecked(), 25));
+                    } catch (IllegalArgumentException rejected) {
+                        showError("Check the run details", rejected.getMessage());
+                    }
+                })
+                .show();
+    }
+
+    private void showRunDialog(MobileRunRequest.Mode mode) {
+        if (!requireReadyTarget()) return;
+        EditText cost = input("Maximum OpenAI cost in USD (1–150)");
+        cost.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        cost.setText(mode == MobileRunRequest.Mode.PRODREADY ? "150" : "50");
+        LinearLayout form = form();
+        form.addView(cost);
+        String title = mode == MobileRunRequest.Mode.AUDIT
+                ? "Option 3 · Audit and repair" : "Option 4 · Production ready";
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage("Verified green work may be committed, pushed, and merged by the FlexFactor engine.")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Run FlexFactor", (dialog, which) -> {
+                    try {
+                        double cap = Double.parseDouble(cost.getText().toString().trim());
+                        confirmAndDispatch(request(mode, "", "", false, cap));
+                    } catch (NumberFormatException rejected) {
+                        showError("Check the cost cap", "Enter a number from 1 through 150.");
+                    } catch (IllegalArgumentException rejected) {
+                        showError("Check the run details", rejected.getMessage());
+                    }
+                })
+                .show();
+    }
+
+    private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
+            boolean scoutApply, double cost) {
+        return new MobileRunRequest(mode,
+                preferences.getString(REPOSITORY, ""),
+                preferences.getString(REF, "main"),
+                file, goal, scoutApply, cost);
+    }
+
+    private void confirmAndDispatch(MobileRunRequest request) {
+        String detail = request.repository + " · " + request.ref;
+        if (request.mode == MobileRunRequest.Mode.AUDIT
+                || request.mode == MobileRunRequest.Mode.PRODREADY) {
+            detail += "\nMaximum provider cost: $"
+                    + String.format(Locale.US, "%.2f", request.maxCost);
+        } else {
+            detail += "\nProvider usage follows the OpenAI account limits for this mode.";
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Start " + request.mode.wire + "?")
+                .setMessage(detail)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Start", (dialog, which) -> dispatch(request))
+                .show();
+    }
+
+    private void dispatch(MobileRunRequest request) {
+        runState.setText("Submitting " + request.mode.wire + " to GitHub Actions…");
+        worker.execute(() -> {
+            try {
+                GitHubApi.RunState state = api.dispatch(
+                        secrets.get(SecureStore.GITHUB_TOKEN), request);
+                preferences.edit()
+                        .putLong(LAST_RUN_ID, state.id)
+                        .putString(LAST_RUN_URL, state.htmlUrl)
+                        .putString(LAST_RUN_STATUS, "Queued · " + request.repository)
+                        .apply();
+                post(() -> {
+                    refreshRunLabel();
+                    pollLastRun();
+                });
+            } catch (Exception failed) {
+                post(() -> showError("FlexFactor did not start", safeMessage(failed)));
+            }
+        });
+    }
+
+    private void pollLastRun() {
+        main.removeCallbacks(pollRun);
+        long id = preferences.getLong(LAST_RUN_ID, 0L);
+        if (id <= 0 || !configured() || destroyed) return;
+        worker.execute(() -> {
+            try {
+                GitHubApi.RunState state = api.run(secrets.get(SecureStore.GITHUB_TOKEN), id);
+                String label = state.complete()
+                        ? ("success".equals(state.conclusion) ? "Completed successfully" :
+                        "Completed: " + state.conclusion)
+                        : capitalize(state.status) + " · " + state.currentStep;
+                preferences.edit()
+                        .putString(LAST_RUN_URL, state.htmlUrl)
+                        .putString(LAST_RUN_STATUS, label)
+                        .apply();
+                post(() -> {
+                    refreshRunLabel();
+                    if (!state.complete()) {
+                        main.postDelayed(pollRun, POLL_MS);
+                    } else if ("success".equals(state.conclusion)) {
+                        Toast.makeText(this, "FlexFactor completed successfully",
+                                Toast.LENGTH_LONG).show();
+                    }
+                });
+            } catch (Exception failed) {
+                preferences.edit().putString(LAST_RUN_STATUS,
+                        "Status check failed · tap run details").apply();
+                post(() -> {
+                    refreshRunLabel();
+                    main.postDelayed(pollRun, POLL_MS * 2);
+                });
+            }
+        });
+    }
+
+    private void refreshRunLabel() {
+        if (runState == null) return;
+        long id = preferences.getLong(LAST_RUN_ID, 0L);
+        String status = preferences.getString(LAST_RUN_STATUS, "");
+        runState.setText(id <= 0 ? "No run has been started from this phone."
+                : (status.isEmpty() ? "Run #" + id : status + " · run #" + id));
+        runState.setTextColor(status.startsWith("Completed successfully")
+                ? Color.rgb(63, 185, 80) : Color.rgb(170, 181, 194));
+    }
+
+    private boolean requireConfiguration() {
+        if (configured()) return true;
+        showCredentialSetup();
+        return false;
+    }
+
+    private boolean requireReadyTarget() {
+        if (!requireConfiguration()) return false;
+        if (!preferences.getString(REPOSITORY, "").isEmpty()) return true;
+        Toast.makeText(this, "Choose a repository first", Toast.LENGTH_LONG).show();
+        chooseRepository();
+        return false;
+    }
+
+    private void openLastRun() {
+        String url = preferences.getString(LAST_RUN_URL, "");
+        if (url.isEmpty()) {
+            Toast.makeText(this, "No GitHub run is available yet", Toast.LENGTH_LONG).show();
+            return;
+        }
+        openExternal(url);
     }
 
     private void startUpdate() {
-        if (!getPackageManager().canRequestPackageInstalls()) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) {
             new AlertDialog.Builder(this)
                     .setTitle("Allow FlexFactor updates")
-                    .setMessage("Android needs permission for FlexFactor to open its signed update in the system installer. Enable Allow from this source, then tap Update again.")
+                    .setMessage("Enable Allow from this source, then tap Update again. Android will still ask you to confirm every signed installation.")
                     .setNegativeButton("Cancel", null)
-                    .setPositiveButton("Open settings", (dialog, which) -> {
-                        Intent intent = new Intent(
-                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:" + getPackageName()));
-                        startActivity(intent);
-                    })
+                    .setPositiveButton("Open settings", (dialog, which) -> startActivity(new Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:" + getPackageName()))))
                     .show();
             return;
         }
-
         updateButton.setEnabled(false);
         updateButton.setText("Checking…");
         new AppUpdater(this).checkAndInstall(new AppUpdater.Callback() {
-            @Override
-            public void onUpToDate(String versionName) {
+            @Override public void onUpToDate(String versionName) {
                 resetUpdateButton();
                 new AlertDialog.Builder(MainActivity.this)
                         .setTitle("FlexFactor is current")
                         .setMessage("Version " + versionName + " is the latest signed release.")
-                        .setPositiveButton("OK", null)
-                        .show();
+                        .setPositiveButton("OK", null).show();
             }
-
-            @Override
-            public void onInstallerReady(String versionName) {
+            @Override public void onInstallerReady(String versionName) {
                 resetUpdateButton();
                 Toast.makeText(MainActivity.this,
                         "Version " + versionName + " verified. Confirm the Android install.",
                         Toast.LENGTH_LONG).show();
             }
-
-            @Override
-            public void onError(String message) {
+            @Override public void onError(String message) {
                 resetUpdateButton();
-                new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Update not installed")
-                        .setMessage(message)
-                        .setPositiveButton("OK", null)
-                        .show();
+                showError("Update not installed", message);
             }
         });
     }
 
     private void resetUpdateButton() {
-        if (updateButton == null) return;
-        updateButton.setText("Update");
-        updateButton.setEnabled(true);
+        if (updateButton != null) {
+            updateButton.setText("Update");
+            updateButton.setEnabled(true);
+        }
     }
 
-    private void showSettings() {
-        EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setHint("http://127.0.0.1:8765/?t=...");
-        input.setText(storedEndpoint());
-        input.setSelectAllOnFocus(true);
-        int pad = dp(20);
-        FrameLayout holder = new FrameLayout(this);
-        holder.setPadding(pad, 0, pad, 0);
-        holder.addView(input, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("This phone's engine")
-                .setMessage("Paste the authenticated URL printed by flexfactor-engine start. Remote PC addresses are refused.")
-                .setView(holder)
-                .setNegativeButton("Cancel", null)
-                .setNeutralButton("Start / repair", null)
-                .setPositiveButton("Save", null)
-                .create();
-        dialog.setOnShowListener(ignored -> {
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
-                dialog.dismiss();
-                requestEngineRecovery(true);
-            });
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-                try {
-                    saveEndpoint(input.getText().toString());
-                    loadedEndpoint = "";
-                    render();
-                    dialog.dismiss();
-                } catch (IllegalArgumentException rejected) {
-                    input.setError(rejected.getMessage());
-                }
-            });
-        });
-        dialog.show();
+    private void showError(String title, String message) {
+        if (destroyed || isFinishing()) return;
+        new AlertDialog.Builder(this).setTitle(title).setMessage(message)
+                .setPositiveButton("OK", null).show();
     }
 
-    private void maybeRecoverForThisVersion() {
-        int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                .getInt(RECOVERED_VERSION_KEY, 0);
-        if (recovered >= installedVersionCode() || !isTermuxInstalled()) return;
-        if (checkSelfPermission(EngineRecoveryScript.TERMUX_PERMISSION)
-                == PackageManager.PERMISSION_GRANTED) {
-            requestEngineRecovery(true);
+    private void openExternal(String value) {
+        Uri uri = Uri.parse(value);
+        if (!"https".equals(uri.getScheme())) {
+            showError("Link blocked", "FlexFactor opens HTTPS links only.");
             return;
         }
-        if (permissionPromptShown) return;
-        permissionPromptShown = true;
-        new AlertDialog.Builder(this)
-                .setTitle("Finish on-phone setup")
-                .setMessage("FlexFactor needs Android's Run commands in Termux permission so its icon can start and repair the on-phone engine.")
-                .setNegativeButton("Later", null)
-                .setPositiveButton("Continue", (dialog, which) -> requestEngineRecovery(true))
-                .show();
+        startActivity(new Intent(Intent.ACTION_VIEW, uri));
     }
 
-    private boolean isTermuxInstalled() {
-        try {
-            getPackageManager().getApplicationInfo(EngineRecoveryScript.TERMUX_PACKAGE, 0);
-            return true;
-        } catch (PackageManager.NameNotFoundException missing) {
-            return false;
-        }
-    }
-
-    private void requestEngineRecovery(boolean repair) {
-        if (recoveryMode) return;
-        if (!isTermuxInstalled()) {
-            new AlertDialog.Builder(this)
-                    .setTitle("Termux is required")
-                    .setMessage("Install the current F-Droid or official GitHub build of Termux, then return to FlexFactor.")
-                    .setPositiveButton("OK", null)
-                    .show();
-            return;
-        }
-        if (checkSelfPermission(EngineRecoveryScript.TERMUX_PERMISSION)
-                != PackageManager.PERMISSION_GRANTED) {
-            int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                    .getInt(RECOVERED_VERSION_KEY, 0);
-            repairAfterPermission = repairAfterPermission || repair
-                    || recovered < installedVersionCode();
-            if (permissionRequestInFlight) return;
-            permissionRequestInFlight = true;
-            requestPermissions(new String[]{EngineRecoveryScript.TERMUX_PERMISSION},
-                    RUN_COMMAND_PERMISSION_REQUEST);
-            return;
-        }
-        runTermuxCommand(repair);
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != RUN_COMMAND_PERMISSION_REQUEST) return;
-        permissionRequestInFlight = false;
-        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            int recovered = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                    .getInt(RECOVERED_VERSION_KEY, 0);
-            runTermuxCommand(repairAfterPermission || recovered < installedVersionCode());
-            return;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Permission still needed")
-                .setMessage("Open FlexFactor App info → Permissions → Additional permissions and allow Run commands in Termux environment.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Open App info", (dialog, which) -> startActivity(new Intent(
-                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.parse("package:" + getPackageName()))))
-                .show();
-    }
-
-    private void runTermuxCommand(boolean repair) {
-        String nonce = java.util.UUID.randomUUID().toString();
-        long started = System.currentTimeMillis();
-        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .putString(RECOVERY_STATUS_KEY, "requested")
-                .putString(RECOVERY_NONCE_KEY, nonce)
-                .putBoolean(RECOVERY_IN_FLIGHT_KEY, true)
-                .putBoolean(RECOVERY_IS_REPAIR_KEY, repair)
-                .putLong(RECOVERY_STARTED_KEY, started)
-                .apply();
-        recoveryMode = true;
-        recoveryStartedAt = started;
-        displayedRecoveryStatus = "requested";
-        showRecovery(displayedRecoveryStatus);
-
-        Intent command = new Intent();
-        command.setComponent(new ComponentName(
-                EngineRecoveryScript.TERMUX_PACKAGE, EngineRecoveryScript.TERMUX_SERVICE));
-        command.setAction(EngineRecoveryScript.TERMUX_ACTION);
-        command.putExtra("com.termux.RUN_COMMAND_PATH", EngineRecoveryScript.BASH);
-        command.putExtra("com.termux.RUN_COMMAND_ARGUMENTS", new String[]{"-s"});
-        command.putExtra("com.termux.RUN_COMMAND_STDIN",
-                repair ? EngineRecoveryScript.repairScript(nonce)
-                        : EngineRecoveryScript.startScript(nonce));
-        command.putExtra("com.termux.RUN_COMMAND_WORKDIR", EngineRecoveryScript.HOME);
-        command.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
-        command.putExtra("com.termux.RUN_COMMAND_COMMAND_LABEL", "FlexFactor engine recovery");
-        command.putExtra("com.termux.RUN_COMMAND_COMMAND_DESCRIPTION",
-                "Updates and starts the FlexFactor engine on this phone.");
-        try {
-            startService(command);
-            handler.removeCallbacks(recoveryPoll);
-            handler.postDelayed(recoveryPoll, RECOVERY_POLL_MS);
-        } catch (RuntimeException blocked) {
-            showExternalAppsSetup();
-        }
-    }
-
-    private void pollRecovery() {
-        if (!recoveryMode || isFinishing() || isDestroyed()) return;
-        handler.removeCallbacks(recoveryPoll);
-        confirmPendingHandoff();
-        String status = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                .getString(RECOVERY_STATUS_KEY, "requested");
-        long elapsed = Math.max(0L, System.currentTimeMillis() - recoveryStartedAt);
-        if ("ready".equals(status)) {
-            boolean wasRepair = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                    .getBoolean(RECOVERY_IS_REPAIR_KEY, false);
-            if (wasRepair) {
-                getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                        .putInt(RECOVERED_VERSION_KEY, installedVersionCode()).apply();
-            }
-            clearRecoveryInFlight();
-            recoveryMode = false;
-            loadedEndpoint = "";
-            render();
-            confirmPendingHandoff();
-            return;
-        }
-        if (isRecoveryFailure(status)) {
-            clearRecoveryInFlight();
-            recoveryMode = false;
-            displayedRecoveryStatus = status;
-            showRecovery(status);
-            return;
-        }
-        if ("requested".equals(status) && elapsed >= COMMAND_ACCEPT_TIMEOUT_MS) {
-            showExternalAppsSetup();
-            return;
-        }
-        if (elapsed >= RECOVERY_TIMEOUT_MS) {
-            clearRecoveryInFlight();
-            recoveryMode = false;
-            displayedRecoveryStatus = "timed-out";
-            showRecovery(displayedRecoveryStatus);
-            return;
-        }
-        if (!status.equals(displayedRecoveryStatus)) {
-            displayedRecoveryStatus = status;
-            showRecovery(status);
-        }
-        handler.postDelayed(recoveryPoll, RECOVERY_POLL_MS);
-    }
-
-    private boolean isRecoveryFailure(String status) {
-        return "failed".equals(status) || "missing-engine".equals(status)
-                || "github-auth-required".equals(status) || "checkout-dirty".equals(status);
-    }
-
-    private void showRecovery(String status) {
-        handler.removeCallbacks(recoveryPoll);
-        destroyWebView();
-        root.removeAllViews();
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setGravity(Gravity.CENTER);
-        content.setPadding(dp(28), dp(28), dp(28), dp(90));
-        content.addView(text("FlexFactor", 28, Color.WHITE));
-
-        String message;
-        boolean retry = false;
-        if ("updating".equals(status)) {
-            message = "Updating the on-phone engine…";
-        } else if ("starting".equals(status)) {
-            message = "Starting the on-phone engine…";
-        } else if ("github-auth-required".equals(status)) {
-            message = "GitHub needs to be signed in once in Termux. Run gh auth login --web --git-protocol https, then retry.";
-            retry = true;
-        } else if ("checkout-dirty".equals(status)) {
-            message = "The managed FlexFactor checkout has local changes, so the app preserved them. Resolve them in Termux, then retry.";
-            retry = true;
-        } else if ("failed".equals(status) || "missing-engine".equals(status)
-                || "timed-out".equals(status)) {
-            message = "The engine did not become ready. Retry the safe repair; details are in ~/.phone-console/app-recovery.log in Termux.";
-            retry = true;
-        } else {
-            message = "Connecting to Termux and preparing the on-phone engine…";
-        }
-        TextView detail = text(message, 16, Color.rgb(170, 181, 194));
-        detail.setGravity(Gravity.CENTER);
-        content.addView(detail);
-        if (retry) {
-            Button button = new Button(this);
-            button.setText("Retry repair");
-            button.setOnClickListener(view -> requestEngineRecovery(true));
-            content.addView(button);
-            Button termux = new Button(this);
-            termux.setText("Open Termux");
-            termux.setOnClickListener(view -> openTermux());
-            content.addView(termux);
-        }
-        root.addView(content, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        addSettingsButton();
-        addUpdateButton();
-    }
-
-    private void showExternalAppsSetup() {
-        handler.removeCallbacks(recoveryPoll);
-        clearRecoveryInFlight();
-        recoveryMode = false;
-        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        new AlertDialog.Builder(this)
-                .setTitle("One-time Termux approval")
-                .setMessage("Termux requires its owner to enable external app commands once. Tap Copy & open Termux, paste the command, press Enter, then return here.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Copy & open Termux", (dialog, which) -> {
-                    clipboard.setPrimaryClip(ClipData.newPlainText(
-                            "Enable FlexFactor icon control",
-                            EngineRecoveryScript.ENABLE_EXTERNAL_APPS_COMMAND));
-                    Toast.makeText(this, "Command copied", Toast.LENGTH_SHORT).show();
-                    externalSetupPending = true;
-                    openTermux();
-                })
-                .show();
-        loadedEndpoint = "";
-        render();
-    }
-
-    private void openTermux() {
-        Intent launch = getPackageManager().getLaunchIntentForPackage(
-                EngineRecoveryScript.TERMUX_PACKAGE);
-        if (launch != null) startActivity(launch);
-    }
-
-    private int installedVersionCode() {
+    private String installedVersion() {
         try {
             PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
-            long code = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                    ? info.getLongVersionCode()
-                    : info.versionCode;
-            return code > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) code;
+            return info.versionName == null ? "unknown" : info.versionName;
         } catch (PackageManager.NameNotFoundException impossible) {
-            return 0;
+            return "unknown";
         }
     }
 
-    private void restoreRecoveryState() {
-        android.content.SharedPreferences prefs = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
-        if (!prefs.getBoolean(RECOVERY_IN_FLIGHT_KEY, false)) return;
-        long started = prefs.getLong(RECOVERY_STARTED_KEY, 0L);
-        long age = Math.max(0L, System.currentTimeMillis() - started);
-        if (started <= 0L || age >= RECOVERY_TIMEOUT_MS) {
-            clearRecoveryInFlight();
-            return;
-        }
-        String nonce = prefs.getString(RECOVERY_NONCE_KEY, "");
-        if (nonce.isEmpty()) {
-            clearRecoveryInFlight();
-            return;
-        }
-        recoveryMode = true;
-        recoveryStartedAt = started;
-        displayedRecoveryStatus = prefs.getString(RECOVERY_STATUS_KEY, "requested");
+    private void post(Runnable action) {
+        main.post(() -> {
+            if (!destroyed && !isFinishing()) action.run();
+        });
     }
 
-    private void clearRecoveryInFlight() {
-        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
-                .remove(RECOVERY_IN_FLIGHT_KEY)
-                .remove(RECOVERY_STARTED_KEY)
-                .remove(RECOVERY_IS_REPAIR_KEY)
-                .remove(RECOVERY_NONCE_KEY)
-                .apply();
+    private static String safeMessage(Exception error) {
+        String value = error.getMessage();
+        if (value == null || value.trim().isEmpty()) return error.getClass().getSimpleName();
+        return value.length() > 300 ? value.substring(0, 300) : value;
+    }
+
+    private static String capitalize(String value) {
+        if (value == null || value.isEmpty()) return "Unknown";
+        return Character.toUpperCase(value.charAt(0)) + value.substring(1);
+    }
+
+    private LinearLayout form() {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(22), 0, dp(22), 0);
+        return form;
+    }
+
+    private EditText input(String hint) {
+        EditText input = new EditText(this);
+        input.setHint(hint);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.rgb(125, 133, 144));
+        input.setSingleLine(true);
+        return input;
+    }
+
+    private EditText secretInput(String hint) {
+        EditText input = input(hint);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        return input;
+    }
+
+    private Button button(String label) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        return button;
+    }
+
+    private TextView section(String value) {
+        TextView view = text(value, 14, Color.rgb(88, 166, 255));
+        view.setAllCaps(true);
+        view.setLetterSpacing(0.06f);
+        view.setPadding(0, dp(18), 0, dp(4));
+        return view;
     }
 
     private TextView text(String value, int sp, int color) {
@@ -666,8 +620,22 @@ public final class MainActivity extends Activity {
         view.setText(value);
         view.setTextSize(sp);
         view.setTextColor(color);
-        view.setPadding(0, dp(8), 0, dp(8));
+        view.setPadding(0, dp(5), 0, dp(5));
         return view;
+    }
+
+    private LinearLayout.LayoutParams weighted() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        params.setMargins(dp(4), 0, dp(4), 0);
+        return params;
+    }
+
+    private LinearLayout.LayoutParams margins(int left, int top, int right, int bottom) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(dp(left), dp(top), dp(right), dp(bottom));
+        return params;
     }
 
     private int dp(int value) {

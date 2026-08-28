@@ -10,8 +10,8 @@ android {
         applicationId = "com.firer.console.flexfactor"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20203
-        versionName = "2.2.3"
+        versionCode = 30000
+        versionName = "3.0.0"
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }
@@ -46,5 +46,6 @@ android {
 }
 
 dependencies {
+    implementation("com.goterl:lazysodium-android:5.2.0")
     testImplementation("junit:junit:4.13.2")
 }
