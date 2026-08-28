@@ -1,0 +1,161 @@
+name: android-client
+
+on:
+  push:
+    branches: [main]
+    tags: ["android-v*"]
+    paths:
+      - "android/**"
+      - "scripts/phone/**"
+      - "flexfactor_web.py"
+      - ".github/workflows/android-client.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "scripts/phone/**"
+      - "flexfactor_web.py"
+      - ".github/workflows/android-client.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: android-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.13"
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
+      - name: Unit tests, lint, and debug APK
+        shell: bash
+        run: gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
+      - name: Record exact APK checksum
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          (cd android/app/build/outputs/apk/debug && sha256sum app-debug.apk > SHA256SUMS)
+          printf '%s\n' "$SOURCE_SHA" > android/app/build/outputs/apk/debug/SOURCE_COMMIT
+      - name: Upload exact-commit Android test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flexfactor-android-debug-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/SHA256SUMS
+            android/app/build/outputs/apk/debug/SOURCE_COMMIT
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: android-release
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: android-release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.13"
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
+      - name: Materialize protected release key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 is required" >&2; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/flexfactor-release.jks"
+          test -s "$RUNNER_TEMP/flexfactor-release.jks"
+      - name: Build signed production APK
+        shell: bash
+        env:
+          FLEXFACTOR_ANDROID_KEYSTORE: ${{ runner.temp }}/flexfactor-release.jks
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          FLEXFACTOR_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FLEXFACTOR_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          test -n "$FLEXFACTOR_ANDROID_KEY_ALIAS"
+          test -n "$FLEXFACTOR_ANDROID_KEY_PASSWORD"
+          gradle --no-daemon -p android testDebugUnitTest lintRelease assembleRelease
+      - name: Verify signature and record provenance
+        shell: bash
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          test -s "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" | tee android/app/build/outputs/apk/release/CERTIFICATE.txt
+          (cd android/app/build/outputs/apk/release && sha256sum app-release.apk > SHA256SUMS)
+          printf '%s\n' "${GITHUB_SHA}" > android/app/build/outputs/apk/release/SOURCE_COMMIT
+      - name: Create signed update manifest
+        shell: bash
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name "$apk")
+          version_code=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-code "$apk")
+          test "$GITHUB_REF_NAME" = "android-v${version_name}"
+          mkdir -p "$release_dir"
+          release_apk="$release_dir/flexfactor-${version_name}.apk"
+          cp "$apk" "$release_apk"
+          apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/flexfactor-${version_name}.apk"
+          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
+            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
+            > "$release_dir/android-update.json"
+      - name: Publish signed APK for in-app updates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
+            "android/app/build/outputs/apk/release/app-release.apk")
+          gh release create "$GITHUB_REF_NAME" \
+            "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
+            "$release_dir/android-update.json#Signed update manifest" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "FlexFactor Android ${version_name}" \
+            --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+      - name: Upload signed exact-commit Android release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flexfactor-android-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/release/CERTIFICATE.txt
+            android/app/build/outputs/apk/release/SHA256SUMS
+            android/app/build/outputs/apk/release/SOURCE_COMMIT
+            android/app/build/outputs/apk/release/publish/android-update.json
+          if-no-files-found: error
+          retention-days: 90

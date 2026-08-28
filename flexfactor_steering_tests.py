@@ -53,6 +53,26 @@ class SteeringTests(unittest.TestCase):
         for value in ("", "x" * (fs.MAX_COMMENT_CHARS + 1), "bad\x00text"):
             with self.assertRaises(ValueError):
                 fs.submit("Target", self.project, value, root=self.root)
+
+    def test_web_dashboard_identifies_the_on_phone_engine(self):
+        self.assertEqual(
+            "this phone",
+            web._host_label({"TERMUX_VERSION": "0.119.0", "HOSTNAME": "localhost"}),
+        )
+        self.assertEqual(
+            "this phone",
+            web._host_label({"PREFIX": "/data/data/com.termux/files/usr"}),
+        )
+
+    def test_web_dashboard_host_label_has_an_explicit_override(self):
+        self.assertEqual(
+            "my phone",
+            web._host_label({
+                "FLEXFACTOR_HOST_LABEL": "my phone",
+                "TERMUX_VERSION": "0.119.0",
+            }),
+        )
+        self.assertEqual("build-host", web._host_label({"HOSTNAME": "build-host"}))
     def test_context_replaces_prior_snapshot(self):
         combined = fs.merge_context("BASE", fs.steering_block([{"id": "one", "comment": "first"}]))
         refreshed = fs.merge_context(combined, fs.steering_block([{"id": "two", "comment": "second"}]))

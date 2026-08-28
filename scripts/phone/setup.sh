@@ -177,7 +177,8 @@ cat <<'EOF'
     flexfactor-engine status
 
   "start" also hands the freshly-minted dashboard token to the FlexFactor app
-  on this phone, so there is nothing to type.
+  on this phone. Approve the on-phone connection when the app asks; there is
+  nothing secret to type.
 
   Install Termux:Boot from F-Droid so the dashboard survives a reboot.
 EOF

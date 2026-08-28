@@ -331,8 +331,26 @@ def build_state(sampler: Sampler) -> dict:
         "status_mtime": mtime or None,
         "status_quiet_s": round(quiet_s) if quiet_s is not None else None,
         "programs": out,
-        "host": os.environ.get("COMPUTERNAME") or "pc",
+        "host": _host_label(),
     }
+
+
+def _host_label(env=None):
+    """Return an honest, user-facing label for the machine doing the work.
+
+    Android's Termux environment normally has no ``COMPUTERNAME``. Falling
+    straight back to ``pc`` made a fully local phone engine look as if it were
+    still connected to a laptop. An explicit label wins for unusual hosts;
+    otherwise the Termux markers are checked before desktop host names.
+    """
+    env = os.environ if env is None else env
+    explicit = str(env.get("FLEXFACTOR_HOST_LABEL") or "").strip()
+    if explicit:
+        return explicit
+    prefix = str(env.get("PREFIX") or "")
+    if env.get("TERMUX_VERSION") or prefix.startswith("/data/data/com.termux/"):
+        return "this phone"
+    return str(env.get("COMPUTERNAME") or env.get("HOSTNAME") or "pc")
 
 
 # --------------------------------------------------------------- HTTP
