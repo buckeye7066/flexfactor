@@ -46,12 +46,14 @@ die() { printf '\n\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
   die "this script is for Termux on Android. On the desktop use flexfactor_launch.ps1."
 
 # --- 1. packages ----------------------------------------------------------
-say "installing packages"
-pkg update -y
-# python: the engine. git: mandatory, every audit branches and commits.
-# nodejs-lts + esbuild-capable npm: needed to GATE JavaScript projects.
-# gh: optional, used only for pr create/merge (guarded by `which gh`).
-pkg install -y python git gh nodejs-lts openssh which termux-api
+if [ "${FLEXFACTOR_SKIP_PACKAGES:-0}" != "1" ]; then
+  say "installing packages"
+  pkg update -y
+  # python: the engine. git: mandatory, every audit branches and commits.
+  # nodejs-lts + esbuild-capable npm: needed to GATE JavaScript projects.
+  # gh: optional, used only for pr create/merge (guarded by `which gh`).
+  pkg install -y python git gh nodejs-lts openssh which termux-api
+fi
 command -v python >/dev/null || die "python did not install"
 command -v git    >/dev/null || die "git did not install (audits cannot run without it)"
 say "python $(python -V 2>&1 | awk '{print $2}'), git $(git --version | awk '{print $3}')"
@@ -61,6 +63,8 @@ if ! gh auth status >/dev/null 2>&1; then
   say "GitHub login required (repo is private)"
   if [ -n "${GH_TOKEN:-}" ]; then
     printf '%s' "$GH_TOKEN" | gh auth login --with-token
+  elif [ "${FLEXFACTOR_NONINTERACTIVE:-0}" = "1" ]; then
+    die "GitHub is not signed in. Open Termux and run: gh auth login --web --git-protocol https"
   else
     echo "Paste a GitHub token with 'repo' scope, then press Enter:"
     read -r _tok
@@ -168,6 +172,19 @@ termux-wake-lock
 exec "$HOME/.local/bin/flexfactor-engine" start
 BOOT
 chmod +x "$HOME/.termux/boot/10-flexfactor.sh"
+
+# Termux intentionally requires this property in addition to Android's
+# RUN_COMMAND permission before the FlexFactor icon may start or repair the
+# engine. setup.sh runs as the Termux user, so this remains an explicit Termux
+# owner action rather than an APK bypass of Termux-private storage.
+TERMUX_PROPERTIES="$HOME/.termux/termux.properties"
+touch "$TERMUX_PROPERTIES"
+if grep -q '^[[:space:]]*allow-external-apps[[:space:]]*=' "$TERMUX_PROPERTIES"; then
+  sed -i 's/^[[:space:]]*allow-external-apps[[:space:]]*=.*/allow-external-apps=true/' "$TERMUX_PROPERTIES"
+else
+  printf '\nallow-external-apps=true\n' >> "$TERMUX_PROPERTIES"
+fi
+command -v termux-reload-settings >/dev/null && termux-reload-settings || true
 
 say "setup complete"
 cat <<'EOF'
