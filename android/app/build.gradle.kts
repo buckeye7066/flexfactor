@@ -6,6 +6,10 @@ android {
     namespace = "com.firer.console.flexfactor"
     compileSdk = 36
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "com.firer.console.flexfactor"
         minSdk = 26
