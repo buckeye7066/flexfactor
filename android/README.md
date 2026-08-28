@@ -1,7 +1,7 @@
 # FlexFactor Android client
 
 This directory is the source of the FlexFactor Android dashboard. Version
-2.2.1 connects only to an authenticated engine on Android loopback. The engine
+2.2.2 connects only to an authenticated engine on Android loopback. The engine
 and the repositories it audits live in Termux on the same phone; a PC is not
 required.
 
@@ -74,7 +74,7 @@ the matching `android-v*` tag and publishes the signed release. A matching tag
 push remains supported for deliberate reruns. The release workflow publishes
 the exact source commit, APK SHA-256, signing-certificate digest, release APK,
 and update manifest. The tag must match the app version (for example,
-`android-v2.2.1`). Missing signing material fails the release; it never falls
+`android-v2.2.2`). Missing signing material fails the release; it never falls
 back to a debug key.
 
 ## Security boundary
