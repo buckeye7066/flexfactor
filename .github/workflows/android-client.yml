@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: read
+  copilot-requests: write
 
 jobs:
   build:
@@ -46,6 +47,16 @@ jobs:
       - name: Unit tests, lint, and debug APK
         shell: bash
         run: gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
+      - name: Verify the default phone model provider
+        shell: bash
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+        run: |
+          test -n "$COPILOT_GITHUB_TOKEN" || { echo "Mobile GitHub token is not configured" >&2; exit 1; }
+          npm install --global @github/copilot
+          result=$(printf 'Reply with FLEXFACTOR_READY only.\n' | \
+            copilot -s --no-ask-user --no-auto-update --no-color --no-custom-instructions)
+          test "$result" = FLEXFACTOR_READY
       - name: Record exact APK checksum
         shell: bash
         env:

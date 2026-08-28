@@ -72,6 +72,14 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn('per_page=100&page=" + page', api)
         self.assertIn('row.optBoolean("private", true)', api)
 
+    def test_android_release_gate_proves_the_default_copilot_provider(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "android-client.yml").read_text(encoding="utf-8")
+        self.assertIn("copilot-requests: write", workflow)
+        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("FLEXFACTOR_READY", workflow)
+        self.assertIn("@github/copilot", workflow)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
