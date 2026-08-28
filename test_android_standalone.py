@@ -177,6 +177,9 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("FLEXFACTOR_READY", workflow)
         self.assertIn("bundlePlay", workflow)
         self.assertIn("app-play.aab", workflow)
+        self.assertIn('jarsigner -verify "$aab"', workflow)
+        self.assertNotIn("jarsigner -verify -strict", workflow)
+        self.assertNotIn("bundle/play/app-release.aab", workflow)
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
         build_gate = build_gate.split("- name: Verify the default phone model provider live", 1)[0]
         self.assertIn("testPlayUnitTest", build_gate)
