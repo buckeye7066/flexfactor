@@ -54,7 +54,7 @@ final class AppUpdater {
             try {
                 UpdateInfo update = fetchManifest();
                 PackageInfo installed = installedPackage();
-                if (!UpdatePolicy.isNewer(update.versionCode, installed.getLongVersionCode())) {
+                if (!UpdatePolicy.isNewer(update.versionCode, versionCode(installed))) {
                     String installedName = installed.versionName == null ? "unknown" : installed.versionName;
                     post(() -> callback.onUpToDate(installedName));
                     return;
@@ -173,11 +173,11 @@ final class AppUpdater {
     private void verifyArchive(File apk, UpdateInfo update) throws Exception {
         PackageManager manager = context.getPackageManager();
         PackageInfo archive = manager.getPackageArchiveInfo(
-                apk.getAbsolutePath(), PackageManager.GET_SIGNING_CERTIFICATES);
+                apk.getAbsolutePath(), signingFlags());
         if (archive == null || !UpdatePolicy.PACKAGE_NAME.equals(archive.packageName)) {
             throw new SecurityException("The downloaded APK is not FlexFactor.");
         }
-        if (archive.getLongVersionCode() != update.versionCode
+        if (versionCode(archive) != update.versionCode
                 || archive.versionName == null
                 || !archive.versionName.equals(update.versionName)) {
             throw new SecurityException("The downloaded APK version does not match its manifest.");
@@ -192,10 +192,20 @@ final class AppUpdater {
     }
 
     private Set<String> certificateDigests(PackageInfo info) throws Exception {
-        if (info.signingInfo == null) throw new SecurityException("The APK has no signing certificate.");
-        Signature[] signatures = info.signingInfo.hasMultipleSigners()
-                ? info.signingInfo.getApkContentsSigners()
-                : info.signingInfo.getSigningCertificateHistory();
+        Signature[] signatures;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (info.signingInfo == null) {
+                throw new SecurityException("The APK has no signing certificate.");
+            }
+            signatures = info.signingInfo.hasMultipleSigners()
+                    ? info.signingInfo.getApkContentsSigners()
+                    : info.signingInfo.getSigningCertificateHistory();
+        } else {
+            signatures = info.signatures;
+        }
+        if (signatures == null || signatures.length == 0) {
+            throw new SecurityException("The APK has no signing certificate.");
+        }
         Set<String> result = new HashSet<>();
         for (Signature signature : signatures) {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(signature.toByteArray());
@@ -208,7 +218,21 @@ final class AppUpdater {
 
     private PackageInfo installedPackage() throws PackageManager.NameNotFoundException {
         return context.getPackageManager().getPackageInfo(
-                context.getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+                context.getPackageName(), signingFlags());
+    }
+
+    @SuppressWarnings("deprecation")
+    private int signingFlags() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ? PackageManager.GET_SIGNING_CERTIFICATES
+                : PackageManager.GET_SIGNATURES;
+    }
+
+    @SuppressWarnings("deprecation")
+    private long versionCode(PackageInfo info) {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ? info.getLongVersionCode()
+                : info.versionCode;
     }
 
     private void install(File apk) throws Exception {
@@ -229,11 +253,15 @@ final class AppUpdater {
             }
             Intent result = new Intent(context, UpdateResultReceiver.class)
                     .setAction(UpdatePolicy.PACKAGE_NAME + ".UPDATE_STATUS." + sessionId);
+            int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                pendingFlags |= PendingIntent.FLAG_MUTABLE;
+            }
             PendingIntent pending = PendingIntent.getBroadcast(
                     context,
                     sessionId,
                     result,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+                    pendingFlags);
             session.commit(pending.getIntentSender());
             committed = true;
         } finally {
