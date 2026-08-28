@@ -1,7 +1,7 @@
 # FlexFactor Android client
 
 This directory is the source of the FlexFactor Android dashboard. Version
-2.2.0 connects only to an authenticated engine on Android loopback. The engine
+2.2.1 connects only to an authenticated engine on Android loopback. The engine
 and the repositories it audits live in Termux on the same phone; a PC is not
 required.
 
@@ -41,8 +41,9 @@ silently grant itself those privileges.
 
 Version 2.1.0 does not contain this updater. If its original private signing
 key cannot be recovered, the migration to 2.2.0 requires one uninstall and
-reinstall. Once 2.2.0 is installed with the permanent release key, the Update
-button can install subsequent versions in place when the same key is used.
+reinstall. Once 2.2.0 or later is installed with the permanent release key,
+the Update button can install subsequent versions in place when the same key
+is used.
 
 ## Build
 
@@ -71,7 +72,7 @@ CI secrets. Configure the `android-release` GitHub environment with
 `ANDROID_KEY_PASSWORD`, then push an `android-v*` tag. The release workflow
 publishes the exact source commit, APK SHA-256, signing-certificate digest,
 release APK, and update manifest. The tag must match the app version (for
-example, `android-v2.2.0`). Missing signing material fails the release; it never
+example, `android-v2.2.1`). Missing signing material fails the release; it never
 falls back to a debug key.
 
 ## Security boundary
