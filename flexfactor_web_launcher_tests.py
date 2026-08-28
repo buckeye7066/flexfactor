@@ -25,6 +25,7 @@ class PhoneLauncherTests(unittest.TestCase):
             "FLEXFACTOR_PROJECT_ROOTS": self.root,
             "OPENAI_API_KEY": "test-secret-that-must-not-leak",
         }
+        self.provider_path = os.path.join(self.root, "private", "providers.json")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -62,6 +63,110 @@ class PhoneLauncherTests(unittest.TestCase):
         )
         self.assertTrue(next(item for item in readiness if item["name"] == "openai")["ready"])
         self.assertNotIn(self.env["OPENAI_API_KEY"], json.dumps(readiness))
+
+    def test_provider_key_is_saved_privately_without_response_leak(self):
+        secret = "test-provider-secret-that-must-not-leak"
+        result = web.save_phone_provider(
+            {"provider": "openai", "api_key": secret},
+            env=self.env,
+            provider_path=self.provider_path,
+        )
+        self.assertTrue(result["configured"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(secret, web._load_phone_provider_env(
+            self.provider_path)["OPENAI_API_KEY"])
+        blank_env = dict(self.env, OPENAI_API_KEY="")
+        self.assertEqual(secret, web._effective_provider_env(
+            blank_env, self.provider_path)["OPENAI_API_KEY"])
+        if os.name != "nt":
+            self.assertEqual(0o600, os.stat(self.provider_path).st_mode & 0o777)
+            self.assertEqual(0o700, os.stat(os.path.dirname(
+                self.provider_path)).st_mode & 0o777)
+
+    def test_provider_setup_rejects_invalid_inputs_without_writing(self):
+        cases = [
+            ({"provider": "ollama", "api_key": "long-enough-secret-value"},
+             "openai or anthropic"),
+            ({"provider": "openai", "api_key": "short"}, "invalid format"),
+            ({"provider": "openai", "api_key": "bad-secret-value\n"},
+             "invalid format"),
+        ]
+        for body, message in cases:
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, message):
+                web.save_phone_provider(
+                    body, env=self.env, provider_path=self.provider_path)
+        self.assertFalse(os.path.exists(self.provider_path))
+
+    def test_saved_provider_key_reaches_child_only_through_environment(self):
+        secret = "saved-provider-secret-that-must-not-leak"
+        env = dict(self.env)
+        env.pop("OPENAI_API_KEY")
+        web.save_phone_provider(
+            {"provider": "openai", "api_key": secret},
+            env=env,
+            provider_path=self.provider_path,
+        )
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["env"] = kwargs["env"]
+            return SimpleNamespace(pid=737373)
+
+        run_dir = os.path.join(self.root, "configured-run")
+        result = web.start_phone_run(
+            {"program": self.project, "mode": "audit", "provider": "openai",
+             "max_cost": 3},
+            env=env,
+            programs=[{"name": "target-app", "path": self.project}],
+            readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
+            provider_path=self.provider_path,
+            pid_path=os.path.join(run_dir, "audit.pid"),
+            log_path=os.path.join(run_dir, "audit.log"),
+            lock_path=os.path.join(run_dir, "audit.lock"),
+            popen=fake_popen,
+            start_reaper=lambda process, path: None,
+        )
+        self.assertEqual(secret, captured["env"]["OPENAI_API_KEY"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn(secret, json.dumps(captured["command"]))
+        with open(os.path.join(run_dir, "audit.log"), encoding="utf-8") as fh:
+            self.assertNotIn(secret, fh.read())
+
+    def test_provider_support_installer_uses_fixed_allowlisted_argv(self):
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(pid=838383)
+
+        run_dir = os.path.join(self.root, "provider-install")
+        result = web.start_phone_provider_install(
+            {"provider": "openai"},
+            env=self.env,
+            pid_path=os.path.join(run_dir, "provider.pid"),
+            log_path=os.path.join(run_dir, "provider.log"),
+            popen=fake_popen,
+            start_reaper=lambda process, path: captured.update(
+                reaped=(process.pid, path)),
+        )
+        self.assertEqual(838383, result["pid"])
+        self.assertEqual("openai", captured["command"][-1])
+        self.assertTrue(captured["command"][0].endswith(
+            "scripts/phone/install-provider.sh"))
+        self.assertNotIn("shell", captured["kwargs"])
+        self.assertEqual((838383, os.path.join(run_dir, "provider.pid")),
+                         captured["reaped"])
+
+    def test_provider_support_installer_rejects_non_cloud_provider(self):
+        with self.assertRaisesRegex(ValueError, "openai or anthropic"):
+            web.start_phone_provider_install(
+                {"provider": "ollama"}, env=self.env,
+                pid_path=os.path.join(self.root, "provider.pid"),
+                log_path=os.path.join(self.root, "provider.log"),
+                popen=lambda *args, **kwargs: self.fail("must not spawn"),
+            )
 
     def test_launch_uses_exact_argv_and_never_pushes_or_merges(self):
         captured = {}
@@ -212,7 +317,7 @@ class PhoneLauncherTests(unittest.TestCase):
 
     def test_http_launch_requires_exact_token(self):
         original = web.start_phone_run
-        web.start_phone_run = lambda body: {
+        web.start_phone_run = lambda body, provider_path=None: {
             "ok": True, "pid": 12, "program": "target-app", "mode": "audit",
             "provider": "openai", "max_cost": 10,
         }
@@ -244,10 +349,55 @@ class PhoneLauncherTests(unittest.TestCase):
             thread.join(5)
             web.start_phone_run = original
 
+    def test_http_provider_setup_requires_token_and_never_echoes_key(self):
+        secret = "http-provider-secret-that-must-not-leak"
+        original = web.save_phone_provider
+        web.save_phone_provider = lambda body, provider_path=None: {
+            "ok": True, "provider": body["provider"], "configured": True,
+            "ready": True, "detail": "ready",
+        }
+        web.Handler.token = "provider-setup-token"
+        web.Handler.sampler = object()
+        web.Handler.provider_path = self.provider_path
+        server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = "http://127.0.0.1:{}/api/provider".format(server.server_port)
+
+            def post(token):
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps({"provider": "openai", "api_key": secret}).encode(),
+                    method="POST",
+                    headers={"Content-Type": "application/json",
+                             "Authorization": "Bearer " + token},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        return response.status, response.read().decode()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.read().decode()
+
+            self.assertEqual(401, post("wrong")[0])
+            status, response = post("provider-setup-token")
+            self.assertEqual(201, status)
+            self.assertNotIn(secret, response)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+            web.save_phone_provider = original
+
     def test_page_exposes_launcher_and_local_only_policy(self):
         self.assertIn("Start on this phone", web.PAGE)
         self.assertIn("cannot push or merge", web.PAGE)
         self.assertIn("/api/launch", web.PAGE)
+        self.assertIn("Save key on this phone", web.PAGE)
+        self.assertIn('type="password"', web.PAGE)
+        self.assertIn("/api/provider", web.PAGE)
+        self.assertIn("Install provider support", web.PAGE)
+        self.assertIn("/api/provider/install", web.PAGE)
 
     def test_android_webview_enables_launcher_dialogs(self):
         path = os.path.join(
