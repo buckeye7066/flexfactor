@@ -17,6 +17,7 @@ RUN_DIR="$HOME/.phone-console"
 PID_FILE="$RUN_DIR/flexfactor-web.pid"
 LOG_FILE="$RUN_DIR/flexfactor-web.log"
 AUDIT_LOG="$RUN_DIR/flexfactor-audit.log"
+AUDIT_LOCK="$RUN_DIR/audit.lock"
 PORT="${FLEXFACTOR_WEB_PORT:-8765}"
 APP_PKG="com.firer.console.flexfactor"
 
@@ -24,6 +25,38 @@ mkdir -p "$RUN_DIR"
 [ -f "$HOME/.flexfactor-phone.env" ] && . "$HOME/.flexfactor-phone.env"
 
 alive() { [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; }
+
+release_audit_lock() {
+  rm -f "$AUDIT_LOCK/owner.pid"
+  rmdir "$AUDIT_LOCK" 2>/dev/null || true
+}
+
+acquire_audit_lock() {
+  if mkdir "$AUDIT_LOCK" 2>/dev/null; then
+    echo "$$" > "$AUDIT_LOCK/owner.pid"
+    return 0
+  fi
+  if [ -f "$RUN_DIR/audit.pid" ] && kill -0 "$(cat "$RUN_DIR/audit.pid")" 2>/dev/null; then
+    echo "an audit is already running (pid $(cat "$RUN_DIR/audit.pid"))" >&2
+    return 1
+  fi
+  if [ -f "$AUDIT_LOCK/owner.pid" ] && kill -0 "$(cat "$AUDIT_LOCK/owner.pid")" 2>/dev/null; then
+    echo "another FlexFactor launch is already starting" >&2
+    return 1
+  fi
+  # A creator can be interrupted between mkdir and writing owner.pid. Never
+  # steal a fresh empty lock; after 30 seconds it is provably stale enough to
+  # recover on the next attempt.
+  now="$(date +%s)"
+  changed="$(stat -c %Y "$AUDIT_LOCK" 2>/dev/null || echo "$now")"
+  if [ $((now - changed)) -le 30 ]; then
+    echo "another FlexFactor launch is already starting" >&2
+    return 1
+  fi
+  release_audit_lock
+  mkdir "$AUDIT_LOCK"
+  echo "$$" > "$AUDIT_LOCK/owner.pid"
+}
 
 url() { python "$APP_DIR/flexfactor_web.py" --host 127.0.0.1 --port "$PORT" --print-url; }
 
@@ -121,6 +154,8 @@ cmd_run() {
   local mode="$1"; shift
   [ $# -ge 1 ] || { echo "usage: flexfactor-engine $mode <program> [args...]" >&2; exit 2; }
   [ -d "$APP_DIR" ] || { echo "not installed: $APP_DIR" >&2; exit 1; }
+  acquire_audit_lock || exit 1
+  trap release_audit_lock EXIT
   if [ -f "$RUN_DIR/audit.pid" ] && kill -0 "$(cat "$RUN_DIR/audit.pid")" 2>/dev/null; then
     echo "an audit is already running (pid $(cat "$RUN_DIR/audit.pid")); stop it first" >&2
     exit 1
@@ -131,6 +166,8 @@ cmd_run() {
   nohup python flexfactor.py "$mode" --program "$1" --no-dashboard "${@:2}" \
       >> "$AUDIT_LOG" 2>&1 &
   echo $! > "$RUN_DIR/audit.pid"
+  release_audit_lock
+  trap - EXIT
   echo "$mode started on this phone (pid $(cat "$RUN_DIR/audit.pid"))"
   echo "watch it: the FlexFactor app, or  tail -f $AUDIT_LOG"
 }
