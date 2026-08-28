@@ -30,6 +30,20 @@ Running audits also requires an on-phone provider. Re-run setup with
 loopback Ollama provider. The dashboard and engine do not use the PC in either
 case.
 
+## In-app updates
+
+Tap **Update** in the lower-left corner. FlexFactor checks the latest signed
+Android release from this repository, downloads it over HTTPS, and verifies
+the package name, version, SHA-256, and signing-certificate lineage before
+opening Android's installer. Android requires the user to enable **Allow from
+this source** once and to confirm each install; a normal sideloaded app cannot
+silently grant itself those privileges.
+
+Version 2.1.0 does not contain this updater. If its original private signing
+key cannot be recovered, the migration to 2.2.0 requires one uninstall and
+reinstall. Once 2.2.0 is installed with the permanent release key, the Update
+button can install subsequent versions in place when the same key is used.
+
 ## Build
 
 JDK 17, Android SDK 36, and Gradle 8.13 are required:
@@ -55,8 +69,10 @@ Never commit a keystore or its passwords. Release signing belongs in protected
 CI secrets. Configure the `android-release` GitHub environment with
 `ANDROID_KEYSTORE_BASE64`, `ANDROID_STORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
 `ANDROID_KEY_PASSWORD`, then push an `android-v*` tag. The release workflow
-publishes the exact source commit, APK SHA-256, and signing-certificate digest.
-Missing signing material fails the release; it never falls back to a debug key.
+publishes the exact source commit, APK SHA-256, signing-certificate digest,
+release APK, and update manifest. The tag must match the app version (for
+example, `android-v2.2.0`). Missing signing material fails the release; it never
+falls back to a debug key.
 
 ## Security boundary
 
