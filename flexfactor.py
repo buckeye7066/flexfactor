@@ -166,6 +166,7 @@ except ImportError:
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "openai": "gpt-4o",
+    "copilot": "auto",
     # LOCAL tier. qwen3-coder:30b and deepseek-coder:33b (~18GB each) were both
     # tried and BOTH fail to load on this machine's hardware - measured 2026-08-12:
     # deepseek-coder:33b timed out with "timed out waiting for llama-server to
@@ -186,6 +187,7 @@ DEFAULT_MODELS = {
 JUDGE_MODELS = {
     "anthropic": "claude-haiku-4-5",
     "openai": "gpt-4o-mini",
+    "copilot": "auto",
     "ollama": "llama3.2:latest",  # small + fast local judge
 }
 
@@ -2580,6 +2582,55 @@ class OpenAIProvider:
             self._meter(resp, self.judge_model)
 
 
+class CopilotProvider:
+    """Direct-provider contract backed by the authenticated GitHub Copilot CLI.
+
+    The generic CLI adapter is shaped for the rotation layer; this wrapper adds
+    FlexFactor's direct-provider Grade contract and the same repo-payload egress
+    gate used by the HTTP cloud providers.
+    """
+
+    def __init__(self, model: str = "auto", judge_model: str | None = None):
+        from providers.cli_provider import CliProvider, cli_binary_for
+        binary = cli_binary_for("copilot-cli")
+        if not binary:
+            raise RuntimeError("GitHub Copilot CLI is not installed")
+        self.model = model or "auto"
+        self.judge_model = judge_model or self.model
+        self.meter = None
+        self._cli = CliProvider("copilot-cli", self.model, binary,
+                                judge_model=self.judge_model)
+
+    def complete(self, instruction: str) -> str:
+        return self._cli.complete(_egress_gate(instruction), system=REWRITE_SYSTEM).strip()
+
+    def grade(self, prompt: str) -> Grade:
+        data = self._cli.structured(
+            GRADE_SYSTEM + " Keys: grade, meets_goal, rationale, issues.",
+            _egress_gate(prompt),
+            {"type": "object", "properties": {
+                "grade": {"type": "number"},
+                "meets_goal": {"type": "boolean"},
+                "rationale": {"type": "string"},
+                "issues": {"type": "array", "items": {"type": "string"}},
+            }},
+            max_tokens=4000,
+        )
+        return _parse_grade(json.dumps(data))
+
+    def structured(self, system: str, prompt: str, schema: dict,
+                   max_tokens: int = 8000, model: str | None = None,
+                   salvage_truncated: bool = False, **kwargs) -> dict:
+        del model, salvage_truncated, kwargs
+        data = self._cli.structured(system, _egress_gate(prompt), schema,
+                                    max_tokens=max_tokens)
+        return _check_structured_type(data, schema, json.dumps(data))
+
+    def ping(self) -> None:
+        if not self._cli.ping():
+            raise RuntimeError("GitHub Copilot authentication was rejected")
+
+
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ---- Global ollama concurrency gate (2026-08-11 live failure) --------------- #
@@ -3181,6 +3232,8 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
         prov = OpenAIProvider(model, judge_model=jm)
     elif name == "ollama":
         prov = OllamaProvider(model, judge_model=jm)
+    elif name == "copilot":
+        prov = CopilotProvider(model, judge_model=jm)
     else:
         raise ValueError(f"Unknown provider: {name}")
     prov.meter = meter  # share one meter so all calls bill into the same budget
@@ -3461,6 +3514,9 @@ def _provider_key_present(name: str) -> bool:
         return bool(os.environ.get("ANTHROPIC_API_KEY")) or bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
     if name == "openai":
         return bool(os.environ.get("OPENAI_API_KEY"))
+    if name == "copilot":
+        return bool(os.environ.get("COPILOT_GITHUB_TOKEN")
+                    or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
     if name == "ollama":
         return True  # local server, no key; the preflight PING is the real check
     return False
@@ -4131,7 +4187,7 @@ def _compute_provider_health(name: str, meter: "CostMeter | None" = None) -> tup
     adapter methods + the _budget_guard reservation chokepoint + the meter."""
     if not _provider_key_present(name):
         return (False, "no API key set")
-    if name not in ("anthropic", "openai", "ollama"):
+    if name not in ("anthropic", "openai", "ollama", "copilot"):
         return (False, f"unknown provider {name}")
     if name == "ollama":
         # Local server: a failed ping means Ollama isn't RUNNING - that is a
@@ -4262,7 +4318,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             # actually present, and not one silently re-pointed at the free FCC
             # proxy (which would make a 'paid' run quietly free - the mirror of
             # the failure the free mode guards against).
-            return (name in {"anthropic", "openai"}
+            return (name in {"anthropic", "openai", "copilot"}
                     and _provider_key_present(name)
                     and not _provider_free_routed(name))
         # free: Ollama always, and a vendor name only while it is free-routed
@@ -4399,7 +4455,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
         # "paid mode excludes the configured routes" -- the exact opposite of
         # what happened.  Diagnose permission before exclusion, using the same
         # _permitted chokepoint that selected providers above.
-        candidates = ("anthropic", "openai", "ollama")
+        candidates = ("anthropic", "openai", "ollama", "copilot")
         permitted_key = any(_permitted(name) and _provider_key_present(name)
                             for name in candidates)
         excluded_key = any(not _permitted(name) and _provider_key_present(name)
@@ -17625,7 +17681,7 @@ def main(argv=None) -> int:
         )
         parser.add_argument("--program", required=True,
                             help="The program to help: a project folder, file, .lnk shortcut, URL, or description.")
-        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
+        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
         parser.add_argument("--economy", action="store_true", dest="economy",
@@ -17767,7 +17823,7 @@ def main(argv=None) -> int:
                                  "Repeatable: pass up to 10 to audit several programs in one run.")
         parser.add_argument("--parallel", type=int, default=1, dest="parallel",
                             help="How many programs to audit concurrently (default: 1).")
-        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
+        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
                             help="LLM backend (default: anthropic).")
         # choices still ACCEPTS the retired spellings so an invocation we did not
         # find degrades with a warning instead of argparse exit 2 (the documented
@@ -18084,7 +18140,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--file", required=True, help="Path to the source file to refactor.")
     parser.add_argument("--goal", required=True, help="Plain-English description of the desired change.")
-    parser.add_argument("--provider", choices=["anthropic", "openai", "ollama"], default="anthropic",
+    parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
                         help="LLM backend (default: anthropic).")
     parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
     parser.add_argument("--economy", action="store_true", dest="economy",

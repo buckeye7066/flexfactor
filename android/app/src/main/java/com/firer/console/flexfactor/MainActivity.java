@@ -160,10 +160,12 @@ public final class MainActivity extends Activity {
         String login = preferences.getString(LOGIN, "");
         if (configured()) {
             accountState.setText("GitHub: " + (login.isEmpty() ? "configured" : login)
-                    + " · OpenAI: verified · No PC or Termux required");
+                    + (secrets.contains(SecureStore.OPENAI_KEY)
+                    ? " · Provider: OpenAI" : " · Provider: hosted open model")
+                    + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
-            accountState.setText("One-time setup needed: GitHub token and OpenAI key");
+            accountState.setText("One-time setup needed: GitHub token · OpenAI key optional");
             accountState.setTextColor(Color.rgb(248, 81, 73));
         }
         if (repositoryButton != null) {
@@ -174,21 +176,25 @@ public final class MainActivity extends Activity {
     }
 
     private boolean configured() {
-        return secrets.contains(SecureStore.GITHUB_TOKEN)
-                && secrets.contains(SecureStore.OPENAI_KEY);
+        return secrets.contains(SecureStore.GITHUB_TOKEN);
     }
 
     private void showCredentialSetup() {
         LinearLayout form = form();
         TextView guidance = text(
-                "Enter each credential once. FlexFactor verifies both, encrypts them on this phone, and installs encrypted copies into the protected GitHub Actions runner.",
+                "Enter your GitHub token once. FlexFactor runs its own open model in GitHub Actions by default. An OpenAI API key is optional and switches runs to OpenAI.",
                 14, Color.rgb(170, 181, 194));
         EditText github = secretInput("GitHub token (repo and workflow access)");
-        EditText openAi = secretInput("OpenAI API key");
+        EditText openAi = secretInput("OpenAI API key (optional)");
+        CheckBox useHostedModel = new CheckBox(this);
+        useHostedModel.setText("Use hosted open model (no OpenAI key)");
+        useHostedModel.setTextColor(Color.WHITE);
+        useHostedModel.setChecked(!secrets.contains(SecureStore.OPENAI_KEY));
         if (secrets.contains(SecureStore.GITHUB_TOKEN)) github.setHint("GitHub token already saved");
         if (secrets.contains(SecureStore.OPENAI_KEY)) openAi.setHint("OpenAI key already saved");
         form.addView(guidance);
         form.addView(github);
+        form.addView(useHostedModel);
         form.addView(openAi);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
@@ -205,13 +211,17 @@ public final class MainActivity extends Activity {
                 String githubValue = github.getText().toString().trim();
                 String openAiValue = openAi.getText().toString().trim();
                 if (githubValue.isEmpty()) githubValue = secrets.get(SecureStore.GITHUB_TOKEN);
-                if (openAiValue.isEmpty()) openAiValue = secrets.get(SecureStore.OPENAI_KEY);
+                if (useHostedModel.isChecked()) {
+                    openAiValue = "";
+                } else if (openAiValue.isEmpty()) {
+                    openAiValue = secrets.get(SecureStore.OPENAI_KEY);
+                }
                 if (githubValue.isEmpty()) {
                     github.setError("GitHub token is required.");
                     return;
                 }
-                if (openAiValue.isEmpty()) {
-                    openAi.setError("OpenAI key is required.");
+                if (!useHostedModel.isChecked() && openAiValue.isEmpty()) {
+                    openAi.setError("Enter an OpenAI key or select the hosted open model.");
                     return;
                 }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
@@ -232,7 +242,9 @@ public final class MainActivity extends Activity {
                 post(() -> {
                     dialog.dismiss();
                     refreshHeader();
-                    Toast.makeText(this, "GitHub and OpenAI are ready", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, openAi.isEmpty()
+                            ? "Hosted open model is selected" : "GitHub and OpenAI are ready",
+                            Toast.LENGTH_LONG).show();
                 });
             } catch (Exception failed) {
                 post(() -> {
@@ -355,7 +367,9 @@ public final class MainActivity extends Activity {
 
     private void showRunDialog(MobileRunRequest.Mode mode) {
         if (!requireReadyTarget()) return;
-        EditText cost = input("Maximum OpenAI cost in USD (1–150)");
+        EditText cost = input(secrets.contains(SecureStore.OPENAI_KEY)
+                ? "Maximum OpenAI cost in USD (1–150)"
+                : "Maximum provider budget (1–150)");
         cost.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         cost.setText(mode == MobileRunRequest.Mode.PRODREADY ? "150" : "50");
         LinearLayout form = form();
@@ -382,7 +396,9 @@ public final class MainActivity extends Activity {
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
             boolean scoutApply, double cost) {
-        return new MobileRunRequest(mode,
+        MobileRunRequest.Provider provider = secrets.contains(SecureStore.OPENAI_KEY)
+                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.OLLAMA;
+        return new MobileRunRequest(mode, provider,
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
                 file, goal, scoutApply, cost);
@@ -395,7 +411,8 @@ public final class MainActivity extends Activity {
             detail += "\nMaximum provider cost: $"
                     + String.format(Locale.US, "%.2f", request.maxCost);
         } else {
-            detail += "\nProvider usage follows the OpenAI account limits for this mode.";
+            detail += "\nProvider: " + (request.provider == MobileRunRequest.Provider.OLLAMA
+                    ? "Hosted open model" : "OpenAI");
         }
         new AlertDialog.Builder(this)
                 .setTitle("Start " + request.mode.wire + "?")

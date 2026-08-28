@@ -9,6 +9,7 @@ on:
       - "scripts/phone/**"
       - "flexfactor_web.py"
       - ".github/workflows/android-client.yml"
+      - ".github/workflows/mobile-run.yml"
   pull_request:
     branches: [main]
     paths:
@@ -16,6 +17,7 @@ on:
       - "scripts/phone/**"
       - "flexfactor_web.py"
       - ".github/workflows/android-client.yml"
+      - ".github/workflows/mobile-run.yml"
   workflow_dispatch:
 
 permissions:
@@ -25,7 +27,7 @@ jobs:
   build:
     name: android-client
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -46,6 +48,49 @@ jobs:
       - name: Unit tests, lint, and debug APK
         shell: bash
         run: gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
+      - name: Verify the default phone model provider live
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+          curl --fail --location --silent --show-error --retry 3 \
+            https://github.com/ollama/ollama/releases/download/v0.33.1/ollama-linux-amd64.tar.zst \
+            --output "$archive"
+          printf '%s  %s\n' \
+            88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d \
+            "$archive" | sha256sum --check --strict
+          sudo tar --zstd -xf "$archive" -C /usr
+          ollama serve >"$RUNNER_TEMP/ollama.log" 2>&1 &
+          for attempt in {1..60}; do
+            curl --fail --silent http://127.0.0.1:11434/api/version && break
+            if [ "$attempt" -eq 60 ]; then cat "$RUNNER_TEMP/ollama.log"; exit 1; fi
+            sleep 1
+          done
+          ollama pull qwen2.5-coder:7b
+          python - <<'PY'
+          import json, urllib.request
+          request = urllib.request.Request(
+              "http://127.0.0.1:11434/api/chat",
+              data=json.dumps({
+              "model": "qwen2.5-coder:7b",
+              "stream": False,
+              "messages": [{"role": "user", "content": "Return the requested readiness JSON."}],
+              "format": {
+                  "type": "object",
+                  "properties": {"ready": {"type": "string", "enum": ["FLEXFACTOR_READY"]}},
+                  "required": ["ready"],
+                  "additionalProperties": False,
+              },
+              "options": {"temperature": 0, "num_predict": 32},
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=600) as response:
+              content = json.load(response)["message"]["content"]
+          answer = json.loads(content)
+          if answer != {"ready": "FLEXFACTOR_READY"}:
+              raise SystemExit(f"hosted model returned an unexpected answer: {answer!r}")
+          print(answer["ready"])
+          PY
       - name: Record exact APK checksum
         shell: bash
         env:

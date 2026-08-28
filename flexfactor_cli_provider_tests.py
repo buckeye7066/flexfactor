@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI-backed rotation providers (`claude-code`, `codex-cli`) and the filter.
+"""CLI-backed rotation providers (`claude-code`, `codex-cli`, `copilot-cli`).
 
 THE DEFECT THESE EXIST TO PREVENT
 ---------------------------------
@@ -290,6 +290,43 @@ class CliProviderBehaviourTests(unittest.TestCase):
             subprocess.run = real
         # codex exec takes no --append-system-prompt, so it must ride the prompt.
         self.assertIn("THEME_MARKER", seen["input"])
+
+    def test_copilot_is_silent_noninteractive_and_receives_prompt_on_stdin(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            cp.CliProvider("copilot-cli", "auto", "copilot").complete(
+                "PROMPT", system="SYSTEM")
+        finally:
+            subprocess.run = real
+        self.assertIn("-s", seen["argv"])
+        self.assertIn("--no-ask-user", seen["argv"])
+        self.assertNotIn("--allow-all-tools", seen["argv"])
+        self.assertIn("SYSTEM", seen["input"])
+        self.assertIn("PROMPT", seen["input"])
+
+    def test_copilot_ping_proves_inference_not_just_binary_version(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="OK", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            self.assertTrue(cp.CliProvider(
+                "copilot-cli", "auto", "copilot").ping())
+        finally:
+            subprocess.run = real
+        self.assertNotIn("--version", seen["argv"])
+        self.assertIn("Reply with OK", seen["input"])
 
     def test_billing_label_marks_these_flat_rate(self):
         self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)

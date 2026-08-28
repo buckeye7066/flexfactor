@@ -7,6 +7,14 @@ import java.util.regex.Pattern;
 
 /** Immutable, validated input for the standalone GitHub Actions runner. */
 public final class MobileRunRequest {
+    public enum Provider {
+        OLLAMA("ollama"),
+        OPENAI("openai");
+
+        final String wire;
+        Provider(String wire) { this.wire = wire; }
+    }
+
     public enum Mode {
         REFACTOR("refactor"),
         SCOUT("scout"),
@@ -24,6 +32,7 @@ public final class MobileRunRequest {
 
     public final String requestId;
     public final Mode mode;
+    public final Provider provider;
     public final String repository;
     public final String ref;
     public final String file;
@@ -31,16 +40,17 @@ public final class MobileRunRequest {
     public final boolean scoutApply;
     public final double maxCost;
 
-    public MobileRunRequest(Mode mode, String repository, String ref, String file,
+    public MobileRunRequest(Mode mode, Provider provider, String repository, String ref, String file,
             String goal, boolean scoutApply, double maxCost) {
-        this(UUID.randomUUID().toString(), mode, repository, ref, file, goal,
+        this(UUID.randomUUID().toString(), mode, provider, repository, ref, file, goal,
                 scoutApply, maxCost);
     }
 
-    MobileRunRequest(String requestId, Mode mode, String repository, String ref,
+    MobileRunRequest(String requestId, Mode mode, Provider provider, String repository, String ref,
             String file, String goal, boolean scoutApply, double maxCost) {
         this.requestId = clean(requestId);
         this.mode = mode;
+        this.provider = provider;
         this.repository = clean(repository);
         this.ref = clean(ref);
         this.file = clean(file);
@@ -55,6 +65,7 @@ public final class MobileRunRequest {
             throw new IllegalArgumentException("The run identifier is invalid.");
         }
         if (mode == null) throw new IllegalArgumentException("Choose a FlexFactor mode.");
+        if (provider == null) throw new IllegalArgumentException("Choose a model provider.");
         if (!REPOSITORY.matcher(repository).matches() || repository.endsWith(".")) {
             throw new IllegalArgumentException("Repository must be written as owner/name.");
         }
@@ -84,6 +95,7 @@ public final class MobileRunRequest {
         Map<String, String> values = new LinkedHashMap<>();
         values.put("request_id", requestId);
         values.put("mode", mode.wire);
+        values.put("provider", provider.wire);
         values.put("target_repository", repository);
         values.put("target_ref", ref);
         values.put("file", file);

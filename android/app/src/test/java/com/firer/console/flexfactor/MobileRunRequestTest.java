@@ -33,12 +33,14 @@ public final class MobileRunRequestTest {
         assertEquals("main", values.get("target_ref"));
         assertEquals("25", values.get("max_cost"));
         assertEquals("false", values.get("scout_apply"));
+        assertEquals("ollama", values.get("provider"));
     }
 
     @Test
     public void scoutApplyCannotLeakIntoAnotherMode() {
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, "buckeye7066/flexfactor", "main",
+                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                "buckeye7066/flexfactor", "main",
                 "", "", true, 25));
         assertTrue(request(MobileRunRequest.Mode.SCOUT, "", "", true)
                 .scoutApply);
@@ -59,16 +61,20 @@ public final class MobileRunRequestTest {
     @Test
     public void invalidRepositoryRefAndBudgetFailClosed() {
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, "not-a-repo", "main", "", "", false, 25));
+                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                "not-a-repo", "main", "", "", false, 25));
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, "owner/repo", "../main", "", "", false, 25));
+                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                "owner/repo", "../main", "", "", false, 25));
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, "owner/repo", "main", "", "", false, 151));
+                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                "owner/repo", "main", "", "", false, 151));
     }
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file,
             String goal, boolean scoutApply) {
-        return new MobileRunRequest(ID, mode, "buckeye7066/flexfactor", "main",
+        return new MobileRunRequest(ID, mode, MobileRunRequest.Provider.OLLAMA,
+                "buckeye7066/flexfactor", "main",
                 file, goal, scoutApply, 25);
     }
 }

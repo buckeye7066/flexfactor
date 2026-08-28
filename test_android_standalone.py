@@ -50,7 +50,14 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         for mode in ("refactor", "scout", "audit", "prodready"):
             self.assertIn(mode, workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
+        self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token", workflow)
+        self.assertIn("contents: read", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
+        self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn('--judge-model "$FLEXFACTOR_PHONE_MODEL"', workflow)
+        self.assertIn("ollama serve", workflow)
+        self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
+        self.assertIn('--provider "$PROVIDER"', workflow)
         self.assertNotIn("${{ inputs.github_token }}", workflow)
         self.assertNotIn("${{ inputs.openai", workflow.lower())
         self.assertNotIn("inputs.target_repository }} ·", workflow)
@@ -68,6 +75,24 @@ class StandaloneAndroidInvariants(unittest.TestCase):
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
         self.assertIn('per_page=100&page=" + page', api)
         self.assertIn('row.optBoolean("private", true)', api)
+
+    def test_credential_switch_validates_before_write_and_removes_old_openai_secret(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        configure = api.split("ConfigurationResult configure", 1)[1]
+        configure = configure.split("List<Repository> repositories", 1)[0]
+        self.assertLess(configure.index("verifyOpenAi(provider)"),
+                        configure.index('putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN"'))
+        self.assertIn('deleteRepositorySecretIfPresent(token, "OPENAI_API_KEY")', configure)
+        self.assertIn("result.status != 204 && result.status != 404", api)
+
+    def test_android_release_gate_proves_the_default_hosted_provider(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "android-client.yml").read_text(encoding="utf-8")
+        self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn("ollama serve", workflow)
+        self.assertIn("sha256sum --check --strict", workflow)
+        self.assertIn("FLEXFACTOR_READY", workflow)
 
 
 if __name__ == "__main__":

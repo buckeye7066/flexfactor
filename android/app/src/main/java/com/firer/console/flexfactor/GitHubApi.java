@@ -63,13 +63,20 @@ final class GitHubApi {
 
     ConfigurationResult configure(String githubToken, String openAiKey) throws Exception {
         String token = requireSecret(githubToken, "GitHub token");
-        String provider = requireSecret(openAiKey, "OpenAI key");
         JSONObject user = github(token, "GET", "/user", null);
         String login = user.optString("login", "").trim();
         if (login.isEmpty()) throw new ApiException("GitHub did not identify this account.");
-        verifyOpenAi(provider);
+        String provider = openAiKey == null ? "" : openAiKey.trim();
+        // Validate every supplied credential before mutating repository state.
+        // A rejected optional key must not leave the runner using a different
+        // GitHub token than the one retained by the phone.
+        if (!provider.isEmpty()) verifyOpenAi(provider);
         putRepositorySecret(token, "FLEXFACTOR_MOBILE_GITHUB_TOKEN", token);
-        putRepositorySecret(token, "OPENAI_API_KEY", provider);
+        if (provider.isEmpty()) {
+            deleteRepositorySecretIfPresent(token, "OPENAI_API_KEY");
+        } else {
+            putRepositorySecret(token, "OPENAI_API_KEY", provider);
+        }
         return new ConfigurationResult(login);
     }
 
@@ -166,6 +173,20 @@ final class GitHubApi {
         payload.put("key_id", key.getString("key_id"));
         github(token, "PUT", "/repos/" + CONTROL_REPOSITORY
                 + "/actions/secrets/" + name, payload);
+    }
+
+    private void deleteRepositorySecretIfPresent(String token, String name) throws Exception {
+        URL url = new URL(GITHUB + "/repos/" + CONTROL_REPOSITORY
+                + "/actions/secrets/" + name);
+        HttpURLConnection connection = connection(url);
+        connection.setRequestMethod("DELETE");
+        connection.setRequestProperty("Accept", "application/vnd.github+json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        connection.setRequestProperty("X-GitHub-Api-Version", API_VERSION);
+        HttpResult result = execute(connection, null);
+        if (result.status != 204 && result.status != 404) {
+            throw new ApiException(githubError(result));
+        }
     }
 
     private JSONObject github(String token, String method, String path, JSONObject body)

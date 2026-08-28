@@ -14,6 +14,12 @@ on:
         required: true
         type: choice
         options: [refactor, scout, audit, prodready]
+      provider:
+        description: Model provider selected by the signed Android app
+        required: true
+        default: ollama
+        type: choice
+        options: [ollama, openai]
       target_repository:
         description: Target owner/repository
         required: true
@@ -55,9 +61,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+      # The app-managed token enables other owner repositories. The scoped
+      # Actions token keeps the control repository usable before first setup
+      # and gives same-repository report-only runs a least-surprise recovery path.
+      GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
+      FLEXFACTOR_PHONE_MODEL: qwen2.5-coder:7b
+      FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
+      FLEXFACTOR_OLLAMA_TIMEOUT: "1800"
       PYTHONUTF8: "1"
 
     steps:
@@ -70,6 +82,7 @@ jobs:
               inputs = json.load(fh).get("inputs", {})
           request_id = str(inputs.get("request_id", ""))
           mode = str(inputs.get("mode", ""))
+          provider = str(inputs.get("provider", ""))
           repository = str(inputs.get("target_repository", ""))
           ref = str(inputs.get("target_ref", ""))
           file = str(inputs.get("file", ""))
@@ -77,6 +90,8 @@ jobs:
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
+          if provider not in {"ollama", "openai"}:
+              raise SystemExit("unsupported provider")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
                               repository):
               raise SystemExit("invalid repository")
@@ -116,8 +131,10 @@ jobs:
       - name: Require protected mobile credentials
         shell: bash
         run: |
-          test -n "$GH_TOKEN" || { echo "FLEXFACTOR_MOBILE_GITHUB_TOKEN is missing" >&2; exit 1; }
-          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
+          test -n "$GH_TOKEN" || { echo "GitHub workflow credential is unavailable" >&2; exit 1; }
+          if [ "${{ inputs.provider }}" = openai ]; then
+            test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
+          fi
 
       - name: Check out the exact FlexFactor engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -130,7 +147,7 @@ jobs:
         with:
           repository: ${{ inputs.target_repository }}
           ref: ${{ inputs.target_ref }}
-          token: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN }}
+          token: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
           path: target
           fetch-depth: 0
           persist-credentials: true
@@ -142,10 +159,26 @@ jobs:
           cache: pip
           cache-dependency-path: engine/requirements.txt
 
-      - name: Set up Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
+      - name: Install and start the hosted open model
+        if: inputs.provider == 'ollama'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
+          curl --fail --location --silent --show-error --retry 3 \
+            https://github.com/ollama/ollama/releases/download/v0.33.1/ollama-linux-amd64.tar.zst \
+            --output "$archive"
+          printf '%s  %s\n' \
+            88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d \
+            "$archive" | sha256sum --check --strict
+          sudo tar --zstd -xf "$archive" -C /usr
+          ollama --version
+          ollama serve >"$RUNNER_TEMP/ollama.log" 2>&1 &
+          for attempt in {1..60}; do
+            curl --fail --silent http://127.0.0.1:11434/api/version && break
+            if [ "$attempt" -eq 60 ]; then cat "$RUNNER_TEMP/ollama.log"; exit 1; fi
+            sleep 1
+          done
+          ollama pull qwen2.5-coder:7b
 
       - name: Install the engine and browser runtime
         shell: bash
@@ -167,6 +200,7 @@ jobs:
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
+          PROVIDER: ${{ inputs.provider }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
@@ -179,6 +213,11 @@ jobs:
           before="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$before" > mobile-before.txt
           rc=0
+          provider_args=(--provider "$PROVIDER")
+          if [ "$PROVIDER" = ollama ]; then
+            provider_args+=(--model "$FLEXFACTOR_PHONE_MODEL"
+              --judge-model "$FLEXFACTOR_PHONE_MODEL")
+          fi
 
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
@@ -199,7 +238,7 @@ jobs:
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
                 --goal "$TARGET_GOAL" \
-                --provider openai 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
+                "${provider_args[@]}" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
               rm -f -- "$backup_path"
             fi
             if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
@@ -218,7 +257,7 @@ jobs:
               fi
             fi
           elif [ "$MODE" = scout ]; then
-            args=(scout --program "$GITHUB_WORKSPACE/target" --provider openai
+            args=(scout --program "$GITHUB_WORKSPACE/target" "${provider_args[@]}"
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards)
@@ -226,9 +265,11 @@ jobs:
             python engine/flexfactor.py "${args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           else
+            model_mode=paid
+            if [ "$PROVIDER" = ollama ]; then model_mode=free; fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              --provider openai --model-mode paid --single \
+              "${provider_args[@]}" --model-mode "$model_mode" --single \
               --max-cost "$MAX_COST" --no-dashboard --yes --apply \
               --trust-repo --no-auto-clean 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}

@@ -6,6 +6,7 @@ LOCAL CLI subprocess rather than an HTTP endpoint:
 
     api="claude-code"  -> the `claude` CLI   (flat-rate subscription)
     api="codex-cli"    -> the `codex` CLI    (flat-rate subscription)
+    api="copilot-cli"  -> the `copilot` CLI  (GitHub Copilot entitlement)
 
 WHY THIS EXISTS
 ---------------
@@ -66,6 +67,7 @@ DEFAULT_TIMEOUT_S = float(os.environ.get("FLEXFACTOR_CLI_TIMEOUT", "600") or 600
 CLI_BINARIES = {
     "claude-code": "claude",
     "codex-cli": "codex",
+    "copilot-cli": "copilot",
 }
 
 
@@ -114,6 +116,12 @@ def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
     if api == "codex-cli":
         # `exec` is codex's non-interactive one-shot mode.
         return [binary, "exec", "--skip-git-repo-check", "-"]
+    if api == "copilot-cli":
+        # Silent programmatic mode reads the prompt from stdin. No tools are
+        # allowlisted: FlexFactor needs model inference here, not a second agent
+        # with shell or filesystem authority.
+        return [binary, "-s", "--no-ask-user", "--no-auto-update", "--no-color",
+                "--no-custom-instructions"]
     raise CliUnavailable(f"no CLI argv defined for api '{api}'")
 
 
@@ -127,7 +135,8 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
     # `codex exec` takes no --append-system-prompt, so the theme is prepended
     # to the prompt instead. Losing it would let a rotated call wander off the
     # run's task, which is the whole reason the theme block exists.
-    body = prompt if (api != "codex-cli" or not system) else f"{system}\n\n{prompt}"
+    body = prompt if (api not in ("codex-cli", "copilot-cli") or not system) \
+        else f"{system}\n\n{prompt}"
     try:
         proc = subprocess.run(
             argv,
@@ -225,6 +234,11 @@ class CliProvider:
 
     def ping(self, **_: Any) -> bool:
         """Is the CLI actually runnable? A PATH hit is not proof."""
+        if self.api == "copilot-cli":
+            # Unlike a version check, this proves the supplied GitHub token has
+            # a usable Copilot entitlement before a long audit begins.
+            return bool(_run_cli(self.api, self._binary, "Reply with OK only.",
+                                 system=None, timeout=min(self._timeout, 90)))
         try:
             proc = subprocess.run(
                 [self._binary, "--version"], capture_output=True, text=True,
