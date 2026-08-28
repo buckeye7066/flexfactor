@@ -546,7 +546,7 @@ def start_phone_provider_install(body: dict, *, env=None,
             return {"ok": True, "provider": provider, "pid": running,
                     "installing": True}
         os.makedirs(os.path.dirname(pid_path), exist_ok=True)
-        command = [script, provider]
+        command = ["bash", script, provider]
         child_env = dict(env)
         with open(log_path, "a", encoding="utf-8") as log:
             log.write("\n--- {} installing {} support ---\n".format(
