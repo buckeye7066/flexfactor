@@ -50,10 +50,10 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         for mode in ("refactor", "scout", "audit", "prodready"):
             self.assertIn(mode, workflow)
         self.assertIn("secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN", workflow)
-        self.assertIn("github.token", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
-        self.assertIn("copilot-requests: write", workflow)
-        self.assertIn("@github/copilot", workflow)
+        self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn("ollama serve", workflow)
+        self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
         self.assertIn('--provider "$PROVIDER"', workflow)
         self.assertNotIn("${{ inputs.github_token }}", workflow)
         self.assertNotIn("${{ inputs.openai", workflow.lower())
@@ -73,13 +73,13 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn('per_page=100&page=" + page', api)
         self.assertIn('row.optBoolean("private", true)', api)
 
-    def test_android_release_gate_proves_the_default_copilot_provider(self):
+    def test_android_release_gate_proves_the_default_hosted_provider(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "android-client.yml").read_text(encoding="utf-8")
-        self.assertIn("copilot-requests: write", workflow)
-        self.assertIn("github.token", workflow)
+        self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn("ollama serve", workflow)
+        self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
-        self.assertIn("@github/copilot", workflow)
 
 
 if __name__ == "__main__":
