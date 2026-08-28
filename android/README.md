@@ -25,9 +25,12 @@ FlexFactor and approve the on-phone connection. If Android does not deliver
 the broadcast, open the gear button and paste the URL printed by
 `flexfactor-engine start`. Never paste that token into an issue, chat, or log.
 
-Running audits also requires an on-phone provider. Re-run setup with
-`WITH_SDK=1` and configure a supported cloud credential, or configure a
-loopback Ollama provider. The dashboard and engine do not use the PC in either
+Running audits also requires an on-phone provider. In the paired dashboard,
+select OpenAI or Anthropic, paste the API key, and tap **Save key on this
+phone**. If the provider reports a missing SDK, tap **Install provider
+support** and wait for readiness to refresh. The key is stored only in
+Termux-private app storage and is never displayed again. A loopback Ollama
+provider remains available as the local alternative. No PC is used in either
 case.
 
 ## In-app updates
