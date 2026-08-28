@@ -2,7 +2,7 @@
 
 Version 3.1 is a standalone Android control plane. Tapping the FlexFactor icon
 opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
-Ollama are not part of its runtime.
+an on-phone model server are not part of its runtime.
 
 The phone sends authenticated requests to GitHub's API. GitHub Actions supplies
 the disposable Python, Git, Node, browser, and build environment needed to audit
@@ -14,12 +14,12 @@ sandbox.
 
 Open **Credentials** and enter:
 
-1. A GitHub token for the owner account with repository/workflow access and a
-   usable GitHub Copilot entitlement.
-2. Optionally, an OpenAI API key if OpenAI should be used instead of Copilot.
+1. A GitHub token for the owner account with repository/workflow access.
+2. Optionally, an OpenAI API key if OpenAI should be used instead of the hosted
+   open-source model.
 
-FlexFactor validates the GitHub account before saving anything. Copilot is
-preflighted by the disposable Actions runner before a long run begins; an
+FlexFactor validates the GitHub account before saving anything. A pinned Ollama
+runtime and coding model run in the disposable Actions runner by default; an
 optional OpenAI key is validated live when saved. Values are encrypted at rest with a
 non-exportable Android Keystore key. The app then encrypts them with the
 repository's GitHub Actions public key and writes them to protected Actions
