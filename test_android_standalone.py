@@ -178,6 +178,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("bundlePlay", workflow)
         self.assertIn("app-play.aab", workflow)
         self.assertIn('jarsigner -verify "$aab"', workflow)
+        self.assertIn('grep -Fq "jar verified."', workflow)
+        self.assertIn('grep -Fq "jar is unsigned."', workflow)
         self.assertNotIn("jarsigner -verify -strict", workflow)
         self.assertNotIn("bundle/play/app-release.aab", workflow)
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
