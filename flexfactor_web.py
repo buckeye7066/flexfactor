@@ -54,6 +54,7 @@ ACCESS_LOG = os.path.join(FLEX_DIR, "web-access.log")
 PHONE_RUN_DIR = os.path.join(os.path.expanduser("~"), ".phone-console")
 AUDIT_PID_PATH = os.path.join(PHONE_RUN_DIR, "audit.pid")
 AUDIT_LOG_PATH = os.path.join(PHONE_RUN_DIR, "flexfactor-audit.log")
+AUDIT_LOCK_PATH = os.path.join(PHONE_RUN_DIR, "audit.lock")
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 LAUNCH_MODES = {"audit", "prodready"}
 LAUNCH_PROVIDERS = {"anthropic", "openai", "ollama"}
@@ -373,6 +374,14 @@ def _is_phone_environment(env=None) -> bool:
     return bool(env.get("TERMUX_VERSION")) or prefix.startswith("/data/data/com.termux/")
 
 
+def _path_within_root(root: str, path: str) -> bool:
+    try:
+        return (os.path.normcase(os.path.commonpath([root, path])) ==
+                os.path.normcase(root))
+    except ValueError:
+        return False
+
+
 def _available_phone_programs(env=None) -> list[dict]:
     """Return exact, already-cloned git repositories the phone may launch.
 
@@ -401,6 +410,8 @@ def _available_phone_programs(env=None) -> list[dict]:
             pass
         for candidate in candidates:
             path = os.path.realpath(candidate)
+            if not _path_within_root(root, path):
+                continue
             if not os.path.isdir(path) or not os.path.exists(os.path.join(path, ".git")):
                 continue
             found[path] = {"name": os.path.basename(path) or path, "path": path}
@@ -466,6 +477,73 @@ def _running_audit_pid(pid_path=AUDIT_PID_PATH) -> int | None:
         return None
 
 
+def _acquire_audit_start_lock(lock_path: str, pid_path: str) -> None:
+    """Atomically serialize dashboard and shell starts across processes."""
+    for _ in range(2):
+        try:
+            os.mkdir(lock_path)
+            try:
+                with open(os.path.join(lock_path, "owner.pid"), "w", encoding="utf-8") as fh:
+                    fh.write(str(os.getpid()) + "\n")
+            except OSError:
+                try:
+                    os.rmdir(lock_path)
+                except OSError:
+                    pass
+                raise
+            return
+        except FileExistsError:
+            running = _running_audit_pid(pid_path)
+            if running:
+                raise ValueError("an audit is already running (pid {})".format(running))
+            owner_path = os.path.join(lock_path, "owner.pid")
+            owner = _running_audit_pid(owner_path)
+            try:
+                old = time.time() - os.path.getmtime(lock_path) > 30
+            except OSError:
+                old = False
+            if owner or not old:
+                raise ValueError("another FlexFactor launch is already starting")
+            try:
+                os.unlink(owner_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(lock_path)
+            except OSError:
+                raise ValueError("another FlexFactor launch is already starting") from None
+    raise ValueError("another FlexFactor launch is already starting")
+
+
+def _release_audit_start_lock(lock_path: str) -> None:
+    try:
+        os.unlink(os.path.join(lock_path, "owner.pid"))
+    except OSError:
+        pass
+    try:
+        os.rmdir(lock_path)
+    except OSError:
+        pass
+
+
+def _start_audit_reaper(process, pid_path: str) -> None:
+    """Reap the detached child and clear only its own PID record."""
+    def reap() -> None:
+        try:
+            process.wait()
+        finally:
+            with LAUNCH_LOCK:
+                try:
+                    with open(pid_path, "r", encoding="utf-8") as fh:
+                        recorded = int(fh.read().strip())
+                    if recorded == process.pid:
+                        os.unlink(pid_path)
+                except (OSError, TypeError, ValueError):
+                    pass
+
+    threading.Thread(target=reap, name="flexfactor-audit-reaper", daemon=True).start()
+
+
 def phone_launch_state(env=None) -> dict:
     env = os.environ if env is None else env
     phone = _is_phone_environment(env)
@@ -481,7 +559,8 @@ def phone_launch_state(env=None) -> dict:
 
 def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                     pid_path=AUDIT_PID_PATH, log_path=AUDIT_LOG_PATH,
-                    popen=subprocess.Popen) -> dict:
+                    lock_path=AUDIT_LOCK_PATH, popen=subprocess.Popen,
+                    start_reaper=_start_audit_reaper) -> dict:
     """Validate and spawn one detached phone run without invoking a shell."""
     env = os.environ if env is None else env
     if not _is_phone_environment(env):
@@ -512,31 +591,46 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
         raise ValueError(provider + " is not ready: " + detail)
 
     with LAUNCH_LOCK:
-        running = _running_audit_pid(pid_path)
-        if running:
-            raise ValueError("an audit is already running (pid {})".format(running))
         os.makedirs(os.path.dirname(pid_path), exist_ok=True)
-        command = [
-            sys.executable, os.path.join(APP_ROOT, "flexfactor.py"), mode,
-            "--program", requested, "--no-dashboard", "--provider", provider,
-            "--single", "--max-cost", "{:g}".format(max_cost),
-            "--no-push", "--no-merge",
-        ]
-        child_env = dict(env)
-        child_env["FLEXFACTOR_HOST_LABEL"] = "this phone"
-        with open(log_path, "a", encoding="utf-8") as log:
-            log.write("\n--- {} app launch: {} {} (max ${:g}) ---\n".format(
-                time.strftime("%Y-%m-%dT%H:%M:%S%z"), mode, requested, max_cost))
-            log.flush()
-            process = popen(
-                command, cwd=APP_ROOT, env=child_env, stdin=subprocess.DEVNULL,
-                stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                close_fds=True,
-            )
-        temporary = pid_path + ".tmp-{}".format(os.getpid())
-        with open(temporary, "w", encoding="utf-8") as fh:
-            fh.write(str(process.pid) + "\n")
-        os.replace(temporary, pid_path)
+        _acquire_audit_start_lock(lock_path, pid_path)
+        try:
+            running = _running_audit_pid(pid_path)
+            if running:
+                raise ValueError("an audit is already running (pid {})".format(running))
+            model_mode = "free" if provider == "ollama" else "paid"
+            command = [
+                sys.executable, os.path.join(APP_ROOT, "flexfactor.py"), mode,
+                "--program", requested, "--no-dashboard", "--provider", provider,
+                "--model-mode", model_mode, "--single",
+                "--max-cost", "{:g}".format(max_cost),
+                "--no-push", "--no-merge", "--no-auto-clean",
+            ]
+            child_env = dict(env)
+            child_env["FLEXFACTOR_HOST_LABEL"] = "this phone"
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write("\n--- {} app launch: {} {} (max ${:g}) ---\n".format(
+                    time.strftime("%Y-%m-%dT%H:%M:%S%z"), mode, requested, max_cost))
+                log.flush()
+                process = popen(
+                    command, cwd=APP_ROOT, env=child_env, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                    close_fds=True,
+                )
+            temporary = pid_path + ".tmp-{}".format(os.getpid())
+            try:
+                with open(temporary, "w", encoding="utf-8") as fh:
+                    fh.write(str(process.pid) + "\n")
+                os.replace(temporary, pid_path)
+            except OSError:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:  # noqa: BLE001 - retain the original filesystem failure
+                    pass
+                raise
+            start_reaper(process, pid_path)
+        finally:
+            _release_audit_start_lock(lock_path)
     return {"ok": True, "pid": process.pid, "program": match["name"],
             "mode": mode, "provider": provider, "max_cost": max_cost}
 
