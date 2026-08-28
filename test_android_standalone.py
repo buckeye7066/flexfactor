@@ -175,6 +175,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
+        self.assertIn("bundleRelease", workflow)
+        self.assertIn("app-release.aab", workflow)
 
     def test_startup_update_check_runs_before_installer_permission_gate(self):
         updater = (ANDROID / "java" / "com" / "firer" / "console" /
