@@ -214,6 +214,12 @@ repository. `flexfactor-engine start` hands the authenticated local URL to the
 Android client. A correctly paired dashboard identifies its source as
 `this phone`, never `pc`.
 
+The paired dashboard can save an OpenAI or Anthropic key directly in
+Termux-private storage and install the selected provider SDK. The key is never
+rendered back into the page, logged, or placed in a command argument. Once the
+provider reports `ready`, choose a repository, run type, and cost cap, then tap
+**Start FlexFactor**; no PC or shell-based credential editing is required.
+
 ### Errors are reported IN the run, not in a log
 
 Every run writes an error ledger - what failed, which code is responsible, and a
