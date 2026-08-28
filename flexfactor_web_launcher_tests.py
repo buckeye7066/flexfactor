@@ -32,8 +32,11 @@ class PhoneLauncherTests(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "ordinary-folder"))
         outside = tempfile.mkdtemp(dir=self.tmp.name)
         programs = web._available_phone_programs(self.env)
-        self.assertEqual([{"name": "target-app", "path": self.project}], programs)
-        self.assertNotIn(outside, [item["path"] for item in programs])
+        self.assertEqual(1, len(programs))
+        self.assertEqual("target-app", programs[0]["name"])
+        self.assertTrue(os.path.samefile(self.project, programs[0]["path"]))
+        self.assertFalse(any(os.path.samefile(outside, item["path"])
+                             for item in programs))
 
     def test_provider_readiness_never_exposes_secret_values(self):
         readiness = web._provider_readiness(
@@ -67,7 +70,8 @@ class PhoneLauncherTests(unittest.TestCase):
         command = captured["command"]
         self.assertEqual(424242, result["pid"])
         self.assertIsInstance(command, list)
-        self.assertEqual(self.project, command[command.index("--program") + 1])
+        self.assertTrue(os.path.samefile(
+            self.project, command[command.index("--program") + 1]))
         self.assertIn("--no-push", command)
         self.assertIn("--no-merge", command)
         self.assertIn("--single", command)
