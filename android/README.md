@@ -1,61 +1,52 @@
-# FlexFactor Android client
+# FlexFactor Android app
 
-This directory is the source of the FlexFactor Android dashboard. Version
-2.2.3 connects only to an authenticated engine on Android loopback. The engine
-and the repositories it audits live in Termux on the same phone; a PC is not
-required.
+Version 3.0 is a standalone Android control plane. Tapping the FlexFactor icon
+opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
+Ollama are not part of its runtime.
 
-## Install the on-phone engine
+The phone sends authenticated requests to GitHub's API. GitHub Actions supplies
+the disposable Python, Git, Node, browser, and build environment needed to audit
+real repositories. This is materially different from pretending an APK can
+safely execute every supported desktop toolchain inside Android's application
+sandbox.
 
-Install **Termux**, **Termux:API**, and **Termux:Boot** from F-Droid. Do not use
-the obsolete Play Store Termux build. In Termux:
+## First launch
 
-```bash
-pkg update -y
-pkg install -y git gh
-gh auth login --web --git-protocol https
-mkdir -p "$HOME/phone-console"
-gh repo clone buckeye7066/flexfactor "$HOME/phone-console/flexfactor"
-bash "$HOME/phone-console/flexfactor/scripts/phone/setup.sh"
-flexfactor-engine start
-```
+Open **Credentials** and enter:
 
-The last command sends the authenticated `127.0.0.1` URL to this app. Open
-FlexFactor and approve the on-phone connection. If Android does not deliver
-the broadcast, open the gear button and paste the URL printed by
-`flexfactor-engine start`. Never paste that token into an issue, chat, or log.
+1. A GitHub token for the owner account with `repo` and `workflow` access.
+2. An OpenAI API key.
 
-Version 2.2.3 can also perform this install/update/start flow from the
-FlexFactor icon using Termux's documented `RUN_COMMAND` service. Android asks
-once for **Run commands in Termux environment**. Termux separately requires
-`allow-external-apps=true`; the app provides a one-time **Copy & open Termux**
-step because Android does not let another app silently change Termux-private
-security settings. After those approvals, opening FlexFactor starts a stopped
-engine and each new app version fast-forwards the managed checkout before it
-starts. Local checkout changes are preserved and reported instead of erased.
+FlexFactor validates the GitHub account and makes a live authenticated OpenAI
+request before saving anything. Both values are encrypted at rest with a
+non-exportable Android Keystore key. The app then encrypts them with the
+repository's GitHub Actions public key and writes them to protected Actions
+secrets; neither value is sent as a workflow input, URL, command argument,
+artifact, or log field.
 
-Running audits also requires an on-phone provider. In the paired dashboard,
-select OpenAI or Anthropic, paste the API key, and tap **Save key on this
-phone**. If the provider reports a missing SDK, tap **Install provider
-support** and wait for readiness to refresh. The key is stored only in
-Termux-private app storage and is never displayed again. A loopback Ollama
-provider remains available as the local alternative. No PC is used in either
-case.
+After setup, choose a writable repository and use any original mode:
+
+1. **Refactor a file** — improve a selected file toward a stated goal and open a
+   publication PR when the verified output changes it.
+2. **Scout improvements** — research useful competitive/open-source capabilities
+   in report mode or emit gated integration proposals.
+3. **Audit and repair** — run the full review/fix/test/publication path.
+4. **Make production ready** — run the complete purpose, build, browser, test,
+   competitive-gap, and readiness pipeline.
+
+The latest run is polled by ID and survives activity recreation or process
+restart. **Open run details** opens the authoritative GitHub Actions record.
+Every run uploads a correlated `mobile-result-<request UUID>` artifact.
 
 ## In-app updates
 
-Tap **Update** in the lower-left corner. FlexFactor checks the latest signed
-Android release from this repository, downloads it over HTTPS, and verifies
-the package name, version, SHA-256, and signing-certificate lineage before
-opening Android's installer. Android requires the user to enable **Allow from
-this source** once and to confirm each install; a normal sideloaded app cannot
-silently grant itself those privileges.
+Tap **Update**. FlexFactor checks the latest signed Android release, downloads
+it over HTTPS, and verifies the package name, version, SHA-256, and signing
+certificate lineage before opening Android's installer. Android requires the
+user to enable **Allow from this source** once and confirm each installation.
 
-Version 2.1.0 does not contain this updater. If its original private signing
-key cannot be recovered, the migration to 2.2.0 requires one uninstall and
-reinstall. Once 2.2.0 or later is installed with the permanent release key,
-the Update button can install subsequent versions in place when the same key
-is used.
+Version 2.2.0 and later use the permanent release key, so 3.0 installs in place
+without uninstalling the existing app.
 
 ## Build
 
@@ -65,36 +56,25 @@ JDK 17, Android SDK 36, and Gradle 8.13 are required:
 gradle --no-daemon -p android testDebugUnitTest lintDebug assembleDebug
 ```
 
-CI publishes `flexfactor-android-debug-<commit>` for every pull request. Debug
-artifacts are test builds, not production releases.
+CI publishes an exact-commit debug artifact for every pull request. Merging a
+versioned Android change to `main` creates `android-v3.0.0` and publishes the
+signed production APK plus its update manifest.
 
-## Release signing and migration
+## Release signing
 
-Android accepts an in-place update only when the application id and signing
-certificate match the installed app. This project retains the existing id,
-`com.firer.console.flexfactor`, but the private key for the sideloaded 2.1.0
-app is not in this repository. Recover that key before producing a release
-build. If it cannot be recovered, uninstall 2.1.0 once and install a release
-signed with a new, durably backed-up key; subsequent updates must use that same
-key.
+Never commit a keystore or its passwords. The protected `android-release`
+environment supplies `ANDROID_KEYSTORE_BASE64`, `ANDROID_STORE_PASSWORD`,
+`ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. A release fails closed when any
+signing value is absent; it never falls back to a debug key.
 
-Never commit a keystore or its passwords. Release signing belongs in protected
-CI secrets. Configure the `android-release` GitHub environment with
-`ANDROID_KEYSTORE_BASE64`, `ANDROID_STORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
-`ANDROID_KEY_PASSWORD`. Merging a versioned Android change to `main` creates
-the matching `android-v*` tag and publishes the signed release. A matching tag
-push remains supported for deliberate reruns. The release workflow publishes
-the exact source commit, APK SHA-256, signing-certificate digest, release APK,
-and update manifest. The tag must match the app version (for example,
-`android-v2.2.2`). Missing signing material fails the release; it never falls
-back to a debug key.
+## Boundaries
 
-## Security boundary
-
-- Only `localhost` or `127.0.0.1` endpoints with a dashboard token are
-  accepted, and automatic handoffs require confirmation in the app.
-- Cleartext traffic is disabled globally and allowed only for loopback.
-- WebView file/content access is disabled.
-- Main-frame navigation and every subresource are restricted to the paired
-  origin.
-- Android backup is disabled so the bearer token is not exported in backups.
+- The Android app connects only to HTTPS GitHub and OpenAI endpoints plus the
+  HTTPS allowlist used by the signed updater.
+- Credentials are masked in the UI, encrypted locally, and transferred to
+  GitHub only through the official LibSodium-sealed Actions secrets API.
+- Target code executes on an ephemeral GitHub-hosted runner, not on the phone.
+- Workflow inputs are validated again on the runner before checkout or
+  execution.
+- The legacy `scripts/phone/` Termux engine remains available for command-line
+  operators, but the Android app neither detects nor invokes it.

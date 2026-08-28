@@ -200,25 +200,23 @@ python flexfactor_dashboard_tests.py                    # draws a frame, reads i
 python flexfactor_web.py --print-url                    # same view, phone-reachable
 ```
 
-### Android: run without a PC
+### Android: standalone phone app
 
-The Android client is in [`android/`](android/). It is a deliberately small,
-loopback-only dashboard: the real FlexFactor engine, Git checkout, Python, and
-Node toolchain run beside it in Termux on the same phone. No PC is in the data
-path. See [`android/README.md`](android/README.md) for installation, signing,
-and recovery instructions.
+The Android app is in [`android/`](android/). Version 3.0 opens the complete
+four-option FlexFactor launcher directly from the phone icon: Refactor, Scout,
+Audit, and Production Ready. It requires neither a PC nor Termux/Ollama. The
+signed APK is the native control plane and a disposable GitHub Actions runner
+provides the multi-toolchain execution environment.
 
-Install Termux and Termux:Boot from F-Droid (the obsolete Play Store Termux
-build is unsupported), then run `scripts/phone/setup.sh` inside the cloned
-repository. `flexfactor-engine start` hands the authenticated local URL to the
-Android client. A correctly paired dashboard identifies its source as
-`this phone`, never `pc`.
+The first-launch Credentials screen verifies a GitHub token and OpenAI key,
+encrypts both with Android Keystore, and installs LibSodium-sealed copies as
+protected GitHub Actions secrets. Provider keys are never workflow inputs.
+Choose a writable repository, select one of the four modes, and monitor the
+exact correlated Actions run from the same app. See
+[`android/README.md`](android/README.md) for the operating and release model.
 
-The paired dashboard can save an OpenAI or Anthropic key directly in
-Termux-private storage and install the selected provider SDK. The key is never
-rendered back into the page, logged, or placed in a command argument. Once the
-provider reports `ready`, choose a repository, run type, and cost cap, then tap
-**Start FlexFactor**; no PC or shell-based credential editing is required.
+The older `scripts/phone/` Termux engine remains an optional command-line path;
+the Android app does not depend on, detect, or invoke it.
 
 ### Errors are reported IN the run, not in a log
 
