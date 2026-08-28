@@ -149,7 +149,8 @@ grep -q 'flexfactor-phone.env' "$HOME/.bashrc" 2>/dev/null || \
 # blobs are 100755 now; this keeps it working if anyone's umask, filesystem or
 # zip-based copy loses the bit again.
 mkdir -p "$HOME/.local/bin"
-chmod +x "$APP_DIR/scripts/phone/engine.sh" "$APP_DIR/scripts/phone/setup.sh"
+chmod +x "$APP_DIR/scripts/phone/engine.sh" "$APP_DIR/scripts/phone/setup.sh" \
+  "$APP_DIR/scripts/phone/install-provider.sh"
 ln -sf "$APP_DIR/scripts/phone/engine.sh" "$HOME/.local/bin/flexfactor-engine"
 # Test the FILE, not the live $PATH. Testing $PATH is subtly wrong: whoever
 # runs setup often already has ~/.local/bin exported, so the check passes, the
