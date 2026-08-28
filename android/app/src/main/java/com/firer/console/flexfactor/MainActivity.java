@@ -278,7 +278,8 @@ public final class MainActivity extends Activity {
         repositoryButton.setEnabled(true);
         refreshHeader();
         if (repositories.isEmpty()) {
-            showError("No writable repositories", "The GitHub token returned no writable repositories.");
+            showError("No writable public repositories",
+                    "FlexFactor Mobile runs only public targets from its public control repository.");
             return;
         }
         String[] labels = new String[repositories.size()];
@@ -388,10 +389,17 @@ public final class MainActivity extends Activity {
     }
 
     private void confirmAndDispatch(MobileRunRequest request) {
+        String detail = request.repository + " · " + request.ref;
+        if (request.mode == MobileRunRequest.Mode.AUDIT
+                || request.mode == MobileRunRequest.Mode.PRODREADY) {
+            detail += "\nMaximum provider cost: $"
+                    + String.format(Locale.US, "%.2f", request.maxCost);
+        } else {
+            detail += "\nProvider usage follows the OpenAI account limits for this mode.";
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Start " + request.mode.wire + "?")
-                .setMessage(request.repository + " · " + request.ref
-                        + "\nMaximum provider cost: $" + String.format(Locale.US, "%.2f", request.maxCost))
+                .setMessage(detail)
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Start", (dialog, which) -> dispatch(request))
                 .show();
