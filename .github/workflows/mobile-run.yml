@@ -67,6 +67,7 @@ jobs:
       GH_TOKEN: ${{ secrets.FLEXFACTOR_MOBILE_GITHUB_TOKEN || github.token }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
+      FLEXFACTOR_PHONE_MODEL: qwen2.5-coder:7b
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
       FLEXFACTOR_OLLAMA_TIMEOUT: "1800"
       PYTHONUTF8: "1"
@@ -212,6 +213,11 @@ jobs:
           before="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$before" > mobile-before.txt
           rc=0
+          provider_args=(--provider "$PROVIDER")
+          if [ "$PROVIDER" = ollama ]; then
+            provider_args+=(--model "$FLEXFACTOR_PHONE_MODEL"
+              --judge-model "$FLEXFACTOR_PHONE_MODEL")
+          fi
 
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
@@ -232,7 +238,7 @@ jobs:
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
                 --goal "$TARGET_GOAL" \
-                --provider "$PROVIDER" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
+                "${provider_args[@]}" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
               rm -f -- "$backup_path"
             fi
             if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
@@ -251,7 +257,7 @@ jobs:
               fi
             fi
           elif [ "$MODE" = scout ]; then
-            args=(scout --program "$GITHUB_WORKSPACE/target" --provider "$PROVIDER"
+            args=(scout --program "$GITHUB_WORKSPACE/target" "${provider_args[@]}"
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards)
@@ -263,7 +269,7 @@ jobs:
             if [ "$PROVIDER" = ollama ]; then model_mode=free; fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              --provider "$PROVIDER" --model-mode "$model_mode" --single \
+              "${provider_args[@]}" --model-mode "$model_mode" --single \
               --max-cost "$MAX_COST" --no-dashboard --yes --apply \
               --trust-repo --no-auto-clean 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
