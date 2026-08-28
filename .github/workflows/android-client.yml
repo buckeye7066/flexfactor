@@ -51,7 +51,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          sha256sum android/app/build/outputs/apk/debug/app-debug.apk > android/app/build/outputs/apk/debug/SHA256SUMS
+          (cd android/app/build/outputs/apk/debug && sha256sum app-debug.apk > SHA256SUMS)
           printf '%s\n' "$SOURCE_SHA" > android/app/build/outputs/apk/debug/SOURCE_COMMIT
       - name: Upload exact-commit Android test build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -67,6 +67,8 @@ jobs:
   release:
     name: android-release
     if: startsWith(github.ref, 'refs/tags/android-v')
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: android-release
@@ -112,8 +114,39 @@ jobs:
           apk="android/app/build/outputs/apk/release/app-release.apk"
           test -s "$apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" | tee android/app/build/outputs/apk/release/CERTIFICATE.txt
-          sha256sum "$apk" > android/app/build/outputs/apk/release/SHA256SUMS
+          (cd android/app/build/outputs/apk/release && sha256sum app-release.apk > SHA256SUMS)
           printf '%s\n' "${GITHUB_SHA}" > android/app/build/outputs/apk/release/SOURCE_COMMIT
+      - name: Create signed update manifest
+        shell: bash
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name "$apk")
+          version_code=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-code "$apk")
+          test "$GITHUB_REF_NAME" = "android-v${version_name}"
+          mkdir -p "$release_dir"
+          release_apk="$release_dir/flexfactor-${version_name}.apk"
+          cp "$apk" "$release_apk"
+          apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/flexfactor-${version_name}.apk"
+          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
+            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
+            > "$release_dir/android-update.json"
+      - name: Publish signed APK for in-app updates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
+            "android/app/build/outputs/apk/release/app-release.apk")
+          gh release create "$GITHUB_REF_NAME" \
+            "$release_dir/flexfactor-${version_name}.apk#FlexFactor Android ${version_name}" \
+            "$release_dir/android-update.json#Signed update manifest" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "FlexFactor Android ${version_name}" \
+            --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
       - name: Upload signed exact-commit Android release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -123,5 +156,6 @@ jobs:
             android/app/build/outputs/apk/release/CERTIFICATE.txt
             android/app/build/outputs/apk/release/SHA256SUMS
             android/app/build/outputs/apk/release/SOURCE_COMMIT
+            android/app/build/outputs/apk/release/publish/android-update.json
           if-no-files-found: error
           retention-days: 90
