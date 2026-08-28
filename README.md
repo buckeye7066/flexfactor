@@ -211,7 +211,7 @@ provides the multi-toolchain execution environment.
 The first-launch Credentials screen verifies a GitHub token and OpenAI key,
 encrypts both with Android Keystore, and installs LibSodium-sealed copies as
 protected GitHub Actions secrets. Provider keys are never workflow inputs.
-Choose a writable repository, select one of the four modes, and monitor the
+Choose a writable public repository, select one of the four modes, and monitor the
 exact correlated Actions run from the same app. See
 [`android/README.md`](android/README.md) for the operating and release model.
 
