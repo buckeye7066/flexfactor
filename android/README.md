@@ -1,7 +1,7 @@
 # FlexFactor Android client
 
 This directory is the source of the FlexFactor Android dashboard. Version
-2.2.2 connects only to an authenticated engine on Android loopback. The engine
+2.2.3 connects only to an authenticated engine on Android loopback. The engine
 and the repositories it audits live in Termux on the same phone; a PC is not
 required.
 
@@ -24,6 +24,15 @@ The last command sends the authenticated `127.0.0.1` URL to this app. Open
 FlexFactor and approve the on-phone connection. If Android does not deliver
 the broadcast, open the gear button and paste the URL printed by
 `flexfactor-engine start`. Never paste that token into an issue, chat, or log.
+
+Version 2.2.3 can also perform this install/update/start flow from the
+FlexFactor icon using Termux's documented `RUN_COMMAND` service. Android asks
+once for **Run commands in Termux environment**. Termux separately requires
+`allow-external-apps=true`; the app provides a one-time **Copy & open Termux**
+step because Android does not let another app silently change Termux-private
+security settings. After those approvals, opening FlexFactor starts a stopped
+engine and each new app version fast-forwards the managed checkout before it
+starts. Local checkout changes are preserved and reported instead of erased.
 
 Running audits also requires an on-phone provider. In the paired dashboard,
 select OpenAI or Anthropic, paste the API key, and tap **Save key on this
