@@ -10,6 +10,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -21,6 +22,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /** Minimal GitHub/OpenAI client for the standalone Android control plane. */
 final class GitHubApi {
@@ -29,6 +32,8 @@ final class GitHubApi {
     private static final String GITHUB = "https://api.github.com";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
     private static final int READ_TIMEOUT_MS = 45_000;
+    private static final int MAX_PHONE_ARTIFACT_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_PHONE_ENTRY_BYTES = 256 * 1024;
 
     static final class ConfigurationResult {
         final String login;
@@ -62,6 +67,42 @@ final class GitHubApi {
             this.currentStep = currentStep;
         }
         boolean complete() { return "completed".equals(status); }
+    }
+
+    static final class RunDetails {
+        final String result;
+        final String errors;
+        final String status;
+        RunDetails(String result, String errors, String status) {
+            this.result = result;
+            this.errors = errors;
+            this.status = status;
+        }
+
+        String displayText() {
+            StringBuilder text = new StringBuilder();
+            if (!result.isEmpty()) {
+                try {
+                    JSONObject row = new JSONObject(result);
+                    text.append(row.optBoolean("success", false)
+                            ? "Run completed successfully." : "Run did not complete successfully.");
+                    text.append("\nRepository: ").append(row.optString("target_repository", "unknown"));
+                    text.append("\nMode: ").append(row.optString("mode", "unknown"));
+                    text.append("\nExit code: ").append(row.optInt("exit_code", -1));
+                } catch (JSONException ignored) {
+                    text.append(result.trim());
+                }
+            }
+            if (!errors.trim().isEmpty()) {
+                if (text.length() > 0) text.append("\n\n");
+                text.append("Error ledger\n\n").append(errors.trim());
+            }
+            if (text.length() == 0 && !status.trim().isEmpty()) {
+                text.append("Latest engine status\n\n").append(status.trim());
+            }
+            return text.length() == 0
+                    ? "This run did not publish phone-readable details." : text.toString();
+        }
     }
 
     ConfigurationResult configure(String githubToken, String openAiKey, String anthropicKey)
@@ -165,6 +206,154 @@ final class GitHubApi {
         }
         return new RunState(runId, status, conclusion,
                 run.optString("html_url", ""), step);
+    }
+
+    RunDetails runDetails(String token, String repository, long runId) throws Exception {
+        if (runId <= 0) throw new IllegalArgumentException("Run ID is invalid.");
+        if (!repository.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+            throw new IllegalArgumentException("Run repository is invalid.");
+        }
+        String cleanToken = requireSecret(token, "GitHub token");
+        JSONObject page = github(cleanToken, "GET", "/repos/" + repository
+                + "/actions/runs/" + runId + "/artifacts?per_page=100", null);
+        JSONArray artifacts = page.optJSONArray("artifacts");
+        long artifactId = 0L;
+        if (artifacts != null) {
+            for (int i = 0; i < artifacts.length(); i++) {
+                JSONObject item = artifacts.getJSONObject(i);
+                if (!item.optBoolean("expired", false)
+                        && item.optString("name", "").startsWith("mobile-phone-")) {
+                    artifactId = item.optLong("id", 0L);
+                    break;
+                }
+            }
+        }
+        if (artifactId <= 0) {
+            throw new ApiException("Phone-readable details are not available for this run yet.");
+        }
+        byte[] archive = downloadArtifact(cleanToken, repository, artifactId);
+        String result = "";
+        String errors = "";
+        String status = "";
+        try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(archive))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                if (entry.isDirectory()) continue;
+                String name = entry.getName().replace('\\', '/');
+                if (name.contains("../") || name.startsWith("/")) continue;
+                String base = name.substring(name.lastIndexOf('/') + 1);
+                if (!"mobile-result.json".equals(base)
+                        && !"errors.md".equals(base)
+                        && !"status.json".equals(base)) continue;
+                String value = new String(readZipEntryLimited(zip, MAX_PHONE_ENTRY_BYTES),
+                        StandardCharsets.UTF_8);
+                if ("mobile-result.json".equals(base)) result = value;
+                if ("errors.md".equals(base)) errors = value;
+                if ("status.json".equals(base)) status = value;
+            }
+        }
+        return new RunDetails(result, errors, status);
+    }
+
+    void submitSteering(String token, String repository, String requestId, String comment)
+            throws Exception {
+        String cleanToken = requireSecret(token, "GitHub token");
+        if (!repository.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
+            throw new IllegalArgumentException("Run repository is invalid.");
+        }
+        String compactId = requestId == null ? "" : requestId.replace("-", "");
+        if (!compactId.matches("[A-Fa-f0-9]{32}")) {
+            throw new IllegalArgumentException("Run request ID is invalid.");
+        }
+        String value = comment == null ? "" : comment.trim();
+        boolean invalidControl = false;
+        for (int i = 0; i < value.length(); i++) {
+            char item = value.charAt(i);
+            if (Character.getType(item) == Character.CONTROL
+                    && item != '\n' && item != '\r' && item != '\t') {
+                invalidControl = true;
+                break;
+            }
+        }
+        if (value.isEmpty() || value.length() > 4_000 || invalidControl) {
+            throw new IllegalArgumentException(
+                    "Steering comments must contain 1 to 4,000 printable characters.");
+        }
+        String name = "FLEXFACTOR_STEERING_" + compactId.substring(0, 16).toUpperCase();
+        String path = "/repos/" + repository + "/actions/variables/" + name;
+        HttpResult existing = rawGithub(cleanToken, "GET", path, null);
+        JSONArray comments = new JSONArray();
+        if (existing.status == 200) {
+            JSONObject row = new JSONObject(new String(existing.body, StandardCharsets.UTF_8));
+            try {
+                comments = new JSONArray(row.optString("value", "[]"));
+            } catch (JSONException ignored) {
+                comments = new JSONArray();
+            }
+        } else if (existing.status != 404) {
+            throw new ApiException(githubError(existing));
+        }
+        JSONObject entry = new JSONObject();
+        entry.put("id", java.util.UUID.randomUUID().toString());
+        entry.put("comment", value);
+        entry.put("created_at", Instant.now().toString());
+        comments.put(entry);
+        while (comments.length() > 8) comments.remove(0);
+        String serialized = comments.toString();
+        if (serialized.length() > 40_000) {
+            throw new IllegalArgumentException("The active build's steering queue is full.");
+        }
+        JSONObject payload = new JSONObject();
+        payload.put("name", name);
+        payload.put("value", serialized);
+        if (existing.status == 200) {
+            github(cleanToken, "PATCH", path, payload);
+        } else {
+            github(cleanToken, "POST", "/repos/" + repository + "/actions/variables", payload);
+        }
+    }
+
+    private byte[] downloadArtifact(String token, String repository, long artifactId)
+            throws Exception {
+        HttpURLConnection api = connection(new URL(GITHUB + "/repos/" + repository
+                + "/actions/artifacts/" + artifactId + "/zip"));
+        api.setRequestMethod("GET");
+        api.setRequestProperty("Accept", "application/vnd.github+json");
+        api.setRequestProperty("Authorization", "Bearer " + token);
+        api.setRequestProperty("X-GitHub-Api-Version", API_VERSION);
+        try {
+            int status = api.getResponseCode();
+            if (status != 302 && status != 307) {
+                throw new ApiException("GitHub could not open the result artifact (HTTP "
+                        + status + ").");
+            }
+            String location = api.getHeaderField("Location");
+            if (location == null || location.trim().isEmpty()) {
+                throw new ApiException("GitHub returned no artifact download location.");
+            }
+            URL target = new URL(location);
+            String host = target.getHost().toLowerCase();
+            if (!"https".equals(target.getProtocol())
+                    || (!host.endsWith(".blob.core.windows.net")
+                    && !host.endsWith(".githubusercontent.com")
+                    && !host.endsWith(".github.com"))) {
+                throw new SecurityException("GitHub returned an untrusted artifact location.");
+            }
+            HttpURLConnection download = connection(target);
+            download.setRequestMethod("GET");
+            try {
+                int downloadStatus = download.getResponseCode();
+                if (downloadStatus != 200) {
+                    throw new ApiException("The result artifact returned HTTP "
+                            + downloadStatus + ".");
+                }
+                return readLimited(download.getInputStream(), MAX_PHONE_ARTIFACT_BYTES);
+            } finally {
+                download.disconnect();
+            }
+        } finally {
+            api.disconnect();
+        }
     }
 
     private void verifyOpenAi(String key) throws Exception {
@@ -390,6 +579,21 @@ final class GitHubApi {
             }
             return output.toByteArray();
         }
+    }
+
+    private static byte[] readZipEntryLimited(ZipInputStream input, int limit) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int total = 0;
+        int count;
+        while ((count = input.read(buffer)) != -1) {
+            total += count;
+            if (total > limit) {
+                throw new ApiException("The run detail entry was unexpectedly large.");
+            }
+            output.write(buffer, 0, count);
+        }
+        return output.toByteArray();
     }
 
     private static String requireSecret(String value, String label) {

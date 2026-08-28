@@ -68,8 +68,10 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("target/*_repo_rewards_report.md", workflow)
         self.assertIn("target/*_audit_report.md", workflow)
         self.assertIn("target/*_readiness.md", workflow)
+        self.assertIn("Collect the in-app result and error ledger", workflow)
+        self.assertIn("mobile-phone-${{ inputs.request_id }}", workflow)
         summary = workflow.split("- name: Write the phone-readable run summary", 1)[1]
-        summary = summary.split("- name: Upload exact-run result", 1)[0]
+        summary = summary.split("- name: Collect the in-app result and error ledger", 1)[0]
         self.assertNotIn("${{ inputs.", summary)
 
     def test_repository_picker_paginates_and_supports_private_targets(self):
@@ -100,6 +102,38 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertNotIn("workflow_run_id", dispatch)
         self.assertIn("display_title", api)
         self.assertIn("request.requestId", api)
+
+    def test_completed_runs_expose_the_error_ledger_inside_the_app(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        self.assertIn("RunDetails runDetails", api)
+        self.assertIn("mobile-phone-", api)
+        self.assertIn("errors.md", api)
+        self.assertIn("View results and error ledger", activity)
+
+    def test_active_audits_accept_authenticated_phone_steering(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" /
+                    "mobile-run.yml").read_text(encoding="utf-8")
+        self.assertIn("Steer this build", activity)
+        self.assertIn("submitSteering", api)
+        self.assertIn("FLEXFACTOR_STEERING_", api)
+        self.assertIn("flexfactor_steering.submit", workflow)
+        self.assertIn('source="android"', workflow)
+
+    def test_audit_and_prodready_support_parallel_repository_runs(self):
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        self.assertIn("Run up to 10 repositories in parallel", activity)
+        self.assertIn("showBatchRepositoryList", activity)
+        self.assertIn("dispatchBatch", activity)
+        self.assertIn("Active and recent runs", activity)
+        self.assertIn("RUN_HISTORY", activity)
 
     def test_mobile_runner_matches_desktop_provider_and_verification_controls(self):
         workflow = (ROOT / ".github" / "workflows" /

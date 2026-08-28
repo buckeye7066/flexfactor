@@ -39,9 +39,17 @@ the private repository rather than crossing the public control repository.
 4. **Make production ready** — run the complete purpose, build, browser, test,
    competitive-gap, and readiness pipeline.
 
+Audit and Production Ready can select up to ten repositories and launch their
+independent workflows in parallel, matching the desktop multi-program path.
+**Active and recent runs** preserves and polls each correlated run rather than
+discarding the earlier run when another starts.
+
 The latest run is polled by ID and survives activity recreation or process
-restart. **Open run details** opens the authoritative GitHub Actions record.
-Every run uploads a correlated `mobile-result-<request UUID>` artifact.
+restart. **View results and error ledger** reads a bounded, correlated result
+artifact directly inside the app; **Open run details** opens the authoritative
+GitHub Actions record. During Audit or Production Ready, **Steer this build**
+queues an authenticated owner comment that the engine consumes at its next audit
+phase boundary through the same containment and verification gates as desktop.
 
 ## In-app updates
 
@@ -80,7 +88,8 @@ signing value is absent; it never falls back to a debug key.
 - Credentials are masked in the UI, encrypted locally, and transferred to
   GitHub only through the official LibSodium-sealed Actions secrets API.
 - Target code executes on an ephemeral GitHub-hosted runner, not on the phone.
-- The public mobile control plane accepts public target repositories only.
+- Public and private targets run from the pinned caller workflow installed in
+  the selected target repository; private metadata remains in that repository.
 - Workflow inputs are validated again on the runner before checkout or
   execution.
 - The legacy `scripts/phone/` Termux engine remains available for command-line

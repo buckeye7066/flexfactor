@@ -214,8 +214,9 @@ open model. Public and private targets run from a pinned caller installed into t
 selected repository, keeping private run metadata private. Credentials are encrypted with
 Android Keystore and installed as LibSodium-sealed GitHub Actions secrets; they
 are never workflow inputs.
-Choose a writable public repository, select one of the four modes, and monitor the
-exact correlated Actions run from the same app. See
+Choose any writable public or private repository, select one of the four modes,
+monitor the exact correlated Actions run, view its error ledger, and submit live
+operator steering from the same app. See
 [`android/README.md`](android/README.md) for the operating and release model.
 
 The older `scripts/phone/` Termux engine remains an optional command-line path;

@@ -284,6 +284,46 @@ jobs:
           before="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$before" > mobile-before.txt
           rc=0
+          steering_name="FLEXFACTOR_STEERING_$(printf '%s' "$REQUEST_ID" | tr -d '-' | cut -c1-16 | tr '[:lower:]' '[:upper:]')"
+          export STEERING_NAME="$steering_name"
+          python - <<'PY' &
+          import json, os, pathlib, time, urllib.error, urllib.request
+          import sys
+
+          sys.path.insert(0, str(pathlib.Path("engine").resolve()))
+          import flexfactor_steering
+
+          api = ("https://api.github.com/repos/" + os.environ["TARGET_REPOSITORY"]
+                 + "/actions/variables/" + os.environ["STEERING_NAME"])
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "X-GitHub-Api-Version": "2026-03-10",
+              "User-Agent": "FlexFactor-Mobile-Steering",
+          }
+          seen = set()
+          while True:
+              try:
+                  with urllib.request.urlopen(
+                          urllib.request.Request(api, headers=headers), timeout=20) as response:
+                      queue = json.loads(json.load(response).get("value", "[]"))
+                  for item in queue if isinstance(queue, list) else []:
+                      ident = str(item.get("id", ""))
+                      comment = str(item.get("comment", ""))
+                      if ident and ident not in seen and comment:
+                          flexfactor_steering.submit(
+                              "target", str(pathlib.Path("target").resolve()), comment,
+                              source="android")
+                          seen.add(ident)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      print("[steering] GitHub check failed; will retry", file=sys.stderr)
+              except Exception:
+                  print("[steering] queue check failed; will retry", file=sys.stderr)
+              time.sleep(20)
+          PY
+          steering_pid=$!
+          trap 'kill "$steering_pid" 2>/dev/null || true' EXIT
           provider_args=(--provider "$PROVIDER")
           if [ "$PROVIDER" = ollama ]; then
             provider_args+=(--model "$FLEXFACTOR_PHONE_MODEL"
@@ -396,6 +436,51 @@ jobs:
               echo "- The request was rejected before execution."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect the in-app result and error ledger
+        if: always()
+        shell: python
+        run: |
+          import json, pathlib, shutil
+
+          destination = pathlib.Path("mobile-phone-summary")
+          destination.mkdir(exist_ok=True)
+          result = pathlib.Path("mobile-result.json")
+          if result.is_file():
+              shutil.copyfile(result, destination / "mobile-result.json")
+
+          runs = pathlib.Path.home() / ".flexfactor" / "runs"
+          ledgers = sorted(
+              runs.glob("**/errors.md") if runs.is_dir() else [],
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+          if ledgers:
+              raw = ledgers[0].read_text(encoding="utf-8", errors="replace")
+              # Keep the newest useful evidence within the Android client's strict
+              # artifact bound. The complete ledger remains in the full artifact.
+              (destination / "errors.md").write_text(
+                  raw[-120_000:], encoding="utf-8")
+
+          status = pathlib.Path.home() / ".flexfactor" / "status.json"
+          if status.is_file():
+              raw = status.read_text(encoding="utf-8", errors="replace")
+              try:
+                  parsed = json.loads(raw)
+                  raw = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+              except ValueError:
+                  pass
+              (destination / "status.json").write_text(
+                  raw[-120_000:], encoding="utf-8")
+
+      - name: Upload bounded in-app result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mobile-phone-${{ inputs.request_id }}
+          path: mobile-phone-summary/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload exact-run result
         if: always()
