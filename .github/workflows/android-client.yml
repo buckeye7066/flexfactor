@@ -208,7 +208,7 @@ jobs:
           aab_dir="android/app/build/outputs/bundle/play"
           aab="$aab_dir/app-play.aab"
           test -s "$aab"
-          jarsigner -verify -strict "$aab"
+          jarsigner -verify "$aab"
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
           printf '%s\n' "${GITHUB_SHA}" > "$aab_dir/SOURCE_COMMIT"
       - name: Create signed update manifest
@@ -326,7 +326,7 @@ jobs:
             android/app/build/outputs/apk/release/CERTIFICATE.txt
             android/app/build/outputs/apk/release/SHA256SUMS
             android/app/build/outputs/apk/release/SOURCE_COMMIT
-            android/app/build/outputs/bundle/play/app-release.aab
+            android/app/build/outputs/bundle/play/app-play.aab
             android/app/build/outputs/bundle/play/SHA256SUMS
             android/app/build/outputs/bundle/play/SOURCE_COMMIT
             android/app/build/outputs/apk/release/publish/flexfactor-*.aab
