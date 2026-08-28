@@ -52,7 +52,7 @@ if [ "${FLEXFACTOR_SKIP_PACKAGES:-0}" != "1" ]; then
   # python: the engine. git: mandatory, every audit branches and commits.
   # nodejs-lts + esbuild-capable npm: needed to GATE JavaScript projects.
   # gh: optional, used only for pr create/merge (guarded by `which gh`).
-  pkg install -y python git gh nodejs-lts openssh which termux-api
+  pkg install -y python git gh nodejs-lts openssh which curl termux-api
 fi
 command -v python >/dev/null || die "python did not install"
 command -v git    >/dev/null || die "git did not install (audits cannot run without it)"
