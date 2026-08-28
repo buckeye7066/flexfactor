@@ -200,6 +200,20 @@ python flexfactor_dashboard_tests.py                    # draws a frame, reads i
 python flexfactor_web.py --print-url                    # same view, phone-reachable
 ```
 
+### Android: run without a PC
+
+The Android client is in [`android/`](android/). It is a deliberately small,
+loopback-only dashboard: the real FlexFactor engine, Git checkout, Python, and
+Node toolchain run beside it in Termux on the same phone. No PC is in the data
+path. See [`android/README.md`](android/README.md) for installation, signing,
+and recovery instructions.
+
+Install Termux and Termux:Boot from F-Droid (the obsolete Play Store Termux
+build is unsupported), then run `scripts/phone/setup.sh` inside the cloned
+repository. `flexfactor-engine start` hands the authenticated local URL to the
+Android client. A correctly paired dashboard identifies its source as
+`this phone`, never `pc`.
+
 ### Errors are reported IN the run, not in a log
 
 Every run writes an error ledger - what failed, which code is responsible, and a
