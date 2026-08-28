@@ -42,7 +42,7 @@ http_ok() { curl -fsS --max-time 4 -o /dev/null "$(url)"; }
 # this uses `-W` and reads the receiver's own result code instead of assuming.
 tell_app() {
   command -v am >/dev/null || return 0
-  out="$(am broadcast -W -n "$APP_PKG/com.firer.console.ConfigReceiver" \
+  out="$(am broadcast -W -n "$APP_PKG/com.firer.console.flexfactor.ConfigReceiver" \
           --es local "$(url)" 2>&1)" || true
   case "$out" in
     *"result=1"*)
