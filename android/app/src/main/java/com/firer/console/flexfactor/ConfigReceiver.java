@@ -15,7 +15,12 @@ public final class ConfigReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         String recovery = intent == null ? null : intent.getStringExtra("recovery_status");
         if (recovery != null) {
-            if (!RECOVERY_STATES.contains(recovery)) {
+            String nonce = intent.getStringExtra("recovery_nonce");
+            String expected = context.getSharedPreferences(
+                    MainActivity.PREFERENCES, Context.MODE_PRIVATE)
+                    .getString(MainActivity.RECOVERY_NONCE_KEY, "");
+            if (!RECOVERY_STATES.contains(recovery) || expected.isEmpty()
+                    || nonce == null || !expected.equals(nonce)) {
                 setResultCode(4);
                 return;
             }
