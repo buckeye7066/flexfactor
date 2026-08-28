@@ -97,6 +97,33 @@ class PhoneLauncherTests(unittest.TestCase):
                     body, env=self.env, provider_path=self.provider_path)
         self.assertFalse(os.path.exists(self.provider_path))
 
+    def test_concurrent_provider_saves_retain_both_keys(self):
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def save(provider, secret):
+            try:
+                barrier.wait()
+                web.save_phone_provider(
+                    {"provider": provider, "api_key": secret},
+                    env=self.env, provider_path=self.provider_path)
+            except Exception as exc:  # noqa: BLE001 - surfaced after both threads join
+                errors.append(exc)
+
+        first = threading.Thread(target=save, args=(
+            "openai", "concurrent-openai-secret-value"))
+        second = threading.Thread(target=save, args=(
+            "anthropic", "concurrent-anthropic-secret-value"))
+        first.start()
+        second.start()
+        barrier.wait()
+        first.join(5)
+        second.join(5)
+        self.assertEqual([], errors)
+        configured = web._load_phone_provider_env(self.provider_path)
+        self.assertIn("OPENAI_API_KEY", configured)
+        self.assertIn("ANTHROPIC_API_KEY", configured)
+
     def test_saved_provider_key_reaches_child_only_through_environment(self):
         secret = "saved-provider-secret-that-must-not-leak"
         env = dict(self.env)
@@ -160,8 +187,91 @@ class PhoneLauncherTests(unittest.TestCase):
                          "install-provider.sh"),
         ))
         self.assertNotIn("shell", captured["kwargs"])
+        self.assertNotIn("OPENAI_API_KEY", captured["kwargs"]["env"])
         self.assertEqual((838383, os.path.join(run_dir, "provider.pid")),
                          captured["reaped"])
+
+    def test_provider_install_and_audit_are_mutually_exclusive(self):
+        audit_pid = os.path.join(self.root, "active-audit.pid")
+        with open(audit_pid, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        with self.assertRaisesRegex(ValueError, "while audit pid"):
+            web.start_phone_provider_install(
+                {"provider": "openai"}, env=self.env,
+                audit_pid_path=audit_pid,
+                pid_path=os.path.join(self.root, "provider.pid"),
+                log_path=os.path.join(self.root, "provider.log"),
+                popen=lambda *args, **kwargs: self.fail("must not spawn"),
+            )
+
+        install_pid = os.path.join(self.root, "active-install.pid")
+        with open(install_pid, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        with self.assertRaisesRegex(ValueError, "provider installation pid"):
+            web.start_phone_run(
+                {"program": self.project, "mode": "audit", "provider": "openai",
+                 "max_cost": 3}, env=self.env,
+                programs=[{"name": "target-app", "path": self.project}],
+                readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
+                provider_install_pid_path=install_pid,
+                pid_path=os.path.join(self.root, "mutual-audit.pid"),
+                log_path=os.path.join(self.root, "mutual-audit.log"),
+                lock_path=os.path.join(self.root, "mutual-audit.lock"),
+                popen=lambda *args, **kwargs: self.fail("must not spawn"),
+            )
+
+    def test_provider_installer_is_terminated_when_pid_cannot_be_recorded(self):
+        terminated = []
+
+        class Process:
+            pid = 848484
+
+            @staticmethod
+            def terminate():
+                terminated.append("terminate")
+
+            @staticmethod
+            def wait(timeout=None):
+                terminated.append(("wait", timeout))
+                return 1
+
+        blocked_pid_path = os.path.join(self.root, "pid-is-a-directory")
+        os.mkdir(blocked_pid_path)
+        with self.assertRaises(OSError):
+            web.start_phone_provider_install(
+                {"provider": "openai"}, env=self.env,
+                audit_pid_path=os.path.join(self.root, "no-audit.pid"),
+                pid_path=blocked_pid_path,
+                log_path=os.path.join(self.root, "failed-provider.log"),
+                popen=lambda *args, **kwargs: Process(),
+            )
+        self.assertEqual(["terminate", ("wait", 5)], terminated)
+
+    def test_provider_installer_failure_is_sanitized_for_the_dashboard(self):
+        status_path = os.path.join(self.root, "install-status.json")
+        pid_path = os.path.join(self.root, "install-status.pid")
+        with open(pid_path, "w", encoding="utf-8") as fh:
+            fh.write("858585\n")
+        finished = threading.Event()
+
+        class Process:
+            pid = 858585
+
+            @staticmethod
+            def wait():
+                finished.set()
+                return 1
+
+        web._start_provider_install_reaper(
+            Process(), pid_path, status_path, "openai")
+        self.assertTrue(finished.wait(2))
+        for _ in range(50):
+            if os.path.exists(status_path) and not os.path.exists(pid_path):
+                break
+            time.sleep(0.01)
+        status = web._load_provider_install_status(status_path)
+        self.assertEqual("failed", status["state"])
+        self.assertIn("provider-log", status["detail"])
 
     def test_provider_support_installer_rejects_non_cloud_provider(self):
         with self.assertRaisesRegex(ValueError, "openai or anthropic"):
@@ -402,6 +512,7 @@ class PhoneLauncherTests(unittest.TestCase):
         self.assertIn("/api/provider", web.PAGE)
         self.assertIn("Install provider support", web.PAGE)
         self.assertIn("/api/provider/install", web.PAGE)
+        self.assertNotIn("if(providerKey&&providerKey.value) return", web.PAGE)
 
     def test_android_webview_enables_launcher_dialogs(self):
         path = os.path.join(
