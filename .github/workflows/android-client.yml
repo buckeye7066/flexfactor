@@ -50,6 +50,29 @@ jobs:
         run: >-
           gradle --no-daemon -p android testDebugUnitTest testPlayUnitTest
           lintDebug lintPlay assembleDebug bundlePlay
+      - name: Prove strict bundle signature policy
+        shell: bash
+        run: |
+          proof_dir="$RUNNER_TEMP/bundle-signature-proof"
+          mkdir -p "$proof_dir"
+          printf 'signed payload\n' > "$proof_dir/payload.txt"
+          jar --create --file "$proof_dir/signed.jar" -C "$proof_dir" payload.txt
+          keytool -genkeypair -alias flexfactor-proof -keyalg RSA \
+            -keystore "$proof_dir/proof.p12" -storetype PKCS12 \
+            -storepass proof-password -keypass proof-password \
+            -dname "CN=FlexFactor release proof" -validity 1
+          jarsigner -keystore "$proof_dir/proof.p12" -storepass proof-password \
+            -keypass proof-password "$proof_dir/signed.jar" flexfactor-proof
+          jarsigner -verify -strict -keystore "$proof_dir/proof.p12" \
+            -storepass proof-password "$proof_dir/signed.jar"
+          cp "$proof_dir/signed.jar" "$proof_dir/partial.jar"
+          printf 'unsigned payload\n' > "$proof_dir/unsigned.txt"
+          jar --update --file "$proof_dir/partial.jar" -C "$proof_dir" unsigned.txt
+          if jarsigner -verify -strict -keystore "$proof_dir/proof.p12" \
+              -storepass proof-password "$proof_dir/partial.jar"; then
+            echo "Strict verification accepted a partially signed archive" >&2
+            exit 1
+          fi
       - name: Verify the default phone model provider live
         shell: bash
         run: |
@@ -199,6 +222,8 @@ jobs:
             testDebugUnitTest testPlayUnitTest lintRelease lintPlay assembleRelease bundlePlay
       - name: Verify signature and record provenance
         shell: bash
+        env:
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
         run: |
           apk="android/app/build/outputs/apk/release/app-release.apk"
           test -s "$apk"
@@ -208,13 +233,10 @@ jobs:
           aab_dir="android/app/build/outputs/bundle/play"
           aab="$aab_dir/app-play.aab"
           test -s "$aab"
-          aab_signature=$(jarsigner -verify "$aab" 2>&1)
-          printf '%s\n' "$aab_signature"
-          printf '%s\n' "$aab_signature" | grep -Fq "jar verified."
-          if printf '%s\n' "$aab_signature" | grep -Fq "jar is unsigned."; then
-            echo "Play bundle is unsigned" >&2
-            exit 1
-          fi
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          jarsigner -verify -strict \
+            -keystore "$RUNNER_TEMP/flexfactor-release.jks" \
+            -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
           printf '%s\n' "${GITHUB_SHA}" > "$aab_dir/SOURCE_COMMIT"
       - name: Create signed update manifest
