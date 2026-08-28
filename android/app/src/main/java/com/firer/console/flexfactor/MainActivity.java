@@ -161,7 +161,7 @@ public final class MainActivity extends Activity {
         if (configured()) {
             accountState.setText("GitHub: " + (login.isEmpty() ? "configured" : login)
                     + (secrets.contains(SecureStore.OPENAI_KEY)
-                    ? " · Provider: OpenAI" : " · Provider: GitHub Copilot")
+                    ? " · Provider: OpenAI" : " · Provider: hosted open model")
                     + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
@@ -182,19 +182,19 @@ public final class MainActivity extends Activity {
     private void showCredentialSetup() {
         LinearLayout form = form();
         TextView guidance = text(
-                "Enter your GitHub token once. FlexFactor uses GitHub Copilot by default. An OpenAI API key is optional and switches runs to OpenAI.",
+                "Enter your GitHub token once. FlexFactor runs its own open model in GitHub Actions by default. An OpenAI API key is optional and switches runs to OpenAI.",
                 14, Color.rgb(170, 181, 194));
         EditText github = secretInput("GitHub token (repo and workflow access)");
         EditText openAi = secretInput("OpenAI API key (optional)");
-        CheckBox useCopilot = new CheckBox(this);
-        useCopilot.setText("Use GitHub Copilot (no OpenAI key)");
-        useCopilot.setTextColor(Color.WHITE);
-        useCopilot.setChecked(!secrets.contains(SecureStore.OPENAI_KEY));
+        CheckBox useHostedModel = new CheckBox(this);
+        useHostedModel.setText("Use hosted open model (no OpenAI key)");
+        useHostedModel.setTextColor(Color.WHITE);
+        useHostedModel.setChecked(!secrets.contains(SecureStore.OPENAI_KEY));
         if (secrets.contains(SecureStore.GITHUB_TOKEN)) github.setHint("GitHub token already saved");
         if (secrets.contains(SecureStore.OPENAI_KEY)) openAi.setHint("OpenAI key already saved");
         form.addView(guidance);
         form.addView(github);
-        form.addView(useCopilot);
+        form.addView(useHostedModel);
         form.addView(openAi);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
@@ -211,7 +211,7 @@ public final class MainActivity extends Activity {
                 String githubValue = github.getText().toString().trim();
                 String openAiValue = openAi.getText().toString().trim();
                 if (githubValue.isEmpty()) githubValue = secrets.get(SecureStore.GITHUB_TOKEN);
-                if (useCopilot.isChecked()) {
+                if (useHostedModel.isChecked()) {
                     openAiValue = "";
                 } else if (openAiValue.isEmpty()) {
                     openAiValue = secrets.get(SecureStore.OPENAI_KEY);
@@ -220,8 +220,8 @@ public final class MainActivity extends Activity {
                     github.setError("GitHub token is required.");
                     return;
                 }
-                if (!useCopilot.isChecked() && openAiValue.isEmpty()) {
-                    openAi.setError("Enter an OpenAI key or select GitHub Copilot.");
+                if (!useHostedModel.isChecked() && openAiValue.isEmpty()) {
+                    openAi.setError("Enter an OpenAI key or select the hosted open model.");
                     return;
                 }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
@@ -243,7 +243,7 @@ public final class MainActivity extends Activity {
                     dialog.dismiss();
                     refreshHeader();
                     Toast.makeText(this, openAi.isEmpty()
-                            ? "GitHub Copilot is selected" : "GitHub and OpenAI are ready",
+                            ? "Hosted open model is selected" : "GitHub and OpenAI are ready",
                             Toast.LENGTH_LONG).show();
                 });
             } catch (Exception failed) {
@@ -397,7 +397,7 @@ public final class MainActivity extends Activity {
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
             boolean scoutApply, double cost) {
         MobileRunRequest.Provider provider = secrets.contains(SecureStore.OPENAI_KEY)
-                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.COPILOT;
+                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.OLLAMA;
         return new MobileRunRequest(mode, provider,
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
@@ -411,8 +411,8 @@ public final class MainActivity extends Activity {
             detail += "\nMaximum provider cost: $"
                     + String.format(Locale.US, "%.2f", request.maxCost);
         } else {
-            detail += "\nProvider: " + (request.provider == MobileRunRequest.Provider.COPILOT
-                    ? "GitHub Copilot" : "OpenAI");
+            detail += "\nProvider: " + (request.provider == MobileRunRequest.Provider.OLLAMA
+                    ? "Hosted open model" : "OpenAI");
         }
         new AlertDialog.Builder(this)
                 .setTitle("Start " + request.mode.wire + "?")
