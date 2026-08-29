@@ -81,6 +81,11 @@ ff.STATUS_PATH = os.path.join(_TEST_STATE_DIR, "status.json")
 # for real; here, the tempdir) - the SAME class of owner-state hazard as
 # BRAIN_PATH/STATUS_PATH, so it gets the identical unconditional redirection.
 ff.RUNS_PATH = os.path.join(_TEST_STATE_DIR, "runs")
+# INVOCATION_PATH records how the process was launched, for the dashboard's
+# per-program resume button. Any test that reaches run_cli would otherwise
+# overwrite the RUNNING audit's recorded launch, so the resume button would
+# replay a test's argv against the owner's repos. Same unconditional redirect.
+ff.INVOCATION_PATH = os.path.join(_TEST_STATE_DIR, "last-invocation.json")
 if hasattr(ff, "_PROGRESS") and hasattr(ff._PROGRESS, "path"):
     ff._PROGRESS.path = ff.STATUS_PATH
 
@@ -193,12 +198,14 @@ class TestSessionIsolationTests(unittest.TestCase):
         home_flex = os.path.join(os.path.expanduser("~"), ".flexfactor")
         for name, path in (("BRAIN_PATH", ff.BRAIN_PATH),
                            ("STATUS_PATH", ff.STATUS_PATH),
-                           ("RUNS_PATH", ff.RUNS_PATH)):
+                           ("RUNS_PATH", ff.RUNS_PATH),
+                           ("INVOCATION_PATH", ff.INVOCATION_PATH)):
             self.assertFalse(
                 os.path.abspath(path).lower().startswith(os.path.abspath(home_flex).lower()),
                 f"{name} points at the owner's real state ({path}); a test run "
-                "would evict real projects from brain.json or write resume "
-                "checkpoints into the owner's real ~/.flexfactor/runs")
+                "would evict real projects from brain.json, write resume "
+                "checkpoints into the owner's real ~/.flexfactor/runs, or "
+                "overwrite the live run's recorded launch argv")
 
     def test_rotation_catalog_and_state_are_not_the_real_ones(self):
         """Without the env redirect above, this dev machine's REAL 654-route
@@ -10107,6 +10114,108 @@ class BareListSalvageTests(unittest.TestCase):
     def test_dict_passes_through_unchanged(self):
         d = {"changed": True, "edits": []}
         self.assertIs(ff._check_structured_type(d, ff.FIX_EDITS_SCHEMA, "{}"), d)
+
+
+class ArrayItemShapeTests(unittest.TestCase):
+    """LIVE repo-rewards 2026-08-29, run reporewards-...-35988-0002.
+
+    The unit-test phase asked for {"files":[{"path":..,"contents":..}], ..} and
+    the model answered with a list of STRINGS. That dict is the right top-level
+    type and carries every required key, so _check_structured_type passed it,
+    and the consumer's `f.get("path")` raised
+    "'str' object has no attribute 'get'" - OUTSIDE the try/except, which wraps
+    only the _gen_unit_tests call. The whole program aborted at cycle 7:
+    checkpoint "interrupted", branch None, 49 fixes unpublished, 19 generated
+    test files stranded uncommitted in the owner's tree.
+
+    This is the same bug class BareListSalvageTests covers, one level down, so
+    the guard belongs at the same chokepoint: OpenAI json_object mode is not
+    schema-constrained and 15 schemas' worth of call sites dereference array
+    elements unguarded."""
+
+    def test_the_exact_live_payload_raises_instead_of_reaching_the_caller(self):
+        # The literal shape measured in the live run.
+        payload = {"files": ["tests/foo.test.ts"], "notes": "wrote one test"}
+        with self.assertRaises(RuntimeError) as caught:
+            ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
+        # Names the offending property AND index, so the ledger entry is
+        # actionable rather than "no known fix".
+        self.assertIn("'files'[0]", str(caught.exception))
+        self.assertIn("str", str(caught.exception))
+
+    def test_a_str_element_is_not_an_AttributeError(self):
+        # The POINT of the fix: the failure must be the ordinary generation
+        # error the retry/[skip] paths handle, never the AttributeError that
+        # escaped to the per-program handler and ended the run.
+        payload = {"files": ["a.ts"], "notes": "n"}
+        try:
+            ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
+        except AttributeError:  # pragma: no cover - this is the regression
+            self.fail("shape fault surfaced as AttributeError, not RuntimeError")
+        except RuntimeError:
+            return
+        # Falling through is ALSO the regression: the payload reached the
+        # caller unchallenged, which is exactly how the live run died three
+        # frames later. Asserting only "not an AttributeError" would be a
+        # check that cannot fail.
+        self.fail("a str element passed the chokepoint unchallenged")
+
+    def test_a_bad_element_anywhere_in_the_list_is_caught(self):
+        # Not just index 0 - a single bad tail element killed the run just as
+        # dead, and a loop that only checks the head is a check that mostly
+        # cannot fail.
+        payload = {"files": [{"path": "a.ts", "contents": "x"}, "b.ts"],
+                   "notes": "n"}
+        with self.assertRaises(RuntimeError) as caught:
+            ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
+        self.assertIn("'files'[1]", str(caught.exception))
+
+    def test_a_well_formed_payload_still_passes_unchanged(self):
+        payload = {"files": [{"path": "a.test.ts", "contents": "x"}],
+                   "notes": "n"}
+        out = ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
+        self.assertEqual(out, payload)
+
+    def test_scalar_item_arrays_still_accept_strings(self):
+        # fixed_titles declares items.type=string. Validating it as objects
+        # would break every schema that legitimately carries a string list -
+        # the guard must be narrow or it becomes the outage.
+        payload = {"changed": True, "edits": [], "fixed_titles": ["Unused import"]}
+        out = ff._check_structured_type(payload, ff.FIX_EDITS_SCHEMA, "{}")
+        self.assertEqual(out["fixed_titles"], ["Unused import"])
+
+    def test_an_absent_array_property_is_not_a_failure(self):
+        # A partial answer (missing SOME keys) is normal and still passes, per
+        # the decoy guard's own deliberately-narrow rule.
+        out = ff._check_structured_type({"notes": "n"}, ff.TEST_GEN_SCHEMA, "{}")
+        self.assertEqual(out, {"notes": "n"})
+
+    def test_an_empty_array_is_not_a_failure(self):
+        out = ff._check_structured_type({"files": [], "notes": "n"},
+                                        ff.TEST_GEN_SCHEMA, "{}")
+        self.assertEqual(out["files"], [])
+
+    def test_the_guard_covers_other_schemas_not_just_test_generation(self):
+        # 15 schemas share this chokepoint; a fix that only knew about
+        # TEST_GEN_SCHEMA would leave the review path exposed to the identical
+        # AttributeError.
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(
+                {"findings": ["line 3 is wrong"], "summary": "s"},
+                ff.AUDIT_FINDINGS_SCHEMA, "{}")
+
+    def test_the_bare_list_salvage_path_is_validated_too(self):
+        # A bare list that gets WRAPPED must be checked after wrapping, or the
+        # salvage path becomes an unguarded back door into the same crash.
+        with self.assertRaises(RuntimeError):
+            ff._check_array_item_shape(
+                {"files": ["a.ts"]}, ff.TEST_GEN_SCHEMA, "[]")
+
+    def test_a_non_dict_passes_through_for_the_top_level_check_to_judge(self):
+        # This helper only reasons about elements INSIDE a dict's arrays; the
+        # top-level verdict stays with _check_structured_type so the two cannot
+        # disagree about what a bare list means.
+        self.assertEqual(ff._check_array_item_shape([1, 2], {}, ""), [1, 2])
 
 
 class PoolSizeRoutingTests(unittest.TestCase):

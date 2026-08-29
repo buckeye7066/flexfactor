@@ -3134,6 +3134,61 @@ def _rename_single_array_key(data, schema: dict):
     return {prop: rows}
 
 
+def _check_array_item_shape(data, schema: dict, text: str):
+    """Reject array ELEMENTS that are not the objects the schema declares.
+
+    `_check_structured_type` below guards the TOP-LEVEL type, because the
+    failure it was written for - an opaque "'list' object has no attribute
+    'get'" many frames from the provider - arrived as a whole response of the
+    wrong type. The identical failure arrives ONE LEVEL DOWN and nothing
+    caught it: `{"files": ["tests/foo.test.ts"], "notes": "..."}` is a dict,
+    carries every required key, and sails through - and then the caller's
+    `for f in gen.get("files"): f.get("path")` raises
+    "'str' object has no attribute 'get'".
+
+    LIVE repo-rewards 2026-08-29 (run reporewards-...-35988-0002): that exact
+    AttributeError escaped the unit-test phase (whose try/except wraps only the
+    _gen_unit_tests CALL, not the loop that consumes its result), propagated to
+    the outer per-program handler, and ABORTED the whole program at cycle 7 -
+    checkpoint status "interrupted", branch None, 49 fixes never published, and
+    19 generated test files left uncommitted in the owner's working tree for
+    the next run's autoclean to commit.
+
+    OpenAI json_object mode is NOT schema-constrained (see the comment at the
+    top of OpenAIProvider.structured, which explicitly delegates the shape
+    contract to "the caller's code defends against missing keys with .get()
+    defaults" - a promise 15 schemas' worth of call sites do not keep). This
+    chokepoint is the only place that can hold that contract for all of them at
+    once.
+
+    RAISES rather than filtering the bad elements out. A filtered list is a
+    silent partial result: the run would write fewer tests, or apply fewer
+    edits, and report success - the exact silent-no-op shape the exit-code-3
+    rule exists to prevent. Raising degrades to the ordinary generation failure
+    the existing retry / [skip] / another-backend paths already handle.
+    Arrays whose schema declares scalar items (`items.type == "string"`) are
+    untouched.
+    """
+    if not isinstance(data, dict):
+        return data
+    for prop, spec in (schema.get("properties") or {}).items():
+        spec = spec or {}
+        if spec.get("type") != "array":
+            continue
+        if ((spec.get("items") or {}).get("type")) != "object":
+            continue
+        value = data.get(prop)
+        if not isinstance(value, list):
+            continue
+        for idx, element in enumerate(value):
+            if not isinstance(element, dict):
+                raise RuntimeError(
+                    f"Structured output's '{prop}'[{idx}] is a "
+                    f"{type(element).__name__}, but the schema declares an "
+                    f"object; len={len(text)} head={text[:200]!r}")
+    return data
+
+
 def _check_structured_type(data, schema: dict, text: str):
     """Every provider's structured() promises the caller a value shaped like
     `schema` (almost always a top-level JSON object with named keys the caller
@@ -3167,7 +3222,7 @@ def _check_structured_type(data, schema: dict, text: str):
             if salvaged is None:
                 salvaged = _rename_single_array_key(data, schema)
             if salvaged is not None:
-                return salvaged
+                return _check_array_item_shape(salvaged, schema, text)
             raise RuntimeError(
                 "Structured output matched no schema key (decoy/unrelated JSON "
                 f"object; expected one of {req}); len={len(text)} "
@@ -3199,7 +3254,7 @@ def _check_structured_type(data, schema: dict, text: str):
                 fit, prop = scored[0]
                 print(f"  [salvage] structured output was a bare list; wrapped "
                       f"into '{prop}' per schema (element fit {fit:.0%})")
-                return {prop: data}
+                return _check_array_item_shape({prop: data}, schema, text)
         raise RuntimeError(
             f"Structured output did not match schema (expected a JSON object, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
@@ -3207,7 +3262,7 @@ def _check_structured_type(data, schema: dict, text: str):
         raise RuntimeError(
             f"Structured output did not match schema (expected a JSON array, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
-    return data
+    return _check_array_item_shape(data, schema, text)
 
 
 def _salvage_truncated_json(text: str):
@@ -15043,14 +15098,31 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # module-level alias to borrow.
                     import flexfactor_errors as _fe_kinds
                     _blocked = "[flexfactor-containment]" in str(failing_log or "")
+                    # THIRD VERDICT: the build did not FAIL, it could not be
+                    # EVALUATED. Live repo-rewards 2026-08-29 filed a blackholed
+                    # proxy (next/font unable to reach Google Fonts) as a
+                    # program-defect and told the owner to fix compile errors
+                    # that did not exist - the same tree builds clean with
+                    # normal network. Publication still refuses (an unevaluated
+                    # build is None, never True - the tri-state rule _full_gate
+                    # already enforces); what changes is the DIAGNOSIS, so the
+                    # owner is pointed at the host instead of at their code.
+                    # Checked AFTER containment, which is the more specific
+                    # environmental verdict and names its own remedy.
+                    _envcause = (None if _blocked else
+                                 _fe_kinds.build_failure_is_environmental(
+                                     str(failing_log or "")))
                     _ledger(
                         "baseline",
                         ("baseline publication gate BLOCKED: the project's "
                          "build/test commands were refused before they ran"
                          if _blocked else
+                         "baseline could not be EVALUATED on this host: "
+                         f"{_envcause}"
+                         if _envcause else
                          "baseline publication suite is RED and bounded "
                          "targeted repair did not fix it"),
-                        kind=(_fe_kinds.KIND_ENV if _blocked
+                        kind=(_fe_kinds.KIND_ENV if (_blocked or _envcause)
                               else _fe_kinds.KIND_PROGRAM),
                         detail=_tail(str(failing_log or ""), 40),
                         suggestion=(
@@ -15060,6 +15132,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             "--trust-repo. Until then NOTHING is verified: no build, no "
                             "tests, and publication stays refused."
                             if _blocked else
+                            "This is a HOST problem, not a defect in the audited code - "
+                            "do not 'fix' the build. Restore network access for the build "
+                            "(check HTTP_PROXY/HTTPS_PROXY and any host firewall; a proxy "
+                            "aimed at 127.0.0.1:9 is a blackhole) and re-run. Publication "
+                            "stays refused because nothing was verified, NOT because the "
+                            f"code is known bad. Full log: {log_path or '(not written)'}."
+                            if _envcause else
                             f"Read the full log at {log_path or '(not written)'}. "
                             "Publication (push/merge) stays refused while the baseline "
                             "is red; the review still runs."),
@@ -16209,6 +16288,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     gen = _gen_unit_tests(
                         author, rel, text, stack["test_cmd"], pfx=pfx,
                         required_capabilities=_required_capabilities)
+                    # DEFENCE IN DEPTH for the shape fault that killed the live
+                    # repo-rewards run of 2026-08-29 (see _check_array_item_shape).
+                    # The provider chokepoint now raises on a non-object element,
+                    # but THIS loop is the consumer that dereferences it, and this
+                    # try/except historically wrapped only the CALL - so the
+                    # AttributeError landed outside it and aborted the program
+                    # instead of skipping one module. Validating the shape inside
+                    # the try means a fault arriving by ANY route (a provider added
+                    # later that bypasses the chokepoint, a salvage path, a cached
+                    # answer) degrades to this file's [skip], which is what the
+                    # surrounding code was always written to expect.
+                    if not isinstance(gen, dict):
+                        raise RuntimeError(
+                            "test generation returned "
+                            f"{type(gen).__name__}, not an object")
+                    _check_array_item_shape(gen, TEST_GEN_SCHEMA, "")
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     manual_review.add(rel)
