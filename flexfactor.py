@@ -3667,6 +3667,7 @@ def _rotation_route_provider(route):
 # Printed-once guards so an absent catalog explains itself exactly once per
 # process instead of once per program in a batch run.
 _ROTATION_REASON_PRINTED: set[str] = set()
+_LAST_ROTATION_USABLE = 0   # usable route count of the last rotation build
 # Same guard for the catalog-staleness warning, keyed by catalog PATH: the fact
 # is about the file, so it is worth saying once and worthless said per route.
 # LOCKED, unlike its sibling above: a `--parallel` batch builds providers from
@@ -4071,13 +4072,20 @@ _UNFIT_CODE_PATTERNS = _ff_directed._UNFIT_CODE_PATTERNS
 _unfit_for_code_reason = _ff_directed.unfit_for_code_reason
 
 
-def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
+def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
+                             quiet: bool = False):
     """Return a RotatingProvider, or None with the reason PRINTED (never silent).
 
     None means "keep the existing provider selection" — rotation is the default
     when a usable catalog exists, and exactly the prior behaviour when not.
+
+    `quiet` builds a SECOND provider off the same catalog without repeating the
+    banner, credential list and staleness note the first one already printed.
+    Only the announcement is suppressed; nothing about selection changes.
     """
     def _say(reason: str) -> None:
+        if quiet:
+            return
         if reason and reason not in _ROTATION_REASON_PRINTED:
             _ROTATION_REASON_PRINTED.add(reason)
             print(f"  [rotation] not rotating: {reason}", file=sys.stderr)
@@ -4095,7 +4103,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
         _say(fr.unavailable_reason() or "route catalog is empty")
         return None
     hydrated = _hydrate_route_credentials(catalog.enabled())
-    if hydrated:
+    if hydrated and not quiet:
         print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
               + ", ".join(hydrated), file=sys.stderr)
     usable, dropped = [], {}
@@ -4145,7 +4153,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     # It is printed HERE, below the "no usable route" bail-out above, so it is
     # only ever said about a catalog this run is actually going to rotate on.
     stale_note = fr.catalog_staleness_note(catalog)
-    if stale_note and _claim_stale_warning(catalog.path):
+    if stale_note and not quiet and _claim_stale_warning(catalog.path):
         print(f"  [rotation] {stale_note}", file=sys.stderr)
     # Say free-vs-paid out loud. The line used to read "N free routes" and was
     # printed by the same code whether or not that was true, so once paid routes
@@ -4155,9 +4163,12 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     n_paid = len(usable) - n_free
     mix = f"{n_free} free" + (f" + {n_paid} paid (billed against --max-cost "
                               f"${getattr(args, 'max_cost', 0) or 0:g})" if n_paid else "")
-    print(f"  [rotation] ON: {mix} routes over {pools} pools, "
-          f"author tier '{author_tier}'"
-          + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
+    if not quiet:
+        print(f"  [rotation] ON: {mix} routes over {pools} pools, "
+              f"author tier '{author_tier}'"
+              + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
+    global _LAST_ROTATION_USABLE
+    _LAST_ROTATION_USABLE = len(usable)
     return fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=fr.LIGHT,
                                allow_paid=True, meter=meter,
@@ -4386,7 +4397,34 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
         if not args.model and not getattr(args, "judge_model", None):
             rotating = _build_rotating_provider(args, meter, model_mode)
             if rotating is not None:
-                return [("rotation", rotating)]
+                out_rot: list[tuple[str, object]] = [("rotation", rotating)]
+                # A SECOND ROTATED ROUTE VERIFIES EVERY FIX.
+                #
+                # Rotation is the default whenever a usable catalog exists, so
+                # this - not the FCC/ollama pool below - is the free path almost
+                # every run actually takes. It returned ONE provider, and every
+                # fix-approval gate in this file is conditional on a second one
+                # (`cross = providers[1][1] if len(providers) > 1 else None`).
+                # So the normal free run authored a fix and accepted it on the
+                # author's own say-so while 120 other free routes stood idle:
+                # the run rotated hard for reviewing and not at all for the one
+                # decision that actually writes to the repo.
+                #
+                # The verifier is a second independent RotatingProvider over the
+                # same catalog. Both share the rotator's LRU state store, and
+                # the rotator already keeps a reviewer off the author's model
+                # family, so the two land on genuinely different models. Every
+                # route here is free in free mode, so this costs nothing but the
+                # latency of the check it performs.
+                if (args.use_both and _LAST_ROTATION_USABLE > 1
+                        and model_mode != "paid"):
+                    verifier = _build_rotating_provider(
+                        args, meter, model_mode, quiet=True)
+                    if verifier is not None:
+                        out_rot.append(("rotation-verify", verifier))
+                        print("  [rotation] every fix is cross-verified by a "
+                              "second rotated route (free).", file=sys.stderr)
+                return out_rot
         fcc_usable = _usable("anthropic") and _provider_free_routed("anthropic")
         ollama_usable = _usable("ollama")
         if fcc_usable or ollama_usable:

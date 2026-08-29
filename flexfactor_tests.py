@@ -424,6 +424,81 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._auto_activate_fcc_proxy = real_fcc
             ff._build_rotating_provider = real_rot
 
+    def test_rotation_returns_a_second_route_to_verify_every_fix(self):
+        """The default free path is rotation, and it returned ONE provider.
+
+        `cross = providers[1][1] if len(providers) > 1 else None` gates every
+        fix-approval path in the run, so a single-provider rotation meant the
+        normal free run wrote each fix on the author's own say-so while the rest
+        of the catalog (121 free routes over 23 pools, measured on this machine)
+        stood idle. Rotation now hands back a second independent route for the
+        cross-check, built quietly so the banner is not printed twice."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        calls = []
+        real_build = ff._build_rotating_provider
+        real_usable = ff._LAST_ROTATION_USABLE
+        real_fcc = ff._auto_activate_fcc_proxy
+
+        def fake_build(a, meter, mode, quiet=False):
+            calls.append(quiet)
+            ff._LAST_ROTATION_USABLE = 7
+            return object()
+
+        ff._build_rotating_provider = fake_build
+        ff._auto_activate_fcc_proxy = lambda: None
+        try:
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["rotation", "rotation-verify"], names)
+            self.assertEqual([False, True], calls,
+                             "the verifier must be built quietly - one banner "
+                             "per run, not two")
+        finally:
+            ff._build_rotating_provider = real_build
+            ff._LAST_ROTATION_USABLE = real_usable
+            ff._auto_activate_fcc_proxy = real_fcc
+
+    def test_rotation_with_one_usable_route_stays_single(self):
+        """One route cannot cross-check itself; claiming otherwise would be the
+        same silent-approval defect wearing the opposite mask."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        real_build = ff._build_rotating_provider
+        real_usable = ff._LAST_ROTATION_USABLE
+        real_fcc = ff._auto_activate_fcc_proxy
+
+        def fake_build(a, meter, mode, quiet=False):
+            ff._LAST_ROTATION_USABLE = 1
+            return object()
+
+        ff._build_rotating_provider = fake_build
+        ff._auto_activate_fcc_proxy = lambda: None
+        try:
+            self.assertEqual(["rotation"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+        finally:
+            ff._build_rotating_provider = real_build
+            ff._LAST_ROTATION_USABLE = real_usable
+            ff._auto_activate_fcc_proxy = real_fcc
+
     def test_paid_mode_runs_when_both_models_are_usable(self):
         """The positive half of the pair rule: two healthy keys -> two providers,
         author first and the cross-checker second."""
