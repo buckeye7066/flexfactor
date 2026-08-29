@@ -116,12 +116,36 @@ class ConfigSurfaceTests(unittest.TestCase):
         if os.path.isdir(assets):
             sources += [os.path.join(assets, f) for f in os.listdir(assets)
                         if f.endswith((".js", ".mjs", ".cjs"))]
+        # ...nor only Python and JavaScript. The .ps1 launchers ARE the runtime
+        # on this platform - they are what a desktop shortcut starts - and they
+        # read their own variables. A launcher knob documented in the template
+        # would have been reported as fiction purely because no .py mentions it.
+        sources += [os.path.join(HERE, f) for f in os.listdir(HERE)
+                    if f.endswith(".ps1")]
+        scripts = os.path.join(HERE, "scripts")
+        if os.path.isdir(scripts):
+            sources += [os.path.join(scripts, f) for f in os.listdir(scripts)
+                        if f.endswith(".ps1")]
         blob = ""
         for path in sources:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 blob += fh.read()
         fiction = sorted(n for n in listed if n not in blob)
         self.assertEqual(fiction, [], f"documented but never read: {fiction}")
+
+    def test_a_launcher_only_variable_is_not_called_fiction(self):
+        """The .ps1 launchers are the runtime a desktop shortcut starts.
+
+        FLEXFACTOR_PYTHON is read only by scripts\\flexfactor_python.ps1 - no
+        Python file mentions it - so before the launchers were scanned, the
+        template documenting it would have failed as documented-but-never-read.
+        The variable is real: it is how a host with several Pythons pins the one
+        FlexFactor runs, and how the launcher-parity suite reaches its stub."""
+        self.assertIn("FLEXFACTOR_PYTHON", documented())
+        resolver = os.path.join(HERE, "scripts", "flexfactor_python.ps1")
+        self.assertTrue(os.path.isfile(resolver))
+        with open(resolver, encoding="utf-8") as fh:
+            self.assertIn("FLEXFACTOR_PYTHON", fh.read())
 
     def test_every_runtime_variable_is_documented(self):
         listed = documented()

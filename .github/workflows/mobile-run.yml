@@ -385,11 +385,19 @@ jobs:
             audit_args=(--model-mode "$model_mode" --max-cost "$MAX_COST"
               --no-dashboard --yes --apply --trust-repo --allow-dirty --auto-clean)
             if [ "$ECONOMY" = true ]; then audit_args+=(--economy); fi
+            # --single is for the cases where a PAIR is impossible or was not
+            # asked for: the owner turned the cross-check off, or the provider
+            # is not one of the two named accounts (ollama is local; copilot has
+            # no vendor key of its own).
+            #
+            # It is deliberately NOT added when a pair member's key is simply
+            # missing. That branch used to quietly hand the run --single, which
+            # removes the approval step paid mode is named for and reports the
+            # run as ordinary - the same silent downgrade the desktop path was
+            # refusing at the same moment. The engine now refuses that run and
+            # names the missing key, so the phone shows the reason and the fix
+            # instead of a weaker run that looks like a normal one.
             if [ "$USE_BOTH" != true ] || [ "$PROVIDER" = ollama ] || [ "$PROVIDER" = copilot ]; then
-              audit_args+=(--single)
-            elif [ "$PROVIDER" = openai ] && [ -z "$ANTHROPIC_API_KEY" ]; then
-              audit_args+=(--single)
-            elif [ "$PROVIDER" = anthropic ] && [ -z "$OPENAI_API_KEY" ]; then
               audit_args+=(--single)
             fi
             python engine/flexfactor.py "$MODE" \

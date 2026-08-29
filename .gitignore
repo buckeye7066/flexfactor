@@ -48,3 +48,10 @@ catalog.auto.json
 # Per-run evidence written by a run started FROM this checkout (`runs/`), the
 # same class as logs/ above: it is output, not source.
 runs/
+
+# The interpreter README tells every owner to create (`py -3.12 -m venv .venv`).
+# It was never ignored, so the documented install left thousands of
+# untracked files in `git status` - and FlexFactor's own dirty-tree gate
+# reads that status.
+.venv/
+venv/
