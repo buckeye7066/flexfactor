@@ -195,6 +195,79 @@ def classify(text: str) -> Tuple[str, str]:
     return KIND_UNKNOWN, _SUGGEST_FALLBACK
 
 
+# A HOST THAT COULD NOT REACH THE NETWORK IS NOT A BROKEN PROGRAM.
+#
+# LIVE repo-rewards 2026-08-29 (run reporewards-...-35988-0002). The baseline
+# gate ran `npm run typecheck` (PASSED) then `npm run build`, which failed with:
+#
+#     Error: connect ECONNREFUSED 127.0.0.1:9
+#     src\app\layout.tsx  `next/font` error:
+#         Failed to fetch `IBM Plex Sans` from Google Fonts.
+#
+# Port 9 is the DISCARD port: something in that run's environment pointed the
+# proxy at a blackhole, so `next/font` could not fetch its webfonts at build
+# time. The code was fine - the SAME tree builds clean on this host with normal
+# network (measured 2026-08-29: `npm run build` exit 0, 9 routes emitted).
+#
+# FlexFactor filed it `program-defect` and told the owner to "Fix the
+# compile/build errors" - advice for errors that did not exist - then refused
+# to publish 49 fixes and reported the repository NOT PRODUCTION READY. A
+# confidently wrong diagnosis is worse than none: it is the same failure shape
+# as the 2026-08-20 circuit breaker that blamed a "provider outage" for eight
+# hours while every backend was up.
+#
+# PUBLICATION STILL REFUSES on this verdict, and that is deliberate. An
+# unevaluated build is `None`, not `True` - the tri-state rule this codebase
+# already enforces in `_full_gate`. What changes is the DIAGNOSIS and the
+# instruction, not the gate.
+#
+# Deliberately CONSERVATIVE: a bare connection error is not enough, because a
+# program's own tests may legitimately assert one. A network token must
+# CO-OCCUR with a build-infrastructure token (a webfont/package/registry fetch,
+# or DNS resolution) before the failure is excused as environmental. Erring
+# toward "program-defect" only costs a misleading message; erring the other way
+# would excuse a real defect that cannot reach a service it needs.
+_NETWORK_FAILURE_TOKENS = (
+    r"ECONNREFUSED", r"ENOTFOUND", r"EAI_AGAIN", r"ETIMEDOUT", r"ECONNRESET",
+    r"getaddrinfo", r"socket hang up", r"network timed out",
+    r"unable to (?:get|verify) local issuer certificate",
+)
+_BUILD_RESOURCE_TOKENS = (
+    r"from Google Fonts", r"next/font", r"fonts\.googleapis\.com",
+    r"fonts\.gstatic\.com", r"registry\.npmjs\.org", r"registry\.yarnpkg\.com",
+    r"pypi\.org", r"files\.pythonhosted\.org", r"crates\.io", r"proxy\.golang\.org",
+    r"repo\.maven\.apache\.org", r"rubygems\.org", r"nuget\.org",
+    r"failed to (?:fetch|download|resolve)",
+)
+
+
+def build_failure_is_environmental(log_text: str) -> Optional[str]:
+    """Name the environment cause when a baseline build/test log shows the HOST
+    prevented evaluation, or None when the evidence points at the code.
+
+    Returns a short human cause (used in the ledger entry and the console) so
+    every surface quotes the SAME sentence - a second formatter is how the
+    dashboard and errors.md start disagreeing about what happened.
+    """
+    text = log_text or ""
+    if not text.strip():
+        return None
+    net = next((p for p in _NETWORK_FAILURE_TOKENS
+                if re.search(p, text, re.I)), None)
+    if net is None:
+        return None
+    res = next((p for p in _BUILD_RESOURCE_TOKENS
+                if re.search(p, text, re.I)), None)
+    if res is None:
+        return None
+    hit = re.search(net, text, re.I)
+    blackhole = re.search(r"127\.0\.0\.1:9\b|localhost:9\b", text)
+    where = " (a proxy pointing at the discard port 127.0.0.1:9)" if blackhole else ""
+    return (f"the build could not reach the network{where}: "
+            f"{hit.group(0) if hit else 'connection failure'} while fetching a "
+            "build-time resource")
+
+
 def responsible_frame(exc: Optional[BaseException], tool_root: str) -> Optional[Dict[str, Any]]:
     """The innermost stack frame inside FlexFactor's own code, with its source line.
 
