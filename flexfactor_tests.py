@@ -1831,6 +1831,238 @@ class PurposeAssessmentResilienceTests(unittest.TestCase):
         self.assertIn("no assessor available", errors[0])
 
 
+class ReviewerRouteQualityTests(unittest.TestCase):
+    """The rotator learned from fixes and not from reviews.
+
+    `_report_route_quality` was called only from the fix loop, so a route that
+    reliably returned reviews the evidence gate refuses - "supplied findings but
+    none had valid source evidence" - kept its full share of the rotation and
+    kept being drawn. Measured 2026-08-29 on a free run: 2 candidate files,
+    three separate routes tried, 0 reviewed. The gate was right every time; the
+    result was that nothing downstream of it changed which route came next."""
+
+    class _Reviewer:
+        model = "test-only/reviewer"
+
+        def __init__(self, fail: bool):
+            self.reports: list[tuple[str, str]] = []
+            self._fail = fail
+
+        def report_quality(self, role, signal):
+            self.reports.append((role, signal))
+            return ""
+
+        def structured(self, system, prompt, schema, max_tokens=8000,
+                       model=None, **kw):
+            if self._fail:
+                raise RuntimeError("review supplied findings but none had valid "
+                                   "source evidence; verdict is incomplete, not clean")
+            return {"reviews": [{"file": "a.py", "findings": [], "summary": "clean"}]}
+
+    def _sweep(self, reviewer):
+        with _RepoFixture({"a.py": "value = 1\n"}) as project:
+            return ff._review_all([reviewer], project, ["a.py"],
+                                  report=lambda **kw: None,
+                                  meter=ff.CostMeter(10.0), workers=1,
+                                  batch_semantic=True)
+
+    def test_a_usable_review_credits_the_route_that_produced_it(self):
+        reviewer = self._Reviewer(fail=False)
+        self._sweep(reviewer)
+        self.assertIn(("reviewer", "verified"), reviewer.reports,
+                      "a completed review must reach the rotator as a reviewer win")
+
+    def test_a_refused_review_is_charged_to_the_route_that_produced_it(self):
+        reviewer = self._Reviewer(fail=True)
+        self._sweep(reviewer)
+        self.assertIn(("reviewer", "rejected"), reviewer.reports,
+                      "the route whose review the gate refused must lose priority")
+
+    def test_a_fixed_provider_has_nothing_to_learn_and_is_not_asked(self):
+        """`_report_route_quality` no-ops on a provider with no report_quality;
+        the accounting must never break a sweep on an ordinary provider."""
+
+        class _Plain:
+            model = "test-only/plain"
+
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, **kw):
+                return {"reviews": [{"file": "a.py", "findings": [],
+                                     "summary": "clean"}]}
+
+        self._sweep(_Plain())     # must not raise
+
+
+class EphemeralStagingTests(unittest.TestCase):
+    """FlexFactor's own litter must not land in the owner's repository.
+
+    Measured 2026-08-29 on a real free-path run that pushed to a target's main:
+    the commit carried three `__pycache__/*.pyc` files beside the source change,
+    because `git add -A` stages what is on disk and the project had no
+    .gitignore. FlexFactor ran the tests that produced them, so they are ours."""
+
+    def _repo(self, tmp):
+        for argv in (["init", "-q", "-b", "main"],
+                     ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *argv], cwd=tmp, capture_output=True, text=True)
+
+    def _write(self, root, rel, body="x\n"):
+        path = os.path.join(root, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def _staged(self, root):
+        out = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                             cwd=root, capture_output=True, text=True)
+        return sorted(x for x in out.stdout.splitlines() if x.strip())
+
+    def test_new_build_droppings_are_left_out_of_the_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            self._write(root, "__pycache__/app.cpython-314.pyc")
+            self._write(root, "src/__pycache__/mod.pyc")
+            self._write(root, ".pytest_cache/v/cache/lastfailed")
+            self._write(root, "node_modules/left-pad/index.js")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(["app.py"], self._staged(root))
+            self.assertEqual(4, len(dropped), dropped)
+
+    def test_a_file_the_project_ALREADY_TRACKS_is_never_unstaged(self):
+        """Tracking a .pyc is the owner's decision; dropping a modification to a
+        tracked file would silently discard a real change."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "vendor/thing.pyc", "one\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self._write(root, "vendor/thing.pyc", "two\n")     # a MODIFICATION
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            self.assertEqual([], ff._unstage_ephemeral_additions(root))
+            self.assertEqual(["vendor/thing.pyc"], self._staged(root))
+
+    def test_an_ordinary_change_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "a.py", "one\n")
+            self._write(root, "docs/readme.md", "hello\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            self.assertEqual([], ff._unstage_ephemeral_additions(root))
+            self.assertEqual(["a.py", "docs/readme.md"], self._staged(root))
+
+    def test_a_C_quoted_path_is_still_dropped(self):
+        """`--name-only` C-quotes a non-ASCII path, and stripping the quotes does
+        not decode the escapes - the reset would name a file that does not exist,
+        leave the artifact staged, and still report it dropped. `-z` is why."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            self._write(root, "caf\u00e9/__pycache__/x.pyc")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(["app.py"], self._staged(root))
+            self.assertEqual(1, len(dropped), dropped)
+            self.assertIn("__pycache__", dropped[0])
+
+    def test_pathspec_magic_is_disabled_not_merely_undelimited(self):
+        """A file literally named `:(exclude)x.pyc` is read as pathspec MAGIC
+        even after `--`, and `git reset` would then unstage every staged path -
+        the fix this run just made included, after which the commit says
+        "nothing to commit".
+
+        `--pathspec-file-nul` does NOT prevent that: it settles how entries are
+        delimited and unquoted, not whether they are parsed as magic. Linux CI
+        proved the difference; `--literal-pathspecs` is the option that works.
+
+        The test drives the MECHANISM rather than planting the file, because
+        Windows refuses ':' in a filename - and a test that skips on the only
+        platform half the runs use is a test that is not protecting anything.
+        `:(exclude)app.py` is the discriminator: read as magic it means
+        "everything except app.py" and unstages the .pyc; read literally it
+        names a file that does not exist and unstages nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            self._write(root, "sub/x.pyc")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            self.assertEqual(["app.py", "sub/x.pyc"], self._staged(root))
+            spec = os.path.join(root, "..", "magic.pathspec")
+            with open(spec, "wb") as fh:
+                fh.write(b":(exclude)app.py\0")
+            try:
+                out = subprocess.run(
+                    ["git", "--literal-pathspecs", "reset", "-q",
+                     f"--pathspec-from-file={spec}", "--pathspec-file-nul"],
+                    cwd=root, capture_output=True, text=True)
+            finally:
+                os.remove(spec)
+            self.assertEqual(0, out.returncode, out.stderr)
+            self.assertEqual(["app.py", "sub/x.pyc"], self._staged(root),
+                             "magic was still parsed: `:(exclude)app.py` "
+                             "unstaged something instead of matching nothing")
+
+    def test_the_helper_uses_literal_pathspecs(self):
+        """The mechanism test above proves git's behaviour; this proves the
+        helper asks for it. Both are needed - one without the other passes while
+        the product does the wrong thing."""
+        source = inspect.getsource(ff._unstage_ephemeral_additions)
+        self.assertIn("--literal-pathspecs", source)
+        self.assertIn("--pathspec-file-nul", source)
+        self.assertIn("-z", source)
+
+    def test_thousands_of_artifacts_do_not_blow_the_command_line(self):
+        """An unignored node_modules is thousands of paths. One `git reset` argv
+        would exceed ~32 KiB on Windows, `_run` would return a launch error, this
+        helper would report "dropped nothing", and the whole generated tree would
+        be committed and pushed - the exact case it exists to prevent, arriving
+        through its own remedy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            for i in range(1200):
+                self._write(root, f"node_modules/pkg{i}/index-with-a-long-name.js")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(1200, len(dropped))
+            self.assertEqual(["app.py"], self._staged(root))
+
+    def test_droppings_left_on_disk_do_not_make_the_tree_dirty(self):
+        """Unstaging keeps them out of the commit and leaves them on disk as
+        `?? __pycache__/`. If the clean-tree predicate still counted those, a run
+        that fixed and committed everything would finish "UNCOMMITTED changes
+        remain" and the next audit would refuse to start."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self._write(root, "__pycache__/app.cpython-314.pyc")
+            self._write(root, ".pytest_cache/v/lastfailed")
+            self.assertTrue(ff._git_tree_clean(root),
+                            "build droppings alone must not read as owner work")
+            self._write(root, "real_change.py", "x = 2\n")
+            self.assertFalse(ff._git_tree_clean(root),
+                             "a genuine untracked source file is still dirty")
+
+    def test_tidiness_never_blocks_a_commit(self):
+        """A repo git cannot read must not turn a fix into a failed run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual([], ff._unstage_ephemeral_additions(os.path.realpath(tmp)))
+
+
 class GitWorktreeContainmentTests(unittest.TestCase):
     """A directory INSIDE someone else's repo is not this run's repo.
 

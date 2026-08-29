@@ -6332,7 +6332,19 @@ def _is_flexfactor_artifact(rel: str) -> bool:
 
 def _git_tree_clean(path: str) -> bool:
     """True if the tree has no changes EXCEPT FlexFactor's own generated artifacts
-    (audit/scout reports, proposals, e2e specs, playwright config) left by a prior run."""
+    (audit/scout reports, proposals, e2e specs, playwright config) left by a prior
+    run, and the build droppings a run's own install/test steps create.
+
+    THE DROPPINGS BELONG HERE, not only in the staging filter. Unstaging a
+    `__pycache__/x.pyc` keeps it out of the commit but leaves it on disk as
+    `?? __pycache__/`, so a run that fixed and committed everything would still
+    finish "UNCOMMITTED changes remain ... NOT a clean checkpoint", and the NEXT
+    audit would refuse to start against a dirty tree. That trades a polluted
+    commit for a blocked repository, which is worse than the defect.
+
+    They are NOT deleted from the working tree: FlexFactor did create them, but
+    a predicate named "is this tree clean" has no business removing files, and a
+    pattern list is not a good enough reason to unlink somebody's data."""
     r = _git(["status", "--porcelain"], path)
     if r.returncode != 0:
         return False
@@ -6342,8 +6354,10 @@ def _git_tree_clean(path: str) -> bool:
         name = line[3:] if len(line) > 3 else ""  # strip the 2-char status + space
         if " -> " in name:  # rename: judge the destination path
             name = name.split(" -> ", 1)[1]
-        if not _is_flexfactor_artifact(name):
-            return False  # a real, non-FlexFactor change -> genuinely dirty
+        name = name.strip().strip('"')
+        if _is_flexfactor_artifact(name) or _is_ephemeral_path(name):
+            continue
+        return False  # a real, non-FlexFactor change -> genuinely dirty
     return True
 
 
@@ -12657,6 +12671,8 @@ def _review_all(reviewers: list, project_dir: str,
                                                      context=context,
                                                      project_dir=project_dir)
                     merged.extend(findings)
+                    _report_route_quality(reviewer_pool.provider(idx),
+                                          "reviewer", "verified")
                     break                      # reviewed successfully
                 except BudgetExceededError:
                     stop.set()
@@ -12664,6 +12680,8 @@ def _review_all(reviewers: list, project_dir: str,
                     break
                 except Exception as ex:  # one bad LLM call must not abort the sweep
                     failed_idx.add(idx)
+                    _report_route_quality(reviewer_pool.provider(idx),
+                                          "reviewer", "rejected")
                     nm = reviewer_pool.name(idx)
                     if len(failed_idx) < len(reviewer_pool.entries):
                         print(f"  [retry] {rel}: review failed via {nm} ({ex}) "
@@ -12691,6 +12709,11 @@ def _review_all(reviewers: list, project_dir: str,
                 findings, _summary = review_file(reviewer, rel, text, context=context,
                                                  project_dir=project_dir)
                 merged.extend(findings)
+                # The rotator learns from reviews, not only from fixes: a route
+                # whose reviews the evidence gate keeps refusing must lose its
+                # turn, or it is drawn again on the next file. Same accounting on
+                # the batch path above.
+                _report_route_quality(reviewer, "reviewer", "verified")
             except BudgetExceededError:
                 stop.set()
                 complete = False  # aborted mid-review -> not a completed clean review
@@ -12698,6 +12721,7 @@ def _review_all(reviewers: list, project_dir: str,
             except Exception as ex:  # one bad LLM call must not abort the sweep
                 print(f"  [skip] {rel}: review failed ({ex})")
                 _ledger("review", ex, program_file=rel)
+                _report_route_quality(reviewer, "reviewer", "rejected")
                 complete = False  # a reviewer threw -> not fully reviewed
         if not complete:
             return (rel, "incomplete")  # NEVER clean; re-reviewed next cycle
@@ -12792,12 +12816,25 @@ def _review_all(reviewers: list, project_dir: str,
                                 project_dir=project_dir)
                             reviewed[rel] = (findings, summary)
                     reviewer._flexfactor_semantic_unhealthy = False
+                    # THE ROTATOR LEARNS FROM REVIEWS TOO. `_report_route_quality`
+                    # was called only from the fix loop, so a route that reliably
+                    # returned reviews the evidence gate refuses ("supplied
+                    # findings but none had valid source evidence") kept its full
+                    # share of the rotation and kept being drawn. Measured
+                    # 2026-08-29 on a free run: 2 candidate files, three separate
+                    # routes, 0 reviewed - the gate was right every time and
+                    # nothing downstream of it changed which route came next.
+                    _report_route_quality(reviewer, "reviewer", "verified")
                     return [(rel, reviewed[rel][0], sha) for rel, _text, sha in unit]
                 except BudgetExceededError:
                     stop.set()
                     return [(rel, "incomplete") for rel, _text, _sha in unit]
                 except Exception as ex:
                     last_error = ex
+                    # Same accounting as the success path above: the route that
+                    # produced an unusable review is the one that should lose
+                    # priority, not the next one to be drawn.
+                    _report_route_quality(reviewer, "reviewer", "rejected")
                     # A recovered review failure must stay DIAGNOSABLE: the
                     # self-dogfood (2026-08-22) logged "'NoneType' object is not
                     # subscriptable" for flexfactor.py with no frame at all.
@@ -13798,6 +13835,93 @@ def _gh_pr_automerge(project_dir: str, branch: str, base: str,
             "merge it once checks pass")
 
 
+# Build droppings a repository without a .gitignore would otherwise receive as
+# FlexFactor's work. Measured 2026-08-29 on a real free-path run: the commit
+# FlexFactor pushed to a target's main carried three `__pycache__/*.pyc` files
+# alongside the source change, because `git add -A` stages whatever is on disk
+# and the project had nothing ignoring them. FlexFactor RAN the tests that
+# produced them, so this is our litter, not the owner's.
+_EPHEMERAL_STAGE_PARTS = ("__pycache__", ".pytest_cache", ".mypy_cache",
+                          ".ruff_cache", "node_modules", ".venv", "venv",
+                          ".tox", ".nox", "htmlcov", ".coverage_html")
+_EPHEMERAL_STAGE_SUFFIXES = (".pyc", ".pyo", ".pyd", ".orig", ".rej")
+
+
+def _is_ephemeral_path(rel: str) -> bool:
+    """A build dropping, by path shape. Used by BOTH the staging filter and the
+    clean-tree predicate - unstaging a file while still counting it as dirt
+    would trade a polluted commit for a run that can never report a clean
+    checkpoint, and a next run that refuses to start on a dirty tree."""
+    text = str(rel or "").replace("\\", "/").strip().strip("/")
+    if not text:
+        return False
+    if any(part in _EPHEMERAL_STAGE_PARTS for part in text.split("/")):
+        return True
+    return text.endswith(_EPHEMERAL_STAGE_SUFFIXES)
+
+
+def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
+    """Drop NEWLY ADDED build droppings from the index. Returns what it dropped.
+
+    Deliberately limited to `--diff-filter=A`: a path that the repository
+    ALREADY TRACKS is the owner's decision, and unstaging a modification to it
+    would silently drop a real change. Only files this run is about to add for
+    the first time are eligible, so the worst case is that a project which
+    genuinely wants to commit a .pyc has to add it itself once.
+
+    THREE THINGS ABOUT THE PLUMBING, each of which is a real failure and not a
+    style preference:
+
+    * `-z`. `--name-only` C-QUOTES a path that is non-ASCII or contains a
+      newline, so `café/x.pyc` arrives as `"caf\\303\\251/x.pyc"`. Stripping the
+      quotes does not decode the escapes, so the reset would name a file that
+      does not exist, leave the artifact staged, and still be reported dropped.
+    * `--pathspec-from-file` + `--pathspec-file-nul`. Git reads these operands as
+      PATHSPECS even after `--`, so an added file literally named
+      `:(exclude)x.pyc` would be read as exclusion magic and `git reset` could
+      unstage every staged path - including the fix this run just made, after
+      which the commit says "nothing to commit". NUL-delimited pathspec-file
+      entries are literal by definition.
+    * ...and it also removes the argv limit. An unignored `node_modules` is
+      thousands of paths; one `git reset` invocation would exceed ~32 KiB on
+      Windows, `_run` would return a launch error, this helper would return
+      "dropped nothing", and the entire generated tree would be committed and
+      pushed. The exact case this function exists to prevent, arriving through
+      its own remedy.
+    """
+    listed = _git(["diff", "--cached", "--name-only", "-z", "--diff-filter=A"],
+                  project_dir)
+    if listed.returncode != 0:
+        return []                       # never block a commit over tidiness
+    drop = [rel for rel in (listed.stdout or "").split("\0")
+            if rel and _is_ephemeral_path(rel)]
+    if not drop:
+        return []
+    handle, spec = tempfile.mkstemp(prefix="flexfactor-unstage-", suffix=".pathspec")
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(b"\0".join(rel.encode("utf-8") for rel in drop))
+        # `--literal-pathspecs` is the part that actually disables MAGIC.
+        # `--pathspec-file-nul` only settles how entries are DELIMITED and
+        # unquoted; git still parses a leading `:(exclude)` / `:!` / `:/` as
+        # magic, so a file literally named `:(exclude)evil.pyc` made this reset
+        # unstage every staged path. Caught on Linux CI by the test written for
+        # exactly that case - Windows refuses ':' in a filename, so the same
+        # test skips there and the mistake would have shipped on the strength of
+        # a local green.
+        reset = _git(["--literal-pathspecs", "reset", "-q",
+                      f"--pathspec-from-file={spec}", "--pathspec-file-nul"],
+                     project_dir)
+    finally:
+        try:
+            os.remove(spec)
+        except OSError:
+            pass
+    if reset.returncode != 0:
+        return []
+    return drop
+
+
 def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                      label: str, stack: dict) -> str:
     """Commit (and optionally push/merge) this cycle's work BEFORE the next cycle
@@ -13818,6 +13942,12 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         # fixes UNSTAGED and let us commit stale content. Fail hard before committing.
         raise BranchStateError(
             f"{label}: 'git add -A' failed (rc={add.returncode}): {_tail(add.stderr, 3)}")
+    dropped = _unstage_ephemeral_additions(project_dir)
+    if dropped:
+        shown = ", ".join(dropped[:4]) + (f" (+{len(dropped) - 4} more)"
+                                          if len(dropped) > 4 else "")
+        print(f"  [stage] left {len(dropped)} build artifact(s) out of the commit: "
+              f"{shown}")
     diff = _git(["diff", "--cached", "--quiet"], project_dir)
     # `git diff --quiet` uses the exit code as data: 0 = no staged change, 1 = there
     # ARE staged changes, >1 = a real error. Do NOT treat >1 as 'nothing to commit'.
