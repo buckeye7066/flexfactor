@@ -282,6 +282,18 @@ class FixDiffTests(unittest.TestCase):
 
 
 class PricingAndEconomyTests(unittest.TestCase):
+    def tearDown(self):
+        # build_audit_providers publishes the chosen free backends in a MODULE
+        # GLOBAL, and audit_one_program wraps whatever is in it into the
+        # reviewer pool. Tests here call the real builder with stub providers,
+        # so leaving that global populated hands a LATER test's audit a pool of
+        # fakes: ResumeCheckpointTests then reviewed nothing and reported
+        # "provider errors/budget" - a failure with no connection to its own
+        # subject, and only when the two ran in the same process.
+        ff._LAST_FREE_REVIEW_POOL = []
+        ff._LAST_ROTATION_USABLE = 0
+        ff._PROVIDER_DIAGNOSIS = ""
+
     def test_claude5_family_priced(self):
         # Missing entries silently fall back to Opus-tier pricing (5/25), which
         # overbills the meter and stops budget-capped runs early.
@@ -498,6 +510,78 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._build_rotating_provider = real_build
             ff._LAST_ROTATION_USABLE = real_usable
             ff._auto_activate_fcc_proxy = real_fcc
+
+    def test_copilot_in_paid_mode_still_needs_both_models(self):
+        """`other` is only ever the other half of the anthropic/openai pair.
+
+        A paid run with --provider copilot therefore left paid_pair_required
+        false and ran alone - the pair promise broken by the one permitted paid
+        provider that never had a partner."""
+        class Args:
+            provider = "copilot"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        ff._provider_free_routed = lambda name: False
+        try:
+            ff._provider_key_present = lambda name: name == "copilot"
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
+            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
+            # Both halves present: copilot authors, and a pair member reviews.
+            ff._provider_key_present = lambda name: True
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["copilot", "anthropic"], names)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
+    def test_secondary_model_is_honoured_by_the_free_pool_verifier(self):
+        """--secondary-model is documented as the 2nd cross-check provider's
+        model. Honouring it only on the paid branch discards an explicit choice
+        with no message."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = "chosen-cross-checker"
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        picked = []
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        real_fcc = ff._auto_activate_fcc_proxy
+        real_rot = ff._build_rotating_provider
+        ff._provider_key_present = lambda name: True
+        ff._provider_free_routed = lambda name: name == "anthropic"
+        ff._auto_activate_fcc_proxy = lambda: None
+        ff._build_rotating_provider = lambda *a, **kw: None
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append((name, model)) or object())
+        try:
+            ff.build_audit_providers(Args)
+            self.assertIn(("ollama", "chosen-cross-checker"), picked)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+            ff._auto_activate_fcc_proxy = real_fcc
+            ff._build_rotating_provider = real_rot
 
     def test_paid_mode_runs_when_both_models_are_usable(self):
         """The positive half of the pair rule: two healthy keys -> two providers,

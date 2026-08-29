@@ -154,29 +154,64 @@ class ReadOnlyPerimeterTests(unittest.TestCase):
 
     def test_a_trailing_comment_cannot_swallow_the_clamp(self):
         out = pe.clamp_read_only_sql(
-            "SELECT id FROM profiles -- everything after this is a comment", 10)
+            "SELECT count(id) FROM profiles -- everything after this is a comment", 10)
         self.assertEqual(out.splitlines()[-1], "LIMIT 10")
 
     def test_an_explicit_limit_is_respected_not_doubled(self):
-        out = pe.clamp_read_only_sql("SELECT id FROM profiles LIMIT 5", 200)
+        out = pe.clamp_read_only_sql("SELECT count(id) FROM profiles LIMIT 5", 200)
         self.assertEqual(out.lower().count("limit"), 1)
 
     def test_a_limit_that_is_a_literal_does_not_suppress_the_clamp(self):
         # `LIKE '%limit%'` is not a row bound. Requiring a DIGIT after the
         # keyword is what tells them apart; a substring test ran it UNBOUNDED.
         out = pe.clamp_read_only_sql(
-            "SELECT id FROM profiles WHERE sponsor LIKE '%limit%'", 7)
+            "SELECT count(id) FROM profiles WHERE sponsor LIKE '%limit%'", 7)
         self.assertEqual(out.splitlines()[-1], "LIMIT 7")
+
+    def test_a_limit_inside_a_comment_does_not_suppress_the_clamp(self):
+        """`-- LIMIT 5` LOOKED like a row bound, so the clamp was skipped and
+        the query ran unbounded against production."""
+        out = pe.clamp_read_only_sql("SELECT count(*) FROM events -- LIMIT 5", 7)
+        self.assertEqual(out.splitlines()[-1], "LIMIT 7")
+
+    def test_an_over_large_limit_is_clamped_not_trusted(self):
+        """`LIMIT 1000000` was accepted verbatim: the guard asked only whether a
+        numeric limit was PRESENT, so MAX_ROW_LIMIT bounded nothing and
+        fetchall() pulled the whole result set out of production."""
+        out = pe.clamp_read_only_sql("SELECT count(*) FROM t LIMIT 1000000", 30)
+        self.assertEqual("SELECT count(*) FROM t LIMIT 30", out)
+        self.assertEqual(1, out.lower().count("limit"))
+
+    def test_a_keyword_inside_a_literal_is_a_value_not_a_statement(self):
+        """Audit tables are exactly what a data-shaped diagnosis groups by, and
+        `action = 'delete'` was rejected as if it were a DELETE."""
+        for sql in ("SELECT count(*) FROM audit_events WHERE action = 'delete'",
+                    "SELECT count(*) FROM audit_events WHERE action = 'update'",
+                    "SELECT count(*) FROM t WHERE note = 'a; b'",
+                    "SELECT count(*) FROM t /* drop this later */"):
+            with self.subTest(sql=sql):
+                pe.assert_read_only_diagnostic_sql(sql)
+
+    def test_raw_row_selection_is_refused_so_production_values_stay_put(self):
+        """The planner prompt has always said "must not be exfiltrated row by
+        row"; nothing checked, and up to 30 rows of real values were serialized
+        into the next judge prompt and sent to a model provider."""
+        with self.assertRaises(pe.ReadOnlySqlError) as caught:
+            pe.assert_read_only_diagnostic_sql("SELECT * FROM users")
+        self.assertIn("AGGREGATE", str(caught.exception))
+        # ...and the metadata path, which reads information_schema, is exempt.
+        pe.assert_read_only_diagnostic_sql(pe.INTROSPECT_COLUMNS_SQL,
+                                           allow_raw_rows=True)
 
     def test_keyword_lookalike_columns_are_queryable(self):
         # THE 90-of-90 DEFECT: a substring test made every timestamped table
         # unqueryable because `updated_at` contains "update".
-        for sql in ("SELECT updated_at FROM t",
-                    "SELECT created_at, created_by FROM t",
-                    "SELECT deleted_at FROM t",
-                    "SELECT inserted_at FROM t",
-                    "SELECT execution_time_ms FROM t",
-                    "SELECT id FROM grants"):
+        for sql in ("SELECT max(updated_at) FROM t",
+                    "SELECT count(created_at), count(created_by) FROM t",
+                    "SELECT max(deleted_at) FROM t",
+                    "SELECT max(inserted_at) FROM t",
+                    "SELECT avg(execution_time_ms) FROM t",
+                    "SELECT count(id) FROM grants"):
             with self.subTest(sql=sql):
                 pe.assert_read_only_diagnostic_sql(sql)
 
@@ -296,6 +331,96 @@ class AvailabilityIsAVerdictTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # B. SCHEMA DISCOVERY BEFORE SQL
 # --------------------------------------------------------------------------- #
+class EvidenceIntegrityTests(unittest.TestCase):
+    """Three ways this phase could report more than it knows."""
+
+    def test_a_verdict_citing_a_probe_that_never_ran_is_refused(self):
+        """The strongest claim this module makes is "production rows demonstrate
+        this". Every dict the verdict model returned used to be accepted, so a
+        stale or invented query_name carried that claim with nothing under it."""
+        def judge(system, prompt, schema):
+            if schema is pe.DIAGNOSTIC_PLAN_SCHEMA:
+                return {"queries": [{
+                    "name": "real", "question": "q",
+                    "sql": "SELECT user_agent, count(*) AS sessions "
+                           "FROM user_sessions GROUP BY user_agent"}]}
+            return {"findings": [
+                {"query_name": "real", "title": "kept", "severity": "high",
+                 "problem": "p", "evidence": "e", "next_step": "n"},
+                {"query_name": "never_ran", "title": "invented", "severity": "high",
+                 "problem": "p", "evidence": "e", "next_step": "n"}]}
+
+        rec = pe.collect_runtime_evidence(
+            judge, "purpose", env={pe.READONLY_URL_ENV: "postgres://x"},
+            connect=lambda _u: _Conn())
+        self.assertEqual(["kept"], [f["title"] for f in rec["findings"]])
+        self.assertTrue(any("never executed" in r["reason"]
+                            for r in rec["rejected"]),
+                        "the invented citation must be recorded, not dropped")
+
+    def test_a_truncated_schema_is_not_presented_as_the_whole_schema(self):
+        """information_schema is ordered by table name, so a bound that fills up
+        drops the LAST tables - and every probe against them then comes back
+        rejected as nonexistent."""
+        real = pe.SCHEMA_ROW_LIMIT
+        pe.SCHEMA_ROW_LIMIT = 1        # the fixture returns more rows than this
+        try:
+            rec = pe.collect_runtime_evidence(
+                lambda *a, **k: {"queries": []}, "purpose",
+                env={pe.READONLY_URL_ENV: "postgres://x"},
+                connect=lambda _u: _Conn())
+        finally:
+            pe.SCHEMA_ROW_LIMIT = real
+        self.assertTrue(any("PREFIX of the real" in e for e in rec["errors"]),
+                        rec["errors"])
+
+    def test_one_database_is_not_every_programs_database(self):
+        """A single `--program A --program B` run diagnosed BOTH from whatever
+        one variable pointed at, and attached A's rows to B's report."""
+        E = pe.READONLY_URL_ENV
+        # One program: the bare variable can only mean that program.
+        self.assertEqual(({E: "postgres://a"}, ""),
+                         pe.resolve_program_url("A", 1, {E: "postgres://a"}))
+        # Several programs, only the bare variable: SKIPPED, with the reason.
+        env, why = pe.resolve_program_url("B", 2, {E: "postgres://a"})
+        self.assertEqual({}, env)
+        self.assertIn("nothing ties that one database", why)
+        self.assertIn("not evidence that no data-shaped problem exists", why)
+        self.assertIn(pe.program_url_env("B"), why)
+        # A per-program variable is unambiguous at any program count.
+        self.assertEqual(
+            ({E: "postgres://b"}, ""),
+            pe.resolve_program_url("B", 2, {E: "postgres://a",
+                                            pe.program_url_env("B"): "postgres://b"}))
+        # Nothing configured stays the module's own "not set" verdict.
+        self.assertEqual(({}, ""), pe.resolve_program_url("A", 3, {}))
+
+    def test_the_connection_attempt_is_bounded(self):
+        """statement_timeout is installed only AFTER the connection succeeds, so
+        it cannot bound the connect itself; against a blackholed host the
+        non-fatal evidence phase could stall the whole audit."""
+        self.assertEqual(10, pe.connect_timeout_s({}))
+        self.assertEqual(3, pe.connect_timeout_s({pe.CONNECT_TIMEOUT_ENV: "3"}))
+        self.assertEqual(60, pe.connect_timeout_s({pe.CONNECT_TIMEOUT_ENV: "9999"}))
+        self.assertEqual(1, pe.connect_timeout_s({pe.CONNECT_TIMEOUT_ENV: "0"}))
+        seen = {}
+
+        class _Mod:
+            @staticmethod
+            def connect(url, **kw):
+                seen.update(kw)
+                return _Conn()
+
+        real = pe.load_driver
+        pe.load_driver = lambda: (_Mod, "fake")
+        try:
+            with pe.ReadOnlySession("postgres://x"):
+                pass
+        finally:
+            pe.load_driver = real
+        self.assertEqual(10, seen.get("connect_timeout"))
+
+
 class SchemaDiscoveryTests(unittest.TestCase):
 
     def test_introspection_runs_FIRST_and_reads_information_schema(self):

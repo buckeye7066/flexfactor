@@ -306,6 +306,10 @@ _MAX_TOKEN_LIMIT_PATTERNS = (
 )
 
 
+class _SkipRuntimeEvidence(Exception):
+    """Internal: PHASE 1c has already recorded why it is not running."""
+
+
 class RouteCapabilityError(RuntimeError):
     """This ROUTE cannot serve this call (its output ceiling is too small) --
     another route can. Distinct from OutputBudgetError (the model ran out of
@@ -4609,8 +4613,26 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     #
     # So in paid mode the pair is REQUIRED unless the owner typed `--single`.
     # A missing half is a refusal with a diagnosis, never a weaker run.
+    # `other` is only ever the OTHER member of the anthropic/openai pair, so a
+    # paid run whose primary is copilot (a permitted paid provider) would leave
+    # this false and proceed alone - the pair promise broken by the one provider
+    # choice that never had a partner. Any paid cloud primary now has to produce
+    # the pair; for copilot that means BOTH named models, since it is neither.
     paid_pair_required = (model_mode == "paid" and args.use_both
-                          and primary in {"anthropic", "openai"})
+                          and primary in {"anthropic", "openai", "copilot"})
+    if primary == "copilot" and paid_pair_required:
+        missing_pair = [n for n in ("anthropic", "openai") if not _usable(n)]
+        if missing_pair:
+            _PROVIDER_DIAGNOSIS = (
+                f"paid mode requires BOTH models: '{primary}' authors, but "
+                f"{' and '.join(repr(n) for n in missing_pair)} "
+                f"{'is' if len(missing_pair) == 1 else 'are'} not usable, so "
+                "no second model can approve its fixes. Set working keys for "
+                "both, or pass --single to accept a deliberately single-model "
+                "run, or use free mode.")
+            print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
+            return []
+        other = "anthropic"
     if paid_pair_required and not (other and _usable(other)):
         missing = other or ("openai" if primary == "anthropic" else "anthropic")
         _PROVIDER_DIAGNOSIS = (
@@ -4634,10 +4656,15 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                                        judge_model=judge_override)))
     if (args.use_both and free_pool_cross and other == free_pool_cross
             and _usable(other)):
-        # Free pool cross-checker: the judge tier of the second free backend.
+        # Free pool cross-checker: the judge tier of the second free backend,
+        # unless --secondary-model named one. That flag is documented as the
+        # override for "the 2nd (cross-check) provider", and this is that
+        # provider - honouring it only on the paid branch would discard an
+        # explicit choice with no message, which is how a flag becomes a lie.
         out.append((other, make_provider(
-            other, JUDGE_MODELS.get(other) or DEFAULT_MODELS[other], meter,
-            judge_model=judge_override)))
+            other,
+            args.secondary_model or JUDGE_MODELS.get(other) or DEFAULT_MODELS[other],
+            meter, judge_model=judge_override)))
     elif args.use_both and model_mode == "paid" and other and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
@@ -15241,12 +15268,24 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             report(phase="runtime-data evidence")
             if checkpoint is not None:
                 checkpoint.set_phase("runtime-data evidence")
+            _ev_env, _ev_skip = _pe.resolve_program_url(display_name, total)
             try:
+                if _ev_skip:
+                    runtime_evidence = {
+                        "available": False, "driver": None, "tables": 0,
+                        "queries": [], "rejected": [], "findings": [],
+                        "errors": [], "reason": _ev_skip}
+                    print(f"{pfx}PHASE 1c - runtime-data evidence UNAVAILABLE: "
+                          f"{_ev_skip}")
+                    raise _SkipRuntimeEvidence
                 runtime_evidence = _pe.collect_runtime_evidence(
                     lambda system, prompt, schema: _judge(
                         purpose_reviewer, system, prompt, schema),
                     purpose_blob or f"Program: {display_name}",
+                    env=dict(os.environ, **_ev_env) if _ev_env else None,
                     log=lambda m: print(f"{pfx}PHASE 1c - {m}"))
+            except _SkipRuntimeEvidence:
+                pass
             except BudgetExceededError:
                 runtime_evidence = {
                     "available": False, "driver": None, "tables": 0,

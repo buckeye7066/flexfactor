@@ -902,6 +902,25 @@ def submit_steering(name: str, project_dir: str, comment: str) -> tuple[bool, st
     return True, "queued - the running audit picks it up at its next checkpoint"
 
 
+def steering_labels(targets: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
+    """(menu label, program, dir) with labels that cannot collide.
+
+    Two audited directories can share a basename - ~/work/api and ~/spike/api -
+    and the picker shows only the program name. Looking the directory back up by
+    the displayed name then resolves BOTH entries to whichever was stored last,
+    so choosing either menu row files the comment against one audit and leaves
+    the other silently unsteered. When a name repeats, its directory goes in the
+    label; unique names are left alone so the common case reads normally."""
+    counts: dict[str, int] = {}
+    for name, _pdir in targets:
+        counts[name] = counts.get(name, 0) + 1
+    out = []
+    for name, pdir in targets:
+        label = name if counts.get(name, 0) < 2 else f"{name}  [{pdir}]"
+        out.append((label, name, pdir))
+    return out
+
+
 def steering_status_line(name: str, project_dir: str) -> str:
     """One-line backlog for the selected program, or '' when unavailable."""
     if _steer is None or not name or not project_dir:
@@ -936,6 +955,9 @@ def _main() -> int:
     steer_target = tk.StringVar(value="")
     steer_note = tk.StringVar(value="steer: waiting for a program")
     steer_targets_cache: list[tuple[str, str]] = []
+    # label -> (program, dir). Keyed on the LABEL, which steering_labels
+    # guarantees is unique, so two same-named programs stay distinguishable.
+    steer_by_label: dict[str, tuple[str, str]] = {}
 
     tk.Label(steer_bar, text="Steer:", bg=BG, fg=DIM).pack(side="left")
     target_menu = tk.OptionMenu(steer_bar, steer_target, "")
@@ -953,8 +975,7 @@ def _main() -> int:
                     anchor="w", width=34)
 
     def do_send(_event=None) -> None:
-        name = steer_target.get()
-        pdir = dict(steer_targets_cache).get(name, "")
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
         ok, msg = submit_steering(name, pdir, entry.get())
         if ok:
             entry.delete(0, "end")
@@ -974,20 +995,22 @@ def _main() -> int:
         if targets == steer_targets_cache:
             return
         steer_targets_cache[:] = targets
+        labelled = steering_labels(targets)
+        steer_by_label.clear()
+        steer_by_label.update({lab: (n, d) for lab, n, d in labelled})
         menu = target_menu["menu"]
         menu.delete(0, "end")
-        for name, _pdir in targets:
-            menu.add_command(label=name,
-                             command=lambda n=name: steer_target.set(n))
+        for label, _n, _d in labelled:
+            menu.add_command(label=label,
+                             command=lambda lb=label: steer_target.set(lb))
         current = steer_target.get()
-        if targets and current not in [n for n, _ in targets]:
-            steer_target.set(targets[0][0])
-        elif not targets:
+        if labelled and current not in steer_by_label:
+            steer_target.set(labelled[0][0])
+        elif not labelled:
             steer_target.set("")
 
     def refresh_note() -> None:
-        name = steer_target.get()
-        pdir = dict(steer_targets_cache).get(name, "")
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
         if not name:
             steer_note.set("steer: waiting for a program")
         else:
@@ -1070,6 +1093,15 @@ if __name__ == "__main__":
         assert [n for n, _ in targets] == ["IPlay"], targets
         assert submit_steering("IPlay", "C:/x", "   ")[0] is False,             "an empty comment must be refused, not queued"
         assert submit_steering("", "C:/x", "do the thing")[0] is False,             "a comment with no selected program must be refused"
+        # Two audits can share a basename; the picker shows only the name, so a
+        # label that repeats would steer whichever directory was stored last.
+        collide = steering_labels([("api", "C:/work/api"), ("api", "C:/spike/api"),
+                                   ("solo", "C:/solo")])
+        assert len({lab for lab, _n, _d in collide}) == 3, collide
+        assert [lab for lab, _n, _d in collide][2] == "solo",             "a unique name must stay unadorned"
+        assert {d for _lab, _n, d in collide} == {
+            "C:/work/api", "C:/spike/api", "C:/solo"}, collide
+        print("steering labels:", [lab for lab, _n, _d in collide])
         if _steer is not None:
             _root = _tf.mkdtemp()
             _steer.DEFAULT_ROOT = _root

@@ -49,6 +49,8 @@ import re
 READONLY_URL_ENV = "FLEXFACTOR_READONLY_DATABASE_URL"
 STATEMENT_TIMEOUT_ENV = "FLEXFACTOR_READONLY_STATEMENT_TIMEOUT_MS"
 DEFAULT_STATEMENT_TIMEOUT_MS = 15_000
+CONNECT_TIMEOUT_ENV = "FLEXFACTOR_DB_CONNECT_TIMEOUT_S"
+DEFAULT_CONNECT_TIMEOUT_S = 10
 DEFAULT_ROW_LIMIT = 200
 MAX_ROW_LIMIT = 500
 
@@ -100,18 +102,101 @@ _FORBIDDEN_PATTERNS = tuple(
 # cannot suppress the clamp - the same substring-vs-token confusion as above,
 # except there it silently ran an UNBOUNDED query.
 _EXPLICIT_ROW_LIMIT_RX = re.compile(r"\blimit\s+\d")
+_LIMIT_VALUE_RX = re.compile(r"\blimit\s+(\d+)")
+
+# information_schema is METADATA, not production data: it holds no PII, so the
+# aggregate rule and the 30-row diagnostic cap do not apply to it. They did.
+# `introspect_columns` went through the ordinary executor, so the schema read
+# was clamped to the diagnostic row limit and ORDER BY table_name meant a
+# database with more columns than the cap simply LOST its later tables. The
+# planner was then handed a truncated schema as if it were the whole one, and
+# every probe against a missing table came back rejected as nonexistent.
+SCHEMA_ROW_LIMIT = int(os.environ.get("FLEXFACTOR_SCHEMA_ROW_LIMIT", "20000"))
 _SELECT_RX = re.compile(r"\bselect\b")
+
+# AGGREGATE-ONLY, ENFORCED RATHER THAN ASKED FOR. DIAGNOSTIC_PLAN_SYSTEM has
+# always told the planner "this is production data and must not be exfiltrated
+# row by row", and nothing checked. `SELECT * FROM users` passed both guards
+# and up to 30 rows of real production values - emails, tokens, whatever the
+# table holds - were serialized into the next judge prompt and sent to a model
+# provider. A rule that lives only in a prompt is not a rule.
+_AGGREGATE_FUNCTIONS = frozenset((
+    "count", "sum", "avg", "min", "max", "array_agg", "string_agg",
+    "bool_and", "bool_or", "every", "percentile_cont", "percentile_disc",
+    "stddev", "variance", "corr", "json_agg", "jsonb_agg",
+))
+_AGGREGATE_RX = re.compile(
+    r"\bgroup\s+by\b|\b(?:" + "|".join(sorted(_AGGREGATE_FUNCTIONS))
+    + r")\s*\(")
+
+
+def mask_sql_noise(sql: str) -> str:
+    """Blank out string literals, quoted identifiers and comments, IN PLACE.
+
+    Every character removed is replaced by a space, so the result is the same
+    length as the input and every index still points at the same character of
+    the original. That is what lets the clamp below rewrite an over-large LIMIT
+    by span without re-parsing the original text.
+
+    Why it is needed at all: the guards ran against the raw lowered SQL, so a
+    VALUE could impersonate a statement.
+    `SELECT count(*) FROM audit_events WHERE action = 'delete'` was rejected as
+    a DELETE - and audit tables are precisely what a data-shaped diagnosis wants
+    to group by. In the other direction `SELECT * FROM events -- LIMIT 5` looked
+    like it already carried a row bound, so the clamp was skipped and the query
+    ran unbounded against production.
+    """
+    out = list(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'" or ch == '"':
+            quote = ch
+            out[i] = " "
+            i += 1
+            while i < n:
+                if sql[i] == quote:
+                    out[i] = " "
+                    i += 1
+                    if i < n and sql[i] == quote:   # '' / "" escape
+                        out[i] = " "
+                        i += 1
+                        continue
+                    break
+                out[i] = " "
+                i += 1
+            continue
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            while i < n and sql[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            while i < n and not (sql[i] == "*" and i + 1 < n and sql[i + 1] == "/"):
+                out[i] = " "
+                i += 1
+            for _ in range(2):
+                if i < n:
+                    out[i] = " "
+                    i += 1
+            continue
+        i += 1
+    return "".join(out)
 
 
 def find_forbidden_sql_keyword(lowered_sql: str) -> str | None:
-    """Return the forbidden keyword this SQL uses AS A KEYWORD, or None."""
+    """Return the forbidden keyword this SQL uses AS A KEYWORD, or None.
+
+    Callers pass MASKED sql (see mask_sql_noise): a keyword inside a literal or
+    a comment is data, not a statement."""
     for keyword, rx in _FORBIDDEN_PATTERNS:
         if rx.search(lowered_sql):
             return keyword
     return None
 
 
-def assert_read_only_diagnostic_sql(sql: str) -> tuple[str, bool]:
+def assert_read_only_diagnostic_sql(sql: str, *,
+                                    allow_raw_rows: bool = False) -> tuple[str, bool]:
     """The single chokepoint deciding whether a string is a safe read-only
     diagnostic query.  Returns (lowered, has_explicit_limit); raises
     ReadOnlySqlError otherwise.
@@ -124,17 +209,21 @@ def assert_read_only_diagnostic_sql(sql: str) -> tuple[str, bool]:
     if not isinstance(sql, str) or not sql.strip():
         raise ReadOnlySqlError("SQL query is required")
     lowered = sql.strip().lower()
-    if not lowered.startswith("select"):
+    # Every structural check below runs on the MASKED text, so a value or a
+    # comment can never impersonate a statement (or a row bound). The query
+    # that EXECUTES is always the caller's original.
+    masked = mask_sql_noise(lowered)
+    if not masked.startswith("select"):
         raise ReadOnlySqlError(
             "only a single SELECT statement is allowed (this one starts with "
-            f"{lowered.split(None, 1)[0]!r})")
-    if ";" in lowered:
+            f"{(masked.split(None, 1) or [chr(39)])[0]!r})")
+    if ";" in masked:
         raise ReadOnlySqlError(
             "';' is not allowed - it permits multi-statement injection")
-    if len(_SELECT_RX.findall(lowered)) > 1:
+    if len(_SELECT_RX.findall(masked)) > 1:
         raise ReadOnlySqlError(
             "subqueries are not allowed - exactly one SELECT per query")
-    keyword = find_forbidden_sql_keyword(lowered)
+    keyword = find_forbidden_sql_keyword(masked)
     if keyword:
         raise ReadOnlySqlError(
             f"forbidden keyword {keyword.upper()!r}: this connection is "
@@ -142,18 +231,44 @@ def assert_read_only_diagnostic_sql(sql: str) -> tuple[str, bool]:
             "and no data-modifying keyword is accepted. A COLUMN named like a "
             "keyword (created_at, updated_at) is fine - re-sending the same "
             "statement will not help.")
-    return lowered, bool(_EXPLICIT_ROW_LIMIT_RX.search(lowered))
+    if not allow_raw_rows and not _AGGREGATE_RX.search(masked):
+        raise ReadOnlySqlError(
+            "this query returns raw rows. Production values are serialized into "
+            "the next judge prompt and sent to a model provider, so every "
+            "diagnostic query must AGGREGATE: use GROUP BY, or one of "
+            + ", ".join(sorted(_AGGREGATE_FUNCTIONS)).upper()
+            + ". Count or bucket the rows that show the problem instead of "
+            "selecting them.")
+    return lowered, bool(_EXPLICIT_ROW_LIMIT_RX.search(masked))
 
 
-def clamp_read_only_sql(sql: str, limit: int = DEFAULT_ROW_LIMIT) -> str:
+def clamp_read_only_sql(sql: str, limit: int = DEFAULT_ROW_LIMIT, *,
+                        allow_raw_rows: bool = False) -> str:
     """Validate then bound.  The clamp goes on its OWN LINE so a trailing
-    `-- comment` cannot swallow it (which would run the query unbounded)."""
-    _lowered, has_limit = assert_read_only_diagnostic_sql(sql)
-    safe_limit = max(1, min(int(limit or DEFAULT_ROW_LIMIT), MAX_ROW_LIMIT))
+    `-- comment` cannot swallow it (which would run the query unbounded).
+
+    A LIMIT the query already carries is CLAMPED, not trusted: `LIMIT 1000000`
+    used to be accepted verbatim because the guard only asked whether a numeric
+    limit was PRESENT, so MAX_ROW_LIMIT bounded nothing and fetchall() pulled
+    the whole result set out of production. Masking preserves offsets, so the
+    effective limit is rewritten in place rather than having a second LIMIT
+    appended after it - which Postgres rejects outright."""
+    _lowered, has_limit = assert_read_only_diagnostic_sql(
+        sql, allow_raw_rows=allow_raw_rows)
+    ceiling = SCHEMA_ROW_LIMIT if allow_raw_rows else MAX_ROW_LIMIT
+    safe_limit = max(1, min(int(limit or DEFAULT_ROW_LIMIT), ceiling))
     text = sql.strip()
-    if has_limit:
+    if not has_limit:
+        return text + "\nLIMIT " + str(safe_limit)
+    masked = mask_sql_noise(text.lower())
+    match = None
+    for match in _LIMIT_VALUE_RX.finditer(masked):
+        pass                      # the LAST effective limit is the binding one
+    if match is None:             # a limit that lives only in a literal/comment
+        return text + "\nLIMIT " + str(safe_limit)
+    if int(match.group(1)) <= safe_limit:
         return text
-    return text + "\nLIMIT " + str(safe_limit)
+    return text[:match.start(1)] + str(safe_limit) + text[match.end(1):]
 
 
 # --------------------------------------------------------------------------- #
@@ -382,6 +497,46 @@ def readonly_database_url(env: dict | None = None) -> str:
     return str((env if env is not None else os.environ).get(READONLY_URL_ENV) or "").strip()
 
 
+def program_url_env(program: str) -> str:
+    """The per-program spelling of the connection-string variable."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(program or "")).strip("_").upper()
+    return f"{READONLY_URL_ENV}__{slug}" if slug else READONLY_URL_ENV
+
+
+def resolve_program_url(program: str, program_count: int,
+                        env: dict | None = None) -> tuple[dict, str]:
+    """({READONLY_URL_ENV: url} or {}, reason-when-empty) for ONE program.
+
+    ONE DATABASE IS NOT EVERY PROGRAM'S DATABASE. The phase read the process
+    environment directly, so a single `--program A --program B` invocation
+    diagnosed BOTH from whatever database the one variable pointed at, and
+    attached A's schema and A's rows to B's report as demonstrated evidence.
+    Nothing tied the connection string to a project directory.
+
+    So: a per-program variable (FLEXFACTOR_READONLY_DATABASE_URL__<PROGRAM>)
+    always wins and is unambiguous by construction. The bare variable is honored
+    only when the invocation audits exactly one program - the case where it
+    cannot mean anything else. With several programs and only the bare variable
+    set, the phase is SKIPPED with that named reason rather than guessing.
+    """
+    source = os.environ if env is None else env
+    specific = str(source.get(program_url_env(program)) or "").strip()
+    if specific:
+        return {READONLY_URL_ENV: specific}, ""
+    shared = str(source.get(READONLY_URL_ENV) or "").strip()
+    if not shared:
+        return {}, ""                      # the module's own "not set" verdict
+    if int(program_count or 1) <= 1:
+        return {READONLY_URL_ENV: shared}, ""
+    return {}, (
+        f"{READONLY_URL_ENV} is set but this invocation audits "
+        f"{program_count} programs, and nothing ties that one database to "
+        f"{program!r}. Diagnosing every program from one program's rows would "
+        f"attach the wrong evidence to the wrong report, so this phase was "
+        f"SKIPPED (this is not evidence that no data-shaped problem exists). "
+        f"Set {program_url_env(program)} to run it for this program.")
+
+
 def availability(env: dict | None = None, connect=None) -> dict:
     """{'available': bool, 'reason': str, 'driver': str|None}.
 
@@ -415,6 +570,16 @@ def availability(env: dict | None = None, connect=None) -> dict:
             "reason": f"{READONLY_URL_ENV} set; driver {name}"}
 
 
+def connect_timeout_s(env: dict | None = None) -> int:
+    """Seconds to wait for the production connection itself. Bounded [1, 60]."""
+    raw = (env if env is not None else os.environ).get(CONNECT_TIMEOUT_ENV)
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_CONNECT_TIMEOUT_S
+    return max(1, min(value, 60))
+
+
 def statement_timeout_ms(env: dict | None = None) -> int:
     raw = (env if env is not None else os.environ).get(STATEMENT_TIMEOUT_ENV)
     try:
@@ -446,12 +611,26 @@ class ReadOnlySession:
         self.driver_name: str | None = None
         self.conn = None
         self.queries: list[str] = []
+        self.truncated_schema = False
 
     def __enter__(self) -> "ReadOnlySession":
         if self._connect is None:
             mod, name = load_driver()
             self.driver_name = name
-            self.conn = mod.connect(self.url)
+            # A BOUNDED CONNECT. `statement_timeout` is issued below - AFTER the
+            # connection succeeds - so it cannot bound the connection attempt
+            # itself. Against an unreachable or blackholed host libpq waits for
+            # the OS to give up, which can be minutes, and this phase is
+            # explicitly a non-fatal side quest: it must never be able to stall
+            # the audit that owns it. libpq takes connect_timeout in seconds.
+            seconds = max(1, int(connect_timeout_s()))
+            try:
+                self.conn = mod.connect(self.url, connect_timeout=seconds)
+            except TypeError:
+                # A driver that does not take the keyword still gets a
+                # connection, and the fact that it is unbounded is said out
+                # loud rather than assumed away.
+                self.conn = mod.connect(self.url)
         else:
             self.driver_name = "injected"
             self.conn = self._connect(self.url)
@@ -478,11 +657,25 @@ class ReadOnlySession:
                 pass
         return False
 
-    def execute(self, sql: str) -> list[tuple]:
+    def schema_execute(self, sql: str) -> list[tuple]:
+        """A metadata read: raw rows allowed, bounded by SCHEMA_ROW_LIMIT.
+
+        Truncation is not silent - a result that exactly fills the bound means
+        the schema handed to the planner may be a prefix of the real one, and
+        that has to be said rather than presented as the whole schema."""
+        rows = self.execute(sql, limit=SCHEMA_ROW_LIMIT, allow_raw_rows=True)
+        if len(rows) >= SCHEMA_ROW_LIMIT:
+            self.truncated_schema = True
+        return rows
+
+    def execute(self, sql: str, *, limit: int | None = None,
+                allow_raw_rows: bool = False) -> list[tuple]:
         """Validate -> clamp -> execute.  Every read in this module goes here."""
         if self.conn is None:
             raise ProdEvidenceUnavailable("read-only session is not open")
-        final_sql = clamp_read_only_sql(sql, self.row_limit)
+        final_sql = clamp_read_only_sql(
+            sql, self.row_limit if limit is None else limit,
+            allow_raw_rows=allow_raw_rows)
         self.queries.append(final_sql)
         cur = self.conn.cursor()
         cur.execute(final_sql)
@@ -662,8 +855,16 @@ def collect_runtime_evidence(judge, purpose_blob: str, *, env: dict | None = Non
     try:
         with ReadOnlySession(url, connect=connect, row_limit=row_limit) as session:
             # ---- gap B: SCHEMA FIRST, always, before any query is written ----
-            columns_by_table = introspect_columns(session.execute)
+            columns_by_table = introspect_columns(session.schema_execute)
             record["tables"] = len(columns_by_table)
+            if getattr(session, "truncated_schema", False):
+                record["errors"].append(
+                    f"information_schema.columns filled the {SCHEMA_ROW_LIMIT}-row "
+                    "read bound, so the schema below may be a PREFIX of the real "
+                    "one (the query orders by table name, so later tables are the "
+                    "ones missing). Probes against those tables will be rejected "
+                    "as nonexistent - raise FLEXFACTOR_SCHEMA_ROW_LIMIT")
+                _log(record["errors"][-1])
             if not columns_by_table:
                 record["errors"].append(
                     "information_schema.columns returned no rows for schema "
@@ -737,8 +938,26 @@ def collect_runtime_evidence(judge, purpose_blob: str, *, env: dict | None = Non
                 + "\n\n".join(blocks)
                 + "\n\nReport only what these rows demonstrate.",
                 RUNTIME_FINDING_SCHEMA) or {}
+            # A FINDING MUST CITE A PROBE THAT RAN. Every dict the verdict model
+            # returned used to be accepted, so a stale or invented `query_name`
+            # was presented in the report as "demonstrated by production rows"
+            # when no such query existed - the strongest claim this module makes,
+            # resting on nothing. Rejections are recorded, not dropped: a model
+            # inventing evidence is itself a finding about the run.
+            executed = {str(out["name"]) for out in results}
             for f in (verdict.get("findings") or []):
                 if not isinstance(f, dict):
+                    continue
+                cited = str(f.get("query_name") or "")
+                if cited not in executed:
+                    record["rejected"].append({
+                        "name": cited or "(no query_name)",
+                        "sql": "",
+                        "reason": ("verdict cited a probe that never executed; "
+                                   "probes that ran: "
+                                   + (", ".join(sorted(executed)) or "none"))})
+                    _log(f"runtime-data: REJECTED finding citing unexecuted probe "
+                         f"{cited!r}")
                     continue
                 record["findings"].append(f)
     except DriverMissingError as ex:
