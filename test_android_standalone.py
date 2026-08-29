@@ -154,6 +154,15 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("audit_args+=(--economy)", workflow)
         self.assertIn("provider_args+=(--economy)", workflow)
         self.assertIn("audit_args+=(--single)", workflow)
+        # ...but ONLY where a pair is impossible or was not asked for. A phone
+        # run whose second key is merely missing must reach the engine's paid
+        # refusal, not be quietly handed --single: that removes the approval
+        # step paid mode is named for while the run still reports as ordinary,
+        # which is the exact downgrade the desktop path refuses.
+        self.assertNotIn('elif [ "$PROVIDER" = openai ] && [ -z "$ANTHROPIC_API_KEY" ]',
+                         workflow)
+        self.assertNotIn('elif [ "$PROVIDER" = anthropic ] && [ -z "$OPENAI_API_KEY" ]',
+                         workflow)
         self.assertIn("--auto-clean", workflow)
         self.assertNotIn("--no-auto-clean", workflow)
 
