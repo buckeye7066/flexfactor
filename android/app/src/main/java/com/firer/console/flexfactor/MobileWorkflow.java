@@ -4,7 +4,18 @@ package com.firer.console.flexfactor;
 final class MobileWorkflow {
     static final String PATH = ".github/workflows/flexfactor-mobile.yml";
     static final String FILE_NAME = "flexfactor-mobile.yml";
-    static final String ENGINE_REF = "android-v3.2.2";
+
+    // The release tag android-client.yml publishes is exactly
+    // "android-v${versionName}", so the engine this build was tested against is
+    // derivable from the build itself. It used to be a hand-typed literal, and
+    // it drifted: the shipped 3.2.1 app carried the previous release's tag and
+    // therefore installed a caller that ran that older engine, whose validator
+    // read the caller's event payload instead of the reusable workflow's
+    // inputs. Every phone run died on "invalid repository" at its first step.
+    // A version string typed in more than one place is a version string that
+    // will disagree with itself; there is now only one. (The drift above was
+    // 3.2.1 shipping with the 3.2.0 tag typed into this field.)
+    static final String ENGINE_REF = "android-v" + BuildConfig.VERSION_NAME;
 
     private MobileWorkflow() {}
 
