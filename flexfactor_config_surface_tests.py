@@ -65,13 +65,36 @@ def _runtime_sources() -> list:
 
 
 def read_by_runtime() -> dict:
-    """{VAR: file that reads it} across the runtime modules."""
-    pattern = re.compile(
+    """{VAR: file that reads it} across the runtime modules.
+
+    TWO patterns, because one of them is how a variable escapes this gate.
+    The literal form - os.environ.get("NAME") - is the obvious one. The other is
+    a module constant holding the name:
+
+        READONLY_URL_ENV = "FLEXFACTOR_READONLY_DATABASE_URL"
+        ...
+        (env if env is not None else os.environ).get(READONLY_URL_ENV)
+
+    which the literal scan cannot see at all, so an entire module's worth of
+    configuration could be added with none of it documented and this test would
+    still pass. Measured 2026-08-28: flexfactor_prodevidence.py reads four
+    variables that way and the gate reported nothing missing.
+
+    The constant form is matched by VALUE - a module-level string that spells a
+    FLEXFACTOR_/FF_/AI_ variable name - rather than by tracing the reference.
+    That is deliberately an over-approximation: the worst it can do is ask for a
+    line of documentation about a name the project chose to define."""
+    literal = re.compile(
         r"""(?:os\.environ\.get\(|os\.getenv\(|os\.environ\[)\s*["']([A-Z][A-Z_0-9]*)["']""")
+    named_constant = re.compile(
+        r"""^\s*[A-Z][A-Z_0-9]*\s*(?::\s*str\s*)?=\s*["']((?:FLEXFACTOR|FF|AI)_[A-Z_0-9]*)["']""",
+        re.M)
     found = {}
     for path in _runtime_sources():
         with open(path, encoding="utf-8", errors="replace") as fh:
-            for name in pattern.findall(fh.read()):
+            text = fh.read()
+        for pattern in (literal, named_constant):
+            for name in pattern.findall(text):
                 found.setdefault(name, os.path.basename(path))
     return found
 
@@ -108,6 +131,22 @@ class ConfigSurfaceTests(unittest.TestCase):
                          "read by the runtime but absent from .env.example: "
                          f"{missing}. Add it there (with what it does and its "
                          "default) or add it to NOT_OURS if the OS owns it.")
+
+    def test_the_gate_sees_a_variable_read_through_a_module_constant(self):
+        """The check that could not fail for a whole class of variable.
+
+        flexfactor_prodevidence.py names its four connection variables in module
+        constants and reads them through those, which the literal scan cannot
+        see - so they were invisible to the gate that exists to notice exactly
+        this. Asserting on real names keeps the widened detector honest: if
+        someone narrows it back, this fails."""
+        found = read_by_runtime()
+        for name in ("FLEXFACTOR_READONLY_DATABASE_URL",
+                     "FLEXFACTOR_READONLY_STATEMENT_TIMEOUT_MS",
+                     "FLEXFACTOR_DB_CONNECT_TIMEOUT_S"):
+            self.assertIn(name, found,
+                          f"{name} is read through a module constant and the "
+                          "gate must still see it")
 
     def test_the_template_ships_no_real_secret(self):
         # A template with a live key in it is the failure this whole gate exists

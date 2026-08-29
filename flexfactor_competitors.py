@@ -418,7 +418,18 @@ def github_repo_search(query: str, limit: int = 5, opener=None) -> list[dict]:
     raise the rate limit; it is never required.
     """
     opener = opener or _default_opener
-    url = ("https://api.github.com/search/repositories?per_page=%d&sort=stars&q=%s"
+    # RELEVANCE, NOT POPULARITY. `sort=stars` asks GitHub for the most-starred
+    # repositories that match AT ALL, and for a descriptive query that is a list
+    # of star-farmed repositories whose text happens to contain the words.
+    # Measured 2026-08-28, query "grant management platform": sort=stars
+    # returned redesigned-pancake (260 stars, a copy of GitHub's own docs page),
+    # a NiceHash terms-of-use dump and a bank's benefits page - four of five
+    # results unrelated to the field. GitHub's default best-match ordering
+    # returned five actual grant-management projects for the same query, and
+    # for a NAMED competitor ("OpenTofu") both orderings put the canonical repo
+    # first, so nothing is lost. Star counts still ride along in the payload for
+    # the judge to weigh.
+    url = ("https://api.github.com/search/repositories?per_page=%d&q=%s"
            % (limit, urllib.parse.quote_plus(query)))
     headers = {"Accept": "application/vnd.github+json"}
     token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()

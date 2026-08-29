@@ -29,8 +29,15 @@ def _key(program: str, project_dir: str) -> str:
     identity = str(program or "").strip().casefold() + "\n" + _canonical(project_dir)
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
-def journal_path(program: str, project_dir: str, root: str = DEFAULT_ROOT) -> str:
-    return os.path.join(root, _key(program, project_dir) + ".jsonl")
+def journal_path(program: str, project_dir: str, root: str | None = None) -> str:
+    # LATE-BOUND ROOT. A `root: str = DEFAULT_ROOT` default is captured when the
+    # module is imported, so a test that reassigns DEFAULT_ROOT to a temp dir
+    # still wrote into the OWNER'S ~/.flexfactor/steering. Measured 2026-08-28:
+    # the dashboard self-test left two live "prioritize the auth bugs" comments
+    # in the real journal, where the next audit of a matching program would have
+    # claimed them as owner instructions. Resolving the default per call is what
+    # makes patching DEFAULT_ROOT actually isolate.
+    return os.path.join(root or DEFAULT_ROOT, _key(program, project_dir) + ".jsonl")
 
 def _clean_comment(comment: str) -> str:
     value = str(comment or "").strip()
@@ -75,7 +82,7 @@ def _records(path: str) -> list[dict]:
     return out
 
 def submit(program: str, project_dir: str, comment: str, *,
-           source: str = "dashboard", root: str = DEFAULT_ROOT) -> dict:
+           source: str = "dashboard", root: str | None = None) -> dict:
     program_s = str(program or "").strip()
     if not program_s:
         raise ValueError("program is required")
@@ -86,7 +93,7 @@ def submit(program: str, project_dir: str, comment: str, *,
     return dict(row, status="pending")
 
 def list_comments(program: str, project_dir: str, *,
-                  root: str = DEFAULT_ROOT, limit: int = 20) -> list[dict]:
+                  root: str | None = None, limit: int = 20) -> list[dict]:
     submissions, receipts, order = {}, {}, []
     for row in _records(journal_path(program, project_dir, root)):
         ident = str(row.get("id"))
@@ -108,7 +115,7 @@ def list_comments(program: str, project_dir: str, *,
     return result[-max(1, int(limit)):]
 
 def claim(program: str, project_dir: str, run_id: str, *,
-          root: str = DEFAULT_ROOT) -> tuple[list[dict], list[str]]:
+          root: str | None = None) -> tuple[list[dict], list[str]]:
     comments = list_comments(program, project_dir, root=root, limit=5000)
     active, newly_claimed = [], []
     path = journal_path(program, project_dir, root)
@@ -158,13 +165,13 @@ def merge_context(context: str, block: str) -> str:
     return (base + "\n\n" + block).strip() if block else base
 
 def refresh_context(context: str, program: str, project_dir: str, run_id: str, *,
-                    root: str = DEFAULT_ROOT) -> tuple[str, list[str], list[str]]:
+                    root: str | None = None) -> tuple[str, list[str], list[str]]:
     active, newly = claim(program, project_dir, run_id, root=root)
     return merge_context(context, steering_block(active)), [
         str(item["id"]) for item in active], newly
 
 def finish(program: str, project_dir: str, run_id: str, ids: list[str], *,
-           completed: bool, detail: str = "", root: str = DEFAULT_ROOT) -> None:
+           completed: bool, detail: str = "", root: str | None = None) -> None:
     path = journal_path(program, project_dir, root)
     status = "completed" if completed else "needs-attention"
     for ident in dict.fromkeys(str(i) for i in ids if i):
@@ -172,7 +179,7 @@ def finish(program: str, project_dir: str, run_id: str, ids: list[str], *,
                       "run_id": str(run_id or ""), "at": _now(),
                       "detail": str(detail or "")[:500]})
 
-def summary(program: str, project_dir: str, *, root: str = DEFAULT_ROOT) -> dict:
+def summary(program: str, project_dir: str, *, root: str | None = None) -> dict:
     rows = list_comments(program, project_dir, root=root, limit=5000)
     counts = {}
     for row in rows:

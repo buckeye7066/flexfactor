@@ -306,6 +306,10 @@ _MAX_TOKEN_LIMIT_PATTERNS = (
 )
 
 
+class _SkipRuntimeEvidence(Exception):
+    """Internal: PHASE 1c has already recorded why it is not running."""
+
+
 class RouteCapabilityError(RuntimeError):
     """This ROUTE cannot serve this call (its output ceiling is too small) --
     another route can. Distinct from OutputBudgetError (the model ran out of
@@ -2555,7 +2559,21 @@ class OpenAIProvider:
         else:  # pragma: no cover - the loop always breaks or raises
             raise RouteCapabilityError(
                 f"route '{use_model}' rejected every output budget we offered")
-        choice = resp.choices[0]
+        # A GATEWAY THAT ANSWERS WITHOUT AN ANSWER. OpenAI-compatible endpoints
+        # do not all return `choices` on every response: several free routes
+        # reply 200 with `{"choices": null}` or an empty list when they refuse
+        # or fail internally. `resp.choices[0]` then raised
+        # `TypeError: 'NoneType' object is not subscriptable`, which the run's
+        # error ledger recorded against flexfactor.py rather than against the
+        # route that produced it - a route fault filed as a tool defect, and no
+        # rotation away from the route that keeps doing it. Observed live
+        # 2026-08-28 in a free rotated run (ledger entry 7 of 7).
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise RuntimeError(
+                f"route '{use_model}' returned a response with no choices "
+                f"(choices={choices!r}); nothing was generated")
+        choice = choices[0]
         if choice.finish_reason == "length":
             # Same guard AnthropicProvider.structured has, and it raises the
             # TYPED OutputBudgetError so callers can shrink the unit of
@@ -3068,6 +3086,54 @@ def _wrap_path_map(data: dict, schema: dict):
     return {prop: wrapped}
 
 
+def _rename_single_array_key(data, schema: dict):
+    """Salvage `{"findings": [...]}` when the schema asked for `{"reviews": [...]}`.
+
+    Free routes get the SHAPE right and the top-level NAME wrong often enough to
+    end a run: measured 2026-08-28 on a rotated free audit, a batch review came
+    back as `{"findings": [{"file": "ledger.py", "findings": [...]}]}` - the
+    schema's own item shape, filed under the wrong key - and both candidate
+    files finished the run as review_incomplete with the defects already
+    identified inside the discarded payload.
+
+    Deliberately narrow, because the decoy guard this sits inside is what stops
+    a false CLEAN:
+      * the response has exactly ONE key, and its value is a non-empty list;
+      * the schema has exactly ONE required array-typed property;
+      * every item in the list is an object carrying at least one of that
+        property's own required item fields.
+    A decoy like `{"ok": 1}` fails on the first rule; an unrelated list of
+    strings or of objects with no overlapping field fails on the third. Anything
+    that does not fit falls through to the raise, unchanged.
+    """
+    if not isinstance(data, dict) or len(data) != 1:
+        return None
+    (got_key, rows), = data.items()
+    if not isinstance(rows, list) or not rows:
+        return None
+    targets = []
+    for prop, spec in (schema.get("properties") or {}).items():
+        spec = spec or {}
+        if spec.get("type") != "array" or prop not in (schema.get("required") or []):
+            continue
+        item_req = [r for r in ((spec.get("items") or {}).get("required") or [])
+                    if isinstance(r, str)]
+        if item_req:
+            targets.append((prop, item_req))
+    if len(targets) != 1:
+        return None
+    prop, item_req = targets[0]
+    if prop == got_key:
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or not any(r in row for r in item_req):
+            return None
+    print(f"  [salvage] structured output filed {len(rows)} row(s) under "
+          f"'{got_key}'; the schema's only required array is '{prop}' and every "
+          "row matches its item shape - accepted under the schema's name")
+    return {prop: rows}
+
+
 def _check_structured_type(data, schema: dict, text: str):
     """Every provider's structured() promises the caller a value shaped like
     `schema` (almost always a top-level JSON object with named keys the caller
@@ -3098,6 +3164,8 @@ def _check_structured_type(data, schema: dict, text: str):
         req = [k for k in (schema.get("required") or []) if isinstance(k, str)]
         if req and not any(k in data for k in req):
             salvaged = _wrap_path_map(data, schema)
+            if salvaged is None:
+                salvaged = _rename_single_array_key(data, schema)
             if salvaged is not None:
                 return salvaged
             raise RuntimeError(
@@ -3667,6 +3735,7 @@ def _rotation_route_provider(route):
 # Printed-once guards so an absent catalog explains itself exactly once per
 # process instead of once per program in a batch run.
 _ROTATION_REASON_PRINTED: set[str] = set()
+_LAST_ROTATION_USABLE = 0   # usable route count of the last rotation build
 # Same guard for the catalog-staleness warning, keyed by catalog PATH: the fact
 # is about the file, so it is worth saying once and worthless said per route.
 # LOCKED, unlike its sibling above: a `--parallel` batch builds providers from
@@ -4071,13 +4140,20 @@ _UNFIT_CODE_PATTERNS = _ff_directed._UNFIT_CODE_PATTERNS
 _unfit_for_code_reason = _ff_directed.unfit_for_code_reason
 
 
-def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
+def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
+                             quiet: bool = False):
     """Return a RotatingProvider, or None with the reason PRINTED (never silent).
 
     None means "keep the existing provider selection" — rotation is the default
     when a usable catalog exists, and exactly the prior behaviour when not.
+
+    `quiet` builds a SECOND provider off the same catalog without repeating the
+    banner, credential list and staleness note the first one already printed.
+    Only the announcement is suppressed; nothing about selection changes.
     """
     def _say(reason: str) -> None:
+        if quiet:
+            return
         if reason and reason not in _ROTATION_REASON_PRINTED:
             _ROTATION_REASON_PRINTED.add(reason)
             print(f"  [rotation] not rotating: {reason}", file=sys.stderr)
@@ -4095,7 +4171,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
         _say(fr.unavailable_reason() or "route catalog is empty")
         return None
     hydrated = _hydrate_route_credentials(catalog.enabled())
-    if hydrated:
+    if hydrated and not quiet:
         print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
               + ", ".join(hydrated), file=sys.stderr)
     usable, dropped = [], {}
@@ -4145,7 +4221,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     # It is printed HERE, below the "no usable route" bail-out above, so it is
     # only ever said about a catalog this run is actually going to rotate on.
     stale_note = fr.catalog_staleness_note(catalog)
-    if stale_note and _claim_stale_warning(catalog.path):
+    if stale_note and not quiet and _claim_stale_warning(catalog.path):
         print(f"  [rotation] {stale_note}", file=sys.stderr)
     # Say free-vs-paid out loud. The line used to read "N free routes" and was
     # printed by the same code whether or not that was true, so once paid routes
@@ -4155,9 +4231,12 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str):
     n_paid = len(usable) - n_free
     mix = f"{n_free} free" + (f" + {n_paid} paid (billed against --max-cost "
                               f"${getattr(args, 'max_cost', 0) or 0:g})" if n_paid else "")
-    print(f"  [rotation] ON: {mix} routes over {pools} pools, "
-          f"author tier '{author_tier}'"
-          + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
+    if not quiet:
+        print(f"  [rotation] ON: {mix} routes over {pools} pools, "
+              f"author tier '{author_tier}'"
+              + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
+    global _LAST_ROTATION_USABLE
+    _LAST_ROTATION_USABLE = len(usable)
     return fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=fr.LIGHT,
                                allow_paid=True, meter=meter,
@@ -4372,6 +4451,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # phase (inherently more serial - build-gating, cross-verification,
     # commits) is deliberately NOT pooled; it stays on whichever pool member
     # is fastest, exactly as a single free-first primary always has.
+    free_pool_cross: str | None = None
     if _free_first_applies:
         _auto_activate_fcc_proxy()  # zero-setup: give the fast free tier a chance too
         # POOL-FIRST ROTATION (owner order 2026-08-18): when the owner named
@@ -4385,7 +4465,34 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
         if not args.model and not getattr(args, "judge_model", None):
             rotating = _build_rotating_provider(args, meter, model_mode)
             if rotating is not None:
-                return [("rotation", rotating)]
+                out_rot: list[tuple[str, object]] = [("rotation", rotating)]
+                # A SECOND ROTATED ROUTE VERIFIES EVERY FIX.
+                #
+                # Rotation is the default whenever a usable catalog exists, so
+                # this - not the FCC/ollama pool below - is the free path almost
+                # every run actually takes. It returned ONE provider, and every
+                # fix-approval gate in this file is conditional on a second one
+                # (`cross = providers[1][1] if len(providers) > 1 else None`).
+                # So the normal free run authored a fix and accepted it on the
+                # author's own say-so while 120 other free routes stood idle:
+                # the run rotated hard for reviewing and not at all for the one
+                # decision that actually writes to the repo.
+                #
+                # The verifier is a second independent RotatingProvider over the
+                # same catalog. Both share the rotator's LRU state store, and
+                # the rotator already keeps a reviewer off the author's model
+                # family, so the two land on genuinely different models. Every
+                # route here is free in free mode, so this costs nothing but the
+                # latency of the check it performs.
+                if (args.use_both and _LAST_ROTATION_USABLE > 1
+                        and model_mode != "paid"):
+                    verifier = _build_rotating_provider(
+                        args, meter, model_mode, quiet=True)
+                    if verifier is not None:
+                        out_rot.append(("rotation-verify", verifier))
+                        print("  [rotation] every fix is cross-verified by a "
+                              "second rotated route (free).", file=sys.stderr)
+                return out_rot
         fcc_usable = _usable("anthropic") and _provider_free_routed("anthropic")
         ollama_usable = _usable("ollama")
         if fcc_usable or ollama_usable:
@@ -4402,13 +4509,32 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                                           judge_model=judge_override),
                              _OLLAMA_POOL_CONCURRENCY))
             _LAST_FREE_REVIEW_POOL = pool
-            primary, other = pool[0][0], None  # fastest usable free backend authors/fixes
+            # The fastest usable free backend authors and fixes. When a SECOND
+            # free backend is up, it becomes the cross-model verifier rather
+            # than review-only (owner order 2026-08-28: on the free path
+            # "optimize the use of the free platforms available where they work
+            # harmoniously towards a common goal").
+            #
+            # This matters because every fix-approval gate in the run is
+            # conditional on a second provider existing. With `other = None` the
+            # free path reviewed with both backends and then accepted every fix
+            # on the author's own say-so - the one step where a second opinion
+            # is worth the most was the one step that did not get one, while a
+            # perfectly good second free backend sat idle for it. Both members
+            # are free, so this buys the adversarial verify loop at no cost.
+            # An EXPLICIT `--provider ollama` never reaches here (local-only /
+            # zero-egress is settled above), so this cannot add egress the owner
+            # did not ask for.
+            primary = pool[0][0]
+            other = pool[1][0] if len(pool) > 1 else None
+            free_pool_cross = other
             if len(pool) > 1:
                 names = " + ".join(f"{n}({c}x concurrent)" for n, _, c in pool)
                 print(f"  [preflight] FREE-FIRST POOL: {names} all usable - reviewing "
                       f"concurrently across every free backend instead of picking one "
                       f"and leaving the rest idle; authoring/fixing with '{primary}' "
-                      "(the fastest).", file=sys.stderr)
+                      f"(the fastest) and cross-verifying every fix with "
+                      f"'{other}' (also free).", file=sys.stderr)
             else:
                 print(f"  [preflight] FREE-FIRST: authoring locally with '{primary}'"
                       + (("; cloud cross-check disabled to preserve local-only "
@@ -4472,6 +4598,52 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             _PROVIDER_DIAGNOSIS = "no LLM API key found"
         return []
 
+    # PAID MODE MEANS BOTH MODELS (owner order 2026-08-28: "For the paid path,
+    # allow both Anthropic and OpenAI API keys to be used. Each edit must be
+    # approved by both models.").
+    #
+    # Every fix-approval gate in this file - the adversarial verify loop and the
+    # legacy single-shot veto alike - is conditional on a SECOND provider
+    # existing (`cross is not None`). So a paid run whose other key is missing,
+    # unfunded, or preflight-rejected used to fall straight through this `if`
+    # and audit with one model and no approval gate at all, while still
+    # reporting itself as a normal paid run. That is the shape of a silent
+    # downgrade: the promise the mode is named for quietly stops holding, and
+    # nothing in the output says so.
+    #
+    # So in paid mode the pair is REQUIRED unless the owner typed `--single`.
+    # A missing half is a refusal with a diagnosis, never a weaker run.
+    # `other` is only ever the OTHER member of the anthropic/openai pair, so a
+    # paid run whose primary is copilot (a permitted paid provider) would leave
+    # this false and proceed alone - the pair promise broken by the one provider
+    # choice that never had a partner. Any paid cloud primary now has to produce
+    # the pair; for copilot that means BOTH named models, since it is neither.
+    paid_pair_required = (model_mode == "paid" and args.use_both
+                          and primary in {"anthropic", "openai", "copilot"})
+    if primary == "copilot" and paid_pair_required:
+        missing_pair = [n for n in ("anthropic", "openai") if not _usable(n)]
+        if missing_pair:
+            _PROVIDER_DIAGNOSIS = (
+                f"paid mode requires BOTH models: '{primary}' authors, but "
+                f"{' and '.join(repr(n) for n in missing_pair)} "
+                f"{'is' if len(missing_pair) == 1 else 'are'} not usable, so "
+                "no second model can approve its fixes. Set working keys for "
+                "both, or pass --single to accept a deliberately single-model "
+                "run, or use free mode.")
+            print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
+            return []
+        other = "anthropic"
+    if paid_pair_required and not (other and _usable(other)):
+        missing = other or ("openai" if primary == "anthropic" else "anthropic")
+        _PROVIDER_DIAGNOSIS = (
+            f"paid mode requires BOTH models: '{primary}' is usable but "
+            f"'{missing}' is not (no key, an unfunded/revoked key, or a key "
+            f"re-pointed at the free proxy). Every fix in paid mode is approved "
+            f"by the second model, so a one-model paid run is refused. Set a "
+            f"working {missing.upper()}_API_KEY, or pass --single to accept a "
+            f"deliberately single-model run, or use free mode.")
+        print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
+        return []
     judge_override = getattr(args, "judge_model", None)
     out: list[tuple[str, object]] = []
     # Author model: explicit --model wins; --economy routes authoring to the
@@ -4482,7 +4654,18 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                      or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
-    if args.use_both and model_mode == "paid" and other and _usable(other):
+    if (args.use_both and free_pool_cross and other == free_pool_cross
+            and _usable(other)):
+        # Free pool cross-checker: the judge tier of the second free backend,
+        # unless --secondary-model named one. That flag is documented as the
+        # override for "the 2nd (cross-check) provider", and this is that
+        # provider - honouring it only on the paid branch would discard an
+        # explicit choice with no message, which is how a flag becomes a lie.
+        out.append((other, make_provider(
+            other,
+            args.secondary_model or JUDGE_MODELS.get(other) or DEFAULT_MODELS[other],
+            meter, judge_model=judge_override)))
+    elif args.use_both and model_mode == "paid" and other and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
         # defaults to the cheap model, not a second frontier model. This keeps the
@@ -5991,12 +6174,61 @@ def _brokered_tuple_runner(cmd, cwd=None, timeout: int = 300):
     return cp.returncode, ((cp.stdout or "") + (cp.stderr or "")).strip()
 
 
-def _is_git_repo(path: str) -> bool:
+def _git_worktree_root(path: str) -> str | None:
+    """The working-tree root git resolves for `path`, or None if there is none."""
     try:
-        r = _git(["rev-parse", "--is-inside-work-tree"], path)
-        return r.returncode == 0 and r.stdout.strip() == "true"
+        r = _git(["rev-parse", "--show-toplevel"], path)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out:
+        return None
+    try:
+        return os.path.realpath(out)
+    except OSError:
+        return None
+
+
+def _is_git_repo(path: str) -> bool:
+    """Is `path` a git working tree THIS RUN may commit into?
+
+    Not the same question as "does git find a repo from here". git walks UP
+    until it finds one, so a directory that merely SITS INSIDE somebody else's
+    repository answers yes - and then every `git add -A` / branch / commit this
+    file runs lands in that outer repository instead.
+
+    Measured 2026-08-28 on the owner's machine, whose home directory is itself
+    a `git init`-ed tree holding every project: a project directory with no
+    `.git` of its own resolved to the HOME repo, and one `git add -A` grew to
+    695 MB of RSS staging several terabytes of unrelated files before it was
+    killed. The audit would then have committed the owner's entire home
+    directory as this program's work.
+
+    So: the root git resolves must either BE this directory, or be an ancestor
+    that actually tracks content here (a real monorepo subdirectory - `git
+    ls-files` finds tracked files). An ancestor that tracks nothing here is
+    somebody else's repository that this directory happens to sit inside, and
+    git mode stays OFF - the audit still runs, it just does not commit."""
+    root = _git_worktree_root(path)
+    if root is None:
+        return False
+    try:
+        here = os.path.realpath(path)
+    except OSError:
+        return False
+    if os.path.normcase(root) == os.path.normcase(here):
+        return True
+    try:
+        tracked = _git(["ls-files", "--", "."], path)
     except (OSError, subprocess.SubprocessError):
         return False
+    if tracked.returncode == 0 and (tracked.stdout or "").strip():
+        return True
+    print(f"  [git] '{path}' is inside the repository at '{root}', which tracks "
+          "nothing here - treating this directory as NOT a git repo so the run "
+          "cannot commit an unrelated tree. Run `git init` here to get commits.",
+          file=sys.stderr)
+    return False
 
 
 def _git_has_remote(path: str) -> bool:
@@ -6080,6 +6312,15 @@ def _is_flexfactor_artifact(rel: str) -> bool:
     base = r.rsplit("/", 1)[-1]
     return (r.endswith("_audit_report.md")
             or r.endswith("_low_findings.md")
+            # The prodready scorecard. Its absence here meant the mode whose
+            # whole promise is "point it at a program and walk away" could never
+            # report a clean checkpoint: the last thing every prodready run does
+            # is write <program>_readiness.md into the tree, and the very next
+            # thing it does is check whether the tree is clean. Measured
+            # 2026-08-28 on a run that fixed both planted defects, committed
+            # them, and still finished "UNCOMMITTED changes remain ... NOT a
+            # clean checkpoint" - about its own scorecard.
+            or r.endswith("_readiness.md")
             or r.endswith("_repo_rewards_report.md")
             or "_run_manifest_" in base  # immutable run evidence (Master Prompt 86/90)
             or base == "_scout_report.json"  # Scout structured report (94/99)
@@ -7994,6 +8235,45 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
+# --------------------------------------------------------------------------- #
+# NON-CODE VERDICTS (owner order 2026-08-25)
+#
+# THE CASE THAT FORCED THIS.  A live GrantFlow complaint ("can't log in") had
+# two root causes.  The first was not code at all: the user's session was the
+# Facebook in-app browser (user_agent contains FB_IAB), which drops a
+# sameSite:strict refresh cookie, so she was bounced every 3 hours - proven by
+# comparing refresh-rotation counts per client in prod (0 vs 10).  NO CODE WAS
+# WRONG.  Every category FlexFactor could emit was a CODE category, so its only
+# possible output was a patch - and a tool that can only emit patches will
+# INVENT one.
+#
+# A finding in one of these categories, or carrying evidence_source
+# 'runtime-data', is REPORTED TO THE OWNER AS A BRIEF and never enters the fix
+# pipeline.  The refusal lives in `should_fix_finding`, the single chokepoint
+# every fix path already crosses, so no future call site can bypass it.
+NON_CODE_FINDING_CATEGORIES = frozenset({
+    "data",           # the stored rows are wrong / missing / mass-mutated
+    "environment",    # deployment or platform: region, proxy, TLS, clock, limits
+    "client",         # the user's browser/app/device: in-app webview, cookies
+    "configuration",  # a setting/flag/env var the system does not handle
+})
+FINDING_EVIDENCE_SOURCES = ("code", "runtime-data")
+
+
+def finding_is_non_code(finding: dict) -> bool:
+    """True when this finding's root cause is NOT in the source code.
+
+    Either signal is sufficient and they are deliberately OR-ed: a model that
+    picks the category but forgets the discriminator (or the reverse) still gets
+    the safe answer, because the failure mode being prevented is a non-code
+    conclusion silently acquiring a patch.
+    """
+    if not isinstance(finding, dict):
+        return False
+    category = str(finding.get("category") or "").strip().lower()
+    source = str(finding.get("evidence_source") or "").strip().lower()
+    return category in NON_CODE_FINDING_CATEGORIES or source == "runtime-data"
+
 # One file's worth of line-by-line findings.
 AUDIT_FINDINGS_SCHEMA = {
     "type": "object",
@@ -8024,7 +8304,21 @@ AUDIT_FINDINGS_SCHEMA = {
                                      "that don't occur on real inputs are AT MOST low (usually info) - "
                                      "NEVER high or critical. When unsure between two levels, pick the LOWER.")},
                     "category": {"type": "string",
-                                 "description": "bug|security|error-handling|edge-case|concurrency|performance|correctness|dead-code|a11y|style"},
+                                 "description": (
+                                     "CODE verdicts (a patch can resolve them): bug|security|"
+                                     "error-handling|edge-case|concurrency|performance|correctness|"
+                                     "dead-code|a11y|style.\n"
+                                     "NON-CODE verdicts (NO code is wrong; a patch would be an "
+                                     "INVENTION): data|environment|client|configuration. Use one of "
+                                     "these ONLY with evidence_source='runtime-data' - a source file "
+                                     "read line by line cannot prove one.")},
+                    "evidence_source": {"type": "string",
+                                        "enum": ["code", "runtime-data"],
+                                        "description": (
+                                            "'code' = the defect is proven by the source text you "
+                                            "were shown; this is ALWAYS the answer when reviewing a "
+                                            "file. 'runtime-data' = proven by observed live data or "
+                                            "environment state, never by reading source.")},
                     "title": {"type": "string", "description": "Short defect title."},
                     "problem": {"type": "string", "description": "Exactly what is wrong and how it manifests."},
                     "fix": {"type": "string", "description": "The concrete change that resolves it."},
@@ -8032,7 +8326,8 @@ AUDIT_FINDINGS_SCHEMA = {
                     "trigger": {"type": "string", "description": "A concrete reachable input or execution path that triggers the defect."},
                     "observable_failure": {"type": "string", "description": "The externally observable wrong result, crash, leak, or security consequence."},
                 },
-                "required": ["line", "severity", "category", "title", "problem", "fix",
+                "required": ["line", "severity", "category", "evidence_source",
+                             "title", "problem", "fix",
                              "source_excerpt", "trigger", "observable_failure"],
                 "additionalProperties": False,
             },
@@ -8264,12 +8559,15 @@ AUDIT_SYSTEM = (
     "{\"findings\": [{\"line\": <integer, 1-based line the defect starts on (0 if "
     "file-wide)>, \"severity\": \"critical\"|\"high\"|\"medium\"|\"low\"|\"info\", "
     "\"category\": \"bug\"|\"security\"|\"error-handling\"|\"edge-case\"|\"concurrency\"|"
-    "\"performance\"|\"correctness\"|\"dead-code\"|\"a11y\"|\"style\", \"title\": <short "
+    "\"performance\"|\"correctness\"|\"dead-code\"|\"a11y\"|\"style\", "
+    "\"evidence_source\": \"code\" (a file review is always \"code\": a source file "
+    "cannot prove a data/environment/client/configuration cause), \"title\": <short "
     "defect title>, \"problem\": <exactly what is wrong and how it manifests>, \"fix\": "
     "<the concrete change that resolves it>, \"source_excerpt\": <exact verbatim source>, "
     "\"trigger\": <reachable execution path>, \"observable_failure\": <observable bad "
     "result>}], \"summary\": <one sentence on the file's overall health>}. EVERY finding "
-    "object MUST contain all nine keys - line, severity, category, title, problem, fix, "
+    "object MUST contain all ten keys - line, severity, category, evidence_source, "
+    "title, problem, fix, "
     "source_excerpt, trigger, observable_failure - with non-empty string values (line is "
     "an integer). "
     "If the file is genuinely clean, return {\"findings\": [], \"summary\": \"...\"}. "
@@ -9420,6 +9718,12 @@ def _enrich_stack_with_toolchains(project_dir: str, info: dict) -> None:
 # 'high'/'critical' to touch only the scariest defects.
 # --------------------------------------------------------------------------- #
 def should_fix_finding(finding: dict, min_severity: str) -> bool:
+    # A NON-CODE FINDING NEVER BECOMES A PATCH (owner order 2026-08-25).
+    # This is the single chokepoint every fix path crosses, so refusing here is
+    # what makes "reported, never auto-applied" a property of the code rather
+    # than a habit. See finding_is_non_code for why the distinction exists.
+    if finding_is_non_code(finding):
+        return False
     rank = SEVERITY_RANK.get(str(finding.get("severity", "")).lower(), 0)
     floor = max(1, SEVERITY_RANK.get(min_severity.lower(), 1))  # never below 'low'
     return rank >= floor
@@ -9502,6 +9806,21 @@ def _normalize_finding(f: dict) -> dict:
         f["fix"] = cand or ("See problem description." if (blob or _has("problem")) else "")
     if not _has("category"):
         f["category"] = "uncategorized"
+    # evidence_source is REQUIRED by the schema but must never be load-bearing on
+    # a model remembering to emit it. A finding produced by reading a file is a
+    # CODE finding; anything else has to say so explicitly. Defaulting to 'code'
+    # here fails SAFE: the wrong default would let an omission turn a code defect
+    # into an unfixable "brief".
+    source = str(f.get("evidence_source") or "").strip().lower()
+    if source not in FINDING_EVIDENCE_SOURCES:
+        source = "code"
+    f["evidence_source"] = source
+    # A non-code finding carries the gap shape (code_fixable=false + next_step)
+    # so the report renders an owner ACTION, not a pretend code edit.
+    if finding_is_non_code(f):
+        f["code_fixable"] = False
+        if not _has("next_step"):
+            f["next_step"] = f.get("fix") or ""
     return f
 
 
@@ -9979,6 +10298,20 @@ def _competitors_module():
         return None
 
 
+def _prodevidence_module():
+    """Lazy import of flexfactor_prodevidence (read-only production evidence).
+
+    A missing module is a NAMED skip in the report, never a silent absence -
+    the whole point of the subsystem is that "we could not look" and "we looked
+    and found nothing" are different sentences.
+    """
+    try:
+        import flexfactor_prodevidence as _pe
+        return _pe
+    except Exception:
+        return None
+
+
 def _purpose_label(pg: dict | None) -> str:
     """The honesty tag that must ride with EVERY printed criteria figure: this
     number is a model-derived assessment, and these are the samples behind it."""
@@ -10269,6 +10602,65 @@ def _merge_gaps(samples: list[dict]) -> list[dict]:
     for key, g in seen.items():
         g["acceptance_refs_seen"] = list(refs.get(key) or [])
     return list(seen.values())
+
+
+PURPOSE_ASSESS_ATTEMPTS = 3
+
+
+def assess_purpose_gap_resiliently(assessors, purpose_blob: str, files: list[str],
+                                   findings: list, *, project_dir: str, contract,
+                                   label: str, errors: list, log=None):
+    """assess_purpose_gap with retries, because ONE bad response is not a verdict.
+
+    PHASE 1 is the phase this tool exists for: everything downstream is graded
+    against the gap it measures. It was a single call wrapped in a non-fatal
+    handler, so one malformed response ended it for the whole run and the line
+    "purpose baseline failed (non-fatal): Expecting value: line 1 column 1" was
+    the only trace - a generic defect sweep wearing a purpose-driven run's name.
+    Measured live 2026-08-28 on a rotated free run, with 121 usable routes
+    standing by after the first one returned something that was not JSON.
+
+    Each attempt re-calls the assessor, and a rotating provider selects a fresh
+    route per call, so a retry is a genuinely different model rather than the
+    same one asked twice. `assessors` is tried in order and then cycled. Every
+    failed attempt is appended to `errors` - retrying must not turn three
+    failures into silence, which is the same defect one level up.
+
+    BudgetExceededError is never retried: the cap is a decision, not a fault.
+    """
+    live = [a for a in (assessors or []) if a is not None]
+    if not live:
+        errors.append(f"{label} purpose assessment skipped: no assessor available")
+        return None
+    for attempt in range(PURPOSE_ASSESS_ATTEMPTS):
+        provider = live[attempt % len(live)]
+        try:
+            got = assess_purpose_gap(provider, purpose_blob, files, findings,
+                                     project_dir=project_dir, contract=contract)
+        except BudgetExceededError:
+            errors.append(f"{label} purpose assessment skipped: cost cap reached")
+            if log:
+                log(f"{label} purpose assessment skipped: cost cap reached")
+            return None
+        except Exception as ex:                        # noqa: BLE001
+            detail = (f"{label} purpose assessment attempt "
+                      f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS} failed: "
+                      f"{type(ex).__name__}: {ex}")
+            errors.append(detail)
+            if log:
+                log(detail)
+            continue
+        if got:
+            if attempt and log:
+                log(f"{label} purpose assessment succeeded on attempt "
+                    f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS}")
+            return got
+        detail = (f"{label} purpose assessment attempt "
+                  f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS} returned nothing usable")
+        errors.append(detail)
+        if log:
+            log(detail)
+    return None
 
 
 def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
@@ -11818,6 +12210,14 @@ def _residual_is_material(r: dict) -> bool:
     'residuals' ('returns None is not ideal', NaN-validation wishes) that named no
     failing case - those are suggestions, not defects. A residual missing ALL
     classification keys stays MATERIAL (fail-safe for malformed/legacy verdicts)."""
+    # A NON-CODE residual is never MATERIAL to a code fix. The adversarial
+    # verifier feeds material residuals back to the author as new fix targets;
+    # a residual whose root cause is data/environment/client/configuration has
+    # no in-file edit that resolves it, so treating it as material would burn
+    # rounds and end in an invented patch. It is not dropped: the caller
+    # documents every residual, material or not, in the report notes.
+    if finding_is_non_code(r):
+        return False
     if ("realistic_input" not in r and "affects_core" not in r
             and "repro" not in r):
         return True
@@ -14566,24 +14966,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # says which, because a silent absence reads as "no competitors exist".
         competitor_research: dict | None = None
         competitor_bridged_findings: list[dict] = []
+        # Phase 1c. None is never a valid end state: the phase always writes a
+        # record, because "unavailable" has to be a printed verdict rather than
+        # an absence that reads as a clean data bill of health.
+        runtime_evidence: dict | None = None
+        runtime_evidence_findings: list[dict] = []
         if getattr(args, "purpose_gap", True) and purpose_blob:
             report(phase="purpose gap (baseline)")
             if checkpoint is not None:
                 checkpoint.set_phase("purpose gap (baseline)")
             print(f"{pfx}PHASE 1 - purpose: measuring the gap between this program "
                   "and the job it was created to do...")
-            try:
-                purpose_before = assess_purpose_gap(
-                    purpose_reviewer, purpose_blob, all_files, [],
-                    project_dir=project_dir, contract=purpose_contract)
-            except BudgetExceededError:
-                print(f"{pfx}purpose baseline skipped: cost cap reached")
-                purpose_assessment_errors.append(
-                    "baseline purpose assessment skipped: cost cap reached")
-            except Exception as ex:
-                print(f"{pfx}purpose baseline failed (non-fatal): {ex}")
-                purpose_assessment_errors.append(
-                    f"baseline purpose assessment failed: {type(ex).__name__}: {ex}")
+            purpose_before = assess_purpose_gap_resiliently(
+                [purpose_reviewer, author, cross], purpose_blob, all_files, [],
+                project_dir=project_dir, contract=purpose_contract,
+                label="baseline", errors=purpose_assessment_errors,
+                log=lambda m: print(f"{pfx}{m}"))
             if purpose_before:
                 _got = int(purpose_before.get("assessment_samples") or 0)
                 _want = int(purpose_before.get("assessment_expected_samples") or _got)
@@ -14850,6 +15248,79 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}competitor research SKIPPED: "
                   + ("cost cap reached" if meter.over_limit() else "run aborted earlier"))
         # ================== END PHASE 1b ======================================
+
+        # ================== PHASE 1c - RUNTIME-DATA EVIDENCE ==================
+        # Owner order 2026-08-25. Reading source can only ever produce a CODE
+        # verdict. The motivating case had none: a Facebook in-app browser
+        # dropping a sameSite:strict refresh cookie bounced a real user every 3
+        # hours, provable ONLY by querying prod `user_sessions` and comparing
+        # refresh-rotation counts per client. So: introspect the live schema
+        # FIRST (never guess a column name), run guarded read-only SELECTs, and
+        # turn what the ROWS demonstrate into NON-CODE findings that go to the
+        # owner as a brief - never into a patch.
+        #
+        # Authority is NOT widened to get here: `railway` remains a blocked
+        # deploy exe in flexfactor_cmdpolicy and no process is launched. The
+        # connection string comes from FLEXFACTOR_READONLY_DATABASE_URL, which
+        # the owner sets. Absent -> the phase reports UNAVAILABLE and says so.
+        _pe = _prodevidence_module()
+        if _pe is None:
+            runtime_evidence = {
+                "available": False, "driver": None, "tables": 0,
+                "queries": [], "rejected": [], "findings": [],
+                "errors": ["flexfactor_prodevidence could not be imported"],
+                "reason": "flexfactor_prodevidence module could not be imported - "
+                          "no read path to production data was attempted"}
+            print(f"{pfx}runtime-data evidence UNAVAILABLE: "
+                  f"{runtime_evidence['reason']}")
+        else:
+            report(phase="runtime-data evidence")
+            if checkpoint is not None:
+                checkpoint.set_phase("runtime-data evidence")
+            _ev_env, _ev_skip = _pe.resolve_program_url(display_name, total)
+            try:
+                if _ev_skip:
+                    runtime_evidence = {
+                        "available": False, "driver": None, "tables": 0,
+                        "queries": [], "rejected": [], "findings": [],
+                        "errors": [], "reason": _ev_skip}
+                    print(f"{pfx}PHASE 1c - runtime-data evidence UNAVAILABLE: "
+                          f"{_ev_skip}")
+                    raise _SkipRuntimeEvidence
+                runtime_evidence = _pe.collect_runtime_evidence(
+                    lambda system, prompt, schema: _judge(
+                        purpose_reviewer, system, prompt, schema),
+                    purpose_blob or f"Program: {display_name}",
+                    env=dict(os.environ, **_ev_env) if _ev_env else None,
+                    log=lambda m: print(f"{pfx}PHASE 1c - {m}"))
+            except _SkipRuntimeEvidence:
+                pass
+            except BudgetExceededError:
+                runtime_evidence = {
+                    "available": False, "driver": None, "tables": 0,
+                    "queries": [], "rejected": [], "findings": [],
+                    "errors": ["cost cap reached"],
+                    "reason": "runtime-data evidence stopped at the cost cap - "
+                              "production data was NOT examined"}
+                print(f"{pfx}runtime-data evidence stopped at the cost cap")
+            except Exception as ex:   # never abort an audit over evidence gathering
+                runtime_evidence = {
+                    "available": False, "driver": None, "tables": 0,
+                    "queries": [], "rejected": [], "findings": [],
+                    "errors": [f"{type(ex).__name__}: {ex}"],
+                    "reason": f"runtime-data evidence failed: {type(ex).__name__}: "
+                              f"{ex} - production data was NOT examined"}
+                print(f"{pfx}runtime-data evidence failed (non-fatal): {ex}")
+            for _rf in _pe.runtime_findings(runtime_evidence):
+                # Merged into the finding record AFTER the cycle loop (the loop
+                # reassigns all_findings wholesale), exactly like the phase-1b
+                # competitor findings. should_fix_finding refuses every one of
+                # them, so none can reach the fixer.
+                runtime_evidence_findings.append(_normalize_finding(_rf))
+            if runtime_evidence_findings:
+                print(f"{pfx}PHASE 1c - {len(runtime_evidence_findings)} NON-CODE "
+                      "finding(s) from live data; reported to the owner, never patched")
+        # ================== END PHASE 1c ======================================
 
         if purpose_files and not dirty_abort:
             # Purpose-critical files lead the sweep, so even a run that stops at
@@ -15291,6 +15762,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         if competitor_bridged_findings:
             all_findings = list(all_findings) + competitor_bridged_findings
 
+        # Phase 1c NON-CODE findings join the record here for the same reason.
+        # They are deliberately NOT added to file_findings: that map drives the
+        # per-file fix/report machinery and a runtime-data verdict has no file.
+        if runtime_evidence_findings:
+            all_findings = list(all_findings) + runtime_evidence_findings
+
         # 4b. PURPOSE GAP: infer what this program was created FOR from its own
         #     metadata and measure the distance between that purpose and what the
         #     code delivers - then BRIDGE it where safely possible. Small,
@@ -15315,18 +15792,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 and not infrastructure_abort):
             report(phase="purpose-gap assessment")
             print(f"{pfx}Assessing purpose gap (metadata vs delivered behavior)...")
-            try:
-                purpose_gap = assess_purpose_gap(
-                    purpose_reviewer_final, purpose_blob, all_files, all_findings,
-                    project_dir=project_dir, contract=purpose_contract)
-            except BudgetExceededError:
-                print(f"{pfx}purpose-gap skipped: cost cap reached")
-                purpose_assessment_errors.append(
-                    "final purpose assessment skipped: cost cap reached")
-            except Exception as ex:
-                print(f"{pfx}purpose-gap assessment failed (non-fatal): {ex}")
-                purpose_assessment_errors.append(
-                    f"final purpose assessment failed: {type(ex).__name__}: {ex}")
+            purpose_gap = assess_purpose_gap_resiliently(
+                [purpose_reviewer_final, author, cross], purpose_blob, all_files,
+                all_findings, project_dir=project_dir, contract=purpose_contract,
+                label="final", errors=purpose_assessment_errors,
+                log=lambda m: print(f"{pfx}{m}"))
             if purpose_gap:
                 _got = int(purpose_gap.get("assessment_samples") or 0)
                 _want = int(purpose_gap.get("assessment_expected_samples") or _got)
@@ -15500,18 +15970,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if bridged_files and not dirty_abort and not infrastructure_abort:
                 report(phase="purpose-gap reassessment")
                 print(f"{pfx}Reassessing purpose after purpose-bridge changes...")
-                try:
-                    refreshed = assess_purpose_gap(
-                        purpose_reviewer_final, purpose_blob, all_files, all_findings,
-                        project_dir=project_dir, contract=purpose_contract)
-                except BudgetExceededError:
-                    refreshed = None
-                    purpose_assessment_errors.append(
-                        "post-bridge purpose reassessment skipped: cost cap reached")
-                except Exception as ex:
-                    refreshed = None
-                    purpose_assessment_errors.append(
-                        f"post-bridge purpose reassessment failed: {type(ex).__name__}: {ex}")
+                refreshed = assess_purpose_gap_resiliently(
+                    [purpose_reviewer_final, author, cross], purpose_blob,
+                    all_files, all_findings, project_dir=project_dir,
+                    contract=purpose_contract, label="post-bridge reassessment",
+                    errors=purpose_assessment_errors,
+                    log=lambda m: print(f"{pfx}{m}"))
                 if refreshed:
                     _got = int(refreshed.get("assessment_samples") or 0)
                     _want = int(refreshed.get("assessment_expected_samples") or _got)
@@ -16197,6 +16661,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
             "product_invariants": product_invariants,
+            "runtime_evidence": runtime_evidence,
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
             "bridged_early": bridged_early,
@@ -17365,9 +17830,63 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     floor = SEVERITY_RANK.get(str(a.get("fix_severity", "high")).lower(), 3)
     applied = set(a.get("applied_files") or [])
     unresolved = set(a.get("unresolved_files") or [])
+    # RUNTIME-DATA EVIDENCE: what was actually read from production, or the
+    # NAMED reason nothing was. Printed unconditionally and BEFORE the brief:
+    # "no data findings" and "no read path to look" are opposite statements and
+    # must never render identically.
+    _re = a.get("runtime_evidence")
+    if _re is not None:
+        L += ["## Runtime-data evidence (read-only production)", ""]
+        if not _re.get("available"):
+            L += [f"**UNAVAILABLE** - {_re.get('reason')}", "",
+                  "_This is NOT a clean data bill of health: no data-shaped or "
+                  "environment-shaped root cause could be looked for._", ""]
+        else:
+            L += [f"- Driver: `{_re.get('driver')}`; "
+                  f"{_re.get('tables', 0)} table(s) introspected from "
+                  "`information_schema.columns` BEFORE any query was written.",
+                  f"- Probes executed: {len(_re.get('queries') or [])}; "
+                  f"rejected before execution: {len(_re.get('rejected') or [])}.", ""]
+            for q in _re.get("queries") or []:
+                L.append(f"  - `{q.get('name')}` ({q.get('row_count')} row(s)) - "
+                         f"{q.get('question')}")
+            for r in _re.get("rejected") or []:
+                L.append(f"  - REJECTED `{r.get('name')}`: {r.get('reason')}")
+            for e in _re.get("errors") or []:
+                L.append(f"  - ERROR: {e}")
+            L.append("")
+
+    # THE OWNER BRIEF for non-code root causes (owner order 2026-08-25). These
+    # findings are NEVER patched (should_fix_finding refuses them), so if they
+    # were not printed HERE they would vanish - the exact silent-drop this
+    # section exists to prevent. The runtime-evidence section below states
+    # separately whether the capability could run at all, so an empty brief is
+    # never readable as "no data problems found".
+    non_code = [f for f in a["findings"] if finding_is_non_code(f)]
+    if non_code:
+        L += ["## Non-code root causes - OWNER BRIEF (never auto-applied)", "",
+              "_No code is wrong in these. A patch would be an invention, so "
+              "FlexFactor reports them and stops. Each names the evidence it "
+              "rests on and the concrete non-code action that resolves it._", ""]
+        for f in sorted(non_code, key=lambda x: -SEVERITY_RANK.get(
+                str(x.get("severity")).lower(), 0)):
+            L.append(f"- **[{f.get('severity')}] {f.get('category')}** "
+                     f"(evidence: {f.get('evidence_source', 'runtime-data')}"
+                     + (f", probe `{f.get('query_name')}`" if f.get("query_name") else "")
+                     + f") - **{f.get('title')}**: {f.get('problem')}")
+            if f.get("evidence"):
+                L.append(f"  - Evidence: {f.get('evidence')}")
+            L.append(f"  - Next step (owner): {f.get('next_step') or f.get('fix') or '(none given)'}")
+        L.append("")
+
     remaining: dict[str, list[dict]] = {}
     for f in a["findings"]:
         if f.get("file") in ("(e2e)", "(unit tests)", "(full suite)", "(readiness)"):
+            continue
+        # Already rendered in the owner brief above, and structurally unfixable
+        # by a patch - listing it as a "defect not auto-fixed" would read as a
+        # code backlog item.
+        if finding_is_non_code(f):
             continue
         rank = SEVERITY_RANK.get(str(f.get("severity")).lower(), 0)
         below_floor = rank < floor
@@ -18173,6 +18692,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_trust", "flexfactor_partial", "flexfactor_wip",
                  "flexfactor_runstate", "flexfactor_evidence", "flexfactor_purpose",
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
+                 "flexfactor_prodevidence",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
                  "flexfactor_product_invariants", "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
@@ -18201,6 +18721,12 @@ def runtime_manifest() -> dict:
     for hook in ("partial_output", "trust_gate", "wip_snapshot", "execution_broker"):
         fn = globals().get("_WIRED_" + hook.upper())
         wired[hook] = bool(fn)
+    # A BEHAVIOURAL probe, not a flag: it drives the real chokepoint with a real
+    # non-code finding at the most permissive severity floor. "The constant
+    # exists" is exactly the kind of evidence this manifest refuses to accept.
+    wired["non_code_findings_never_patched"] = (
+        should_fix_finding({"category": "client", "severity": "critical",
+                            "evidence_source": "runtime-data"}, "info") is False)
     return {
         "tool_version": TOOL_VERSION,
         "modes": ["refactor", "scout", "audit", "prodready", "policy"],

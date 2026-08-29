@@ -73,6 +73,33 @@ class SteeringTests(unittest.TestCase):
             }),
         )
         self.assertEqual("build-host", web._host_label({"HOSTNAME": "build-host"}))
+    def test_reassigning_DEFAULT_ROOT_actually_isolates(self):
+        """Patching the module default must redirect writes, not decorate them.
+
+        `root: str = DEFAULT_ROOT` bound the owner's real journal directory at
+        import time, so every caller that reassigned DEFAULT_ROOT - the desktop
+        dashboard's self-test among them - still wrote into
+        ~/.flexfactor/steering. Measured 2026-08-28: two live comments
+        ("prioritize the auth bugs") sat in the real journal pointing at
+        tempdirs, and a matching program's next audit would have claimed them as
+        owner instructions."""
+        real = fs.DEFAULT_ROOT
+        redirected = os.path.join(self.root, "redirected")
+        fs.DEFAULT_ROOT = redirected
+        try:
+            fs.submit("prog", self.root, "only in the redirected journal")
+            self.assertTrue(
+                os.path.isfile(fs.journal_path("prog", self.root, redirected)),
+                "the write must land under the reassigned root")
+            self.assertFalse(
+                os.path.isdir(os.path.join(real, "prog")),
+                "and nothing may appear under the import-time default")
+            self.assertEqual(
+                1, len(fs.list_comments("prog", self.root)),
+                "reads must follow the same reassigned root as writes")
+        finally:
+            fs.DEFAULT_ROOT = real
+
     def test_context_replaces_prior_snapshot(self):
         combined = fs.merge_context("BASE", fs.steering_block([{"id": "one", "comment": "first"}]))
         refreshed = fs.merge_context(combined, fs.steering_block([{"id": "two", "comment": "second"}]))

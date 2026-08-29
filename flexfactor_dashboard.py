@@ -33,6 +33,21 @@ try:
 except Exception:  # noqa: BLE001 - a missing viewer feature is not a crash
     _fe = None
 
+# Operator steering (owner order 2026-08-28: "a text box where I can steer the
+# direction the program is taking in its editing"). The desktop dashboard is the
+# UI the audit auto-launches, so the steering box has to live HERE and not only
+# in the web dashboard - a control the owner has to go find in a browser is a
+# control that does not exist during the run it was meant to redirect.
+# Soft import for the same reason as _fe: an older tree still gets a dashboard.
+try:
+    import flexfactor_steering as _steer
+except Exception:  # noqa: BLE001
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import flexfactor_steering as _steer
+    except Exception:  # noqa: BLE001
+        _steer = None
+
 STATUS_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.expanduser("~"), ".flexfactor", "status.json")
 
@@ -843,6 +858,82 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
 
 
 
+def steering_targets(progs: list[dict]) -> list[tuple[str, str]]:
+    """(display name, project dir) for every program that can be steered.
+
+    A program with no resolved directory cannot be addressed: the steering
+    journal is keyed on (program, canonical dir), so a blank dir would file the
+    comment under a key no run will ever claim. Those are dropped here rather
+    than accepted and silently lost."""
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for p in progs or []:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        pdir = str(p.get("dir") or "").strip()
+        if not name or not pdir:
+            continue
+        key = (name.casefold(), os.path.normcase(os.path.abspath(pdir)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, pdir))
+    return out
+
+
+def submit_steering(name: str, project_dir: str, comment: str) -> tuple[bool, str]:
+    """Record one steering comment. Returns (accepted, message-for-the-operator).
+
+    Never raises: this runs on a Tk callback, and an exception there kills the
+    redraw loop. Rejections (empty text, oversize, control characters, no
+    steering module) are reported in the panel instead."""
+    if _steer is None:
+        return False, "steering module not available in this tree"
+    text = str(comment or "").strip()
+    if not text:
+        return False, "type a comment first"
+    if not name or not project_dir:
+        return False, "no program selected"
+    try:
+        _steer.submit(name, project_dir, text, source="desktop-dashboard")
+    except (ValueError, OSError) as e:
+        return False, f"not accepted: {e}"
+    return True, "queued - the running audit picks it up at its next checkpoint"
+
+
+def steering_labels(targets: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
+    """(menu label, program, dir) with labels that cannot collide.
+
+    Two audited directories can share a basename - ~/work/api and ~/spike/api -
+    and the picker shows only the program name. Looking the directory back up by
+    the displayed name then resolves BOTH entries to whichever was stored last,
+    so choosing either menu row files the comment against one audit and leaves
+    the other silently unsteered. When a name repeats, its directory goes in the
+    label; unique names are left alone so the common case reads normally."""
+    counts: dict[str, int] = {}
+    for name, _pdir in targets:
+        counts[name] = counts.get(name, 0) + 1
+    out = []
+    for name, pdir in targets:
+        label = name if counts.get(name, 0) < 2 else f"{name}  [{pdir}]"
+        out.append((label, name, pdir))
+    return out
+
+
+def steering_status_line(name: str, project_dir: str) -> str:
+    """One-line backlog for the selected program, or '' when unavailable."""
+    if _steer is None or not name or not project_dir:
+        return ""
+    try:
+        summary = _steer.summary(name, project_dir)
+    except (ValueError, OSError):
+        return ""
+    counts = summary.get("counts") or {}
+    parts = [f"{k}: {v}" for k, v in sorted(counts.items()) if v]
+    return f"steering ({summary.get('total', 0)}) " + ", ".join(parts) if parts else ""
+
+
 def _main() -> int:
     import tkinter as tk
 
@@ -852,8 +943,81 @@ def _main() -> int:
     root.geometry("960x620")
     root.minsize(420, 420)
 
+    # Steering panel FIRST (side="bottom"), so the canvas below it takes the
+    # remaining space instead of squeezing the controls off-screen when the
+    # window is small.
+    steer_bar = tk.Frame(root, bg=BG)
+    steer_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+
     canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
-    canvas.pack(fill="both", expand=True)
+    canvas.pack(side="top", fill="both", expand=True)
+
+    steer_target = tk.StringVar(value="")
+    steer_note = tk.StringVar(value="steer: waiting for a program")
+    steer_targets_cache: list[tuple[str, str]] = []
+    # label -> (program, dir). Keyed on the LABEL, which steering_labels
+    # guarantees is unique, so two same-named programs stay distinguishable.
+    steer_by_label: dict[str, tuple[str, str]] = {}
+
+    tk.Label(steer_bar, text="Steer:", bg=BG, fg=DIM).pack(side="left")
+    target_menu = tk.OptionMenu(steer_bar, steer_target, "")
+    target_menu.configure(bg=BG, fg=TEXT, highlightthickness=0, activebackground=BG,
+                          activeforeground=TEXT, width=16, anchor="w")
+    target_menu["menu"].configure(bg=BG, fg=TEXT)
+    target_menu.pack(side="left", padx=(6, 8))
+
+    entry = tk.Entry(steer_bar, bg=PANEL, fg=TEXT, insertbackground=TEXT,
+                     relief="flat", highlightthickness=1,
+                     highlightbackground=DIM, highlightcolor=TEXT)
+    entry.pack(side="left", fill="x", expand=True, ipady=4)
+
+    note = tk.Label(steer_bar, textvariable=steer_note, bg=BG, fg=DIM,
+                    anchor="w", width=34)
+
+    def do_send(_event=None) -> None:
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
+        ok, msg = submit_steering(name, pdir, entry.get())
+        if ok:
+            entry.delete(0, "end")
+        steer_note.set(msg)
+
+    send = tk.Button(steer_bar, text="Send", command=do_send, bg=PANEL, fg=TEXT,
+                     activebackground=PANEL, activeforeground=TEXT, relief="flat",
+                     padx=14)
+    send.pack(side="left", padx=(8, 8))
+    note.pack(side="left")
+    entry.bind("<Return>", do_send)
+
+    def refresh_targets(progs: list[dict]) -> None:
+        """Keep the program picker in step with the run, without stomping on a
+        selection the operator already made."""
+        targets = steering_targets(progs)
+        if targets == steer_targets_cache:
+            return
+        steer_targets_cache[:] = targets
+        labelled = steering_labels(targets)
+        steer_by_label.clear()
+        steer_by_label.update({lab: (n, d) for lab, n, d in labelled})
+        menu = target_menu["menu"]
+        menu.delete(0, "end")
+        for label, _n, _d in labelled:
+            menu.add_command(label=label,
+                             command=lambda lb=label: steer_target.set(lb))
+        current = steer_target.get()
+        if labelled and current not in steer_by_label:
+            steer_target.set(labelled[0][0])
+        elif not labelled:
+            steer_target.set("")
+
+    def refresh_note() -> None:
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
+        if not name:
+            steer_note.set("steer: waiting for a program")
+        else:
+            steer_note.set(steering_status_line(name, pdir) or "steer: no comments yet")
+        root.after(3000, refresh_note)
+
+    refresh_note()
 
     # Per-(program, bar) eased display value so bars glide instead of jumping.
     shown: dict[tuple, float] = {}
@@ -869,12 +1033,21 @@ def _main() -> int:
 
     canvas.bind("<Button-1>", on_click)
 
+    _targets_tick = [0.0]
+
     def redraw() -> None:
         canvas.delete("all")
         hits.clear()
+        progs = read_status(STATUS_PATH)
+        # Rebuilding the OptionMenu is Tk widget work; it must not run at 25 fps
+        # (same no-work-per-frame rule as the black-screen-flash fix above).
+        now = time.time()
+        if now - _targets_tick[0] >= 1.0:
+            _targets_tick[0] = now
+            refresh_targets(progs)
         draw_frame(canvas, hits, shown,
                    canvas.winfo_width() or 960, canvas.winfo_height() or 620,
-                   read_status(STATUS_PATH))
+                   progs)
         root.after(40, redraw)  # ~25 fps for smooth bar glide
 
     redraw()
@@ -910,5 +1083,31 @@ if __name__ == "__main__":
         restore_all()
         assert len(visible_programs(both)) == 2
         print("restore_all:", [p["name"] for p in visible_programs(both)])
+        # Operator steering, headless. The box is the owner's live control over
+        # a running audit, so its accept/reject contract is gated here rather
+        # than only exercised by clicking it.
+        import tempfile as _tf
+        targets = steering_targets([sample, stopped,
+                                    {"name": "NoDir", "dir": ""},
+                                    dict(stopped)])
+        assert [n for n, _ in targets] == ["IPlay"], targets
+        assert submit_steering("IPlay", "C:/x", "   ")[0] is False,             "an empty comment must be refused, not queued"
+        assert submit_steering("", "C:/x", "do the thing")[0] is False,             "a comment with no selected program must be refused"
+        # Two audits can share a basename; the picker shows only the name, so a
+        # label that repeats would steer whichever directory was stored last.
+        collide = steering_labels([("api", "C:/work/api"), ("api", "C:/spike/api"),
+                                   ("solo", "C:/solo")])
+        assert len({lab for lab, _n, _d in collide}) == 3, collide
+        assert [lab for lab, _n, _d in collide][2] == "solo",             "a unique name must stay unadorned"
+        assert {d for _lab, _n, d in collide} == {
+            "C:/work/api", "C:/spike/api", "C:/solo"}, collide
+        print("steering labels:", [lab for lab, _n, _d in collide])
+        if _steer is not None:
+            _root = _tf.mkdtemp()
+            _steer.DEFAULT_ROOT = _root
+            ok, msg = submit_steering("IPlay", _root, "prioritize the auth bugs")
+            assert ok, msg
+            assert "pending: 1" in steering_status_line("IPlay", _root),                 "an accepted comment must show up as pending backlog"
+            print("steering:", steering_status_line("IPlay", _root))
         sys.exit(0)
     sys.exit(_main())

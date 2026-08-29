@@ -23,6 +23,28 @@ import tomllib
 import unittest
 from unittest import mock
 
+# --------------------------------------------------------------------------- #
+# The suite must not inherit the HOST's git repository (2026-08-28).
+#
+# Tests build throwaway projects under the system temp dir and then assert on
+# what FlexFactor does with a directory that is NOT a git repo. On a machine
+# where the temp dir happens to live inside some other repository - a home
+# directory someone ran `git init` in, for one - every `git` call FlexFactor
+# makes inside those fixtures walks up and finds that outer repo instead. The
+# non-git assertions fail, and audits refuse to start against "a dirty tree"
+# that belongs to the host, not the fixture. Measured here: four failures whose
+# output named the host's index.lock and nothing about the test.
+#
+# GIT_CEILING_DIRECTORIES stops git's upward walk at the temp root, so a fixture
+# is its own repo or no repo at all, identically on every machine. It is set
+# once, before flexfactor is imported, so no test can be missed.
+# --------------------------------------------------------------------------- #
+import tempfile as _tempfile_ceiling  # noqa: E402
+_TEMP_ROOT = os.path.abspath(_tempfile_ceiling.gettempdir())
+os.environ["GIT_CEILING_DIRECTORIES"] = (
+    _TEMP_ROOT + os.pathsep + os.environ["GIT_CEILING_DIRECTORIES"]
+    if os.environ.get("GIT_CEILING_DIRECTORIES") else _TEMP_ROOT)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location("flexfactor", os.path.join(_HERE, "flexfactor.py"))
 ff = importlib.util.module_from_spec(_SPEC)
@@ -260,6 +282,18 @@ class FixDiffTests(unittest.TestCase):
 
 
 class PricingAndEconomyTests(unittest.TestCase):
+    def tearDown(self):
+        # build_audit_providers publishes the chosen free backends in a MODULE
+        # GLOBAL, and audit_one_program wraps whatever is in it into the
+        # reviewer pool. Tests here call the real builder with stub providers,
+        # so leaving that global populated hands a LATER test's audit a pool of
+        # fakes: ResumeCheckpointTests then reviewed nothing and reported
+        # "provider errors/budget" - a failure with no connection to its own
+        # subject, and only when the two ran in the same process.
+        ff._LAST_FREE_REVIEW_POOL = []
+        ff._LAST_ROTATION_USABLE = 0
+        ff._PROVIDER_DIAGNOSIS = ""
+
     def test_claude5_family_priced(self):
         # Missing entries silently fall back to Opus-tier pricing (5/25), which
         # overbills the meter and stops budget-capped runs early.
@@ -308,9 +342,19 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._provider_key_present, ff.make_provider = real_key, real_make
 
     def test_preflight_drops_dead_primary_and_falls_back(self):
-        # anthropic key is present but DEAD (out of credits); openai is healthy.
-        # Preflight must drop anthropic as author and fall back to openai, not
-        # return [] and not crash a later fix call by picking the broke provider.
+        """A dead half of the paid pair is a REFUSAL, not a quieter run.
+
+        Owner order 2026-08-28: "For the paid path, allow both Anthropic and
+        OpenAI API keys to be used. Each edit must be approved by both models."
+
+        Every approval gate in the fix loop - the adversarial verify and the
+        legacy single-shot veto both - is conditional on a second provider
+        existing. So the old behaviour here (anthropic dead -> continue on
+        openai alone) did not merely lose a reviewer: it silently removed the
+        approval step the paid path is named for, and reported the run as
+        normal. Paid mode now refuses and names the missing half. `--single`
+        (use_both=False) is how a one-model run is asked for on purpose - that
+        path still falls back, and is covered below."""
         class Args:
             provider = "anthropic"
             model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
@@ -331,10 +375,236 @@ class PricingAndEconomyTests(unittest.TestCase):
         ff.make_provider = lambda name, model, meter=None, judge_model=None: (
             picked.append(name) or object())
         try:
+            self.assertEqual([], ff.build_audit_providers(Args),
+                             "paid mode must not run one-model when --single "
+                             "was not asked for")
+            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
+            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
+            # ...and the deliberate single-model run still works, with openai
+            # as the fallback author exactly as before.
+            picked.clear()
+            Args.use_both = False
             out = ff.build_audit_providers(Args)
-            # Only openai survives, and it is the (fallback) primary author.
             self.assertEqual([n for n, _ in out], ["openai"])
             self.assertEqual(picked, ["openai"])
+        finally:
+            Args.use_both = True
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_free_pool_puts_the_second_free_backend_on_fix_approval(self):
+        """Two free backends up -> the second one CROSS-VERIFIES, not just reviews.
+
+        Owner order 2026-08-28, free path: "optimize the use of the free
+        platforms available where they work harmoniously towards a common
+        goal." The fix-approval gates (`_adversarial_verify_fix` and the legacy
+        veto) are conditional on a second provider being present, so returning a
+        single provider here means every free-path fix is accepted on the
+        author's own say-so while a usable second free backend sits idle for the
+        one decision a second opinion is worth most on."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False   # free-first only applies when unnamed
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        real_fcc = ff._auto_activate_fcc_proxy
+        real_rot = ff._build_rotating_provider
+        ff._provider_key_present = lambda name: True
+        ff._provider_free_routed = lambda name: name == "anthropic"
+        ff._auto_activate_fcc_proxy = lambda: None
+        ff._build_rotating_provider = lambda *a, **kw: None   # exercise the POOL path
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["anthropic", "ollama"], names,
+                             "both free backends must be returned so the fix "
+                             "loop has a cross-model verifier")
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+            ff._auto_activate_fcc_proxy = real_fcc
+            ff._build_rotating_provider = real_rot
+
+    def test_rotation_returns_a_second_route_to_verify_every_fix(self):
+        """The default free path is rotation, and it returned ONE provider.
+
+        `cross = providers[1][1] if len(providers) > 1 else None` gates every
+        fix-approval path in the run, so a single-provider rotation meant the
+        normal free run wrote each fix on the author's own say-so while the rest
+        of the catalog (121 free routes over 23 pools, measured on this machine)
+        stood idle. Rotation now hands back a second independent route for the
+        cross-check, built quietly so the banner is not printed twice."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        calls = []
+        real_build = ff._build_rotating_provider
+        real_usable = ff._LAST_ROTATION_USABLE
+        real_fcc = ff._auto_activate_fcc_proxy
+
+        def fake_build(a, meter, mode, quiet=False):
+            calls.append(quiet)
+            ff._LAST_ROTATION_USABLE = 7
+            return object()
+
+        ff._build_rotating_provider = fake_build
+        ff._auto_activate_fcc_proxy = lambda: None
+        try:
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["rotation", "rotation-verify"], names)
+            self.assertEqual([False, True], calls,
+                             "the verifier must be built quietly - one banner "
+                             "per run, not two")
+        finally:
+            ff._build_rotating_provider = real_build
+            ff._LAST_ROTATION_USABLE = real_usable
+            ff._auto_activate_fcc_proxy = real_fcc
+
+    def test_rotation_with_one_usable_route_stays_single(self):
+        """One route cannot cross-check itself; claiming otherwise would be the
+        same silent-approval defect wearing the opposite mask."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        real_build = ff._build_rotating_provider
+        real_usable = ff._LAST_ROTATION_USABLE
+        real_fcc = ff._auto_activate_fcc_proxy
+
+        def fake_build(a, meter, mode, quiet=False):
+            ff._LAST_ROTATION_USABLE = 1
+            return object()
+
+        ff._build_rotating_provider = fake_build
+        ff._auto_activate_fcc_proxy = lambda: None
+        try:
+            self.assertEqual(["rotation"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+        finally:
+            ff._build_rotating_provider = real_build
+            ff._LAST_ROTATION_USABLE = real_usable
+            ff._auto_activate_fcc_proxy = real_fcc
+
+    def test_copilot_in_paid_mode_still_needs_both_models(self):
+        """`other` is only ever the other half of the anthropic/openai pair.
+
+        A paid run with --provider copilot therefore left paid_pair_required
+        false and ran alone - the pair promise broken by the one permitted paid
+        provider that never had a partner."""
+        class Args:
+            provider = "copilot"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        ff._provider_free_routed = lambda name: False
+        try:
+            ff._provider_key_present = lambda name: name == "copilot"
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
+            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
+            # Both halves present: copilot authors, and a pair member reviews.
+            ff._provider_key_present = lambda name: True
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["copilot", "anthropic"], names)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
+    def test_secondary_model_is_honoured_by_the_free_pool_verifier(self):
+        """--secondary-model is documented as the 2nd cross-check provider's
+        model. Honouring it only on the paid branch discards an explicit choice
+        with no message."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = "chosen-cross-checker"
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False
+
+        picked = []
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        real_fcc = ff._auto_activate_fcc_proxy
+        real_rot = ff._build_rotating_provider
+        ff._provider_key_present = lambda name: True
+        ff._provider_free_routed = lambda name: name == "anthropic"
+        ff._auto_activate_fcc_proxy = lambda: None
+        ff._build_rotating_provider = lambda *a, **kw: None
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append((name, model)) or object())
+        try:
+            ff.build_audit_providers(Args)
+            self.assertIn(("ollama", "chosen-cross-checker"), picked)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+            ff._auto_activate_fcc_proxy = real_fcc
+            ff._build_rotating_provider = real_rot
+
+    def test_paid_mode_runs_when_both_models_are_usable(self):
+        """The positive half of the pair rule: two healthy keys -> two providers,
+        author first and the cross-checker second."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            self.assertEqual(["anthropic", "openai"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
         finally:
             ff._provider_key_present = real_key
             ff.make_provider = real_make
@@ -1449,6 +1719,175 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIsNone(ff._git_real_files(tmp))
             files = ff._enumerate_source_files(tmp, max_files=0)
             self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
+
+
+class MisKeyedArraySalvageTests(unittest.TestCase):
+    """The right rows under the wrong name are still the right rows.
+
+    Measured 2026-08-28 on a rotated free audit: a batch review came back as
+    {"findings": [{"file": "ledger.py", "findings": [...]}]} - the schema's own
+    item shape filed under the wrong top-level key. It was discarded, both
+    candidate files ended review_incomplete, and the run reported ZERO WORK with
+    the defects sitting inside the payload it threw away."""
+
+    BATCH = ff.AUDIT_BATCH_SCHEMA
+
+    def test_the_measured_payload_is_accepted_under_the_schema_name(self):
+        rows = [{"file": "ledger.py", "findings": [], "summary": "ok"}]
+        got = ff._check_structured_type({"findings": rows}, self.BATCH, "")
+        self.assertEqual({"reviews": rows}, got)
+
+    def test_a_decoy_object_is_still_refused(self):
+        """The guard this sits inside is what stops a false CLEAN."""
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type({"ok": 1}, self.BATCH, "")
+
+    def test_an_unrelated_list_is_still_refused(self):
+        for payload in ({"notes": ["a", "b"]},
+                        {"notes": [{"unrelated": 1}]},
+                        {"notes": []}):
+            with self.assertRaises(RuntimeError):
+                ff._check_structured_type(payload, self.BATCH, "")
+
+    def test_two_keys_are_ambiguous_and_still_refused(self):
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(
+                {"findings": [{"file": "a.py"}], "extra": [{"file": "b.py"}]},
+                self.BATCH, "")
+
+    def test_a_response_that_already_uses_the_right_key_is_untouched(self):
+        rows = [{"file": "a.py", "findings": [], "summary": "s"}]
+        self.assertEqual({"reviews": rows},
+                         ff._check_structured_type({"reviews": rows}, self.BATCH, ""))
+
+
+class PurposeAssessmentResilienceTests(unittest.TestCase):
+    """One malformed response is not a verdict on the program.
+
+    PHASE 1 measures the gap this whole tool is pointed at, and it was a single
+    call inside a non-fatal handler. Measured live 2026-08-28 on a rotated free
+    run: the first route returned something that was not JSON, the run printed
+    "purpose baseline failed (non-fatal): Expecting value: line 1 column 1", and
+    then audited as a generic defect sweep with 121 usable routes idle."""
+
+    def _run(self, side_effects, assessors=1):
+        calls = []
+        errors = []
+        logs = []
+
+        def fake(provider, blob, files, findings, *, project_dir, contract):
+            calls.append(provider)
+            outcome = side_effects[len(calls) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        real = ff.assess_purpose_gap
+        ff.assess_purpose_gap = fake
+        try:
+            got = ff.assess_purpose_gap_resiliently(
+                [f"assessor{i}" for i in range(assessors)], "blob", [], [],
+                project_dir="/p", contract=None, label="baseline",
+                errors=errors, log=logs.append)
+        finally:
+            ff.assess_purpose_gap = real
+        return got, calls, errors, logs
+
+    def test_a_malformed_first_response_retries_and_succeeds(self):
+        got, calls, errors, logs = self._run(
+            [ValueError("Expecting value: line 1 column 1 (char 0)"),
+             {"purpose": "recovered"}], assessors=2)
+        self.assertEqual({"purpose": "recovered"}, got)
+        self.assertEqual(["assessor0", "assessor1"], calls,
+                         "the retry must move to the next assessor")
+        self.assertTrue(any("attempt 1/3 failed" in e for e in errors),
+                        "the failed attempt must still be recorded, not swallowed")
+
+    def test_every_attempt_failing_is_reported_not_silent(self):
+        got, calls, errors, _ = self._run([RuntimeError("down")] * 3)
+        self.assertIsNone(got)
+        self.assertEqual(3, len(calls), "all attempts must be spent")
+        self.assertEqual(3, len(errors),
+                         "retrying must not turn three failures into silence")
+
+    def test_a_budget_refusal_is_not_retried(self):
+        got, calls, errors, _ = self._run([ff.BudgetExceededError("cap")] * 3)
+        self.assertIsNone(got)
+        self.assertEqual(1, len(calls),
+                         "the cost cap is a decision, not a fault to retry")
+        self.assertIn("cost cap reached", errors[0])
+
+    def test_an_empty_result_counts_as_a_failed_attempt(self):
+        got, calls, errors, _ = self._run([None, {}, {"purpose": "third"}])
+        self.assertEqual({"purpose": "third"}, got)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(2, len(errors))
+
+    def test_no_assessor_at_all_says_so(self):
+        errors = []
+        self.assertIsNone(ff.assess_purpose_gap_resiliently(
+            [None, None], "blob", [], [], project_dir="/p", contract=None,
+            label="baseline", errors=errors))
+        self.assertIn("no assessor available", errors[0])
+
+
+class GitWorktreeContainmentTests(unittest.TestCase):
+    """A directory INSIDE someone else's repo is not this run's repo.
+
+    Measured 2026-08-28: the owner's home directory is itself a git tree that
+    holds every project, so a project folder with no `.git` of its own resolved
+    to the HOME repo. One `git add -A` reached 695 MB of RSS staging terabytes
+    of unrelated files before it was killed, and a commit would have recorded
+    the whole home directory as that program's work."""
+
+    def _init(self, path, *, commit=None):
+        for argv in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *argv], cwd=path, capture_output=True, text=True)
+        if commit:
+            with open(os.path.join(path, commit), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+            subprocess.run(["git", "add", "-A"], cwd=path, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=path,
+                           capture_output=True, text=True)
+
+    def test_a_folder_inside_an_unrelated_repo_is_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = os.path.realpath(tmp)
+            self._init(outer, commit="outer.txt")
+            inner = os.path.join(outer, "someone-elses-program")
+            os.makedirs(inner)
+            with open(os.path.join(inner, "app.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")   # present but UNTRACKED in the outer repo
+            self.assertTrue(ff._git_worktree_root(inner),
+                            "git does resolve the outer repo - that is the trap")
+            self.assertFalse(ff._is_git_repo(inner),
+                             "an enclosing repo that tracks nothing here must "
+                             "not become the repo this run commits into")
+
+    def test_the_repo_root_itself_is_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._init(root, commit="a.txt")
+            self.assertTrue(ff._is_git_repo(root))
+
+    def test_a_tracked_monorepo_subdirectory_is_still_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._init(root)
+            sub = os.path.join(root, "services", "api")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "main.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self.assertTrue(ff._is_git_repo(sub),
+                            "a real monorepo subdirectory keeps git mode")
+
+    def test_a_plain_directory_is_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(ff._is_git_repo(os.path.realpath(tmp)))
 
 
 class FuzzyDedupeTests(unittest.TestCase):
@@ -7961,15 +8400,35 @@ import flexfactor_prodready as pr                                  # noqa: E402
 
 
 class _RepoFixture:
-    """Build a throwaway repo from a {relpath: contents} map."""
+    """Build a throwaway repo from a {relpath: contents} map.
+
+    HERMETICITY (2026-08-28). The fixture directory lives under the system temp
+    dir, and on a machine where the temp dir sits INSIDE some other git
+    repository (a home directory that was itself `git init`-ed, for instance)
+    every `git` command FlexFactor runs inside the fixture walks up and finds
+    that outer repository instead of finding nothing. The audit then reads the
+    outer repo's dirty tree and refuses to start - a green suite on one machine
+    and a wall of unrelated failures on another, with the real cause nowhere in
+    the output.
+
+    GIT_CEILING_DIRECTORIES stops the upward walk at the fixture's parent, so
+    the fixture is either its own repo or no repo at all, whatever the host
+    looks like. It is restored on exit; nesting is safe because the previous
+    value is saved per-instance."""
 
     def __init__(self, files: dict):
         self.files = files
         self._tmp = None
+        self._prev_ceiling = None
 
     def __enter__(self) -> str:
         self._tmp = tempfile.TemporaryDirectory()
         root = self._tmp.name
+        self._prev_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        ceiling = os.path.dirname(os.path.abspath(root))
+        os.environ["GIT_CEILING_DIRECTORIES"] = (
+            ceiling + os.pathsep + self._prev_ceiling
+            if self._prev_ceiling else ceiling)
         for rel, body in self.files.items():
             path = os.path.join(root, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -7978,6 +8437,10 @@ class _RepoFixture:
         return root
 
     def __exit__(self, *exc):
+        if self._prev_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self._prev_ceiling
         self._tmp.cleanup()
         return False
 
@@ -8547,6 +9010,16 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         (same contract FlexFactor core uses for run manifests)."""
         import subprocess
         import tempfile
+        # The prodready scorecard. Without it the mode whose promise is "point
+        # it at a program and walk away" could never report a clean checkpoint:
+        # writing <program>_readiness.md is the last thing every prodready run
+        # does, and checking whether the tree is clean is the next thing.
+        # Measured 2026-08-28 on a run that fixed both planted defects,
+        # committed them, and still ended "UNCOMMITTED changes remain".
+        self.assertTrue(ff._is_flexfactor_artifact("e2e_readiness.md"))
+        self.assertTrue(ff._is_flexfactor_artifact("GrantFlow_readiness.md"))
+        self.assertFalse(ff._is_flexfactor_artifact("readiness.md"),
+                         "a project's own readiness.md is not our artifact")
         self.assertTrue(ff._is_flexfactor_artifact("_scout_report.json"))
         self.assertTrue(ff._is_flexfactor_artifact(".flexfactor-scout-proposals.json"))
         self.assertTrue(ff._is_flexfactor_artifact("FixtureApp_repo_rewards_report.md"))
@@ -13386,6 +13859,28 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         mode, _ = fc.license_reuse_mode(repos[0]["license"])
         self.assertEqual(mode, fc.REUSE_CLEAN_ROOM)
 
+    def test_github_search_asks_for_relevance_not_the_most_starred_match(self):
+        """`sort=stars` returns the most-starred repo that matches AT ALL.
+
+        Measured 2026-08-28 against the live API, query "grant management
+        platform": four of the five results were star-farmed repositories whose
+        text merely contained the words - a copy of GitHub's own docs page, a
+        NiceHash terms-of-use dump, a bank's benefits page. Best-match returned
+        five real grant-management projects, and for a named competitor
+        ("OpenTofu") both orderings put the canonical repo first. Popularity is
+        still in the payload for the judge; it must not be the ranking."""
+        seen = []
+
+        def op(url, data=None, headers=None):
+            seen.append(url)
+            return _GH_FIXTURE
+
+        fc.github_repo_search("grant management platform", opener=op)
+        self.assertTrue(seen)
+        self.assertNotIn("sort=", seen[0],
+                         "ordering must be GitHub's relevance default")
+        self.assertIn("q=grant+management+platform", seen[0])
+
 
 class CompetitorResearchPipelineTests(unittest.TestCase):
     """End-to-end with fakes: no network, no provider, no keys."""
@@ -15415,6 +15910,27 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         self.assertEqual(seen, [16000, 4096],
                          "expected one rejected 16000 then a clamped 4096 retry, "
                          "got " + repr(seen))
+
+    def test_a_response_with_no_choices_names_the_route_not_flexfactor(self):
+        """Several free gateways answer 200 with `choices: null`.
+
+        `resp.choices[0]` raised `TypeError: 'NoneType' object is not
+        subscriptable`, so the run's error ledger filed a ROUTE fault against
+        flexfactor.py and rotation had no route-shaped failure to move away
+        from. Observed live 2026-08-28, entry 7 of 7 in a free rotated run."""
+        for empty in (None, []):
+            class _Resp:
+                choices = empty
+                usage = None
+
+            prov = self._fake_openai_provider("test-only/no-choices",
+                                              lambda **kw: _Resp())
+            with self.assertRaises(RuntimeError) as caught:
+                prov.structured("sys", "prompt", {"type": "object"},
+                                max_tokens=1000)
+            self.assertNotIsInstance(caught.exception, TypeError)
+            self.assertIn("test-only/no-choices", str(caught.exception))
+            self.assertIn("no choices", str(caught.exception))
 
     def test_a_ceiling_below_the_usable_floor_raises_RouteCapabilityError(self):
         class _Err(Exception):

@@ -36,12 +36,30 @@ redirect it gets a TypeError rather than quietly writing to ~/.flexfactor.
 from __future__ import annotations
 
 import datetime
+import itertools
 import json
 import os
 import shutil
+import threading
 import time
 
 SCHEMA_VERSION = 2
+
+# Per-process run_id sequence. The wall clock alone is not enough to keep two
+# ids apart: on Windows `datetime.now()` advances in ~15.6 ms steps, so the
+# microsecond field this id already carries repeats verbatim for every call
+# inside one tick. Measured 2026-08-28: two back-to-back new_run() calls for one
+# program produced the identical id (...-222647-378500-36808), and the second
+# checkpoint then took over the first one's directory - the exact overwrite the
+# microsecond field was added to stop. Time + pid separate different processes;
+# this counter separates calls within one.
+_RUN_SEQ = itertools.count()
+_RUN_SEQ_LOCK = threading.Lock()
+
+
+def _next_run_seq() -> int:
+    with _RUN_SEQ_LOCK:
+        return next(_RUN_SEQ) % 10000
 
 #: A run is resumable while its status is one of these.
 LIVE_STATUSES = ("running", "interrupted")
@@ -266,10 +284,11 @@ def new_run(root: str, *, program: str, project_dir: str, mode: str,
     # new_run then silently OVERWRITES the first one's directory instead of
     # getting its own. Two runs of one program in one second is not exotic -
     # it is what the resume tests do, and what a fast retry does.
-    rid = run_id or "{}-{}-{}".format(
+    rid = run_id or "{}-{}-{}-{:04d}".format(
         _slug(program),
         datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
-        os.getpid())
+        os.getpid(),
+        _next_run_seq())
     data = {
         "schema": SCHEMA_VERSION,
         "run_id": rid,
