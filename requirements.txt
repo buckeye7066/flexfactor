@@ -6,7 +6,7 @@
 # Both SDKs are imported lazily - one provider's key is enough to run.
 # Py3.12 SDK compat is fragile (see CLAUDE.md): re-run flexfactor_tests.py
 # after ANY bump before trusting a live audit with it.
-anthropic==0.116.0
+anthropic==1.0.0
 openai==2.44.0
 socksio==1.0.0
 # The DECLARED test runner ([tool.pytest.ini_options] in pyproject). Without it
