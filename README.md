@@ -18,6 +18,19 @@ purpose/readiness engines, and deterministic evidence runtime. Provider SDKs are
 optional; `.[all]` installs both cloud adapters. Ollama/local mode requires no
 paid service.
 
+## Desktop entry points
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_desktop_shortcuts.ps1
+```
+
+Creates **FlexFactor** and **FlexFactor Scout** on the desktop, pointed at this
+checkout. Double-click FlexFactor to pick a mode and a model mode (free or
+paid); drag a file or folder onto it to run against that program directly. The
+script is idempotent - re-run it after moving the checkout. It resolves the
+desktop from the shell folder, so a OneDrive-redirected profile gets them in the
+place its owner actually looks.
+
 ## Modes
 
 - **refactor** (default) - self-grading rewrite loop on one source file:

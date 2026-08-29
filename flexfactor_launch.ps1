@@ -187,12 +187,25 @@ if ($mode -eq "3" -or $mode -eq "4") {
         Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
         Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
         Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
-        if ([string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY) -and [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
-            Write-Host "Paid mode requested, but no captured paid credential is available." -ForegroundColor Red
+        # BOTH, not either. Paid mode's contract is that every applied fix is
+        # approved by the second model, and the engine refuses a one-model paid
+        # run rather than quietly dropping the approval step. Checking for
+        # "at least one key" here let the owner pick paid, watch the menu accept
+        # it, and only then meet the refusal several minutes into the run.
+        $missingPaid = @()
+        if ([string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) { $missingPaid += "ANTHROPIC_API_KEY" }
+        if ([string]::IsNullOrEmpty($env:OPENAI_API_KEY))    { $missingPaid += "OPENAI_API_KEY" }
+        if ($missingPaid.Count -gt 0) {
+            Write-Host ("Paid mode needs BOTH accounts and this environment is missing: " +
+                        ($missingPaid -join ", ")) -ForegroundColor Red
+            Write-Host "  Every fix in paid mode is approved by the second model, so a" -ForegroundColor Red
+            Write-Host "  one-model paid run is refused. Set the missing key, or choose free." -ForegroundColor Red
             Read-Host "Press Enter to close"; exit 1
         }
         Write-Host "  Paid mode: your Anthropic and OpenAI accounts ONLY, until their credits" -ForegroundColor Yellow
         Write-Host "             expire. No free routes, no Ollama, no OpenRouter resale." -ForegroundColor Yellow
+        Write-Host "             Both models are required: each applied fix is approved by the" -ForegroundColor Yellow
+        Write-Host "             one that did not write it." -ForegroundColor Yellow
     } else {
         $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = ""
         $env:FLEXFACTOR_FALLBACK_OPENAI_KEY = ""
