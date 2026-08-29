@@ -1856,3 +1856,123 @@ Now:
   `blocked_reasons`, `blocked_without_reason`, `unknown_blocked_ids`,
   `blocked_declared`; the dashboard payload carries `functions_blocked` and
   `functions_blocked_without_reason`. Blocked NEVER increments the direct count.
+
+
+## The run that "finished" and landed nothing (2026-08-29, live repo-rewards)
+
+`flexfactor_run.py prodready --program GrantFlow --program Genemap --program
+SermonSmith --program IPlay --program reporewards --parallel 5 --model-mode paid
+--paid-models openai --economy --yes`. The owner was told repo-rewards had
+finished. Measured from its own artifacts, the slot had **crashed**, published
+**nothing**, and left a **landmine**:
+
+| checkpoint field | value |
+|---|---|
+| `status` | `interrupted` |
+| `phase` | `unit tests` |
+| `cycle` | 7 |
+| `error` | `'str' object has no attribute 'get'` |
+| `branch` | `None` |
+| `spend_usd` | 1.839 |
+
+Zero modified tracked files in the repo. The only commits were two
+`chore(autoclean)` commits whose entire content is report markdown and run
+manifest JSON. The audit's own report said
+`Git: PROVIDER-OUTAGE ABORT on main: ... no unverified commit created` and
+`Files fixed: 49 (2 unverified - project didn't build at baseline)` - **49
+fixes that exist in no commit and no working tree.**
+
+### Defect 1: the shape guard stopped one level too high
+
+`_check_structured_type` was written for exactly this failure - its docstring
+names *"an opaque 'list' object has no attribute 'get' AttributeError that
+aborted the WHOLE program's audit"*. It guards the TOP-LEVEL type. The same
+failure arrived **inside an array**:
+
+    {"files": ["tests/foo.test.ts"], "notes": "..."}   # schema wants objects
+
+A dict, carrying every required key - so it passed - and then the unit-test
+phase's `for f in gen.get("files"): f.get("path")` raised
+`'str' object has no attribute 'get'`. **OpenAI's `json_object` mode is not
+schema-constrained**, and `OpenAIProvider.structured`'s own comment delegates
+the shape contract to *"the caller's code defends against missing keys with
+`.get()` defaults"* - a promise 15 schemas' worth of call sites do not keep.
+
+`_check_array_item_shape` now validates array elements at that same chokepoint,
+so all 15 schemas are covered at once. It **raises** rather than filtering the
+bad elements out: a filtered list is a silent partial result - fewer tests
+written, fewer edits applied, run reports success - which is the exact
+silent-no-op the exit-code-3 rule exists to prevent. Arrays whose schema
+declares scalar items (`items.type == "string"`) are untouched, or every
+`fixed_titles`-shaped property would break.
+
+**Second half of the fix, at the crash site:** that phase's `try/except` wraps
+only the `_gen_unit_tests` CALL, not the loop that consumes its result - which
+is why an AttributeError three lines later killed the program instead of
+skipping one module. The shape is now validated **inside** the try, so a fault
+arriving by any other route still degrades to that file's `[skip]`.
+
+**The landmine:** 19 generated test files were left uncommitted. The phase's own
+rollback (`_unlink_contained` on every generated file when the suite goes red)
+never ran, because the crash happened during generation. Measured against the
+repo's runner: **8 failed / 19 passed**, every failure one of the generated
+files, each dying at import with `ReferenceError: jest is not defined` -
+**Jest idioms written into a Vitest project**, plus ~11 more placed outside
+`vitest.config.ts`'s `include: ["src/**/*.test.ts"]`, so they never run at all.
+And `autoclean` COMMITS pre-existing working-tree changes at the start of the
+next run - so the next repo-rewards run would have committed a red suite to
+`main`. (Its own report said `Unit tests added: 0 (suite not run)`: it never ran
+what it wrote.)
+
+### Defect 2: a blackholed proxy reported as the program's fault
+
+The baseline gate ran `npm run typecheck` (**PASSED**) then `npm run build`:
+
+    Error: connect ECONNREFUSED 127.0.0.1:9
+    src\app\layout.tsx  `next/font` error:
+        Failed to fetch `IBM Plex Sans` from Google Fonts.
+
+Port 9 is the **discard port**. `next/font` could not fetch webfonts at build
+time. FlexFactor filed it `kind=program-defect`, told the owner to *"Fix the
+compile/build errors"* - **there were none** - refused to publish, and reported
+the repository **NOT PRODUCTION READY**. Measured the same day on this host with
+normal network: the identical tree builds clean, exit 0, 9 routes emitted.
+
+This is the 2026-08-20 "provider outage" failure shape again: a confidently
+wrong diagnosis pointed the owner at their own code for a fault in the host.
+
+`flexfactor_errors.build_failure_is_environmental()` is the shared detector (one
+sentence, quoted by the ledger and the console, so surfaces cannot drift), and
+the baseline STOP site now has a **third verdict** between "blocked by
+containment" and "red". **Publication still refuses** - an unevaluated build is
+`None`, never `True`, exactly as `_full_gate` already rules - and that is the
+point: only the DIAGNOSIS changes, so the owner is sent to `HTTP(S)_PROXY` and
+the firewall instead of to a compiler error that does not exist.
+
+Deliberately **conservative**: a bare connection token is not enough (a
+program's own tests may assert `ECONNREFUSED`). A network token must co-occur
+with a build-infrastructure token - webfonts, npm/PyPI/crates/maven registries,
+DNS. Erring toward `program-defect` costs a misleading message; erring the other
+way would excuse a real defect that cannot reach a service it needs.
+
+### Verified 2026-08-29
+- `python flexfactor_tests.py`: **950 tests OK (skipped=8), exit 0.**
+- `flexfactor_invariant_sweep_tests.py`: 50 passed.
+- **Canaried, because a regression test that passes without the fix proves
+  nothing:** neutering `_check_array_item_shape` to a pass-through reddens 5 of
+  the 10 new `ArrayItemShapeTests`; neutering
+  `build_failure_is_environmental` reddens 3 of the 6 new
+  `EnvironmentalBuildFailureTests`. The remainder are the no-false-positive
+  guards and correctly pass either way.
+- repo-rewards after removing the 19-file debris: `npx vitest run` **19 passed
+  / 1 skipped, 108 tests**, and `npm run build` exit 0.
+
+### What this was NOT (checked, so nobody re-checks)
+- **Not a provider outage**, despite the report saying `PROVIDER-OUTAGE ABORT`.
+  Typecheck passed on the same host, minutes earlier, and the run had already
+  spent $1.84 getting real answers.
+- **Not the `--yes` trap and not launcher drift.** `crash-39808.log` records the
+  full argv; every flag was correct.
+- **Not a repo-rewards defect.** Its build and its 19 pre-existing test files
+  were green throughout; the only red tests in the tree were the ones FlexFactor
+  generated and never ran.

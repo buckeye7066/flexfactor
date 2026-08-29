@@ -210,5 +210,73 @@ class RouteFailuresAreTheProviders(unittest.TestCase):
         self.assertEqual(led.entries[0]["suggestion_source"], "none")
 
 
+class EnvironmentalBuildFailureTests(unittest.TestCase):
+    """LIVE repo-rewards 2026-08-29 (run reporewards-...-35988-0002).
+
+    The baseline gate ran typecheck (PASSED) then `npm run build`, which failed
+    only because `next/font` could not fetch its webfonts - the run's proxy
+    pointed at 127.0.0.1:9, the discard port. FlexFactor filed it
+    `program-defect`, told the owner to "Fix the compile/build errors" (there
+    were none), refused to publish 49 fixes and reported NOT PRODUCTION READY.
+    Measured the same day: the identical tree builds clean on this host with
+    normal network.
+
+    The gate must STILL refuse to publish - an unevaluated build is None, not
+    True. Only the diagnosis changes."""
+
+    # The exact bytes from the live baseline-publication-failure.log.
+    LIVE = (
+        "$ npm run typecheck\n\n> repo-rewards@0.1.0 typecheck\n> tsc --noEmit\n\n\n"
+        "$ npm run build\n  code: 'ECONNREFUSED',\n  syscall: 'connect',\n"
+        "  address: '127.0.0.1',\n  port: 9\n}\nError: connect ECONNREFUSED 127.0.0.1:9\n"
+        "Failed to compile.\n\nsrc\\app\\layout.tsx\n`next/font` error:\n"
+        "Failed to fetch `IBM Plex Sans` from Google Fonts.\n"
+    )
+
+    def test_the_live_log_is_recognised_as_environmental(self):
+        cause = E.build_failure_is_environmental(self.LIVE)
+        self.assertIsNotNone(cause)
+        self.assertIn("could not reach the network", cause)
+        # Name the blackhole, because "check your network" is not actionable
+        # and 127.0.0.1:9 is the whole answer.
+        self.assertIn("127.0.0.1:9", cause)
+
+    def test_a_real_compile_error_is_NOT_excused(self):
+        # The failure mode that would matter: excusing a genuine defect as
+        # "environment" would publish-block silently AND misdirect the owner.
+        for log in (
+            "src/a.ts(3,1): error TS2304: Cannot find name 'x'",
+            "Failed to compile.\n./src/app/page.tsx\nSyntaxError: Unexpected token",
+            "Module not found: Can't resolve './missing'",
+        ):
+            self.assertIsNone(E.build_failure_is_environmental(log), log)
+
+    def test_a_bare_connection_error_is_NOT_enough(self):
+        # A program's own tests may legitimately assert a refused connection.
+        # A network token must co-occur with a BUILD-RESOURCE token.
+        self.assertIsNone(E.build_failure_is_environmental(
+            "FAIL test/net.test.ts > refuses ECONNREFUSED upstream"))
+
+    def test_a_registry_outage_is_environmental_too(self):
+        # Not just webfonts: the same class covers package registries, which is
+        # how this fails on a CI box behind a proxy.
+        cause = E.build_failure_is_environmental(
+            "npm ERR! code ENOTFOUND\nnpm ERR! network request to "
+            "https://registry.npmjs.org/next failed, reason: getaddrinfo ENOTFOUND")
+        self.assertIsNotNone(cause)
+
+    def test_empty_and_missing_logs_are_not_excused(self):
+        # No evidence is not evidence of an environment problem.
+        for log in ("", "   ", None):
+            self.assertIsNone(E.build_failure_is_environmental(log))
+
+    def test_the_verdict_is_environment_not_program_defect(self):
+        # End-to-end through the ledger's own kind, since the kind is what the
+        # dashboard error box and errors.md both render.
+        self.assertIsNotNone(E.build_failure_is_environmental(self.LIVE))
+        self.assertEqual(E.KIND_ENV, "environment")
+        self.assertNotEqual(E.KIND_ENV, E.KIND_PROGRAM)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
