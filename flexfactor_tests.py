@@ -1831,6 +1831,68 @@ class PurposeAssessmentResilienceTests(unittest.TestCase):
         self.assertIn("no assessor available", errors[0])
 
 
+class ReviewerRouteQualityTests(unittest.TestCase):
+    """The rotator learned from fixes and not from reviews.
+
+    `_report_route_quality` was called only from the fix loop, so a route that
+    reliably returned reviews the evidence gate refuses - "supplied findings but
+    none had valid source evidence" - kept its full share of the rotation and
+    kept being drawn. Measured 2026-08-29 on a free run: 2 candidate files,
+    three separate routes tried, 0 reviewed. The gate was right every time; the
+    result was that nothing downstream of it changed which route came next."""
+
+    class _Reviewer:
+        model = "test-only/reviewer"
+
+        def __init__(self, fail: bool):
+            self.reports: list[tuple[str, str]] = []
+            self._fail = fail
+
+        def report_quality(self, role, signal):
+            self.reports.append((role, signal))
+            return ""
+
+        def structured(self, system, prompt, schema, max_tokens=8000,
+                       model=None, **kw):
+            if self._fail:
+                raise RuntimeError("review supplied findings but none had valid "
+                                   "source evidence; verdict is incomplete, not clean")
+            return {"reviews": [{"file": "a.py", "findings": [], "summary": "clean"}]}
+
+    def _sweep(self, reviewer):
+        with _RepoFixture({"a.py": "value = 1\n"}) as project:
+            return ff._review_all([reviewer], project, ["a.py"],
+                                  report=lambda **kw: None,
+                                  meter=ff.CostMeter(10.0), workers=1,
+                                  batch_semantic=True)
+
+    def test_a_usable_review_credits_the_route_that_produced_it(self):
+        reviewer = self._Reviewer(fail=False)
+        self._sweep(reviewer)
+        self.assertIn(("reviewer", "verified"), reviewer.reports,
+                      "a completed review must reach the rotator as a reviewer win")
+
+    def test_a_refused_review_is_charged_to_the_route_that_produced_it(self):
+        reviewer = self._Reviewer(fail=True)
+        self._sweep(reviewer)
+        self.assertIn(("reviewer", "rejected"), reviewer.reports,
+                      "the route whose review the gate refused must lose priority")
+
+    def test_a_fixed_provider_has_nothing_to_learn_and_is_not_asked(self):
+        """`_report_route_quality` no-ops on a provider with no report_quality;
+        the accounting must never break a sweep on an ordinary provider."""
+
+        class _Plain:
+            model = "test-only/plain"
+
+            def structured(self, system, prompt, schema, max_tokens=8000,
+                           model=None, **kw):
+                return {"reviews": [{"file": "a.py", "findings": [],
+                                     "summary": "clean"}]}
+
+        self._sweep(_Plain())     # must not raise
+
+
 class EphemeralStagingTests(unittest.TestCase):
     """FlexFactor's own litter must not land in the owner's repository.
 

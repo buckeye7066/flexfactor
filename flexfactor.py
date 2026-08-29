@@ -12657,6 +12657,8 @@ def _review_all(reviewers: list, project_dir: str,
                                                      context=context,
                                                      project_dir=project_dir)
                     merged.extend(findings)
+                    _report_route_quality(reviewer_pool.provider(idx),
+                                          "reviewer", "verified")
                     break                      # reviewed successfully
                 except BudgetExceededError:
                     stop.set()
@@ -12664,6 +12666,8 @@ def _review_all(reviewers: list, project_dir: str,
                     break
                 except Exception as ex:  # one bad LLM call must not abort the sweep
                     failed_idx.add(idx)
+                    _report_route_quality(reviewer_pool.provider(idx),
+                                          "reviewer", "rejected")
                     nm = reviewer_pool.name(idx)
                     if len(failed_idx) < len(reviewer_pool.entries):
                         print(f"  [retry] {rel}: review failed via {nm} ({ex}) "
@@ -12691,6 +12695,11 @@ def _review_all(reviewers: list, project_dir: str,
                 findings, _summary = review_file(reviewer, rel, text, context=context,
                                                  project_dir=project_dir)
                 merged.extend(findings)
+                # The rotator learns from reviews, not only from fixes: a route
+                # whose reviews the evidence gate keeps refusing must lose its
+                # turn, or it is drawn again on the next file. Same accounting on
+                # the batch path above.
+                _report_route_quality(reviewer, "reviewer", "verified")
             except BudgetExceededError:
                 stop.set()
                 complete = False  # aborted mid-review -> not a completed clean review
@@ -12698,6 +12707,7 @@ def _review_all(reviewers: list, project_dir: str,
             except Exception as ex:  # one bad LLM call must not abort the sweep
                 print(f"  [skip] {rel}: review failed ({ex})")
                 _ledger("review", ex, program_file=rel)
+                _report_route_quality(reviewer, "reviewer", "rejected")
                 complete = False  # a reviewer threw -> not fully reviewed
         if not complete:
             return (rel, "incomplete")  # NEVER clean; re-reviewed next cycle
@@ -12792,12 +12802,25 @@ def _review_all(reviewers: list, project_dir: str,
                                 project_dir=project_dir)
                             reviewed[rel] = (findings, summary)
                     reviewer._flexfactor_semantic_unhealthy = False
+                    # THE ROTATOR LEARNS FROM REVIEWS TOO. `_report_route_quality`
+                    # was called only from the fix loop, so a route that reliably
+                    # returned reviews the evidence gate refuses ("supplied
+                    # findings but none had valid source evidence") kept its full
+                    # share of the rotation and kept being drawn. Measured
+                    # 2026-08-29 on a free run: 2 candidate files, three separate
+                    # routes, 0 reviewed - the gate was right every time and
+                    # nothing downstream of it changed which route came next.
+                    _report_route_quality(reviewer, "reviewer", "verified")
                     return [(rel, reviewed[rel][0], sha) for rel, _text, sha in unit]
                 except BudgetExceededError:
                     stop.set()
                     return [(rel, "incomplete") for rel, _text, _sha in unit]
                 except Exception as ex:
                     last_error = ex
+                    # Same accounting as the success path above: the route that
+                    # produced an unusable review is the one that should lose
+                    # priority, not the next one to be drawn.
+                    _report_route_quality(reviewer, "reviewer", "rejected")
                     # A recovered review failure must stay DIAGNOSABLE: the
                     # self-dogfood (2026-08-22) logged "'NoneType' object is not
                     # subscriptable" for flexfactor.py with no frame at all.
