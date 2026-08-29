@@ -2,11 +2,67 @@
 """Repository-level invariants for the independent Android app."""
 
 from pathlib import Path
+import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parent
 ANDROID = ROOT / "android" / "app" / "src" / "main"
+
+
+def _android_version_name() -> str:
+    """The versionName android-client.yml turns into the `android-v*` tag."""
+    gradle = (ROOT / "android" / "app" /
+              "build.gradle.kts").read_text(encoding="utf-8")
+    match = re.search(r'^\s*versionName\s*=\s*"([^"]+)"', gradle, re.MULTILINE)
+    assert match is not None, "android/app/build.gradle.kts has no versionName"
+    return match.group(1)
+
+
+class EngineRefIsOneVersionEverywhere(unittest.TestCase):
+    """A phone run reaches the engine through THREE version pins.
+
+    `android-client.yml` releases the app under the tag
+    `android-v${versionName}`. The app writes a caller workflow into the target
+    repository that calls `mobile-run.yml@<ENGINE_REF>`, and that reusable
+    workflow checks the engine out at its own `ref:`. If any of the three
+    disagree, every phone run either executes an engine the build was never
+    tested against or names a tag that does not exist yet -- and the owner sees
+    a run that dies at its first step.
+
+    That is not hypothetical. The shipped `android-v3.2.1` app carried
+    `ENGINE_REF = "android-v3.2.0"`, so it installed a caller that ran the
+    3.2.0 engine, whose request validator read the caller's event payload
+    instead of the reusable workflow's inputs. `target_repository` is computed
+    by the caller (`${{ github.repository }}`) and so is absent from that
+    payload, which made it the empty string, which failed the repository regex.
+    Live runs 33253519755 and 33255312894 (buckeye7066/FutureU, 2026-08-29)
+    both ended `invalid repository` at step 2 of 17.
+
+    `MobileWorkflow.ENGINE_REF` is now derived from `BuildConfig.VERSION_NAME`,
+    so the Java half cannot drift. These tests hold the two pins that live
+    outside the Java compiler's reach.
+    """
+
+    def test_the_engine_ref_is_derived_from_the_build_not_typed_again(self):
+        source = (ANDROID / "java" / "com" / "firer" / "console" / "flexfactor" /
+                  "MobileWorkflow.java").read_text(encoding="utf-8")
+        self.assertIn(
+            'ENGINE_REF = "android-v" + BuildConfig.VERSION_NAME', source)
+        # A hand-typed version literal anywhere in this file is the defect.
+        self.assertIsNone(
+            re.search(r'"android-v\d', source),
+            "MobileWorkflow must not hardcode an engine version",
+        )
+
+    def test_the_reusable_workflow_checks_out_this_versions_engine(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "mobile-run.yml").read_text(encoding="utf-8")
+        engine = workflow.split("- name: Check out the exact FlexFactor engine", 1)
+        self.assertEqual(len(engine), 2, "the engine checkout step is missing")
+        engine = engine[1].split("- name: ", 1)[0]
+        self.assertIn("repository: buckeye7066/flexfactor", engine)
+        self.assertIn(f"ref: android-v{_android_version_name()}", engine)
 
 
 class StandaloneAndroidInvariants(unittest.TestCase):
