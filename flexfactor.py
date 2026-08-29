@@ -13798,6 +13798,49 @@ def _gh_pr_automerge(project_dir: str, branch: str, base: str,
             "merge it once checks pass")
 
 
+# Build droppings a repository without a .gitignore would otherwise receive as
+# FlexFactor's work. Measured 2026-08-29 on a real free-path run: the commit
+# FlexFactor pushed to a target's main carried three `__pycache__/*.pyc` files
+# alongside the source change, because `git add -A` stages whatever is on disk
+# and the project had nothing ignoring them. FlexFactor RAN the tests that
+# produced them, so this is our litter, not the owner's.
+_EPHEMERAL_STAGE_PARTS = ("__pycache__", ".pytest_cache", ".mypy_cache",
+                          ".ruff_cache", "node_modules", ".venv", "venv",
+                          ".tox", ".nox", "htmlcov", ".coverage_html")
+_EPHEMERAL_STAGE_SUFFIXES = (".pyc", ".pyo", ".pyd", ".orig", ".rej")
+
+
+def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
+    """Drop NEWLY ADDED build droppings from the index. Returns what it dropped.
+
+    Deliberately limited to `--diff-filter=A`: a path that the repository
+    ALREADY TRACKS is the owner's decision, and unstaging a modification to it
+    would silently drop a real change. Only files this run is about to add for
+    the first time are eligible, so the worst case is that a project which
+    genuinely wants to commit a .pyc has to add it itself once.
+    """
+    listed = _git(["diff", "--cached", "--name-only", "--diff-filter=A"], project_dir)
+    if listed.returncode != 0:
+        return []                       # never block a commit over tidiness
+    drop = []
+    for raw in (listed.stdout or "").splitlines():
+        rel = raw.strip().strip('"')
+        if not rel:
+            continue
+        parts = rel.replace("\\", "/").split("/")
+        if any(part in _EPHEMERAL_STAGE_PARTS for part in parts) or \
+                rel.endswith(_EPHEMERAL_STAGE_SUFFIXES):
+            drop.append(rel)
+    if not drop:
+        return []
+    # One reset per batch, with `--` so a path that looks like a revision cannot
+    # be read as one.
+    reset = _git(["reset", "-q", "--", *drop], project_dir)
+    if reset.returncode != 0:
+        return []
+    return drop
+
+
 def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                      label: str, stack: dict) -> str:
     """Commit (and optionally push/merge) this cycle's work BEFORE the next cycle
@@ -13818,6 +13861,12 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         # fixes UNSTAGED and let us commit stale content. Fail hard before committing.
         raise BranchStateError(
             f"{label}: 'git add -A' failed (rc={add.returncode}): {_tail(add.stderr, 3)}")
+    dropped = _unstage_ephemeral_additions(project_dir)
+    if dropped:
+        shown = ", ".join(dropped[:4]) + (f" (+{len(dropped) - 4} more)"
+                                          if len(dropped) > 4 else "")
+        print(f"  [stage] left {len(dropped)} build artifact(s) out of the commit: "
+              f"{shown}")
     diff = _git(["diff", "--cached", "--quiet"], project_dir)
     # `git diff --quiet` uses the exit code as data: 0 = no staged change, 1 = there
     # ARE staged changes, >1 = a real error. Do NOT treat >1 as 'nothing to commit'.

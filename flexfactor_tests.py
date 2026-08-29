@@ -1831,6 +1831,77 @@ class PurposeAssessmentResilienceTests(unittest.TestCase):
         self.assertIn("no assessor available", errors[0])
 
 
+class EphemeralStagingTests(unittest.TestCase):
+    """FlexFactor's own litter must not land in the owner's repository.
+
+    Measured 2026-08-29 on a real free-path run that pushed to a target's main:
+    the commit carried three `__pycache__/*.pyc` files beside the source change,
+    because `git add -A` stages what is on disk and the project had no
+    .gitignore. FlexFactor ran the tests that produced them, so they are ours."""
+
+    def _repo(self, tmp):
+        for argv in (["init", "-q", "-b", "main"],
+                     ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *argv], cwd=tmp, capture_output=True, text=True)
+
+    def _write(self, root, rel, body="x\n"):
+        path = os.path.join(root, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def _staged(self, root):
+        out = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                             cwd=root, capture_output=True, text=True)
+        return sorted(x for x in out.stdout.splitlines() if x.strip())
+
+    def test_new_build_droppings_are_left_out_of_the_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            self._write(root, "__pycache__/app.cpython-314.pyc")
+            self._write(root, "src/__pycache__/mod.pyc")
+            self._write(root, ".pytest_cache/v/cache/lastfailed")
+            self._write(root, "node_modules/left-pad/index.js")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(["app.py"], self._staged(root))
+            self.assertEqual(4, len(dropped), dropped)
+
+    def test_a_file_the_project_ALREADY_TRACKS_is_never_unstaged(self):
+        """Tracking a .pyc is the owner's decision; dropping a modification to a
+        tracked file would silently discard a real change."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "vendor/thing.pyc", "one\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self._write(root, "vendor/thing.pyc", "two\n")     # a MODIFICATION
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            self.assertEqual([], ff._unstage_ephemeral_additions(root))
+            self.assertEqual(["vendor/thing.pyc"], self._staged(root))
+
+    def test_an_ordinary_change_is_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "a.py", "one\n")
+            self._write(root, "docs/readme.md", "hello\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            self.assertEqual([], ff._unstage_ephemeral_additions(root))
+            self.assertEqual(["a.py", "docs/readme.md"], self._staged(root))
+
+    def test_tidiness_never_blocks_a_commit(self):
+        """A repo git cannot read must not turn a fix into a failed run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual([], ff._unstage_ephemeral_additions(os.path.realpath(tmp)))
+
+
 class GitWorktreeContainmentTests(unittest.TestCase):
     """A directory INSIDE someone else's repo is not this run's repo.
 
