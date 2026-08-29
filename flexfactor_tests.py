@@ -23,6 +23,28 @@ import tomllib
 import unittest
 from unittest import mock
 
+# --------------------------------------------------------------------------- #
+# The suite must not inherit the HOST's git repository (2026-08-28).
+#
+# Tests build throwaway projects under the system temp dir and then assert on
+# what FlexFactor does with a directory that is NOT a git repo. On a machine
+# where the temp dir happens to live inside some other repository - a home
+# directory someone ran `git init` in, for one - every `git` call FlexFactor
+# makes inside those fixtures walks up and finds that outer repo instead. The
+# non-git assertions fail, and audits refuse to start against "a dirty tree"
+# that belongs to the host, not the fixture. Measured here: four failures whose
+# output named the host's index.lock and nothing about the test.
+#
+# GIT_CEILING_DIRECTORIES stops git's upward walk at the temp root, so a fixture
+# is its own repo or no repo at all, identically on every machine. It is set
+# once, before flexfactor is imported, so no test can be missed.
+# --------------------------------------------------------------------------- #
+import tempfile as _tempfile_ceiling  # noqa: E402
+_TEMP_ROOT = os.path.abspath(_tempfile_ceiling.gettempdir())
+os.environ["GIT_CEILING_DIRECTORIES"] = (
+    _TEMP_ROOT + os.pathsep + os.environ["GIT_CEILING_DIRECTORIES"]
+    if os.environ.get("GIT_CEILING_DIRECTORIES") else _TEMP_ROOT)
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location("flexfactor", os.path.join(_HERE, "flexfactor.py"))
 ff = importlib.util.module_from_spec(_SPEC)
@@ -308,9 +330,19 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._provider_key_present, ff.make_provider = real_key, real_make
 
     def test_preflight_drops_dead_primary_and_falls_back(self):
-        # anthropic key is present but DEAD (out of credits); openai is healthy.
-        # Preflight must drop anthropic as author and fall back to openai, not
-        # return [] and not crash a later fix call by picking the broke provider.
+        """A dead half of the paid pair is a REFUSAL, not a quieter run.
+
+        Owner order 2026-08-28: "For the paid path, allow both Anthropic and
+        OpenAI API keys to be used. Each edit must be approved by both models."
+
+        Every approval gate in the fix loop - the adversarial verify and the
+        legacy single-shot veto both - is conditional on a second provider
+        existing. So the old behaviour here (anthropic dead -> continue on
+        openai alone) did not merely lose a reviewer: it silently removed the
+        approval step the paid path is named for, and reported the run as
+        normal. Paid mode now refuses and names the missing half. `--single`
+        (use_both=False) is how a one-model run is asked for on purpose - that
+        path still falls back, and is covered below."""
         class Args:
             provider = "anthropic"
             model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
@@ -331,10 +363,89 @@ class PricingAndEconomyTests(unittest.TestCase):
         ff.make_provider = lambda name, model, meter=None, judge_model=None: (
             picked.append(name) or object())
         try:
+            self.assertEqual([], ff.build_audit_providers(Args),
+                             "paid mode must not run one-model when --single "
+                             "was not asked for")
+            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
+            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
+            # ...and the deliberate single-model run still works, with openai
+            # as the fallback author exactly as before.
+            picked.clear()
+            Args.use_both = False
             out = ff.build_audit_providers(Args)
-            # Only openai survives, and it is the (fallback) primary author.
             self.assertEqual([n for n, _ in out], ["openai"])
             self.assertEqual(picked, ["openai"])
+        finally:
+            Args.use_both = True
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_health = real_health
+
+    def test_free_pool_puts_the_second_free_backend_on_fix_approval(self):
+        """Two free backends up -> the second one CROSS-VERIFIES, not just reviews.
+
+        Owner order 2026-08-28, free path: "optimize the use of the free
+        platforms available where they work harmoniously towards a common
+        goal." The fix-approval gates (`_adversarial_verify_fix` and the legacy
+        veto) are conditional on a second provider being present, so returning a
+        single provider here means every free-path fix is accepted on the
+        author's own say-so while a usable second free backend sits idle for the
+        one decision a second opinion is worth most on."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "free"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            explicit_provider = False   # free-first only applies when unnamed
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        real_fcc = ff._auto_activate_fcc_proxy
+        real_rot = ff._build_rotating_provider
+        ff._provider_key_present = lambda name: True
+        ff._provider_free_routed = lambda name: name == "anthropic"
+        ff._auto_activate_fcc_proxy = lambda: None
+        ff._build_rotating_provider = lambda *a, **kw: None   # exercise the POOL path
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            names = [n for n, _ in ff.build_audit_providers(Args)]
+            self.assertEqual(["anthropic", "ollama"], names,
+                             "both free backends must be returned so the fix "
+                             "loop has a cross-model verifier")
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+            ff._auto_activate_fcc_proxy = real_fcc
+            ff._build_rotating_provider = real_rot
+
+    def test_paid_mode_runs_when_both_models_are_usable(self):
+        """The positive half of the pair rule: two healthy keys -> two providers,
+        author first and the cross-checker second."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = False
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_health = ff._provider_health
+        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
+        ff._provider_health = lambda name, meter=None: (True, "ok")
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            self.assertEqual(["anthropic", "openai"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
         finally:
             ff._provider_key_present = real_key
             ff.make_provider = real_make
@@ -1449,6 +1560,65 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIsNone(ff._git_real_files(tmp))
             files = ff._enumerate_source_files(tmp, max_files=0)
             self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
+
+
+class GitWorktreeContainmentTests(unittest.TestCase):
+    """A directory INSIDE someone else's repo is not this run's repo.
+
+    Measured 2026-08-28: the owner's home directory is itself a git tree that
+    holds every project, so a project folder with no `.git` of its own resolved
+    to the HOME repo. One `git add -A` reached 695 MB of RSS staging terabytes
+    of unrelated files before it was killed, and a commit would have recorded
+    the whole home directory as that program's work."""
+
+    def _init(self, path, *, commit=None):
+        for argv in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", *argv], cwd=path, capture_output=True, text=True)
+        if commit:
+            with open(os.path.join(path, commit), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+            subprocess.run(["git", "add", "-A"], cwd=path, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=path,
+                           capture_output=True, text=True)
+
+    def test_a_folder_inside_an_unrelated_repo_is_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = os.path.realpath(tmp)
+            self._init(outer, commit="outer.txt")
+            inner = os.path.join(outer, "someone-elses-program")
+            os.makedirs(inner)
+            with open(os.path.join(inner, "app.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")   # present but UNTRACKED in the outer repo
+            self.assertTrue(ff._git_worktree_root(inner),
+                            "git does resolve the outer repo - that is the trap")
+            self.assertFalse(ff._is_git_repo(inner),
+                             "an enclosing repo that tracks nothing here must "
+                             "not become the repo this run commits into")
+
+    def test_the_repo_root_itself_is_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._init(root, commit="a.txt")
+            self.assertTrue(ff._is_git_repo(root))
+
+    def test_a_tracked_monorepo_subdirectory_is_still_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._init(root)
+            sub = os.path.join(root, "services", "api")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "main.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self.assertTrue(ff._is_git_repo(sub),
+                            "a real monorepo subdirectory keeps git mode")
+
+    def test_a_plain_directory_is_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(ff._is_git_repo(os.path.realpath(tmp)))
 
 
 class FuzzyDedupeTests(unittest.TestCase):
@@ -7961,15 +8131,35 @@ import flexfactor_prodready as pr                                  # noqa: E402
 
 
 class _RepoFixture:
-    """Build a throwaway repo from a {relpath: contents} map."""
+    """Build a throwaway repo from a {relpath: contents} map.
+
+    HERMETICITY (2026-08-28). The fixture directory lives under the system temp
+    dir, and on a machine where the temp dir sits INSIDE some other git
+    repository (a home directory that was itself `git init`-ed, for instance)
+    every `git` command FlexFactor runs inside the fixture walks up and finds
+    that outer repository instead of finding nothing. The audit then reads the
+    outer repo's dirty tree and refuses to start - a green suite on one machine
+    and a wall of unrelated failures on another, with the real cause nowhere in
+    the output.
+
+    GIT_CEILING_DIRECTORIES stops the upward walk at the fixture's parent, so
+    the fixture is either its own repo or no repo at all, whatever the host
+    looks like. It is restored on exit; nesting is safe because the previous
+    value is saved per-instance."""
 
     def __init__(self, files: dict):
         self.files = files
         self._tmp = None
+        self._prev_ceiling = None
 
     def __enter__(self) -> str:
         self._tmp = tempfile.TemporaryDirectory()
         root = self._tmp.name
+        self._prev_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+        ceiling = os.path.dirname(os.path.abspath(root))
+        os.environ["GIT_CEILING_DIRECTORIES"] = (
+            ceiling + os.pathsep + self._prev_ceiling
+            if self._prev_ceiling else ceiling)
         for rel, body in self.files.items():
             path = os.path.join(root, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -7978,6 +8168,10 @@ class _RepoFixture:
         return root
 
     def __exit__(self, *exc):
+        if self._prev_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = self._prev_ceiling
         self._tmp.cleanup()
         return False
 

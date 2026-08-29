@@ -4372,6 +4372,7 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # phase (inherently more serial - build-gating, cross-verification,
     # commits) is deliberately NOT pooled; it stays on whichever pool member
     # is fastest, exactly as a single free-first primary always has.
+    free_pool_cross: str | None = None
     if _free_first_applies:
         _auto_activate_fcc_proxy()  # zero-setup: give the fast free tier a chance too
         # POOL-FIRST ROTATION (owner order 2026-08-18): when the owner named
@@ -4402,13 +4403,32 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                                           judge_model=judge_override),
                              _OLLAMA_POOL_CONCURRENCY))
             _LAST_FREE_REVIEW_POOL = pool
-            primary, other = pool[0][0], None  # fastest usable free backend authors/fixes
+            # The fastest usable free backend authors and fixes. When a SECOND
+            # free backend is up, it becomes the cross-model verifier rather
+            # than review-only (owner order 2026-08-28: on the free path
+            # "optimize the use of the free platforms available where they work
+            # harmoniously towards a common goal").
+            #
+            # This matters because every fix-approval gate in the run is
+            # conditional on a second provider existing. With `other = None` the
+            # free path reviewed with both backends and then accepted every fix
+            # on the author's own say-so - the one step where a second opinion
+            # is worth the most was the one step that did not get one, while a
+            # perfectly good second free backend sat idle for it. Both members
+            # are free, so this buys the adversarial verify loop at no cost.
+            # An EXPLICIT `--provider ollama` never reaches here (local-only /
+            # zero-egress is settled above), so this cannot add egress the owner
+            # did not ask for.
+            primary = pool[0][0]
+            other = pool[1][0] if len(pool) > 1 else None
+            free_pool_cross = other
             if len(pool) > 1:
                 names = " + ".join(f"{n}({c}x concurrent)" for n, _, c in pool)
                 print(f"  [preflight] FREE-FIRST POOL: {names} all usable - reviewing "
                       f"concurrently across every free backend instead of picking one "
                       f"and leaving the rest idle; authoring/fixing with '{primary}' "
-                      "(the fastest).", file=sys.stderr)
+                      f"(the fastest) and cross-verifying every fix with "
+                      f"'{other}' (also free).", file=sys.stderr)
             else:
                 print(f"  [preflight] FREE-FIRST: authoring locally with '{primary}'"
                       + (("; cloud cross-check disabled to preserve local-only "
@@ -4472,6 +4492,34 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             _PROVIDER_DIAGNOSIS = "no LLM API key found"
         return []
 
+    # PAID MODE MEANS BOTH MODELS (owner order 2026-08-28: "For the paid path,
+    # allow both Anthropic and OpenAI API keys to be used. Each edit must be
+    # approved by both models.").
+    #
+    # Every fix-approval gate in this file - the adversarial verify loop and the
+    # legacy single-shot veto alike - is conditional on a SECOND provider
+    # existing (`cross is not None`). So a paid run whose other key is missing,
+    # unfunded, or preflight-rejected used to fall straight through this `if`
+    # and audit with one model and no approval gate at all, while still
+    # reporting itself as a normal paid run. That is the shape of a silent
+    # downgrade: the promise the mode is named for quietly stops holding, and
+    # nothing in the output says so.
+    #
+    # So in paid mode the pair is REQUIRED unless the owner typed `--single`.
+    # A missing half is a refusal with a diagnosis, never a weaker run.
+    paid_pair_required = (model_mode == "paid" and args.use_both
+                          and primary in {"anthropic", "openai"})
+    if paid_pair_required and not (other and _usable(other)):
+        missing = other or ("openai" if primary == "anthropic" else "anthropic")
+        _PROVIDER_DIAGNOSIS = (
+            f"paid mode requires BOTH models: '{primary}' is usable but "
+            f"'{missing}' is not (no key, an unfunded/revoked key, or a key "
+            f"re-pointed at the free proxy). Every fix in paid mode is approved "
+            f"by the second model, so a one-model paid run is refused. Set a "
+            f"working {missing.upper()}_API_KEY, or pass --single to accept a "
+            f"deliberately single-model run, or use free mode.")
+        print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
+        return []
     judge_override = getattr(args, "judge_model", None)
     out: list[tuple[str, object]] = []
     # Author model: explicit --model wins; --economy routes authoring to the
@@ -4482,7 +4530,13 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
                      or DEFAULT_MODELS[primary])
     out.append((primary, make_provider(primary, primary_model, meter,
                                        judge_model=judge_override)))
-    if args.use_both and model_mode == "paid" and other and _usable(other):
+    if (args.use_both and free_pool_cross and other == free_pool_cross
+            and _usable(other)):
+        # Free pool cross-checker: the judge tier of the second free backend.
+        out.append((other, make_provider(
+            other, JUDGE_MODELS.get(other) or DEFAULT_MODELS[other], meter,
+            judge_model=judge_override)))
+    elif args.use_both and model_mode == "paid" and other and _usable(other):
         # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
         # authors code), and both of those are routed to the judge tier - so it
         # defaults to the cheap model, not a second frontier model. This keeps the
@@ -5991,12 +6045,61 @@ def _brokered_tuple_runner(cmd, cwd=None, timeout: int = 300):
     return cp.returncode, ((cp.stdout or "") + (cp.stderr or "")).strip()
 
 
-def _is_git_repo(path: str) -> bool:
+def _git_worktree_root(path: str) -> str | None:
+    """The working-tree root git resolves for `path`, or None if there is none."""
     try:
-        r = _git(["rev-parse", "--is-inside-work-tree"], path)
-        return r.returncode == 0 and r.stdout.strip() == "true"
+        r = _git(["rev-parse", "--show-toplevel"], path)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out:
+        return None
+    try:
+        return os.path.realpath(out)
+    except OSError:
+        return None
+
+
+def _is_git_repo(path: str) -> bool:
+    """Is `path` a git working tree THIS RUN may commit into?
+
+    Not the same question as "does git find a repo from here". git walks UP
+    until it finds one, so a directory that merely SITS INSIDE somebody else's
+    repository answers yes - and then every `git add -A` / branch / commit this
+    file runs lands in that outer repository instead.
+
+    Measured 2026-08-28 on the owner's machine, whose home directory is itself
+    a `git init`-ed tree holding every project: a project directory with no
+    `.git` of its own resolved to the HOME repo, and one `git add -A` grew to
+    695 MB of RSS staging several terabytes of unrelated files before it was
+    killed. The audit would then have committed the owner's entire home
+    directory as this program's work.
+
+    So: the root git resolves must either BE this directory, or be an ancestor
+    that actually tracks content here (a real monorepo subdirectory - `git
+    ls-files` finds tracked files). An ancestor that tracks nothing here is
+    somebody else's repository that this directory happens to sit inside, and
+    git mode stays OFF - the audit still runs, it just does not commit."""
+    root = _git_worktree_root(path)
+    if root is None:
+        return False
+    try:
+        here = os.path.realpath(path)
+    except OSError:
+        return False
+    if os.path.normcase(root) == os.path.normcase(here):
+        return True
+    try:
+        tracked = _git(["ls-files", "--", "."], path)
     except (OSError, subprocess.SubprocessError):
         return False
+    if tracked.returncode == 0 and (tracked.stdout or "").strip():
+        return True
+    print(f"  [git] '{path}' is inside the repository at '{root}', which tracks "
+          "nothing here - treating this directory as NOT a git repo so the run "
+          "cannot commit an unrelated tree. Run `git init` here to get commits.",
+          file=sys.stderr)
+    return False
 
 
 def _git_has_remote(path: str) -> bool:
