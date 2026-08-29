@@ -1973,26 +1973,52 @@ class EphemeralStagingTests(unittest.TestCase):
             self.assertEqual(1, len(dropped), dropped)
             self.assertIn("__pycache__", dropped[0])
 
-    def test_a_pathspec_magic_filename_cannot_unstage_everything(self):
-        """A file literally named `:(exclude)x.pyc` is read as pathspec MAGIC even
-        after `--`, and `git reset` would then unstage every staged path - the fix
-        this run just made included, after which the commit says nothing to
-        commit. NUL-delimited pathspec-file entries are literal by definition."""
+    def test_pathspec_magic_is_disabled_not_merely_undelimited(self):
+        """A file literally named `:(exclude)x.pyc` is read as pathspec MAGIC
+        even after `--`, and `git reset` would then unstage every staged path -
+        the fix this run just made included, after which the commit says
+        "nothing to commit".
+
+        `--pathspec-file-nul` does NOT prevent that: it settles how entries are
+        delimited and unquoted, not whether they are parsed as magic. Linux CI
+        proved the difference; `--literal-pathspecs` is the option that works.
+
+        The test drives the MECHANISM rather than planting the file, because
+        Windows refuses ':' in a filename - and a test that skips on the only
+        platform half the runs use is a test that is not protecting anything.
+        `:(exclude)app.py` is the discriminator: read as magic it means
+        "everything except app.py" and unstages the .pyc; read literally it
+        names a file that does not exist and unstages nothing."""
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.realpath(tmp)
             self._repo(root)
             self._write(root, "app.py", "value = 1\n")
-            try:
-                self._write(root, ":(exclude)evil.pyc")
-            except OSError:
-                self.skipTest("this filesystem refuses ':' in a filename")
+            self._write(root, "sub/x.pyc")
             subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
-            staged_before = self._staged(root)
-            if len(staged_before) < 2:
-                self.skipTest("git did not stage the magic-named file on this host")
-            ff._unstage_ephemeral_additions(root)
-            self.assertEqual(["app.py"], self._staged(root),
-                             "the source change must survive")
+            self.assertEqual(["app.py", "sub/x.pyc"], self._staged(root))
+            spec = os.path.join(root, "..", "magic.pathspec")
+            with open(spec, "wb") as fh:
+                fh.write(b":(exclude)app.py\0")
+            try:
+                out = subprocess.run(
+                    ["git", "--literal-pathspecs", "reset", "-q",
+                     f"--pathspec-from-file={spec}", "--pathspec-file-nul"],
+                    cwd=root, capture_output=True, text=True)
+            finally:
+                os.remove(spec)
+            self.assertEqual(0, out.returncode, out.stderr)
+            self.assertEqual(["app.py", "sub/x.pyc"], self._staged(root),
+                             "magic was still parsed: `:(exclude)app.py` "
+                             "unstaged something instead of matching nothing")
+
+    def test_the_helper_uses_literal_pathspecs(self):
+        """The mechanism test above proves git's behaviour; this proves the
+        helper asks for it. Both are needed - one without the other passes while
+        the product does the wrong thing."""
+        source = inspect.getsource(ff._unstage_ephemeral_additions)
+        self.assertIn("--literal-pathspecs", source)
+        self.assertIn("--pathspec-file-nul", source)
+        self.assertIn("-z", source)
 
     def test_thousands_of_artifacts_do_not_blow_the_command_line(self):
         """An unignored node_modules is thousands of paths. One `git reset` argv
