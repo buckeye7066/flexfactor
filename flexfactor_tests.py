@@ -9010,6 +9010,16 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         (same contract FlexFactor core uses for run manifests)."""
         import subprocess
         import tempfile
+        # The prodready scorecard. Without it the mode whose promise is "point
+        # it at a program and walk away" could never report a clean checkpoint:
+        # writing <program>_readiness.md is the last thing every prodready run
+        # does, and checking whether the tree is clean is the next thing.
+        # Measured 2026-08-28 on a run that fixed both planted defects,
+        # committed them, and still ended "UNCOMMITTED changes remain".
+        self.assertTrue(ff._is_flexfactor_artifact("e2e_readiness.md"))
+        self.assertTrue(ff._is_flexfactor_artifact("GrantFlow_readiness.md"))
+        self.assertFalse(ff._is_flexfactor_artifact("readiness.md"),
+                         "a project's own readiness.md is not our artifact")
         self.assertTrue(ff._is_flexfactor_artifact("_scout_report.json"))
         self.assertTrue(ff._is_flexfactor_artifact(".flexfactor-scout-proposals.json"))
         self.assertTrue(ff._is_flexfactor_artifact("FixtureApp_repo_rewards_report.md"))

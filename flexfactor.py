@@ -6312,6 +6312,15 @@ def _is_flexfactor_artifact(rel: str) -> bool:
     base = r.rsplit("/", 1)[-1]
     return (r.endswith("_audit_report.md")
             or r.endswith("_low_findings.md")
+            # The prodready scorecard. Its absence here meant the mode whose
+            # whole promise is "point it at a program and walk away" could never
+            # report a clean checkpoint: the last thing every prodready run does
+            # is write <program>_readiness.md into the tree, and the very next
+            # thing it does is check whether the tree is clean. Measured
+            # 2026-08-28 on a run that fixed both planted defects, committed
+            # them, and still finished "UNCOMMITTED changes remain ... NOT a
+            # clean checkpoint" - about its own scorecard.
+            or r.endswith("_readiness.md")
             or r.endswith("_repo_rewards_report.md")
             or "_run_manifest_" in base  # immutable run evidence (Master Prompt 86/90)
             or base == "_scout_report.json"  # Scout structured report (94/99)
