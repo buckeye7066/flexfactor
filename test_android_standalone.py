@@ -75,6 +75,41 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         summary = summary.split("- name: Collect the in-app result and error ledger", 1)[0]
         self.assertNotIn("${{ inputs.", summary)
 
+    def test_reusable_validator_reads_effective_workflow_call_inputs(self):
+        """Computed `with:` values are absent from the caller's event payload."""
+        workflow = (ROOT / ".github" / "workflows" /
+                    "mobile-run.yml").read_text(encoding="utf-8")
+        self.assertNotIn('os.environ["GITHUB_EVENT_PATH"]', workflow)
+        self.assertIn(
+            "INPUT_TARGET_REPOSITORY: ${{ inputs.target_repository }}",
+            workflow,
+        )
+        self.assertIn(
+            'repository = os.environ["INPUT_TARGET_REPOSITORY"]',
+            workflow,
+        )
+
+    def test_every_validated_value_comes_from_the_effective_input_context(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "mobile-run.yml").read_text(encoding="utf-8")
+        expected = {
+            "REQUEST_ID": "request_id",
+            "MODE": "mode",
+            "PROVIDER": "provider",
+            "TARGET_REPOSITORY": "target_repository",
+            "TARGET_REF": "target_ref",
+            "FILE": "file",
+            "GOAL": "goal",
+            "MAX_COST": "max_cost",
+            "THRESHOLD": "threshold",
+            "MAX_ITERATIONS": "max_iterations",
+        }
+        for env_name, input_name in expected.items():
+            self.assertIn(
+                f"INPUT_{env_name}: ${{{{ inputs.{input_name} }}}}",
+                workflow,
+            )
+
     def test_repository_picker_paginates_and_supports_private_targets(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
