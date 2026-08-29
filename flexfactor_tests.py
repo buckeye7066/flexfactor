@@ -13580,6 +13580,28 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         mode, _ = fc.license_reuse_mode(repos[0]["license"])
         self.assertEqual(mode, fc.REUSE_CLEAN_ROOM)
 
+    def test_github_search_asks_for_relevance_not_the_most_starred_match(self):
+        """`sort=stars` returns the most-starred repo that matches AT ALL.
+
+        Measured 2026-08-28 against the live API, query "grant management
+        platform": four of the five results were star-farmed repositories whose
+        text merely contained the words - a copy of GitHub's own docs page, a
+        NiceHash terms-of-use dump, a bank's benefits page. Best-match returned
+        five real grant-management projects, and for a named competitor
+        ("OpenTofu") both orderings put the canonical repo first. Popularity is
+        still in the payload for the judge; it must not be the ranking."""
+        seen = []
+
+        def op(url, data=None, headers=None):
+            seen.append(url)
+            return _GH_FIXTURE
+
+        fc.github_repo_search("grant management platform", opener=op)
+        self.assertTrue(seen)
+        self.assertNotIn("sort=", seen[0],
+                         "ordering must be GitHub's relevance default")
+        self.assertIn("q=grant+management+platform", seen[0])
+
 
 class CompetitorResearchPipelineTests(unittest.TestCase):
     """End-to-end with fakes: no network, no provider, no keys."""
