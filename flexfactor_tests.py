@@ -1958,6 +1958,79 @@ class EphemeralStagingTests(unittest.TestCase):
             self.assertEqual([], ff._unstage_ephemeral_additions(root))
             self.assertEqual(["a.py", "docs/readme.md"], self._staged(root))
 
+    def test_a_C_quoted_path_is_still_dropped(self):
+        """`--name-only` C-quotes a non-ASCII path, and stripping the quotes does
+        not decode the escapes - the reset would name a file that does not exist,
+        leave the artifact staged, and still report it dropped. `-z` is why."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            self._write(root, "caf\u00e9/__pycache__/x.pyc")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(["app.py"], self._staged(root))
+            self.assertEqual(1, len(dropped), dropped)
+            self.assertIn("__pycache__", dropped[0])
+
+    def test_a_pathspec_magic_filename_cannot_unstage_everything(self):
+        """A file literally named `:(exclude)x.pyc` is read as pathspec MAGIC even
+        after `--`, and `git reset` would then unstage every staged path - the fix
+        this run just made included, after which the commit says nothing to
+        commit. NUL-delimited pathspec-file entries are literal by definition."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            try:
+                self._write(root, ":(exclude)evil.pyc")
+            except OSError:
+                self.skipTest("this filesystem refuses ':' in a filename")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            staged_before = self._staged(root)
+            if len(staged_before) < 2:
+                self.skipTest("git did not stage the magic-named file on this host")
+            ff._unstage_ephemeral_additions(root)
+            self.assertEqual(["app.py"], self._staged(root),
+                             "the source change must survive")
+
+    def test_thousands_of_artifacts_do_not_blow_the_command_line(self):
+        """An unignored node_modules is thousands of paths. One `git reset` argv
+        would exceed ~32 KiB on Windows, `_run` would return a launch error, this
+        helper would report "dropped nothing", and the whole generated tree would
+        be committed and pushed - the exact case it exists to prevent, arriving
+        through its own remedy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            for i in range(1200):
+                self._write(root, f"node_modules/pkg{i}/index-with-a-long-name.js")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            dropped = ff._unstage_ephemeral_additions(root)
+            self.assertEqual(1200, len(dropped))
+            self.assertEqual(["app.py"], self._staged(root))
+
+    def test_droppings_left_on_disk_do_not_make_the_tree_dirty(self):
+        """Unstaging keeps them out of the commit and leaves them on disk as
+        `?? __pycache__/`. If the clean-tree predicate still counted those, a run
+        that fixed and committed everything would finish "UNCOMMITTED changes
+        remain" and the next audit would refuse to start."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            self._repo(root)
+            self._write(root, "app.py", "value = 1\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root,
+                           capture_output=True, text=True)
+            self._write(root, "__pycache__/app.cpython-314.pyc")
+            self._write(root, ".pytest_cache/v/lastfailed")
+            self.assertTrue(ff._git_tree_clean(root),
+                            "build droppings alone must not read as owner work")
+            self._write(root, "real_change.py", "x = 2\n")
+            self.assertFalse(ff._git_tree_clean(root),
+                             "a genuine untracked source file is still dirty")
+
     def test_tidiness_never_blocks_a_commit(self):
         """A repo git cannot read must not turn a fix into a failed run."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -6332,7 +6332,19 @@ def _is_flexfactor_artifact(rel: str) -> bool:
 
 def _git_tree_clean(path: str) -> bool:
     """True if the tree has no changes EXCEPT FlexFactor's own generated artifacts
-    (audit/scout reports, proposals, e2e specs, playwright config) left by a prior run."""
+    (audit/scout reports, proposals, e2e specs, playwright config) left by a prior
+    run, and the build droppings a run's own install/test steps create.
+
+    THE DROPPINGS BELONG HERE, not only in the staging filter. Unstaging a
+    `__pycache__/x.pyc` keeps it out of the commit but leaves it on disk as
+    `?? __pycache__/`, so a run that fixed and committed everything would still
+    finish "UNCOMMITTED changes remain ... NOT a clean checkpoint", and the NEXT
+    audit would refuse to start against a dirty tree. That trades a polluted
+    commit for a blocked repository, which is worse than the defect.
+
+    They are NOT deleted from the working tree: FlexFactor did create them, but
+    a predicate named "is this tree clean" has no business removing files, and a
+    pattern list is not a good enough reason to unlink somebody's data."""
     r = _git(["status", "--porcelain"], path)
     if r.returncode != 0:
         return False
@@ -6342,8 +6354,10 @@ def _git_tree_clean(path: str) -> bool:
         name = line[3:] if len(line) > 3 else ""  # strip the 2-char status + space
         if " -> " in name:  # rename: judge the destination path
             name = name.split(" -> ", 1)[1]
-        if not _is_flexfactor_artifact(name):
-            return False  # a real, non-FlexFactor change -> genuinely dirty
+        name = name.strip().strip('"')
+        if _is_flexfactor_artifact(name) or _is_ephemeral_path(name):
+            continue
+        return False  # a real, non-FlexFactor change -> genuinely dirty
     return True
 
 
@@ -13833,6 +13847,19 @@ _EPHEMERAL_STAGE_PARTS = ("__pycache__", ".pytest_cache", ".mypy_cache",
 _EPHEMERAL_STAGE_SUFFIXES = (".pyc", ".pyo", ".pyd", ".orig", ".rej")
 
 
+def _is_ephemeral_path(rel: str) -> bool:
+    """A build dropping, by path shape. Used by BOTH the staging filter and the
+    clean-tree predicate - unstaging a file while still counting it as dirt
+    would trade a polluted commit for a run that can never report a clean
+    checkpoint, and a next run that refuses to start on a dirty tree."""
+    text = str(rel or "").replace("\\", "/").strip().strip("/")
+    if not text:
+        return False
+    if any(part in _EPHEMERAL_STAGE_PARTS for part in text.split("/")):
+        return True
+    return text.endswith(_EPHEMERAL_STAGE_SUFFIXES)
+
+
 def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
     """Drop NEWLY ADDED build droppings from the index. Returns what it dropped.
 
@@ -13841,24 +13868,46 @@ def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
     would silently drop a real change. Only files this run is about to add for
     the first time are eligible, so the worst case is that a project which
     genuinely wants to commit a .pyc has to add it itself once.
+
+    THREE THINGS ABOUT THE PLUMBING, each of which is a real failure and not a
+    style preference:
+
+    * `-z`. `--name-only` C-QUOTES a path that is non-ASCII or contains a
+      newline, so `café/x.pyc` arrives as `"caf\\303\\251/x.pyc"`. Stripping the
+      quotes does not decode the escapes, so the reset would name a file that
+      does not exist, leave the artifact staged, and still be reported dropped.
+    * `--pathspec-from-file` + `--pathspec-file-nul`. Git reads these operands as
+      PATHSPECS even after `--`, so an added file literally named
+      `:(exclude)x.pyc` would be read as exclusion magic and `git reset` could
+      unstage every staged path - including the fix this run just made, after
+      which the commit says "nothing to commit". NUL-delimited pathspec-file
+      entries are literal by definition.
+    * ...and it also removes the argv limit. An unignored `node_modules` is
+      thousands of paths; one `git reset` invocation would exceed ~32 KiB on
+      Windows, `_run` would return a launch error, this helper would return
+      "dropped nothing", and the entire generated tree would be committed and
+      pushed. The exact case this function exists to prevent, arriving through
+      its own remedy.
     """
-    listed = _git(["diff", "--cached", "--name-only", "--diff-filter=A"], project_dir)
+    listed = _git(["diff", "--cached", "--name-only", "-z", "--diff-filter=A"],
+                  project_dir)
     if listed.returncode != 0:
         return []                       # never block a commit over tidiness
-    drop = []
-    for raw in (listed.stdout or "").splitlines():
-        rel = raw.strip().strip('"')
-        if not rel:
-            continue
-        parts = rel.replace("\\", "/").split("/")
-        if any(part in _EPHEMERAL_STAGE_PARTS for part in parts) or \
-                rel.endswith(_EPHEMERAL_STAGE_SUFFIXES):
-            drop.append(rel)
+    drop = [rel for rel in (listed.stdout or "").split("\0")
+            if rel and _is_ephemeral_path(rel)]
     if not drop:
         return []
-    # One reset per batch, with `--` so a path that looks like a revision cannot
-    # be read as one.
-    reset = _git(["reset", "-q", "--", *drop], project_dir)
+    handle, spec = tempfile.mkstemp(prefix="flexfactor-unstage-", suffix=".pathspec")
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(b"\0".join(rel.encode("utf-8") for rel in drop))
+        reset = _git(["reset", "-q", f"--pathspec-from-file={spec}",
+                      "--pathspec-file-nul"], project_dir)
+    finally:
+        try:
+            os.remove(spec)
+        except OSError:
+            pass
     if reset.returncode != 0:
         return []
     return drop
