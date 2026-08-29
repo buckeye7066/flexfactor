@@ -83,6 +83,10 @@ ERRCOL = "#f85149"
 ERRBOX = "#1a1113"    # error box fill - a shade warmer than PANEL
 ERRHEAD = "#ff7b72"
 FIXCOL = "#7ee787"    # the suggested fix reads as the actionable line
+# The small note face. MODULE level, not a local of draw_frame: the resume
+# button at the TOP of a panel measures itself with it, and a function-local
+# assignment further down would make every earlier reference an UnboundLocalError.
+F_NOTE = ("Segoe UI", 7)
 
 # Which kind of error the entry was filed under, in the box's accent color.
 KIND_COLOR = {
@@ -544,6 +548,205 @@ def visible_programs(progs: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# PER-PROGRAM RESUME BUTTON (added 2026-08-29 by a subagent, UNREQUESTED - see
+# the provenance note on _record_invocation in flexfactor.py. The owner has not
+# asked for this feature, and no directive for it exists in the transcript,
+# .remember or the vault; an earlier draft of this comment quoted one verbatim.)
+#
+# The failure this exists to prevent is the one the honesty doctrine cares about
+# most: a control that LOOKS like a resume and silently starts a full fresh run.
+# FlexFactor resumes by RECOVERING a checkpoint, and `flexfactor_runstate.
+# is_resumable` is the only authority on whether that recovery can happen - a
+# checkpoint whose owning pid is still alive, or that reached a terminal status,
+# or that recorded nothing to pick up, is NOT resumable and re-launching it
+# would re-pay for the whole program. So the button asks that function, refuses
+# to launch when the answer is no, and SAYS WHY on the panel. It never
+# reimplements the rule (a second resumability vocabulary is how the
+# launcher-drift trap starts).
+#
+# The button is still only a launcher: it re-issues the run's own recorded argv
+# with a single `--program`. Whether the recovery then actually engaged is
+# visible on the panel's own attempt line ("attempt N (M resumed)"), which reads
+# `resume_count` straight off the checkpoint - so the claim is verifiable by the
+# owner rather than asserted here. One thing this cannot predict: FlexFactor
+# also drops a checkpoint written under a DIFFERENT purpose-contract policy, and
+# computing that needs the whole audit runtime, not a viewer. The attempt line
+# is the evidence for that case too.
+# --------------------------------------------------------------------------- #
+try:
+    import flexfactor_runstate as _rs
+except Exception:  # noqa: BLE001 - same soft-import contract as _fe/_steer
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import flexfactor_runstate as _rs
+    except Exception:  # noqa: BLE001
+        _rs = None
+
+INVOCATION_PATH = os.path.join(os.path.expanduser("~"), ".flexfactor",
+                               "last-invocation.json")
+
+# program key -> (expires_at, message). Transient, in-memory, per session -
+# same contract as _DISMISSED: this file never writes audit state.
+_RESUME_NOTE: dict[str, tuple] = {}
+_RESUME_NOTE_S = 12.0
+# program key -> pid we launched, so the button can report itself honestly.
+_RESUMED: dict[str, int] = {}
+
+
+def _checkpoint_for(p: dict) -> dict:
+    """This program's checkpoint, or {} when there is none to read."""
+    run_dir = _run_dir_for(p)
+    if not run_dir:
+        return {}
+    try:
+        with open(os.path.join(run_dir, "checkpoint.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resume_state(p: dict) -> tuple:
+    """(label, enabled, reason) for this program's resume button.
+
+    `enabled` is False whenever a launch would NOT continue the recorded work,
+    and the reason names which condition blocked it. No button is drawn at all
+    when there is no checkpoint - there is nothing to continue."""
+    key = program_key(p)
+    pid = _RESUMED.get(key)
+    if pid and _rs is not None and _rs.pid_alive(pid):
+        return (f"resuming {pid}", False, f"resume running as pid {pid}")
+    if _rs is None:
+        return ("", False, "flexfactor_runstate.py not importable")
+    ckpt = _checkpoint_for(p)
+    if not ckpt:
+        return ("", False, "no checkpoint on disk")
+    if _rs.is_resumable(ckpt):
+        return ("resume", True, "")
+    owner = int(ckpt.get("pid") or 0)
+    if _rs.pid_alive(owner) and owner != os.getpid():
+        return ("resume: live", False,
+                f"pid {owner} is still working on this run - "
+                f"resuming now would fight it for the branch")
+    status = str(ckpt.get("status") or "?")
+    if not (ckpt.get("reviewed") or ckpt.get("files")
+            or (ckpt.get("bootstrap") or {}).get("done")):
+        return ("resume: empty", False,
+                f"checkpoint ({status}) recorded no reviewed file to pick up - "
+                f"a relaunch would start over, so this refuses")
+    return ("resume: done", False,
+            f"checkpoint status '{status}' is terminal - nothing left to resume")
+
+
+def _read_invocation() -> dict:
+    try:
+        with open(INVOCATION_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resume_argv(p: dict, inv: dict, ckpt: dict) -> list:
+    """The recorded launch argv, narrowed to THIS program.
+
+    `--program` is `action="append"`, so its occurrences in argv are in the same
+    order as the status entries' 1-based `index` - that is how one slot of a
+    five-program batch is identified without guessing at name resolution. Both
+    spellings (`--program X` and `--program=X`) are handled; the project dir is
+    the fallback when the index cannot be matched, because it is what the
+    checkpoint is actually keyed on."""
+    argv = [str(a) for a in (inv.get("argv") or [])]
+    tokens, kept, skip = [], [], False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a == "--program":
+            if i + 1 < len(argv):
+                tokens.append(argv[i + 1])
+            skip = True
+            continue
+        if a.startswith("--program="):
+            tokens.append(a.split("=", 1)[1])
+            continue
+        kept.append(a)
+    idx = int(p.get("index") or 0) - 1
+    token = tokens[idx] if 0 <= idx < len(tokens) else ""
+    if not token:
+        token = str(ckpt.get("project_dir") or p.get("dir") or p.get("name") or "")
+    if not kept or not token:
+        return []
+    out = list(kept) + ["--program", token]
+    # One dashboard per desktop, not one per resumed slot.
+    if "--no-dashboard" not in out:
+        out.append("--no-dashboard")
+    return out
+
+
+def resume_program(p: dict) -> bool:
+    """Relaunch ONE program so its recorded checkpoint is picked up.
+
+    Refuses (and says why on the panel) unless `flexfactor_runstate` says the
+    checkpoint is genuinely resumable. Detached + windowless so it survives this
+    viewer closing and cannot flash a console (see the module comment); the
+    child's own output goes to a log beside the checkpoint it is continuing."""
+    key = program_key(p)
+
+    def note(msg: str) -> bool:
+        _RESUME_NOTE[key] = (time.monotonic() + _RESUME_NOTE_S, msg)
+        return False
+
+    label, enabled, reason = resume_state(p)
+    if not enabled:
+        return note(reason or "cannot resume")
+    inv = _read_invocation()
+    if not inv.get("argv"):
+        return note("no recorded launch to replay (~/.flexfactor/"
+                    "last-invocation.json missing)")
+    ckpt = _checkpoint_for(p)
+    argv = resume_argv(p, inv, ckpt)
+    if not argv:
+        return note("recorded launch names no program to resume")
+    exe = str(inv.get("python") or sys.executable)
+    script = str(inv.get("script") or "")
+    if not script or not os.path.isfile(script):
+        return note(f"recorded launcher is gone: {script or '(none)'}")
+    run_dir = _run_dir_for(p) or os.path.dirname(INVOCATION_PATH)
+    log = os.path.join(run_dir, f"resume-{time.strftime('%Y%m%d-%H%M%S')}.log")
+    flags = _NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
+    try:
+        fh = open(log, "a", encoding="utf-8")
+    except OSError as ex:
+        return note(f"cannot open resume log: {ex}")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - fixed launcher, recorded argv
+            [exe, script, *argv], cwd=(inv.get("cwd") or None),
+            stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=flags, close_fds=True)
+    except (OSError, subprocess.SubprocessError) as ex:
+        fh.close()
+        return note(f"resume launch failed: {ex}")
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+    _RESUMED[key] = proc.pid
+    _RESUME_NOTE[key] = (time.monotonic() + _RESUME_NOTE_S,
+                         f"resumed as pid {proc.pid} - watch the attempt line")
+    return True
+
+
+def resume_note(p: dict) -> str:
+    """The transient one-line answer to the last click, or ""."""
+    hit = _RESUME_NOTE.get(program_key(p))
+    if not hit or hit[0] <= time.monotonic():
+        return ""
+    return str(hit[1])
+
+
+# --------------------------------------------------------------------------- #
 # ONE FRAME. Lifted out of _main's closure (2026-08-23) so the panel - bars,
 # stats, and the new error box - can be DRAWN AND READ BACK by a test rather
 # than only looked at by a person. `hits` and `shown` are passed in because they
@@ -632,6 +835,24 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
                            font=("Segoe UI", 11, "bold"))
         hits.append((cx + col_w - 24, top, cx + col_w, top + 24,
                      lambda p=p: dismiss(p)))
+        # RESUME control, top-LEFT, mirroring the dismiss "x" and drawn for the
+        # same reason after the title: a long centred program name paints under
+        # it. Absent entirely when there is no checkpoint (nothing to continue);
+        # drawn DISABLED with the blocking condition in its own label when a
+        # relaunch would start over instead of resuming. `p=p` binds THIS panel.
+        r_label, r_enabled, _r_why = resume_state(p)
+        if r_label:
+            rw = (_measure(F_NOTE, r_label) or 40) + 14
+            rx0, ry0 = cx + 6, top + 4
+            rx1, ry1 = rx0 + rw, top + 20
+            rcol = FIXCOL if r_enabled else DIM
+            canvas.create_rectangle(rx0, ry0, rx1, ry1, outline=rcol,
+                                    fill=BG, width=1)
+            canvas.create_text((rx0 + rx1) / 2, (ry0 + ry1) / 2, text=r_label,
+                               fill=rcol, font=F_NOTE)
+            # A DISABLED button is still clickable on purpose: the click is how
+            # the owner is told why it is disabled. It launches nothing.
+            hits.append((rx0, ry0, rx1, ry1, lambda p=p: resume_program(p)))
         # ATTEMPT + LANDED line (2026-08-14). `cycle` counts cycles inside THIS
         # process, so it resets to 1 on every restart - after five restarts the
         # panel still read "cycle 1/12" while four earlier attempts had produced
@@ -639,8 +860,19 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
         # two numbers survive restarts: `attempt` (how many times this program has
         # been (re)launched + resumed) and `landed` (commits actually on the
         # branch - the DURABLE metric; the per-cycle "fixed" counter resets too).
+        # The resume button's answer takes this line for a few seconds when
+        # there is one: it is the only place a refusal ("pid N is still working
+        # on this run") can be READ, and a control that refuses silently is the
+        # same defect as one that silently starts over. It reverts to the
+        # durable attempt/landed facts on its own.
+        rnote = resume_note(p)
         att = attempt_info(p)
-        if att:
+        if rnote:
+            canvas.create_text(cx + col_w / 2, top + 47,
+                               text=fit(rnote, col_w - 12, spec=F_NOTE),
+                               fill=FIXCOL if _RESUMED.get(program_key(p))
+                               else BUDGET, font=F_NOTE)
+        elif att:
             canvas.create_text(cx + col_w / 2, top + 47, text=att[:46], fill=DIM,
                                font=("Segoe UI", 8))
 
@@ -773,7 +1005,6 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
         F_KIND = ("Segoe UI", 8, "bold")
         F_MONO = ("Consolas", 8)
         F_FIX = ("Segoe UI", 8)
-        F_NOTE = ("Segoe UI", 7)
         canvas.create_text(bx0 + 8, by0 + 10, anchor="w",
                            text=fit(head, inner, spec=F_HEAD),
                            fill=ERRHEAD if rows else DIM, font=F_HEAD)
