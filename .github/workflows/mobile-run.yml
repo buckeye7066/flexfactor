@@ -118,18 +118,31 @@ jobs:
     steps:
       - name: Validate the mobile request
         shell: python
+        env:
+          INPUT_REQUEST_ID: ${{ inputs.request_id }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_PROVIDER: ${{ inputs.provider }}
+          INPUT_TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          INPUT_TARGET_REF: ${{ inputs.target_ref }}
+          INPUT_FILE: ${{ inputs.file }}
+          INPUT_GOAL: ${{ inputs.goal }}
+          INPUT_MAX_COST: ${{ inputs.max_cost }}
+          INPUT_THRESHOLD: ${{ inputs.threshold }}
+          INPUT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
         run: |
           import json, math, os, pathlib, re, urllib.error, urllib.request, uuid
 
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
-              inputs = json.load(fh).get("inputs", {})
-          request_id = str(inputs.get("request_id", ""))
-          mode = str(inputs.get("mode", ""))
-          provider = str(inputs.get("provider", ""))
-          repository = str(inputs.get("target_repository", ""))
-          ref = str(inputs.get("target_ref", ""))
-          file = str(inputs.get("file", ""))
-          goal = str(inputs.get("goal", "")).strip()
+          # A called workflow keeps the caller's original event payload. Values
+          # computed by the caller (notably github.repository) exist only in the
+          # reusable workflow's inputs context, so GITHUB_EVENT_PATH is not an
+          # authoritative source for the effective request.
+          request_id = os.environ["INPUT_REQUEST_ID"]
+          mode = os.environ["INPUT_MODE"]
+          provider = os.environ["INPUT_PROVIDER"]
+          repository = os.environ["INPUT_TARGET_REPOSITORY"]
+          ref = os.environ["INPUT_TARGET_REF"]
+          file = os.environ["INPUT_FILE"]
+          goal = os.environ["INPUT_GOAL"].strip()
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
@@ -141,11 +154,11 @@ jobs:
           if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", ref)
                   or ".." in ref or ref.endswith("/")):
               raise SystemExit("invalid ref")
-          cost = float(inputs.get("max_cost", ""))
+          cost = float(os.environ["INPUT_MAX_COST"])
           if not math.isfinite(cost) or not 1 <= cost <= 150:
               raise SystemExit("cost cap must be between 1 and 150")
-          threshold = int(inputs.get("threshold", ""))
-          iterations = int(inputs.get("max_iterations", ""))
+          threshold = int(os.environ["INPUT_THRESHOLD"])
+          iterations = int(os.environ["INPUT_MAX_ITERATIONS"])
           if not 0 <= threshold <= 100:
               raise SystemExit("threshold must be between 0 and 100")
           if not 1 <= iterations <= 20:
@@ -192,7 +205,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.2.0
+          ref: android-v3.2.2
           path: engine
           persist-credentials: false
 
