@@ -10504,6 +10504,65 @@ def _merge_gaps(samples: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
+PURPOSE_ASSESS_ATTEMPTS = 3
+
+
+def assess_purpose_gap_resiliently(assessors, purpose_blob: str, files: list[str],
+                                   findings: list, *, project_dir: str, contract,
+                                   label: str, errors: list, log=None):
+    """assess_purpose_gap with retries, because ONE bad response is not a verdict.
+
+    PHASE 1 is the phase this tool exists for: everything downstream is graded
+    against the gap it measures. It was a single call wrapped in a non-fatal
+    handler, so one malformed response ended it for the whole run and the line
+    "purpose baseline failed (non-fatal): Expecting value: line 1 column 1" was
+    the only trace - a generic defect sweep wearing a purpose-driven run's name.
+    Measured live 2026-08-28 on a rotated free run, with 121 usable routes
+    standing by after the first one returned something that was not JSON.
+
+    Each attempt re-calls the assessor, and a rotating provider selects a fresh
+    route per call, so a retry is a genuinely different model rather than the
+    same one asked twice. `assessors` is tried in order and then cycled. Every
+    failed attempt is appended to `errors` - retrying must not turn three
+    failures into silence, which is the same defect one level up.
+
+    BudgetExceededError is never retried: the cap is a decision, not a fault.
+    """
+    live = [a for a in (assessors or []) if a is not None]
+    if not live:
+        errors.append(f"{label} purpose assessment skipped: no assessor available")
+        return None
+    for attempt in range(PURPOSE_ASSESS_ATTEMPTS):
+        provider = live[attempt % len(live)]
+        try:
+            got = assess_purpose_gap(provider, purpose_blob, files, findings,
+                                     project_dir=project_dir, contract=contract)
+        except BudgetExceededError:
+            errors.append(f"{label} purpose assessment skipped: cost cap reached")
+            if log:
+                log(f"{label} purpose assessment skipped: cost cap reached")
+            return None
+        except Exception as ex:                        # noqa: BLE001
+            detail = (f"{label} purpose assessment attempt "
+                      f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS} failed: "
+                      f"{type(ex).__name__}: {ex}")
+            errors.append(detail)
+            if log:
+                log(detail)
+            continue
+        if got:
+            if attempt and log:
+                log(f"{label} purpose assessment succeeded on attempt "
+                    f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS}")
+            return got
+        detail = (f"{label} purpose assessment attempt "
+                  f"{attempt + 1}/{PURPOSE_ASSESS_ATTEMPTS} returned nothing usable")
+        errors.append(detail)
+        if log:
+            log(detail)
+    return None
+
+
 def assess_purpose_gap(provider, purpose_blob: str, files: list[str],
                        findings: list[dict], project_dir: str | None = None,
                        contract=None, samples: int | None = None) -> dict | None:
@@ -14818,18 +14877,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 checkpoint.set_phase("purpose gap (baseline)")
             print(f"{pfx}PHASE 1 - purpose: measuring the gap between this program "
                   "and the job it was created to do...")
-            try:
-                purpose_before = assess_purpose_gap(
-                    purpose_reviewer, purpose_blob, all_files, [],
-                    project_dir=project_dir, contract=purpose_contract)
-            except BudgetExceededError:
-                print(f"{pfx}purpose baseline skipped: cost cap reached")
-                purpose_assessment_errors.append(
-                    "baseline purpose assessment skipped: cost cap reached")
-            except Exception as ex:
-                print(f"{pfx}purpose baseline failed (non-fatal): {ex}")
-                purpose_assessment_errors.append(
-                    f"baseline purpose assessment failed: {type(ex).__name__}: {ex}")
+            purpose_before = assess_purpose_gap_resiliently(
+                [purpose_reviewer, author, cross], purpose_blob, all_files, [],
+                project_dir=project_dir, contract=purpose_contract,
+                label="baseline", errors=purpose_assessment_errors,
+                log=lambda m: print(f"{pfx}{m}"))
             if purpose_before:
                 _got = int(purpose_before.get("assessment_samples") or 0)
                 _want = int(purpose_before.get("assessment_expected_samples") or _got)
@@ -15628,18 +15680,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 and not infrastructure_abort):
             report(phase="purpose-gap assessment")
             print(f"{pfx}Assessing purpose gap (metadata vs delivered behavior)...")
-            try:
-                purpose_gap = assess_purpose_gap(
-                    purpose_reviewer_final, purpose_blob, all_files, all_findings,
-                    project_dir=project_dir, contract=purpose_contract)
-            except BudgetExceededError:
-                print(f"{pfx}purpose-gap skipped: cost cap reached")
-                purpose_assessment_errors.append(
-                    "final purpose assessment skipped: cost cap reached")
-            except Exception as ex:
-                print(f"{pfx}purpose-gap assessment failed (non-fatal): {ex}")
-                purpose_assessment_errors.append(
-                    f"final purpose assessment failed: {type(ex).__name__}: {ex}")
+            purpose_gap = assess_purpose_gap_resiliently(
+                [purpose_reviewer_final, author, cross], purpose_blob, all_files,
+                all_findings, project_dir=project_dir, contract=purpose_contract,
+                label="final", errors=purpose_assessment_errors,
+                log=lambda m: print(f"{pfx}{m}"))
             if purpose_gap:
                 _got = int(purpose_gap.get("assessment_samples") or 0)
                 _want = int(purpose_gap.get("assessment_expected_samples") or _got)
@@ -15813,18 +15858,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if bridged_files and not dirty_abort and not infrastructure_abort:
                 report(phase="purpose-gap reassessment")
                 print(f"{pfx}Reassessing purpose after purpose-bridge changes...")
-                try:
-                    refreshed = assess_purpose_gap(
-                        purpose_reviewer_final, purpose_blob, all_files, all_findings,
-                        project_dir=project_dir, contract=purpose_contract)
-                except BudgetExceededError:
-                    refreshed = None
-                    purpose_assessment_errors.append(
-                        "post-bridge purpose reassessment skipped: cost cap reached")
-                except Exception as ex:
-                    refreshed = None
-                    purpose_assessment_errors.append(
-                        f"post-bridge purpose reassessment failed: {type(ex).__name__}: {ex}")
+                refreshed = assess_purpose_gap_resiliently(
+                    [purpose_reviewer_final, author, cross], purpose_blob,
+                    all_files, all_findings, project_dir=project_dir,
+                    contract=purpose_contract, label="post-bridge reassessment",
+                    errors=purpose_assessment_errors,
+                    log=lambda m: print(f"{pfx}{m}"))
                 if refreshed:
                     _got = int(refreshed.get("assessment_samples") or 0)
                     _want = int(refreshed.get("assessment_expected_samples") or _got)

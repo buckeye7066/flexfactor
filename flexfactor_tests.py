@@ -1637,6 +1637,76 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
 
 
+class PurposeAssessmentResilienceTests(unittest.TestCase):
+    """One malformed response is not a verdict on the program.
+
+    PHASE 1 measures the gap this whole tool is pointed at, and it was a single
+    call inside a non-fatal handler. Measured live 2026-08-28 on a rotated free
+    run: the first route returned something that was not JSON, the run printed
+    "purpose baseline failed (non-fatal): Expecting value: line 1 column 1", and
+    then audited as a generic defect sweep with 121 usable routes idle."""
+
+    def _run(self, side_effects, assessors=1):
+        calls = []
+        errors = []
+        logs = []
+
+        def fake(provider, blob, files, findings, *, project_dir, contract):
+            calls.append(provider)
+            outcome = side_effects[len(calls) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        real = ff.assess_purpose_gap
+        ff.assess_purpose_gap = fake
+        try:
+            got = ff.assess_purpose_gap_resiliently(
+                [f"assessor{i}" for i in range(assessors)], "blob", [], [],
+                project_dir="/p", contract=None, label="baseline",
+                errors=errors, log=logs.append)
+        finally:
+            ff.assess_purpose_gap = real
+        return got, calls, errors, logs
+
+    def test_a_malformed_first_response_retries_and_succeeds(self):
+        got, calls, errors, logs = self._run(
+            [ValueError("Expecting value: line 1 column 1 (char 0)"),
+             {"purpose": "recovered"}], assessors=2)
+        self.assertEqual({"purpose": "recovered"}, got)
+        self.assertEqual(["assessor0", "assessor1"], calls,
+                         "the retry must move to the next assessor")
+        self.assertTrue(any("attempt 1/3 failed" in e for e in errors),
+                        "the failed attempt must still be recorded, not swallowed")
+
+    def test_every_attempt_failing_is_reported_not_silent(self):
+        got, calls, errors, _ = self._run([RuntimeError("down")] * 3)
+        self.assertIsNone(got)
+        self.assertEqual(3, len(calls), "all attempts must be spent")
+        self.assertEqual(3, len(errors),
+                         "retrying must not turn three failures into silence")
+
+    def test_a_budget_refusal_is_not_retried(self):
+        got, calls, errors, _ = self._run([ff.BudgetExceededError("cap")] * 3)
+        self.assertIsNone(got)
+        self.assertEqual(1, len(calls),
+                         "the cost cap is a decision, not a fault to retry")
+        self.assertIn("cost cap reached", errors[0])
+
+    def test_an_empty_result_counts_as_a_failed_attempt(self):
+        got, calls, errors, _ = self._run([None, {}, {"purpose": "third"}])
+        self.assertEqual({"purpose": "third"}, got)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(2, len(errors))
+
+    def test_no_assessor_at_all_says_so(self):
+        errors = []
+        self.assertIsNone(ff.assess_purpose_gap_resiliently(
+            [None, None], "blob", [], [], project_dir="/p", contract=None,
+            label="baseline", errors=errors))
+        self.assertIn("no assessor available", errors[0])
+
+
 class GitWorktreeContainmentTests(unittest.TestCase):
     """A directory INSIDE someone else's repo is not this run's repo.
 
