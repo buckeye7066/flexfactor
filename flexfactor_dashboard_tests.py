@@ -20,8 +20,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -513,6 +515,213 @@ class CopyButtonRenderTests(unittest.TestCase):
         texts, _ = self._draw([prog])
         self.assertIn("copied!", texts,
                       "a click with no visible result reads as a broken button")
+
+
+class ResumeButtonTests(unittest.TestCase):
+    """The per-program resume button (added 2026-08-29 by a subagent, UNREQUESTED).
+
+    The whole point of these is the REFUSAL path. A button that says "resume"
+    and quietly starts a full fresh run would re-pay for the entire program and
+    look identical to a working resume, so every test here asserts either that
+    nothing was launched, or that what WAS launched carried this run's own flags
+    narrowed to one program."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ff-resume-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._inv = dash.INVOCATION_PATH
+        self.addCleanup(setattr, dash, "INVOCATION_PATH", self._inv)
+        dash.INVOCATION_PATH = os.path.join(self.tmp, "last-invocation.json")
+        dash._RESUMED.clear()
+        dash._RESUME_NOTE.clear()
+        self.addCleanup(dash._RESUMED.clear)
+        self.addCleanup(dash._RESUME_NOTE.clear)
+        if dash._rs is None:
+            self.skipTest("flexfactor_runstate not importable")
+
+    def _program(self, **ckpt):
+        run_dir = os.path.join(self.tmp, "demo-run")
+        os.makedirs(run_dir, exist_ok=True)
+        data = {"schema": dash._rs.SCHEMA_VERSION, "status": "interrupted",
+                "pid": 999999, "program": "Demo", "project_dir": self.tmp,
+                "reviewed": {"a.py": {"sha": "x", "policy": "p", "findings": []}},
+                "files": {}, "bootstrap": {"done": False, "steps": []}}
+        data.update(ckpt)
+        with open(os.path.join(run_dir, "checkpoint.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return {"index": 1, "name": "Demo", "dir": self.tmp, "run_dir": run_dir}
+
+    def _invocation(self, argv):
+        stub = os.path.join(self.tmp, "stub.py")
+        with open(stub, "w", encoding="utf-8") as fh:
+            fh.write("import sys\nprint('ARGV', ' '.join(sys.argv[1:]))\n")
+        with open(dash.INVOCATION_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"python": sys.executable, "script": stub,
+                       "cwd": self.tmp, "argv": argv}, fh)
+        return stub
+
+    def _live_pid(self):
+        """A pid that is genuinely alive and is NOT this process.
+
+        os.getpid() would be wrong: `is_resumable` deliberately lets a process
+        resume its OWN checkpoint, so testing the refusal with our own pid
+        tests the opposite branch."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc.pid
+
+    def test_a_run_someone_else_is_working_on_REFUSES_and_says_whose(self):
+        pid = self._live_pid()
+        prog = self._program(pid=pid, status="running")
+        self._invocation(["prodready", "--program", "Demo", "--yes"])
+        label, enabled, why = dash.resume_state(prog)
+        self.assertFalse(enabled)
+        self.assertIn("live", label)
+        self.assertFalse(dash.resume_program(prog))
+        self.assertEqual(dash._RESUMED, {}, "a refusal must launch NOTHING")
+        self.assertIn(str(pid), dash.resume_note(prog))
+
+    def test_a_checkpoint_with_nothing_recorded_REFUSES_rather_than_restarting(self):
+        prog = self._program(reviewed={}, files={})
+        self._invocation(["prodready", "--program", "Demo", "--yes"])
+        label, enabled, _ = dash.resume_state(prog)
+        self.assertFalse(enabled)
+        self.assertFalse(dash.resume_program(prog))
+        self.assertEqual(dash._RESUMED, {})
+        self.assertIn("start over", dash.resume_note(prog))
+
+    def test_a_finished_run_REFUSES(self):
+        prog = self._program(status="finished")
+        self._invocation(["prodready", "--program", "Demo", "--yes"])
+        self.assertFalse(dash.resume_state(prog)[1])
+        self.assertFalse(dash.resume_program(prog))
+        self.assertEqual(dash._RESUMED, {})
+
+    def test_no_checkpoint_means_no_button_at_all(self):
+        prog = {"index": 1, "name": "Nothing", "dir": self.tmp,
+                "run_dir": os.path.join(self.tmp, "absent")}
+        self.assertEqual(dash.resume_state(prog)[0], "",
+                         "a program with nothing to continue must not offer to")
+
+    def test_a_resumable_run_relaunches_with_THIS_runs_flags_one_program(self):
+        prog = self._program()
+        self._invocation(["prodready", "--program", "Demo", "--program", "Other",
+                          "--model-mode", "paid", "--economy", "--yes"])
+        self.assertTrue(dash.resume_state(prog)[1])
+        self.assertTrue(dash.resume_program(prog))
+        self.assertIn(dash.program_key(prog), dash._RESUMED)
+        log = [f for f in os.listdir(prog["run_dir"]) if f.startswith("resume-")]
+        self.assertTrue(log, "the relaunch must leave evidence it happened")
+        body = ""
+        for _ in range(80):
+            with open(os.path.join(prog["run_dir"], log[0]),
+                      encoding="utf-8") as fh:
+                body = fh.read()
+            if "ARGV" in body:
+                break
+            time.sleep(0.25)
+        self.assertIn("ARGV", body, "the child never ran")
+        self.assertIn("--program Demo", body)
+        self.assertNotIn("Other", body, "resume must narrow to ONE program")
+        for flag in ("prodready", "--model-mode paid", "--economy", "--yes"):
+            self.assertIn(flag, body, f"{flag} was dropped from the resume")
+        self.assertIn("--no-dashboard", body, "a resume must not stack dashboards")
+
+    def test_a_missing_recorded_launch_REFUSES_instead_of_guessing(self):
+        prog = self._program()
+        self.assertTrue(dash.resume_state(prog)[1])
+        self.assertFalse(dash.resume_program(prog))
+        self.assertEqual(dash._RESUMED, {})
+        self.assertIn("no recorded launch", dash.resume_note(prog))
+
+    def test_both_program_spellings_and_the_index_mapping(self):
+        inv = {"argv": ["audit", "--program=A", "--program", "B", "--yes"]}
+        first = dash.resume_argv({"index": 1}, inv, {})
+        second = dash.resume_argv({"index": 2}, inv, {})
+        # Both spellings are recognised, in argv order, and the OTHER program's
+        # token never survives - that is what makes this a one-slot resume.
+        self.assertEqual(first, ["audit", "--yes", "--program", "A",
+                                 "--no-dashboard"])
+        self.assertEqual(second, ["audit", "--yes", "--program", "B",
+                                  "--no-dashboard"])
+        # An index outside the recorded list falls back to the dir the
+        # checkpoint is actually keyed on, never to a wrong sibling program.
+        got = dash.resume_argv({"index": 9}, inv, {"project_dir": r"C:\x\y"})
+        self.assertIn(r"C:\x\y", got)
+
+
+class ResumeButtonRenderTests(unittest.TestCase):
+    """The button has to be ON the panel and its refusal has to be READABLE."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import tkinter as tk
+            cls.root = tk.Tk()
+            cls.root.withdraw()
+            cls.canvas = tk.Canvas(cls.root, width=960, height=620)
+        except Exception as ex:  # noqa: BLE001
+            raise unittest.SkipTest(f"no Tk display: {ex}")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ff-resume-draw-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        dash._RESUME_NOTE.clear()
+        self.addCleanup(dash._RESUME_NOTE.clear)
+        if dash._rs is None:
+            self.skipTest("flexfactor_runstate not importable")
+
+    def _prog(self, **ckpt):
+        run_dir = os.path.join(self.tmp, "r")
+        os.makedirs(run_dir, exist_ok=True)
+        data = {"schema": dash._rs.SCHEMA_VERSION, "status": "interrupted",
+                "pid": 999999, "program": "Demo", "project_dir": self.tmp,
+                "reviewed": {"a.py": {"sha": "x", "policy": "p", "findings": []}},
+                "files": {}, "bootstrap": {"done": False, "steps": []}}
+        data.update(ckpt)
+        with open(os.path.join(run_dir, "checkpoint.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return {"index": 1, "name": "Demo", "dir": self.tmp, "run_dir": run_dir}
+
+    def _draw(self, progs):
+        hits: list = []
+        self.canvas.delete("all")
+        dash.draw_frame(self.canvas, hits, {}, 960, 620, progs, status_label="t")
+        texts = [self.canvas.itemcget(i, "text") for i in self.canvas.find_all()
+                 if self.canvas.type(i) == "text"]
+        return texts, hits
+
+    def test_every_program_gets_its_own_resume_button(self):
+        a, b = self._prog(), self._prog()
+        b = dict(b, index=2, name="Two")
+        texts, hits = self._draw([a, b])
+        self.assertEqual(len([t for t in texts if t == "resume"]), 2,
+                         "one button per program, per the owner's request")
+        self.assertGreaterEqual(len(hits), 4)  # 2 dismiss + 2 resume
+
+    def test_a_disabled_button_says_which_condition_blocked_it(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        prog = self._prog(pid=proc.pid, status="running")
+        texts, _ = self._draw([prog])
+        self.assertIn("resume: live", texts)
+        dash.resume_program(prog)                      # click it
+        texts, _ = self._draw([prog])
+        self.assertTrue(any("still working" in t for t in texts),
+                        "a control that refuses silently is the defect")
 
 
 if __name__ == "__main__":
