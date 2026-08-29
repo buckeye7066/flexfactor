@@ -13901,8 +13901,17 @@ def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
     try:
         with os.fdopen(handle, "wb") as fh:
             fh.write(b"\0".join(rel.encode("utf-8") for rel in drop))
-        reset = _git(["reset", "-q", f"--pathspec-from-file={spec}",
-                      "--pathspec-file-nul"], project_dir)
+        # `--literal-pathspecs` is the part that actually disables MAGIC.
+        # `--pathspec-file-nul` only settles how entries are DELIMITED and
+        # unquoted; git still parses a leading `:(exclude)` / `:!` / `:/` as
+        # magic, so a file literally named `:(exclude)evil.pyc` made this reset
+        # unstage every staged path. Caught on Linux CI by the test written for
+        # exactly that case - Windows refuses ':' in a filename, so the same
+        # test skips there and the mistake would have shipped on the strength of
+        # a local green.
+        reset = _git(["--literal-pathspecs", "reset", "-q",
+                      f"--pathspec-from-file={spec}", "--pathspec-file-nul"],
+                     project_dir)
     finally:
         try:
             os.remove(spec)
