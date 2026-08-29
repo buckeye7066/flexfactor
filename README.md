@@ -24,6 +24,12 @@ paid service.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_desktop_shortcuts.ps1
 ```
 
+It also creates one shortcut per program it finds (`FlexFactor - GrantFlow`,
+`- SermonSmith`, `- GeneMap`) which starts the same launcher with that program
+already selected — the drag-and-drop path with the drag already done. They carry
+the same icon, because they are the same application. A program folder that is
+not on this machine is skipped and said out loud.
+
 Creates **FlexFactor**, **Scout a Program** and **Audit a Program** on the
 desktop, pointed at this
 checkout - the three shortcuts CLAUDE.md has always named. Double-click
@@ -46,6 +52,14 @@ place its owner actually looks.
   (`.flexfactor-apply-approval.json`). Builds/tests of target code run through
   the execution broker (see docs/EXECUTION_CONTAINMENT.md) and require a
   trusted repository on hosts without an OS sandbox.
+Paid runs take `--paid-models {both,anthropic,openai}` (default `both`).
+`both` is the contract that every applied fix is approved by the model that did
+not write it, and refuses to start if either account is unusable. Naming one
+account is a deliberate single-model paid run on it — for when the other is out
+of credit — and the report says so rather than implying a second opinion. On the
+phone the same choice comes from the provider picker plus the "independent
+cross-model verification" tick-box.
+
 - **prodready** - point it at any program and walk away. Detects every toolchain
   in the tree (13 ecosystems, monorepo-aware), installs the project's own
   dependencies so the build gate measures the CODE rather than a missing

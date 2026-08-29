@@ -511,6 +511,140 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._LAST_ROTATION_USABLE = real_usable
             ff._auto_activate_fcc_proxy = real_fcc
 
+    def test_paid_models_lets_the_owner_pick_one_account(self):
+        """`--paid-models anthropic|openai` is a DELIBERATE single-model paid run.
+
+        Owner request 2026-08-29: run paid on just one account when the other is
+        out of credit. That is not the silent downgrade the pair rule exists to
+        stop - it was asked for, it rides in the run manifest, and the pair rule
+        still applies whenever the choice is 'both'."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            paid_models = "openai"
+
+        picked = []
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff._provider_free_routed = lambda name: False
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append(name) or object())
+        try:
+            # Only OpenAI is usable, and only OpenAI was asked for: it runs.
+            ff._provider_key_present = lambda name: name == "openai"
+            self.assertEqual(["openai"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+            # The mirror case.
+            picked.clear()
+            Args.paid_models = "anthropic"
+            Args.provider = "openai"
+            ff._provider_key_present = lambda name: name == "anthropic"
+            self.assertEqual(["anthropic"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+            # ...and 'both' still refuses when one half is missing.
+            Args.paid_models = "both"
+            Args.provider = "anthropic"
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
+    def test_paid_models_account_is_preflighted_not_assumed(self):
+        """The SELECTED account is the one that gets health-checked.
+
+        The first version of this flag reassigned `primary` AFTER the only
+        mandatory `_usable(primary)` check, so the check answered a question
+        nobody asked. Both directions were wrong, and both are pinned here:
+
+        1. `--provider anthropic --paid-models openai` with a healthy Anthropic
+           key passed preflight on ANTHROPIC, then handed the run an OpenAI
+           provider nobody had checked - the documented setup diagnosis was
+           replaced by a crash on the first model call.
+        2. `--provider ollama --model-mode paid --paid-models openai` was
+           refused for ollama's sake (ollama is not permitted in paid mode)
+           before a perfectly healthy OpenAI account was ever considered.
+
+        Asserting on the returned provider list alone is what let this through:
+        case 1 returns ["openai"] under BOTH the broken and fixed ordering if
+        the key is present. So case 1 gives OpenAI NO key - the state the
+        preflight exists to catch - and demands the refusal."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            paid_models = "openai"
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        built = []
+        ff._provider_free_routed = lambda name: False
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            built.append(name) or object())
+        try:
+            # 1. Healthy Anthropic must NOT vouch for an unusable OpenAI.
+            ff._provider_key_present = lambda name: name == "anthropic"
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertEqual([], built,
+                             "an unchecked provider was constructed for the "
+                             "account the preflight never looked at")
+            self.assertTrue(ff._PROVIDER_DIAGNOSIS,
+                            "refusing without a diagnosis is the failure this "
+                            "flag was supposed to avoid")
+            # 2. An unusable --provider must not veto the account chosen here.
+            built.clear()
+            Args.provider = "ollama"
+            ff._provider_key_present = lambda name: name == "openai"
+            self.assertEqual(["openai"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+        finally:
+            Args.provider = "anthropic"
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
+    def test_paid_models_defaults_to_both_when_absent(self):
+        """Every existing caller and launcher omits the flag; omitting it must
+        keep the pair contract rather than silently becoming single-model."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            # deliberately no paid_models attribute
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff._provider_key_present = lambda name: name == "anthropic"
+        ff._provider_free_routed = lambda name: False
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
     def test_copilot_in_paid_mode_still_needs_both_models(self):
         """`other` is only ever the other half of the anthropic/openai pair.
 
@@ -6865,6 +6999,14 @@ class RunManifestTests(unittest.TestCase):
         self.assertEqual(data["max_cost_usd"], 50.0)
         self.assertEqual(data["applied_files"], ["a.py"])
         self.assertEqual(data["commit_status"], "committed")
+        # THE REQUEST, NOT JUST THE RESULT. A one-provider `providers` list is
+        # produced by a deliberate `--paid-models openai`, by `--single`, and by
+        # a paid run that silently lost its second account. The single-account
+        # contract is that the owner ASKED for one model, so the ask itself has
+        # to survive in the immutable evidence or the contract is unprovable.
+        self.assertIn("model_mode", data)
+        self.assertIn("paid_models", data)
+        self.assertIn("cross_verification_requested", data)
         # Timestamped name: a second write must not overwrite the first.
         path2 = ff._write_run_manifest(tmp, audit, max_cost=10.0)
         self.assertNotEqual(path, path2)
