@@ -304,8 +304,19 @@ if ($mode -eq "3") {
     $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
     $extraArgs = @('--model-mode', $selectedRuntimeMode)
     if ($selectedRuntimeMode -eq 'paid') { $extraArgs += @('--paid-models', $selectedPaidModels) }
+    # NAMING ONE PAID ACCOUNT SETTLES THE PROVIDER QUESTION. The engine makes
+    # the named account the primary and adds no second one, so anything this
+    # launcher says about a different primary - or about a cross-check that
+    # cannot happen - is simply untrue. Choosing 'openai' and pressing Enter at
+    # the primary prompt used to announce "anthropic authors, openai reviews"
+    # and then run OpenAI alone. There is no choice left to offer here, so the
+    # prompt is skipped and the messages report the account actually running.
+    $paidSingleAccount = ($selectedRuntimeMode -eq 'paid' -and $selectedPaidModels -ne 'both')
 
-    if ($haveAnthropic -and $haveOpenai) {
+    if ($paidSingleAccount) {
+        Write-Host ("Paid accounts: $selectedPaidModels only - $selectedPaidModels authors and fixes; no second model reviews.") -ForegroundColor Yellow
+        $defaultProvider = $selectedPaidModels
+    } elseif ($haveAnthropic -and $haveOpenai) {
         # Both keys present: run primary + cross-check. Do NOT pass --single.
         Write-Host "Both keys detected - audit will use both models (primary + cross-check)." -ForegroundColor Green
         $defaultProvider = "anthropic"
@@ -328,7 +339,7 @@ if ($mode -eq "3") {
     # so the question was pure noise (owner feedback 2026-08-11 evening). In
     # this free-proxy launcher OPENAI_API_KEY is always blanked above, so the
     # prompt never fires here at all.
-    if ($haveAnthropic -and $haveOpenai) {
+    if ($haveAnthropic -and $haveOpenai -and -not $paidSingleAccount) {
         $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
         if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
     } else {
@@ -425,7 +436,9 @@ if ($mode -eq "3") {
     if ($selectedRuntimeMode -eq "paid") {
         $extraArgs += "--provider"
         $extraArgs += $primary
-        if ($haveAnthropic -and $haveOpenai) {
+        if ($paidSingleAccount) {
+            Write-Host "Paid audit: $primary only (you chose '$selectedPaidModels'); no second model cross-checks." -ForegroundColor Yellow
+        } elseif ($haveAnthropic -and $haveOpenai) {
             $secondary = if ($primary -eq "anthropic") { "openai" } else { "anthropic" }
             Write-Host "Paid audit: $primary is primary; $secondary will independently cross-check." -ForegroundColor Yellow
         } else {

@@ -51,6 +51,22 @@ $programs = @(
 )
 foreach ($prog in $programs) {
     if (-not (Test-Path $prog.Path)) {
+        # SKIPPING IS NOT ENOUGH ON A RE-RUN. This installer is idempotent, so
+        # it runs again after a program folder is moved or deleted - and a
+        # previous run may have already written "FlexFactor - <name>.lnk" whose
+        # embedded argument points at the path that just disappeared. Merely
+        # skipping creation leaves that shortcut on the desktop, breaking the
+        # guarantee that a missing program never leaves a shortcut that fails
+        # when clicked. Remove the stale one before moving on.
+        $staleLnk = Join-Path $desktop ('FlexFactor - ' + $prog.Name + '.lnk')
+        if (Test-Path $staleLnk) {
+            Remove-Item -LiteralPath $staleLnk -Force -ErrorAction SilentlyContinue
+            if (Test-Path $staleLnk) {
+                Write-Host ("WARN (could not remove stale shortcut): " + $staleLnk) -ForegroundColor Red
+            } else {
+                Write-Host ("removed stale shortcut: " + $staleLnk) -ForegroundColor Yellow
+            }
+        }
         Write-Host ("SKIP (no such folder): " + $prog.Name + " -> " + $prog.Path) -ForegroundColor Yellow
         continue
     }

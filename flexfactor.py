@@ -4378,6 +4378,33 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     else:
         other = "openai" if primary == "anthropic" else "anthropic"
 
+    # OWNER CHOICE OF PAID ACCOUNTS (2026-08-29). `--paid-models anthropic|openai`
+    # is a deliberate single-model paid run on that account: it makes the primary
+    # that account and lifts the pair requirement, which is exactly what is
+    # wanted when the other account is out of credit. It is NOT the silent
+    # downgrade the pair rule below exists to stop - the owner asked for one
+    # model, the flag rides in the run manifest, and the report never implies a
+    # second opinion.
+    #
+    # IT IS RESOLVED HERE, BEFORE PREFLIGHT, and that placement is the point.
+    # The first version reassigned `primary` AFTER the only mandatory
+    # `_usable(primary)` check, which got the answer wrong in both directions:
+    #   - `--provider anthropic --paid-models openai` with a healthy Anthropic
+    #     key passed preflight on ANTHROPIC and then built an OpenAI provider
+    #     nobody had checked, so a keyless or unfunded OpenAI account failed on
+    #     the first model call instead of returning the setup diagnosis;
+    #   - `--provider ollama --model-mode paid --paid-models openai` refused for
+    #     ollama's sake before a perfectly healthy OpenAI account was ever
+    #     considered.
+    # Resolving it here makes the SELECTED account the one every downstream
+    # check - preflight, fallback, and the three-way diagnosis - is asked about.
+    # Falling back to ollama cannot happen from here: `_usable` goes through
+    # `_permitted`, which excludes ollama entirely in paid mode.
+    paid_choice = str(getattr(args, "paid_models", "both") or "both").lower()
+    if model_mode == "paid" and paid_choice in ("anthropic", "openai"):
+        primary = paid_choice
+        other = None
+
     # "Usable" = key present AND (unless --no-preflight) verified live. A present
     # but dead key (out of credits / revoked) must NOT be chosen as the author,
     # or the audit crashes on the first fix call. Preflight defaults ON.
@@ -4618,16 +4645,9 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # this false and proceed alone - the pair promise broken by the one provider
     # choice that never had a partner. Any paid cloud primary now has to produce
     # the pair; for copilot that means BOTH named models, since it is neither.
-    # OWNER CHOICE OF PAID ACCOUNTS (2026-08-29). `--paid-models anthropic|openai`
-    # is a deliberate single-model paid run on that account: it makes the primary
-    # that account and lifts the pair requirement, which is exactly what is
-    # wanted when the other account is out of credit. It is NOT the silent
-    # downgrade the pair rule exists to stop - the owner asked for one model, the
-    # flag is in the run manifest, and the report never implies a second opinion.
-    paid_choice = str(getattr(args, "paid_models", "both") or "both").lower()
-    if model_mode == "paid" and paid_choice in ("anthropic", "openai"):
-        primary = paid_choice
-        other = None
+    # `paid_choice` and the single-account override are resolved ABOVE, before
+    # preflight, so the account the owner named is the one that was health-
+    # checked. Only the pair requirement is decided here.
     paid_pair_required = (model_mode == "paid" and args.use_both
                           and paid_choice == "both"
                           and primary in {"anthropic", "openai", "copilot"})
@@ -16787,6 +16807,15 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "commit_status": commit_status, "baseline_ok": baseline_ok,
             "wip_snapshot_ref": result.get("wip_snapshot_ref"),
             "cycles": cycles_run, "providers": [f"{n}:{p.model}" for n, p in providers],
+            # WHAT WAS ASKED FOR, not just what came out. The resulting provider
+            # list cannot distinguish a deliberate `--paid-models openai` run
+            # from `--single --provider openai` or from a paid run that silently
+            # lost its second account - all three render as one provider. The
+            # single-account contract is that the owner ASKED for one model, so
+            # the request itself has to be in the immutable evidence.
+            "model_mode": normalize_model_mode(getattr(args, "model_mode", "free")),
+            "paid_models": str(getattr(args, "paid_models", "both") or "both").lower(),
+            "cross_verification_requested": bool(getattr(args, "use_both", False)),
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
             "fix_severity": args.fix_severity, "manual_review": sorted(manual_review),
@@ -17554,6 +17583,11 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "max_cost_usd": float(max_cost),
         "usd_spent": a.get("usd"),
         "providers": list(a.get("providers") or []),
+        # The REQUEST alongside the RESULT, so a one-provider paid run is
+        # provably an explicit owner choice rather than a silent downgrade.
+        "model_mode": a.get("model_mode"),
+        "paid_models": a.get("paid_models"),
+        "cross_verification_requested": a.get("cross_verification_requested"),
         "cycles": a.get("cycles"),
         "files_reviewed": a.get("files_reviewed"),
         # candidates == acted_on + skipped_by_reason + failed, immutably recorded.
