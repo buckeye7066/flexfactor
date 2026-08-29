@@ -24,8 +24,10 @@ paid service.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_desktop_shortcuts.ps1
 ```
 
-Creates **FlexFactor** and **FlexFactor Scout** on the desktop, pointed at this
-checkout. Double-click FlexFactor to pick a mode and a model mode (free or
+Creates **FlexFactor**, **Scout a Program** and **Audit a Program** on the
+desktop, pointed at this
+checkout - the three shortcuts CLAUDE.md has always named. Double-click
+FlexFactor to pick a mode and a model mode (free or
 paid); drag a file or folder onto it to run against that program directly. The
 script is idempotent - re-run it after moving the checkout. It resolves the
 desktop from the shell folder, so a OneDrive-redirected profile gets them in the

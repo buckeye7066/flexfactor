@@ -25,10 +25,14 @@ $targets = @(
        Script = Join-Path $repo 'flexfactor_launch.ps1'
        Icon = Join-Path $repo 'flexfactor.ico'
        Description = 'FlexFactor - refactor / scout / audit / prodready (free or paid)' },
-    @{ Name = 'FlexFactor Scout'
+    @{ Name = 'Scout a Program'
        Script = Join-Path $repo 'flexfactor_scout_launch.ps1'
        Icon = Join-Path $repo 'flexfactor_scout.ico'
-       Description = 'FlexFactor Scout - find open-source work worth adopting' }
+       Description = 'FlexFactor Scout - find open-source work worth adopting' },
+    @{ Name = 'Audit a Program'
+       Script = Join-Path $repo 'flexfactor_audit_launch.ps1'
+       Icon = Join-Path $repo 'flexfactor.ico'
+       Description = 'FlexFactor Audit - line-by-line review that fixes what it finds' }
 )
 
 # Windows PowerShell 5.1 is what a .lnk actually launches on this machine, so
