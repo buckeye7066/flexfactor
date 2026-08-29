@@ -382,12 +382,20 @@ def readonly_database_url(env: dict | None = None) -> str:
     return str((env if env is not None else os.environ).get(READONLY_URL_ENV) or "").strip()
 
 
-def availability(env: dict | None = None) -> dict:
+def availability(env: dict | None = None, connect=None) -> dict:
     """{'available': bool, 'reason': str, 'driver': str|None}.
 
     UNAVAILABLE IS A VERDICT, NOT A SILENCE.  Every caller prints this reason;
     the audit report carries it verbatim.  There is no code path in which the
     absence of this capability renders as a clean data bill of health.
+
+    `connect` is the caller-supplied opener ReadOnlySession will actually use.
+    When one is supplied the installed driver is irrelevant - the connection is
+    not made by this module at all - so requiring one would report "no driver,
+    therefore no conclusions" about a probe that was perfectly able to run.
+    Measured 2026-08-28: the whole probe suite passed on a machine with psycopg
+    installed and failed on one without it, for tests that never touch a real
+    database, which is a verdict about the host rather than about the program.
     """
     url = readonly_database_url(env)
     if not url:
@@ -396,6 +404,9 @@ def availability(env: dict | None = None) -> dict:
                            "read path to production data, so NO data-shaped or "
                            "environment-shaped root cause could be looked for "
                            "(this is not evidence that none exists)")}
+    if connect is not None:
+        return {"available": True, "driver": "caller-supplied",
+                "reason": f"{READONLY_URL_ENV} set; connection opened by the caller"}
     try:
         _mod, name = load_driver()
     except DriverMissingError as ex:
@@ -639,7 +650,7 @@ def collect_runtime_evidence(judge, purpose_blob: str, *, env: dict | None = Non
         if log:
             log(msg)
 
-    avail = availability(env)
+    avail = availability(env, connect=connect)
     record: dict = {"available": bool(avail["available"]), "reason": avail["reason"],
                     "driver": avail.get("driver"), "tables": 0, "queries": [],
                     "rejected": [], "findings": [], "errors": []}
