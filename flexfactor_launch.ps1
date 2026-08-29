@@ -189,25 +189,39 @@ if ($mode -eq "3" -or $mode -eq "4") {
         Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
         Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
         Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
-        # BOTH, not either. Paid mode's contract is that every applied fix is
-        # approved by the second model, and the engine refuses a one-model paid
-        # run rather than quietly dropping the approval step. Checking for
-        # "at least one key" here let the owner pick paid, watch the menu accept
-        # it, and only then meet the refusal several minutes into the run.
+        # WHICH ACCOUNTS (owner request 2026-08-29). 'both' keeps the contract
+        # that every applied fix is approved by the model that did not write it,
+        # and needs both keys. Naming one account is a DELIBERATE single-model
+        # run on it - what you want when the other one is out of credit - and it
+        # is asked for here rather than discovered as a refusal several minutes
+        # into a run.
+        $selectedPaidModels = Read-Host "Paid accounts [both / anthropic / openai] (Enter = both)"
+        if ([string]::IsNullOrWhiteSpace($selectedPaidModels)) { $selectedPaidModels = "both" }
+        $selectedPaidModels = $selectedPaidModels.ToLowerInvariant()
+        if ($selectedPaidModels -notin @("both", "anthropic", "openai")) {
+            Write-Host "Unknown choice '$selectedPaidModels'. Choose both, anthropic or openai." -ForegroundColor Red
+            Read-Host "Press Enter to close"; exit 2
+        }
         $missingPaid = @()
-        if ([string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) { $missingPaid += "ANTHROPIC_API_KEY" }
-        if ([string]::IsNullOrEmpty($env:OPENAI_API_KEY))    { $missingPaid += "OPENAI_API_KEY" }
+        if ($selectedPaidModels -in @("both", "anthropic") -and
+            [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) { $missingPaid += "ANTHROPIC_API_KEY" }
+        if ($selectedPaidModels -in @("both", "openai") -and
+            [string]::IsNullOrEmpty($env:OPENAI_API_KEY))    { $missingPaid += "OPENAI_API_KEY" }
         if ($missingPaid.Count -gt 0) {
-            Write-Host ("Paid mode needs BOTH accounts and this environment is missing: " +
-                        ($missingPaid -join ", ")) -ForegroundColor Red
-            Write-Host "  Every fix in paid mode is approved by the second model, so a" -ForegroundColor Red
-            Write-Host "  one-model paid run is refused. Set the missing key, or choose free." -ForegroundColor Red
+            Write-Host ("Paid mode '$selectedPaidModels' needs: " + ($missingPaid -join ", ") +
+                        " - not set in this environment.") -ForegroundColor Red
             Read-Host "Press Enter to close"; exit 1
         }
-        Write-Host "  Paid mode: your Anthropic and OpenAI accounts ONLY, until their credits" -ForegroundColor Yellow
-        Write-Host "             expire. No free routes, no Ollama, no OpenRouter resale." -ForegroundColor Yellow
-        Write-Host "             Both models are required: each applied fix is approved by the" -ForegroundColor Yellow
-        Write-Host "             one that did not write it." -ForegroundColor Yellow
+        Write-Host "  Paid mode: your own accounts ONLY, until their credits expire." -ForegroundColor Yellow
+        Write-Host "             No free routes, no Ollama, no OpenRouter resale." -ForegroundColor Yellow
+        if ($selectedPaidModels -eq "both") {
+            Write-Host "             Both models: each applied fix is approved by the one that" -ForegroundColor Yellow
+            Write-Host "             did not write it." -ForegroundColor Yellow
+        } else {
+            Write-Host ("             SINGLE MODEL ($selectedPaidModels): no second opinion on each") -ForegroundColor Yellow
+            Write-Host "             fix. The build gate and the project's own suite still gate" -ForegroundColor Yellow
+            Write-Host "             every commit, and the report says the run was single-model." -ForegroundColor Yellow
+        }
     } else {
         $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = ""
         $env:FLEXFACTOR_FALLBACK_OPENAI_KEY = ""
@@ -273,7 +287,9 @@ if ($mode -eq "4") {
     # and the whole run silently degrades to report-only (2026-08-11: 6h /
     # $17.75 GrantFlow review, 3464 defects found, 0 fixed). This menu already
     # IS the owner's confirmation - same reasoning as audit mode above.
-    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode, '--economy', '--yes'))
+    $paidArgs = @()
+    if ($selectedRuntimeMode -eq 'paid') { $paidArgs = @('--paid-models', $selectedPaidModels) }
+    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode) + $paidArgs + @('--economy', '--yes'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
     exit 0
@@ -287,6 +303,7 @@ if ($mode -eq "3") {
     $haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
     $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
     $extraArgs = @('--model-mode', $selectedRuntimeMode)
+    if ($selectedRuntimeMode -eq 'paid') { $extraArgs += @('--paid-models', $selectedPaidModels) }
 
     if ($haveAnthropic -and $haveOpenai) {
         # Both keys present: run primary + cross-check. Do NOT pass --single.

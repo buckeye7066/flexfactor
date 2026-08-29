@@ -4618,7 +4618,18 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     # this false and proceed alone - the pair promise broken by the one provider
     # choice that never had a partner. Any paid cloud primary now has to produce
     # the pair; for copilot that means BOTH named models, since it is neither.
+    # OWNER CHOICE OF PAID ACCOUNTS (2026-08-29). `--paid-models anthropic|openai`
+    # is a deliberate single-model paid run on that account: it makes the primary
+    # that account and lifts the pair requirement, which is exactly what is
+    # wanted when the other account is out of credit. It is NOT the silent
+    # downgrade the pair rule exists to stop - the owner asked for one model, the
+    # flag is in the run manifest, and the report never implies a second opinion.
+    paid_choice = str(getattr(args, "paid_models", "both") or "both").lower()
+    if model_mode == "paid" and paid_choice in ("anthropic", "openai"):
+        primary = paid_choice
+        other = None
     paid_pair_required = (model_mode == "paid" and args.use_both
+                          and paid_choice == "both"
                           and primary in {"anthropic", "openai", "copilot"})
     if primary == "copilot" and paid_pair_required:
         missing_pair = [n for n in ("anthropic", "openai") if not _usable(n)]
@@ -18486,6 +18497,17 @@ def main(argv=None) -> int:
                                  "Ollama/FCC; the run cannot spend. paid: the owner's Anthropic and "
                                  "OpenAI accounts only, until their credits expire. "
                                  "('auto' and 'local' are retired and run as 'free'.)")
+        parser.add_argument("--paid-models", choices=["both", "anthropic", "openai"],
+                            default="both", dest="paid_models",
+                            help="Which of the owner's accounts a PAID run may use "
+                                 "(default: both). 'both' keeps the contract that every "
+                                 "applied fix is approved by the model that did not "
+                                 "write it, and refuses to start if either account is "
+                                 "unusable. 'anthropic' or 'openai' is a deliberate "
+                                 "SINGLE-MODEL paid run on that account alone - useful "
+                                 "when the other one is out of credit - and the report "
+                                 "says so rather than implying a second opinion. No "
+                                 "effect in free mode.")
         parser.add_argument("--model", default=None, help="Override the AUTHOR model id (code generation).")
         parser.add_argument("--economy", action="store_true", dest="economy",
                             help="Cheapest-credits mode: author fixes/tests with claude-sonnet-5 "

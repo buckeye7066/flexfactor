@@ -400,6 +400,20 @@ jobs:
             if [ "$USE_BOTH" != true ] || [ "$PROVIDER" = ollama ] || [ "$PROVIDER" = copilot ]; then
               audit_args+=(--single)
             fi
+            # SAME CHOICE THE DESKTOP OFFERS, from the controls the app already
+            # has: leaving "independent cross-model verification" ticked means
+            # both accounts and the approval contract; unticking it with OpenAI
+            # or Anthropic selected is a deliberate single-model paid run on that
+            # account - what you want when the other one is out of credit.
+            if [ "$model_mode" = paid ]; then
+              if [ "$USE_BOTH" != true ] && [ "$PROVIDER" = openai ]; then
+                audit_args+=(--paid-models openai)
+              elif [ "$USE_BOTH" != true ] && [ "$PROVIDER" = anthropic ]; then
+                audit_args+=(--paid-models anthropic)
+              else
+                audit_args+=(--paid-models both)
+              fi
+            fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
               "${provider_args[@]}" "${audit_args[@]}" 2>&1 | tee mobile-run.log \

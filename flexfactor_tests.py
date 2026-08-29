@@ -511,6 +511,81 @@ class PricingAndEconomyTests(unittest.TestCase):
             ff._LAST_ROTATION_USABLE = real_usable
             ff._auto_activate_fcc_proxy = real_fcc
 
+    def test_paid_models_lets_the_owner_pick_one_account(self):
+        """`--paid-models anthropic|openai` is a DELIBERATE single-model paid run.
+
+        Owner request 2026-08-29: run paid on just one account when the other is
+        out of credit. That is not the silent downgrade the pair rule exists to
+        stop - it was asked for, it rides in the run manifest, and the pair rule
+        still applies whenever the choice is 'both'."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            paid_models = "openai"
+
+        picked = []
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff._provider_free_routed = lambda name: False
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
+            picked.append(name) or object())
+        try:
+            # Only OpenAI is usable, and only OpenAI was asked for: it runs.
+            ff._provider_key_present = lambda name: name == "openai"
+            self.assertEqual(["openai"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+            # The mirror case.
+            picked.clear()
+            Args.paid_models = "anthropic"
+            Args.provider = "openai"
+            ff._provider_key_present = lambda name: name == "anthropic"
+            self.assertEqual(["anthropic"],
+                             [n for n, _ in ff.build_audit_providers(Args)])
+            # ...and 'both' still refuses when one half is missing.
+            Args.paid_models = "both"
+            Args.provider = "anthropic"
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
+    def test_paid_models_defaults_to_both_when_absent(self):
+        """Every existing caller and launcher omits the flag; omitting it must
+        keep the pair contract rather than silently becoming single-model."""
+        class Args:
+            provider = "anthropic"
+            model_mode = "paid"
+            model = None
+            economy = False
+            use_both = True
+            secondary_model = None
+            judge_model = None
+            no_preflight = True
+            # deliberately no paid_models attribute
+
+        real_key = ff._provider_key_present
+        real_make = ff.make_provider
+        real_free = ff._provider_free_routed
+        ff._provider_key_present = lambda name: name == "anthropic"
+        ff._provider_free_routed = lambda name: False
+        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
+        try:
+            self.assertEqual([], ff.build_audit_providers(Args))
+            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
+        finally:
+            ff._provider_key_present = real_key
+            ff.make_provider = real_make
+            ff._provider_free_routed = real_free
+
     def test_copilot_in_paid_mode_still_needs_both_models(self):
         """`other` is only ever the other half of the anthropic/openai pair.
 
