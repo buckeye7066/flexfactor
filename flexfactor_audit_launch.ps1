@@ -12,6 +12,8 @@ $env:PYTHONIOENCODING = "utf-8"
 
 # Directed entry: unfit-route filter + theme stamp + skip-dir (same rule as Factory Deck).
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
+# ONE interpreter answer for all three launchers (see the file's header).
+. (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
 
 Write-Host ""
 Write-Host "  [##]  FlexFactor Audit" -ForegroundColor Cyan
@@ -152,6 +154,6 @@ $providerArgs = @('--provider', $primary)
 
 Write-Host ""
 # audit auto-detects keys; when both are set it cross-checks with both models.
-python $script audit @providerArgs @programArgs @extraArgs
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script, "audit") + $providerArgs + $programArgs + $extraArgs)
 Write-Host ""
 Read-Host "Done. Press Enter to close"

@@ -90,6 +90,12 @@ function global:python {{
         env = dict(os.environ)
         env.update(extra_env)
         env["FLEXFACTOR_LAUNCHER_CAPTURE"] = capture
+        # The launchers resolve their interpreter (.venv first, then `py -3.12`,
+        # then PATH). This harness captures arguments by shadowing the `python`
+        # COMMAND, so without pinning the resolution the test would run the real
+        # interpreter on the test machine and capture nothing - the parity gate
+        # would pass by not running.
+        env["FLEXFACTOR_PYTHON"] = "python"
         cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", harness],
                             cwd=HERE, env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=120)
@@ -97,6 +103,73 @@ function global:python {{
             raise AssertionError((name, cp.returncode, cp.stdout[-3000:], cp.stderr[-3000:]))
         with open(capture, encoding="utf-8") as handle:
             return handle.read().split(chr(31))
+
+
+class InterpreterResolutionTests(unittest.TestCase):
+    """Which Python a desktop shortcut actually runs.
+
+    README's install path is `py -3.12 -m venv .venv` + `pip install -e ".[all]"`,
+    so on a fresh machine the provider SDKs exist ONLY inside `.venv`. All three
+    launchers called bare `python`, which resolves to whatever is first on PATH -
+    quite possibly a different version with no `anthropic` or `openai` installed.
+    Double-clicking the documented shortcut would fail on an import, pointing at
+    nothing the owner did wrong.
+
+    The parity suite above pins FLEXFACTOR_PYTHON so its command stub is
+    reachable, which means these are the only tests covering the resolution."""
+
+    RESOLVER = os.path.join(HERE, "scripts", "flexfactor_python.ps1")
+
+    def _resolve(self, repo: str, env_override: str | None = None) -> str:
+        ps = shutil.which("pwsh") or shutil.which("powershell")
+        if not ps:
+            self.skipTest("PowerShell is unavailable on this host")
+        script = (". " + _ps_literal(self.RESOLVER) + "\n"
+                  "$r = Get-FlexFactorPython -Repo " + _ps_literal(repo) + "\n"
+                  "Write-Output ($r -join ' ')\n")
+        env = dict(os.environ)
+        env.pop("FLEXFACTOR_PYTHON", None)
+        if env_override is not None:
+            env["FLEXFACTOR_PYTHON"] = env_override
+        cp = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script],
+                            cwd=HERE, env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(0, cp.returncode, cp.stderr[-2000:])
+        return cp.stdout.strip()
+
+    def test_the_resolver_exists_and_every_launcher_uses_it(self):
+        self.assertTrue(os.path.isfile(self.RESOLVER))
+        for name in ("flexfactor_launch.ps1", "flexfactor_scout_launch.ps1",
+                     "flexfactor_audit_launch.ps1"):
+            text = open(os.path.join(HERE, name), encoding="utf-8").read()
+            self.assertIn("scripts\\flexfactor_python.ps1", text, name)
+            self.assertIn("Invoke-FlexFactorPython", text, name)
+            # The bare call is what this change exists to remove.
+            self.assertNotIn("\npython ", text, name)
+            self.assertNotIn("\n        python ", text, name)
+
+    def test_a_checkout_venv_is_preferred_over_whatever_is_on_PATH(self):
+        with tempfile.TemporaryDirectory(prefix="ff-venv-") as tmp:
+            exe = os.path.join(tmp, ".venv", "Scripts", "python.exe")
+            os.makedirs(os.path.dirname(exe), exist_ok=True)
+            with open(exe, "w", encoding="utf-8") as fh:
+                fh.write("not a real interpreter")
+            self.assertEqual(exe, self._resolve(tmp))
+
+    def test_without_a_venv_it_still_resolves_something_runnable(self):
+        with tempfile.TemporaryDirectory(prefix="ff-novenv-") as tmp:
+            got = self._resolve(tmp)
+            self.assertTrue(got, "the resolver must always name an interpreter")
+            self.assertTrue(got.endswith("python") or "py.exe" in got, got)
+
+    def test_an_explicit_override_wins_over_the_venv(self):
+        with tempfile.TemporaryDirectory(prefix="ff-override-") as tmp:
+            exe = os.path.join(tmp, ".venv", "Scripts", "python.exe")
+            os.makedirs(os.path.dirname(exe), exist_ok=True)
+            with open(exe, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            self.assertEqual("C:/chosen/python.exe",
+                             self._resolve(tmp, env_override="C:/chosen/python.exe"))
 
 
 class EntryPointParityTests(unittest.TestCase):

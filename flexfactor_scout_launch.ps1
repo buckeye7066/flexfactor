@@ -8,6 +8,8 @@ $ErrorActionPreference = "Stop"
 
 # Directed entry: same orchestration rule as Factory Deck / Purpose Foundry.
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
+# ONE interpreter answer for all three launchers (see the file's header).
+. (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
 $productionRr = if (-not [string]::IsNullOrWhiteSpace($env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL)) {
     $env:FLEXFACTOR_REPO_REWARDS_PRODUCTION_URL.TrimEnd("/")
 } else {
@@ -133,6 +135,6 @@ $pyArgs = @(
     "--repo-rewards-url", $rrUrl,
     "--no-auto-start"
 ) + $remoteArgs + $contextArgs + $applyArgs
-python @pyArgs
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs $pyArgs
 Write-Host ""
 Read-Host "Done. Press Enter to close"

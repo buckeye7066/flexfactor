@@ -44,6 +44,15 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SKIP_DIRS = {
     ".git", "build", "dist", "__pycache__", ".pytest_cache", ".remember",
     "flexfactor.egg-info", "node_modules", "eval_fixtures", "docs",
+    # THIRD-PARTY CODE IS NOT FIRST-PARTY CODE, and README tells every owner to
+    # create the first of these: `py -3.12 -m venv .venv`. Following the
+    # documented install put ~25 pip/pytest/pygments launch sites, hundreds of
+    # third-party truthiness reads and every vendored module's filename in front
+    # of a sweep whose entire subject is FlexFactor's OWN invariants - four of
+    # its checks went red, none of them about FlexFactor. Measured 2026-08-29 on
+    # a fresh `.venv` in this checkout; CI never saw it because CI installs to
+    # the interpreter rather than into the tree.
+    ".venv", "venv", ".env", "env", "site-packages", ".tox", ".nox", ".mypy_cache",
 }
 
 # Test modules are excluded from the truthiness sweep on purpose, with reason:
@@ -69,6 +78,53 @@ def repo_python_files(include_tests: bool = False) -> list[str]:
                 continue
             out.append(os.path.join(dirpath, fn))
     return sorted(out)
+
+
+class FirstPartyDiscoveryTests(unittest.TestCase):
+    """The sweep's subject is FlexFactor's own code, and only that.
+
+    Every check in this module reads `repo_python_files()`. Vendored or
+    virtual-environment code appearing there does not merely add noise: it fails
+    checks whose remedy is to edit somebody else's package, which is no remedy at
+    all, so the sweep stops being actionable and gets muted. README's own install
+    step creates `.venv` inside the checkout, so this is the DOCUMENTED state of
+    an owner machine - not an exotic one."""
+
+    def test_a_virtualenv_in_the_checkout_is_not_swept(self):
+        import tempfile
+
+        made = []
+        for rel in (os.path.join(".venv", "Lib", "site-packages", "vendored.py"),
+                    os.path.join("venv", "lib", "vendored2.py"),
+                    os.path.join(".tox", "py312", "vendored3.py")):
+            path = os.path.join(_HERE, rel)
+            if os.path.exists(path):
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("import subprocess\nsubprocess.run(['npm', 'install'])\n")
+            made.append(path)
+        try:
+            swept = repo_python_files(include_tests=True)
+            leaked = [p for p in swept
+                      if any(part in os.path.normpath(p).split(os.sep)
+                             for part in (".venv", "venv", ".tox", "site-packages"))]
+            self.assertEqual([], leaked,
+                             "third-party code reached a first-party sweep")
+        finally:
+            for path in made:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_the_sweep_still_sees_the_product(self):
+        """The exclusion must not be so broad that it hides FlexFactor."""
+        names = {os.path.basename(p) for p in repo_python_files(include_tests=True)}
+        for expected in ("flexfactor.py", "flexfactor_rotation.py",
+                         "flexfactor_prodevidence.py",
+                         "flexfactor_invariant_sweep_tests.py"):
+            self.assertIn(expected, names)
 
 
 def _read(path: str) -> str:

@@ -91,7 +91,7 @@ function Invoke-FlexFactorJob {
             Write-Host ""
             Write-Host "  RESTART $attempt/$maxAttempts - relaunching the job (free backend dropped it) ..." -ForegroundColor Yellow
         }
-        python $script @JobArgs
+        Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $JobArgs)
         $code = $LASTEXITCODE
         if ($code -eq 0) { return 0 }
         if ($code -eq 2) {
@@ -117,6 +117,8 @@ function Invoke-FlexFactorJob {
 # flexfactor_run.py is a thin shim onto flexfactor.run_cli (the same entry the
 # installed console script uses); directed orchestration is native to the runtime.
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
+# ONE interpreter answer for all three launchers (see the file's header).
+. (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
 $selectedRuntimeMode = "free"   # two modes only: free (default) / paid
 
 Write-Host ""
