@@ -9,7 +9,7 @@ public final class MobileWorkflowTest {
     @Test
     public void callerIsPinnedAndSupportsPrivateTargetExecution() {
         String workflow = MobileWorkflow.content();
-        assertTrue(workflow.contains("@android-v3.2.0"));
+        assertTrue(workflow.contains("@android-v3.2.2"));
         assertTrue(workflow.contains("target_repository: ${{ github.repository }}"));
         assertTrue(workflow.contains("contents: write"));
         assertTrue(workflow.contains("pull-requests: write"));

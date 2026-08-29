@@ -4,7 +4,7 @@ package com.firer.console.flexfactor;
 final class MobileWorkflow {
     static final String PATH = ".github/workflows/flexfactor-mobile.yml";
     static final String FILE_NAME = "flexfactor-mobile.yml";
-    static final String ENGINE_REF = "android-v3.2.0";
+    static final String ENGINE_REF = "android-v3.2.2";
 
     private MobileWorkflow() {}
 
