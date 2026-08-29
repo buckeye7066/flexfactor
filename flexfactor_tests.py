@@ -1637,6 +1637,46 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertEqual([f.replace("\\", "/") for f in files], ["src/app.js"])
 
 
+class MisKeyedArraySalvageTests(unittest.TestCase):
+    """The right rows under the wrong name are still the right rows.
+
+    Measured 2026-08-28 on a rotated free audit: a batch review came back as
+    {"findings": [{"file": "ledger.py", "findings": [...]}]} - the schema's own
+    item shape filed under the wrong top-level key. It was discarded, both
+    candidate files ended review_incomplete, and the run reported ZERO WORK with
+    the defects sitting inside the payload it threw away."""
+
+    BATCH = ff.AUDIT_BATCH_SCHEMA
+
+    def test_the_measured_payload_is_accepted_under_the_schema_name(self):
+        rows = [{"file": "ledger.py", "findings": [], "summary": "ok"}]
+        got = ff._check_structured_type({"findings": rows}, self.BATCH, "")
+        self.assertEqual({"reviews": rows}, got)
+
+    def test_a_decoy_object_is_still_refused(self):
+        """The guard this sits inside is what stops a false CLEAN."""
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type({"ok": 1}, self.BATCH, "")
+
+    def test_an_unrelated_list_is_still_refused(self):
+        for payload in ({"notes": ["a", "b"]},
+                        {"notes": [{"unrelated": 1}]},
+                        {"notes": []}):
+            with self.assertRaises(RuntimeError):
+                ff._check_structured_type(payload, self.BATCH, "")
+
+    def test_two_keys_are_ambiguous_and_still_refused(self):
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(
+                {"findings": [{"file": "a.py"}], "extra": [{"file": "b.py"}]},
+                self.BATCH, "")
+
+    def test_a_response_that_already_uses_the_right_key_is_untouched(self):
+        rows = [{"file": "a.py", "findings": [], "summary": "s"}]
+        self.assertEqual({"reviews": rows},
+                         ff._check_structured_type({"reviews": rows}, self.BATCH, ""))
+
+
 class PurposeAssessmentResilienceTests(unittest.TestCase):
     """One malformed response is not a verdict on the program.
 
@@ -15776,6 +15816,27 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         self.assertEqual(seen, [16000, 4096],
                          "expected one rejected 16000 then a clamped 4096 retry, "
                          "got " + repr(seen))
+
+    def test_a_response_with_no_choices_names_the_route_not_flexfactor(self):
+        """Several free gateways answer 200 with `choices: null`.
+
+        `resp.choices[0]` raised `TypeError: 'NoneType' object is not
+        subscriptable`, so the run's error ledger filed a ROUTE fault against
+        flexfactor.py and rotation had no route-shaped failure to move away
+        from. Observed live 2026-08-28, entry 7 of 7 in a free rotated run."""
+        for empty in (None, []):
+            class _Resp:
+                choices = empty
+                usage = None
+
+            prov = self._fake_openai_provider("test-only/no-choices",
+                                              lambda **kw: _Resp())
+            with self.assertRaises(RuntimeError) as caught:
+                prov.structured("sys", "prompt", {"type": "object"},
+                                max_tokens=1000)
+            self.assertNotIsInstance(caught.exception, TypeError)
+            self.assertIn("test-only/no-choices", str(caught.exception))
+            self.assertIn("no choices", str(caught.exception))
 
     def test_a_ceiling_below_the_usable_floor_raises_RouteCapabilityError(self):
         class _Err(Exception):

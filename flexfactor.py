@@ -2555,7 +2555,21 @@ class OpenAIProvider:
         else:  # pragma: no cover - the loop always breaks or raises
             raise RouteCapabilityError(
                 f"route '{use_model}' rejected every output budget we offered")
-        choice = resp.choices[0]
+        # A GATEWAY THAT ANSWERS WITHOUT AN ANSWER. OpenAI-compatible endpoints
+        # do not all return `choices` on every response: several free routes
+        # reply 200 with `{"choices": null}` or an empty list when they refuse
+        # or fail internally. `resp.choices[0]` then raised
+        # `TypeError: 'NoneType' object is not subscriptable`, which the run's
+        # error ledger recorded against flexfactor.py rather than against the
+        # route that produced it - a route fault filed as a tool defect, and no
+        # rotation away from the route that keeps doing it. Observed live
+        # 2026-08-28 in a free rotated run (ledger entry 7 of 7).
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise RuntimeError(
+                f"route '{use_model}' returned a response with no choices "
+                f"(choices={choices!r}); nothing was generated")
+        choice = choices[0]
         if choice.finish_reason == "length":
             # Same guard AnthropicProvider.structured has, and it raises the
             # TYPED OutputBudgetError so callers can shrink the unit of
@@ -3068,6 +3082,54 @@ def _wrap_path_map(data: dict, schema: dict):
     return {prop: wrapped}
 
 
+def _rename_single_array_key(data, schema: dict):
+    """Salvage `{"findings": [...]}` when the schema asked for `{"reviews": [...]}`.
+
+    Free routes get the SHAPE right and the top-level NAME wrong often enough to
+    end a run: measured 2026-08-28 on a rotated free audit, a batch review came
+    back as `{"findings": [{"file": "ledger.py", "findings": [...]}]}` - the
+    schema's own item shape, filed under the wrong key - and both candidate
+    files finished the run as review_incomplete with the defects already
+    identified inside the discarded payload.
+
+    Deliberately narrow, because the decoy guard this sits inside is what stops
+    a false CLEAN:
+      * the response has exactly ONE key, and its value is a non-empty list;
+      * the schema has exactly ONE required array-typed property;
+      * every item in the list is an object carrying at least one of that
+        property's own required item fields.
+    A decoy like `{"ok": 1}` fails on the first rule; an unrelated list of
+    strings or of objects with no overlapping field fails on the third. Anything
+    that does not fit falls through to the raise, unchanged.
+    """
+    if not isinstance(data, dict) or len(data) != 1:
+        return None
+    (got_key, rows), = data.items()
+    if not isinstance(rows, list) or not rows:
+        return None
+    targets = []
+    for prop, spec in (schema.get("properties") or {}).items():
+        spec = spec or {}
+        if spec.get("type") != "array" or prop not in (schema.get("required") or []):
+            continue
+        item_req = [r for r in ((spec.get("items") or {}).get("required") or [])
+                    if isinstance(r, str)]
+        if item_req:
+            targets.append((prop, item_req))
+    if len(targets) != 1:
+        return None
+    prop, item_req = targets[0]
+    if prop == got_key:
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or not any(r in row for r in item_req):
+            return None
+    print(f"  [salvage] structured output filed {len(rows)} row(s) under "
+          f"'{got_key}'; the schema's only required array is '{prop}' and every "
+          "row matches its item shape - accepted under the schema's name")
+    return {prop: rows}
+
+
 def _check_structured_type(data, schema: dict, text: str):
     """Every provider's structured() promises the caller a value shaped like
     `schema` (almost always a top-level JSON object with named keys the caller
@@ -3098,6 +3160,8 @@ def _check_structured_type(data, schema: dict, text: str):
         req = [k for k in (schema.get("required") or []) if isinstance(k, str)]
         if req and not any(k in data for k in req):
             salvaged = _wrap_path_map(data, schema)
+            if salvaged is None:
+                salvaged = _rename_single_array_key(data, schema)
             if salvaged is not None:
                 return salvaged
             raise RuntimeError(
