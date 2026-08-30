@@ -176,6 +176,23 @@ def install(module_globals: dict) -> None:
 
         # A partial run is not DONE. Preserve the final state as incomplete so
         # the dashboard cannot display a 100% review bar as production success.
+        #
+        # THE LABEL HAS TO SAY THE PROGRAM STOPPED (2026-08-30). `done=False` is
+        # right and stays - a partial run must never be counted as success - but
+        # the old wording, "review complete - repairs/verification pending",
+        # reads as WORK IN PROGRESS, and with done=False the dashboard renders it
+        # exactly like a program that is still grinding. Measured live: three of
+        # five programs (SermonSmith, IPlay, reporewards) had finished partial
+        # hours earlier - final readiness and audit report written at 22:59,
+        # 22:46 and 21:28, checkpoints untouched since - and the owner was
+        # watching the panel believing all five were still running, waiting on
+        # runs that would never move again.
+        #
+        # Trading a false "success" for a false "in progress" is not a fix; it
+        # is the same lie pointed the other way, and this one costs the owner
+        # their night. The phase now says STOPPED, so the panel distinguishes
+        # "ended without finishing" from "still working" - which is the whole
+        # question a progress display exists to answer.
         progress = module_globals.get("_PROGRESS")
         update = getattr(progress, "update", None)
         if callable(update) and not getattr(update, "_capacity_semantics", False):
@@ -183,7 +200,8 @@ def install(module_globals: dict) -> None:
                 phase = str(kwargs.get("phase") or "")
                 if kwargs.get("done") is True and phase.startswith("done - partial"):
                     kwargs["done"] = False
-                    kwargs["phase"] = "review complete - repairs/verification pending"
+                    kwargs["phase"] = ("STOPPED (incomplete) - repairs/"
+                                       "verification pending")
                 return update(index, **kwargs)
             progress_update._capacity_semantics = True
             progress.update = progress_update

@@ -295,8 +295,18 @@ class DirectedStatusSemanticsTests(unittest.TestCase):
         finally:
             cap.recommended_program_parallelism = prior
         _, row = progress.rows[-1]
+        # done stays False: a partial run must never be counted as success.
         self.assertFalse(row["done"])
-        self.assertEqual("review complete - repairs/verification pending", row["phase"])
+        # ...but the label must say the program STOPPED. The previous wording,
+        # "review complete - repairs/verification pending", reads as work in
+        # progress, and with done=False the panel renders it exactly like a
+        # program still grinding. Measured live 2026-08-29: three of five
+        # programs had finished partial hours earlier (final readiness written
+        # 21:28 / 22:46 / 22:59, checkpoints untouched since) while the owner
+        # watched the dashboard believing all five were still running.
+        self.assertEqual("STOPPED (incomplete) - repairs/verification pending",
+                         row["phase"])
+        self.assertIn("STOPPED", row["phase"])
 
 
 if __name__ == "__main__":
