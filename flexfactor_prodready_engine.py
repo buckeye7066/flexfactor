@@ -56,6 +56,33 @@ SKIP_DIRS = frozenset({
 MAX_SCAN_DEPTH = 3
 
 
+# The manifest a remediation would edit to pin a component's dependencies.
+_MANIFEST_BY_MANAGER = {
+    "npm": "package.json", "pnpm": "package.json", "yarn": "package.json",
+    "bun": "package.json", "pip": "requirements.txt", "poetry": "pyproject.toml",
+    "uv": "pyproject.toml", "pdm": "pyproject.toml", "pipenv": "Pipfile",
+    "go": "go.mod", "cargo": "Cargo.toml", "bundler": "Gemfile",
+    "composer": "composer.json", "mix": "mix.exs", "deno": "deno.json",
+    "dart": "pubspec.yaml", "flutter": "pubspec.yaml", "gradle": "build.gradle",
+    "maven": "pom.xml",
+}
+
+
+def _manifest_path(project_dir: str, tc: "Toolchain") -> str | None:
+    """Repo-relative manifest for a component, when it exists on disk.
+
+    A blocker whose remediation edits a file it cannot name is not actionable,
+    so this returns None rather than a guess: a caller must be able to trust
+    that a path it is given is a real file it can open.
+    """
+    name = _MANIFEST_BY_MANAGER.get(tc.manager)
+    if not name:
+        return None
+    root = (tc.root or ".").strip("./")
+    rel = f"{root}/{name}" if root and root != "." else name
+    return rel if os.path.isfile(os.path.join(project_dir, rel)) else None
+
+
 def _license_declared_in_manifest(project_dir: str, files) -> str | None:
     """The manifest path declaring a licence, or None.
 
@@ -778,6 +805,19 @@ class Gate:
     evidence: str = ""
     remediation: str = ""
     auto_fixable: bool = False
+    # THE FILE A REMEDIATION WOULD EDIT, repo-relative, when one is knowable.
+    #
+    # Without it a readiness blocker is unfixable BY CONSTRUCTION: the audit
+    # turns each one into a finding filed against the placeholder "(readiness)",
+    # and `_fix_files` only ever edits real paths - so no run, and no number of
+    # runs, could close it. Measured: repo-rewards carried "License declared:
+    # FAIL" across four runs, IPlay "no lockfile: python:." across twelve, and
+    # GrantFlow's persistence findings across sixteen. Every one was reported
+    # every time and fixed never.
+    #
+    # `auto_fixable` claimed these were fixable while nothing could act on them.
+    # This field is what makes that claim true.
+    path: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1165,7 +1205,8 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
                                               for t in unpinned[:5]))
         if unpinned else "lockfiles present for all components",
         remediation="Commit the lockfile so builds are reproducible.",
-        auto_fixable=True)
+        auto_fixable=True,
+        path=_manifest_path(project_dir, unpinned[0]) if unpinned else None)
 
     # --- Operational readiness --------------------------------------------- #
     has_ci = any(any(p.lower() in f for p in _CI_PATHS) for f in lower)
@@ -1215,7 +1256,10 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         remediation="Add a LICENSE file, or declare the licence in the package "
                     "manifest (npm's `\"license\": \"UNLICENSED\"` is the correct "
                     "declaration for a private, proprietary package).",
-        auto_fixable=True)
+        auto_fixable=True,
+        path=next((f for f in files
+                   if f.lower() in ("package.json", "pyproject.toml",
+                                    "cargo.toml", "composer.json")), None))
 
     # A service is something that serves traffic; a library legitimately has no
     # container or health endpoint, so this is "na" rather than a failure.

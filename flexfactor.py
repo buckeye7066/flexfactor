@@ -8821,6 +8821,13 @@ MAX_PURPOSE_GAP_FIXES = 3
 # IS the job ("bridge the gap between where it is and that purpose").
 MAX_PURPOSE_GAP_FIXES_AUTHORED = 12
 
+# Readiness blockers that name a real file get ONE bounded remediation pass at
+# the end of a run. Bounded because this runs after the cycle loop, with the
+# budget already largely spent: the point is to close the mechanical blockers
+# that no amount of semantic review will ever reach (an unpinned manifest, an
+# undeclared licence), not to open a second unbounded fix phase.
+MAX_READINESS_FIXES = 6
+
 PURPOSE_GAP_SYSTEM = (
     "You are a product-minded principal engineer. From the program's own metadata "
     "(README, package description, file tree) infer the PURPOSE this program was "
@@ -16656,14 +16663,73 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if readiness and readiness.get("blockers"):
                 # Surface each blocker as a real finding so it flows into the audit
                 # report and the exit status, instead of living only in a side file.
+                #
+                # A BLOCKER FILED AGAINST "(readiness)" IS UNFIXABLE BY
+                # CONSTRUCTION. `_fix_files` only ever edits real paths, and this
+                # append happens AFTER the cycle loop, so a blocker could not be
+                # acted on in this run and - filed against a placeholder - not in
+                # any future run either. Measured: repo-rewards carried "License
+                # declared: FAIL" across four runs, IPlay "no lockfile: python:."
+                # across twelve, GrantFlow's persistence findings across sixteen.
+                # Reported every time, fixed never, while the gate advertised
+                # auto_fixable=True. A tool whose readiness verdict can never be
+                # closed cannot make a program production ready, which is the
+                # whole job.
+                #
+                # Gates that can name the file a remediation would edit now carry
+                # it, so the finding is filed against THAT file and one bounded
+                # remediation pass runs below.
+                _readiness_fixable: dict[str, list[dict]] = {}
                 for b in readiness["blockers"]:
-                    all_findings.append({
-                        "file": "(readiness)", "line": 0,
+                    _bpath = str(b.get("path") or "").replace("\\", "/").strip()
+                    _finding = {
+                        "file": _bpath or "(readiness)", "line": 0,
                         "severity": b.get("severity", "high"), "category": "production-readiness",
                         "title": b.get("title", "readiness gate failed"),
                         "problem": b.get("evidence", ""),
                         "fix": b.get("remediation", ""),
-                    })
+                    }
+                    all_findings.append(_finding)
+                    if _bpath and _contained_existence(project_dir, _bpath) == "file":
+                        _readiness_fixable.setdefault(_bpath, []).append(_finding)
+
+                # ONE bounded remediation pass, through the SAME machinery as any
+                # other fix: build gate, adversarial verification, budget cap. A
+                # readiness fix gets no privileges - if it cannot pass the gates
+                # it is rolled back like anything else.
+                if (_readiness_fixable and git and not dirty_abort
+                        and not infrastructure_abort and not meter.over_limit()):
+                    _capped = dict(list(_readiness_fixable.items())[:MAX_READINESS_FIXES])
+                    print(f"{pfx}readiness remediation: attempting "
+                          f"{len(_capped)} blocker(s) with a resolvable file "
+                          f"({', '.join(_capped)})")
+                    report(phase="readiness remediation")
+                    try:
+                        _rf_applied, _rf_unverified, _rf_notes = _fix_files(
+                            author, cross, project_dir, _capped, stack, baseline_ok,
+                            args, meter=meter, oversized=oversized, report=report,
+                            done_set=set(), total_overall=max(1, len(_capped)),
+                            commit_cb=None,
+                            adversarial=getattr(args, "adversarial", True),
+                            adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+                            materiality=getattr(args, "adversarial_materiality", "material"))
+                        fix_notes.extend(_rf_notes)
+                        applied_files.extend(
+                            f for f in _rf_applied if f not in applied_files)
+                        if _rf_applied:
+                            # The verdict above was measured BEFORE these edits,
+                            # so re-assess rather than report a stale one. This is
+                            # the same "a result about a tree that no longer
+                            # exists" defect as the rolled-back unit tests.
+                            print(f"{pfx}readiness remediation applied "
+                                  f"{len(_rf_applied)} fix(es); re-assessing")
+                            readiness = _assess_readiness_phase(
+                                project_dir, stack, display_name,
+                                build_ok=final_build, tests_ok=tests_ok,
+                                bootstrap=bootstrap_results, pfx=pfx)
+                    except (BudgetExceededError, DirtyTreeError) as _rex:
+                        fix_notes.append("readiness remediation aborted: "
+                                         f"{type(_rex).__name__}: {_rex}")
 
         # Dynamic-coverage failures can be discovered after the static review
         # loop said "converged". They are part of completion, so they must revoke

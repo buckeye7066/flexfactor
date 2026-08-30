@@ -10495,6 +10495,54 @@ class CheckpointFinalizationIsNotSilentTests(unittest.TestCase):
                       "the message must name the consequence, not just the error")
 
 
+class ReadinessRemediationIsWiredTests(unittest.TestCase):
+    """Readiness blockers must reach the fix loop, not just the report.
+
+    They were appended AFTER the cycle loop and filed against "(readiness)", so
+    they were unfixable in that run and, having no real path, in every future
+    run too. Source-level guards, in the same style as
+    test_every_capture_call_site_pins_an_encoding: the call site is inside a
+    3,000-line function and cannot be driven in isolation."""
+
+    def _block(self):
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        i = src.find('"category": "production-readiness"')
+        self.assertGreater(i, 0, "readiness findings block not found")
+        return src, src[max(0, i - 2500):i + 3500]
+
+    def test_a_blocker_is_filed_against_its_own_file_when_it_has_one(self):
+        _src, block = self._block()
+        self.assertIn('_bpath = str(b.get("path")', block,
+                      "the blocker's own path is ignored")
+        self.assertIn('"file": _bpath or "(readiness)"', block,
+                      "the finding is still hard-filed against the placeholder")
+
+    def test_the_remediation_pass_actually_calls_the_fix_loop(self):
+        _src, block = self._block()
+        self.assertIn("_fix_files(", block,
+                      "readiness blockers still never reach the fix loop")
+        self.assertIn("MAX_READINESS_FIXES", block, "the pass is unbounded")
+
+    def test_the_remediation_pass_respects_the_existing_gates(self):
+        _src, block = self._block()
+        for guard in ("not dirty_abort", "not infrastructure_abort",
+                      "meter.over_limit()", "adversarial="):
+            self.assertIn(guard, block, f"readiness fixes bypass {guard}")
+
+    def test_only_a_real_file_is_handed_to_the_fix_loop(self):
+        _src, block = self._block()
+        self.assertIn('_contained_existence(project_dir, _bpath) == "file"', block,
+                      "a non-existent path could be handed to the fix loop")
+
+    def test_the_verdict_is_re_assessed_after_a_fix_lands(self):
+        # Otherwise the report carries a verdict measured before the edits -
+        # the same "result about a tree that no longer exists" defect as the
+        # rolled-back generated tests.
+        _src, block = self._block()
+        self.assertIn("re-assessing", block)
+        self.assertIn("readiness = _assess_readiness_phase(", block)
+
+
 class TrustedRepoBuildNetworkTests(unittest.TestCase):
     """FlexFactor blackholed its OWN build's network, then blamed the repo.
 

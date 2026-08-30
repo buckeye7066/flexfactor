@@ -434,6 +434,67 @@ class ForeignPlatformDoesNotVetoVerificationTests(unittest.TestCase):
             self.assertTrue(E._host_can_build(self._tc(eco, ".", False)), eco)
 
 
+class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
+    """A blocker that cannot name a file is unfixable BY CONSTRUCTION.
+
+    The audit turns each readiness blocker into a finding, and `_fix_files`
+    only ever edits real paths - so a blocker filed against the placeholder
+    "(readiness)" could never be acted on, in that run or any future one, while
+    the gate advertised `auto_fixable=True`.
+
+    Measured across the live runs: repo-rewards carried "License declared: FAIL"
+    for four runs, IPlay "no lockfile: python:." for twelve, GrantFlow's
+    persistence findings for sixteen. Reported every time; fixed never. A tool
+    whose readiness verdict can never be closed cannot make a program
+    production ready, which is the whole job."""
+
+    def _gates(self, files):
+        with _RepoFixture(files) as root:
+            chains = pr.detect_toolchains(root)
+            return {g.id: g for g in pr.assess_readiness(root, chains, _fake_run())}
+
+    def test_an_unpinned_python_component_names_its_requirements_file(self):
+        g = self._gates({"requirements.txt": "requests>=2,<3\n"})["deps_pinned"]
+        self.assertEqual(g.status, "fail")
+        self.assertEqual(g.path, "requirements.txt")
+
+    def test_an_unpinned_node_component_names_its_package_json(self):
+        g = self._gates({"package.json": '{"name":"x","dependencies":{"a":"^1"}}'})["deps_pinned"]
+        self.assertEqual(g.status, "fail")
+        self.assertEqual(g.path, "package.json")
+
+    def test_an_undeclared_licence_names_the_manifest_to_edit(self):
+        g = self._gates({"package.json": '{"name":"x"}'})["license_present"]
+        self.assertEqual(g.status, "fail")
+        self.assertEqual(g.path, "package.json")
+
+    def test_a_passing_gate_carries_no_path(self):
+        # Nothing to remediate, so nothing to point at - a path here would send
+        # the fix loop at a file with no defect.
+        g = self._gates({"package.json": '{"name":"x"}',
+                         "package-lock.json": '{"lockfileVersion":3}'})["deps_pinned"]
+        self.assertEqual(g.status, "pass")
+        self.assertIsNone(g.path)
+
+    def test_a_path_is_never_a_guess(self):
+        # _manifest_path returns None rather than a plausible-looking path that
+        # does not exist: a caller must be able to open what it is handed.
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({"requirements.txt": "a==1\n"}) as root:
+            tc = pr.Toolchain(ecosystem="python", root="services/api", manager="pip",
+                              marker="requirements.txt")
+            self.assertIsNone(E._manifest_path(root, tc))   # that subdir has none
+            tc2 = pr.Toolchain(ecosystem="python", root=".", manager="pip",
+                               marker="requirements.txt")
+            self.assertEqual(E._manifest_path(root, tc2), "requirements.txt")
+
+    def test_an_unknown_manager_yields_no_path(self):
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({"Makefile": "all:\n"}) as root:
+            tc = pr.Toolchain(ecosystem="make", root=".", manager="make", marker="Makefile")
+            self.assertIsNone(E._manifest_path(root, tc))
+
+
 class LicenceDeclarationGateTests(unittest.TestCase):
     """"License declared" asked a question it would not accept the real answer to.
 
