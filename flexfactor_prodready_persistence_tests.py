@@ -247,5 +247,73 @@ class PersistenceReadinessGateTests(unittest.TestCase):
         self.assertEqual(g["schema_bootstrap_covers_extras"].status, "na")
 
 
+class LicenceDeclarationGateTests(unittest.TestCase):
+    """"License declared" asked a question it would not accept the real answer to.
+
+    The gate accepted only a LICENSE/COPYING FILE, so a PRIVATE, proprietary
+    package failed it forever: npm's own declaration for that case is
+    `"license": "UNLICENSED"` in package.json, there is no file to add, and
+    adding an OSS one would be actively wrong.
+
+    Measured on repo-rewards 2026-08-29: `private: true`, licence declared
+    UNLICENSED, gate still FAIL - a finding that can never be closed, which is
+    how a rubric teaches its reader to ignore it."""
+
+    BASE = {"package.json": '{"name":"x","version":"1.0.0"}'}
+
+    def _gate(self, files):
+        with _RepoFixture(files) as root:
+            chains = pr.detect_toolchains(root)
+            return {g.id: g for g in
+                    pr.assess_readiness(root, chains, _fake_run())}["license_present"]
+
+    def test_a_private_package_declaring_UNLICENSED_passes(self):
+        g = self._gate({"package.json":
+                        '{"name":"x","private":true,"license":"UNLICENSED"}'})
+        self.assertEqual(g.status, "pass")
+        self.assertIn("package.json", g.evidence)
+
+    def test_an_spdx_licence_in_the_manifest_passes(self):
+        self.assertEqual(
+            self._gate({"package.json": '{"name":"x","license":"MIT"}'}).status, "pass")
+
+    def test_a_LICENSE_file_still_passes_and_is_still_what_evidence_says(self):
+        g = self._gate({**self.BASE, "LICENSE": "MIT License\n"})
+        self.assertEqual(g.status, "pass")
+        self.assertIn("license file present", g.evidence)
+
+    def test_no_file_and_no_manifest_field_still_FAILS(self):
+        # The gate must keep its teeth: this is the case it exists for.
+        g = self._gate(self.BASE)
+        self.assertEqual(g.status, "fail")
+        self.assertIn("no license file", g.evidence)
+
+    def test_an_empty_licence_field_is_not_a_declaration(self):
+        self.assertEqual(
+            self._gate({"package.json": '{"name":"x","license":""}'}).status, "fail")
+
+    def test_a_malformed_manifest_declares_nothing(self):
+        # Must not raise, and must not pass on unparseable input.
+        self.assertEqual(
+            self._gate({"package.json": '{ broken'}).status, "fail")
+
+    def test_a_cargo_manifest_licence_passes(self):
+        g = self._gate({"Cargo.toml": '[package]\nname = "x"\nlicense = "Apache-2.0"\n'})
+        self.assertEqual(g.status, "pass")
+
+    def test_a_licence_in_a_NESTED_manifest_does_not_count(self):
+        # A dependency's or subpackage's manifest is not this project declaring
+        # its own licence.
+        g = self._gate({**self.BASE,
+                        "packages/inner/package.json": '{"name":"i","license":"MIT"}'})
+        self.assertEqual(g.status, "fail")
+
+    def test_the_gate_stays_low_severity_and_non_blocking(self):
+        # It reports; it must never block a release on its own.
+        g = self._gate(self.BASE)
+        self.assertEqual(g.severity, "low")
+        self.assertFalse(pr.is_blocking(g))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

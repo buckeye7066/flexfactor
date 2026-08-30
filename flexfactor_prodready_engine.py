@@ -54,6 +54,43 @@ SKIP_DIRS = frozenset({
 MAX_SCAN_DEPTH = 3
 
 
+def _license_declared_in_manifest(project_dir: str, files) -> str | None:
+    """The manifest path declaring a licence, or None.
+
+    Deliberately narrow: only the ecosystem's OWN package manifest counts, only
+    a non-empty scalar value, and the file must be one this project actually
+    tracks. A licence mentioned in a README or a dependency's manifest is not
+    this project declaring its own licence.
+    """
+    wanted = ("package.json", "pyproject.toml", "cargo.toml", "composer.json")
+    for rel in files:
+        base = rel.lower().split("/")[-1]
+        if base not in wanted and not base.endswith(".gemspec"):
+            continue
+        # Only the project's own manifest, never one nested in a subpackage we
+        # happen to have walked.
+        if rel.strip("./").count("/") > 0:
+            continue
+        text = _read_text(os.path.join(project_dir, rel))
+        if not text:
+            continue
+        if base.endswith(".json"):
+            try:
+                value = (json.loads(text) or {}).get("license")
+            except Exception:            # a malformed manifest declares nothing
+                continue
+            # npm also allows the deprecated {"type": ..., "url": ...} form.
+            if isinstance(value, dict):
+                value = value.get("type")
+            if isinstance(value, str) and value.strip():
+                return rel
+        else:
+            # TOML / gemspec: a bare `license = "MIT"` or `spec.license = "MIT"`.
+            if re.search(r"""(?m)^\s*(?:spec\.)?license\s*[:=]\s*['"][^'"]+['"]""", text):
+                return rel
+    return None
+
+
 def _read_text(path: str, limit: int = MAX_CONFIG_BYTES) -> str:
     """Read a config file defensively. Returns "" for anything unreadable.
 
@@ -908,13 +945,36 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         remediation="Document prerequisites, install, configure, run, and test.",
         auto_fixable=True)
 
-    has_license = any(f.lower().split("/")[-1].startswith(("license", "licence",
-                                                           "copying"))
-                      for f in files)
+    # A LICENCE FILE IS ONE OF TWO STANDARD DECLARATIONS, NOT THE ONLY ONE.
+    #
+    # This gate asks "is the licence declared?" and used to accept only a
+    # LICENSE/COPYING file, so it reported "no license file" for every package
+    # that declares its licence in the ecosystem's OWN manifest - which for a
+    # PRIVATE, proprietary package is the only correct answer available. npm's
+    # own convention for that case is `"license": "UNLICENSED"` in package.json;
+    # there is no file to add, and adding an OSS one would be actively wrong
+    # (measured on repo-rewards 2026-08-29: `private: true`, licence declared
+    # UNLICENSED, gate still FAIL -> a defect that can never be closed, which is
+    # how a rubric trains its reader to ignore it).
+    #
+    # A manifest declaration therefore counts. `license-file` (Cargo) still
+    # points at a file and is covered by the file check above.
+    has_license_file = any(f.lower().split("/")[-1].startswith(("license", "licence",
+                                                                "copying"))
+                           for f in files)
+    declared_in = None
+    if not has_license_file:
+        declared_in = _license_declared_in_manifest(project_dir, files)
+    has_license = has_license_file or bool(declared_in)
     add(id="license_present", title="License declared", status="pass" if has_license
         else "fail", severity="low",
-        evidence="license file present" if has_license else "no license file",
-        remediation="Add a LICENSE file.", auto_fixable=True)
+        evidence=("license file present" if has_license_file else
+                  f"licence declared in {declared_in}" if declared_in else
+                  "no license file and no licence field in the package manifest"),
+        remediation="Add a LICENSE file, or declare the licence in the package "
+                    "manifest (npm's `\"license\": \"UNLICENSED\"` is the correct "
+                    "declaration for a private, proprietary package).",
+        auto_fixable=True)
 
     # A service is something that serves traffic; a library legitimately has no
     # container or health endpoint, so this is "na" rather than a failure.
