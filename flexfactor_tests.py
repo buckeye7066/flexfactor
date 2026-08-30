@@ -10251,6 +10251,56 @@ class RolledBackGeneratedTestsDoNotFailTheRepoTests(unittest.TestCase):
         self.assertIn("Generated unit tests fail against current code", src)
 
 
+class SuiteExecutionEvidenceTests(unittest.TestCase):
+    """A green suite must not read as "no tests collected".
+
+    The check wanted a NUMBER next to a word - a pytest/vitest shape. Several
+    ecosystems never print one on success, so quality_gates revoked convergence
+    on a PASSING repository. Found in review of the rolled-back-test fix, which
+    made the path far more reachable: after a rollback `test_status` is None, so
+    the generated-files clause cannot carry the evidence either and everything
+    rests on parsing the suite's own output."""
+
+    def test_go_pass_lines_count(self):
+        # `ok <pkg> <time>` carries no number anywhere.
+        self.assertTrue(ff._suite_reported_tests(
+            "ok  \tgithub.com/x/pkg\t0.003s\nok  \tgithub.com/x/api\t0.010s"))
+
+    def test_go_no_test_files_does_NOT_count(self):
+        # The distinction was always in the output: this line starts with `?`.
+        self.assertFalse(ff._suite_reported_tests(
+            "?   \tgithub.com/x/pkg\t[no test files]"))
+
+    def test_dotnet_and_maven_number_after_the_word_count(self):
+        self.assertTrue(ff._suite_reported_tests(
+            "Passed!  - Failed:     0, Passed:    12, Skipped:     0"))
+        self.assertTrue(ff._suite_reported_tests(
+            "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0"))
+
+    def test_the_original_shapes_still_count(self):
+        for log in (" Test Files  19 passed (20)\n      Tests  108 passed",
+                    "collected 113 items\n113 passed in 4.2s",
+                    "test result: ok. 12 passed; 0 failed",
+                    "8 examples, 0 failures"):
+            self.assertTrue(ff._suite_reported_tests(log), log)
+
+    def test_zero_counts_never_count(self):
+        # Every numeric clause requires [1-9] first, so an empty run cannot
+        # masquerade as executed tests.
+        self.assertFalse(ff._suite_reported_tests("Tests run: 0, Failures: 0"))
+        self.assertFalse(ff._suite_reported_tests("0 passed"))
+
+    def test_unrelated_output_does_not_count(self):
+        self.assertFalse(ff._suite_reported_tests("Build succeeded."))
+        self.assertFalse(ff._suite_reported_tests(""))
+        self.assertFalse(ff._suite_reported_tests(None))
+
+    def test_the_call_site_uses_the_helper(self):
+        # written-but-not-wired guard; this codebase has hit it four times.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_suite_reported_tests(suite_log)", src)
+
+
 class TrustedRepoBuildNetworkTests(unittest.TestCase):
     """FlexFactor blackholed its OWN build's network, then blamed the repo.
 

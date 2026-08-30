@@ -63,6 +63,7 @@ def _license_declared_in_manifest(project_dir: str, files) -> str | None:
     this project declaring its own licence.
     """
     wanted = ("package.json", "pyproject.toml", "cargo.toml", "composer.json")
+    tracked = {f.lower().lstrip("./") for f in files}
     for rel in files:
         base = rel.lower().split("/")[-1]
         if base not in wanted and not base.endswith(".gemspec"):
@@ -79,16 +80,68 @@ def _license_declared_in_manifest(project_dir: str, files) -> str | None:
                 value = (json.loads(text) or {}).get("license")
             except Exception:            # a malformed manifest declares nothing
                 continue
-            # npm also allows the deprecated {"type": ..., "url": ...} form.
+            # npm also allows the deprecated {"type": ..., "url": ...} form,
+            # and Composer's multi-licence form is a LIST of SPDX ids
+            # ("license": ["MIT", "GPL-3.0-or-later"]) - rejecting the list
+            # reproduced the exact "no licence field" this function removes.
             if isinstance(value, dict):
                 value = value.get("type")
+            if isinstance(value, list):
+                value = next((v for v in value
+                              if isinstance(v, str) and v.strip()), None)
             if isinstance(value, str) and value.strip():
                 return rel
+        elif base.endswith(".gemspec"):
+            if re.search(r"""(?m)^\s*\w+\.license\s*=\s*['"][^'"]+['"]""", text):
+                return rel
         else:
-            # TOML / gemspec: a bare `license = "MIT"` or `spec.license = "MIT"`.
-            if re.search(r"""(?m)^\s*(?:spec\.)?license\s*[:=]\s*['"][^'"]+['"]""", text):
+            # TOML: the key MUST belong to the table that describes the
+            # distributable package. An unscoped search matched
+            # `[tool.foo] license = "MIT"` or `[package.metadata.x]` and passed
+            # a project whose own package declares nothing.
+            if _toml_package_license(text):
+                return rel
+            # Cargo's `license-file` names a file by PATH, and that filename is
+            # routinely not license-shaped (EULA.txt), so the basename check in
+            # the gate cannot see it. Honour it only when the named file is
+            # actually tracked.
+            path = _toml_package_license_file(text)
+            if path and path.lower().lstrip("./") in tracked:
                 return rel
     return None
+
+
+_TOML_PACKAGE_TABLES = ("package", "project", "tool.poetry")
+
+
+def _toml_scalar_in_package_table(text: str, key: str) -> str | None:
+    """Value of `key` declared directly under a package-describing TOML table.
+
+    A hand-rolled section scan rather than a TOML parse: this module is
+    stdlib-only and must not fail closed on a manifest that a strict parser
+    would reject for reasons unrelated to the licence.
+    """
+    section = ""
+    pattern = re.compile(r"""^\s*%s\s*=\s*['"]([^'"]+)['"]""" % re.escape(key))
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped.strip("[]").strip().strip('"').lower()
+            continue
+        if section not in _TOML_PACKAGE_TABLES:
+            continue
+        m = pattern.match(line)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def _toml_package_license(text: str) -> str | None:
+    return _toml_scalar_in_package_table(text, "license")
+
+
+def _toml_package_license_file(text: str) -> str | None:
+    return _toml_scalar_in_package_table(text, "license-file")
 
 
 def _read_text(path: str, limit: int = MAX_CONFIG_BYTES) -> str:

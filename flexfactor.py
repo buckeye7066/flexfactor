@@ -8587,6 +8587,40 @@ TEST_GEN_SCHEMA = {
 }
 
 
+_SUITE_EXECUTION_EVIDENCE = re.compile(
+    r"(?im)(?:collected\s+[1-9]\d*"           # pytest
+    r"|[1-9]\d*\s+(?:tests?|passed|examples?)"  # vitest/jest/cargo/rspec
+    r"|test files\s+[1-9]\d*"                 # vitest summary
+    r"|^ok\s+\S+"                             # go: one line per package that ran
+    r"|passed:\s*[1-9]\d*"                    # dotnet
+    r"|tests run:\s*[1-9]\d*)"                # maven/surefire
+)
+
+
+def _suite_reported_tests(suite_log: str) -> bool:
+    """Did the project's suite actually EXECUTE tests, per its own output?
+
+    The original check wanted a NUMBER next to a word, which is a
+    pytest/vitest shape. Several ecosystems never print one on success, so a
+    green suite read as "nothing was collected" and quality_gates revoked
+    convergence on a passing repository:
+
+        go      `ok  example/pkg 0.003s`      - no count at all
+        dotnet  `Passed:    12`               - number AFTER the word
+        maven   `Tests run: 12, Failures: 0`  - number AFTER the word
+
+    That became reachable far more often once a generated-test rollback started
+    forcing a genuine re-run, because `test_status` is None on that path so the
+    generated-files clause cannot carry the evidence either.
+
+    Go's empty case is `?  example/pkg [no test files]`, which starts with `?`
+    and cannot match the `^ok ` clause - the distinction is already in the
+    output, it just was not being read. Zero counts never match, by
+    construction: every numeric clause requires [1-9] first.
+    """
+    return bool(_SUITE_EXECUTION_EVIDENCE.search(suite_log or ""))
+
+
 def _reuse_unit_test_result(suite_cmd, test_cmd, test_status) -> bool:
     """May the full-suite gate QUOTE the unit-test run instead of re-running it?
 
@@ -16754,11 +16788,24 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     final_index, changed_paths)
                 blast_evidence = evidence_mod.dependency_blast_radius(
                     final_index, changed_paths)
+                # WHAT COUNTS AS "TESTS ACTUALLY RAN".
+                #
+                # This was a pytest/vitest-shaped heuristic: it wanted a NUMBER
+                # next to a word. Several ecosystems never print one on success,
+                # so a green suite read as "nothing was collected" and
+                # quality_gates revoked convergence on a passing repository.
+                # That became reachable far more often once a generated-test
+                # rollback started forcing a genuine re-run (test_status is None
+                # there, so the first clause cannot carry it either):
+                #   go      `ok  example/pkg 0.003s`     - no count at all
+                #   dotnet  `Passed:    12`              - number AFTER the word
+                #   maven   `Tests run: 12, Failures: 0` - number AFTER the word
+                # Go's empty case is `?  example/pkg [no test files]`, which
+                # starts with `?` and so cannot match the `^ok ` clause - the
+                # distinction the gate needs is already in the output.
                 tests_collected = bool(
                     (test_status is not None and test_files)
-                    or (suite_status is True and re.search(
-                        r"(?i)(?:collected\s+[1-9]\d*|[1-9]\d*\s+(?:tests?|passed)|"
-                        r"test files\s+[1-9]\d*)", suite_log or "")))
+                    or (suite_status is True and _suite_reported_tests(suite_log)))
                 coverage_evidence = evidence_mod.coverage_ledger(
                     final_index, run_id=evidence_run_id,
                     test_command=stack.get("full_suite_cmd") or stack.get("test_cmd"),
