@@ -16680,18 +16680,29 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # it, so the finding is filed against THAT file and one bounded
                 # remediation pass runs below.
                 _readiness_fixable: dict[str, list[dict]] = {}
+                _readiness_findings: list[dict] = []
                 for b in readiness["blockers"]:
-                    _bpath = str(b.get("path") or "").replace("\\", "/").strip()
-                    _finding = {
-                        "file": _bpath or "(readiness)", "line": 0,
-                        "severity": b.get("severity", "high"), "category": "production-readiness",
-                        "title": b.get("title", "readiness gate failed"),
-                        "problem": b.get("evidence", ""),
-                        "fix": b.get("remediation", ""),
-                    }
-                    all_findings.append(_finding)
-                    if _bpath and _contained_existence(project_dir, _bpath) == "file":
-                        _readiness_fixable.setdefault(_bpath, []).append(_finding)
+                    # EVERY unpinned component, not just the first: a monorepo
+                    # can have several, and pointing at one leaves the gate red
+                    # for the rest (caught in review).
+                    _bpaths = [str(p).replace("\\", "/").strip()
+                               for p in (b.get("paths") or []) if str(p).strip()]
+                    _bpaths = [p for p in _bpaths
+                               if _contained_existence(project_dir, p) == "file"]
+                    for _target in (_bpaths or ["(readiness)"]):
+                        _finding = {
+                            "file": _target, "line": 0,
+                            "severity": b.get("severity", "high"),
+                            "category": "production-readiness",
+                            "title": b.get("title", "readiness gate failed"),
+                            "problem": b.get("evidence", ""),
+                            "fix": b.get("remediation", ""),
+                            "_gate_id": b.get("id", ""),
+                        }
+                        all_findings.append(_finding)
+                        _readiness_findings.append(_finding)
+                        if _target != "(readiness)":
+                            _readiness_fixable.setdefault(_target, []).append(_finding)
 
                 # ONE bounded remediation pass, through the SAME machinery as any
                 # other fix: build gate, adversarial verification, budget cap. A
@@ -16717,17 +16728,57 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         applied_files.extend(
                             f for f in _rf_applied if f not in applied_files)
                         if _rf_applied:
+                            # COMMIT IT. `commit_cb=None` above means _fix_files
+                            # does not commit, and this phase runs AFTER the
+                            # cycle loop's commits - so without this the repaired
+                            # manifest sat uncommitted for the next run's
+                            # autoclean to sweep into an unrelated commit
+                            # (caught in review). It goes through
+                            # _commit_and_sync like any other work, so the
+                            # publication gate still decides whether it ships.
+                            print(f"{pfx}readiness remediation applied "
+                                  f"{len(_rf_applied)} fix(es); re-assessing")
+                            if git:
+                                print(f"{pfx}git: " + _commit_and_sync(
+                                    project_dir, branch, prev_branch, args,
+                                    "readiness remediation", stack))
                             # The verdict above was measured BEFORE these edits,
                             # so re-assess rather than report a stale one. This is
                             # the same "a result about a tree that no longer
                             # exists" defect as the rolled-back unit tests.
-                            print(f"{pfx}readiness remediation applied "
-                                  f"{len(_rf_applied)} fix(es); re-assessing")
                             readiness = _assess_readiness_phase(
                                 project_dir, stack, display_name,
                                 build_ok=final_build, tests_ok=tests_ok,
                                 bootstrap=bootstrap_results, pfx=pfx)
-                    except (BudgetExceededError, DirtyTreeError) as _rex:
+                            # ...and RETRACT the findings the re-assessment
+                            # cleared. Leaving them would keep a closed blocker
+                            # in the report, the exit status and the evidence
+                            # bundle - the stale-verdict defect again, pointed
+                            # the other way.
+                            _still_red = {str(b.get("id") or "")
+                                          for b in (readiness or {}).get("blockers", [])}
+                            _closed = [f for f in _readiness_findings
+                                       if f.get("_gate_id")
+                                       and f["_gate_id"] not in _still_red]
+                            for _f in _closed:
+                                with contextlib.suppress(ValueError):
+                                    all_findings.remove(_f)
+                            if _closed:
+                                print(f"{pfx}readiness: {len(_closed)} blocker "
+                                      "finding(s) closed by the remediation")
+                    except DirtyTreeError as _rex:
+                        # FAIL CLOSED. DirtyTreeError means a candidate was
+                        # WRITTEN and its rollback was REFUSED, so an unverified
+                        # change is on disk. Merely noting that and carrying on
+                        # would let the run commit and publish it (caught in
+                        # review). Same handling the cycle loop gives it.
+                        dirty_abort = True
+                        manual_review.add("(readiness remediation)")
+                        fix_notes.append(
+                            "readiness remediation left an UNVERIFIED change on "
+                            f"disk and its rollback was refused: {_rex}")
+                        print(f"{pfx}[dirty-abort] readiness remediation: {_rex}")
+                    except BudgetExceededError as _rex:
                         fix_notes.append("readiness remediation aborted: "
                                          f"{type(_rex).__name__}: {_rex}")
 
