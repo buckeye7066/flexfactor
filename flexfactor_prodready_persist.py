@@ -316,6 +316,28 @@ def _schema_bootstrap_holes(project_dir: str, files: list[str]
     return "pass", []
 
 
+def _paths_from_hits(project_dir: str, hits: list[str]) -> list[str]:
+    """Repo-relative files named by a gate's own hit strings.
+
+    These gates already know exactly which file is wrong - `_scan_entity_stubs`
+    emits "<rel> (<why>)" and the counter scan emits a bare "<rel>" - but that
+    knowledge died in a prose evidence string, so the blocker reached the audit
+    with no file and could never be handed to the fix loop.
+
+    Never a guess: a candidate is kept only when it exists on disk, because a
+    caller must be able to open what it is handed.
+    """
+    out: list[str] = []
+    for hit in hits or []:
+        # "<rel> (<why>)" -> "<rel>"; a bare "<rel>" is unchanged.
+        cand = str(hit).split(" (", 1)[0].strip().replace("\\", "/")
+        if not cand or cand in out:
+            continue
+        if os.path.isfile(os.path.join(project_dir, cand)):
+            out.append(cand)
+    return out
+
+
 def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
     """Append the five high persistence gates onto assess_readiness via add()."""
     counter_hits = _scan_client_unique_counters(project_dir, files)
@@ -327,7 +349,8 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
         if counter_hits else "no frontend unique-counter increment",
         remediation="Mint invoice/order/ticket numbers with an atomic server/DB "
                     "counter (ON CONFLICT / RETURNING). Do not increment "
-                    "last_invoice_number / lastNumber+1 in the browser.")
+                    "last_invoice_number / lastNumber+1 in the browser.",
+        paths=_paths_from_hits(project_dir, counter_hits))
 
     js_layer = any(_is_js_ts_product(f) for f in files)
     stub_hits = _scan_entity_stubs(project_dir, files) if js_layer else []
@@ -341,7 +364,8 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
             else "no createStubEntityClient / populated KNOWN_STUB_ENTITIES"),
         remediation="Replace createStubEntityClient / KNOWN_STUB_ENTITIES with "
                     "a real persist path. A named user-facing entity that only "
-                    "lives in a Map (toast-then-vanish) is not production-ready.")
+                    "lives in a Map (toast-then-vanish) is not production-ready.",
+        paths=_paths_from_hits(project_dir, stub_hits))
 
     overlay_hits = _root_factory_overlays(files)
     add(id="no_factory_overlay",
@@ -386,4 +410,12 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
                     "workspacePersistenceTables / ensureSqliteSchema / "
                     "applyWorkspace) AND ship the Postgres twin when "
                     "backend/db/postgres/migrations exists. A hidden "
-                    "`npm run migrate` must not be required to create them.")
+                    "`npm run migrate` must not be required to create them.",
+        # The file a remediation EDITS is the fresh-DB schema, not the migration
+        # its evidence quotes: the hole is that schema.sql does not create the
+        # table, and the migration is already correct. Pointing the fix loop at
+        # the migration would ask it to repair a file that is not broken.
+        paths=([schema] if schema_status == "fail" and
+               (schema := next((p for p in _SCHEMA_CANDIDATES
+                                if os.path.isfile(os.path.join(project_dir, *p.split("/")))),
+                               None)) else []))

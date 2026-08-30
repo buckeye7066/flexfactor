@@ -10512,10 +10512,11 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
 
     def test_a_blocker_is_filed_against_its_own_file_when_it_has_one(self):
         _src, block = self._block()
-        self.assertIn('_bpath = str(b.get("path")', block,
-                      "the blocker's own path is ignored")
-        self.assertIn('"file": _bpath or "(readiness)"', block,
+        self.assertIn('b.get("paths")', block,
+                      "the blocker's own paths are ignored")
+        self.assertIn('for _target in (_bpaths or ["(readiness)"])', block,
                       "the finding is still hard-filed against the placeholder")
+        self.assertIn('"file": _target', block)
 
     def test_the_remediation_pass_actually_calls_the_fix_loop(self):
         _src, block = self._block()
@@ -10531,7 +10532,7 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
 
     def test_only_a_real_file_is_handed_to_the_fix_loop(self):
         _src, block = self._block()
-        self.assertIn('_contained_existence(project_dir, _bpath) == "file"', block,
+        self.assertIn('_contained_existence(project_dir, p) == "file"', block,
                       "a non-existent path could be handed to the fix loop")
 
     def test_the_verdict_is_re_assessed_after_a_fix_lands(self):

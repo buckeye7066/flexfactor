@@ -454,19 +454,24 @@ class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
             return {g.id: g for g in pr.assess_readiness(root, chains, _fake_run())}
 
     def test_an_unpinned_python_component_names_its_requirements_file(self):
+        # pip's pinning IS the file, so editing it is a remedy a fix loop can
+        # actually perform.
         g = self._gates({"requirements.txt": "requests>=2,<3\n"})["deps_pinned"]
         self.assertEqual(g.status, "fail")
-        self.assertEqual(g.path, "requirements.txt")
+        self.assertEqual(g.paths, ["requirements.txt"])
 
-    def test_an_unpinned_node_component_names_its_package_json(self):
+    def test_a_lockfile_manager_offers_NO_edit_path(self):
+        # npm's pinning is a GENERATED package-lock.json. Pointing the fix loop
+        # at package.json would ask a model to repair a file that is not broken;
+        # the remedy is `npm install`, which bootstrap already runs.
         g = self._gates({"package.json": '{"name":"x","dependencies":{"a":"^1"}}'})["deps_pinned"]
         self.assertEqual(g.status, "fail")
-        self.assertEqual(g.path, "package.json")
+        self.assertEqual(g.paths, [])
 
     def test_an_undeclared_licence_names_the_manifest_to_edit(self):
         g = self._gates({"package.json": '{"name":"x"}'})["license_present"]
         self.assertEqual(g.status, "fail")
-        self.assertEqual(g.path, "package.json")
+        self.assertEqual(g.paths, ["package.json"])
 
     def test_a_passing_gate_carries_no_path(self):
         # Nothing to remediate, so nothing to point at - a path here would send
@@ -474,26 +479,52 @@ class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
         g = self._gates({"package.json": '{"name":"x"}',
                          "package-lock.json": '{"lockfileVersion":3}'})["deps_pinned"]
         self.assertEqual(g.status, "pass")
-        self.assertIsNone(g.path)
+        self.assertEqual(g.paths, [])
 
     def test_a_path_is_never_a_guess(self):
-        # _manifest_path returns None rather than a plausible-looking path that
-        # does not exist: a caller must be able to open what it is handed.
         import flexfactor_prodready_engine as E
         with _RepoFixture({"requirements.txt": "a==1\n"}) as root:
-            tc = pr.Toolchain(ecosystem="python", root="services/api", manager="pip",
-                              marker="requirements.txt")
-            self.assertIsNone(E._manifest_path(root, tc))   # that subdir has none
-            tc2 = pr.Toolchain(ecosystem="python", root=".", manager="pip",
-                               marker="requirements.txt")
-            self.assertEqual(E._manifest_path(root, tc2), "requirements.txt")
+            missing = pr.Toolchain(ecosystem="python", root="services/api",
+                                   manager="pip", marker="requirements.txt")
+            self.assertEqual(E._pinning_edit_paths(root, [missing]), [])
+            here = pr.Toolchain(ecosystem="python", root=".", manager="pip",
+                                marker="requirements.txt")
+            self.assertEqual(E._pinning_edit_paths(root, [here]), ["requirements.txt"])
+
+    def test_every_unpinned_component_is_queued_not_just_the_first(self):
+        # A monorepo can have several; pointing at one leaves the gate red for
+        # the rest.
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({"requirements.txt": "a>=1\n",
+                           "svc/requirements.txt": "b>=1\n"}) as root:
+            tcs = [pr.Toolchain(ecosystem="python", root=".", manager="pip",
+                                marker="requirements.txt"),
+                   pr.Toolchain(ecosystem="python", root="svc", manager="pip",
+                                marker="requirements.txt")]
+            self.assertEqual(E._pinning_edit_paths(root, tcs),
+                             ["requirements.txt", "svc/requirements.txt"])
 
     def test_an_unknown_manager_yields_no_path(self):
         import flexfactor_prodready_engine as E
         with _RepoFixture({"Makefile": "all:\n"}) as root:
-            tc = pr.Toolchain(ecosystem="make", root=".", manager="make", marker="Makefile")
-            self.assertIsNone(E._manifest_path(root, tc))
+            tc = pr.Toolchain(ecosystem="make", root=".", manager="make",
+                              marker="Makefile")
+            self.assertEqual(E._pinning_edit_paths(root, [tc]), [])
 
+    def test_a_persistence_blocker_names_the_offending_source_files(self):
+        # These gates always KNEW the file - it died in a prose evidence string.
+        g = self._gates({
+            "src/api/client.js": "export const x = createStubEntityClient();\n",
+        })["no_in_memory_entity_stubs"]
+        self.assertEqual(g.status, "fail")
+        self.assertIn("src/api/client.js", g.paths)
+
+    def test_a_persistence_path_is_only_ever_a_real_file(self):
+        import flexfactor_prodready_persist as PP
+        with _RepoFixture({"a.js": "x\n"}) as root:
+            self.assertEqual(
+                PP._paths_from_hits(root, ["a.js (why)", "gone.js (why)"]),
+                ["a.js"])
 
 class LicenceDeclarationGateTests(unittest.TestCase):
     """"License declared" asked a question it would not accept the real answer to.

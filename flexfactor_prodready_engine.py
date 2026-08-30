@@ -56,31 +56,41 @@ SKIP_DIRS = frozenset({
 MAX_SCAN_DEPTH = 3
 
 
-# The manifest a remediation would edit to pin a component's dependencies.
-_MANIFEST_BY_MANAGER = {
-    "npm": "package.json", "pnpm": "package.json", "yarn": "package.json",
-    "bun": "package.json", "pip": "requirements.txt", "poetry": "pyproject.toml",
-    "uv": "pyproject.toml", "pdm": "pyproject.toml", "pipenv": "Pipfile",
-    "go": "go.mod", "cargo": "Cargo.toml", "bundler": "Gemfile",
-    "composer": "composer.json", "mix": "mix.exs", "deno": "deno.json",
-    "dart": "pubspec.yaml", "flutter": "pubspec.yaml", "gradle": "build.gradle",
-    "maven": "pom.xml",
+# MANAGERS WHOSE PINNING LIVES IN THE MANIFEST, so EDITING that file is the
+# remedy and a fix loop can perform it.
+#
+# Deliberately excludes every lockfile-based manager (npm/pnpm/yarn/bun, cargo,
+# composer, bundler, go, deno, dart/flutter, pipenv, poetry, uv, pdm). For those
+# the remedy is GENERATING the lockfile - `npm install` writes
+# package-lock.json - which the bootstrap phase already does and which no edit
+# to package.json can accomplish. Handing that blocker to the fix loop pointed
+# at package.json would ask a model to repair a file that is not broken, and
+# invite a bogus edit to a manifest that was already correct (caught in review).
+_PINNED_IN_MANIFEST = {
+    "pip": "requirements.txt",     # pinning IS `==` in the file
+    "gradle": "build.gradle",      # exact declared versions
+    "maven": "pom.xml",            # exact declared versions
 }
 
 
-def _manifest_path(project_dir: str, tc: "Toolchain") -> str | None:
-    """Repo-relative manifest for a component, when it exists on disk.
+def _pinning_edit_paths(project_dir: str, unpinned) -> list[str]:
+    """Repo-relative manifests a remediation could EDIT to pin dependencies.
 
-    A blocker whose remediation edits a file it cannot name is not actionable,
-    so this returns None rather than a guess: a caller must be able to trust
-    that a path it is given is a real file it can open.
+    Never a guess: a path is returned only when the file exists on disk, because
+    a caller must be able to open what it is handed. A component whose pinning
+    is a generated lockfile contributes nothing here - there is no edit that
+    fixes it.
     """
-    name = _MANIFEST_BY_MANAGER.get(tc.manager)
-    if not name:
-        return None
-    root = (tc.root or ".").strip("./")
-    rel = f"{root}/{name}" if root and root != "." else name
-    return rel if os.path.isfile(os.path.join(project_dir, rel)) else None
+    out: list[str] = []
+    for tc in unpinned:
+        name = _PINNED_IN_MANIFEST.get(tc.manager)
+        if not name:
+            continue
+        root = (tc.root or ".").strip("./")
+        rel = f"{root}/{name}" if root and root != "." else name
+        if os.path.isfile(os.path.join(project_dir, rel)) and rel not in out:
+            out.append(rel)
+    return out
 
 
 def _license_declared_in_manifest(project_dir: str, files) -> str | None:
@@ -817,7 +827,11 @@ class Gate:
     #
     # `auto_fixable` claimed these were fixable while nothing could act on them.
     # This field is what makes that claim true.
-    path: str | None = None
+    #
+    # A LIST, because a monorepo can have several unpinned components and a
+    # single path would send the fix loop at one of them while the gate stayed
+    # red for the rest (caught in review).
+    paths: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1206,7 +1220,7 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         if unpinned else "lockfiles present for all components",
         remediation="Commit the lockfile so builds are reproducible.",
         auto_fixable=True,
-        path=_manifest_path(project_dir, unpinned[0]) if unpinned else None)
+        paths=_pinning_edit_paths(project_dir, unpinned))
 
     # --- Operational readiness --------------------------------------------- #
     has_ci = any(any(p.lower() in f for p in _CI_PATHS) for f in lower)
@@ -1257,9 +1271,11 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
                     "manifest (npm's `\"license\": \"UNLICENSED\"` is the correct "
                     "declaration for a private, proprietary package).",
         auto_fixable=True,
-        path=next((f for f in files
-                   if f.lower() in ("package.json", "pyproject.toml",
-                                    "cargo.toml", "composer.json")), None))
+        paths=([m] if not has_license and
+               (m := next((f for f in files
+                           if f.lower() in ("package.json", "pyproject.toml",
+                                            "cargo.toml", "composer.json")),
+                          None)) else []))
 
     # A service is something that serves traffic; a library legitimately has no
     # container or health endpoint, so this is "na" rather than a failure.
