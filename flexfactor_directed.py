@@ -202,6 +202,16 @@ def install(module_globals: dict) -> None:
                     kwargs["done"] = False
                     kwargs["phase"] = ("STOPPED (incomplete) - repairs/"
                                        "verification pending")
+                    # AND A TERMINAL SIGNAL LIVENESS CONSUMERS CAN READ.
+                    # Relabelling the phase was not enough: the phone dashboard
+                    # classifies liveness from `done` plus the FILE's freshness,
+                    # and status.json stays fresh while ANY sibling program is
+                    # still working - so a stopped program kept a green LIVE
+                    # pill directly beside the STOPPED phase, for hours, with
+                    # the two contradicting each other. `done` must stay False
+                    # (this run was NOT a success), so the terminal fact needs
+                    # its own field rather than being inferred from `done`.
+                    kwargs["stopped"] = True
                 return update(index, **kwargs)
             progress_update._capacity_semantics = True
             progress.update = progress_update
