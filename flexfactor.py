@@ -15861,6 +15861,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # try any of the other 640 routes. A wrong diagnosis printed
                     # confidently is worse than no diagnosis - it sent the owner
                     # looking at provider status pages for eight hours.
+                    # MEASURE THIS CYCLE, NOT THE WHOLE RUN (caught in review).
+                    # `completed_review_files` accumulates across cycles, so a
+                    # file reviewed in cycle 1 and then MODIFIED still counted
+                    # toward the ratio while awaiting re-review - which could let
+                    # cycle 1's work mask a genuine outage in cycle 2. The
+                    # question this threshold answers is "is anything getting
+                    # through RIGHT NOW", so it must be asked about the scope
+                    # currently being swept.
+                    _cycle_scope = len(sweep_files) or total_to_review
+                    _reviewed_this_cycle = len(
+                        completed_review_files & set(sweep_files))
                     _reviewed_so_far = len(completed_review_files)
                     # A STUCK RESIDUE IS NOT AN OUTAGE. This breaker's own
                     # comment below says it exists so the run does not spend more
@@ -15885,18 +15896,29 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # existing "MOSTLY SKIPPED" threshold, so the vocabulary is
                     # consistent rather than a second invented number.
                     _mostly_reviewed = _review_residue_is_not_an_outage(
-                        _reviewed_so_far, total_to_review)
+                        _reviewed_this_cycle, _cycle_scope)
                     if _mostly_reviewed:
-                        _residue = max(0, total_to_review - _reviewed_so_far)
+                        _residue = max(0, _cycle_scope - _reviewed_this_cycle)
                         stop_reason = (
-                            f"review stopped early: {_residue} of {total_to_review} "
-                            f"candidate file(s) could not be reviewed after three "
-                            f"consecutive zero batches ({_reviewed_so_far} reviewed). "
-                            "Those files stay INCOMPLETE - the run is not converged - "
-                            "but the remaining gates still run against the work that "
-                            "was completed")
+                            f"review stopped early: {_residue} of {_cycle_scope} "
+                            f"file(s) in this cycle could not be reviewed after three "
+                            f"consecutive zero batches ({_reviewed_this_cycle} reviewed "
+                            f"this cycle, {_reviewed_so_far} run-wide). Those files stay "
+                            "INCOMPLETE - the run is not converged - but the remaining "
+                            "gates still run against the work that was completed")
                         print(f"{pfx}{stop_reason}")
-                        _ledger("review", str(stop_reason), kind="provider")
+                        # An EXPLICIT suggestion, because ErrorLedger.record asks a
+                        # MODEL for one when none is given - and the provider it
+                        # would ask is the one that just failed three batches in a
+                        # row (caught in review). Paying for another call to the
+                        # thing that is down, to explain that it is down.
+                        _ledger("review", str(stop_reason), kind="provider",
+                                suggestion=(
+                                    "A small residue of files could not be reviewed; "
+                                    "they are recorded INCOMPLETE and block "
+                                    "convergence. Re-run to retry just those files - "
+                                    "the completed reviews are checkpointed and are "
+                                    "not re-billed."))
                         fix_notes.append(stop_reason)
                         cycle_stopped = True
                         break

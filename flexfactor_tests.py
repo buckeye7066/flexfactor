@@ -10625,6 +10625,31 @@ class StuckReviewResidueIsNotAnOutageTests(unittest.TestCase):
                       "the fail-closed outage abort is gone")
         self.assertIn("infrastructure_abort = True", src)
 
+    def test_the_ratio_is_measured_against_THIS_cycle(self):
+        # completed_review_files accumulates across cycles, so a file reviewed in
+        # cycle 1 and then MODIFIED still counted toward the ratio while awaiting
+        # re-review - which could let cycle 1's work mask a genuine cycle-2
+        # outage. The question is "is anything getting through RIGHT NOW".
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_reviewed_this_cycle = len(", src)
+        self.assertIn("completed_review_files & set(sweep_files)", src)
+        # Built from parts so this literal cannot contain a raw newline.
+        self.assertIn("_review_residue_is_not_an_outage(" + chr(10)
+                      + " " * 24 + "_reviewed_this_cycle, _cycle_scope)", src)
+
+    def test_the_residue_ledger_entry_does_not_call_the_failed_provider(self):
+        # ErrorLedger.record asks a MODEL for a suggestion when none is given,
+        # and the provider it would ask is the one that just failed three
+        # batches in a row. An explicit suggestion sets sugg_source="signature"
+        # and the suggester is skipped.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        i = src.find("review stopped early:")
+        self.assertGreater(i, 0)
+        block = src[i:i + 1800]
+        self.assertIn('_ledger("review"', block)
+        self.assertIn("suggestion=(", block,
+                      "the residue ledger entry still asks the downed provider")
+
     def test_a_residue_does_not_set_infrastructure_abort(self):
         # The residue branch must NOT mark the run an infrastructure abort, or
         # the gates it exists to reach are skipped anyway.
