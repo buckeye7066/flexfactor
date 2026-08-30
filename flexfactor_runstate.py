@@ -262,11 +262,28 @@ class RunCheckpoint:
         self.data["bootstrap"] = {"done": bool(ok), "steps": list(steps or [])}
         self.save(force=True)
 
-    def finish(self, status: str = "finished", **fields) -> None:
+    def finish(self, status: str = "finished", **fields) -> bool:
+        """Mark this checkpoint terminal. RETURNS whether it reached disk.
+
+        The return value is the whole point. `save()` does not raise on a failed
+        write: it returns False and sets `enabled = False`, so a caller that
+        discards the result cannot tell a finalized checkpoint from one that
+        never landed - and an un-finalized checkpoint stays LOCKED to its pid,
+        making that program un-resumable while telling nobody. A caller that
+        wants to retry must also clear `enabled`, because a disabled checkpoint
+        refuses every subsequent save without attempting one; `reopen()` is
+        provided for exactly that.
+        """
         self.data["status"] = str(status)
         self.data["finished_at"] = _now_iso()
         self.data.update(fields)
-        self.save(force=True)
+        return self.save(force=True)
+
+    def reopen(self) -> None:
+        """Re-arm a checkpoint that a failed write disabled, so a retry can try
+        again. Without this, `save()` returns False immediately and a retry loop
+        spins without ever touching the disk."""
+        self.enabled = True
 
     # -- reading ----------------------------------------------------------- #
     def summary(self) -> dict:
