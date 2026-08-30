@@ -19063,57 +19063,6 @@ def runtime_manifest() -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# PER-PROGRAM RESUME (added 2026-08-29 by a subagent during the repo-rewards
-# crash investigation; NOT requested by the owner, and no owner directive for
-# it exists in the transcript, .remember or the vault - an earlier draft of
-# this comment attributed a verbatim quote to the owner that could not be
-# corroborated anywhere, and this codebase treats owner quotes as design
-# authority, so the attribution was removed rather than kept unverified.
-# The mechanism below stands on its own merits; the owner has NOT yet said
-# they want this feature.)
-#
-# Resume is NOT a flag in this tool and deliberately stays that way (the
-# launcher-drift trap): `_resume_recover` already picks up the newest resumable
-# checkpoint for the same program+dir on its own. So resuming ONE slot of a
-# `--parallel` run means re-issuing THIS run's own argv with a single
-# `--program`. That argv is the one fact the dashboard cannot reconstruct - it
-# is a pure reader of status.json, which carries the program name but not the
-# model mode, budget, economy tier or `--yes` the owner actually launched with.
-# Recording it here, at the single process entry point, is the whole change:
-# nothing downstream reads this file, so a failure to write it can only cost a
-# button, never a run.
-# --------------------------------------------------------------------------- #
-INVOCATION_PATH = os.path.join(os.path.expanduser("~"), ".flexfactor",
-                               "last-invocation.json")
-
-
-def _record_invocation(argv=None) -> None:
-    """Persist how this process was launched, for the dashboard's resume button.
-
-    Best-effort and silent, exactly like the status bus: an operator
-    convenience must never be able to fail an audit."""
-    try:
-        args = list(sys.argv[1:] if argv is None else argv)
-        if not args:
-            return
-        payload = {
-            "when": datetime.datetime.now().isoformat(timespec="seconds"),
-            "pid": os.getpid(),
-            "python": sys.executable,
-            "script": os.path.abspath(sys.argv[0] or __file__),
-            "argv": args,
-            "cwd": os.getcwd(),
-        }
-        os.makedirs(os.path.dirname(INVOCATION_PATH), exist_ok=True)
-        tmp = f"{INVOCATION_PATH}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=1)
-        os.replace(tmp, INVOCATION_PATH)
-    except Exception:  # noqa: BLE001 - recording the launch is never fatal
-        pass
-
-
 def run_cli(argv=None) -> int:
     """THE single process entry point. Arms the death-obituary instrumentation
     (a crash must never be silent), runs main(), and marks the finish.
@@ -19129,7 +19078,6 @@ def run_cli(argv=None) -> int:
         print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))
         return 0
     _arm_death_instrumentation()
-    _record_invocation(argv)
     try:
         rc = main(argv)
         _mark_run_finished()  # intentional exit (any code) - not a silent death

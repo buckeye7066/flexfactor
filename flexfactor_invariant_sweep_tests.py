@@ -569,13 +569,6 @@ _PROCESS_LAUNCH_SITES = {
         "Read-only `git -C <project> log` inside the DASHBOARD process, which "
         "is a viewer: it applies nothing and publishes nothing."
     ),
-    "flexfactor_dashboard.py::resume_program": (
-        "Relaunches FlexFactor itself with the running interpreter and this "
-        "run's OWN recorded argv, narrowed to one --program, so a crashed slot "
-        "continues from its checkpoint instead of starting over. FlexFactor's "
-        "own code and the owner's own recorded flags - no repository input - "
-        "and the child re-enters _run for everything it executes."
-    ),
     "flexfactor_dashboard.py::open_ledger": (
         "Hands a FlexFactor-authored errors.md path to the OS viewer "
         "(os.startfile / xdg-open). Read-only, no repository code."
