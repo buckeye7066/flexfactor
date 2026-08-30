@@ -344,6 +344,21 @@ class ForeignPlatformDoesNotVetoVerificationTests(unittest.TestCase):
     NAMED so the verification claim stays scoped - but a platform the owner is
     not on can no longer veto the parts that do build."""
 
+    def setUp(self):
+        # PIN THE SIMULATED HOST (caught in review). These assertions are about
+        # a NON-macOS host with no Swift toolchain; on macOS the real
+        # sys.platform makes every component local and the assertions invert,
+        # and on a Linux box with swiftc installed the swift case flips too. A
+        # platform test that only passes on the author's machine is not a test.
+        import flexfactor_prodready_engine as _E
+        self._E = _E
+        self._plat, _E.sys.platform = _E.sys.platform, "win32"
+        self._which, _E.shutil.which = _E.shutil.which, lambda name: None
+
+    def tearDown(self):
+        self._E.sys.platform = self._plat
+        self._E.shutil.which = self._which
+
     def _tc(self, ecosystem, root, deps_installed, build=True, install=True):
         return pr.Toolchain(
             ecosystem=ecosystem, root=root, manager="x", marker="m",
@@ -386,6 +401,29 @@ class ForeignPlatformDoesNotVetoVerificationTests(unittest.TestCase):
         self.assertFalse(pr.verification_is_real([])[0])
         self.assertFalse(pr.verification_is_real(
             [self._tc("node", ".", True, build=False)])[0])
+
+    def test_swift_with_a_REAL_toolchain_is_not_foreign(self):
+        # Swift and SwiftPM support Linux and Windows. Treating every swift
+        # component as unbuildable off macOS would SUPPRESS genuine
+        # missing-dependency failures for server-side Swift - the permissive
+        # direction. Foreign only when this host has no swift at all.
+        self._E.shutil.which = lambda name: r"C:\swift\bin\swift.exe"
+        self.assertTrue(self._E._host_can_build(self._tc("swift", "srv", False)))
+        ok, _why = pr.verification_is_real([
+            self._tc("node", ".", True), self._tc("swift", "srv", False)])
+        self.assertFalse(ok, "a real swift component with no deps must still fail")
+
+    def test_xcode_and_cocoapods_stay_unconditionally_foreign(self):
+        # These have no non-macOS implementation, so a toolchain probe is not
+        # the right question for them.
+        self._E.shutil.which = lambda name: "/usr/bin/anything"
+        for eco in ("xcode", "cocoapods", "ios"):
+            self.assertFalse(self._E._host_can_build(self._tc(eco, "ios", False)), eco)
+
+    def test_on_macos_nothing_is_foreign(self):
+        self._E.sys.platform = "darwin"
+        for eco in ("swift", "xcode", "cocoapods", "ios"):
+            self.assertTrue(self._E._host_can_build(self._tc(eco, "ios", False)), eco)
 
     def test_host_capability_is_narrow(self):
         # Only Apple ecosystems, and only off-macOS. Everything else stays

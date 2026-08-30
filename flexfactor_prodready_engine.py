@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field, asdict
 
@@ -680,15 +681,29 @@ def run_bootstrap(project_dir: str, toolchains: list[Toolchain], run,
 # Capacitor/React-Native project routinely carries a generated ios/ component,
 # and on a Windows or Linux host its dependencies can never be installed - that
 # is a property of the HOST, not a defect in the repository.
-_APPLE_ONLY_ECOSYSTEMS = frozenset({"swift", "xcode", "cocoapods", "ios"})
+_APPLE_ONLY_ECOSYSTEMS = frozenset({"xcode", "cocoapods", "ios"})
 
 
 def _host_can_build(tc: "Toolchain") -> bool:
     """False when this machine could not build the component whatever the owner
-    does. Narrow on purpose: only the Apple-only ecosystems, and only when the
-    host is not macOS. Everything else is assumed buildable, so a genuine
-    "dependencies not installed" is still reported."""
-    return not (tc.ecosystem in _APPLE_ONLY_ECOSYSTEMS and sys.platform != "darwin")
+    does. Narrow on purpose, so a genuine "dependencies not installed" is still
+    reported for everything else.
+
+    SWIFT IS NOT APPLE-ONLY (caught in review): Swift and SwiftPM support Linux
+    and Windows, so classifying every `swift` component as unbuildable off macOS
+    would SUPPRESS real missing-dependency failures for server-side and
+    cross-platform Swift packages - the permissive direction, and the opposite
+    of this gate's job. Swift therefore counts as foreign only when this host
+    has no Swift toolchain at all, which is measured rather than assumed. Xcode
+    and CocoaPods have no non-macOS implementation and stay unconditional.
+    """
+    if sys.platform == "darwin":
+        return True
+    if tc.ecosystem in _APPLE_ONLY_ECOSYSTEMS:
+        return False
+    if tc.ecosystem == "swift":
+        return shutil.which("swift") is not None
+    return True
 
 
 def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
@@ -899,6 +914,22 @@ _DYNAMIC_GRADLE_RE = re.compile(
     re.I)
 _DYNAMIC_MAVEN_RE = re.compile(
     r"<version>\s*(?:LATEST|RELEASE|[\[\(][^<]*)\s*</version>", re.I)
+# `libVersion = '1.+'` / `libVersion = "latest.release"` - a dynamic version
+# held in a variable and referenced as "$libVersion" in the coordinate.
+# NOT line-anchored: the idiomatic form is `ext { libVersion = '1.+' }`, all on
+# one line after an opening brace, so anchoring to ^\s* missed exactly the case
+# this exists to catch.
+_DYNAMIC_GRADLE_VAR_RE = re.compile(
+    r"""(?i)\b\w*version\w*\s*=\s*['"][^'"]*(?:\+|latest\.\w+)['"]""")
+# <version>${lib.version}</version> - the range lives in the property, not in
+# the <version> tag, so the literal scan above cannot see it.
+_MAVEN_PROPERTY_REF_RE = re.compile(r"<version>\s*\$\{([^}]+)\}\s*</version>")
+
+
+def _maven_property(text: str, name: str) -> str:
+    m = re.search(r"<%s>\s*([^<]*)\s*</%s>" % (re.escape(name), re.escape(name)),
+                  text, re.I)
+    return (m.group(1) or "").strip() if m else ""
 
 
 def _declared_jvm_versions(root: str, manager: str) -> str:
@@ -911,8 +942,22 @@ def _declared_jvm_versions(root: str, manager: str) -> str:
     if manager == "gradle":
         if any(_exists(root, n) for n in _GRADLE_LOCK_FILES):
             return "pinned"
-        if os.path.isdir(os.path.join(root, _GRADLE_LOCK_DIR)):
-            return "pinned"
+        # An EMPTY gradle/dependency-locks directory is an abandoned or failed
+        # locking setup, not a lock (caught in review). Returning "pinned" for
+        # the bare directory let a project with `a:b:1.+` pass without any
+        # declaration ever being read.
+        lock_dir = os.path.join(root, _GRADLE_LOCK_DIR)
+        if os.path.isdir(lock_dir):
+            try:
+                # An actual *.lockfile, not merely "some file" - a `.keep` or a
+                # stray README is not a lock, and accepting one would pass a
+                # project whose declarations were never read.
+                if any(n.lower().endswith(".lockfile")
+                       and os.path.isfile(os.path.join(lock_dir, n))
+                       for n in os.listdir(lock_dir)):
+                    return "pinned"
+            except OSError:
+                pass
         texts, saw_dep = [], False
         for current, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -923,6 +968,15 @@ def _declared_jvm_versions(root: str, manager: str) -> str:
             if not text:
                 continue
             if _DYNAMIC_GRADLE_RE.search(text):
+                return "dynamic"
+            # A DYNAMIC VERSION HELD IN A VARIABLE (caught in review). The
+            # common Gradle form is `libVersion = '1.+'` followed by
+            # `implementation "a:b:$libVersion"` - the coordinate regex above
+            # sees no `+` because the version is not in the string, and the
+            # generic coordinate check below would then bank it as "pinned".
+            # This is the same defect the whole gate exists to prevent, hiding
+            # one indirection away.
+            if _DYNAMIC_GRADLE_VAR_RE.search(text):
                 return "dynamic"
             if re.search(r"""["'][A-Za-z0-9._-]+:[A-Za-z0-9._-]+:[^"']+["']""", text):
                 saw_dep = True
@@ -938,6 +992,17 @@ def _declared_jvm_versions(root: str, manager: str) -> str:
         return "none"
     if _DYNAMIC_MAVEN_RE.search(text):
         return "dynamic"
+    # A RANGE HELD IN A PROPERTY (caught in review): with
+    # <version>${lib.version}</version> and <lib.version>[1.0,2.0)</lib.version>
+    # the literal scan above sees only the reference, and the mere presence of
+    # a <version> tag then banked it as "pinned". Resolve one level - which is
+    # the level Maven itself uses for this idiom - and re-test the value.
+    for name in _MAVEN_PROPERTY_REF_RE.findall(text):
+        value = _maven_property(text, name)
+        if not value:
+            continue
+        if value.upper() in ("LATEST", "RELEASE") or value[:1] in "[(":
+            return "dynamic"
     return "pinned" if "<version>" in text else "none"
 
 

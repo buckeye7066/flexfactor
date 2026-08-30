@@ -17251,25 +17251,43 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # still will not land, SAY SO on the console and in the error ledger
             # instead of swallowing it. A run that cannot record that it
             # finished is a run nobody can continue.
-            _finish_error = None
+            # `save()` does NOT raise on a failed write - it returns False and
+            # DISABLES the checkpoint - so this must read the return value and
+            # re-arm before retrying, or the loop spins without touching disk.
+            # (Caught in review of the first version of this fix, which wrapped
+            # the call in try/except and therefore detected nothing at all.)
+            #
+            # `stopped=True` is the field is_resumable reads to know the owning
+            # run has released this program. Calling finish() IS that
+            # declaration, so it is recorded here, on the checkpoint - the first
+            # version set it only on the progress bus, which never reaches
+            # ~/.flexfactor/runs/<id>/checkpoint.json and so released nothing.
+            _finished_ok, _finish_error = False, None
             for _attempt in range(4):
                 try:
-                    checkpoint.finish(
+                    _finished_ok = checkpoint.finish(
                         status=("finished" if run_complete else "interrupted"),
+                        stopped=True,
                         defects_found=len(all_findings),
                         defects_fixed=len(applied_files))
-                    _finish_error = None
-                    break
                 except Exception as _ex:  # noqa: BLE001 - reported below, never raised
-                    _finish_error = _ex
-                    time.sleep(0.25 * (_attempt + 1))
-            if _finish_error is not None:
-                print(f"{pfx}CHECKPOINT NOT FINALIZED: {_finish_error} - this "
-                      "program cannot be resumed until its checkpoint is "
-                      "writable; the run's work is committed, only the "
-                      "resume marker is missing")
+                    _finished_ok, _finish_error = False, _ex
+                if _finished_ok:
+                    break
+                time.sleep(0.25 * (_attempt + 1))
                 with contextlib.suppress(Exception):
-                    _ledger("checkpoint", _finish_error,
+                    checkpoint.reopen()
+            if not _finished_ok:
+                _why = f": {_finish_error}" if _finish_error else ""
+                print(f"{pfx}CHECKPOINT NOT FINALIZED{_why} - this program "
+                      "cannot be resumed until its checkpoint is writable; the "
+                      "run's work is committed, only the resume marker is "
+                      f"missing ({getattr(checkpoint, 'path', '?')})")
+                with contextlib.suppress(Exception):
+                    _ledger("checkpoint",
+                            _finish_error or RuntimeError(
+                                "checkpoint.finish() could not write the "
+                                "terminal record"),
                             program_file=getattr(checkpoint, "path", ""))
         if _rsmod is not None:
             with contextlib.suppress(Exception):

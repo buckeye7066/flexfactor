@@ -10374,6 +10374,80 @@ class ParallelSiblingResumeTests(unittest.TestCase):
              "stopped": True, "reviewed": {}}))
 
 
+class FinishReportsWhetherItLandedTests(unittest.TestCase):
+    """`finish()` returned None, so a failed terminal write was undetectable.
+
+    Caught in review of the first version of this fix, which wrapped the call in
+    try/except and therefore detected NOTHING: `save()` does not raise on a
+    failed write - it returns False and sets `enabled = False`. The retry loop
+    saw a normal return on attempt one and broke immediately. A fix that cannot
+    observe the failure it exists to handle is the written-but-not-wired trap,
+    and this codebase has now hit it five times.
+
+    A disabled checkpoint also refuses every SUBSEQUENT save without attempting
+    one, so a retry must re-arm it - which is what `reopen()` is for."""
+
+    def _ckpt(self, tmp):
+        import flexfactor_runstate as rs
+        return rs.new_run(tmp, program="p", project_dir=tmp, mode="audit",
+                          policy="x", tool="t")
+
+    def test_finish_returns_True_when_the_write_lands(self):
+        with _tempfile.TemporaryDirectory() as tmp:
+            self.assertIs(self._ckpt(tmp).finish(status="interrupted"), True)
+
+    def test_finish_returns_False_when_the_write_fails(self):
+        import flexfactor_runstate as rs
+        with _tempfile.TemporaryDirectory() as tmp:
+            c = self._ckpt(tmp)
+            saved, rs._atomic_write_json = rs._atomic_write_json, lambda *a, **k: False
+            try:
+                self.assertIs(c.finish(status="interrupted"), False)
+            finally:
+                rs._atomic_write_json = saved
+
+    def test_a_failed_write_disables_the_checkpoint_and_reopen_re_arms_it(self):
+        # This is why a retry needs reopen(): without it every later save
+        # returns False immediately, never touching the disk, and the loop
+        # spins to exhaustion against a decision made on attempt one.
+        import flexfactor_runstate as rs
+        with _tempfile.TemporaryDirectory() as tmp:
+            c = self._ckpt(tmp)
+            saved, rs._atomic_write_json = rs._atomic_write_json, lambda *a, **k: False
+            try:
+                c.finish(status="interrupted")
+                self.assertFalse(c.enabled)
+            finally:
+                rs._atomic_write_json = saved
+            self.assertFalse(c.finish(status="interrupted"),
+                             "a disabled checkpoint must not silently 'succeed'")
+            c.reopen()
+            self.assertTrue(c.enabled)
+            self.assertTrue(c.finish(status="interrupted"))
+
+    def test_finish_persists_the_stopped_marker_into_the_checkpoint_FILE(self):
+        # The other half of the review finding: the first version set `stopped`
+        # only on the ProgressBus, which writes status.json - NOT
+        # ~/.flexfactor/runs/<id>/checkpoint.json - so is_resumable, which reads
+        # the checkpoint, never saw it and released nothing.
+        import flexfactor_runstate as rs
+        with _tempfile.TemporaryDirectory() as tmp:
+            c = self._ckpt(tmp)
+            c.record_reviewed("a.py", "sha", [])
+            self.assertTrue(c.finish(status="interrupted", stopped=True))
+            on_disk = json.load(_io.open(c.path, encoding="utf-8"))
+            self.assertTrue(on_disk.get("stopped"),
+                            "the marker never reached the checkpoint file")
+            self.assertTrue(rs.is_resumable(on_disk))
+
+    def test_the_call_site_reads_the_return_value(self):
+        # written-but-not-wired guard, for the fifth time.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_finished_ok = checkpoint.finish(", src)
+        self.assertIn("checkpoint.reopen()", src)
+        self.assertIn("stopped=True", src)
+
+
 class CheckpointFinalizationIsNotSilentTests(unittest.TestCase):
     """The one write that must not fail silently was the only one suppressed.
 
