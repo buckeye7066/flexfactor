@@ -20,7 +20,7 @@ if (-not $desktop -or -not (Test-Path $desktop)) {
     Write-Error "Could not resolve the desktop folder."
 }
 
-$targets = @(
+$targets = [System.Collections.ArrayList]@(
     @{ Name = 'FlexFactor'
        Script = Join-Path $repo 'flexfactor_launch.ps1'
        Icon = Join-Path $repo 'flexfactor.ico'
@@ -37,6 +37,48 @@ $targets = @(
 
 # Windows PowerShell 5.1 is what a .lnk actually launches on this machine, so
 # everything here stays inside the 5.1 language surface.
+# PER-PROGRAM SHORTCUTS (owner request 2026-08-29). The launcher already accepts
+# a dropped path, so one shortcut per program is the same entry point with the
+# program pre-filled: click GrantFlow and FlexFactor starts on GrantFlow. They
+# carry the SAME flexfactor.ico as the main icon, so they read as FlexFactor
+# rather than as separate applications - which is what they are. A path that
+# does not exist on this machine is SKIPPED and said out loud, never written as
+# a shortcut that fails when clicked.
+$programs = @(
+    @{ Name = 'GrantFlow';   Path = Join-Path $env:USERPROFILE 'GrantFlow' },
+    @{ Name = 'SermonSmith'; Path = Join-Path $env:USERPROFILE 'sermonsmith' },
+    @{ Name = 'GeneMap';     Path = Join-Path $env:USERPROFILE 'genemap-discovery' }
+)
+foreach ($prog in $programs) {
+    if (-not (Test-Path $prog.Path)) {
+        # SKIPPING IS NOT ENOUGH ON A RE-RUN. This installer is idempotent, so
+        # it runs again after a program folder is moved or deleted - and a
+        # previous run may have already written "FlexFactor - <name>.lnk" whose
+        # embedded argument points at the path that just disappeared. Merely
+        # skipping creation leaves that shortcut on the desktop, breaking the
+        # guarantee that a missing program never leaves a shortcut that fails
+        # when clicked. Remove the stale one before moving on.
+        $staleLnk = Join-Path $desktop ('FlexFactor - ' + $prog.Name + '.lnk')
+        if (Test-Path $staleLnk) {
+            Remove-Item -LiteralPath $staleLnk -Force -ErrorAction SilentlyContinue
+            if (Test-Path $staleLnk) {
+                Write-Host ("WARN (could not remove stale shortcut): " + $staleLnk) -ForegroundColor Red
+            } else {
+                Write-Host ("removed stale shortcut: " + $staleLnk) -ForegroundColor Yellow
+            }
+        }
+        Write-Host ("SKIP (no such folder): " + $prog.Name + " -> " + $prog.Path) -ForegroundColor Yellow
+        continue
+    }
+    [void]$targets.Add(@{
+        Name = 'FlexFactor - ' + $prog.Name
+        Script = Join-Path $repo 'flexfactor_launch.ps1'
+        Icon = Join-Path $repo 'flexfactor.ico'
+        Description = 'FlexFactor on ' + $prog.Name + ' (' + $prog.Path + ')'
+        Program = $prog.Path
+    })
+}
+
 $ws = New-Object -ComObject WScript.Shell
 foreach ($t in $targets) {
     if (-not (Test-Path $t.Script)) {
@@ -47,6 +89,11 @@ foreach ($t in $targets) {
     $s = $ws.CreateShortcut($lnk)
     $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $s.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $t.Script + '"'
+    if ($t.ContainsKey('Program')) {
+        # The launcher reads $args as dropped programs, so passing the path here
+        # is exactly the drag-and-drop path with the drag already done.
+        $s.Arguments += ' "' + $t.Program + '"'
+    }
     $s.WorkingDirectory = $repo
     if (Test-Path $t.Icon) { $s.IconLocation = $t.Icon }
     $s.Description = $t.Description
