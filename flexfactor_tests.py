@@ -10183,6 +10183,85 @@ class BareListSalvageTests(unittest.TestCase):
         self.assertIs(ff._check_structured_type(d, ff.FIX_EDITS_SCHEMA, "{}"), d)
 
 
+class TrustedRepoBuildNetworkTests(unittest.TestCase):
+    """FlexFactor blackholed its OWN build's network, then blamed the repo.
+
+    `_run_target_code` chose `network=("install" in classes)` under the comment
+    "Installs need the registry; builds and tests of an audited tree do not."
+    False for modern toolchains, and it stopped a whole overnight batch:
+
+      repo-rewards  next/font fetches IBM Plex Sans + Space Grotesk from Google
+                    Fonts AT BUILD TIME -> ECONNREFUSED 127.0.0.1:9
+      Genemap       apps/desktop electron-builder downloads native deps at
+                    build -> the identical ECONNREFUSED 127.0.0.1:9
+
+    Both were filed as PROGRAM DEFECTS and both refused publication of real
+    work. Measured 2026-08-29: repo-rewards builds clean, exit 0, 9 routes, as
+    soon as the build can reach the network. The denial bought nothing either -
+    on this host network isolation is "best-effort-env" proxy poisoning that
+    raw sockets bypass, so it was an obstacle, never a boundary.
+
+    These drive the REAL `_run_target_code` and assert on the Limits handed to
+    the broker - a test of the wiring, not of a helper."""
+
+    def setUp(self):
+        self._saved_run = ff._ff_sandbox.run_contained
+        self._saved_auth = ff._execution_authorization
+        self.seen = {}
+
+        def fake_run_contained(cmd, cwd, limits=None, env=None, source_root=None):
+            self.seen["limits"] = limits
+            cp = subprocess.CompletedProcess(cmd, 0, "", "")
+            cp.flexfactor_containment = {"mechanism": "test", "level": {}}
+            return cp
+
+        ff._ff_sandbox.run_contained = fake_run_contained
+
+    def tearDown(self):
+        ff._ff_sandbox.run_contained = self._saved_run
+        ff._execution_authorization = self._saved_auth
+
+    def _run_with(self, basis_kind, classes):
+        ff._execution_authorization = lambda cwd: (
+            {"basis": basis_kind, "trust": {}}, "")
+        ff._run_target_code(["npm", "run", "build"], os.getcwd(), 60, None,
+                            set(classes), lambda rc, o, e: subprocess.
+                            CompletedProcess(["x"], rc, o, e))
+        return self.seen["limits"]
+
+    def test_a_trusted_repo_BUILD_gets_the_network(self):
+        # The whole point: the owner named this repository in trusted_repos, so
+        # its build is their own code and must be allowed to fetch what it
+        # needs. Without this the build fails and is reported as their defect.
+        self.assertTrue(self._run_with("trusted-repo", {"build"}).network)
+
+    def test_a_trusted_repo_TEST_gets_the_network(self):
+        self.assertTrue(self._run_with("trusted-repo", {"test"}).network)
+
+    def test_an_install_ALWAYS_gets_the_network(self):
+        # Unchanged behaviour, both bases.
+        self.assertTrue(self._run_with("trusted-repo", {"install"}).network)
+        self.assertTrue(self._run_with("os-sandbox", {"install"}).network)
+
+    def test_an_UNTRUSTED_tree_still_has_its_build_network_denied(self):
+        # The containment property is preserved exactly where it still means
+        # something: a tree running only because an OS sandbox contains it.
+        # Widening this to every repo would be the guardrail-removal this fix
+        # is NOT.
+        self.assertFalse(self._run_with("os-sandbox", {"build"}).network)
+        self.assertFalse(self._run_with("os-sandbox", {"test"}).network)
+
+    def test_a_refused_authorization_still_never_runs(self):
+        ff._execution_authorization = lambda cwd: (None, "not trusted")
+        cp = ff._run_target_code(
+            ["npm", "run", "build"], os.getcwd(), 60, None, {"build"},
+            lambda rc, o, e: subprocess.CompletedProcess(["x"], rc, o, e))
+        self.assertEqual(cp.returncode, 126)
+        self.assertTrue(getattr(cp, "flexfactor_containment_blocked", False))
+        # and the broker was never reached
+        self.assertNotIn("limits", self.seen)
+
+
 class ArrayItemShapeTests(unittest.TestCase):
     """LIVE repo-rewards 2026-08-29, run reporewards-...-35988-0002.
 
@@ -16765,7 +16844,16 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
         self.assertEqual(len(entries), 1, ff._EXECUTION_LEDGER)
         self.assertFalse(entries[0]["refused"])
         self.assertEqual(entries[0]["basis"], "trusted-repo")
-        self.assertIn(entries[0]["network"], (False,))
+        # POLICY CHANGED 2026-08-29: a TRUSTED repository's build/test now gets
+        # the network. This assertion used to read `(False,)`. It is updated,
+        # not deleted, because the value is still worth pinning - see
+        # TrustedRepoBuildNetworkTests for the measured reason (FlexFactor
+        # blackholed its own build's proxy, next/font and electron-builder
+        # could not fetch, and both failures were then filed as the audited
+        # repository's defect and blocked publication). An UNTRUSTED tree still
+        # asserts False, which is where the containment property still means
+        # something.
+        self.assertIs(entries[0]["network"], True)
         self.assertIsNotNone(getattr(cp, "flexfactor_execution_basis", None))
 
     def test_run_level_trust_repo_flag_authorizes_one_repository_only(self):

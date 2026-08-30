@@ -6087,8 +6087,37 @@ def _run_target_code(cmd: list[str], cwd: str, timeout: int, env: dict | None,
         cp = _fail(126, "", "[flexfactor-containment] REFUSED: " + why)
         cp.flexfactor_containment_blocked = True
         return cp
-    # Installs need the registry; builds and tests of an audited tree do not.
-    limits = _ff_sandbox.Limits(timeout_s=int(timeout), network=("install" in classes))
+    # NETWORK FOR BUILD/TEST OF A TRUSTED REPOSITORY (2026-08-29).
+    #
+    # The old rule was `network=("install" in classes)`, under the comment
+    # "Installs need the registry; builds and tests of an audited tree do not."
+    # That premise is FALSE for modern toolchains, and it is what stopped a
+    # whole overnight batch from completing:
+    #
+    #   repo-rewards  next/font fetches IBM Plex Sans + Space Grotesk from
+    #                 Google Fonts AT BUILD TIME -> ECONNREFUSED 127.0.0.1:9
+    #   Genemap       apps/desktop electron-builder downloads native deps
+    #                 at build -> the identical ECONNREFUSED 127.0.0.1:9
+    #
+    # Both were then filed as PROGRAM DEFECTS and both refused publication of
+    # real, verified work - FlexFactor blackholed its own build's proxy
+    # (flexfactor_sandbox.DEAD_PROXY), then reported the resulting failure as
+    # the audited repository's fault. Measured 2026-08-29: repo-rewards builds
+    # clean, exit 0, 9 routes, the moment the build can reach the network.
+    #
+    # The denial also bought NOTHING here. `capability_report()` on this host
+    # reports network isolation as "best-effort-env" - proxy poisoning that
+    # "raw sockets bypass" - so it was never a boundary, only an obstacle.
+    #
+    # So: an install still always gets the network, and for a repository the
+    # OWNER HAS EXPLICITLY TRUSTED (basis "trusted-repo": their own code, named
+    # in policy.json trusted_repos / FLEXFACTOR_TRUSTED_REPOS / --trust-repo)
+    # its build and test get it too. An UNTRUSTED tree running only because an
+    # OS sandbox contains it keeps the old behaviour exactly.
+    _owner_trusted = basis.get("basis") == "trusted-repo"
+    limits = _ff_sandbox.Limits(
+        timeout_s=int(timeout),
+        network=("install" in classes) or _owner_trusted)
     cp = _ff_sandbox.run_contained(_winify(cmd), cwd, limits=limits, env=env,
                                    source_root=cwd)
     cont = getattr(cp, "flexfactor_containment", None) or {}
