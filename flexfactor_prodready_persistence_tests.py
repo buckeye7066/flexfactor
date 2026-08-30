@@ -308,6 +308,48 @@ class LicenceDeclarationGateTests(unittest.TestCase):
                         "packages/inner/package.json": '{"name":"i","license":"MIT"}'})
         self.assertEqual(g.status, "fail")
 
+    def test_composer_multi_licence_LIST_passes(self):
+        # Composer's valid multi-licence form. Rejecting the list reproduced the
+        # very "no licence field" result this change removes.
+        g = self._gate({"composer.json":
+                        '{"name":"x/y","license":["MIT","GPL-3.0-or-later"]}'})
+        self.assertEqual(g.status, "pass")
+
+    def test_an_empty_licence_list_is_not_a_declaration(self):
+        self.assertEqual(
+            self._gate({"composer.json": '{"name":"x/y","license":[]}'}).status, "fail")
+
+    def test_a_licence_under_an_UNRELATED_toml_table_does_not_pass(self):
+        # `[tool.foo] license = "MIT"` says nothing about the distributable
+        # package's licence; an unscoped search passed it and gave the gate a
+        # way to be wrong in the permissive direction.
+        for manifest, body in (("pyproject.toml", '[tool.foo]\nlicense = "MIT"\n'),
+                               ("Cargo.toml", '[package.metadata.foo]\nlicense = "MIT"\n')):
+            self.assertEqual(self._gate({manifest: body}).status, "fail", manifest)
+
+    def test_licence_under_a_real_package_table_passes(self):
+        for manifest, body in (
+                ("Cargo.toml", '[package]\nname = "x"\nlicense = "Apache-2.0"\n'),
+                ("pyproject.toml", '[project]\nname = "x"\nlicense = "MIT"\n'),
+                ("pyproject.toml", '[tool.poetry]\nname = "x"\nlicense = "MIT"\n')):
+            self.assertEqual(self._gate({manifest: body}).status, "pass", body)
+
+    def test_cargo_license_file_pointing_at_a_TRACKED_file_passes(self):
+        # `license-file = "EULA.txt"` is a real declaration, and the filename is
+        # routinely not licence-shaped, so the basename check cannot see it.
+        g = self._gate({"Cargo.toml": '[package]\nname = "x"\nlicense-file = "EULA.txt"\n',
+                        "EULA.txt": "All rights reserved.\n"})
+        self.assertEqual(g.status, "pass")
+
+    def test_cargo_license_file_pointing_at_NOTHING_still_fails(self):
+        # A manifest may name a file that was never committed; that is a broken
+        # declaration, not a licence.
+        with _RepoFixture({"Cargo.toml":
+                           '[package]\nname = "x"\nlicense-file = "EULA.txt"\n'}) as root:
+            chains = pr.detect_toolchains(root)
+            gates = {g.id: g for g in pr.assess_readiness(root, chains, _fake_run())}
+            self.assertEqual(gates["license_present"].status, "fail")
+
     def test_the_gate_stays_low_severity_and_non_blocking(self):
         # It reports; it must never block a release on its own.
         g = self._gate(self.BASE)
