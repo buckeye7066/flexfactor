@@ -285,6 +285,15 @@ def build_state(sampler: Sampler) -> dict:
         # single boolean the reader will mistake for "dead".
         if p.get("done"):
             live = "done"
+        elif p.get("stopped"):
+            # TERMINAL, BUT NOT A SUCCESS. A program that ended partial carries
+            # done=False on purpose (it must never count as success), and
+            # liveness is otherwise inferred from the FILE's freshness - which
+            # stays fresh while any sibling program is still working. So a
+            # stopped program used to show a green LIVE pill next to a STOPPED
+            # phase for hours, the two contradicting each other, and the owner
+            # waited on runs that had already ended.
+            live = "stopped"
         elif quiet_s is not None and quiet_s > STALL_S:
             live = "quiet"
         else:
@@ -911,6 +920,7 @@ h1{font-size:17px;margin:14px 0 4px;letter-spacing:.3px}
 .pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;
  text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
 .live{background:#12331c;color:#3fb950}.quiet{background:#3a2d0c;color:#d29922}
+.stopped{background:#4a1d1d;color:#f85149}
 .done{background:#16304d;color:#58a6ff}
 .lbl{color:#7d8590;font-size:11px;text-transform:uppercase;letter-spacing:.6px;
  margin:14px 0 5px}
@@ -1070,8 +1080,10 @@ function spark(v){
 }
 function card(p){
   var h="";
-  var cls = p.liveness==="done"?"done":(p.liveness==="quiet"?"quiet":"live");
-  var lab = p.liveness==="done"?"done":(p.liveness==="quiet"?"quiet":"live");
+  var cls = p.liveness==="done"?"done":(p.liveness==="stopped"?"stopped":
+            (p.liveness==="quiet"?"quiet":"live"));
+  var lab = p.liveness==="done"?"done":(p.liveness==="stopped"?"stopped":
+            (p.liveness==="quiet"?"quiet":"live"));
   h+='<div class="card">';
   h+='<div class="row"><div class="name">'+esc(p.name)+'</div>'+
      '<div class="pill '+cls+'">'+lab+'</div></div>';

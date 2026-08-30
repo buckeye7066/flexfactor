@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import io as _io
 from dataclasses import dataclass
 
 import flexfactor_capacity as cap
@@ -307,6 +308,67 @@ class DirectedStatusSemanticsTests(unittest.TestCase):
         self.assertEqual("STOPPED (incomplete) - repairs/verification pending",
                          row["phase"])
         self.assertIn("STOPPED", row["phase"])
+
+
+class StoppedIsTerminalForLivenessTests(unittest.TestCase):
+    """A stopped-partial program must not read as LIVE.
+
+    Relabelling the phase was not enough. The phone dashboard classifies
+    liveness from `done` plus the FRESHNESS OF status.json, and that file stays
+    fresh while ANY sibling program is still working - so a program that had
+    ended kept a green LIVE pill directly beside its STOPPED phase, for hours,
+    the two contradicting each other. `done` must stay False (the run was not a
+    success), so the terminal fact needs a field of its own.
+
+    Measured live 2026-08-29/30: three of five programs had finished partial
+    hours earlier while the owner watched the panel believing all five were
+    still running."""
+
+    def _row(self, phase, done):
+        import flexfactor_directed as directed
+
+        class _Progress:
+            def __init__(self): self.rows = []
+            def update(self, index, **kw): self.rows.append((index, kw))
+
+        progress = _Progress()
+        directed.install({"_PROGRESS": progress, "_UNFIT_CODE_PATTERNS": (),
+                          "_SKIP_DIRS": set()})
+        progress.update(1, phase=phase, done=done)
+        return progress.rows[-1][1]
+
+    def test_a_stopped_partial_run_carries_a_terminal_flag(self):
+        row = self._row("done - partial", True)
+        self.assertFalse(row["done"], "a partial run must never count as success")
+        self.assertTrue(row.get("stopped"), "liveness has no terminal signal to read")
+        self.assertIn("STOPPED", row["phase"])
+
+    def test_a_still_working_program_is_never_marked_stopped(self):
+        row = self._row("reviewing (cycle 1/12)", False)
+        self.assertFalse(row.get("stopped"))
+        self.assertEqual("reviewing (cycle 1/12)", row["phase"])
+
+    def test_a_fully_done_program_is_left_alone(self):
+        # Only "done - partial" is rewritten; a genuine success keeps done=True
+        # and is never relabelled.
+        row = self._row("done - verified", True)
+        self.assertTrue(row["done"])
+        self.assertNotIn("STOPPED", row["phase"])
+        self.assertFalse(row.get("stopped"))
+
+    def test_the_web_dashboard_classifies_stopped_before_liveness(self):
+        # The bug was that freshness won. Assert the ORDER: a stopped program
+        # with a perfectly fresh status file is "stopped", not "live".
+        import flexfactor_web as web
+        src = _io.open(web.__file__, encoding="utf-8", errors="replace").read()
+        i_stop = src.find('elif p.get("stopped")')
+        i_quiet = src.find("quiet_s is not None and quiet_s > STALL_S")
+        self.assertGreater(i_stop, 0, "web dashboard has no stopped branch")
+        self.assertLess(i_stop, i_quiet,
+                        "stopped must be decided before the freshness fallback")
+        # ...and the UI must be able to render it.
+        self.assertIn(".stopped{", src)
+        self.assertIn('p.liveness==="stopped"', src)
 
 
 if __name__ == "__main__":
