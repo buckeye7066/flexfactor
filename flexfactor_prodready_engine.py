@@ -125,11 +125,21 @@ def _lockfile_is_fabricated(path: str) -> bool:
     # "placeholder", or a resolved URL with "todo" in the path.
     if _has_placeholder_hash(data):
         return True
-    groups = [v for k, v in data.items()
-              if k in ("default", "develop", "packages", "dependencies")
-              and isinstance(v, dict)]
-    entries = [(name, e) for g in groups for name, e in g.items()
-               if isinstance(e, dict)]
+    # COMPOSER'S GROUPS ARE ARRAYS, not maps (caught in review): composer.lock
+    # stores `"packages": [ {...}, ... ]`, so an isinstance(v, dict) filter
+    # discarded every entry and the "nothing to judge" branch then ACCEPTED a
+    # hand-written Composer lock without inspecting it at all.
+    entries: list[tuple[str, dict]] = []
+    for key, group in data.items():
+        if key not in ("default", "develop", "packages", "packages-dev",
+                       "dependencies"):
+            continue
+        if isinstance(group, dict):
+            entries += [(name, e) for name, e in group.items()
+                        if isinstance(e, dict)]
+        elif isinstance(group, list):
+            entries += [(str(e.get("name") or ""), e) for e in group
+                        if isinstance(e, dict)]
     # A VALID LOCK CAN LEGITIMATELY HAVE NO HASHED DEPENDENCIES (caught in
     # review): `npm install --package-lock-only` on a dependency-free project
     # writes a v3 lock whose only entry is the root package `""`, which carries
@@ -139,8 +149,10 @@ def _lockfile_is_fabricated(path: str) -> bool:
         return False                      # nothing to judge, or root-only
     # A real pipenv/npm lock records an integrity hash per package. None at all,
     # across every dependency entry, means nothing was ever resolved.
+    # Composer records integrity under dist/source rather than a flat key.
     return not any(
-        any(k in e for k in ("hashes", "hash", "integrity", "resolved", "checksum"))
+        any(k in e for k in ("hashes", "hash", "integrity", "resolved",
+                             "checksum", "dist", "source"))
         for _n, e in real)
 
 
@@ -187,10 +199,27 @@ def _pinning_remediation(unpinned) -> str:
     managers = {t.manager for t in (unpinned or [])}
     lines = []
     if "pip" in managers:
+        # NAME THE FILE THAT ACTUALLY EXISTS (caught in review): pip is also
+        # detected from pyproject.toml / setup.py / setup.cfg, and telling the
+        # model to edit a requirements.txt that is not there is an instruction
+        # it cannot carry out - which is exactly how the Pipfile fabrication
+        # happened. Note honestly when pinning that manifest will not by itself
+        # close the gate, instead of promising a closure that cannot occur.
+        pip_markers = sorted({
+            os.path.basename(t.marker or "") or "requirements.txt"
+            for t in unpinned if t.manager == "pip"})
+        target = ", ".join(pip_markers) or "requirements.txt"
         lines.append(
-            "For pip, pin EVERY requirement to an exact version with `==` in "
-            "requirements.txt (e.g. `numpy==1.26.4`), choosing versions that "
-            "satisfy the ranges already there.")
+            f"For pip, pin EVERY requirement to an exact version with `==` in "
+            f"{target} (e.g. `numpy==1.26.4`), choosing versions that satisfy "
+            "the ranges already there.")
+        if not any(m.lower() == "requirements.txt" for m in pip_markers):
+            lines.append(
+                "NOTE: this gate recognises pip pinning only in a "
+                "requirements.txt, so pinning "
+                f"{target} alone will not clear it - export a pinned "
+                "requirements.txt (e.g. `pip freeze > requirements.txt`) as "
+                "well.")
     if managers & {"gradle", "maven"}:
         lines.append(
             "For Gradle/Maven, replace every dynamic version ('1.+', '+', "
@@ -1049,6 +1078,10 @@ _LOCKFILES = {
     "composer": ("composer.lock",), "mix": ("mix.lock",), "deno": ("deno.lock",),
     "dart": ("pubspec.lock",), "flutter": ("pubspec.lock",),
     "swiftpm": ("Package.resolved",),
+    # `dotnet restore --use-lock-file` writes this. Without the entry the
+    # remediation promised that running the installer would close the gate
+    # while nothing could ever recognise its output (caught in review).
+    "dotnet": ("packages.lock.json",),
 }
 
 

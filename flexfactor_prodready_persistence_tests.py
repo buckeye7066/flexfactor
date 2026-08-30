@@ -642,20 +642,66 @@ class FabricatedLockfileTests(unittest.TestCase):
                                    ' "resolved": "https://r/todo-utils.tgz",'
                                    ' "integrity": "sha512-REAL"}}}'))
 
+    def test_a_hand_written_COMPOSER_lock_is_caught(self):
+        # composer.lock stores `"packages": [ {...} ]` - an ARRAY. An
+        # isinstance(v, dict) filter discarded every entry and the
+        # "nothing to judge" branch then ACCEPTED the file uninspected.
+        self.assertTrue(self._fab(
+            "composer.lock", '{"packages": [{"name": "x/y", "version": "1.0.0"}]}'))
+
+    def test_a_REAL_composer_lock_is_accepted(self):
+        # Composer records integrity under dist/source, not a flat hash key.
+        self.assertFalse(self._fab(
+            "composer.lock",
+            '{"packages": [{"name": "x/y", "version": "1.0.0",'
+            ' "dist": {"type": "zip", "url": "https://r/x.zip", "shasum": "abc"}}]}'))
+
+    def test_a_crate_named_placeholder_is_not_accused(self):
+        # Cargo generates `name = "placeholder"` for a crate with that name.
+        cargo = ("[[package]]" + chr(10) + 'name = "placeholder"' + chr(10)
+                 + 'version = "1.0.0"' + chr(10))
+        self.assertFalse(self._fab("Cargo.lock", cargo))
+
+    def test_dotnet_has_a_known_lockfile_so_the_promise_is_true(self):
+        # The remediation tells dotnet users that running the installer closes
+        # the gate. That was false while _LOCKFILES had no dotnet entry - the
+        # unclosable-finding shape, in my own instruction text.
+        import flexfactor_prodready_engine as E
+        self.assertIn("packages.lock.json", E._LOCKFILES.get("dotnet", ()))
+
+    def test_pip_detected_without_requirements_txt_names_the_real_file(self):
+        # pip is also detected from pyproject.toml/setup.py/setup.cfg. Telling
+        # the model to edit a requirements.txt that is not there is an
+        # instruction it cannot carry out - which is how the Pipfile
+        # fabrication happened in the first place.
+        import flexfactor_prodready_engine as E
+
+        class _T:
+            def __init__(self, m, mk): self.manager, self.marker = m, mk
+
+        txt = E._pinning_remediation([_T("pip", "pyproject.toml")])
+        self.assertIn("pyproject.toml", txt)
+        # ...and it must NOT promise a closure that cannot happen.
+        self.assertIn("will not clear it", txt)
+
+        plain = E._pinning_remediation([_T("pip", "requirements.txt")])
+        self.assertIn("requirements.txt", plain)
+        self.assertNotIn("will not clear it", plain)
+
     def test_the_remediation_says_what_to_actually_do(self):
         # "Commit the lockfile" is not an instruction a text-editing fix loop
         # can carry out - which is exactly how it ended up inventing one.
         import flexfactor_prodready_engine as E
 
         class _T:
-            def __init__(self, m): self.manager = m
+            def __init__(self, m, mk=""): self.manager, self.marker = m, mk
 
-        pip_text = E._pinning_remediation([_T("pip")])
+        pip_text = E._pinning_remediation([_T("pip", "requirements.txt")])
         self.assertIn("==", pip_text)
         self.assertIn("requirements.txt", pip_text)
         self.assertIn("NEVER hand-write a lockfile", pip_text)
 
-        npm_text = E._pinning_remediation([_T("npm")])
+        npm_text = E._pinning_remediation([_T("npm", "package.json")])
         self.assertIn("GENERATED", npm_text)
         self.assertIn("NEVER hand-write a lockfile", npm_text)
 
