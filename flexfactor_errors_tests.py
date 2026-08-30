@@ -270,6 +270,40 @@ class EnvironmentalBuildFailureTests(unittest.TestCase):
         for log in ("", "   ", None):
             self.assertIsNone(E.build_failure_is_environmental(log))
 
+    def test_evidence_from_TWO_DIFFERENT_commands_is_not_an_excuse(self):
+        # FOUND IN REVIEW of this change (2026-08-29). _publication_gate
+        # CONCATENATES the logs of every command it ran. Searching the whole
+        # blob independently let a harmless `next/font` line in a SUCCESSFUL
+        # build pair with an ECONNREFUSED raised by an application TEST, and
+        # report a real program/test defect as a host outage. That direction is
+        # the dangerous one: it SUPPRESSES a genuine failure rather than merely
+        # mis-wording it.
+        log = (
+            "$ npm run build\n"
+            "  Compiled successfully. next/font loaded IBM Plex Sans.\n"
+            "\n"
+            "$ npm test\n"
+            "  FAIL test/api.test.ts > retries upstream\n"
+            "  Error: connect ECONNREFUSED 10.0.0.5:5432\n")
+        self.assertIsNone(E.build_failure_is_environmental(log))
+
+    def test_evidence_inside_ONE_command_is_still_recognised(self):
+        # The real shape must keep working: both tokens in the same `$` block.
+        log = ("$ npm run typecheck\n  ok\n\n"
+               "$ npm run build\n"
+               "  Error: connect ECONNREFUSED 127.0.0.1:9\n"
+               "  `next/font` error: Failed to fetch `IBM Plex Sans` from Google Fonts.\n")
+        cause = E.build_failure_is_environmental(log)
+        self.assertIsNotNone(cause)
+        self.assertIn("127.0.0.1:9", cause)
+
+    def test_a_log_with_no_command_headers_is_one_segment(self):
+        # Not every caller writes `$ ` headers; that shape keeps the old
+        # whole-text behaviour rather than silently never matching.
+        log = ("Error: getaddrinfo ENOTFOUND registry.npmjs.org\n"
+               "npm ERR! failed to fetch next\n")
+        self.assertIsNotNone(E.build_failure_is_environmental(log))
+
     def test_the_verdict_is_environment_not_program_defect(self):
         # End-to-end through the ledger's own kind, since the kind is what the
         # dashboard error box and errors.md both render.

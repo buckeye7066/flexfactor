@@ -252,20 +252,37 @@ def build_failure_is_environmental(log_text: str) -> Optional[str]:
     text = log_text or ""
     if not text.strip():
         return None
-    net = next((p for p in _NETWORK_FAILURE_TOKENS
-                if re.search(p, text, re.I)), None)
-    if net is None:
-        return None
-    res = next((p for p in _BUILD_RESOURCE_TOKENS
-                if re.search(p, text, re.I)), None)
-    if res is None:
-        return None
-    hit = re.search(net, text, re.I)
-    blackhole = re.search(r"127\.0\.0\.1:9\b|localhost:9\b", text)
-    where = " (a proxy pointing at the discard port 127.0.0.1:9)" if blackhole else ""
-    return (f"the build could not reach the network{where}: "
-            f"{hit.group(0) if hit else 'connection failure'} while fetching a "
-            "build-time resource")
+    # BOTH TOKENS MUST BELONG TO THE SAME FAILING COMMAND (caught in review of
+    # this change, 2026-08-29). `_publication_gate` CONCATENATES the logs of
+    # every command it ran - a passing build then a failing test suite - so
+    # searching the whole blob independently would let a harmless `next/font`
+    # line in the SUCCESSFUL build pair up with an `ECONNREFUSED` raised by an
+    # application TEST, and report a genuine program/test defect as a host
+    # outage. That is the false-excuse direction this detector must never take,
+    # because it would suppress a real failure instead of merely mis-wording it.
+    #
+    # The gate writes each command as a `$ <cmd>` header (see
+    # baseline-publication-failure.log), so segment on that and require one
+    # segment to carry both kinds of evidence. A log with no headers is treated
+    # as a single segment, which is the old behaviour for that shape only.
+    segments = re.split(r"(?m)^\s*\$ ", text)
+    for seg in segments:
+        if not seg.strip():
+            continue
+        net = next((p for p in _NETWORK_FAILURE_TOKENS
+                    if re.search(p, seg, re.I)), None)
+        if net is None:
+            continue
+        if not any(re.search(p, seg, re.I) for p in _BUILD_RESOURCE_TOKENS):
+            continue
+        hit = re.search(net, seg, re.I)
+        blackhole = re.search(r"127\.0\.0\.1:9\b|localhost:9\b", seg)
+        where = (" (a proxy pointing at the discard port 127.0.0.1:9)"
+                 if blackhole else "")
+        return (f"the build could not reach the network{where}: "
+                f"{hit.group(0) if hit else 'connection failure'} while fetching a "
+                "build-time resource")
+    return None
 
 
 def responsible_frame(exc: Optional[BaseException], tool_root: str) -> Optional[Dict[str, Any]]:

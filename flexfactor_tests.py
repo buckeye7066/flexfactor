@@ -10357,6 +10357,38 @@ class ArrayItemShapeTests(unittest.TestCase):
             ff._check_array_item_shape(
                 {"files": ["a.ts"]}, ff.TEST_GEN_SCHEMA, "[]")
 
+    def test_a_STRING_where_an_array_belongs_is_rejected(self):
+        # FOUND IN REVIEW of this very change (2026-08-29). The first draft did
+        # `if not isinstance(value, list): continue`, so a present-but-wrong
+        # type sailed through BOTH this chokepoint and the defense-in-depth
+        # call inside the unit-test try. `for f in "tests/foo.test.ts"` then
+        # iterates CHARACTERS and calls "t".get("path") - the identical
+        # "'str' object has no attribute 'get'" from the identical schema,
+        # one type further out. A guard that fails open where it must fail
+        # closed is worse than no guard, because it reads as covered.
+        with self.assertRaises(RuntimeError) as caught:
+            ff._check_structured_type(
+                {"files": "tests/foo.test.ts", "notes": "n"},
+                ff.TEST_GEN_SCHEMA, "{}")
+        self.assertIn("'files'", str(caught.exception))
+        self.assertIn("array", str(caught.exception))
+
+    def test_a_dict_where_an_array_belongs_is_rejected(self):
+        # Same hole, different wrong type: iterating a dict yields its KEYS
+        # (strings), so this crashes the caller exactly the same way.
+        with self.assertRaises(RuntimeError):
+            ff._check_structured_type(
+                {"files": {"path": "a.ts"}, "notes": "n"},
+                ff.TEST_GEN_SCHEMA, "{}")
+
+    def test_an_explicit_null_array_is_still_treated_as_absent(self):
+        # `{"files": null}` is the model declining to supply the key, which the
+        # decoy guard already treats as a normal partial answer. Raising here
+        # would turn ordinary partial output into a hard failure.
+        out = ff._check_structured_type({"files": None, "notes": "n"},
+                                        ff.TEST_GEN_SCHEMA, "{}")
+        self.assertIsNone(out["files"])
+
     def test_a_non_dict_passes_through_for_the_top_level_check_to_judge(self):
         # This helper only reasons about elements INSIDE a dict's arrays; the
         # top-level verdict stays with _check_structured_type so the two cannot
