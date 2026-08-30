@@ -17226,10 +17226,51 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     spend_usd=round(meter.usd, 6),
                     final_commit=(evidence or {}).get("final_commit"))
         if checkpoint is not None:
-            with contextlib.suppress(Exception):
-                checkpoint.finish(
-                    status=("finished" if run_complete else "interrupted"),
-                    defects_found=len(all_findings), defects_fixed=len(applied_files))
+            # THE TERMINAL WRITE WAS THE ONE WRITE THAT COULD NOT BE ALLOWED TO
+            # FAIL SILENTLY, AND IT WAS THE ONLY ONE WRAPPED IN A BLANKET
+            # SUPPRESSOR.
+            #
+            # `finish()` is what marks a program's checkpoint terminal. Under
+            # `--parallel N` one process owns N checkpoints, and until a
+            # checkpoint is terminal it stays LOCKED to the owning pid - so a
+            # suppressed failure here does not lose a status line, it makes that
+            # program permanently un-resumable while telling nobody. The next
+            # resume finds no checkpoint and silently restarts from ZERO,
+            # re-reviewing and re-billing work already paid for.
+            #
+            # Measured 2026-08-30: SermonSmith, IPlay and reporewards had each
+            # ended (final readiness written 22:59 / 22:46 / 21:28) while their
+            # checkpoints still read status="running" with a stale finished_at
+            # from a previous run - the exact footprint of this call not taking
+            # effect. This machine also has a documented failure mode for it:
+            # AV scanning makes os.replace() raise PermissionError(13) when the
+            # target is briefly open, which save(force=True) does on every
+            # flush.
+            #
+            # So: retry a few times (the lock is transient by nature), and if it
+            # still will not land, SAY SO on the console and in the error ledger
+            # instead of swallowing it. A run that cannot record that it
+            # finished is a run nobody can continue.
+            _finish_error = None
+            for _attempt in range(4):
+                try:
+                    checkpoint.finish(
+                        status=("finished" if run_complete else "interrupted"),
+                        defects_found=len(all_findings),
+                        defects_fixed=len(applied_files))
+                    _finish_error = None
+                    break
+                except Exception as _ex:  # noqa: BLE001 - reported below, never raised
+                    _finish_error = _ex
+                    time.sleep(0.25 * (_attempt + 1))
+            if _finish_error is not None:
+                print(f"{pfx}CHECKPOINT NOT FINALIZED: {_finish_error} - this "
+                      "program cannot be resumed until its checkpoint is "
+                      "writable; the run's work is committed, only the "
+                      "resume marker is missing")
+                with contextlib.suppress(Exception):
+                    _ledger("checkpoint", _finish_error,
+                            program_file=getattr(checkpoint, "path", ""))
         if _rsmod is not None:
             with contextlib.suppress(Exception):
                 _rsmod.prune(RUNS_PATH)  # bound ~/.flexfactor/runs; keep finished runs pruned first

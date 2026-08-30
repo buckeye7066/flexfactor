@@ -10301,6 +10301,126 @@ class SuiteExecutionEvidenceTests(unittest.TestCase):
         self.assertIn("_suite_reported_tests(suite_log)", src)
 
 
+class ParallelSiblingResumeTests(unittest.TestCase):
+    """Under --parallel N, a FINISHED program stayed locked by a LIVE sibling.
+
+    `is_resumable` refused any checkpoint whose pid is alive, on the reasoning
+    that "a run whose PID is alive belongs to someone else". True for one
+    process per program - but under `--parallel N` ONE process owns N
+    checkpoints, and a program can finish while its siblings keep working. Every
+    finished program was therefore un-resumable until the whole batch exited,
+    and a resume attempt got no checkpoint and silently started that program
+    again FROM ZERO, re-reviewing and re-billing work already paid for.
+
+    Measured 2026-08-30: of a five-program run, SermonSmith, IPlay and
+    reporewards had each finished partial hours earlier (final readiness written
+    22:59 / 22:46 / 21:28) while GrantFlow and Genemap were still working, and
+    none of the three could be continued.
+
+    `stopped` is written ONLY by the owning run declaring itself done with that
+    program, so honouring it is the lock's owner releasing it - not a guess
+    about liveness."""
+
+    def _ckpt(self, **over):
+        import flexfactor_runstate as rs
+        d = {"schema": rs.SCHEMA_VERSION, "status": "running",
+             "pid": os.getpid(),          # a definitely-alive pid that is not ours
+             "reviewed": {"a.py": {"sha": "x"}}}
+        d.update(over)
+        return d
+
+    def _alive_foreign_pid(self):
+        # os.getpid() is excluded by the guard itself, so use a pid that is
+        # alive and NOT us: the parent of this process is close enough for the
+        # branch under test, and on Windows os.getppid() is real.
+        return os.getppid() or 4
+
+    def test_a_finished_sibling_is_resumable_while_the_owner_lives(self):
+        import flexfactor_runstate as rs
+        pid = self._alive_foreign_pid()
+        if not rs.pid_alive(pid):
+            self.skipTest("no live foreign pid available to exercise the guard")
+        locked = self._ckpt(pid=pid)
+        self.assertFalse(rs.is_resumable(locked),
+                         "a program still being worked on must stay locked")
+        released = self._ckpt(pid=pid, stopped=True)
+        self.assertTrue(rs.is_resumable(released),
+                        "the owning run declared it done; it must be resumable")
+
+    def test_a_checkpoint_without_the_marker_keeps_the_old_behaviour(self):
+        # An older run's checkpoints and a genuine crash both look like this,
+        # and both must behave exactly as before.
+        import flexfactor_runstate as rs
+        pid = self._alive_foreign_pid()
+        if not rs.pid_alive(pid):
+            self.skipTest("no live foreign pid available")
+        self.assertFalse(rs.is_resumable(self._ckpt(pid=pid)))
+
+    def test_a_dead_owner_is_still_resumable_marker_or_not(self):
+        import flexfactor_runstate as rs
+        dead = self._ckpt(pid=999_999_999)
+        if rs.pid_alive(999_999_999):
+            self.skipTest("999999999 is a live pid on this host")
+        self.assertTrue(rs.is_resumable(dead))
+
+    def test_stopped_does_not_override_the_other_guards(self):
+        # The marker releases the PID lock and NOTHING else: a terminal status,
+        # a wrong schema, or an empty checkpoint must still refuse.
+        import flexfactor_runstate as rs
+        self.assertFalse(rs.is_resumable(self._ckpt(stopped=True, status="finished")))
+        self.assertFalse(rs.is_resumable(self._ckpt(stopped=True, schema=0)))
+        self.assertFalse(rs.is_resumable(
+            {"schema": rs.SCHEMA_VERSION, "status": "running", "pid": 1,
+             "stopped": True, "reviewed": {}}))
+
+
+class CheckpointFinalizationIsNotSilentTests(unittest.TestCase):
+    """The one write that must not fail silently was the only one suppressed.
+
+    `checkpoint.finish()` is what marks a program's checkpoint terminal, and
+    until it is terminal that program stays LOCKED to the owning pid. So a
+    suppressed failure there does not lose a status line - it makes the program
+    permanently un-resumable while telling nobody, and the next resume silently
+    restarts it from zero.
+
+    Measured 2026-08-30: three programs had ended (final readiness written
+    22:59 / 22:46 / 21:28) while their checkpoints still read status="running"
+    with a stale finished_at from a previous run - the footprint of this call
+    not taking effect. This machine has a documented cause: AV scanning makes
+    os.replace() raise PermissionError(13) when the target is briefly open,
+    which save(force=True) does on every flush.
+
+    Source-level guards, in the same style as
+    test_every_capture_call_site_pins_an_encoding: the call site is inside a
+    3,000-line function and cannot be driven in isolation."""
+
+    def _finish_block(self):
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        i = src.find("checkpoint.finish(")
+        self.assertGreater(i, 0, "checkpoint.finish call site not found")
+        return src, src[max(0, i - 2200):i + 1600]
+
+    def test_the_terminal_write_is_no_longer_blanket_suppressed(self):
+        _src, block = self._finish_block()
+        before = block[:block.find("checkpoint.finish(")]
+        # The exact pre-fix shape: a bare suppressor immediately before the
+        # terminal write. Built from parts so this assertion cannot itself
+        # contain the pattern it forbids.
+        suppressed = ("with contextlib.suppress(Exception):" + chr(10)
+                      + " " * 16 + "checkpoint.finish(")
+        self.assertNotIn(suppressed, block,
+                         "the terminal checkpoint write is silently suppressed again")
+        self.assertIn("for _attempt in range(", before,
+                      "the transient-lock retry is gone")
+
+    def test_a_persistent_failure_is_reported_not_swallowed(self):
+        _src, block = self._finish_block()
+        self.assertIn("CHECKPOINT NOT FINALIZED", block,
+                      "a checkpoint that cannot be finalized must say so")
+        self.assertIn("cannot be resumed", block,
+                      "the message must name the consequence, not just the error")
+
+
 class TrustedRepoBuildNetworkTests(unittest.TestCase):
     """FlexFactor blackholed its OWN build's network, then blamed the repo.
 
