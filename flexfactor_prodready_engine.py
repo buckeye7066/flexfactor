@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field, asdict
 
 # Bound every config read: a hostile or corrupt repo must not be able to make
@@ -675,6 +676,21 @@ def run_bootstrap(project_dir: str, toolchains: list[Toolchain], run,
     return results
 
 
+# Apple's toolchains (swiftpm, Xcode, CocoaPods) exist only on macOS. A
+# Capacitor/React-Native project routinely carries a generated ios/ component,
+# and on a Windows or Linux host its dependencies can never be installed - that
+# is a property of the HOST, not a defect in the repository.
+_APPLE_ONLY_ECOSYSTEMS = frozenset({"swift", "xcode", "cocoapods", "ios"})
+
+
+def _host_can_build(tc: "Toolchain") -> bool:
+    """False when this machine could not build the component whatever the owner
+    does. Narrow on purpose: only the Apple-only ecosystems, and only when the
+    host is not macOS. Everything else is assumed buildable, so a genuine
+    "dependencies not installed" is still reported."""
+    return not (tc.ecosystem in _APPLE_ONLY_ECOSYSTEMS and sys.platform != "darwin")
+
+
 def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
     """Can we actually prove a change didn't break this project?
 
@@ -694,9 +710,37 @@ def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
     # complaint about it - there is nothing that could have installed them.
     missing = [t for t in buildable
                if t.build_needs_deps and t.install and not t.deps_installed]
+    # A COMPONENT THIS HOST CANNOT BUILD AT ALL IS NOT AN INSTALL FAILURE.
+    #
+    # Measured on GrantFlow 2026-08-30 (win32): node + three gradle components
+    # all had deps_installed=True, and the ENTIRE program was reported
+    # "Changes can be build-verified: FAIL [critical] - dependencies not
+    # installed for swift:ios/App/CapApp-SPM". That component is a
+    # Capacitor-generated iOS Swift package; Apple toolchains require macOS and
+    # neither swift nor xcodebuild exists on this machine, so its dependencies
+    # can NEVER be installed here. The finding was unclosable by any action the
+    # owner could take, on a CRITICAL gate, while four of five components were
+    # fully verifiable.
+    #
+    # The honesty guard is preserved, not weakened: the unbuildable components
+    # are NAMED in the message so the verification claim stays scoped to what
+    # was actually provable, and if NOTHING is buildable on this host the gate
+    # still fails. What changes is that a platform the owner is not on can no
+    # longer veto verification of the parts that do build here.
+    foreign = [t for t in missing if not _host_can_build(t)]
+    missing = [t for t in missing if _host_can_build(t)]
     if missing:
         names = ", ".join(f"{t.ecosystem}:{t.root}" for t in missing)
         return False, f"dependencies not installed for {names} - build gate would false-fail"
+    local = [t for t in buildable if _host_can_build(t)]
+    if not local:
+        eco = ", ".join(sorted({t.ecosystem for t in buildable}))
+        return False, (f"the only build system(s) detected ({eco}) cannot run on "
+                       f"this host ({sys.platform}) - changes are UNVERIFIED here")
+    if foreign:
+        names = ", ".join(f"{t.ecosystem}:{t.root}" for t in foreign)
+        return True, ("build verification available; NOT verifiable on this host "
+                      f"({sys.platform}): {names}")
     return True, "build verification available"
 
 
@@ -815,7 +859,86 @@ def _current_lockfile(project_dir: str, tc: Toolchain) -> str | None:
     if tc.manager == "go" and "require" not in _read_text(
             os.path.join(root, "go.mod")):
         return "go.mod (no dependencies)"
+    # GRADLE AND MAVEN PIN BY DECLARATION, and _LOCKFILES had no entry for
+    # either - so `.get(manager, ())` was always empty and EVERY Java component
+    # failed this high-severity gate permanently, with no action that could ever
+    # close it. That is the same unclosable-finding shape as the licence gate,
+    # and it is worse here because this one BLOCKS.
+    #
+    # Measured on sermonsmith 2026-08-30: apps/mobile/android is a Capacitor
+    # shell whose every version is an exact pin in variables.gradle
+    # (androidxCoreVersion = '1.17.0', ...) with ZERO dynamic versions anywhere
+    # in its .gradle files - and it was reported "no lockfile: java:apps/mobile/
+    # android" as one of three blockers keeping the program NOT PRODUCTION
+    # READY.
+    #
+    # This mirrors the pip precedent directly above: a pinned requirements.txt
+    # IS pip's pinning mechanism, and exact declared versions are Gradle's and
+    # Maven's. The teeth stay in: a DYNAMIC version anywhere ("1.+", "+",
+    # "latest.release", or a Maven range/LATEST/RELEASE) means the build is not
+    # reproducible and still fails.
+    if tc.manager in ("gradle", "maven"):
+        declared = _declared_jvm_versions(root, tc.manager)
+        if declared == "dynamic":
+            return None
+        if declared == "pinned":
+            return ("exact declared versions (gradle)" if tc.manager == "gradle"
+                    else "exact declared versions (pom.xml)")
     return None
+
+
+# Gradle dependency locking, when a project opts into it, writes one of these.
+_GRADLE_LOCK_DIR = os.path.join("gradle", "dependency-locks")
+_GRADLE_LOCK_FILES = ("gradle.lockfile", "buildscript-gradle.lockfile")
+
+# A version that is resolved at build time rather than written down. Gradle:
+# "1.+", "+", "latest.release". Maven: "LATEST", "RELEASE", and range syntax
+# "[1.0,2.0)". Any of these means two builds can differ.
+_DYNAMIC_GRADLE_RE = re.compile(
+    r"""["']([A-Za-z0-9._-]+):([A-Za-z0-9._-]+):([^"']*(?:\+|latest\.\w+))["']""",
+    re.I)
+_DYNAMIC_MAVEN_RE = re.compile(
+    r"<version>\s*(?:LATEST|RELEASE|[\[\(][^<]*)\s*</version>", re.I)
+
+
+def _declared_jvm_versions(root: str, manager: str) -> str:
+    """"pinned" | "dynamic" | "none" for a Gradle/Maven component.
+
+    "none" means no dependency declarations were found at all, which is NOT the
+    same as pinned - the caller must not treat an unreadable or empty component
+    as satisfied.
+    """
+    if manager == "gradle":
+        if any(_exists(root, n) for n in _GRADLE_LOCK_FILES):
+            return "pinned"
+        if os.path.isdir(os.path.join(root, _GRADLE_LOCK_DIR)):
+            return "pinned"
+        texts, saw_dep = [], False
+        for current, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                if name.endswith((".gradle", ".gradle.kts", ".properties")):
+                    texts.append(_read_text(os.path.join(current, name)))
+        for text in texts:
+            if not text:
+                continue
+            if _DYNAMIC_GRADLE_RE.search(text):
+                return "dynamic"
+            if re.search(r"""["'][A-Za-z0-9._-]+:[A-Za-z0-9._-]+:[^"']+["']""", text):
+                saw_dep = True
+            # Capacitor/Android convention: versions live in ext {} as literals
+            # and are referenced by name, so the coordinate string alone does
+            # not carry them. A quoted x.y(.z) literal is the declaration.
+            if re.search(r"""^\s*\w*[Vv]ersion\s*=\s*['"][0-9]+(?:\.[0-9]+)+""",
+                         text, re.M):
+                saw_dep = True
+        return "pinned" if saw_dep else "none"
+    text = _read_text(os.path.join(root, "pom.xml"))
+    if not text:
+        return "none"
+    if _DYNAMIC_MAVEN_RE.search(text):
+        return "dynamic"
+    return "pinned" if "<version>" in text else "none"
 
 
 # --------------------------------------------------------------------------- #

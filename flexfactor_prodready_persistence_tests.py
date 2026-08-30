@@ -247,6 +247,155 @@ class PersistenceReadinessGateTests(unittest.TestCase):
         self.assertEqual(g["schema_bootstrap_covers_extras"].status, "na")
 
 
+class JvmDependencyPinningGateTests(unittest.TestCase):
+    """Every Java component failed "Dependencies are lock-pinned" forever.
+
+    `_LOCKFILES` had no entry for gradle OR maven, so `.get(manager, ())` was
+    always empty and no action could ever close the finding - on a HIGH gate
+    that BLOCKS. Same unclosable shape as the licence gate, but worse, because
+    this one stops a release.
+
+    Measured on sermonsmith 2026-08-30: apps/mobile/android is a Capacitor
+    shell whose every version is an exact pin in variables.gradle
+    (androidxCoreVersion = '1.17.0', ...), with ZERO dynamic versions in any
+    .gradle file - and it was reported "no lockfile: java:apps/mobile/android"
+    as one of three blockers keeping the program NOT PRODUCTION READY.
+
+    Gradle and Maven pin BY DECLARATION, exactly as pip does with a `==`
+    requirements.txt, which this gate already accepts."""
+
+    def _gate(self, files):
+        with _RepoFixture(files) as root:
+            chains = pr.detect_toolchains(root)
+            return {g.id: g for g in
+                    pr.assess_readiness(root, chains, _fake_run())}["deps_pinned"]
+
+    # A Capacitor-shaped Android module: versions as ext literals.
+    CAPACITOR = {
+        "build.gradle": "apply from: 'variables.gradle'\n",
+        "variables.gradle": ("ext {\n    androidxCoreVersion = '1.17.0'\n"
+                             "    androidxAppCompatVersion = '1.7.1'\n}\n"),
+        "settings.gradle": "include ':app'\n",
+    }
+
+    def test_exact_declared_gradle_versions_are_pinned(self):
+        self.assertEqual(self._gate(self.CAPACITOR).status, "pass")
+
+    def test_an_exact_gradle_COORDINATE_is_pinned(self):
+        self.assertEqual(self._gate({
+            "build.gradle": 'dependencies { implementation "androidx.core:core:1.17.0" }',
+            "settings.gradle": "include ':app'\n"}).status, "pass")
+
+    def test_a_DYNAMIC_gradle_version_still_FAILS(self):
+        # The teeth. "1.+" means two builds can differ, which is exactly what
+        # this gate exists to catch - widening it must not blunt that.
+        for version in ('1.+', '+', 'latest.release'):
+            g = self._gate({
+                "build.gradle": f'dependencies {{ implementation "a.b:c:{version}" }}',
+                "settings.gradle": "include ':app'\n"})
+            self.assertEqual(g.status, "fail", version)
+
+    def test_a_real_gradle_lockfile_is_honoured(self):
+        self.assertEqual(self._gate({
+            "build.gradle": 'dependencies { implementation "a.b:c:1.+" }',
+            "gradle.lockfile": "a.b:c:1.2.3=compileClasspath\n",
+            "settings.gradle": "include ':app'\n"}).status, "pass")
+
+    def test_maven_exact_versions_are_pinned(self):
+        self.assertEqual(self._gate({
+            "pom.xml": ("<project><dependencies><dependency>"
+                        "<version>1.2.3</version></dependency></dependencies></project>")
+        }).status, "pass")
+
+    def test_a_maven_RANGE_or_LATEST_still_FAILS(self):
+        for v in ("[1.0,2.0)", "LATEST", "RELEASE"):
+            g = self._gate({"pom.xml": f"<project><version>{v}</version></project>"})
+            self.assertEqual(g.status, "fail", v)
+
+    def test_the_gate_keeps_its_severity(self):
+        # Still high and still blocking when it genuinely fails - the fix
+        # removes a false positive, it does not soften the gate.
+        g = self._gate({"build.gradle": 'implementation "a.b:c:+"',
+                        "settings.gradle": "include ':app'\n"})
+        if g.status == "fail":
+            self.assertEqual(g.severity, "high")
+            self.assertTrue(pr.is_blocking(g))
+
+    def test_npm_pinning_is_untouched(self):
+        # Regression guard: the JVM branch must not change the Node verdict.
+        self.assertEqual(self._gate({"package.json": '{"name":"x"}'}).status, "fail")
+        self.assertEqual(self._gate({"package.json": '{"name":"x"}',
+                                     "package-lock.json": '{"lockfileVersion":3}'}
+                                    ).status, "pass")
+
+
+class ForeignPlatformDoesNotVetoVerificationTests(unittest.TestCase):
+    """An iOS component vetoed build-verification of a whole Windows project.
+
+    Measured on GrantFlow 2026-08-30 (win32): node and three gradle components
+    all had deps_installed=True, and the ENTIRE program was reported
+    "Changes can be build-verified: FAIL [critical] - dependencies not installed
+    for swift:ios/App/CapApp-SPM". That is a Capacitor-generated iOS Swift
+    package; Apple toolchains require macOS and neither swift nor xcodebuild
+    exists on this machine, so its dependencies can NEVER be installed here.
+
+    An unclosable finding on a CRITICAL gate, while four of five components were
+    fully verifiable. The honesty guard is kept - the unbuildable component is
+    NAMED so the verification claim stays scoped - but a platform the owner is
+    not on can no longer veto the parts that do build."""
+
+    def _tc(self, ecosystem, root, deps_installed, build=True, install=True):
+        return pr.Toolchain(
+            ecosystem=ecosystem, root=root, manager="x", marker="m",
+            build=[["build"]] if build else [], install=[["install"]] if install else [],
+            build_needs_deps=True, deps_installed=deps_installed)
+
+    def test_an_uninstallable_APPLE_component_does_not_veto_the_rest(self):
+        ok, why = pr.verification_is_real([
+            self._tc("node", ".", True),
+            self._tc("swift", "ios/App/CapApp-SPM", False),
+        ])
+        self.assertTrue(ok)
+        # ...and the claim must SAY what was not covered, or it overstates.
+        self.assertIn("swift:ios/App/CapApp-SPM", why)
+        self.assertIn("NOT verifiable on this host", why)
+
+    def test_a_REAL_missing_install_still_fails(self):
+        # The teeth. A node component whose deps are genuinely not installed is
+        # still a false-failing build gate and must still be reported.
+        ok, why = pr.verification_is_real([
+            self._tc("node", ".", False),
+            self._tc("swift", "ios", False),
+        ])
+        self.assertFalse(ok)
+        self.assertIn("node:.", why)
+
+    def test_an_apple_ONLY_project_is_still_unverified_here(self):
+        # If nothing on this host can build, the gate must not claim
+        # verification just because the only failures were foreign.
+        ok, why = pr.verification_is_real([self._tc("swift", "ios", False)])
+        self.assertFalse(ok)
+        self.assertIn("cannot run on this host", why)
+
+    def test_a_fully_installed_project_is_unchanged(self):
+        ok, why = pr.verification_is_real([self._tc("node", ".", True)])
+        self.assertTrue(ok)
+        self.assertEqual("build verification available", why)
+
+    def test_the_no_build_system_verdicts_are_unchanged(self):
+        self.assertFalse(pr.verification_is_real([])[0])
+        self.assertFalse(pr.verification_is_real(
+            [self._tc("node", ".", True, build=False)])[0])
+
+    def test_host_capability_is_narrow(self):
+        # Only Apple ecosystems, and only off-macOS. Everything else stays
+        # assumed-buildable so a genuine failure is still surfaced.
+        import flexfactor_prodready_engine as E
+        self.assertFalse(E._host_can_build(self._tc("swift", "ios", False)))
+        for eco in ("node", "python", "java", "go", "rust", "dotnet"):
+            self.assertTrue(E._host_can_build(self._tc(eco, ".", False)), eco)
+
+
 class LicenceDeclarationGateTests(unittest.TestCase):
     """"License declared" asked a question it would not accept the real answer to.
 
