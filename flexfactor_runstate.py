@@ -399,7 +399,26 @@ def is_resumable(data: dict) -> bool:
         return False
     if str(data.get("status")) not in LIVE_STATUSES:
         return False
-    if pid_alive(data.get("pid") or 0) and int(data.get("pid") or 0) != os.getpid():
+    # THE PID GUARD ASSUMED ONE PROCESS = ONE PROGRAM. Under `--parallel N` a
+    # single process owns N checkpoints, and a program can finish while its
+    # siblings keep working - so every finished program stayed LOCKED until the
+    # whole batch exited, and a resume attempt got no checkpoint and silently
+    # started that program again from ZERO, re-reviewing and re-billing work
+    # already paid for.
+    #
+    # Measured 2026-08-30: of a five-program run, SermonSmith, IPlay and
+    # reporewards had each finished partial hours earlier (final readiness
+    # written 22:59 / 22:46 / 21:28) while GrantFlow and Genemap were still
+    # working, and none of the three could be continued.
+    #
+    # `stopped` is set ONLY by the owning run declaring itself done with that
+    # program (flexfactor_directed, on a done-partial outcome), so honouring it
+    # is not a guess about liveness - it is the owner of the lock releasing it.
+    # A checkpoint without the marker keeps the old behaviour exactly, which is
+    # what an older run's checkpoints and a genuine crash both look like.
+    if (not data.get("stopped")
+            and pid_alive(data.get("pid") or 0)
+            and int(data.get("pid") or 0) != os.getpid()):
         return False
     # Nothing to pick up: no review recorded, nothing fixed, no bootstrap done.
     d = data
