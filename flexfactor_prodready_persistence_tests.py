@@ -606,6 +606,42 @@ class FabricatedLockfileTests(unittest.TestCase):
             if "deps_pinned" in gates and gates["deps_pinned"].status != "na":
                 self.assertEqual(gates["deps_pinned"].status, "fail")
 
+    def test_a_GENUINE_lock_over_the_read_cap_is_not_accused(self):
+        # THE DANGEROUS DIRECTION (caught in review). _read_text returns "" for
+        # a file over MAX_CONFIG_BYTES (512 KiB), a symlink, or any read error -
+        # and a real package-lock.json ROUTINELY exceeds that. Calling those
+        # fabricated would re-open a gate the owner has genuinely satisfied.
+        import json as _j
+        big = _j.dumps({"lockfileVersion": 3, "packages": {
+            "": {"name": "p"},
+            **{f"node_modules/p{i}": {"version": "1.0.0",
+                                      "resolved": f"https://r/p{i}.tgz",
+                                      "integrity": "sha512-" + "A" * 60}
+               for i in range(4000)}}})
+        self.assertGreater(len(big), 512 * 1024)
+        self.assertFalse(self._fab("package-lock.json", big))
+
+    def test_only_a_TRULY_zero_byte_lock_counts_as_empty(self):
+        self.assertTrue(self._fab("Pipfile.lock", ""))
+
+    def test_a_valid_npm_lock_with_NO_dependencies_is_accepted(self):
+        # `npm install --package-lock-only` on a dependency-free project writes
+        # a v3 lock whose only entry is the root package "", which carries no
+        # integrity because there is nothing to fetch. That is a real lock.
+        self.assertFalse(self._fab("package-lock.json",
+                                   '{"name": "p", "lockfileVersion": 3,'
+                                   ' "packages": {"": {"name": "p", "version": "1.0.0"}}}'))
+
+    def test_a_package_NAMED_placeholder_is_not_a_placeholder_hash(self):
+        # Matching the raw text would accuse a lock containing a package named
+        # "placeholder", or a resolved URL with "todo" in the path. The match is
+        # against a hash FIELD'S VALUE only.
+        self.assertFalse(self._fab("package-lock.json",
+                                   '{"lockfileVersion": 3, "packages":'
+                                   ' {"node_modules/placeholder": {"version": "1.0.0",'
+                                   ' "resolved": "https://r/todo-utils.tgz",'
+                                   ' "integrity": "sha512-REAL"}}}'))
+
     def test_the_remediation_says_what_to_actually_do(self):
         # "Commit the lockfile" is not an instruction a text-editing fix loop
         # can carry out - which is exactly how it ended up inventing one.

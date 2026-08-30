@@ -75,9 +75,12 @@ _PINNED_IN_MANIFEST = {
 
 # A hash a resolver never produced. Measured from the lockfile the author model
 # invented for IPlay 2026-08-30: `"sha256": "generated-lockfile-sha"`.
+# Matched against a hash FIELD'S VALUE in full, never against raw file text -
+# scanning the text would accuse a lock containing a package named
+# "placeholder" or a resolved URL with "todo" in the path.
 _PLACEHOLDER_HASH_RE = re.compile(
-    r"""["'](?:generated[- ]?lockfile[- ]?sha|placeholder|todo|changeme|"""
-    r"""fake[- ]?hash|sha256-placeholder|xxx+)["']""", re.I)
+    r"""(?:sha\d*[:=-]?\s*)?(?:generated[- ]?lockfile[- ]?sha|placeholder|todo|"""
+    r"""changeme|fake[- ]?hash|sha256-placeholder|x{3,})""", re.I)
 
 
 def _lockfile_is_fabricated(path: str) -> bool:
@@ -99,9 +102,16 @@ def _lockfile_is_fabricated(path: str) -> bool:
     """
     text = _read_text(path)
     if not text.strip():
-        return True                       # an empty lockfile locks nothing
-    if _PLACEHOLDER_HASH_RE.search(text):
-        return True
+        # UNREADABLE IS NOT EMPTY (caught in review). `_read_text` returns ""
+        # for a file over MAX_CONFIG_BYTES, a symlink, or any read error - and a
+        # genuine package-lock.json ROUTINELY exceeds 512 KiB. Calling those
+        # fabricated would re-open a gate the owner has actually satisfied,
+        # which is the dangerous direction for this check. Only a file that is
+        # really zero bytes locks nothing.
+        try:
+            return os.path.getsize(path) == 0
+        except OSError:
+            return False                  # cannot even stat it -> not accused
     if not path.lower().endswith((".lock", ".json")):
         return False                      # not a shape we can judge
     try:
@@ -110,17 +120,48 @@ def _lockfile_is_fabricated(path: str) -> bool:
         return False                      # unreadable -> not accused
     if not isinstance(data, dict):
         return False
+    # PLACEHOLDER ONLY IN A HASH VALUE (caught in review). Scanning the whole
+    # text would accuse a lock containing a package literally named
+    # "placeholder", or a resolved URL with "todo" in the path.
+    if _has_placeholder_hash(data):
+        return True
     groups = [v for k, v in data.items()
               if k in ("default", "develop", "packages", "dependencies")
               and isinstance(v, dict)]
-    entries = [e for g in groups for e in g.values() if isinstance(e, dict)]
-    if not entries:
-        return False                      # nothing to judge
+    entries = [(name, e) for g in groups for name, e in g.items()
+               if isinstance(e, dict)]
+    # A VALID LOCK CAN LEGITIMATELY HAVE NO HASHED DEPENDENCIES (caught in
+    # review): `npm install --package-lock-only` on a dependency-free project
+    # writes a v3 lock whose only entry is the root package `""`, which carries
+    # no integrity because there is nothing to fetch. That is a real lock.
+    real = [(n, e) for n, e in entries if n not in ("", ".")]
+    if not real:
+        return False                      # nothing to judge, or root-only
     # A real pipenv/npm lock records an integrity hash per package. None at all,
-    # across every entry, means nothing was ever resolved.
+    # across every dependency entry, means nothing was ever resolved.
     return not any(
         any(k in e for k in ("hashes", "hash", "integrity", "resolved", "checksum"))
-        for e in entries)
+        for _n, e in real)
+
+
+def _has_placeholder_hash(data, depth: int = 0) -> bool:
+    """A hash-named field whose VALUE is a literal placeholder."""
+    if depth > 6 or not isinstance(data, (dict, list)):
+        return False
+    if isinstance(data, list):
+        return any(_has_placeholder_hash(v, depth + 1) for v in data)
+    for key, value in data.items():
+        k = str(key).lower()
+        if k in ("hash", "hashes", "integrity", "checksum", "sha256", "sha512"):
+            flat = [value] if isinstance(value, str) else (
+                list(value.values()) if isinstance(value, dict) else
+                list(value) if isinstance(value, list) else [])
+            if any(isinstance(v, str) and _PLACEHOLDER_HASH_RE.fullmatch(v.strip())
+                   for v in flat):
+                return True
+        if _has_placeholder_hash(value, depth + 1):
+            return True
+    return False
 
 
 def _pinning_remediation(unpinned) -> str:
