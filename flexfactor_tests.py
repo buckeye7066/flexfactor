@@ -10534,9 +10534,26 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
             self.assertIn(guard, block, f"readiness fixes bypass {guard}")
 
     def test_only_a_real_file_is_handed_to_the_fix_loop(self):
+        # THIS TEST PINNED THE BUG IT WAS MEANT TO CATCH. It grepped the source
+        # for `== "file"` - and `_contained_existence` is TRI-STATE
+        # ('exists' | 'missing' | 'refused'), so the comparison was ALWAYS
+        # FALSE, _readiness_fixable was always empty, and the remediation pass
+        # never ran once. Caught live on IPlay 2026-08-30: its only blocker had
+        # a perfectly resolved path to requirements.txt and was still not
+        # remediated. A source-grep guard is only as good as the string it
+        # grabs, so this now checks the CONTRACT as well.
         _src, block = self._block()
-        self.assertIn('_contained_existence(project_dir, p) == "file"', block,
-                      "a non-existent path could be handed to the fix loop")
+        self.assertIn('_contained_existence(project_dir, p) == "exists"', block,
+                      "the guard compares against a value this function never returns")
+        self.assertNotIn('== "file"', block,
+                         "the always-false comparison is back")
+        # And the contract itself, so a rename of the sentinel cannot silently
+        # re-break it: a real file must satisfy the guard, a missing one must not.
+        with _tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "real.txt"), "w", encoding="utf-8") as fh:
+                fh.write("x")
+            self.assertEqual(ff._contained_existence(d, "real.txt"), "exists")
+            self.assertEqual(ff._contained_existence(d, "nope.txt"), "missing")
 
     def test_every_failing_gate_with_a_path_is_a_candidate_not_just_blockers(self):
         # readiness["blockers"] is high+ only, so the LOW licence gate - the very

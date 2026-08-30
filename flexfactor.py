@@ -16772,8 +16772,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # for the rest (caught in review).
                     _bpaths = [str(p).replace("\\", "/").strip()
                                for p in (b.get("paths") or []) if str(p).strip()]
+                    # "exists", NOT "file". _contained_existence is TRI-STATE
+                    # ('exists' | 'missing' | 'refused') and never returns
+                    # "file" - so the first version of this guard was ALWAYS
+                    # FALSE, _readiness_fixable was always empty, and the whole
+                    # remediation pass never ran once. Caught live on IPlay
+                    # 2026-08-30: its only blocker ("no lockfile: python:.") had
+                    # a perfectly resolved path to requirements.txt and was
+                    # still not remediated. A 'refused' existence is fail-closed
+                    # and must never be handed to the fix loop either.
                     _bpaths = [p for p in _bpaths
-                               if _contained_existence(project_dir, p) == "file"]
+                               if _contained_existence(project_dir, p) == "exists"]
                     for _target in (_bpaths or ["(readiness)"]):
                         _finding = {
                             "file": _target, "line": 0,
@@ -16804,7 +16813,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         continue        # already queued as a blocker
                     for _p in (_g.get("paths") or []):
                         _p = str(_p).replace("\\", "/").strip()
-                        if _p and _contained_existence(project_dir, _p) == "file":
+                        if _p and _contained_existence(project_dir, _p) == "exists":
                             _readiness_fixable.setdefault(_p, []).append({
                                 "file": _p, "line": 0,
                                 "severity": _g.get("severity", "low"),
