@@ -8621,6 +8621,31 @@ def _suite_reported_tests(suite_log: str) -> bool:
     return bool(_SUITE_EXECUTION_EVIDENCE.search(suite_log or ""))
 
 
+def _review_residue_is_not_an_outage(reviewed: int, candidates: int) -> bool:
+    """Three zero review batches: a stuck RESIDUE, or a provider/route outage?
+
+    The zero-progress breaker exists so a run does not push on "against a MOSTLY
+    UNREVIEWED tree" - but it fired on three zero batches regardless of how much
+    had already been reviewed, and discarded the run either way.
+
+    Measured live, repo-rewards 2026-08-30: "27 of 28 candidate file(s) reviewed
+    all run". ONE unreviewable file aborted a 96%-complete run BEFORE the
+    full-suite gate, so the suite never ran, readiness recorded "Test suite
+    passes: tests were not run", and that became the program's only remaining
+    blocker - unclosable, because every retry aborts at the same file.
+
+    True  -> a per-file residue: stop reviewing, keep the completed work, and let
+             the remaining gates run. The stuck files are already in
+             all_review_incomplete, which honestly blocks convergence.
+    False -> nothing is getting through: the original fail-closed abort, which is
+             what caught the 0-of-3537 and 1-of-57 outages.
+
+    50% is `build_review_ledger`'s existing "MOSTLY SKIPPED" threshold rather
+    than a second invented number.
+    """
+    return candidates > 0 and reviewed * 2 >= candidates
+
+
 def _reuse_unit_test_result(suite_cmd, test_cmd, test_status) -> bool:
     """May the full-suite gate QUOTE the unit-test run instead of re-running it?
 
@@ -15837,6 +15862,44 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # confidently is worse than no diagnosis - it sent the owner
                     # looking at provider status pages for eight hours.
                     _reviewed_so_far = len(completed_review_files)
+                    # A STUCK RESIDUE IS NOT AN OUTAGE. This breaker's own
+                    # comment below says it exists so the run does not spend more
+                    # time "against a MOSTLY UNREVIEWED tree" - but it fired on
+                    # three zero batches regardless of how much had already been
+                    # reviewed, and threw the whole run away either way.
+                    #
+                    # Measured live, repo-rewards 2026-08-30: "27 of 28 candidate
+                    # file(s) reviewed all run". ONE unreviewable file aborted a
+                    # 96%-complete run BEFORE the full-suite gate, so the suite
+                    # never ran, readiness recorded "Test suite passes: tests were
+                    # not run", and that became the program's ONLY remaining
+                    # blocker - unclosable, because every retry aborts at the same
+                    # file. A tool that cannot finish a run it has 96% completed
+                    # cannot make that program production ready.
+                    #
+                    # Zero-of-everything is a route fault and still aborts. A
+                    # small residue is a PER-FILE problem: those files are already
+                    # in all_review_incomplete, which honestly blocks convergence,
+                    # so the run can stop reviewing and go on to the gates instead
+                    # of discarding the work. 50% matches build_review_ledger's
+                    # existing "MOSTLY SKIPPED" threshold, so the vocabulary is
+                    # consistent rather than a second invented number.
+                    _mostly_reviewed = _review_residue_is_not_an_outage(
+                        _reviewed_so_far, total_to_review)
+                    if _mostly_reviewed:
+                        _residue = max(0, total_to_review - _reviewed_so_far)
+                        stop_reason = (
+                            f"review stopped early: {_residue} of {total_to_review} "
+                            f"candidate file(s) could not be reviewed after three "
+                            f"consecutive zero batches ({_reviewed_so_far} reviewed). "
+                            "Those files stay INCOMPLETE - the run is not converged - "
+                            "but the remaining gates still run against the work that "
+                            "was completed")
+                        print(f"{pfx}{stop_reason}")
+                        _ledger("review", str(stop_reason), kind="provider")
+                        fix_notes.append(stop_reason)
+                        cycle_stopped = True
+                        break
                     stop_reason = (
                         "review made no progress: three consecutive semantic review "
                         f"batches completed ZERO files ({_reviewed_so_far} of "

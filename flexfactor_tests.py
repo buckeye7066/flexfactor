@@ -10579,6 +10579,64 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
         self.assertIn("readiness = _assess_readiness_phase(", block)
 
 
+class StuckReviewResidueIsNotAnOutageTests(unittest.TestCase):
+    """One unreviewable file threw away a 96%-complete run.
+
+    The zero-progress breaker exists so a run does not push on "against a MOSTLY
+    UNREVIEWED tree" - its own words - but it fired on three consecutive zero
+    batches regardless of how much had already been reviewed.
+
+    Measured live, repo-rewards 2026-08-30: "27 of 28 candidate file(s) reviewed
+    all run". That single stuck file aborted the run BEFORE the full-suite gate,
+    so the suite never ran, readiness recorded "Test suite passes: tests were
+    not run", and that became the program's ONLY remaining blocker - and an
+    unclosable one, because every retry aborts at the same file. A tool that
+    cannot finish a run it has 96% completed cannot make that program
+    production ready."""
+
+    def test_the_live_repo_rewards_shape_continues_to_the_gates(self):
+        self.assertTrue(ff._review_residue_is_not_an_outage(27, 28))
+
+    def test_a_real_outage_still_aborts(self):
+        # The two shapes this breaker was built for, from the 2026-08-24 and
+        # 2026-08-20 incidents. Widening must not blunt them.
+        self.assertFalse(ff._review_residue_is_not_an_outage(0, 3537))
+        self.assertFalse(ff._review_residue_is_not_an_outage(1, 57))
+        self.assertFalse(ff._review_residue_is_not_an_outage(2, 287))
+
+    def test_the_threshold_is_the_existing_MOSTLY_SKIPPED_one(self):
+        # 50%, matching build_review_ledger, rather than a second invented
+        # number that would then have to be kept in step.
+        self.assertTrue(ff._review_residue_is_not_an_outage(14, 28))
+        self.assertFalse(ff._review_residue_is_not_an_outage(13, 28))
+
+    def test_nothing_to_review_is_never_a_residue(self):
+        self.assertFalse(ff._review_residue_is_not_an_outage(0, 0))
+        self.assertFalse(ff._review_residue_is_not_an_outage(5, 0))
+
+    def test_the_breaker_uses_the_helper_and_keeps_the_outage_path(self):
+        # written-but-not-wired guard, and a guard that the fail-closed branch
+        # still exists: a residue must not silently become the only outcome.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_review_residue_is_not_an_outage(\n", src.replace("\r", "")
+                      ) if False else None
+        self.assertIn("_mostly_reviewed = _review_residue_is_not_an_outage(", src)
+        self.assertIn("This is a provider/route fault, NOT evidence the repo is", src,
+                      "the fail-closed outage abort is gone")
+        self.assertIn("infrastructure_abort = True", src)
+
+    def test_a_residue_does_not_set_infrastructure_abort(self):
+        # The residue branch must NOT mark the run an infrastructure abort, or
+        # the gates it exists to reach are skipped anyway.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        i = src.find("review stopped early:")
+        self.assertGreater(i, 0, "residue branch not found")
+        j = src.find("This is a provider/route fault", i)
+        self.assertGreater(j, i)
+        self.assertNotIn("infrastructure_abort = True", src[i:j],
+                         "the residue branch aborts the run it is meant to save")
+
+
 class TrustedRepoBuildNetworkTests(unittest.TestCase):
     """FlexFactor blackholed its OWN build's network, then blamed the repo.
 
