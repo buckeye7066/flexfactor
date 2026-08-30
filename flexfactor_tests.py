@@ -10508,7 +10508,10 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
         src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
         i = src.find('"category": "production-readiness"')
         self.assertGreater(i, 0, "readiness findings block not found")
-        return src, src[max(0, i - 2500):i + 3500]
+        # Window generously sized: this block has grown with each review
+        # round, and a window that silently stops short turns these
+        # guards into checks that cannot fail.
+        return src, src[max(0, i - 4000):i + 12000]
 
     def test_a_blocker_is_filed_against_its_own_file_when_it_has_one(self):
         _src, block = self._block()
@@ -10534,6 +10537,38 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
         _src, block = self._block()
         self.assertIn('_contained_existence(project_dir, p) == "file"', block,
                       "a non-existent path could be handed to the fix loop")
+
+    def test_every_failing_gate_with_a_path_is_a_candidate_not_just_blockers(self):
+        # readiness["blockers"] is high+ only, so the LOW licence gate - the very
+        # gate whose path was added first - could never be remediated and its
+        # auto_fixable claim stayed as false as before.
+        _src, block = self._block()
+        self.assertIn('readiness.get("gates")', block,
+                      "only blocking gates are considered for remediation")
+        self.assertIn('_g.get("status") != "fail"', block)
+
+    def test_test_evidence_is_re_measured_after_a_manifest_edit(self):
+        # _fix_files never re-runs the project's suite, and a dependency-pin
+        # edit is exactly the change that can invalidate a green one.
+        _src, block = self._block()
+        self.assertIn("re-running the suite after the", block)
+        self.assertIn("tests_ok=_rf_tests_ok", block,
+                      "the re-assessment still uses the pre-change tests_ok")
+
+    def test_an_unverified_repair_is_not_counted_as_applied(self):
+        _src, block = self._block()
+        self.assertIn("unverified_files.extend(", block)
+        self.assertIn("f not in _rf_unverified", block,
+                      "an unverified repair is still counted as applied")
+
+    def test_remediation_is_not_gated_on_being_a_git_repo(self):
+        # The ordinary fix loop runs fine in a non-Git directory; requiring a
+        # repo here disabled every remediation there for no safety reason. The
+        # COMMIT stays conditional on git, which is where it belongs.
+        _src, block = self._block()
+        self.assertIn("if (_readiness_fixable and not dirty_abort", block,
+                      "remediation is still gated on git")
+        self.assertIn("if git:", block, "the commit is no longer git-gated")
 
     def test_the_verdict_is_re_assessed_after_a_fix_lands(self):
         # Otherwise the report carries a verdict measured before the edits -

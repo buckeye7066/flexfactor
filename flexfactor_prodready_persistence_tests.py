@@ -504,6 +504,27 @@ class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
             self.assertEqual(E._pinning_edit_paths(root, tcs),
                              ["requirements.txt", "svc/requirements.txt"])
 
+    def test_the_manifest_comes_from_the_DETECTED_marker(self):
+        # A Gradle component's real manifest may be build.gradle.kts. The table
+        # name is only a fallback; hard-coding build.gradle made that blocker
+        # unfixable even though the detector already knew the true file.
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({"build.gradle.kts": 'implementation("a:b:1.+")'}) as root:
+            tc = pr.Toolchain(ecosystem="java", root=".", manager="gradle",
+                              marker="build.gradle.kts")
+            self.assertEqual(E._pinning_edit_paths(root, [tc]), ["build.gradle.kts"])
+
+    def test_a_marker_that_does_not_exist_falls_back_then_gives_up(self):
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({"pom.xml": "<project/>"}) as root:
+            tc = pr.Toolchain(ecosystem="java", root=".", manager="maven",
+                              marker="nope.xml")
+            self.assertEqual(E._pinning_edit_paths(root, [tc]), ["pom.xml"])
+        with _RepoFixture({"readme.md": "x"}) as root:
+            tc = pr.Toolchain(ecosystem="java", root=".", manager="maven",
+                              marker="nope.xml")
+            self.assertEqual(E._pinning_edit_paths(root, [tc]), [])
+
     def test_an_unknown_manager_yields_no_path(self):
         import flexfactor_prodready_engine as E
         with _RepoFixture({"Makefile": "all:\n"}) as root:
