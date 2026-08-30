@@ -16704,11 +16704,44 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         if _target != "(readiness)":
                             _readiness_fixable.setdefault(_target, []).append(_finding)
 
+                # EVERY FAILING GATE THAT NAMES A FILE, not only the blocking
+                # ones. `readiness["blockers"]` holds high+ severity only, so the
+                # licence gate - severity low, and the very gate whose path was
+                # added first - could never be remediated, and its
+                # "auto_fixable" claim stayed as false as before (caught in
+                # review). A low gate does not BLOCK, but there is no reason to
+                # decline to fix it once we are already here.
+                for _g in (readiness.get("gates") or []):
+                    if _g.get("status") != "fail":
+                        continue
+                    if any(f.get("_gate_id") == _g.get("id")
+                           for f in _readiness_findings):
+                        continue        # already queued as a blocker
+                    for _p in (_g.get("paths") or []):
+                        _p = str(_p).replace("\\", "/").strip()
+                        if _p and _contained_existence(project_dir, _p) == "file":
+                            _readiness_fixable.setdefault(_p, []).append({
+                                "file": _p, "line": 0,
+                                "severity": _g.get("severity", "low"),
+                                "category": "production-readiness",
+                                "title": _g.get("title", "readiness gate failed"),
+                                "problem": _g.get("evidence", ""),
+                                "fix": _g.get("remediation", ""),
+                                "_gate_id": _g.get("id", ""),
+                            })
+
                 # ONE bounded remediation pass, through the SAME machinery as any
                 # other fix: build gate, adversarial verification, budget cap. A
                 # readiness fix gets no privileges - if it cannot pass the gates
                 # it is rolled back like anything else.
-                if (_readiness_fixable and git and not dirty_abort
+                #
+                # NOT gated on `git` (caught in review): the ordinary review/fix
+                # loop edits files through contained writes with in-memory
+                # rollback and runs perfectly well in a non-Git directory, so
+                # requiring a repo here disabled every remediation for those runs
+                # for no safety reason. The commit below is what is conditional
+                # on git, which is where the condition belongs.
+                if (_readiness_fixable and not dirty_abort
                         and not infrastructure_abort and not meter.over_limit()):
                     _capped = dict(list(_readiness_fixable.items())[:MAX_READINESS_FIXES])
                     print(f"{pfx}readiness remediation: attempting "
@@ -16725,8 +16758,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             adversarial_rounds=getattr(args, "adversarial_rounds", 2),
                             materiality=getattr(args, "adversarial_materiality", "material"))
                         fix_notes.extend(_rf_notes)
+                        # An UNVERIFIED repair is not an applied one. `_fix_files`
+                        # can keep a syntax-gated edit when the build gate is
+                        # unavailable or already red; discarding _rf_unverified
+                        # while counting the same path as applied would report the
+                        # repair as landed-and-verified when it was neither
+                        # (caught in review).
+                        unverified_files.extend(
+                            f for f in _rf_unverified if f not in unverified_files)
                         applied_files.extend(
-                            f for f in _rf_applied if f not in applied_files)
+                            f for f in _rf_applied
+                            if f not in applied_files and f not in _rf_unverified)
                         if _rf_applied:
                             # COMMIT IT. `commit_cb=None` above means _fix_files
                             # does not commit, and this phase runs AFTER the
@@ -16742,13 +16784,36 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                 print(f"{pfx}git: " + _commit_and_sync(
                                     project_dir, branch, prev_branch, args,
                                     "readiness remediation", stack))
+                            # THE TEST EVIDENCE IS STALE TOO. `tests_ok` was
+                            # measured before these edits, and `_fix_files` only
+                            # applies its per-file/build gate - it never re-runs
+                            # the project's suite. A dependency-pin edit is
+                            # exactly the change that can invalidate a green
+                            # suite, so re-using the old verdict would carry a
+                            # pass that describes a tree that no longer exists
+                            # (caught in review; the third time this class has
+                            # appeared in this area). Re-run it when the project
+                            # has one; when it does not, report UNKNOWN rather
+                            # than the stale pass.
+                            _rf_tests_ok = tests_ok
+                            _rf_suite = (stack.get("full_suite_cmd")
+                                         or stack.get("test_cmd"))
+                            if _rf_suite:
+                                print(f"{pfx}re-running the suite after the "
+                                      "readiness edit(s)")
+                                _rf_r = _run(_rf_suite, project_dir, timeout=2400)
+                                _rf_tests_ok = (_rf_r.returncode == 0)
+                                print(f"{pfx}suite after remediation: "
+                                      f"{'GREEN' if _rf_tests_ok else 'RED'}")
+                            elif tests_ok is not None:
+                                _rf_tests_ok = None
                             # The verdict above was measured BEFORE these edits,
                             # so re-assess rather than report a stale one. This is
                             # the same "a result about a tree that no longer
                             # exists" defect as the rolled-back unit tests.
                             readiness = _assess_readiness_phase(
                                 project_dir, stack, display_name,
-                                build_ok=final_build, tests_ok=tests_ok,
+                                build_ok=final_build, tests_ok=_rf_tests_ok,
                                 bootstrap=bootstrap_results, pfx=pfx)
                             # ...and RETRACT the findings the re-assessment
                             # cleared. Leaving them would keep a closed blocker

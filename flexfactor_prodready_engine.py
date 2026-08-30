@@ -83,13 +83,22 @@ def _pinning_edit_paths(project_dir: str, unpinned) -> list[str]:
     """
     out: list[str] = []
     for tc in unpinned:
-        name = _PINNED_IN_MANIFEST.get(tc.manager)
-        if not name:
+        if tc.manager not in _PINNED_IN_MANIFEST:
             continue
-        root = (tc.root or ".").strip("./")
-        rel = f"{root}/{name}" if root and root != "." else name
-        if os.path.isfile(os.path.join(project_dir, rel)) and rel not in out:
-            out.append(rel)
+        # PREFER THE MARKER THE DETECTOR ACTUALLY FOUND. The table's name is a
+        # fallback: a Gradle component's real manifest may be build.gradle.kts,
+        # and hard-coding build.gradle made its blocker unfixable even though
+        # the detector had already recorded the true file (caught in review).
+        for name in (os.path.basename(tc.marker or ""),
+                     _PINNED_IN_MANIFEST[tc.manager]):
+            if not name:
+                continue
+            root = (tc.root or ".").strip("./")
+            rel = f"{root}/{name}" if root and root != "." else name
+            if os.path.isfile(os.path.join(project_dir, rel)):
+                if rel not in out:
+                    out.append(rel)
+                break
     return out
 
 
