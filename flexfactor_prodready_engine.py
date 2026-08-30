@@ -73,6 +73,171 @@ _PINNED_IN_MANIFEST = {
 }
 
 
+# A hash a resolver never produced. Measured from the lockfile the author model
+# invented for IPlay 2026-08-30: `"sha256": "generated-lockfile-sha"`.
+# Matched against a hash FIELD'S VALUE in full, never against raw file text -
+# scanning the text would accuse a lock containing a package named
+# "placeholder" or a resolved URL with "todo" in the path.
+_PLACEHOLDER_HASH_RE = re.compile(
+    r"""(?:sha\d*[:=-]?\s*)?(?:generated[- ]?lockfile[- ]?sha|placeholder|todo|"""
+    r"""changeme|fake[- ]?hash|sha256-placeholder|x{3,})""", re.I)
+
+
+def _lockfile_is_fabricated(path: str) -> bool:
+    """True when a lockfile was hand-written rather than produced by a resolver.
+
+    A FABRICATED LOCKFILE IS WORSE THAN A MISSING ONE - it claims a
+    reproducibility it cannot deliver, to everyone who later trusts it. Measured
+    live on IPlay 2026-08-30: told to "commit the lockfile", the author model
+    wrote a Pipfile.lock containing `"sha256": "generated-lockfile-sha"`, no
+    per-package hashes at all, and every version guessed as the lower bound of
+    its declared range. Nothing rejected it, so a run could have "closed" the
+    pinning gate with a file that pins nothing.
+
+    Deliberately CONSERVATIVE, because a false positive here re-opens a gate the
+    owner has genuinely satisfied: only a literal placeholder hash, or a JSON
+    lock whose packages carry no hash field at all, counts. A lock this cannot
+    read is treated as REAL (the gate's other checks still apply) rather than
+    accused.
+    """
+    text = _read_text(path)
+    if not text.strip():
+        # UNREADABLE IS NOT EMPTY (caught in review). `_read_text` returns ""
+        # for a file over MAX_CONFIG_BYTES, a symlink, or any read error - and a
+        # genuine package-lock.json ROUTINELY exceeds 512 KiB. Calling those
+        # fabricated would re-open a gate the owner has actually satisfied,
+        # which is the dangerous direction for this check. Only a file that is
+        # really zero bytes locks nothing.
+        try:
+            return os.path.getsize(path) == 0
+        except OSError:
+            return False                  # cannot even stat it -> not accused
+    if not path.lower().endswith((".lock", ".json")):
+        return False                      # not a shape we can judge
+    try:
+        data = json.loads(text)
+    except Exception:
+        return False                      # unreadable -> not accused
+    if not isinstance(data, dict):
+        return False
+    # PLACEHOLDER ONLY IN A HASH VALUE (caught in review). Scanning the whole
+    # text would accuse a lock containing a package literally named
+    # "placeholder", or a resolved URL with "todo" in the path.
+    if _has_placeholder_hash(data):
+        return True
+    # COMPOSER'S GROUPS ARE ARRAYS, not maps (caught in review): composer.lock
+    # stores `"packages": [ {...}, ... ]`, so an isinstance(v, dict) filter
+    # discarded every entry and the "nothing to judge" branch then ACCEPTED a
+    # hand-written Composer lock without inspecting it at all.
+    entries: list[tuple[str, dict]] = []
+    for key, group in data.items():
+        if key not in ("default", "develop", "packages", "packages-dev",
+                       "dependencies"):
+            continue
+        if isinstance(group, dict):
+            entries += [(name, e) for name, e in group.items()
+                        if isinstance(e, dict)]
+        elif isinstance(group, list):
+            entries += [(str(e.get("name") or ""), e) for e in group
+                        if isinstance(e, dict)]
+    # A VALID LOCK CAN LEGITIMATELY HAVE NO HASHED DEPENDENCIES (caught in
+    # review): `npm install --package-lock-only` on a dependency-free project
+    # writes a v3 lock whose only entry is the root package `""`, which carries
+    # no integrity because there is nothing to fetch. That is a real lock.
+    real = [(n, e) for n, e in entries if n not in ("", ".")]
+    if not real:
+        return False                      # nothing to judge, or root-only
+    # A real pipenv/npm lock records an integrity hash per package. None at all,
+    # across every dependency entry, means nothing was ever resolved.
+    # Composer records integrity under dist/source rather than a flat key.
+    return not any(
+        any(k in e for k in ("hashes", "hash", "integrity", "resolved",
+                             "checksum", "dist", "source"))
+        for _n, e in real)
+
+
+def _has_placeholder_hash(data, depth: int = 0) -> bool:
+    """A hash-named field whose VALUE is a literal placeholder."""
+    if depth > 6 or not isinstance(data, (dict, list)):
+        return False
+    if isinstance(data, list):
+        return any(_has_placeholder_hash(v, depth + 1) for v in data)
+    for key, value in data.items():
+        k = str(key).lower()
+        if k in ("hash", "hashes", "integrity", "checksum", "sha256", "sha512"):
+            flat = [value] if isinstance(value, str) else (
+                list(value.values()) if isinstance(value, dict) else
+                list(value) if isinstance(value, list) else [])
+            if any(isinstance(v, str) and _PLACEHOLDER_HASH_RE.fullmatch(v.strip())
+                   for v in flat):
+                return True
+        if _has_placeholder_hash(value, depth + 1):
+            return True
+    return False
+
+
+def _pinning_remediation(unpinned) -> str:
+    """The remediation text for the dependency-pinning gate.
+
+    "Commit the lockfile so builds are reproducible" is not an instruction a
+    text-editing fix loop can carry out, and pointing it at requirements.txt
+    made that worse: told to "commit the lockfile", the author model INVENTED a
+    Pipfile and a Pipfile.lock for a package manager IPlay does not use, copied
+    the same unpinned ranges into it, and wrote
+
+        "hash": {"sha256": "generated-lockfile-sha"}
+
+    with no per-package hashes at all and every version guessed as the lower
+    bound of its range. It passed the verification gate because two unused files
+    break nothing, and the gate still failed afterwards because nothing was
+    actually pinned. A FABRICATED LOCKFILE IS WORSE THAN A MISSING ONE: it
+    claims a reproducibility it cannot deliver, to anyone who later trusts it.
+
+    So the text now says exactly what to do for the ecosystem in front of it,
+    and says plainly what NOT to do. Live IPlay 2026-08-30 is the measurement.
+    """
+    managers = {t.manager for t in (unpinned or [])}
+    lines = []
+    if "pip" in managers:
+        # NAME THE FILE THAT ACTUALLY EXISTS (caught in review): pip is also
+        # detected from pyproject.toml / setup.py / setup.cfg, and telling the
+        # model to edit a requirements.txt that is not there is an instruction
+        # it cannot carry out - which is exactly how the Pipfile fabrication
+        # happened. Note honestly when pinning that manifest will not by itself
+        # close the gate, instead of promising a closure that cannot occur.
+        pip_markers = sorted({
+            os.path.basename(t.marker or "") or "requirements.txt"
+            for t in unpinned if t.manager == "pip"})
+        target = ", ".join(pip_markers) or "requirements.txt"
+        lines.append(
+            f"For pip, pin EVERY requirement to an exact version with `==` in "
+            f"{target} (e.g. `numpy==1.26.4`), choosing versions that satisfy "
+            "the ranges already there.")
+        if not any(m.lower() == "requirements.txt" for m in pip_markers):
+            lines.append(
+                "NOTE: this gate recognises pip pinning only in a "
+                "requirements.txt, so pinning "
+                f"{target} alone will not clear it - export a pinned "
+                "requirements.txt (e.g. `pip freeze > requirements.txt`) as "
+                "well.")
+    if managers & {"gradle", "maven"}:
+        lines.append(
+            "For Gradle/Maven, replace every dynamic version ('1.+', '+', "
+            "'latest.release', a Maven range or LATEST/RELEASE) with an exact "
+            "version in the manifest.")
+    generated = sorted(managers - {"pip", "gradle", "maven"})
+    if generated:
+        lines.append(
+            "For " + ", ".join(generated) + " the lockfile is GENERATED by the "
+            "package manager (e.g. `npm install` writes package-lock.json) - run "
+            "the installer and commit its output.")
+    lines.append(
+        "NEVER hand-write a lockfile, and never introduce a different package "
+        "manager to satisfy this: a lockfile with placeholder or absent hashes "
+        "is a false claim of reproducibility, and is worse than having none.")
+    return " ".join(lines)
+
+
 def _pinning_edit_paths(project_dir: str, unpinned) -> list[str]:
     """Repo-relative manifests a remediation could EDIT to pin dependencies.
 
@@ -913,6 +1078,10 @@ _LOCKFILES = {
     "composer": ("composer.lock",), "mix": ("mix.lock",), "deno": ("deno.lock",),
     "dart": ("pubspec.lock",), "flutter": ("pubspec.lock",),
     "swiftpm": ("Package.resolved",),
+    # `dotnet restore --use-lock-file` writes this. Without the entry the
+    # remediation promised that running the installer would close the gate
+    # while nothing could ever recognise its output (caught in review).
+    "dotnet": ("packages.lock.json",),
 }
 
 
@@ -921,11 +1090,18 @@ def _current_lockfile(project_dir: str, tc: Toolchain) -> str | None:
     detection saw. Bootstrap runs between the two and routinely CREATES it
     (`npm install` writes package-lock.json), so the detect-time value reports a
     project as unpinned moments after the tool pinned it."""
+    # BOTH branches must reject a fabrication, not just the _LOCKFILES loop
+    # below: the detector's own recorded lockfile is checked FIRST, so a fake
+    # one found at detection time would otherwise sail straight past. (My first
+    # version guarded only the second branch; the end-to-end test caught it.)
     if tc.lockfile and _exists(project_dir, tc.root, tc.lockfile):
-        return tc.lockfile
+        if not _lockfile_is_fabricated(
+                os.path.join(project_dir, tc.root, tc.lockfile)):
+            return tc.lockfile
     root = os.path.join(project_dir, tc.root)
     for name in _LOCKFILES.get(tc.manager, ()):
-        if _exists(root, name):
+        if _exists(root, name) and not _lockfile_is_fabricated(
+                os.path.join(root, name)):
             return name
     # pip's pinning mechanism is a pinned requirements.txt, not a lockfile.
     if tc.manager == "pip" and "==" in _read_text(
@@ -1227,7 +1403,7 @@ def assess_readiness(project_dir: str, toolchains: list[Toolchain], run,
         evidence=("no lockfile: " + ", ".join(f"{t.ecosystem}:{t.root}"
                                               for t in unpinned[:5]))
         if unpinned else "lockfiles present for all components",
-        remediation="Commit the lockfile so builds are reproducible.",
+        remediation=_pinning_remediation(unpinned),
         auto_fixable=True,
         paths=_pinning_edit_paths(project_dir, unpinned))
 

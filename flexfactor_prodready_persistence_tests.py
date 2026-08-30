@@ -547,6 +547,165 @@ class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
                 PP._paths_from_hits(root, ["a.js (why)", "gone.js (why)"]),
                 ["a.js"])
 
+class FabricatedLockfileTests(unittest.TestCase):
+    """A hand-written lockfile is WORSE than a missing one.
+
+    Measured live, IPlay 2026-08-30. Told to "commit the lockfile so builds are
+    reproducible" - an instruction a text-editing fix loop cannot carry out -
+    the author model invented a Pipfile and Pipfile.lock for a package manager
+    the project does not use, copied the same UNPINNED ranges into them, and
+    wrote:
+
+        "hash": {"sha256": "generated-lockfile-sha"}
+
+    with no per-package hashes and every version guessed as the lower bound of
+    its range. It passed the verification gate (two unused files break nothing)
+    and was committed to the owner's repo. Nothing rejected it, so a run could
+    have "closed" the pinning gate with a file that pins nothing and claims a
+    reproducibility it cannot deliver."""
+
+    FABRICATED = ('{"_meta": {"hash": {"sha256": "generated-lockfile-sha"}},'
+                  ' "default": {"numpy": {"version": "==1.26.0"}}}')
+    REAL_PIPENV = ('{"_meta": {"hash": {"sha256": "a3f1b2c4d5e6"}},'
+                   ' "default": {"numpy": {"version": "==1.26.4",'
+                   ' "hashes": ["sha256:aaaa"]}}}')
+    REAL_NPM = ('{"lockfileVersion": 3, "packages": {"node_modules/x":'
+                ' {"version": "1.3.0", "resolved": "https://r/x.tgz",'
+                ' "integrity": "sha512-XX"}}}')
+
+    def _fab(self, name, body):
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({name: body}) as root:
+            import os as _os
+            return E._lockfile_is_fabricated(_os.path.join(root, name))
+
+    def test_the_exact_IPlay_fabrication_is_rejected(self):
+        self.assertTrue(self._fab("Pipfile.lock", self.FABRICATED))
+
+    def test_an_empty_lockfile_locks_nothing(self):
+        self.assertTrue(self._fab("Pipfile.lock", ""))
+
+    def test_a_REAL_pipenv_lock_is_accepted(self):
+        self.assertFalse(self._fab("Pipfile.lock", self.REAL_PIPENV))
+
+    def test_a_REAL_npm_lock_is_accepted(self):
+        self.assertFalse(self._fab("package-lock.json", self.REAL_NPM))
+
+    def test_an_unjudgeable_lock_is_NOT_accused(self):
+        # A false positive here re-opens a gate the owner has genuinely
+        # satisfied, so anything this cannot read is treated as real.
+        self.assertFalse(self._fab("Pipfile.lock", "not json at all"))
+        self.assertFalse(self._fab("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"))
+
+    def test_a_fabricated_lock_does_not_satisfy_the_pinning_gate(self):
+        # End-to-end: the gate must still FAIL with the fake lock present.
+        with _RepoFixture({"Pipfile": "[packages]\nnumpy = '*'\n",
+                           "Pipfile.lock": self.FABRICATED}) as root:
+            chains = pr.detect_toolchains(root)
+            gates = {g.id: g for g in pr.assess_readiness(root, chains, _fake_run())}
+            if "deps_pinned" in gates and gates["deps_pinned"].status != "na":
+                self.assertEqual(gates["deps_pinned"].status, "fail")
+
+    def test_a_GENUINE_lock_over_the_read_cap_is_not_accused(self):
+        # THE DANGEROUS DIRECTION (caught in review). _read_text returns "" for
+        # a file over MAX_CONFIG_BYTES (512 KiB), a symlink, or any read error -
+        # and a real package-lock.json ROUTINELY exceeds that. Calling those
+        # fabricated would re-open a gate the owner has genuinely satisfied.
+        import json as _j
+        big = _j.dumps({"lockfileVersion": 3, "packages": {
+            "": {"name": "p"},
+            **{f"node_modules/p{i}": {"version": "1.0.0",
+                                      "resolved": f"https://r/p{i}.tgz",
+                                      "integrity": "sha512-" + "A" * 60}
+               for i in range(4000)}}})
+        self.assertGreater(len(big), 512 * 1024)
+        self.assertFalse(self._fab("package-lock.json", big))
+
+    def test_only_a_TRULY_zero_byte_lock_counts_as_empty(self):
+        self.assertTrue(self._fab("Pipfile.lock", ""))
+
+    def test_a_valid_npm_lock_with_NO_dependencies_is_accepted(self):
+        # `npm install --package-lock-only` on a dependency-free project writes
+        # a v3 lock whose only entry is the root package "", which carries no
+        # integrity because there is nothing to fetch. That is a real lock.
+        self.assertFalse(self._fab("package-lock.json",
+                                   '{"name": "p", "lockfileVersion": 3,'
+                                   ' "packages": {"": {"name": "p", "version": "1.0.0"}}}'))
+
+    def test_a_package_NAMED_placeholder_is_not_a_placeholder_hash(self):
+        # Matching the raw text would accuse a lock containing a package named
+        # "placeholder", or a resolved URL with "todo" in the path. The match is
+        # against a hash FIELD'S VALUE only.
+        self.assertFalse(self._fab("package-lock.json",
+                                   '{"lockfileVersion": 3, "packages":'
+                                   ' {"node_modules/placeholder": {"version": "1.0.0",'
+                                   ' "resolved": "https://r/todo-utils.tgz",'
+                                   ' "integrity": "sha512-REAL"}}}'))
+
+    def test_a_hand_written_COMPOSER_lock_is_caught(self):
+        # composer.lock stores `"packages": [ {...} ]` - an ARRAY. An
+        # isinstance(v, dict) filter discarded every entry and the
+        # "nothing to judge" branch then ACCEPTED the file uninspected.
+        self.assertTrue(self._fab(
+            "composer.lock", '{"packages": [{"name": "x/y", "version": "1.0.0"}]}'))
+
+    def test_a_REAL_composer_lock_is_accepted(self):
+        # Composer records integrity under dist/source, not a flat hash key.
+        self.assertFalse(self._fab(
+            "composer.lock",
+            '{"packages": [{"name": "x/y", "version": "1.0.0",'
+            ' "dist": {"type": "zip", "url": "https://r/x.zip", "shasum": "abc"}}]}'))
+
+    def test_a_crate_named_placeholder_is_not_accused(self):
+        # Cargo generates `name = "placeholder"` for a crate with that name.
+        cargo = ("[[package]]" + chr(10) + 'name = "placeholder"' + chr(10)
+                 + 'version = "1.0.0"' + chr(10))
+        self.assertFalse(self._fab("Cargo.lock", cargo))
+
+    def test_dotnet_has_a_known_lockfile_so_the_promise_is_true(self):
+        # The remediation tells dotnet users that running the installer closes
+        # the gate. That was false while _LOCKFILES had no dotnet entry - the
+        # unclosable-finding shape, in my own instruction text.
+        import flexfactor_prodready_engine as E
+        self.assertIn("packages.lock.json", E._LOCKFILES.get("dotnet", ()))
+
+    def test_pip_detected_without_requirements_txt_names_the_real_file(self):
+        # pip is also detected from pyproject.toml/setup.py/setup.cfg. Telling
+        # the model to edit a requirements.txt that is not there is an
+        # instruction it cannot carry out - which is how the Pipfile
+        # fabrication happened in the first place.
+        import flexfactor_prodready_engine as E
+
+        class _T:
+            def __init__(self, m, mk): self.manager, self.marker = m, mk
+
+        txt = E._pinning_remediation([_T("pip", "pyproject.toml")])
+        self.assertIn("pyproject.toml", txt)
+        # ...and it must NOT promise a closure that cannot happen.
+        self.assertIn("will not clear it", txt)
+
+        plain = E._pinning_remediation([_T("pip", "requirements.txt")])
+        self.assertIn("requirements.txt", plain)
+        self.assertNotIn("will not clear it", plain)
+
+    def test_the_remediation_says_what_to_actually_do(self):
+        # "Commit the lockfile" is not an instruction a text-editing fix loop
+        # can carry out - which is exactly how it ended up inventing one.
+        import flexfactor_prodready_engine as E
+
+        class _T:
+            def __init__(self, m, mk=""): self.manager, self.marker = m, mk
+
+        pip_text = E._pinning_remediation([_T("pip", "requirements.txt")])
+        self.assertIn("==", pip_text)
+        self.assertIn("requirements.txt", pip_text)
+        self.assertIn("NEVER hand-write a lockfile", pip_text)
+
+        npm_text = E._pinning_remediation([_T("npm", "package.json")])
+        self.assertIn("GENERATED", npm_text)
+        self.assertIn("NEVER hand-write a lockfile", npm_text)
+
+
 class LicenceDeclarationGateTests(unittest.TestCase):
     """"License declared" asked a question it would not accept the real answer to.
 
