@@ -8587,6 +8587,30 @@ TEST_GEN_SCHEMA = {
 }
 
 
+def _reuse_unit_test_result(suite_cmd, test_cmd, test_status) -> bool:
+    """May the full-suite gate QUOTE the unit-test run instead of re-running it?
+
+    Only when it is literally the same command AND that run still describes the
+    tree on disk. `test_status is None` means "not evaluated against the current
+    tree", and the generated-test rollback sets it to None for exactly that
+    reason: it deletes the files the run was measuring.
+
+    Live repo-rewards 2026-08-29: 14 generated tests failed, were correctly
+    rolled back, and the gate then printed "reusing unit-test result RED" and
+    reported the REPOSITORY "Test suite passes: FAIL -> NOT PRODUCTION READY" -
+    quoting a verdict about a tree that no longer existed, while the project's
+    own suite on the rolled-back tree was green (19 files, 108 tests).
+
+    Extracted so the rule is testable on its own: it lived inline in a 3,000-line
+    function with no coverage, which is how it stayed wrong.
+    """
+    if not suite_cmd or not test_cmd:
+        return False
+    if list(suite_cmd) != list(test_cmd):
+        return False
+    return test_status is not None
+
+
 def _gen_unit_tests(author, rel: str, text: str, test_cmd: list,
                     pfx: str = "",
                     required_capabilities: list[dict] | None = None) -> dict:
@@ -16446,6 +16470,36 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         test_files = []
                         tests_by_source = {}
                         tests_by_capability = {}
+                        # THE VERDICT DIED WITH THE FILES IT DESCRIBED.
+                        #
+                        # This block's own comment promises the rollback happens
+                        # "without poisoning every later gate" - and it did not
+                        # deliver. `test_status` stayed False, and the full-suite
+                        # gate below reuses it verbatim when full_suite_cmd ==
+                        # test_cmd ("reusing unit-test result RED"), so the
+                        # repository was reported "Test suite passes: FAIL ->
+                        # NOT PRODUCTION READY" on the strength of a run whose
+                        # tree NO LONGER EXISTS - we just deleted 14 files from
+                        # it.
+                        #
+                        # LIVE repo-rewards 2026-08-29 21:28: report line
+                        # "rejected and removed 14 generated test file(s) after
+                        # the native test command failed", readiness "Test suite
+                        # passes | FAIL | suite failed" - while the project's own
+                        # suite on the rolled-back tree is GREEN (19 files, 108
+                        # tests, measured twice). That is the third time this
+                        # tool broke something itself and billed the audited
+                        # repository for it, after the blackholed build proxy and
+                        # the 500MB of run manifests committed into GrantFlow.
+                        #
+                        # None means "not evaluated against the current tree",
+                        # which is exactly true: the reuse test below is
+                        # `test_status is not None`, so the full-suite gate now
+                        # RUNS the project's suite instead of quoting a dead one.
+                        # The failure itself is NOT hidden - the "Generated unit
+                        # tests fail against current code" finding was appended
+                        # above, before this rollback, and stays in the report.
+                        test_status = None
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
@@ -16521,7 +16575,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         suite_cmd = stack.get("full_suite_cmd")
         if (getattr(args, "full_suite", True) and suite_cmd and not dirty_abort
                 and not infrastructure_abort):
-            if suite_cmd == stack.get("test_cmd") and test_status is not None:
+            if _reuse_unit_test_result(suite_cmd, stack.get("test_cmd"), test_status):
                 suite_status = test_status  # already ran it as the unit-test step
                 suite_exit_code = 0 if suite_status else 1
                 print(f"{pfx}full suite ({' '.join(suite_cmd)}): reusing unit-test result "
