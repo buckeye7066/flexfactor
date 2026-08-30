@@ -547,6 +547,83 @@ class ReadinessBlockersNameTheFileToEditTests(unittest.TestCase):
                 PP._paths_from_hits(root, ["a.js (why)", "gone.js (why)"]),
                 ["a.js"])
 
+class FabricatedLockfileTests(unittest.TestCase):
+    """A hand-written lockfile is WORSE than a missing one.
+
+    Measured live, IPlay 2026-08-30. Told to "commit the lockfile so builds are
+    reproducible" - an instruction a text-editing fix loop cannot carry out -
+    the author model invented a Pipfile and Pipfile.lock for a package manager
+    the project does not use, copied the same UNPINNED ranges into them, and
+    wrote:
+
+        "hash": {"sha256": "generated-lockfile-sha"}
+
+    with no per-package hashes and every version guessed as the lower bound of
+    its range. It passed the verification gate (two unused files break nothing)
+    and was committed to the owner's repo. Nothing rejected it, so a run could
+    have "closed" the pinning gate with a file that pins nothing and claims a
+    reproducibility it cannot deliver."""
+
+    FABRICATED = ('{"_meta": {"hash": {"sha256": "generated-lockfile-sha"}},'
+                  ' "default": {"numpy": {"version": "==1.26.0"}}}')
+    REAL_PIPENV = ('{"_meta": {"hash": {"sha256": "a3f1b2c4d5e6"}},'
+                   ' "default": {"numpy": {"version": "==1.26.4",'
+                   ' "hashes": ["sha256:aaaa"]}}}')
+    REAL_NPM = ('{"lockfileVersion": 3, "packages": {"node_modules/x":'
+                ' {"version": "1.3.0", "resolved": "https://r/x.tgz",'
+                ' "integrity": "sha512-XX"}}}')
+
+    def _fab(self, name, body):
+        import flexfactor_prodready_engine as E
+        with _RepoFixture({name: body}) as root:
+            import os as _os
+            return E._lockfile_is_fabricated(_os.path.join(root, name))
+
+    def test_the_exact_IPlay_fabrication_is_rejected(self):
+        self.assertTrue(self._fab("Pipfile.lock", self.FABRICATED))
+
+    def test_an_empty_lockfile_locks_nothing(self):
+        self.assertTrue(self._fab("Pipfile.lock", ""))
+
+    def test_a_REAL_pipenv_lock_is_accepted(self):
+        self.assertFalse(self._fab("Pipfile.lock", self.REAL_PIPENV))
+
+    def test_a_REAL_npm_lock_is_accepted(self):
+        self.assertFalse(self._fab("package-lock.json", self.REAL_NPM))
+
+    def test_an_unjudgeable_lock_is_NOT_accused(self):
+        # A false positive here re-opens a gate the owner has genuinely
+        # satisfied, so anything this cannot read is treated as real.
+        self.assertFalse(self._fab("Pipfile.lock", "not json at all"))
+        self.assertFalse(self._fab("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"))
+
+    def test_a_fabricated_lock_does_not_satisfy_the_pinning_gate(self):
+        # End-to-end: the gate must still FAIL with the fake lock present.
+        with _RepoFixture({"Pipfile": "[packages]\nnumpy = '*'\n",
+                           "Pipfile.lock": self.FABRICATED}) as root:
+            chains = pr.detect_toolchains(root)
+            gates = {g.id: g for g in pr.assess_readiness(root, chains, _fake_run())}
+            if "deps_pinned" in gates and gates["deps_pinned"].status != "na":
+                self.assertEqual(gates["deps_pinned"].status, "fail")
+
+    def test_the_remediation_says_what_to_actually_do(self):
+        # "Commit the lockfile" is not an instruction a text-editing fix loop
+        # can carry out - which is exactly how it ended up inventing one.
+        import flexfactor_prodready_engine as E
+
+        class _T:
+            def __init__(self, m): self.manager = m
+
+        pip_text = E._pinning_remediation([_T("pip")])
+        self.assertIn("==", pip_text)
+        self.assertIn("requirements.txt", pip_text)
+        self.assertIn("NEVER hand-write a lockfile", pip_text)
+
+        npm_text = E._pinning_remediation([_T("npm")])
+        self.assertIn("GENERATED", npm_text)
+        self.assertIn("NEVER hand-write a lockfile", npm_text)
+
+
 class LicenceDeclarationGateTests(unittest.TestCase):
     """"License declared" asked a question it would not accept the real answer to.
 
