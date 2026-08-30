@@ -21,6 +21,7 @@ import threading
 import time
 import tomllib
 import unittest
+import io as _io
 from unittest import mock
 
 # --------------------------------------------------------------------------- #
@@ -10181,6 +10182,73 @@ class BareListSalvageTests(unittest.TestCase):
     def test_dict_passes_through_unchanged(self):
         d = {"changed": True, "edits": []}
         self.assertIs(ff._check_structured_type(d, ff.FIX_EDITS_SCHEMA, "{}"), d)
+
+
+class RolledBackGeneratedTestsDoNotFailTheRepoTests(unittest.TestCase):
+    """FlexFactor failed the suite with its OWN generated tests, threw them
+    away, and then billed the repository for the failure.
+
+    LIVE repo-rewards 2026-08-29 21:28. Its own audit report says
+    "rejected and removed 14 generated test file(s) after the native test
+    command failed" - the transactional rollback working exactly as designed,
+    whose comment promises it happens "without poisoning every later gate".
+    It poisoned the next gate anyway: `test_status` stayed False, the
+    full-suite gate printed "reusing unit-test result RED", and readiness
+    reported "Test suite passes | FAIL" -> NOT PRODUCTION READY. The project's
+    own suite on the rolled-back tree is GREEN (19 files, 108 tests, measured
+    twice, before and after).
+
+    Third instance of the same meta-defect, after the blackholed build proxy
+    and the 500MB of run manifests committed into GrantFlow: the tool breaks
+    something itself and attributes it to the audited repo."""
+
+    CMD = ["npm", "test"]
+
+    def test_a_result_about_a_DELETED_tree_is_not_reusable(self):
+        # The whole fix: after the rollback the verdict is None ("not evaluated
+        # against the current tree"), so the gate must re-run rather than quote.
+        self.assertFalse(ff._reuse_unit_test_result(self.CMD, self.CMD, None))
+
+    def test_a_live_result_for_the_same_command_is_still_reused(self):
+        # The optimisation is real and must survive: a genuine unit-test run
+        # against the current tree should not be paid for twice.
+        self.assertTrue(ff._reuse_unit_test_result(self.CMD, self.CMD, True))
+        self.assertTrue(ff._reuse_unit_test_result(self.CMD, self.CMD, False))
+
+    def test_a_different_suite_command_is_never_reused(self):
+        # full_suite_cmd is meant to be the STRONGEST suite (test:all / ci);
+        # quoting the narrower unit-test command for it would overstate the
+        # evidence behind a publication decision.
+        self.assertFalse(
+            ff._reuse_unit_test_result(["npm", "run", "test:all"], self.CMD, True))
+
+    def test_missing_commands_are_never_reusable(self):
+        for suite, test in ((None, self.CMD), (self.CMD, None), (None, None), ([], [])):
+            self.assertFalse(ff._reuse_unit_test_result(suite, test, True))
+
+    def test_the_call_site_actually_uses_this_helper(self):
+        # This codebase has hit the written-but-not-wired trap four times
+        # (flexfactor_runstate, the set_phase group, _UI_EXPLORER_JS,
+        # gather_purpose_evidence). A helper that is correct and uncalled is
+        # exactly as broken as the bug it replaced, so assert the wiring.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        self.assertIn("_reuse_unit_test_result(suite_cmd, stack.get(\"test_cmd\"), test_status)", src)
+        # ...and that the superseded inline condition is gone, or both could
+        # coexist with the old one winning.
+        self.assertNotIn("if suite_cmd == stack.get(\"test_cmd\") and test_status is not None:", src)
+
+    def test_the_rollback_sets_the_verdict_to_None(self):
+        # Guards the other half of the fix: the rollback branch must clear the
+        # verdict, or the helper above is handed a stale False forever.
+        src = _io.open(ff.__file__, encoding="utf-8", errors="replace").read()
+        marker = "rejected and removed "
+        i = src.find(marker)
+        self.assertGreater(i, 0, "generated-test rollback branch not found")
+        window = src[i:i + 2600]
+        self.assertIn("test_status = None", window)
+        # The FINDING must survive the rollback - hiding the failure would be
+        # the opposite defect.
+        self.assertIn("Generated unit tests fail against current code", src)
 
 
 class TrustedRepoBuildNetworkTests(unittest.TestCase):
