@@ -3177,9 +3177,24 @@ def _check_array_item_shape(data, schema: dict, text: str):
             continue
         if ((spec.get("items") or {}).get("type")) != "object":
             continue
-        value = data.get(prop)
+        if prop not in data or data.get(prop) is None:
+            continue          # absent key = a normal partial answer, not a fault
+        value = data[prop]
         if not isinstance(value, list):
-            continue
+            # A PRESENT-BUT-WRONG-TYPE array reproduces the very crash this
+            # function exists to stop, and `continue` here used to wave it
+            # through (caught in review of this change, 2026-08-29).
+            # `{"files": "tests/foo.test.ts"}` is a STRING: the caller's
+            # `for f in gen.get("files")` then iterates CHARACTERS and calls
+            # `f.get("path")` on "t" - the identical
+            # "'str' object has no attribute 'get'" that aborted the
+            # repo-rewards run, from the identical schema, one type further
+            # out. Skipping validation for anything that is not a list makes
+            # the guard fail open exactly where it must fail closed.
+            raise RuntimeError(
+                f"Structured output's '{prop}' is a {type(value).__name__}, "
+                f"but the schema declares an array; len={len(text)} "
+                f"head={text[:200]!r}")
         for idx, element in enumerate(value):
             if not isinstance(element, dict):
                 raise RuntimeError(
