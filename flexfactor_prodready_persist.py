@@ -238,28 +238,35 @@ def _spine_collapse_reasons(project_dir: str, files: list[str]) -> list[str]:
         size = _file_size(project_dir, rel)
         if size is None:
             continue
+        # REASON SHAPE IS LOAD-BEARING: "<rel> (<why>)" is the one form
+        # `_paths_from_hits` can recover a file from (it splits on " ("). The
+        # old strings put prose between the rel and the paren - "<rel> is N
+        # bytes (...)" - so recovery yielded "backend/server.js is 412 bytes",
+        # not a file, the gate shipped no `paths`, and this HIGH (blocking)
+        # gate was filed against the "(readiness)" placeholder the fix loop
+        # never edits: reported every run, fixable never.
         if rel == "backend/server.js":
             if size < 800:
-                reasons.append(f"{rel} is {size} bytes (collapsed Express spine)")
+                reasons.append(f"{rel} ({size} bytes; collapsed Express spine)")
             elif size < 5 * 1024 and schema_size >= 50 * 1024:
                 reasons.append(
-                    f"{rel} is {size} bytes beside a {schema_size}-byte schema.sql")
+                    f"{rel} ({size} bytes beside a {schema_size}-byte schema.sql)")
         elif rel == "src/api/client.js":
             text = _read_prefix(os.path.join(project_dir, *rel.split("/")), 16 * 1024)
             if size < 250:
-                reasons.append(f"{rel} is {size} bytes (API client collapsed)")
+                reasons.append(f"{rel} ({size} bytes; API client collapsed)")
             elif size < 800 and re.search(
                     r"createStub|not implemented|TODO stub", text, re.I):
-                reasons.append(f"{rel} is a {size}-byte stub client")
+                reasons.append(f"{rel} ({size}-byte stub client)")
         elif rel == "backend/db/migrate.js":
             if size < 200:
-                reasons.append(f"{rel} is {size} bytes (migrator collapsed)")
+                reasons.append(f"{rel} ({size} bytes; migrator collapsed)")
             elif size < 400 and schema_size >= 10 * 1024:
                 reasons.append(
-                    f"{rel} is {size} bytes beside a {schema_size}-byte schema.sql")
+                    f"{rel} ({size} bytes beside a {schema_size}-byte schema.sql)")
         elif rel == "backend/db/schema.sql":
             if size < 80:
-                reasons.append(f"{rel} is {size} bytes (schema emptied)")
+                reasons.append(f"{rel} ({size} bytes; schema emptied)")
     return reasons
 
 
@@ -302,6 +309,15 @@ def _schema_bootstrap_holes(project_dir: str, files: list[str]
                 fresh_miss.append(f"{table} ({_norm_rel(rel)})")
             elif pg_migs and not in_schema and not any(
                     _mentions_ident(t, table) for t in pg_texts):
+                # DELIBERATELY extras-only (authored this way in the original
+                # GrantFlow-class commit, re-examined 2026-08-30): schema.sql
+                # is the engine-shared fresh-DB bootstrap, so a table it names
+                # is covered on Postgres too. Only a table whose sole coverage
+                # is a sqlite-specific extras bootstrap (ensureSqliteSchema /
+                # workspacePersistenceTables) needs its own Postgres twin. The
+                # gate's remediation text used to demand the twin for EVERY
+                # table, promising more than this check verifies - the text is
+                # now scoped to match.
                 twin_miss.append(f"{table} ({_norm_rel(rel)}; no postgres twin)")
             if len(fresh_miss) + len(twin_miss) >= 8:
                 break
@@ -371,11 +387,21 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
     add(id="no_factory_overlay",
         title="No leftover factory overlay files at repo root",
         status="fail" if overlay_hits else "pass",
-        severity="high",
+        # MEDIUM, not high, on purpose (2026-08-30): high makes this a BLOCKER,
+        # and a blocker must be closable by an action the run can take. The
+        # only remedy here is DELETING files, which the text-editing fix loop
+        # cannot do - so at high severity a repo with one leftover _gh_* file
+        # was permanently NOT PRODUCTION READY with no closing action, the
+        # unclosable-finding shape this codebase keeps re-hitting. Junk at the
+        # repo root is real and stays REPORTED with the manual action named;
+        # it does not veto the verdict.
+        severity="medium",
         evidence=("root overlay: " + ", ".join(overlay_hits[:8]))
         if overlay_hits else "no tracked _gh_* / _restore_* at repo root",
-        remediation="Remove leftover Factory Deck overlay files (_gh_*, _restore_*) "
-                    "from the repository root. They are not part of the product.")
+        remediation="Delete leftover Factory Deck overlay files (_gh_*, _restore_*) "
+                    "from the repository root - a manual (or autoclean) step; "
+                    "FlexFactor's fix loop edits files and cannot remove them. "
+                    "They are not part of the product.")
 
     spine_present = False
     file_set = {_norm_rel(f) for f in files}
@@ -393,7 +419,11 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
             else "spine modules present and not implausibly tiny"),
         remediation="Restore backend/server.js, src/api/client.js, "
                     "backend/db/migrate.js, and backend/db/schema.sql. Do not "
-                    "replace the host spine with a 2-route stub.")
+                    "replace the host spine with a 2-route stub.",
+        # The collapsed file itself is the thing to fix; without paths this
+        # HIGH gate landed on the "(readiness)" placeholder - see the reason
+        # shape note in _spine_collapse_reasons.
+        paths=_paths_from_hits(project_dir, spine_reasons))
 
     schema_status, schema_holes = _schema_bootstrap_holes(project_dir, files)
     add(id="schema_bootstrap_covers_extras",
@@ -408,8 +438,9 @@ def apply_persistence_gates(add, project_dir: str, files: list[str]) -> None:
         remediation="Add new tables to the fresh-DB schema.sql (or an "
                     "IF NOT EXISTS extras file applied after it: "
                     "workspacePersistenceTables / ensureSqliteSchema / "
-                    "applyWorkspace) AND ship the Postgres twin when "
-                    "backend/db/postgres/migrations exists. A hidden "
+                    "applyWorkspace); a table covered ONLY by a "
+                    "sqlite-specific extras bootstrap also needs its Postgres "
+                    "twin when backend/db/postgres/migrations exists. A hidden "
                     "`npm run migrate` must not be required to create them.",
         # The file a remediation EDITS is the fresh-DB schema, not the migration
         # its evidence quotes: the hole is that schema.sql does not create the

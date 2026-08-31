@@ -355,6 +355,11 @@ def unknown_identifiers(sql: str, columns_by_table: dict) -> list[str]:
     known_tables = {str(t).lower(): {str(c).lower() for c in cols}
                     for t, cols in (columns_by_table or {}).items()}
     problems: list[str] = []
+    # When the last introspection was capped, what we hold is a SLICE. An
+    # unknown name is then unknown to US - saying "does not exist" would be a
+    # confident claim about the live production schema that we cannot make.
+    missing = ("is not in the schema slice we were given"
+               if _SCHEMA_TRUNCATION else "does not exist")
 
     tables = referenced_tables(sql)
     if not known_tables:
@@ -364,7 +369,7 @@ def unknown_identifiers(sql: str, columns_by_table: dict) -> list[str]:
         if t not in known_tables:
             near = sorted(n for n in known_tables if t in n or n in t)[:5]
             problems.append(
-                f"table {t!r} does not exist"
+                f"table {t!r} {missing}"
                 + (f" (did you mean: {', '.join(near)})" if near else ""))
     # Only columns of tables this query actually names are in scope; a query
     # naming no known table has already been reported above.
@@ -376,7 +381,7 @@ def unknown_identifiers(sql: str, columns_by_table: dict) -> list[str]:
         q, c = qual.lower(), col.lower()
         if q in known_tables and c not in known_tables[q]:
             problems.append(
-                f"column {q}.{c!r} does not exist; {q} has: "
+                f"column {q}.{c!r} {missing}; {q} has: "
                 + ", ".join(sorted(known_tables[q])[:24]))
         elif q not in known_tables and q in aliases and c not in in_scope:
             # Name the real candidates: a model told only "that column does not
@@ -424,6 +429,13 @@ def introspect_columns(execute, *, max_tables: int = 120,
     rows = execute(INTROSPECT_COLUMNS_SQL) or []
     out: dict[str, list[str]] = {}
     types: dict[str, dict[str, str]] = {}
+    # THE IN-PYTHON CAPS ARE NOT ALLOWED TO BE SILENT EITHER. The SCHEMA_ROW_LIMIT
+    # fix above covered only the *row* bound; these two caps still dropped
+    # tables and columns without a word, so `record["tables"]` reported the
+    # truncated count as the schema size and `unknown_identifiers` rejected a
+    # probe naming a dropped table with a confidently wrong "does not exist"
+    # about the LIVE production schema. A 200-table database hits this.
+    dropped_columns: dict[str, int] = {}
     for row in rows:
         if not row or len(row) < 2:
             continue
@@ -431,14 +443,30 @@ def introspect_columns(execute, *, max_tables: int = 120,
         column = str(row[1])
         dtype = str(row[2]) if len(row) > 2 else ""
         cols = out.setdefault(table, [])
-        if len(cols) < max_columns_per_table and column not in cols:
+        if column in cols:
+            continue
+        if len(cols) < max_columns_per_table:
             cols.append(column)
             types.setdefault(table, {})[column] = dtype
+        else:
+            dropped_columns[table] = dropped_columns.get(table, 0) + 1
+    dropped_tables: list[str] = []
     if len(out) > max_tables:
         keep = sorted(out, key=lambda t: -len(out[t]))[:max_tables]
+        dropped_tables = sorted(set(out) - set(keep))
         out = {t: out[t] for t in sorted(keep)}
+        for table in dropped_tables:
+            dropped_columns.pop(table, None)
     _COLUMN_TYPES.clear()
     _COLUMN_TYPES.update(types)
+    _SCHEMA_TRUNCATION.clear()
+    if dropped_tables or dropped_columns:
+        _SCHEMA_TRUNCATION.update({
+            "dropped_tables": dropped_tables,
+            "max_tables": max_tables,
+            "dropped_columns": dict(sorted(dropped_columns.items())),
+            "max_columns_per_table": max_columns_per_table,
+        })
     return out
 
 
@@ -446,6 +474,13 @@ def introspect_columns(execute, *, max_tables: int = 120,
 # without a second round-trip; kept module-level rather than returned so the
 # `{table: [column]}` shape that `unknown_identifiers` consumes stays simple.
 _COLUMN_TYPES: dict[str, dict[str, str]] = {}
+
+# Companion to _COLUMN_TYPES and module-level for the same reason: what the
+# in-Python caps DROPPED from the last introspection. Empty means the schema
+# handed onward is the whole `public` schema; non-empty means it is a SLICE,
+# and neither the report nor `unknown_identifiers` may speak about the dropped
+# names as if production lacked them.
+_SCHEMA_TRUNCATION: dict = {}
 
 
 def schema_digest(columns_by_table: dict, *, max_chars: int = 12_000) -> str:
@@ -857,6 +892,29 @@ def collect_runtime_evidence(judge, purpose_blob: str, *, env: dict | None = Non
             # ---- gap B: SCHEMA FIRST, always, before any query is written ----
             columns_by_table = introspect_columns(session.schema_execute)
             record["tables"] = len(columns_by_table)
+            if _SCHEMA_TRUNCATION:
+                # Named the same way the row bound is: the caps are part of the
+                # schema story, not a private implementation detail.
+                parts = []
+                if _SCHEMA_TRUNCATION.get("dropped_tables"):
+                    dropped = _SCHEMA_TRUNCATION["dropped_tables"]
+                    parts.append(
+                        f"{len(dropped)} table(s) past the "
+                        f"{_SCHEMA_TRUNCATION['max_tables']}-table cap were DROPPED: "
+                        + ", ".join(dropped[:24]))
+                if _SCHEMA_TRUNCATION.get("dropped_columns"):
+                    parts.append(
+                        "columns past the "
+                        f"{_SCHEMA_TRUNCATION['max_columns_per_table']}-per-table cap "
+                        "were DROPPED from: " + ", ".join(
+                            f"{t} (+{n})" for t, n in
+                            list(_SCHEMA_TRUNCATION["dropped_columns"].items())[:24]))
+                record["errors"].append(
+                    "the schema below is a SLICE of the real one - "
+                    + "; ".join(parts)
+                    + ". Probes naming them will be rejected as unknown - raise "
+                      "introspect_columns' max_tables/max_columns_per_table")
+                _log(record["errors"][-1])
             if getattr(session, "truncated_schema", False):
                 record["errors"].append(
                     f"information_schema.columns filled the {SCHEMA_ROW_LIMIT}-row "

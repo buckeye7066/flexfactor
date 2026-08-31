@@ -69,6 +69,27 @@ def install_workspace_lock_inheritance(eng) -> None:
         project_dir = project_root_from_rel(root, rel)
         manager, lockfile, install, inherited, lock_dir = node_lock_at_or_above(
             root, project_dir)
+        # RE-DERIVE THE RUNNER ARGV TOO. orig_detect_node already built
+        # build/typecheck/lint/test/run as [<old manager>, "run", ...] before
+        # this correction, so a pnpm/yarn/bun workspace member reported
+        # manager="pnpm" while its gates still executed `npm run build` - and in
+        # a workspace whose installer lays out node_modules/.bin differently,
+        # that gate fails for an ENVIRONMENTAL reason the run then blames on the
+        # audited code. Only a leading [<old>, "run"] prefix is rewritten;
+        # non-runner argv like ["npx", "tsc", "--noEmit"] is left alone.
+        if manager != tc.manager:
+            for attr in ("build", "typecheck", "lint", "test", "run"):
+                cmds = getattr(tc, attr, None)
+                if not cmds:
+                    continue
+                if isinstance(cmds, list) and cmds and isinstance(cmds[0], list):
+                    rewritten = [([manager] + c[1:] if c[:2] == [tc.manager, "run"]
+                                  else c) for c in cmds]
+                elif isinstance(cmds, list) and cmds[:2] == [tc.manager, "run"]:
+                    rewritten = [manager] + cmds[1:]
+                else:
+                    continue
+                setattr(tc, attr, rewritten)
         tc.manager = manager
         tc.lockfile = lockfile
         tc.install = [] if inherited else [install]

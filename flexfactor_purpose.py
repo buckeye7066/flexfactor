@@ -349,6 +349,18 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
             if not isinstance(data, dict):
                 continue
             c = _contract_from_registry(data)
+            # A CONTRACT WITH NO PURPOSE IS NOT AN AUTHORED CONTRACT. The
+            # markdown branch below has always required a non-empty purpose;
+            # this one accepted any JSON object. So a stub, a half-written
+            # .flexfactor-purpose.json, or another tool's file returned
+            # authored=True with purpose="" - which SHADOWED the owner's real
+            # seeded contract for that program (the registry is only consulted
+            # when this returns None), and then reported "owner-authored"
+            # confidence, which mutation_authorized_by_purpose() turns into
+            # True. A purpose-less file must not silently buy the authority of
+            # a real owner contract; fall through to the registry instead.
+            if not (c.purpose or "").strip():
+                continue
             if not c.name or c.name == "(unnamed)":
                 c.name = program_name or os.path.basename(project_dir)
                 c.slug = slugify(c.name)

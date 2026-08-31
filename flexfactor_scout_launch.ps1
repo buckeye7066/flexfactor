@@ -114,16 +114,23 @@ if ([string]::IsNullOrWhiteSpace($rrUrl)) {
     if (Test-RepoRewardsLocal) {
         $rrUrl = "http://localhost:3000"
         Write-Host "Repo Rewards: local http://localhost:3000" -ForegroundColor DarkGray
-    } elseif ($allowRemote) {
-        $rrUrl = $productionRr
-        $remoteArgs = @("--allow-remote-repo-rewards")
-        Write-Host "Repo Rewards: opted-in remote $productionRr" -ForegroundColor DarkGray
     } else {
-        Write-Host "Repo Rewards is not reachable at http://localhost:3000." -ForegroundColor Red
-        Write-Host "Start local Repo Rewards, set FLEXFACTOR_REPO_REWARDS_URL," -ForegroundColor DarkGray
-        Write-Host "or set FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=1 to opt into" -ForegroundColor DarkGray
-        Write-Host "remote $productionRr (sends search queries off-host)." -ForegroundColor DarkGray
-        Read-Host "Press Enter to close"; exit 1
+        # PRODUCTION IS THE DEFAULT FALLBACK (launcher-drift fix 2026-08-30).
+        # This launcher still enforced the pre-2026-08-16 opt-in policy and
+        # EXITED 1 before the CLI ever ran when local Repo Rewards was down and
+        # FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS was unset. The CLI's
+        # resolve_repo_rewards_url() has since made production the automatic
+        # fallback (opt OUT with --no-remote-repo-rewards or
+        # FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0). Local RR is usually down on
+        # this machine, so the desktop shortcut was refusing runs the CLI would
+        # have completed, and telling the owner to set an env var the CLI no
+        # longer requires. Leave the decision to the CLI, which prints the
+        # endpoint it chose. --allow-remote-repo-rewards is still passed when
+        # explicitly opted in, as the accepted NO-OP it now is.
+        $rrUrl = $productionRr
+        if ($allowRemote) { $remoteArgs = @("--allow-remote-repo-rewards") }
+        Write-Host "Repo Rewards: local is down; using $productionRr" -ForegroundColor DarkGray
+        Write-Host "(opt out with FLEXFACTOR_ALLOW_REMOTE_REPO_REWARDS=0)" -ForegroundColor DarkGray
     }
 }
 

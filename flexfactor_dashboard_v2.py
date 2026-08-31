@@ -261,17 +261,24 @@ def main() -> None:
                 dt = max(1e-6, (h[j][0] - h[j-1][0]) / 60.0)
                 series.append(max(0.0, (h[j][1] - h[j-1][1]) / dt))
 
-            # ---- header
+            # ---- header. Label/colour derive from the PHASE via the SHARED
+            # terminal_label (flexfactor_dashboard) - `done` alone painted a
+            # crashed program (phase="error", done=True) as a green DONE.
+            from flexfactor_dashboard import terminal_label as _tl
+            label, kind = _tl(p)
             canvas.create_text(L, top + 24, anchor="w", text=name[:38],
-                               fill=(GOOD if done_flag else ACCENT),
+                               fill=(GOOD if kind == "done" else
+                                     BAD if kind == "error" else ACCENT),
                                font=("Segoe UI", 15, "bold"))
             d = durable_facts(p)
             att = f"attempt {d['attempts']}" + (f" (+{d['resumes']} resumes)" if d["resumes"] else "")
             canvas.create_text(x0 + col_w - 18, top + 24, anchor="e", text=att,
                                fill=DIM, font=("Segoe UI", 9))
             canvas.create_text(L, top + 46, anchor="w",
-                               text=("DONE" if done_flag else phase)[:46],
-                               fill=(GOOD if done_flag else TEXT), font=("Segoe UI", 10))
+                               text=label[:46],
+                               fill=(GOOD if kind == "done" else
+                                     BAD if kind == "error" else TEXT),
+                               font=("Segoe UI", 10))
 
             y = top + 76
 

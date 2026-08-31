@@ -296,6 +296,14 @@ def build_state(sampler: Sampler) -> dict:
             live = "stopped"
         elif quiet_s is not None and quiet_s > STALL_S:
             live = "quiet"
+        elif moved_ago is not None and moved_ago > STALL_S:
+            # PER-PROGRAM stall. quiet_s is the mtime of status.json - ONE file
+            # shared by every program in a --parallel batch - so a program whose
+            # own counters had not moved for hours kept a green LIVE pill for as
+            # long as ANY sibling kept writing the file. counters_moved_ago is
+            # the per-program signal; it was computed, shipped in the payload,
+            # and never consulted by this verdict.
+            live = "quiet"
         else:
             live = "live"
 
@@ -713,6 +721,46 @@ def _release_audit_start_lock(lock_path: str) -> None:
         pass
 
 
+def _clear_own_pid_record(pid_path: str, pid: int, label: str) -> None:
+    """Remove pid_path iff it still records *pid* - with retries, loudly.
+
+    On Windows a transient AV/indexer lock makes os.unlink raise
+    PermissionError (WinError 32). Both reapers used to swallow that inside
+    `except OSError: pass` and GIVE UP FOREVER - measured in this very test
+    suite under load - so a stale audit.pid made a stopped run keep looking
+    live, and on pid reuse _acquire_audit_start_lock refused every future run
+    with "an audit is already running". Measured AV latency on this machine is
+    11-70ms per filesystem op, so a short bounded backoff clears it; a failure
+    that SURVIVES the backoff is printed, never silently dropped. A record now
+    owned by a different pid is the one benign exit (another run legitimately
+    owns the file).
+    """
+    deadline = time.time() + 2.0
+    delay = 0.02
+    last: OSError | None = None
+    while True:
+        try:
+            with open(pid_path, "r", encoding="utf-8") as fh:
+                recorded = int(fh.read().strip())
+            if recorded != pid:
+                return          # someone else's record - never touch it
+            os.unlink(pid_path)
+            return
+        except FileNotFoundError:
+            return              # already cleared - the goal state
+        except (TypeError, ValueError):
+            return              # unreadable content is not ours to judge
+        except OSError as ex:   # transient lock: retry within the window
+            last = ex
+            if time.time() >= deadline:
+                break
+            time.sleep(delay)
+            delay = min(0.2, delay * 2)
+    print(f"flexfactor-web: {label}: could not clear {pid_path} "
+          f"({type(last).__name__}: {last}) - a stale pid record may make "
+          "this run keep looking live", file=sys.stderr)
+
+
 def _start_audit_reaper(process, pid_path: str) -> None:
     """Reap the detached child and clear only its own PID record."""
     def reap() -> None:
@@ -720,13 +768,7 @@ def _start_audit_reaper(process, pid_path: str) -> None:
             process.wait()
         finally:
             with LAUNCH_LOCK:
-                try:
-                    with open(pid_path, "r", encoding="utf-8") as fh:
-                        recorded = int(fh.read().strip())
-                    if recorded == process.pid:
-                        os.unlink(pid_path)
-                except (OSError, TypeError, ValueError):
-                    pass
+                _clear_own_pid_record(pid_path, process.pid, "audit-reaper")
 
     threading.Thread(target=reap, name="flexfactor-audit-reaper", daemon=True).start()
 
@@ -782,13 +824,7 @@ def _start_provider_install_reaper(process, pid_path: str, status_path: str,
             except OSError:
                 pass
         with LAUNCH_LOCK:
-            try:
-                with open(pid_path, "r", encoding="utf-8") as fh:
-                    recorded = int(fh.read().strip())
-                if recorded == process.pid:
-                    os.unlink(pid_path)
-            except (OSError, TypeError, ValueError):
-                pass
+            _clear_own_pid_record(pid_path, process.pid, "provider-install-reaper")
 
     threading.Thread(target=reap, name="flexfactor-provider-install-reaper",
                      daemon=True).start()
@@ -861,8 +897,14 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
             if running:
                 raise ValueError("an audit is already running (pid {})".format(running))
             model_mode = "free" if provider == "ollama" else "paid"
+            # THE SHIM, not flexfactor.py directly: flexfactor_run.py arms the
+            # directed-runtime hooks (capacity admission + the `stopped=True`
+            # liveness field this very module branches on in build_state).
+            # run_cli now also arms them itself, but spawning the shim keeps the
+            # phone launcher on the same documented entry path as the desktop
+            # launchers instead of a fourth spelling.
             command = [
-                sys.executable, os.path.join(APP_ROOT, "flexfactor.py"), mode,
+                sys.executable, os.path.join(APP_ROOT, "flexfactor_run.py"), mode,
                 "--program", requested, "--no-dashboard", "--provider", provider,
                 "--model-mode", model_mode, "--single",
                 "--max-cost", "{:g}".format(max_cost),
@@ -1120,7 +1162,7 @@ function card(p){
   h+='<div class="lbl">Defects — found in '+p.reviewed+' files reviewed</div>';
   h+='<div class="row"><span class="n">'+p.defects+' found · '+
      p.defects_fixed+' fixed</span>'+
-     (p.errors?'<span class="err n">'+p.errors+' errors</span>':'')+'</div>';
+     (p.errors?'<span class="err n">'+p.errors+' file errors</span>':'')+'</div>';
   if(Object.keys(p.severity||{}).length){
     h+='<div class="sev">';
     for(var k in p.severity){ h+='<span>'+k+' '+p.severity[k]+'</span>'; }

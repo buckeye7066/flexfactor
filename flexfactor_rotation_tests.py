@@ -213,7 +213,26 @@ class PinTests(RotationTestCase):
                   cost=R.PAID_METERED)))
         for pin in ("openrouter", "openrouter:credits", "x-ai/grok-4.6",
                     "openrouter/x-ai/grok-4.6"):
-            self.assertEqual(rot.next_route(pin=pin).route.model, "x-ai/grok-4.6", pin)
+            # allow_paid=True: the pinned target is paid-metered, and a pin does
+            # not override the cost boundary (see the test below).
+            self.assertEqual(
+                rot.next_route(pin=pin, allow_paid=True).route.model,
+                "x-ai/grok-4.6", pin)
+
+    def test_a_pin_to_a_paid_route_cannot_bypass_allow_paid(self):
+        """The module header contract: a $0 call must never silently become a
+        paid one. The pin can come from the SHARED state file (another app's
+        'global' pin), so honoring it blind under allow_paid=False billed money
+        on a free-mode run. The refusal is LOUD (PinUnavailable) and names the
+        cost boundary, not a cooldown."""
+        rot = self.rotator(catalog(
+            route("openrouter/x-ai/grok-4.6", "openrouter:credits",
+                  backend="openrouter", model="x-ai/grok-4.6",
+                  cost=R.PAID_METERED)))
+        with self.assertRaises(R.PinUnavailable) as ctx:
+            rot.next_route(pin="openrouter", allow_paid=False)
+        self.assertIn("paid", str(ctx.exception).lower())
+        self.assertNotIn("cooling", str(ctx.exception).lower())
 
     def test_an_unavailable_pin_fails_loudly_instead_of_substituting(self):
         """A silent substitution is the defect this whole codebase keeps
@@ -633,6 +652,39 @@ class RotatingProviderTests(RotationTestCase):
             route("light/small", "pool-light", tier=R.LIGHT)))
         self.assertEqual(prov.complete("x"), "completed by front/big")
         self.assertEqual(prov.grade()["by"], "light/small")
+
+    def test_paid_mode_rotates_to_the_second_paid_pool_after_a_failure(self):
+        """Owner order 2026-08-21: paid rotates until exhausted.
+
+        The old one-paid-round logic revoked allow_paid on attempts 1..N. It
+        was written for the retired `auto` mode, whose fallback was FREE
+        routes; in `paid` mode the catalog holds ONLY paid backends, so a
+        single metered failure filtered out every remaining pool and the call
+        died with a wrong 'held back because allow_paid is off' diagnosis."""
+        cat = catalog(
+            route("anthropic_api/claude", "anthropic:paid", cost=R.PAID_METERED),
+            route("openai_api/gpt", "openai:paid", cost=R.PAID_METERED))
+        prov = self._provider(
+            cat, failures={"anthropic_api/claude": Boom("overloaded", status_code=503)},
+            allow_paid=True, paid_first=True)
+        # Whichever paid pool is drawn first, the metered failure must hand the
+        # call to the OTHER paid pool instead of stranding it.
+        result = prov.complete("x")
+        self.assertIn("completed by", result)
+
+    def test_rotation_exhaustion_reports_the_real_provider_error(self):
+        """When every pool has genuinely failed, the raise must carry the last
+        provider error as its cause - a bare 'no route available' after a real
+        failure is a confidently wrong diagnosis."""
+        prov = self._provider(
+            catalog(route("a/m", "pool-a")),
+            failures={"a/m": Boom("secret upstream detail", status_code=503)})
+        with self.assertRaises(R.RotationError) as ctx:
+            prov.complete("x")
+        chain = str(ctx.exception) + repr(ctx.exception.__cause__ or "")
+        self.assertIn("secret upstream detail", chain,
+                      "the real provider failure was discarded by the "
+                      "rotation-exhaustion raise")
 
     def test_a_rate_limited_pool_is_skipped_on_the_next_call(self):
         prov = self._provider(

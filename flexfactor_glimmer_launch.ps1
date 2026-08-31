@@ -108,5 +108,14 @@ if (-not $Rest -or $Rest.Count -eq 0) {
 }
 
 Write-Host "FlexFactor -> $MODEL (standalone, rotation bypassed)" -ForegroundColor Cyan
-& python $script @Rest --provider ollama --model $MODEL
+# RESOLVE THE INTERPRETER THE ONE WAY (launcher-drift fix 2026-08-30). This was
+# the last launcher still calling bare `python`, which is the exact defect
+# scripts\flexfactor_python.ps1 was written to end: bare `python` takes whatever
+# is first on PATH, ignoring $env:FLEXFACTOR_PYTHON and the checkout's .venv -
+# and .venv is where `pip install -e ".[all]"` puts the provider SDKs. Measured
+# on this host it resolved to C:\Python314\python.exe while the other three
+# launchers resolved to the .venv interpreter, so this shortcut ran a DIFFERENT
+# Python from every other entry point.
+. (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $Rest + @('--provider', 'ollama', '--model', $MODEL))
 exit $LASTEXITCODE

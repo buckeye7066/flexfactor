@@ -463,8 +463,21 @@ class ErrorLedger:
 # --------------------------------------------------------------------------- #
 
 def slug_for(program: str) -> str:
-    """The run-directory slug flexfactor.py builds for a program name."""
-    return "".join(c.lower() if c.isalnum() else "-" for c in str(program or "")).strip("-")
+    """The run-directory slug for a program name - DELEGATED to the one
+    authoritative spelling, flexfactor_runstate._slug.
+
+    This used to be a second, non-identical implementation: no dash-collapse
+    and no 48-char cap, so slug_for("AWMOAWM (EMS)") == "awmoawm--ems" while
+    the run directory was created from _slug's "awmoawm-ems". When they
+    disagree, find_run_dir's prefix match finds nothing and the error box
+    silently says "no errors recorded" for a program whose errors.md exists.
+    Two spellings of an identity is the '_canon_rel' class of defect; there is
+    exactly one now.
+    """
+    if not str(program or "").strip():
+        return ""   # _slug falls back to "run"; an empty NAME must not match run-*
+    import flexfactor_runstate as _rs
+    return _rs._slug(str(program))
 
 
 def find_run_dir(program: str, runs_root: str = "") -> str:

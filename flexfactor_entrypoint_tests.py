@@ -275,10 +275,16 @@ class EntryPointParityTests(unittest.TestCase):
             ("flexfactor_launch.ps1", [target], ["2", "anthropic", ""],
              {"ANTHROPIC_API_KEY": "test-placeholder", "OPENAI_API_KEY": ""},
              [script, "scout", "--program", target, "--provider", "anthropic"]),
+            # --model-mode is REQUIRED output since 2026-08-30: with only a paid
+            # OpenAI key present, omitting it left the CLI on its `free` default,
+            # which EXCLUDES that key - the run silently demoted to CPU-only
+            # ollama while the launcher claimed otherwise (ledger L11).
             ("flexfactor_audit_launch.ps1", [target], ["n", ""],
              {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
               "OPENAI_API_KEY": "test-placeholder"},
-             [script, "audit", "--provider", "openai", "--program", target,
+             [script, "audit", "--provider", "openai",
+              "--model-mode", "paid", "--paid-models", "openai",
+              "--program", target,
               "--apply", "--yes", "--allow-dirty", "--auto-clean"]),
             ("flexfactor_scout_launch.ps1", [target], ["openai", "YES", "report", ""],
              {"OPENAI_API_KEY": "test-placeholder",

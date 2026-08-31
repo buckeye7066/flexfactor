@@ -60,6 +60,17 @@ SKIP_DIRS = {
     ".next", ".nuxt", "coverage", "__pycache__", ".pytest_cache",
 }
 
+# THE ONE STATUS VOCABULARY BOTH INVENTORY GATES KEY ON.
+# "analyzed-in-chunks" IS a successful analysis: `_index_large_file_in_chunks`
+# returns it when the chunk ledger accounts for every chunk, and
+# totals["analyzed_source_files"] counts it.  That same helper returns
+# "blocked" for a file that was HASHED AND NEVER SCANNED - past the 64MB hard
+# cap, unreadable, or an incomplete ledger.  Spelling the set out twice let
+# "blocked" pass the inventory gate as "complete" and let "analyzed-in-chunks"
+# fail the rescan gate, so a repo with one changed >4MB source file could never
+# converge and the stated reason was wrong.
+ANALYZED_SOURCE_STATUSES = frozenset({"analyzed", "analyzed-in-chunks"})
+
 _SECRET_PATTERNS = (
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
     ("github-token", re.compile(r"\bgh[opusr]_[A-Za-z0-9_]{30,}\b")),
@@ -519,7 +530,12 @@ def build_repository_index(root: str, run_id: str, progress=None) -> dict:
         },
     }
     index["complete_source_inventory"] = all(
-        f["path"] in file_map and f["status"] not in {"inventoried", "refused"}
+        f["path"] in file_map
+        # "parse-error" still counts: the file WAS opened and scanned and the
+        # parser's failure is recorded on its record.  "blocked" does not - its
+        # bytes were never scanned at all.
+        and (f["status"] in ANALYZED_SOURCE_STATUSES
+             or f["status"] == "parse-error")
         for f in files if f["category"] == "source")
     return index
 
@@ -535,7 +551,10 @@ def changed_file_rescan(after: dict, changed: Iterable[str]) -> dict:
     rows = []
     for raw in sorted(set(str(p).replace("\\", "/") for p in changed if p)):
         row = records.get(raw)
-        rescanned = bool(row and row.get("status") in {"analyzed", "inventoried"})
+        # A non-source file's complete record IS "inventoried" (it is hashed,
+        # never parsed); a source file's is one of ANALYZED_SOURCE_STATUSES.
+        rescanned = bool(row and (row.get("status") in ANALYZED_SOURCE_STATUSES
+                                  or row.get("status") == "inventoried"))
         rows.append({"path": raw, "status": row.get("status") if row else "missing",
                      "sha256": row.get("sha256") if row else None,
                      "analysis_run_id": row.get("analysis_run_id") if row else None,
@@ -760,13 +779,28 @@ def secret_findings(root: str, index: dict) -> list[dict]:
     except (OSError, ValueError, TypeError):
         pass
     findings = []
+    cap = 1_000_000
     for file in index.get("files", []):
         if file.get("category") not in {"source", "text"}:
             continue
-        got = _read_bytes(root, file["path"], cap=1_000_000)
+        got = _read_bytes(root, file["path"], cap=cap)
         if got is None:
             continue
-        text = got[0].decode("utf-8", "replace")
+        raw, truncated = got
+        text = raw.decode("utf-8", "replace")
+        if truncated:
+            # A CLEAN SECRETS GATE MUST NOT BE A CLAIM ABOUT BYTES NEVER READ.
+            # The truncation flag used to be discarded, so everything past the
+            # cap was silently unscanned. The fingerprint is the digest of the
+            # prefix that WAS scanned, so the record re-arms when the file
+            # changes, exactly like every other finding here.
+            findings.append({
+                "rule_id": "secret.scan-truncated", "severity": "critical",
+                "message": (f"only the first {cap} bytes were scanned for "
+                            "credentials; the rest of this file is UNSCANNED"),
+                "file": file["path"], "line": 1,
+                "fingerprint": hashlib.sha256(raw).hexdigest(),
+                "disposition": "unresolved", "baseline_reason": None})
         for kind, rx in _SECRET_PATTERNS:
             for m in rx.finditer(text):
                 rule_id = f"secret.{kind}"
@@ -840,8 +874,15 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
         gate("inventory", "Relevant source inventory", True,
              bool(index.get("complete_source_inventory")), index.get("totals")),
         gate("rescan", "Changed-file rescan", True, bool(rescan.get("complete")), rescan),
+        # NOT a tautology. `dependency_blast_radius` hardcodes "ran": True on
+        # every return path, so ran-implies-passed was a gate that could not
+        # fail while still counting toward totals["pass"] and the overall all().
+        # It now asserts the thing the evidence claims to prove: an unresolved
+        # LOCAL import means the reverse closure is incomplete, so the blast
+        # radius below is a floor, not the answer.
         gate("blast-radius", "Dependency blast-radius analysis", bool(blast.get("ran")),
-             bool(blast.get("ran")), blast),
+             bool(blast.get("ran") and not blast.get("unresolved_local_imports")),
+             blast),
         gate("function-coverage", "Direct function invocation evidence", True,
              functions_proven, {"functions": coverage.get("function_total", 0),
                                  "direct": coverage.get("function_direct_coverage_total", 0),

@@ -235,31 +235,23 @@ class RunCheckpoint:
         }
         self.save()
 
-    def record_file_outcome(self, rel: str, outcome: str) -> None:
-        """outcome: fixed | unverified | rolled_back | rejected | skipped."""
-        key = str(rel).replace("\\", "/")
-        self.data.setdefault("files", {})[key] = str(outcome)
-        # A file whose content we just changed can no longer be trusted as
-        # "already reviewed" - drop its recorded review so a resume re-reviews
-        # the NEW content instead of replaying findings about the old bytes.
-        if outcome in ("fixed", "unverified"):
-            self.data.get("reviewed", {}).pop(key, None)
-        self.save()
-
-    def record_spend(self, usd: float) -> None:
-        try:
-            self.data["spend_usd"] = round(float(usd), 6)
-        except (TypeError, ValueError):
-            return
-        self.save()
+    # record_file_outcome / record_spend / record_bootstrap were DELETED
+    # 2026-08-30: written, tested in isolation, and called from NOWHERE - the
+    # fifth instance of this repo's written-but-not-wired trap (after
+    # flexfactor_runstate itself, the set_phase/record_cycle/record_spend
+    # group, _UI_EXPLORER_JS, and the purpose-evidence runners). Their absence
+    # costs nothing that is not already covered: spend rides in through
+    # set_phase/record_cycle **fields on every phase boundary, and a FIXED
+    # file's stale review entry is already dropped on resume because
+    # verify_reviewed re-checks every recorded sha against the file's CURRENT
+    # contained-read sha. Keeping uncalled writers around is how docs start
+    # describing behaviour that never runs (docs/RECOVERY_AND_ROLLBACK.md did
+    # exactly that, corrected in the same change). If a per-file outcome map
+    # is ever wanted, wire the call site FIRST.
 
     def record_cycle(self, cycle: int, **fields) -> None:
         self.data["cycle"] = int(cycle)
         self.data.update(fields)
-        self.save(force=True)
-
-    def record_bootstrap(self, steps: list, ok: bool) -> None:
-        self.data["bootstrap"] = {"done": bool(ok), "steps": list(steps or [])}
         self.save(force=True)
 
     def finish(self, status: str = "finished", **fields) -> bool:
@@ -350,10 +342,8 @@ def run_summary(data: dict) -> dict:
     """Compact, display-ready view of one checkpoint (never the whole findings
     blob, which can be megabytes)."""
     reviewed = data.get("reviewed") or {}
-    files = data.get("files") or {}
     total = int(data.get("files_total") or 0)
     n_reviewed = len(reviewed)
-    fixed = sum(1 for v in files.values() if v in ("fixed", "unverified"))
     pct = int(round(100.0 * n_reviewed / total)) if total else 0
     return {
         "run_id": data.get("run_id"),
@@ -370,7 +360,9 @@ def run_summary(data: dict) -> dict:
         "max_cost": float(data.get("max_cost") or 0.0),
         "files_total": total,
         "reviewed": n_reviewed,
-        "fixed": fixed,
+        # No "fixed" key: it was derived from a per-file outcome map no code
+        # ever populated, so it could only ever be 0 - a number that reads as
+        # "this run landed nothing" regardless of what the run landed.
         "defects_found": int(data.get("defects_found") or 0),
         "percent": pct,
         "branch": data.get("branch"),
@@ -531,15 +523,6 @@ def prune(root: str, keep: int = DEFAULT_KEEP_RUNS) -> int:
     return removed
 
 
-def format_rows(rows: list[dict]) -> str:
-    """ASCII table of run summaries for the CLI and the launcher."""
-    if not rows:
-        return "  (no resumable runs)"
-    lines = ["  {:<34} {:<14} {:<9} {:>7} {:>9}  {}".format(
-        "RUN ID", "PROGRAM", "MODE", "DONE", "SPENT", "LAST UPDATE")]
-    for d in rows:
-        s = run_summary(d)
-        lines.append("  {:<34} {:<14} {:<9} {:>6}% {:>9}  {}".format(
-            str(s["run_id"])[:34], str(s["program"])[:14], str(s["mode"])[:9],
-            s["percent"], "${:.2f}".format(s["spend_usd"]), s["updated"]))
-    return "\n".join(lines)
+# format_rows was DELETED 2026-08-30 with the unwired writers above: "ASCII
+# table ... for the CLI and the launcher" was called by neither, and its DONE
+# column rendered the phantom "fixed" figure.

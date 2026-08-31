@@ -36,6 +36,33 @@ class Classification(unittest.TestCase):
         self.assertIn("no known fix", sugg)
 
 
+class SlugAgreesWithRunstate(unittest.TestCase):
+    """slug_for must be THE SAME spelling flexfactor_runstate builds run
+    directories from. It used to be a second implementation with no
+    dash-collapse and no 48-char cap, so slug_for("AWMOAWM (EMS)") was
+    "awmoawm--ems" while the run dir was created from "awmoawm-ems" -
+    find_run_dir's prefix match found nothing and the error box silently said
+    "no errors recorded" for a program whose errors.md exists."""
+
+    def test_punctuated_program_name_matches_the_run_dir_spelling(self):
+        import flexfactor_runstate as rs
+        for name in ("AWMOAWM (EMS)", "My  App!!", "x" * 80):
+            self.assertEqual(E.slug_for(name), rs._slug(name), name)
+
+    def test_find_run_dir_finds_a_dir_named_by_runstate(self):
+        import flexfactor_runstate as rs
+        with tempfile.TemporaryDirectory() as root:
+            slug = rs._slug("AWMOAWM (EMS)")
+            run = os.path.join(root, f"{slug}-20260830-120000-000001-1234")
+            os.makedirs(run)
+            open(os.path.join(run, "errors.json"), "w").close()
+            found = E.find_run_dir("AWMOAWM (EMS)", runs_root=root)
+            self.assertEqual(os.path.abspath(found), os.path.abspath(run))
+
+    def test_an_empty_name_matches_nothing(self):
+        self.assertEqual(E.slug_for(""), "")
+
+
 class ResponsibleFrame(unittest.TestCase):
     def test_innermost_flexfactor_frame_with_source(self):
         try:

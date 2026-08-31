@@ -80,12 +80,24 @@ function Invoke-FlexFactorJob {
     # converge instead of starting over, and in-process retries mean a restart
     # only happens when the process genuinely died. Exit 2 (argparse usage
     # error) never retries - rerunning a doomed command 5x helps nobody.
+    # THE EXIT CODE LEAVES BY $script:FlexFactorJobExit, NEVER BY return.
+    # In PowerShell a native command's stdout IS the success stream, so the old
+    # `$null = Invoke-FlexFactorJob ...` shape - needed to stop the return value
+    # printing - swallowed EVERY stdout line the Python child produced: the
+    # ConsoleMeter progress line, every per-file [fixed]/[skip]/[no-op]/[timeout]
+    # outcome, the totals, the purpose score, the review ledger. 326 of
+    # flexfactor.py's 399 print() calls go to stdout, so the desktop shortcut ran
+    # blind - including option 4, the very mode the meter was built for in
+    # 2026-08-11 after the owner reported "no progress meter in option 4".
+    # Writing the code to a script-scoped variable lets callers invoke this BARE,
+    # so the child's stdout reaches the console, and still read the real code.
     param([string[]]$JobArgs)
     $maxAttempts = 5
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         if ($selectedRuntimeMode -ne 'paid' -and -not (Ensure-FccProxy)) {
             Write-Host "  Proxy unavailable - cannot run this attempt." -ForegroundColor Red
-            return 1
+            $script:FlexFactorJobExit = 1
+            return
         }
         if ($attempt -gt 1) {
             Write-Host ""
@@ -93,10 +105,11 @@ function Invoke-FlexFactorJob {
         }
         Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $JobArgs)
         $code = $LASTEXITCODE
-        if ($code -eq 0) { return 0 }
+        if ($code -eq 0) { $script:FlexFactorJobExit = 0; return }
         if ($code -eq 2) {
             Write-Host "  Exit code 2 (usage error / cancelled) - not retrying." -ForegroundColor Red
-            return $code
+            $script:FlexFactorJobExit = $code
+            return
         }
         if ($code -eq 3) {
             # Exit 3 = the run completed but APPLIED NOTHING despite finding
@@ -105,13 +118,14 @@ function Invoke-FlexFactorJob {
             Write-Host "  Exit code 3: the run FIXED NOTHING despite finding defects." -ForegroundColor Red
             Write-Host "  Not retrying - a repeat would re-spend the same budget for the" -ForegroundColor Red
             Write-Host "  same result. See the audit report for why nothing could be applied." -ForegroundColor Red
-            return $code
+            $script:FlexFactorJobExit = $code
+            return
         }
         Write-Host "  FlexFactor exited with code $code." -ForegroundColor Yellow
         if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 15 }
     }
     Write-Host "  Gave up after $maxAttempts attempts - see output above." -ForegroundColor Red
-    return 1
+    $script:FlexFactorJobExit = 1
 }
 
 # flexfactor_run.py is a thin shim onto flexfactor.run_cli (the same entry the
@@ -289,10 +303,10 @@ if ($mode -eq "4") {
     # IS the owner's confirmation - same reasoning as audit mode above.
     $paidArgs = @()
     if ($selectedRuntimeMode -eq 'paid') { $paidArgs = @('--paid-models', $selectedPaidModels) }
-    $null = Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode) + $paidArgs + @('--economy', '--yes'))
+    Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode) + $paidArgs + @('--economy', '--yes'))
     Write-Host ""
     Read-Host "Done. Press Enter to close"
-    exit 0
+    exit $script:FlexFactorJobExit
 }
 
 # Audit has its own provider handling: it auto-detects keys and (when both are
@@ -448,10 +462,10 @@ if ($mode -eq "3") {
     }
 
     Write-Host ""
-    $null = Invoke-FlexFactorJob (@('audit') + $programArgs + $extraArgs)
+    Invoke-FlexFactorJob (@('audit') + $programArgs + $extraArgs)
     Write-Host ""
     Read-Host "Done. Press Enter to close"
-    exit 0
+    exit $script:FlexFactorJobExit
 }
 
 $provider = Read-Host "Provider [anthropic / openai] (Enter = anthropic)"
@@ -476,10 +490,10 @@ if ($mode -eq "2") {
         $program = (Read-Host "Program to help (folder, .lnk, URL, or description)").Trim('"')
     }
     Write-Host ""
-    $null = Invoke-FlexFactorJob @('scout', '--program', $program, '--provider', $provider)
+    Invoke-FlexFactorJob @('scout', '--program', $program, '--provider', $provider)
     Write-Host ""
     Read-Host "Done. Press Enter to close"
-    exit 0
+    exit $script:FlexFactorJobExit
 }
 
 # Refactor mode (original behavior).
@@ -501,9 +515,21 @@ if (-not (Test-Path $file)) {
 $goal = Read-Host "What's the goal? (plain English)"
 
 $threshold = Read-Host "Accept threshold 0-100 (Enter = 90)"
-if ([string]::IsNullOrWhiteSpace($threshold)) { $threshold = "90" }
+# --threshold is `type=int` in argparse, so a non-numeric answer here is exit 2
+# and a dead run before anything starts. Every other numeric prompt in this file
+# already validates; this one did not.
+$thresholdValue = 0
+if ([string]::IsNullOrWhiteSpace($threshold) -or
+    -not [int]::TryParse($threshold, [ref]$thresholdValue) -or
+    $thresholdValue -lt 0 -or $thresholdValue -gt 100) {
+    if (-not [string]::IsNullOrWhiteSpace($threshold)) {
+        Write-Host "  '$threshold' is not a whole number 0-100 - using 90." -ForegroundColor Yellow
+    }
+    $threshold = "90"
+}
 
 Write-Host ""
-$null = Invoke-FlexFactorJob @('refactor', '--file', $file, '--goal', $goal, '--provider', $provider, '--threshold', $threshold)
+Invoke-FlexFactorJob @('refactor', '--file', $file, '--goal', $goal, '--provider', $provider, '--threshold', $threshold)
 Write-Host ""
 Read-Host "Done. Press Enter to close"
+exit $script:FlexFactorJobExit
