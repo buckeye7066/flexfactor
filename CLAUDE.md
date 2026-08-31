@@ -55,10 +55,15 @@ of riding a review mode. The surviving rules, and the defect each one killed:
   `merge+push REFUSED` message was therefore half a lie: the push had already
   happened above it.
   Now `if final_ok is True:` guards the push, with `False` and `None` each
-  printing an explicit `PUSH REFUSED - ...` naming which state it was. **The
-  local commit still happens in every case** — work is never lost, the next
-  cycle still builds on it, and the first cycle whose gate passes pushes the
-  accumulated commits, so the tip origin ever sees is green.
+  printing an explicit `PUSH REFUSED - ...` naming which state it was.
+  **CORRECTED 2026-08-30: the local commit does NOT still happen in every
+  case.** Since the `final_ok is not True` early return was added to
+  `_commit_and_sync`, a red or unverified tree is `git reset --hard HEAD`-ed
+  and the function returns "no local commit or push" — retaining a tree the
+  repository itself rejected is the defect that return exists to prevent. The
+  push-gate `else` branch and the `final_ok is None` block below it are
+  therefore UNREACHABLE (kept only because regression guards assert on their
+  text); this paragraph used to describe them as live behaviour.
   The old guard `test_merge_and_push_refused_on_an_unverified_gate` was a
   **source grep for the sentence** and passed happily the entire time red builds
   were shipping — a check that cannot fail proves nothing. The replacements

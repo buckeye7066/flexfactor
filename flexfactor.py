@@ -2500,8 +2500,11 @@ class OpenAIProvider:
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
                    model: str | None = None, salvage_truncated: bool = False) -> dict:
-        # (salvage_truncated accepted for signature parity with AnthropicProvider;
-        # OpenAI json mode already fails loudly on truncation via finish_reason.)
+        # salvage_truncated is LIVE here since 2026-08-30 (it used to be
+        # signature-parity only): finish_reason == "length" catches the
+        # provider's own truncation, but a PROXY/upstream cut mid-stream
+        # arrives with a normal finish_reason and a sawn-off body - the same
+        # shape the Anthropic path salvages.
         # OpenAI json mode isn't schema-constrained, so we inline the schema into
         # the system prompt and tolerantly parse — the caller's code defends
         # against missing keys with .get() defaults. Whole-file callers request a
