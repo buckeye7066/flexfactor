@@ -706,11 +706,19 @@ def build_scout_structured_report(
         },
         "recommendations": recs,
         "proposals": props,
+        # THE DEFAULT DESCRIBES WHAT ACTUALLY HAPPENED. The single production
+        # call site does not pass `sandbox_summary`, and the live enrichment
+        # path (enrich_evidence_from_clone) executes no candidate code at all -
+        # the code that would make an egress claim true (sandbox_eval_env /
+        # run_sandboxed_candidate_eval) is not on it. Hardcoding a
+        # "proxy-poisoned" posture therefore asserted a control this run never
+        # applied, in every _scout_report.json. A caller that really does
+        # sandbox an execution passes its own summary.
         "sandbox": sandbox_summary or {
-            "candidate_execution": "disposable-temp-dir",
-            "credentials": "stripped",
-            "egress": "proxy-poisoned-best-effort",
-            "teardown": "required",
+            "candidate_execution": "not-executed",
+            "credentials": "not-applicable (no candidate code was run)",
+            "egress": "not-controlled (no candidate code was run)",
+            "teardown": "not-applicable (no candidate code was run)",
         },
         "apply_contract": {
             "scout_mutates_target": False,

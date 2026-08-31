@@ -729,13 +729,27 @@ class Rotator:
                 f"(the bare module name does not resolve elsewhere), or "
                 f"clear the pin.")
 
+        # A pin must clear the same cost and account-wide gates as rotation:
+        # the pin can come from the SHARED state file (another app's "global"
+        # pin), so honoring it blind here let a $0 call silently go paid and
+        # re-selected an exhausted daily allowance on every call.
         usable = [r for r in matches if r.enabled
+                  and (allow_paid or r.is_free)
                   and not _cooling(state, r.pool, now)
-                  and not _cooling(state, f"route:{r.id}", now)]
+                  and not _cooling(state, f"route:{r.id}", now)
+                  and not _cooling(state, f"allowance:{allowance_key(r)}", now)]
         if not usable:
             if strict:
-                why = "; ".join(
-                    f"{r.id}: {r.disabled_reason or 'cooling down'}" for r in matches[:4])
+                def _why(r: Route) -> str:
+                    if not r.enabled:
+                        return r.disabled_reason or "disabled"
+                    if not allow_paid and not r.is_free:
+                        return "paid-metered, and allow_paid is off"
+                    if _cooling(state, f"allowance:{allowance_key(r)}", now):
+                        return (f"{allowance_key(r)} allowance exhausted "
+                                "(account-wide)")
+                    return "cooling down"
+                why = "; ".join(f"{r.id}: {_why(r)}" for r in matches[:4])
                 raise PinUnavailable(
                     f"pinned target {pin!r} cannot serve right now -- {why}. "
                     f"Unset the pin to let rotation choose, or wait for the reset.")
@@ -782,10 +796,16 @@ class Rotator:
                 continue
             # Chronically off-purpose for THIS program (see report_quality):
             # skipped here, for this purpose only, with the reason visible.
-            if intent is not None and intent.purpose and \
-                    _cooling(state, f"route:{route.id}@{intent.purpose}", now):
+            # The read mirrors the WRITE key (`purpose or "*"`): a cooldown
+            # recorded under "*" (empty purpose) was written to shared state
+            # and never consulted, and a purposed call also honors the "*"
+            # fallback exactly as _route_yield already does.
+            if intent is not None and (
+                    _cooling(state, f"route:{route.id}@{intent.purpose or '*'}", now)
+                    or (intent.purpose
+                        and _cooling(state, f"route:{route.id}@*", now))):
                 reasons.setdefault(route.pool, f"{route.id} cooled down: low yield for "
-                                               f"'{intent.purpose}'")
+                                               f"'{intent.purpose or '*'}'")
                 continue
             # PURPOSE FIT, before pool selection. A route whose capability
             # list is KNOWN and lacks a hard need is not a candidate for this
@@ -1237,7 +1257,13 @@ class RotatingProvider:
         turn before the call is declared impossible.
         """
         intent = self._complete_intent(kwargs.pop("intent", None))
-        attempts = max(1, len({r.pool for r in self.catalog_routes(tier)}))
+        # Budget attempts across EVERY tier this call may actually be served
+        # from: next_route demotes DOWN TIER_CHAIN when the requested tier has
+        # no candidate, so counting only the requested tier's pools starved a
+        # demoted call (frontier has few pools, light has many) of the serving
+        # tier's rotation.
+        tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
+        attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
         for attempt in range(attempts):
             first = attempt == 0
@@ -1248,11 +1274,29 @@ class RotatingProvider:
                 extra["intent"] = intent
             if self._paid_first:
                 extra["paid_first"] = first
-            selection = self.rotator.next_route(
-                tier=tier,
-                # one paid round: after the first attempt, free pools only
-                allow_paid=self._allow_paid and (first or not self._paid_first),
-                **extra)
+            try:
+                # paid_first is ORDERING only (extra["paid_first"] = first is
+                # the sole one-round mechanism, see _pick_in_tier). The old
+                # `and (first or not self._paid_first)` revoked allow_paid on
+                # attempts 1..N, which was written for the RETIRED auto mode
+                # whose fallback was free routes; in paid mode the catalog has
+                # no free tier, so one metered failure stranded the whole call.
+                # Paid still rotates until exhausted (owner order 2026-08-21).
+                selection = self.rotator.next_route(
+                    tier=tier,
+                    allow_paid=self._allow_paid,
+                    **extra)
+            except RotationError as exc:
+                if last_error is None:
+                    raise
+                # Rotation ran dry AFTER a real provider failure: a bare
+                # "no route available" here would DISCARD last_error and hand
+                # the caller a confidently wrong diagnosis. Same class so a
+                # PinUnavailable stays fatal for its catchers.
+                raise type(exc)(
+                    f"{exc}; last provider error was "
+                    f"{type(last_error).__name__}: {last_error}",
+                    getattr(exc, "reasons", None)) from last_error
             route = selection.route
             self.model = route.model
             if intent is not None and intent.role:

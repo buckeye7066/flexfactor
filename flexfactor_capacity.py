@@ -1,13 +1,42 @@
 """Shared provider-capacity orchestration for concurrent FlexFactor runs."""
 from __future__ import annotations
-import contextlib, json, os, random, tempfile, threading, time, uuid
+import contextlib, json, os, random, socket, tempfile, threading, time, uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 SCHEMA=1
 LEASE_TTL_S=15*60.0
 WAITER_TTL_S=24*60*60.0
+# Waiters heartbeat `seen_at` on every acquire() poll (<=5s apart). A row that
+# stopped refreshing is a DEAD process (Ctrl-C/taskkill/reboot while queued);
+# at the old 24h created_at TTL one dead row blocked every later ticket on its
+# allowance for up to a full day per blocked call.
+WAITER_STALE_S=120.0
 DEFAULT_WAIT_MAX_S=12*60*60.0
+_HOST=socket.gethostname()
+
+def _pid_alive(pid):
+    """True unless the pid is PROVABLY gone on this host; ambiguity means alive
+    (a wrongly-skipped live waiter loses fairness, so fail toward alive and let
+    the seen_at heartbeat TTL settle it)."""
+    try: pid=int(pid)
+    except (TypeError,ValueError): return True
+    if pid<=0: return True
+    if os.name=="nt":
+        # os.kill(pid, 0) TERMINATES on Windows -- query, never signal.
+        import ctypes
+        k32=ctypes.WinDLL("kernel32",use_last_error=True)
+        h=k32.OpenProcess(0x1000,False,pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h: return ctypes.get_last_error()==5  # ACCESS_DENIED: exists
+        try:
+            code=ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h,ctypes.byref(code)): return True
+            return code.value==259  # STILL_ACTIVE
+        finally: k32.CloseHandle(h)
+    try: os.kill(pid,0)
+    except ProcessLookupError: return False
+    except OSError: return True
+    return True
 
 def state_path():
     root=os.environ.get("FLEXFACTOR_STATE_DIR") or os.path.join(os.path.expanduser("~"),".flexfactor")
@@ -94,29 +123,42 @@ class CapacityManager:
         for i,row in list(d.setdefault("leases",{}).items()):
             if float(row.get("expires_at") or 0)<=now: d["leases"].pop(i,None)
         for i,row in list(d.setdefault("waiters",{}).items()):
-            if now-float(row.get("created_at") or 0)>WAITER_TTL_S: d["waiters"].pop(i,None)
+            # Heartbeat TTL, not creation TTL: legacy rows without seen_at fall
+            # back to created_at so a pre-upgrade dead row is reaped too.
+            seen=float(row.get("seen_at") or row.get("created_at") or 0)
+            if now-seen>WAITER_STALE_S: d["waiters"].pop(i,None)
         for k,u in list(d.setdefault("cooldowns",{}).items()):
             if float(u or 0)<=now: d["cooldowns"].pop(k,None)
     def acquire(self,route,app="flexfactor",*,timeout=None):
         timeout=float(timeout if timeout is not None else os.environ.get("FLEXFACTOR_PROVIDER_WAIT_MAX_S",DEFAULT_WAIT_MAX_S)); allowance=self.allowance(route); ident=uuid.uuid4().hex; created=self.clock(); deadline=created+max(0,timeout); delay=.05
-        while True:
-            now=self.clock(); out={"granted":False,"wait":.05}
-            def mutate(d):
-                self._cleanup(d,now); w=d.setdefault("waiters",{})
-                if ident not in w:
-                    t=int(d.get("next_ticket") or 1); d["next_ticket"]=t+1; w[ident]={"ticket":t,"allowance":allowance,"app":app,"created_at":created,"pid":os.getpid()}
-                ticket=int(w[ident]["ticket"]); cool=float(d.setdefault("cooldowns",{}).get(allowance) or 0)
-                if cool>now:
-                    out["wait"]=max(.05,min(30,cool-now)); d["runtime"]={"state":"waiting-for-provider","detail":f"{app} waiting for shared allowance {allowance} cooldown","updated_at":now}; return
-                active=[x for x in d.setdefault("leases",{}).values() if x.get("allowance")==allowance]
-                ahead=[x for wid,x in w.items() if wid!=ident and x.get("allowance")==allowance and int(x.get("ticket") or 0)<ticket]
-                if len(active)<self.limit(route) and not ahead:
-                    d["leases"][ident]={"allowance":allowance,"app":app,"pid":os.getpid(),"thread":threading.get_ident(),"started_at":now,"expires_at":now+LEASE_TTL_S}; w.pop(ident,None); out["granted"]=True; d["runtime"]={"state":"running","detail":"provider capacity granted","updated_at":now}
-                else: d["runtime"]={"state":"waiting-for-provider","detail":f"{app} queued for shared allowance {allowance}","updated_at":now}
-            self.store.update(mutate)
-            if out["granted"]: return Lease(ident,allowance,app)
-            if now>=deadline: self.cancel_waiter(ident); raise CapacityTimeout(f"provider capacity wait exceeded {timeout:.0f}s for {allowance}")
-            s=min(out["wait"],delay,max(0,deadline-now)); self.sleep(max(.01,s+random.random()*min(.05,s))); delay=min(5,delay*2)
+        try:
+            while True:
+                now=self.clock(); out={"granted":False,"wait":.05}
+                def mutate(d):
+                    self._cleanup(d,now); w=d.setdefault("waiters",{})
+                    if ident not in w:
+                        t=int(d.get("next_ticket") or 1); d["next_ticket"]=t+1; w[ident]={"ticket":t,"allowance":allowance,"app":app,"created_at":created,"pid":os.getpid(),"host":_HOST,"seen_at":now}
+                    w[ident]["seen_at"]=now  # heartbeat: _cleanup reaps waiters that stop refreshing
+                    ticket=int(w[ident]["ticket"]); cool=float(d.setdefault("cooldowns",{}).get(allowance) or 0)
+                    if cool>now:
+                        out["wait"]=max(.05,min(30,cool-now)); d["runtime"]={"state":"waiting-for-provider","detail":f"{app} waiting for shared allowance {allowance} cooldown","updated_at":now}; return
+                    active=[x for x in d.setdefault("leases",{}).values() if x.get("allowance")==allowance]
+                    # Belt on the heartbeat TTL: a same-host row whose pid is
+                    # provably dead cannot advance -- do not queue behind it.
+                    ahead=[x for wid,x in w.items() if wid!=ident and x.get("allowance")==allowance and int(x.get("ticket") or 0)<ticket
+                           and not (x.get("host")==_HOST and not _pid_alive(x.get("pid")))]
+                    if len(active)<self.limit(route) and not ahead:
+                        d["leases"][ident]={"allowance":allowance,"app":app,"pid":os.getpid(),"thread":threading.get_ident(),"started_at":now,"expires_at":now+LEASE_TTL_S}; w.pop(ident,None); out["granted"]=True; d["runtime"]={"state":"running","detail":"provider capacity granted","updated_at":now}
+                    else: d["runtime"]={"state":"waiting-for-provider","detail":f"{app} queued for shared allowance {allowance}","updated_at":now}
+                self.store.update(mutate)
+                if out["granted"]: return Lease(ident,allowance,app)
+                if now>=deadline: raise CapacityTimeout(f"provider capacity wait exceeded {timeout:.0f}s for {allowance}")
+                s=min(out["wait"],delay,max(0,deadline-now)); self.sleep(max(.01,s+random.random()*min(.05,s))); delay=min(5,delay*2)
+        except BaseException:
+            # Ctrl-C/taskkill mid-queue must not leave a persistent waiter row
+            # blocking every later ticket on this allowance (also covers the
+            # CapacityTimeout raise above).
+            self.cancel_waiter(ident); raise
     def cancel_waiter(self,ident):
         with contextlib.suppress(Exception): self.store.update(lambda d:d.setdefault("waiters",{}).pop(ident,None))
     def renew(self,lease):
@@ -209,15 +251,31 @@ def install():
             prior_init(self,*a,**kw); original=getattr(self,"_on_error",None)
             if original is not None:
                 def infra(route,exc):
+                    # Record the capacity cooldown, then ALWAYS fall through to the
+                    # original hook: it is the run's error ledger (errors.md/json +
+                    # the dashboard error box), and the early `return` here made
+                    # every 429/daily-allowance/quota refusal invisible to it on
+                    # every normal run -- exactly the entries that diagnosed the
+                    # 2026-08-24 incident (574 of 898 ledger rows were ONE
+                    # account-wide daily quota). flexfactor_rotation states the
+                    # invariant: not charging the route must never make the
+                    # failure invisible.
                     outcome=r._classify(exc)
                     if outcome in ("rate_limited","quota_exhausted"):
-                        scope,reset_at=r.limit_scope(exc); _MANAGER.note_outcome(route,outcome,r._retry_after(exc),scope=scope,reset_at=reset_at); return
+                        scope,reset_at=r.limit_scope(exc); _MANAGER.note_outcome(route,outcome,r._retry_after(exc),scope=scope,reset_at=reset_at)
                     return original(route,exc)
                 self._on_error=infra
         def run(self,method,tier,*a,**kw):
             wait=float(os.environ.get("FLEXFACTOR_PROVIDER_WAIT_MAX_S",DEFAULT_WAIT_MAX_S)); deadline=time.time()+max(0,wait); delay=1.0
             while True:
                 try: return prior_run(self,method,tier,*a,**kw)
+                except r.PinUnavailable:
+                    # Deliberately fatal (flexfactor_rotation's own contract): a pin
+                    # whose routes are cooling interpolates 'cooling down', one of
+                    # the text markers below, so the substring test turned the
+                    # pin's actionable message into a 12-hour silent wait loop.
+                    # Type beats text -- re-raise before the text is consulted.
+                    raise
                 except r.RotationError as exc:
                     if not _waitable_rotation_error(exc) or time.time()>=deadline: raise
                     rt=(_MANAGER.snapshot().get("runtime") or {}); print(f"  [capacity] waiting for provider: {rt.get('detail') or str(exc)}"); time.sleep(min(30,delay)+random.random()*.25); delay=min(30,delay*2)

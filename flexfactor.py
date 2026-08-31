@@ -2500,8 +2500,11 @@ class OpenAIProvider:
 
     def structured(self, system: str, prompt: str, schema: dict, max_tokens: int = 8000,
                    model: str | None = None, salvage_truncated: bool = False) -> dict:
-        # (salvage_truncated accepted for signature parity with AnthropicProvider;
-        # OpenAI json mode already fails loudly on truncation via finish_reason.)
+        # salvage_truncated is LIVE here since 2026-08-30 (it used to be
+        # signature-parity only): finish_reason == "length" catches the
+        # provider's own truncation, but a PROXY/upstream cut mid-stream
+        # arrives with a normal finish_reason and a sawn-off body - the same
+        # shape the Anthropic path salvages.
         # OpenAI json mode isn't schema-constrained, so we inline the schema into
         # the system prompt and tolerantly parse — the caller's code defends
         # against missing keys with .get() defaults. Whole-file callers request a
@@ -2584,8 +2587,28 @@ class OpenAIProvider:
                 f"Model output hit the {out_cap}-token budget (file too "
                 "large to regenerate in one response); raise max_tokens for this call.")
         text = choice.message.content or "{}"
-        data = json.loads(text)
+        # THE SAME EXTRACTION THE ANTHROPIC PATH USES, for the same reason.
+        # A strict json.loads here discarded well-formed payloads that merely
+        # arrived fenced or prose-wrapped - and rotation routes gemini / groq /
+        # NIM / OpenRouter through THIS adapter, i.e. exactly the free backends
+        # documented elsewhere in this file as ignoring the schema and wrapping
+        # their JSON. A rejected-but-usable review costs the file its review (it
+        # lands in `incomplete`) or the fix a [skip], where the Anthropic path
+        # would have recovered it.
+        _salvaged = False
+        data, _ = _extract_json_object(text)
+        if data is None and salvage_truncated:
+            data = _salvage_truncated_json(text)
+            if data is not None:
+                _salvaged = True
+                print("  [salvage] structured output was truncated mid-stream; "
+                      "recovered the complete leading elements (partial tail dropped)")
+        if data is None:
+            raise RuntimeError(f"Structured output was not JSON; len={len(text)} "
+                               f"head={text[:200]!r} tail={text[-120:]!r}")
         data = _check_structured_type(data, schema, text)
+        if _salvaged:
+            return _mark_partial(data, text, "openai")
         return data
 
     def ping(self) -> None:
@@ -2875,7 +2898,6 @@ class OllamaProvider:
                 if data is not None:
                     data = _check_structured_type(data, schema, text)
                     return _mark_partial(data, text, "ollama")
-                    return data
             raise
         data = _check_structured_type(data, schema, text)
         return data
@@ -4416,6 +4438,13 @@ _PROVIDER_DIAGNOSIS: str = ""
 # immediately after calling build_audit_providers, same pattern as
 # _PROVIDER_DIAGNOSIS.
 _LAST_FREE_REVIEW_POOL: list[tuple[str, object, int]] = []
+
+# Serializes build_audit_providers with the caller's read of the two globals
+# above. Both are a return channel, and audit_one_program runs in a thread pool
+# under --parallel, so without this a concurrent program's reset lands between
+# another's build and its read - losing that program's free review pool, or
+# handing it another program's provider instances.
+_PROVIDER_BUILD_LOCK = threading.Lock()
 
 # Per-backend concurrency ceilings for the free-review pool, matching each
 # backend's OWN real capacity limit that already governs it elsewhere in this
@@ -10312,6 +10341,13 @@ def review_files_batch(provider, items: list[tuple[str, str]],
         + ctx + "\n\n".join(blocks))
     data = _judge(provider, AUDIT_SYSTEM, prompt, AUDIT_BATCH_SCHEMA,
                   max_tokens=REVIEW_MAX_TOKENS)
+    # `_judge` enables salvage_truncated, so `data` may be a SALVAGED prefix.
+    # `review_file` raises PartialOutputError for exactly this case; this path -
+    # the default one for rotation runs, which set no reviewer_pool - did not.
+    # A stream cut after a file's "findings":[] closes but before the response
+    # ends yields every expected row, so the `missing` guard below cannot fire,
+    # and that file was returned CLEAN off a truncated review.
+    batch_partial = _ff_partial.is_partial_structured(data)
     rows = data.get("reviews") if isinstance(data, dict) else None
     if not isinstance(rows, list):
         raise RuntimeError("semantic batch response omitted reviews")
@@ -10334,6 +10370,17 @@ def review_files_batch(provider, items: list[tuple[str, str]],
     if missing:
         raise RuntimeError("semantic batch omitted file verdict(s): "
                            + ", ".join(missing))
+    if batch_partial:
+        # Same doctrine as review_file's guard: an empty findings list inside a
+        # SALVAGED response is not a clean verdict, because the unreviewed
+        # remainder is exactly where the defects may be. Only the empty rows are
+        # unsafe - a row that DID report findings was completely parsed.
+        empty = [rel for rel, (found, _s) in by_file.items() if not found]
+        if empty:
+            raise PartialOutputError(
+                "semantic batch output was truncated/malformed; the salvaged "
+                "prefix reported no findings for " + ", ".join(sorted(empty))
+                + " - the remainder is UNREVIEWED, not clean")
     return by_file
 
 
@@ -13170,9 +13217,16 @@ def _review_all(reviewers: list, project_dir: str,
             try:
                 res = fut.result()
             except Exception as ex_:  # defensive: never let one task kill the sweep
-                print(f"  [skip] review task failed ({ex_})")
+                # NEVER let it vanish either. A dropped task used to fall into no
+                # bucket at all, so the file was neither clean nor incomplete and
+                # the cycle could report CONVERGED over a file it never reviewed.
+                incomplete.add(futures[fut])
+                print(f"  [skip] review task failed ({ex_}) - NOT marked clean")
                 continue
             if res is None:
+                # _review_one returns None at the budget/soft-cap cutoff. Same
+                # rule: unreviewed is INCOMPLETE, never clean.
+                incomplete.add(futures[fut])
                 continue
             rel = res[0]
             payload = res[1]
@@ -13229,6 +13283,15 @@ def _review_all(reviewers: list, project_dir: str,
                     report(**kw)
             if _capped():
                 stop.set()  # stop tasks that haven't started; in-flight ones finish
+    # THE SAME RECONCILIATION THE BATCHED BRANCH DOES (see the `accounted` line
+    # above). Without it a file that reached no bucket - a task the executor
+    # never ran, a result shape nothing matched - was silently absent from every
+    # set, so `_update_incomplete_review_ledger` never learned about it, it was
+    # never re-queued by `_next_cycle_review_paths`, and the cycle could print
+    # "CONVERGED: found == fixed (no fixable defects remain)" over files that
+    # were never reviewed. Anything not positively accounted for is INCOMPLETE.
+    accounted = set(reviewed_clean) | set(file_findings) | unreadable | incomplete
+    incomplete.update(set(files) - accounted)
     if stop.is_set():
         print(f"  [stop] budget/reserve reached during review ({meter.summary() if meter else ''}); "
               f"reviewed {done['n']}/{total} file(s) this cycle")
@@ -14254,11 +14317,19 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
         #
         # `is True` is load-bearing, exactly as it is for the merge: False =
         # the build genuinely failed; None = no build/verify command existed so
-        # NOTHING was verified. Neither may be published. The local COMMIT above
-        # still happens in every case - the work is never lost, and the next
-        # cycle still builds on it; only PUBLICATION waits for evidence. When a
-        # later cycle's gate does pass, that push carries these commits with it,
-        # so nothing is stranded and the branch tip origin ever sees is green.
+        # NOTHING was verified. Neither may be published.
+        #
+        # CORRECTED 2026-08-30 - this comment used to claim "the local COMMIT
+        # above still happens in every case - the work is never lost". That has
+        # not been true since the `final_ok is not True` early return above was
+        # added: a red or unverified tree is `git reset --hard HEAD`-ed and the
+        # function returns "no local commit or push". Nothing reaches this point
+        # unless final_ok is True, so the `else` below and the `final_ok is None`
+        # block after it are UNREACHABLE; they are retained only because the
+        # regression guards assert on their text. Do not trust them as a
+        # description of behaviour, and do not "restore" a local commit on the
+        # strength of the old sentence - retaining a tree the repository itself
+        # rejected is the defect the early return exists to prevent.
         wip_ok, wip_why = _wip_publish_guard(project_dir)
         if final_ok is True and not wip_ok:
             status += f"; PUSH REFUSED - owner WIP snapshot: {wip_why}"
@@ -14849,9 +14920,21 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # Dual-provider setup, REBUILT per program so no provider instance is shared
         # across programs/threads: author writes fixes, every provider reviews, the
         # 2nd provider (if any) cross-checks each fix. All share one cost meter.
-        providers = build_audit_providers(args, meter)
+        # BUILD AND CAPTURE UNDER ONE LOCK. build_audit_providers hands its two
+        # results back through MODULE GLOBALS (_PROVIDER_DIAGNOSIS and
+        # _LAST_FREE_REVIEW_POOL), and audit_one_program runs concurrently in a
+        # ThreadPoolExecutor whenever --parallel > 1. Program B's reset of those
+        # globals could land between program A's build and A's read, so A
+        # silently lost its free review pool, or read B's pool and shared B's
+        # provider instances - exactly what the comment above says must never
+        # happen. Holding the lock across the build AND the reads makes the
+        # handoff atomic without changing the API the tests read.
+        with _PROVIDER_BUILD_LOCK:
+            providers = build_audit_providers(args, meter)
+            _diagnosis = _PROVIDER_DIAGNOSIS
+            _free_pool = list(_LAST_FREE_REVIEW_POOL)
         if not providers:
-            why = _PROVIDER_DIAGNOSIS or "no LLM API key found"
+            why = _diagnosis or "no LLM API key found"
             print(f"{pfx}error: {why}. Set/repair ANTHROPIC_API_KEY and/or OPENAI_API_KEY "
                   f"(or pass --no-preflight to skip the live key check).", file=sys.stderr)
             result["error"] = why
@@ -14876,13 +14959,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # GENUINELY additional to the pool (e.g. an explicit --use-both
         # cross-check on a paid provider) so nothing gets double-reviewed by
         # the same backend twice.
-        reviewer_pool = (_ReviewerPool(_LAST_FREE_REVIEW_POOL)
-                         if _LAST_FREE_REVIEW_POOL else None)
+        reviewer_pool = (_ReviewerPool(_free_pool)
+                         if _free_pool else None)
         if reviewer_pool is not None:
-            pool_names = {n for n, _, _ in _LAST_FREE_REVIEW_POOL}
+            pool_names = {n for n, _, _ in _free_pool}
             reviewers = [p for n, p in providers if n not in pool_names]
             active = " + ".join(f"{n}(pool):{getattr(p, 'model', p)}"
-                                for n, p, _ in _LAST_FREE_REVIEW_POOL)
+                                for n, p, _ in _free_pool)
             if reviewers:
                 active += ", " + ", ".join(f"{n}(cross):{p.model}"
                                            for n, p in providers if n not in pool_names)
@@ -19371,8 +19454,10 @@ def main(argv=None) -> int:
         # Review-only cannot be requested any more, so it is never explicit.
         # `dry_run` is not set here either: the attribute is GONE portfolio-wide
         # (2026-08-21), and leaving a False default alive is how the mode crept
-        # back last time.
-        args.explicit_report_only = False
+        # back last time. `explicit_report_only` was the LAST live token of the
+        # removed mode - written on every invocation, read by nothing - so it is
+        # gone too, for the same reason: an attribute sitting on `args` is where
+        # a future consumer re-grows the branch.
         # Did the owner NAME a provider, or is "anthropic" just the argparse default?
         args.explicit_provider = _asked("--provider")
         if args.readiness is None:
@@ -19400,10 +19485,19 @@ def main(argv=None) -> int:
         # green, a merge conflict aborts cleanly rather than forcing, and a
         # protected main falls back to a PR with auto-merge. Report-only runs
         # never commit, so the defaults are inert there. Explicit --no-push /
-        # --no-merge (raw argv, same pattern as --apply above) win.
-        if "--no-push" not in rest:
+        # --no-merge win.
+        #
+        # These MUST go through `_asked`, not `in rest`. argparse accepts any
+        # unambiguous abbreviation, so `--no-pus` / `--no-mer` already set
+        # push=False / merge=False - but an exact-string `in rest` test does not
+        # see them, so the override below silently turned them back ON and the
+        # run pushed and merged to the trunk after the operator had explicitly
+        # asked it not to. `_asked` does the prefix match, which is why it exists
+        # 48 lines above; this was the one publication flag pair still using the
+        # raw test.
+        if not _asked("--no-push"):
             args.push = True
-        if "--no-merge" not in rest:
+        if not _asked("--no-merge"):
             args.merge = True
         if normalize_model_mode(args.model_mode) == "free":
             # The provider adapters have a transport-rescue path that can use
@@ -19488,6 +19582,17 @@ def runtime_manifest() -> dict:
     wired["non_code_findings_never_patched"] = (
         should_fix_finding({"category": "client", "severity": "critical",
                             "evidence_source": "runtime-data"}, "info") is False)
+    # THE TWO DIRECTED BEHAVIOURS, PROBED RATHER THAN ASSUMED. The "directed"
+    # key above compares symbols flexfactor.py binds natively at import, so it
+    # reads True on an entry point where install() never ran - it could not fail
+    # for the thing that actually regressed. These two read the marker install()
+    # stamps on the objects it wraps, so an entry point that skips install() is
+    # visible here instead of being reported as wired.
+    wired["directed_capacity_admission"] = getattr(
+        globals().get("run_audit"), "_capacity_wrapped", False) is True
+    wired["directed_partial_run_semantics"] = getattr(
+        getattr(globals().get("_PROGRESS"), "update", None),
+        "_capacity_semantics", False) is True
     return {
         "tool_version": TOOL_VERSION,
         "modes": ["refactor", "scout", "audit", "prodready", "policy"],
@@ -19507,6 +19612,17 @@ def run_cli(argv=None) -> int:
     `flexfactor` console script (pyproject), and flexfactor_run.py (shim).
     Embedders/tests call main() directly so no crash-log handle is pinned open
     in their working dirs (Windows rmtree fails on open files)."""
+    # ARM THE DIRECTED HOOKS HERE, not only in the flexfactor_run.py shim.
+    # `install()` supplies provider-capacity admission for --parallel and the
+    # truthful STOPPED/partial progress semantics. Its ONLY caller used to be the
+    # shim, so three of the four entry points named above - the installed console
+    # script (`flexfactor = "flexfactor:run_cli"`), `python flexfactor.py` and
+    # `python -m flexfactor` - ran without them: a run that ended partial still
+    # published done=True/"done - partial", which every dashboard paints as a
+    # successful DONE, and --parallel N stampeded one shared free allowance with
+    # no admission control. It is idempotent (_FLEXFACTOR_DIRECTED_INSTALLED), so
+    # the shim calling it first stays harmless.
+    _ff_directed.install(globals())
     if argv is not None and len(argv) == 1 and argv[0] == "--runtime-manifest":
         print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))
         return 0

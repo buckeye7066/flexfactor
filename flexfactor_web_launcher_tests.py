@@ -399,6 +399,110 @@ class PhoneLauncherTests(unittest.TestCase):
         command = captured["command"]
         self.assertEqual("free", command[command.index("--model-mode") + 1])
 
+    def test_launch_spawns_the_shim_that_arms_the_directed_hooks(self):
+        """flexfactor_run.py, not flexfactor.py: the shim arms the directed
+        runtime (capacity admission + the stopped=True liveness field this
+        module's own build_state branches on). Spawning flexfactor.py directly
+        left phone-started runs without them."""
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return SimpleNamespace(pid=515151)
+
+        web.start_phone_run(
+            {"program": self.project, "mode": "audit", "provider": "openai",
+             "max_cost": 2},
+            env=self.env,
+            programs=[{"name": "target-app", "path": self.project}],
+            readiness=[{"name": "openai", "ready": True, "detail": "ready"}],
+            pid_path=os.path.join(self.root, "r", "audit.pid"),
+            log_path=os.path.join(self.root, "r", "audit.log"),
+            lock_path=os.path.join(self.root, "r", "audit.lock"),
+            popen=fake_popen,
+            start_reaper=lambda process, path: None,
+        )
+        self.assertTrue(
+            str(captured["command"][1]).endswith("flexfactor_run.py"),
+            captured["command"][:3])
+
+    def test_reaper_retries_past_a_transient_windows_file_lock(self):
+        """WinError 32 (AV/indexer holding the file) is an OSError; the reaper
+        used to swallow it and give up FOREVER, leaving a stale audit.pid that
+        made a stopped run keep looking live and (on pid reuse) refused every
+        future run. A lock that clears within the bounded backoff must not
+        leave the record behind."""
+        pid_path = os.path.join(self.root, "locked.pid")
+        with open(pid_path, "w", encoding="utf-8") as fh:
+            fh.write("777\n")
+        # Windows: an open handle makes os.unlink raise PermissionError - the
+        # exact transient shape measured in this suite under load.
+        holder = open(pid_path, "r", encoding="utf-8")
+        releaser = threading.Timer(0.15, holder.close)
+        releaser.start()
+        try:
+            waited = threading.Event()
+
+            class Process:
+                pid = 777
+
+                @staticmethod
+                def wait():
+                    waited.set()
+                    return 0
+
+            web._start_audit_reaper(Process(), pid_path)
+            self.assertTrue(waited.wait(2))
+            deadline = time.time() + 3
+            while os.path.exists(pid_path) and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(os.path.exists(pid_path),
+                             "the reaper gave up on a transient lock")
+        finally:
+            releaser.cancel()
+            try:
+                holder.close()
+            except Exception:
+                pass
+
+    def test_a_stalled_programs_own_counters_beat_the_shared_file_clock(self):
+        """status.json is ONE file shared by every program in a --parallel
+        batch, so its mtime stays fresh while ANY sibling works - and a program
+        whose own counters had not moved for hours kept a green LIVE pill. The
+        verdict must consult the per-program counters_moved_ago signal."""
+        stalled_for = web.STALL_S * 10
+
+        class Sampler:
+            status_path = "unused"
+
+            def rate_per_min(self, name):
+                return 0.0
+
+            def counters_moved_ago(self, name):
+                return stalled_for       # this program: nothing moved
+
+            def durable(self, p):
+                return {"attempts": 1, "resumes": 0, "landed": 0}
+
+            def velocity(self, name):
+                return []
+
+        real_read = web.dash.read_status
+        web.dash.read_status = lambda path: (
+            [{"name": "stuck", "phase": "fixing", "done": False,
+              "dir": self.project}],
+            time.time())             # file freshly written (by a sibling)
+        try:
+            state = web.build_state(Sampler())
+        finally:
+            web.dash.read_status = real_read
+        row = next(r for r in state["programs"]
+                   if r["name"] == "stuck") if isinstance(state, dict) else None
+        self.assertIsNotNone(row)
+        self.assertEqual("quiet", row["liveness"],
+                         "a fresh shared file must not paint a stalled "
+                         "program LIVE")
+
     def test_reaper_clears_only_the_exited_child_pid(self):
         pid_path = os.path.join(self.root, "audit.pid")
         with open(pid_path, "w", encoding="utf-8") as fh:

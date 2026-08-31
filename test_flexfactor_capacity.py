@@ -233,7 +233,59 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
         self.assertEqual(1, peak,
                          "six RotatingProvider instances bypassed the shared allowance")
 
-    def test_retryable_429_waits_recovers_and_does_not_pollute_target_error_hook(self):
+    def test_a_pin_failure_is_fatal_not_a_12_hour_wait(self):
+        """PinUnavailable is 'deliberately fatal by default' (rotation's own
+        contract), but the strict-pin message interpolates 'cooling down' - one
+        of _waitable_rotation_error's text markers - so the capacity retry loop
+        used to swallow it and wait for hours printing '[capacity] waiting for
+        provider'. Type must beat text: the pin failure re-raises immediately."""
+        os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "30"
+        route = real_route("groq/pinned", "groq:pinned")
+        store = rotation.StateStore(os.path.join(self.tmp.name, "rotation-pin.json"))
+        rotator = rotation.Rotator(real_catalog(route), store, app="pin-app")
+        # Cool the pinned route so _resolve_pin's strict branch raises with
+        # 'cooling down' in the message.
+        rotator.report(route, "rate_limited", retry_after_seconds=600)
+        os.environ["AI_ROTATE_PIN"] = "groq/pinned"
+        self.addCleanup(os.environ.pop, "AI_ROTATE_PIN", None)
+        provider = rotation.RotatingProvider(
+            rotator, lambda _route: None, tier=rotation.STRONG, allow_paid=False)
+        started = time.time()
+        with self.assertRaises(rotation.PinUnavailable):
+            provider.complete("system", "prompt")
+        self.assertLess(time.time() - started, 5,
+                        "the pin failure entered the capacity wait loop "
+                        "instead of failing fast")
+
+    def test_a_dead_waiter_row_does_not_block_the_queue(self):
+        """Ctrl-C/taskkill/reboot while QUEUED leaves the waiter row in the
+        shared on-disk state. At the old 24h TTL, one dead row with a lower
+        ticket blocked every later process on that allowance for up to a full
+        day per call. A row whose heartbeat (seen_at) has gone stale - or whose
+        recorded same-host pid is provably dead - must be reaped/skipped."""
+        manager = cap.CapacityManager(cap.CapacityState(
+            os.path.join(self.tmp.name, "capacity-dead-waiter.json")))
+        route = Route()
+        allowance = manager.allowance(route)
+        stale = time.time() - (cap.WAITER_STALE_S * 10)
+
+        def plant(d):
+            d.setdefault("waiters", {})["deadbeef"] = {
+                "ticket": 1, "allowance": allowance, "app": "crashed-app",
+                "created_at": stale, "seen_at": stale,
+                "pid": 999999999, "host": cap._HOST}
+            d["next_ticket"] = 2
+        manager.store.update(plant)
+        # Old behavior: this waits the full timeout behind the dead row, then
+        # raises CapacityTimeout. Fixed: the stale row is reaped and the lease
+        # is granted almost immediately.
+        lease = manager.acquire(route, app="live-app", timeout=5)
+        try:
+            self.assertIsNotNone(lease)
+        finally:
+            manager.release(lease)
+
+    def test_retryable_429_recovers_and_still_reaches_the_error_hook(self):
         os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "3"
         errors = []
         calls = 0
@@ -259,8 +311,15 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("recovered", provider.complete("system", "prompt"))
         self.assertEqual(2, calls)
-        self.assertEqual([], errors,
-                         "temporary provider exhaustion leaked into the target-app error ledger")
+        # The hook MUST still fire (flexfactor_rotation's stated invariant:
+        # "not charging the route must never make the failure invisible").
+        # This test used to assert the opposite - [] - which was the swallow
+        # that hid 574 account-wide daily-quota refusals from errors.md on
+        # 2026-08-24; the ledger classifies these kind=budget, it does not
+        # treat them as program defects, so recording is visibility, not noise.
+        self.assertEqual(1, len(errors),
+                         "the 429 must reach the target-app error hook exactly once")
+        self.assertIsInstance(errors[0], RateLimited)
 
 
 class DirectedStatusSemanticsTests(unittest.TestCase):

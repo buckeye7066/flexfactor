@@ -152,8 +152,43 @@ $programArgs = @()
 foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
 $providerArgs = @('--provider', $primary)
 
+# MODEL MODE IS NOT OPTIONAL (launcher-drift fix 2026-08-30). This launcher was
+# never swept when --model-mode landed, so it detected the owner's paid keys,
+# announced "audit prefers both models (primary + cross-check)", and then passed
+# no mode at all - leaving the CLI on its `free` default. free is an EXCLUSION,
+# not an ordering: it admits only ollama or an FCC-free-routed anthropic, so BOTH
+# paid keys were refused and every run silently demoted to CPU-only Ollama with
+# no cross-check - or died with "model mode 'free' excludes the configured
+# routes". Every claim this launcher printed about the run was false.
+#
+# ANTHROPIC_AUTH_TOKEN is the FCC proxy's Bearer credential, which is FREE-routed;
+# only ANTHROPIC_API_KEY / OPENAI_API_KEY are paid. So the mode follows the kind
+# of credential actually present, and is printed so the run says what it is.
+$havePaidAnthropic = -not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)
+$modeArgs = @()
+if ($havePaidAnthropic -and $haveOpenai) {
+    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'both')
+    Write-Host "Model mode: PAID (both providers credentialed - primary + cross-check)." -ForegroundColor Cyan
+} elseif ($havePaidAnthropic) {
+    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'anthropic')
+    Write-Host "Model mode: PAID (anthropic only)." -ForegroundColor Cyan
+} elseif ($haveOpenai) {
+    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'openai')
+    Write-Host "Model mode: PAID (openai only)." -ForegroundColor Cyan
+} else {
+    $modeArgs = @('--model-mode', 'free')
+    Write-Host "Model mode: FREE (no paid key present; free routes / local model only)." -ForegroundColor Cyan
+}
+
 Write-Host ""
 # audit auto-detects keys; when both are set it cross-checks with both models.
-Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script, "audit") + $providerArgs + $programArgs + $extraArgs)
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script, "audit") + $providerArgs + $modeArgs + $programArgs + $extraArgs)
+$auditExit = $LASTEXITCODE
+if ($auditExit -eq 3) {
+    Write-Host ""
+    Write-Host "Exit code 3: the run FIXED NOTHING despite finding defects." -ForegroundColor Red
+    Write-Host "See the audit report for why nothing could be applied." -ForegroundColor Red
+}
 Write-Host ""
 Read-Host "Done. Press Enter to close"
+exit $auditExit

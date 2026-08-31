@@ -54,8 +54,10 @@ Never `git push --mirror` / `--all` while a ref is retained.
 - One file per run: `~/.flexfactor/runs/<run_id>/checkpoint.json`, atomic
   writes, throttled `save()` (force at phase boundaries), per-file
   `record_reviewed(rel, sha, findings)` immediately after every completed
-  review; `record_file_outcome` drops the review entry for fixed/unverified
-  files.
+  review. (A fixed file's stale review entry is dropped ON RESUME by
+  `verify_reviewed`'s sha re-check - the `record_file_outcome` writer this
+  line used to credit was never called from anywhere and was deleted
+  2026-08-30.)
 - Resume (`_resume_recover`): `latest_resumable` (status in LIVE_STATUSES, PID
   not alive, something recorded) -> `verify_reviewed(data, hasher, POLICY_VERSION)`
   re-hashes EVERY `reviewed` entry with the contained reader; policy mismatch

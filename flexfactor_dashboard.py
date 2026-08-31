@@ -105,6 +105,34 @@ SEV_COLOR = {
 }
 
 
+def terminal_label(p: dict) -> tuple[str, str]:
+    """(label, kind) for a program's header - derived from the PHASE, never
+    from `done` alone.
+
+    `done=True` used to replace the phase text with a green "DONE"
+    unconditionally, so a program that DIED rendered exactly like one that
+    succeeded: audit_one_program's fatal handler publishes phase="error",
+    done=True, error=..., and neither the word "error" nor the recorded error
+    string was ever painted. The same substitution hid "done - partial" and
+    "STOPPED (incomplete)". Shared by BOTH dashboards so they cannot drift.
+
+    kind: "done" (genuine success - the only green), "error", "stopped",
+    "partial", or "running".
+    """
+    phase = str(p.get("phase") or "")
+    err = str(p.get("error") or "")
+    low = phase.lower()
+    if low == "error" or (err and bool(p.get("done"))):
+        return (("ERROR: " + err) if err else "ERROR", "error")
+    if low.startswith("stopped"):
+        return phase, "stopped"
+    if low.startswith("done - partial"):
+        return phase, "partial"
+    if bool(p.get("done")):
+        return "DONE", "done"
+    return phase, "running"
+
+
 def read_status(path: str) -> list[dict]:
     """Load the program list from the status file. Returns [] on any problem so
     the dashboard simply shows 'waiting' instead of crashing on a partial write."""
@@ -615,12 +643,16 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
         done = bool(p.get("done"))
         cyc = p.get("cycle")
         cycles = p.get("cycles")
-        title_col = DONE if done else REVIEW
+        # Label and colour come from the PHASE (terminal_label), never from
+        # `done` alone - phase="error", done=True used to paint a green DONE.
+        label, kind = terminal_label(p)
+        title_col = (DONE if kind == "done" else
+                     ERRCOL if kind == "error" else REVIEW)
         canvas.create_text(cx + col_w / 2, top + 16, text=name[:34], fill=title_col,
                            font=("Segoe UI", 11, "bold"))
-        sub = ("DONE" if done else phase) + (
+        sub = label + (
             f"  (cycle {cyc}/{cycles})"
-            if cyc and cycles and not done and "cycle" not in phase else "")
+            if cyc and cycles and kind == "running" and "cycle" not in phase else "")
         canvas.create_text(cx + col_w / 2, top + 34, text=sub[:42], fill=DIM,
                            font=("Segoe UI", 8))
         # Dismiss control, drawn AFTER the title and subtitle so a long

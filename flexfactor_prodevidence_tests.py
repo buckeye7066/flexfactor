@@ -15,13 +15,17 @@ Offline: no database, no network, no provider. The session takes an injected
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import flexfactor_evidence as ev  # noqa: E402
 import flexfactor_prodevidence as pe  # noqa: E402
+import flexfactor_scout_contract as sc  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -683,6 +687,253 @@ class RuntimeEvidencePhaseTests(unittest.TestCase):
         self.assertIn("all_findings = list(all_findings) + runtime_evidence_findings",
                       body)
         self.assertIn('"runtime_evidence": runtime_evidence', body)
+
+
+# --------------------------------------------------------------------------- #
+# G. GATES THAT CAN ACTUALLY FAIL (readiness sweep 2026-08-30)
+#
+# Every test below drives the real function and fails on the pre-sweep code.
+# Nothing here touches ~/.flexfactor: the repository fixtures are tmpdirs and
+# the schema fixtures are injected.
+# --------------------------------------------------------------------------- #
+_BIG_SOURCE_PADDING = ("# " + "x" * 77 + "\n") * 52_000   # ~4.16MB > the 4MB cap
+
+
+def _write_big_source(root: str, name: str = "big.py") -> str:
+    path = os.path.join(root, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("def real_fn():\n    return 1\n" + _BIG_SOURCE_PADDING)
+    return path
+
+
+class UnscannedSourceIsNeverCompleteTests(unittest.TestCase):
+    """A file whose bytes were HASHED AND NEVER SCANNED is not inventoried."""
+
+    def test_a_blocked_source_file_cannot_report_a_complete_inventory(self):
+        """`_index_large_file_in_chunks` emits status "blocked" for a source
+        file past the hard cap - hashed, never scanned. The inventory gate
+        excluded only "inventoried"/"refused", so it called that COMPLETE."""
+        real_cap = ev._LARGE_FILE_HARD_CAP
+        ev._LARGE_FILE_HARD_CAP = 1_000        # the fixture is far above this
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                _write_big_source(tmp)
+                index = ev.build_repository_index(tmp, "blocked-run")
+        finally:
+            ev._LARGE_FILE_HARD_CAP = real_cap
+        record = next(f for f in index["files"] if f["path"] == "big.py")
+        self.assertEqual(record["status"], "blocked")
+        self.assertFalse(index["complete_source_inventory"],
+                         "source that was never scanned cannot be 'complete'")
+
+    def test_a_changed_chunk_analyzed_file_counts_as_rescanned(self):
+        """"analyzed-in-chunks" IS a successful analysis (the totals count it),
+        so omitting it from the rescan vocabulary meant a repo with one changed
+        >4MB source file could NEVER converge, with a wrong stated reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_big_source(tmp)
+            index = ev.build_repository_index(tmp, "chunk-run")
+        record = next(f for f in index["files"] if f["path"] == "big.py")
+        self.assertEqual(record["status"], "analyzed-in-chunks")
+        rescan = ev.changed_file_rescan(index, ["big.py"])
+        self.assertTrue(rescan["complete"], rescan["files"])
+
+    def test_a_changed_non_source_file_still_counts_as_rescanned(self):
+        """Regression guard for the fix above: a hashed-only text file's
+        complete record is "inventoried" and must keep passing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "README.md"), "w", encoding="utf-8") as fh:
+                fh.write("hello\n")
+            index = ev.build_repository_index(tmp, "text-run")
+        self.assertTrue(ev.changed_file_rescan(index, ["README.md"])["complete"])
+
+
+class BlastRadiusGateCanFailTests(unittest.TestCase):
+    """Contract 12: `dependency_blast_radius` hardcodes "ran": True on every
+    return path, so ran-implies-passed was a gate that could not fail."""
+
+    @staticmethod
+    def _gates(index, blast):
+        coverage = ev.coverage_ledger(
+            index, run_id="r", test_command=["pytest"], tests_ran=True,
+            tests_passed=True, generated_test_modules=[], e2e={})
+        return ev.quality_gates(
+            run_id="r", baseline_ran=True, baseline_passed=True,
+            suite_command=["pytest"], suite_ran=True, suite_passed=True,
+            tests_collected=True, e2e={}, rescan={"complete": True},
+            blast=blast, secrets=[], index=index, coverage=coverage)
+
+    def test_an_unresolved_local_import_fails_the_blast_radius_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("from .not_here import gone\ndef a(): return gone()\n")
+            index = ev.build_repository_index(tmp, "blast-run")
+        blast = ev.dependency_blast_radius(index, ["src/a.py"])
+        self.assertTrue(blast["ran"])
+        self.assertTrue(blast["unresolved_local_imports"],
+                        "fixture must actually produce an unresolved import")
+        gate = next(g for g in self._gates(index, blast)["gates"]
+                    if g["id"] == "blast-radius")
+        self.assertEqual(gate["status"], "fail")
+
+    def test_a_fully_resolved_blast_radius_still_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "a.py"), "w", encoding="utf-8") as fh:
+                fh.write("from .b import work\ndef a(): return work()\n")
+            with open(os.path.join(tmp, "src", "b.py"), "w", encoding="utf-8") as fh:
+                fh.write("def work(): return 1\n")
+            index = ev.build_repository_index(tmp, "blast-ok")
+        blast = ev.dependency_blast_radius(index, ["src/b.py"])
+        self.assertEqual(blast["unresolved_local_imports"], [])
+        gate = next(g for g in self._gates(index, blast)["gates"]
+                    if g["id"] == "blast-radius")
+        self.assertEqual(gate["status"], "pass")
+
+
+class SecretScanTruncationTests(unittest.TestCase):
+    """A clean secrets gate must not be a claim about bytes never read."""
+
+    def test_content_past_the_scan_cap_is_reported_not_assumed_clean(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "big_notes.md"), "w", encoding="utf-8") as fh:
+                fh.write("notes\n" + ("y" * 79 + "\n") * 14_000)   # > the 1MB cap
+                fh.write('trailing = "' + token + '"\n')           # never read
+            index = ev.build_repository_index(tmp, "secret-run")
+            findings = ev.secret_findings(tmp, index)
+            coverage = ev.coverage_ledger(
+                index, run_id="r", test_command=None, tests_ran=False,
+                tests_passed=None, generated_test_modules=[], e2e={})
+            gates = ev.quality_gates(
+                run_id="r", baseline_ran=True, baseline_passed=True,
+                suite_command=["pytest"], suite_ran=True, suite_passed=True,
+                tests_collected=True, e2e={}, rescan={"complete": True},
+                blast={"ran": True}, secrets=findings, index=index,
+                coverage=coverage)
+        # Proof the bytes really were never read: the token is not reported.
+        self.assertEqual([f for f in findings
+                          if f["rule_id"] == "secret.github-token"], [])
+        truncated = [f for f in findings
+                     if f["rule_id"] == "secret.scan-truncated"]
+        self.assertEqual(len(truncated), 1, findings)
+        self.assertEqual(truncated[0]["disposition"], "unresolved")
+        secrets_gate = next(g for g in gates["gates"] if g["id"] == "secrets")
+        self.assertEqual(secrets_gate["status"], "fail",
+                         "unscanned content cannot produce a clean gate")
+
+    def test_a_fully_scanned_clean_file_still_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "small.md"), "w", encoding="utf-8") as fh:
+                fh.write("nothing credential shaped here\n")
+            index = ev.build_repository_index(tmp, "clean-run")
+            self.assertEqual(ev.secret_findings(tmp, index), [])
+
+
+class SchemaSliceIsNamedTests(unittest.TestCase):
+    """The SCHEMA_ROW_LIMIT fix covered only the ROW bound; the in-Python
+    max_tables / max_columns_per_table caps were still silent."""
+
+    def setUp(self):
+        # Module state, exactly like _COLUMN_TYPES: leave it as we found it.
+        self.addCleanup(pe._SCHEMA_TRUNCATION.clear)
+        pe._SCHEMA_TRUNCATION.clear()
+
+    def test_a_dropped_table_is_not_reported_as_nonexistent(self):
+        rows = [("t_big", "c%d" % i, "text") for i in range(4)]
+        rows += [("t_small", "id", "uuid")]
+        columns = pe.introspect_columns(lambda _sql: rows, max_tables=1)
+        self.assertEqual(sorted(columns), ["t_big"])
+        self.assertEqual(pe._SCHEMA_TRUNCATION["dropped_tables"], ["t_small"])
+        problems = " ".join(
+            pe.unknown_identifiers("SELECT id FROM t_small", columns))
+        self.assertIn("not in the schema slice", problems)
+        self.assertNotIn("does not exist", problems)
+
+    def test_an_untruncated_schema_still_says_does_not_exist(self):
+        columns = pe.introspect_columns(lambda _sql: [("t_big", "id", "uuid")])
+        self.assertEqual(pe._SCHEMA_TRUNCATION, {})
+        problems = " ".join(
+            pe.unknown_identifiers("SELECT id FROM nope", columns))
+        self.assertIn("does not exist", problems)
+
+    def test_dropped_columns_are_recorded_with_their_cap(self):
+        rows = [("t", "c%d" % i, "text") for i in range(5)]
+        columns = pe.introspect_columns(lambda _sql: rows,
+                                        max_columns_per_table=2)
+        self.assertEqual(columns["t"], ["c0", "c1"])
+        self.assertEqual(pe._SCHEMA_TRUNCATION["dropped_columns"], {"t": 3})
+        self.assertEqual(pe._SCHEMA_TRUNCATION["max_columns_per_table"], 2)
+
+    def test_the_runtime_evidence_report_names_the_dropped_tables(self):
+        """The whole point: the audit report has to SAY the schema is a slice,
+        the way it already says the row bound filled up."""
+        big = [("t%03d" % i, "id", "uuid") for i in range(140)]
+
+        class _SchemaCursor(_Cursor):
+            def execute(self, sql):
+                if "information_schema.columns" in sql.strip().lower():
+                    self.conn.executed.append(sql)
+                    self._rows = list(big)
+                    self.description = [("table_name",), ("column_name",),
+                                        ("data_type",)]
+                    return
+                return super().execute(sql)
+
+        class _SchemaConn(_Conn):
+            def cursor(self):
+                return _SchemaCursor(self)
+
+        rec = pe.collect_runtime_evidence(
+            lambda *a, **k: {"queries": []}, "purpose",
+            env={pe.READONLY_URL_ENV: "postgres://x"},
+            connect=lambda _u: _SchemaConn())
+        joined = " ".join(rec["errors"])
+        self.assertIn("SLICE of the real one", joined)
+        self.assertIn("120-table cap", joined)
+        self.assertIn("t139", joined)
+
+
+class ScoutSandboxPostureIsTrueTests(unittest.TestCase):
+    """Every _scout_report.json asserted a sandbox posture the live path never
+    applied: the production call site passes no sandbox_summary and
+    `enrich_evidence_from_clone` executes no candidate code."""
+
+    EVALUATION = {
+        "need": "n",
+        "repo": {"fullName": "a/b", "htmlUrl": "https://x/a/b"},
+        "result": {"repo": {"fullName": "a/b", "htmlUrl": "https://x/a/b"}},
+        "benefit": {"benefit_score": 70, "how_it_helps": "maybe"},
+        "verdicts": {"safe_to_integrate": True, "reasons": []},
+        "evidence": {
+            "license": "Apache-2.0", "license_compatible": True,
+            "commit_sha": "b" * 40, "commit_pin_source": "clone",
+            "clone_inspection_ok": True, "safety_verdict": "allow",
+            "advisories": "none", "last_activity": "2026-01-01",
+            "stars": 10, "language": "JS",
+        },
+    }
+
+    def _report(self, **kw):
+        return sc.build_scout_structured_report(
+            "Prog", {"summary": "s", "stack": ["node"], "goals": ["g"]},
+            [dict(self.EVALUATION)], **kw)
+
+    def test_the_default_posture_does_not_claim_a_control_that_never_ran(self):
+        sandbox = self._report()["sandbox"]
+        self.assertEqual(sandbox["candidate_execution"], "not-executed")
+        blob = json.dumps(sandbox)
+        self.assertNotIn("proxy-poisoned", blob)
+        self.assertNotIn("disposable-temp-dir", blob)
+
+    def test_a_caller_that_really_sandboxed_still_reports_its_own_posture(self):
+        summary = {"candidate_execution": "disposable-temp-dir",
+                   "credentials": "stripped",
+                   "egress": "proxy-poisoned-best-effort",
+                   "teardown": "required"}
+        self.assertEqual(self._report(sandbox_summary=summary)["sandbox"],
+                         summary)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,31 @@ class WorkspaceLockInheritanceTests(unittest.TestCase):
                 self.assertEqual(gates["deps_pinned"].status, "pass",
                                  gates["deps_pinned"].evidence)
 
+    def test_corrected_manager_rewrites_the_derived_runner_argv(self):
+        """The manager correction must reach the COMMANDS, not just the label.
+
+        orig _detect_node derives build/test/... as [npm, run, ...] before the
+        wrapper corrects the manager from the ancestor lockfile, so a pnpm
+        workspace member said manager="pnpm" while its gates executed
+        `npm run build` — an environmental failure the run then blames on the
+        audited code."""
+        with _RepoFixture({
+                "package.json": '{"private":true,"workspaces":["apps/*"]}',
+                "pnpm-lock.yaml": "",
+                "apps/web/package.json":
+                    '{"name":"web","scripts":{"build":"vite build",'
+                    '"test":"vitest","start":"node server.js"}}',
+        }) as root:
+            chains = pr.detect_toolchains(root)
+            web = {t.root: t for t in chains if t.ecosystem == "node"}["apps/web"]
+            self.assertEqual(web.manager, "pnpm")
+            self.assertIn(["pnpm", "run", "build"], web.build,
+                          f"build still runs the wrong manager: {web.build}")
+            self.assertNotIn(["npm", "run", "build"], web.build)
+            self.assertIn(["pnpm", "run", "test"], web.test, web.test)
+            if web.run:  # flat argv shape
+                self.assertNotEqual(web.run[:2], ["npm", "run"], web.run)
+
     def test_nested_package_without_any_lockfile_is_still_unpinned(self):
         with _RepoFixture({
                 "package.json": '{"private":true}',

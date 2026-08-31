@@ -38,6 +38,43 @@ def _entry(n, kind, phase, error, where=None, program_file="", route="",
             "suggestion": suggestion, "suggestion_source": source}
 
 
+class TerminalLabelTests(unittest.TestCase):
+    """The header label derives from the PHASE, never from `done` alone.
+
+    done=True used to replace the phase text with a green "DONE"
+    unconditionally, so a crashed program (audit_one_program's fatal handler
+    publishes phase="error", done=True, error=...) rendered exactly like a
+    success, and neither the word "error" nor the recorded error string was
+    ever painted. Shared by BOTH dashboards so they cannot drift."""
+
+    def test_a_crashed_program_is_not_a_green_done(self):
+        label, kind = dash.terminal_label(
+            {"phase": "error", "done": True,
+             "error": "'str' object has no attribute 'get'"})
+        self.assertEqual(kind, "error")
+        self.assertIn("'str' object has no attribute 'get'", label)
+        self.assertNotEqual(label, "DONE")
+
+    def test_partial_and_stopped_keep_their_phase_text(self):
+        label, kind = dash.terminal_label(
+            {"phase": "done - partial (suite red)", "done": True})
+        self.assertEqual(kind, "partial")
+        self.assertIn("partial", label)
+        label, kind = dash.terminal_label(
+            {"phase": "STOPPED (incomplete) - repairs/verification pending",
+             "done": False, "stopped": True})
+        self.assertEqual(kind, "stopped")
+        self.assertTrue(label.startswith("STOPPED"))
+
+    def test_a_genuine_success_is_still_the_green_done(self):
+        label, kind = dash.terminal_label({"phase": "done - verified", "done": True})
+        self.assertEqual((label, kind), ("DONE", "done"))
+
+    def test_a_running_program_keeps_its_phase(self):
+        label, kind = dash.terminal_label({"phase": "fixing", "done": False})
+        self.assertEqual((label, kind), ("fixing", "running"))
+
+
 class LedgerReaderTests(unittest.TestCase):
     """flexfactor_errors' reader half - the single source both viewers use."""
 
