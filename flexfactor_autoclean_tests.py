@@ -271,6 +271,46 @@ class SweptTreeIsVerifiedTests(unittest.TestCase):
         self.assertNotIn("newfile.txt", committed)
         self.assertFalse(os.path.exists(os.path.join(d, "newfile.txt")))
 
+    def test_candidate_intended_delete_survives_and_gate_recreate_removed(self):
+        """Baseline has old.txt; candidate deletes it; gate recreates+stages it.
+        Commit and worktree must still omit old.txt; unrelated owner WIP survives."""
+        d = _repo()
+        # Add a baseline tracked file
+        with open(os.path.join(d, "old.txt"), "w") as fh:
+            fh.write("baseline\n")
+        _git(["add", "-A"], d)
+        _git(["commit", "-qm", "add old.txt"], d)
+        # Owner WIP staged-add
+        with open(os.path.join(d, "new_owner.txt"), "w") as fh:
+            fh.write("owner wip\n")
+        # Pre-existing ignored debris that must be preserved
+        os.makedirs(os.path.join(d, "node_modules"), exist_ok=True)
+        with open(os.path.join(d, "node_modules", "pre.txt"), "w") as fh:
+            fh.write("pre\n")
+        # Candidate intends to delete old.txt
+        os.remove(os.path.join(d, "old.txt"))
+        def verify():
+            # Gate recreates + stages old.txt falsely
+            with open(os.path.join(d, "old.txt"), "w") as fh:
+                fh.write("recreated by gate\n")
+            _git(["add", "old.txt"], d)
+            # Also create new ignored debris made by the gate
+            with open(os.path.join(d, "node_modules", "post.txt"), "w") as fh:
+                fh.write("post\n")
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        # Commit omits old.txt; worktree omits old.txt
+        tree = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("old.txt", tree)
+        self.assertFalse(os.path.exists(os.path.join(d, "old.txt")))
+        # Unrelated staged-added owner WIP survives in commit and worktree
+        self.assertIn("new_owner.txt", tree)
+        self.assertTrue(os.path.exists(os.path.join(d, "new_owner.txt")))
+        # Ignored debris: pre-existing kept, newly created removed
+        self.assertTrue(os.path.exists(os.path.join(d, "node_modules", "pre.txt")))
+        self.assertFalse(os.path.exists(os.path.join(d, "node_modules", "post.txt")))
+
     def test_gate_created_ephemeral_output_is_cleaned_not_committed(self):
         d = self._dirty()
 

@@ -263,6 +263,12 @@ def commit_pending_changes(project_dir, *, run, verify=None):
         res["failed"].append({"item": "staged candidate",
                               "reason": "git write-tree failed: " + str(tree_out)[:160]})
         return res
+    # Snapshot baseline ignored/untracked generated paths so pre-existing caches
+    # are not removed; only newly created ignored outputs after verification go.
+    _, baseline_ignored = _nul_paths(
+        run, ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        project_dir)
+    baseline_generated_ignored = {p for p in baseline_ignored if _generated_path(p)}
 
     if callable(verify):
         try:
@@ -306,9 +312,15 @@ def commit_pending_changes(project_dir, *, run, verify=None):
             run, ["git", "checkout", "--"], generated_tracked, project_dir)
         if not ok:
             cleanup_failed.append("tracked generated output: " + str(detail)[:120])
-    if generated_untracked:
+    # Only remove newly created ignored generated outputs compared to baseline.
+    _, post_ignored = _nul_paths(
+        run, ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        project_dir)
+    post_generated_ignored = {p for p in post_ignored if _generated_path(p)}
+    new_ignored_generated = sorted(post_generated_ignored - baseline_generated_ignored)
+    if new_ignored_generated:
         ok, detail = _run_path_chunks(
-            run, ["git", "clean", "-f", "-d", "--"], generated_untracked, project_dir)
+            run, ["git", "clean", "-f", "-d", "--"], new_ignored_generated, project_dir)
         if not ok:
             cleanup_failed.append("untracked generated output: " + str(detail)[:120])
 
@@ -350,8 +362,11 @@ def commit_pending_changes(project_dir, *, run, verify=None):
     _, now_untracked = _nul_paths(
         run, ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         project_dir)
-    candidate_set = set(candidate_paths)
-    purge = [p for p in now_untracked if p not in candidate_set]
+    # Preserve set = ALL files tracked in the candidate index (staged adds included,
+    # staged deletions excluded). This is stronger than using changed-path names.
+    _, keep_list = _nul_paths(run, ["git", "ls-files", "-z"], project_dir)
+    keep_set = set(keep_list)
+    purge = [p for p in now_untracked if p not in keep_set]
     if purge:
         _run_path_chunks(run, ["git", "clean", "-f", "-d", "--"], purge, project_dir)
 
