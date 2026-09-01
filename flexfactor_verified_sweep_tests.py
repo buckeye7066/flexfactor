@@ -11,11 +11,11 @@ Two of FlexFactor's own rules made that possible, and both are fixed here:
   A  `verification_is_real`'s SENTENCE named only the component that failed to
      bootstrap, so a repo whose node suite was fully runnable reported "Build
      verification: NOT AVAILABLE ... Fixes in this run were NOT build-verified"
-     with no hint that anything had been verified at all. The VERDICT is
-     correct and is deliberately unchanged - an unbootstrapped component really
-     is unverified, and `False` is what makes the scorecard record
-     `final_build = None`. A critical line that is unactionable and present on
-     every run is one an operator learns to scroll past.
+     with no hint that sibling components were available for verification. The
+     VERDICT is correct and is deliberately unchanged - an unbootstrapped
+     component really is unverified, and `False` is what makes the scorecard
+     record `final_build = None`. A critical line that is unactionable and
+     present on every run is one an operator learns to scroll past.
 
   B  The fix prompts stated exactly one correctness bar - "the project MUST
      still build" - and EVERY one of the 47 regressions satisfies it. The
@@ -48,7 +48,7 @@ def _tc(ecosystem, root, *, build=True, needs_deps=True, installed=True,
 
 
 class VerificationNoteNamesBothHalvesTests(unittest.TestCase):
-    """The refusal is kept; the sentence stops implying nothing ran.
+    """The refusal is kept; the sentence stops implying nothing is verifiable.
 
     Deliberately NOT changed: the boolean. Returning True on the strength of a
     sibling component's green suite would let a fix land in the unverified
@@ -71,15 +71,14 @@ class VerificationNoteNamesBothHalvesTests(unittest.TestCase):
         finally:
             eng._host_can_build = real
 
-    def test_the_measured_GrantFlow_shape_now_SAYS_node_was_verified(self):
-        """java+node bootstrapped, one component not: the note names both.
+    def test_the_measured_GrantFlow_shape_names_verification_capability(self):
+        """java+node bootstrapped, one component not: name capability and gap.
 
         Measured 2026-08-31: GrantFlow's report said "Build verification: NOT
         AVAILABLE - dependencies not installed for swift:ios/App/CapApp-SPM ...
         Fixes in this run were NOT build-verified", beside "Dependency
         bootstrap: 1/2 install step(s) succeeded", while node held that
-        repository's 8242-test vitest suite and 3098-test node suite and both
-        ran fine.
+        repository's 8242-test vitest suite and 3098-test node suite.
         """
         ok, note = self._all_buildable_here([
             _tc("node", "."),
