@@ -98,6 +98,311 @@ class CommitPendingChangesTests(unittest.TestCase):
         ac.summarise([res])  # must not raise
 
 
+class SweptTreeIsVerifiedTests(unittest.TestCase):
+    """Autoclean VERIFIES what it commits, and never reads `None` as a pass.
+
+    The regression these guard: for weeks `commit_pending_changes` ran
+    `git add -A` with no verification of any kind and committed under a message
+    whose "these changes were already on disk" reads as "not ours". FlexFactor
+    aborts routinely and nothing restores the tree, so the sweep was frequently
+    committing its OWN half-verified output from a dead run - 47 real
+    regressions reached four repositories that way.
+
+    The contract is deliberately narrow, because the fix must not cost the tool
+    any capability: the commit ALWAYS happens (no work is ever discarded, no
+    approval gate, no dry-run mode). Only the VERDICT changes.
+    """
+
+    def _dirty(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        return d
+
+    def test_a_green_gate_is_recorded_as_VERIFIED(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (True, "$ npm test\nok"))
+        self.assertIs(res["verified"], True)
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("Project gate: VERIFIED", body)
+
+    def test_a_RED_gate_still_commits_but_is_never_called_a_pass(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (False, "$ npm test\n1 failing"))
+        # The work is COMMITTED - losing a sibling agent's WIP would be worse
+        # than committing it, and refusing would be the approval gate the owner
+        # has banned.
+        self.assertEqual(len(res["acted_on"]), 1)
+        self.assertEqual(_git(["status", "--porcelain"], d).stdout.strip(), "")
+        # ...but the verdict is the truth, in the result AND in history.
+        self.assertIs(res["verified"], False)
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("Project gate: RED", body)
+        self.assertNotIn("1 failing", body)
+        self.assertIn("1 failing", res["verify_note"])
+
+    def test_NOTHING_RAN_is_UNVERIFIED_and_is_not_success(self):
+        """`None` is the value that used to be reported as success."""
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (None, "no verify command"))
+        self.assertIsNone(res["verified"])
+        self.assertIsNot(res["verified"], True)
+        self.assertIn("Project gate: UNVERIFIED",
+                      _git(["log", "-1", "--format=%B"], d).stdout)
+
+    def test_a_caller_that_supplies_no_gate_gets_UNVERIFIED_not_a_pass(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner)
+        self.assertIsNone(res["verified"])
+        self.assertIn("no verification gate", res["verify_note"])
+
+    def test_a_gate_that_RAISES_is_UNVERIFIED_never_a_pass(self):
+        def boom():
+            raise RuntimeError("verify blew up")
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=boom)
+        self.assertIsNone(res["verified"])
+        self.assertIn("verify blew up", res["verify_note"])
+        self.assertEqual(len(res["acted_on"]), 1)   # still committed
+
+    def test_a_bare_tristate_is_accepted_as_well_as_the_ok_log_pair(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=lambda: True)
+        self.assertIs(res["verified"], True)
+
+    def test_an_unrecognisable_gate_return_is_UNVERIFIED_never_truthy(self):
+        """A truthy non-tri-state must not sneak through as a pass."""
+        for weird in ("passed", 1, [], {"ok": True}):
+            with self.subTest(weird=weird):
+                ok, _ = ac._verdict(weird)
+                self.assertIsNone(ok)
+
+    def test_a_clean_tree_runs_no_gate_at_all(self):
+        """Verification costs a build; do not spend one with nothing to commit."""
+        calls = []
+        d = _repo()
+        ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: calls.append(1) or (True, ""))
+        self.assertEqual(calls, [])
+
+    def test_the_gate_runs_BEFORE_the_commit_not_after(self):
+        """It must read the tree a reader of the commit will check out."""
+        seen = {}
+        d = self._dirty()
+
+        def verify():
+            seen["dirty_at_verify_time"] = bool(
+                _git(["status", "--porcelain"], d).stdout.strip())
+            return True, ""
+        ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertTrue(seen["dirty_at_verify_time"])
+
+
+    def test_gate_created_source_is_not_swept_and_invalidates_green(self):
+        d = self._dirty()
+
+        def verify():
+            with open(os.path.join(d, "generated-source.py"), "w") as fh:
+                fh.write("print('gate output')\n")
+            return True, "all passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertIn("non-generated path", res["verify_note"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertIn("wip.txt", committed)
+        self.assertNotIn("generated-source.py", committed)
+        # Post-verify worktree is restored to the exact candidate; gate-created
+        # non-generated files are removed.
+        self.assertFalse(os.path.exists(os.path.join(d, "generated-source.py")))
+
+    def test_gate_modifies_tracked_file_and_is_restored(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        # Stage candidate
+        def verify():
+            # mutate tracked candidate after staging
+            with open(os.path.join(d, "wip.txt"), "w") as fh:
+                fh.write("mutated by gate\n")
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        # Working tree restored to candidate content
+        with open(os.path.join(d, "wip.txt")) as fh:
+            self.assertEqual(fh.read(), "owner work\n")
+
+    def test_gate_deletes_tracked_file_and_is_restored(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        def verify():
+            os.remove(os.path.join(d, "wip.txt"))
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertTrue(os.path.exists(os.path.join(d, "wip.txt")))
+
+    def test_gate_renames_tracked_file_and_new_name_is_removed(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        def verify():
+            os.rename(os.path.join(d, "wip.txt"), os.path.join(d, "wip2.txt"))
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertTrue(os.path.exists(os.path.join(d, "wip.txt")))
+        self.assertFalse(os.path.exists(os.path.join(d, "wip2.txt")))
+
+    def test_gate_stages_new_file_and_it_is_not_kept(self):
+        d = _repo()
+        def verify():
+            with open(os.path.join(d, "newfile.txt"), "w") as fh:
+                fh.write("gate staged\n")
+            _git(["add", "newfile.txt"], d)
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("newfile.txt", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "newfile.txt")))
+
+    def test_candidate_intended_delete_survives_and_gate_recreate_removed(self):
+        """Baseline has old.txt; candidate deletes it; gate recreates+stages it.
+        Commit and worktree must still omit old.txt; unrelated owner WIP survives."""
+        d = _repo()
+        # Add a baseline tracked file
+        with open(os.path.join(d, "old.txt"), "w") as fh:
+            fh.write("baseline\n")
+        _git(["add", "-A"], d)
+        _git(["commit", "-qm", "add old.txt"], d)
+        # Owner WIP staged-add
+        with open(os.path.join(d, "new_owner.txt"), "w") as fh:
+            fh.write("owner wip\n")
+        # Pre-existing ignored debris that must be preserved
+        os.makedirs(os.path.join(d, "node_modules"), exist_ok=True)
+        with open(os.path.join(d, "node_modules", "pre.txt"), "w") as fh:
+            fh.write("pre\n")
+        # Candidate intends to delete old.txt
+        os.remove(os.path.join(d, "old.txt"))
+        def verify():
+            # Gate recreates + stages old.txt falsely
+            with open(os.path.join(d, "old.txt"), "w") as fh:
+                fh.write("recreated by gate\n")
+            _git(["add", "old.txt"], d)
+            # Also create new ignored debris made by the gate
+            with open(os.path.join(d, "node_modules", "post.txt"), "w") as fh:
+                fh.write("post\n")
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        # Commit omits old.txt; worktree omits old.txt
+        tree = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("old.txt", tree)
+        self.assertFalse(os.path.exists(os.path.join(d, "old.txt")))
+        # Unrelated staged-added owner WIP survives in commit and worktree
+        self.assertIn("new_owner.txt", tree)
+        self.assertTrue(os.path.exists(os.path.join(d, "new_owner.txt")))
+        # Ignored debris: pre-existing kept, newly created removed
+        self.assertTrue(os.path.exists(os.path.join(d, "node_modules", "pre.txt")))
+        self.assertFalse(os.path.exists(os.path.join(d, "node_modules", "post.txt")))
+
+    def test_gate_created_ephemeral_output_is_cleaned_not_committed(self):
+        d = self._dirty()
+
+        def verify():
+            cache = os.path.join(d, "__pycache__")
+            os.makedirs(cache, exist_ok=True)
+            with open(os.path.join(cache, "x.pyc"), "wb") as fh:
+                fh.write(b"compiled")
+            return True, "tests passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIs(res["verified"], True)
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("__pycache__", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "__pycache__", "x.pyc")))
+
+    def test_gate_staging_generated_output_cannot_change_the_committed_tree(self):
+        d = self._dirty()
+
+        def verify():
+            cache = os.path.join(d, "__pycache__")
+            os.makedirs(cache, exist_ok=True)
+            with open(os.path.join(cache, "staged.pyc"), "wb") as fh:
+                fh.write(b"compiled")
+            _git(["add", "-f", "__pycache__/staged.pyc"], d)
+            return True, "tests passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"], "a gate that mutates the index is never VERIFIED")
+        self.assertIn("changed the Git index", res["verify_note"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertIn("wip.txt", committed)
+        self.assertNotIn("__pycache__/staged.pyc", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "__pycache__", "staged.pyc")))
+
+    def test_gate_output_is_redacted_and_never_written_to_history(self):
+        d = self._dirty()
+        secret = "sk-proj-supersecret123456789"
+        res = ac.commit_pending_changes(
+            d, run=_test_runner,
+            verify=lambda: (False, "API_KEY=" + secret + "\nfailed"))
+        self.assertNotIn(secret, res["verify_note"])
+        self.assertIn("[REDACTED]", res["verify_note"])
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertNotIn(secret, body)
+        self.assertNotIn("API_KEY", body)
+
+    def test_build_only_success_says_exactly_what_ran(self):
+        d = self._dirty()
+        ac.commit_pending_changes(
+            d, run=_test_runner,
+            verify=lambda: (True, "build ok\n(no project test suite configured)"))
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("VERIFIED-BUILD-ONLY", body)
+        self.assertNotIn("suite ran and passed", body)
+
+    def test_the_commit_message_stops_claiming_the_changes_are_not_ours(self):
+        d = self._dirty()
+        ac.commit_pending_changes(d, run=_test_runner, verify=lambda: (True, ""))
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("cannot tell whether these edits are the owner's work in "
+                      "progress or its own output", body)
+
+    def test_clean_repo_threads_the_gate_through_to_the_sweep(self):
+        """A gate wired only into the function nobody calls is no gate."""
+        calls = []
+        d = self._dirty()
+
+        def fake_run(cmd, cwd, timeout=ac.TIMEOUT_S):
+            if cmd and cmd[0] == "git":
+                return _test_runner(cmd, cwd, timeout)
+            return 1, "not reachable in this test"
+        ac.clean_repo(d, repo=None, run=fake_run,
+                      verify=lambda: calls.append(1) or (True, "ok"))
+        self.assertEqual(calls, [1])
+
+    def test_the_summary_names_the_verdict_so_a_red_sweep_is_not_read_as_clean(self):
+        step = {"step": "uncommitted-changes", "candidates": 1,
+                "acted_on": ["M src/app.js"], "skipped": [], "failed": [],
+                "verified": False, "verify_note": "1 failing"}
+        text = ac.format_summary(ac.summarise([step]))
+        self.assertIn("gate: RED", text)
+        self.assertIn("1 failing", text)
+
+    def test_the_summary_labels_an_unverified_sweep_as_such(self):
+        step = {"step": "uncommitted-changes", "candidates": 1,
+                "acted_on": ["M src/app.js"], "skipped": [], "failed": [],
+                "verified": None, "verify_note": "no verify command"}
+        self.assertIn("gate: UNVERIFIED",
+                      ac.format_summary(ac.summarise([step])))
+
+
 class PullRequestPolicyTests(unittest.TestCase):
     """Red/draft/conflicting PRs are SKIPPED WITH A REASON, never merged."""
 
