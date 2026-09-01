@@ -1,0 +1,101 @@
+diff --git a/flexfactor.py b/flexfactor.py
+index afab25c..ede3bfb 100644
+--- a/flexfactor.py
++++ b/flexfactor.py
+@@ -11708,6 +11708,26 @@ def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
+     return _publication_gate_after_build(project_dir, stack, build_ok, build_log)
+ 
+ 
++def _autoclean_publication_gate(project_dir: str,
++                                stack: dict) -> tuple[bool | None, str]:
++    """Verify a frozen pre-work candidate without inventing a bootstrap failure.
++
++    Autoclean runs before the normal dependency-bootstrap phase because it must
++    isolate and commit the tree that was already on disk before new work starts.
++    When verification dependencies are not ready yet, running the ordinary
++    publication gate here would label healthy source RED for a missing
++    ``node_modules``/venv/toolchain. That is not a code verdict. Keep the exact
++    candidate UNVERIFIED and let the post-bootstrap baseline gate evaluate it.
++    """
++    if stack.get("verification_is_real") is not True:
++        why = str(stack.get("verification_note") or
++                  "verification dependencies are not ready")
++        return (None,
++                "autoclean publication gate deferred until after dependency "
++                f"bootstrap: {why}")
++    return _publication_gate(project_dir, stack)
++
++
+ _FAILURE_SOURCE_RE = re.compile(
+     r"(?P<path>(?:[A-Za-z]:[\\/][^:\r\n\"'<>|]*?|"
+     # POSIX absolute. Only a Windows drive or one of the magic directory names
+@@ -15075,7 +15095,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int)
+                     # OWN commits - build plus this repository's own suite,
+                     # tri-state. `stack` is already detected above, so this
+                     # costs a gate run only when the tree is actually dirty.
+-                    verify=lambda: _publication_gate(project_dir, stack))
++                    verify=lambda: _autoclean_publication_gate(
++                        project_dir, stack))
+                 print(f"{pfx}" + _autoclean.format_summary(_clean).replace(
+                     "\n", f"\n{pfx}"))
+                 _swept = next((s for s in _clean["steps"]
+diff --git a/flexfactor_verified_sweep_tests.py b/flexfactor_verified_sweep_tests.py
+index 08ec06c..4351edd 100644
+--- a/flexfactor_verified_sweep_tests.py
++++ b/flexfactor_verified_sweep_tests.py
+@@ -208,5 +208,55 @@ class NeverWeakenRuleReachesTheFixPromptsTests(unittest.TestCase):
+                               getattr(self.ff, name))
+ 
+ 
++class AutocleanPreBootstrapGateTests(unittest.TestCase):
++    """Missing verification dependencies are UNKNOWN here, never a code RED."""
++
++    def setUp(self):
++        import flexfactor as ff
++        self.ff = ff
++
++    def test_unbootstrapped_candidate_is_deferred_without_running_the_gate(self):
++        calls = []
++        real = self.ff._publication_gate
++        self.ff._publication_gate = (
++            lambda *a, **k: calls.append((a, k)) or (True, "wrong")
++        )
++        try:
++            verdict, note = self.ff._autoclean_publication_gate(
++                ".", {
++                    "verification_is_real": False,
++                    "verification_note": "dependencies not installed for node:.",
++                })
++        finally:
++            self.ff._publication_gate = real
++        self.assertIs(verdict, None)
++        self.assertEqual(calls, [])
++        self.assertIn("deferred until after dependency bootstrap", note)
++        self.assertIn("dependencies not installed", note)
++
++    def test_bootstrapped_candidate_uses_the_real_publication_gate(self):
++        calls = []
++        real = self.ff._publication_gate
++        self.ff._publication_gate = (
++            lambda project, stack: calls.append((project, stack)) or (True, "green")
++        )
++        stack = {"verification_is_real": True}
++        try:
++            verdict = self.ff._autoclean_publication_gate("repo", stack)
++        finally:
++            self.ff._publication_gate = real
++        self.assertEqual(verdict, (True, "green"))
++        self.assertEqual(calls, [("repo", stack)])
++
++    def test_clean_repo_is_wired_to_the_deferred_gate(self):
++        with open(self.ff.__file__, encoding="utf-8") as source_file:
++            source = source_file.read()
++        self.assertIn(
++            "verify=lambda: _autoclean_publication_gate(\n"
++            "                        project_dir, stack)",
++            source,
++        )
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
