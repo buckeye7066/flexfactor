@@ -986,9 +986,41 @@ def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
     # longer veto verification of the parts that do build here.
     foreign = [t for t in missing if not _host_can_build(t)]
     missing = [t for t in missing if _host_can_build(t)]
+    # THE VERDICT STAYS CONSERVATIVE; ONLY THE SENTENCE GETS HONEST.
+    #
+    # An unbootstrapped component means FlexFactor's fixes TO THAT COMPONENT are
+    # unverified, and `False` here is what makes the readiness scorecard record
+    # `final_build = None`. Returning `True` on the strength of a sibling
+    # component's green suite would let a fix land in the unverified one - the
+    # exact overclaim this function exists to prevent - so the boolean is
+    # deliberately unchanged, and `test_swift_with_a_REAL_toolchain_is_not_foreign`
+    # pins it.
+    #
+    # What WAS wrong is the sentence. Measured 2026-09-01 on two repos: GrantFlow
+    # (java, node, swift) and Ellie (java, node, python) both reported only
+    # "dependencies not installed for <one component> - build gate would
+    # false-fail", which the report renders as "Build verification: NOT AVAILABLE
+    # ... Fixes in this run were NOT build-verified". In both, node - holding
+    # those projects' 8242- and 1034-test suites - was fully bootstrapped, and
+    # `_full_gate` ran its commands. So the line said nothing was verified while
+    # something was, named no action beyond a component the owner may not be able
+    # to bootstrap at all, and appeared on every single run. A critical-severity
+    # line that is unactionable and always present is one an operator learns to
+    # scroll past, which costs the gate its teeth on the day it is real.
+    #
+    # Naming BOTH halves keeps the refusal and makes it useful.
+    verifiable = [t for t in buildable if _host_can_build(t) and t not in missing]
     if missing:
-        names = ", ".join(f"{t.ecosystem}:{t.root}" for t in missing)
-        return False, f"dependencies not installed for {names} - build gate would false-fail"
+        bad = ", ".join(f"{t.ecosystem}:{t.root}" for t in missing)
+        note = f"dependencies not installed for {bad} - build gate would false-fail"
+        if verifiable:
+            ok = ", ".join(f"{t.ecosystem}:{t.root}" for t in verifiable)
+            note += f"; {ok} IS bootstrapped and was verified"
+        if foreign:
+            note += ("; not verifiable on this host "
+                     f"({sys.platform}): "
+                     + ", ".join(f"{t.ecosystem}:{t.root}" for t in foreign))
+        return False, note
     local = [t for t in buildable if _host_can_build(t)]
     if not local:
         eco = ", ".join(sorted({t.ecosystem for t in buildable}))

@@ -98,6 +98,145 @@ class CommitPendingChangesTests(unittest.TestCase):
         ac.summarise([res])  # must not raise
 
 
+class SweptTreeIsVerifiedTests(unittest.TestCase):
+    """Autoclean VERIFIES what it commits, and never reads `None` as a pass.
+
+    The regression these guard: for weeks `commit_pending_changes` ran
+    `git add -A` with no verification of any kind and committed under a message
+    whose "these changes were already on disk" reads as "not ours". FlexFactor
+    aborts routinely and nothing restores the tree, so the sweep was frequently
+    committing its OWN half-verified output from a dead run - 47 real
+    regressions reached four repositories that way.
+
+    The contract is deliberately narrow, because the fix must not cost the tool
+    any capability: the commit ALWAYS happens (no work is ever discarded, no
+    approval gate, no dry-run mode). Only the VERDICT changes.
+    """
+
+    def _dirty(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        return d
+
+    def test_a_green_gate_is_recorded_as_VERIFIED(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (True, "$ npm test\nok"))
+        self.assertIs(res["verified"], True)
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("Project gate: VERIFIED", body)
+
+    def test_a_RED_gate_still_commits_but_is_never_called_a_pass(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (False, "$ npm test\n1 failing"))
+        # The work is COMMITTED - losing a sibling agent's WIP would be worse
+        # than committing it, and refusing would be the approval gate the owner
+        # has banned.
+        self.assertEqual(len(res["acted_on"]), 1)
+        self.assertEqual(_git(["status", "--porcelain"], d).stdout.strip(), "")
+        # ...but the verdict is the truth, in the result AND in history.
+        self.assertIs(res["verified"], False)
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("Project gate: RED", body)
+        self.assertIn("1 failing", body)
+
+    def test_NOTHING_RAN_is_UNVERIFIED_and_is_not_success(self):
+        """`None` is the value that used to be reported as success."""
+        d = self._dirty()
+        res = ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: (None, "no verify command"))
+        self.assertIsNone(res["verified"])
+        self.assertIsNot(res["verified"], True)
+        self.assertIn("Project gate: UNVERIFIED",
+                      _git(["log", "-1", "--format=%B"], d).stdout)
+
+    def test_a_caller_that_supplies_no_gate_gets_UNVERIFIED_not_a_pass(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner)
+        self.assertIsNone(res["verified"])
+        self.assertIn("no verification gate", res["verify_note"])
+
+    def test_a_gate_that_RAISES_is_UNVERIFIED_never_a_pass(self):
+        def boom():
+            raise RuntimeError("verify blew up")
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=boom)
+        self.assertIsNone(res["verified"])
+        self.assertIn("verify blew up", res["verify_note"])
+        self.assertEqual(len(res["acted_on"]), 1)   # still committed
+
+    def test_a_bare_tristate_is_accepted_as_well_as_the_ok_log_pair(self):
+        d = self._dirty()
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=lambda: True)
+        self.assertIs(res["verified"], True)
+
+    def test_an_unrecognisable_gate_return_is_UNVERIFIED_never_truthy(self):
+        """A truthy non-tri-state must not sneak through as a pass."""
+        for weird in ("passed", 1, [], {"ok": True}):
+            with self.subTest(weird=weird):
+                ok, _ = ac._verdict(weird)
+                self.assertIsNone(ok)
+
+    def test_a_clean_tree_runs_no_gate_at_all(self):
+        """Verification costs a build; do not spend one with nothing to commit."""
+        calls = []
+        d = _repo()
+        ac.commit_pending_changes(
+            d, run=_test_runner, verify=lambda: calls.append(1) or (True, ""))
+        self.assertEqual(calls, [])
+
+    def test_the_gate_runs_BEFORE_the_commit_not_after(self):
+        """It must read the tree a reader of the commit will check out."""
+        seen = {}
+        d = self._dirty()
+
+        def verify():
+            seen["dirty_at_verify_time"] = bool(
+                _git(["status", "--porcelain"], d).stdout.strip())
+            return True, ""
+        ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertTrue(seen["dirty_at_verify_time"])
+
+    def test_the_commit_message_stops_claiming_the_changes_are_not_ours(self):
+        d = self._dirty()
+        ac.commit_pending_changes(d, run=_test_runner, verify=lambda: (True, ""))
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("cannot tell whether these edits are the owner's work in "
+                      "progress or its own output", body)
+
+    def test_clean_repo_threads_the_gate_through_to_the_sweep(self):
+        """A gate wired only into the function nobody calls is no gate."""
+        calls = []
+        d = self._dirty()
+
+        def fake_run(cmd, cwd, timeout=ac.TIMEOUT_S):
+            if cmd[:2] == ["git", "status"]:
+                return _test_runner(cmd, cwd, timeout)
+            if cmd[:2] in (["git", "add"], ["git", "commit"]):
+                return _test_runner(cmd, cwd, timeout)
+            return 1, "not reachable in this test"
+        ac.clean_repo(d, repo=None, run=fake_run,
+                      verify=lambda: calls.append(1) or (True, "ok"))
+        self.assertEqual(calls, [1])
+
+    def test_the_summary_names_the_verdict_so_a_red_sweep_is_not_read_as_clean(self):
+        step = {"step": "uncommitted-changes", "candidates": 1,
+                "acted_on": ["M src/app.js"], "skipped": [], "failed": [],
+                "verified": False, "verify_note": "1 failing"}
+        text = ac.format_summary(ac.summarise([step]))
+        self.assertIn("gate: RED", text)
+        self.assertIn("1 failing", text)
+
+    def test_the_summary_labels_an_unverified_sweep_as_such(self):
+        step = {"step": "uncommitted-changes", "candidates": 1,
+                "acted_on": ["M src/app.js"], "skipped": [], "failed": [],
+                "verified": None, "verify_note": "no verify command"}
+        self.assertIn("gate: UNVERIFIED",
+                      ac.format_summary(ac.summarise([step])))
+
+
 class PullRequestPolicyTests(unittest.TestCase):
     """Red/draft/conflicting PRs are SKIPPED WITH A REASON, never merged."""
 

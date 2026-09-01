@@ -95,12 +95,99 @@ def _skip(res, item, reason):
     res["skipped"].append({"item": item, "reason": reason})
 
 
+# Anything that is not literally `True` is NOT a pass. This mirrors the rule
+# `_full_gate`'s docstring imposes on its callers - "`if final_ok is True`,
+# never `if final_ok`" - because `None` (nothing ran) is the value that used to
+# be reported as success and is the single worst overclaim this tool can make.
+VERDICT_LABELS = {
+    True: "VERIFIED",
+    False: "RED",
+    None: "UNVERIFIED",
+}
+
+
+def _verdict(result):
+    """Normalise a gate's return into (tri-state, note).
+
+    Accepts either a bare tri-state or the `(ok, log)` pair that
+    `_full_gate` / `_publication_gate` return. Any shape that is not
+    recognisably one of those is UNVERIFIED - never a pass.
+    """
+    ok, note = (result if isinstance(result, tuple) and len(result) == 2
+                else (result, ""))
+    if ok is not True and ok is not False:
+        ok = None
+    note = str(note or "").strip()
+    if len(note) > 600:
+        note = note[-600:]
+    return ok, note or "(no detail reported)"
+
+
+def _verdict_line(ok, note):
+    """The commit-message sentence. States the verdict, never softens it."""
+    head = {
+        True: ("Project gate: VERIFIED - the build and this repository's own "
+               "suite ran and passed on this exact tree."),
+        False: ("Project gate: RED - a command ran and FAILED on this exact "
+                "tree. These changes are committed anyway so no work is lost, "
+                "but this commit is NOT a verified state and must not be "
+                "treated as one."),
+        None: ("Project gate: UNVERIFIED - nothing was run, so nothing was "
+               "proven. This is not a pass."),
+    }[ok]
+    return head + "\n\n" + note
+
+
 # --------------------------------------------------------------------------
 # Step 1: uncommitted changes
 # --------------------------------------------------------------------------
-def commit_pending_changes(project_dir, *, run):
-    """Commit pre-existing uncommitted changes. Never discards them."""
+def commit_pending_changes(project_dir, *, run, verify=None):
+    """Commit pre-existing uncommitted changes. Never discards them.
+
+    VERIFIES WHAT IT COMMITS (owner order 2026-09-01). `verify` is a zero-arg
+    callable returning the project's own publication gate as the SAME TRI-STATE
+    `_full_gate` uses:
+
+        True  - the build and the repo's own suite ran and passed
+        False - a command ran and FAILED: this tree is red
+        None  - there was NO command to run, so NOTHING was verified
+
+    and `None` is never treated as success, exactly as `_full_gate`'s docstring
+    requires of its callers.
+
+    WHY THIS EXISTS. Until now this function ran `git add -A` with no pathspec
+    and no verification of any kind, then committed under a message asserting
+    the changes "were already on disk" - which is true, and which readers take
+    to mean "not ours". That implication is false by construction, and the cost
+    was measured: FlexFactor aborts routinely (~150 crash-<pid>.log files in
+    ~/.flexfactor), nothing restores the tree on abort (`_obituary` touches only
+    status.json and the lock files), and `_gate_file` deliberately KEEPS an
+    unverifiable candidate ("None -> keep, but flagged unverified"). So a run
+    that died mid-fix leaves its OWN half-verified edits on disk, and the next
+    run sweeps them onto the branch labelled as somebody else's pre-existing
+    work. Two independent line-by-line reviews (sermonsmith + genemap-discovery,
+    then GrantFlow + Ellie, 2026-09-01) found 47 real regressions that reached
+    repositories this way, including a deleted `expect()` in an OTP test and a
+    PII gate made green by allowlisting the PII.
+
+    WHAT THIS DOES **NOT** DO, deliberately:
+      - It does not restrict which paths may be committed. Autoclean commits
+        source, and must: a cleanup that can only commit its own artifacts is
+        the report-only failure mode the owner deleted from this tool.
+      - It does not add a dry-run, a simulate mode, or an approval gate.
+      - It does not discard, stash, or refuse the work on a red verdict. The
+        commit ALWAYS happens; nothing the owner or a sibling agent left on
+        disk is ever lost.
+
+    What changes is only that the verdict becomes TRUE and VISIBLE: it is
+    written into the commit message, and it is returned as `res["verified"]` so
+    the caller can hand a red baseline to the repair pass that already exists
+    rather than building a run on top of it and reporting "closed N of M gaps"
+    over a tree that no longer builds.
+    """
     res = _result("uncommitted-changes")
+    res["verified"] = None
+    res["verify_note"] = "not attempted"
     code, out = run(["git", "status", "--porcelain"], project_dir)
     if code != 0:
         res["failed"].append({"item": "git status", "reason": out})
@@ -109,7 +196,22 @@ def commit_pending_changes(project_dir, *, run):
     changed = [ln for ln in out.splitlines() if ln.strip()]
     res["candidates"] = len(changed)
     if not changed:
+        res["verify_note"] = "nothing to verify (clean tree)"
         return res
+
+    # Verify BEFORE staging, so the gate reads the tree exactly as it sits -
+    # the state a reader of the resulting commit will check out.
+    if callable(verify):
+        try:
+            res["verified"], res["verify_note"] = _verdict(verify())
+        except Exception as exc:                      # noqa: BLE001
+            # A gate that BLEW UP must never read as a verified tree, for the
+            # same reason `clean_repo` failing must never read as a clean repo.
+            res["verified"] = None
+            res["verify_note"] = "verification gate raised: " + str(exc)[:200]
+    else:
+        res["verified"] = None
+        res["verify_note"] = "no verification gate supplied by the caller"
 
     code, out = run(["git", "add", "-A"], project_dir)
     if code != 0:
@@ -119,7 +221,12 @@ def commit_pending_changes(project_dir, *, run):
     msg = ("chore(autoclean): commit pre-existing working-tree changes\n\n"
            "FlexFactor cleans the repo before starting new work. These changes "
            "were already on disk; they are committed here so they stay visible "
-           "in history instead of being swept into an unrelated fix commit.")
+           "in history instead of being swept into an unrelated fix commit.\n\n"
+           "FlexFactor cannot tell whether these edits are the owner's work in "
+           "progress or its own output left behind by an aborted earlier run, "
+           "so it does not claim either. What it CAN state is whether the tree "
+           "it is committing passes this project's own gate:\n\n"
+           + _verdict_line(res["verified"], res["verify_note"]))
     code, out = run(["git", "commit", "-m", msg], project_dir)
     if code != 0:
         # "nothing to commit" is a legitimate no-op (e.g. all changes ignored).
@@ -361,8 +468,14 @@ def summarise(steps):
     return total
 
 
-def clean_repo(project_dir, repo=None, report=None, *, run):
-    """Run every cleanup step in order and return the accounted summary."""
+def clean_repo(project_dir, repo=None, report=None, *, run, verify=None):
+    """Run every cleanup step in order and return the accounted summary.
+
+    `verify` is threaded to `commit_pending_changes` only. It is the project's
+    own publication gate (build + the repository's own suite), returning the
+    tri-state `_full_gate` documents. Callers that omit it get an UNVERIFIED
+    verdict recorded in the commit and on the summary - never a pass.
+    """
     say = report if callable(report) else (lambda *a, **k: None)
     steps = []
     plan = ((commit_pending_changes, False),
@@ -371,8 +484,12 @@ def clean_repo(project_dir, repo=None, report=None, *, run):
             (report_open_issues, True),
             (sync_with_main, False))
     for fn, needs_repo in plan:
-        res = (fn(project_dir, repo, run=run) if needs_repo
-               else fn(project_dir, run=run))
+        if fn is commit_pending_changes:
+            res = fn(project_dir, run=run, verify=verify)
+        elif needs_repo:
+            res = fn(project_dir, repo, run=run)
+        else:
+            res = fn(project_dir, run=run)
         steps.append(res)
         say("autoclean " + res["step"] + ": " + str(len(res["acted_on"]))
             + " done, " + str(len(res["skipped"])) + " skipped, "
@@ -392,6 +509,12 @@ def format_summary(total):
             continue
         lines.append("  " + s["step"] + ": " + str(len(s["acted_on"])) + "/"
                      + str(s["candidates"]) + " actioned")
+        # A committed sweep is only a CLEAN sweep when the project's own gate
+        # said so. Reporting "N actioned" alone is what let a red or entirely
+        # unverified tree read as a successful cleanup.
+        if s["step"] == "uncommitted-changes" and s["acted_on"]:
+            lines.append("    gate: " + VERDICT_LABELS[s.get("verified")]
+                         + " - " + str(s.get("verify_note") or ""))
         for item in s["acted_on"]:
             lines.append("    + " + str(item))
         for sk in s["skipped"]:
