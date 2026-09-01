@@ -87,6 +87,7 @@ jobs:
                    test_flexfactor_capacity.py \
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
+                   flexfactor_autoclean_preverify_tests.py \
                    flexfactor_verified_sweep_tests.py \
                    flexfactor_cli_provider_tests.py \
                    flexfactor_errors_tests.py \
