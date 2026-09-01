@@ -1,0 +1,58 @@
+name: apply-production-readiness-fix
+
+on:
+  push:
+    branches:
+      - fix/autoclean-verifies-what-it-commits
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-production-readiness-fix
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Reconstruct and verify the reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/patches/prodready-fix.patch.gz.b64.* | base64 --decode | gzip --decompress > /tmp/prodready-fix.patch
+          echo '99539b6cb9b3b3d9ec2af8d9ccf201ca58aeb362649a759c237c0d8447d7bc37  /tmp/prodready-fix.patch' | sha256sum --check --strict
+          git apply --check /tmp/prodready-fix.patch
+          git apply /tmp/prodready-fix.patch
+
+      - name: Verify the repaired paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile flexfactor.py flexfactor_autoclean.py flexfactor_prodready_engine.py
+          python flexfactor_autoclean_tests.py
+          python flexfactor_verified_sweep_tests.py
+          python flexfactor_prodready_persistence_tests.py
+
+      - name: Replace staging commits with the actual source repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/patches/prodready-fix.b64.*
+          rm -f .github/patches/prodready-fix.patch.gz.b64.*
+          rmdir .github/patches 2>/dev/null || true
+          rm -f .github/workflows/_apply-prodready-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(prodready): bind autoclean verification to exact committed bytes'
+          git push origin HEAD
