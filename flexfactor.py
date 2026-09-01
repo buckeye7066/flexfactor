@@ -11708,6 +11708,26 @@ def _publication_gate(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     return _publication_gate_after_build(project_dir, stack, build_ok, build_log)
 
 
+def _autoclean_preverify(project_dir: str, stack: dict) -> tuple[bool | None, str]:
+    """Verifier used by autoclean BEFORE dependency bootstrap.
+
+    Purpose: avoid mislabelling a pre-work sweep as RED solely because dependencies
+    are not yet installed. Autoclean runs at the very start of a run; the install
+    (bootstrap) phase comes afterwards in the main flow. When local components need
+    dependencies to build and those are missing, treat the pre-bootstrap verdict as
+    UNVERIFIED and name the reason, rather than as a failing build.
+
+    If verification is actually available on this host with the current dependency
+    state (e.g. pure-parse Python build, already-installed deps, or buildable
+    components that do not require deps), run the normal publication gate.
+    """
+    if not stack.get("verification_is_real", False):
+        note = str(stack.get("verification_note") or "").strip()
+        prefix = "pre-bootstrap: "
+        return (None, prefix + (note or "build verification not available before dependencies are installed"))
+    return _publication_gate(project_dir, stack)
+
+
 _FAILURE_SOURCE_RE = re.compile(
     r"(?P<path>(?:[A-Za-z]:[\\/][^:\r\n\"'<>|]*?|"
     # POSIX absolute. Only a Windows drive or one of the magic directory names
@@ -15075,7 +15095,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # OWN commits - build plus this repository's own suite,
                     # tri-state. `stack` is already detected above, so this
                     # costs a gate run only when the tree is actually dirty.
-                    verify=lambda: _publication_gate(project_dir, stack))
+                    verify=lambda: _autoclean_preverify(project_dir, stack))
                 print(f"{pfx}" + _autoclean.format_summary(_clean).replace(
                     "\n", f"\n{pfx}"))
                 _swept = next((s for s in _clean["steps"]
