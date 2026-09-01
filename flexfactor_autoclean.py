@@ -308,7 +308,7 @@ def commit_pending_changes(project_dir, *, run, verify=None):
             cleanup_failed.append("tracked generated output: " + str(detail)[:120])
     if generated_untracked:
         ok, detail = _run_path_chunks(
-            run, ["git", "clean", "-f", "--"], generated_untracked, project_dir)
+            run, ["git", "clean", "-f", "-d", "--"], generated_untracked, project_dir)
         if not ok:
             cleanup_failed.append("untracked generated output: " + str(detail)[:120])
 
@@ -343,6 +343,17 @@ def commit_pending_changes(project_dir, *, run, verify=None):
         res["verify_note"] = _safe_note(
             f"{prior} result invalidated because " + "; ".join(reasons)
             + ". The original staged candidate is committed, not the gate output.")
+
+    # Finally, restore the ENTIRE working tree to the exact frozen candidate and
+    # remove any newly-created unignored path not present in the candidate.
+    run(["git", "checkout-index", "-a", "-f"], project_dir)
+    _, now_untracked = _nul_paths(
+        run, ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        project_dir)
+    candidate_set = set(candidate_paths)
+    purge = [p for p in now_untracked if p not in candidate_set]
+    if purge:
+        _run_path_chunks(run, ["git", "clean", "-f", "-d", "--"], purge, project_dir)
 
     msg = ("chore(autoclean): commit pre-existing working-tree changes\n\n"
            "FlexFactor cleans the repo before starting new work. These changes "

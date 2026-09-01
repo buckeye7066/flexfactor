@@ -215,7 +215,61 @@ class SweptTreeIsVerifiedTests(unittest.TestCase):
         committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
         self.assertIn("wip.txt", committed)
         self.assertNotIn("generated-source.py", committed)
-        self.assertTrue(os.path.exists(os.path.join(d, "generated-source.py")))
+        # Post-verify worktree is restored to the exact candidate; gate-created
+        # non-generated files are removed.
+        self.assertFalse(os.path.exists(os.path.join(d, "generated-source.py")))
+
+    def test_gate_modifies_tracked_file_and_is_restored(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        # Stage candidate
+        def verify():
+            # mutate tracked candidate after staging
+            with open(os.path.join(d, "wip.txt"), "w") as fh:
+                fh.write("mutated by gate\n")
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        # Working tree restored to candidate content
+        with open(os.path.join(d, "wip.txt")) as fh:
+            self.assertEqual(fh.read(), "owner work\n")
+
+    def test_gate_deletes_tracked_file_and_is_restored(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        def verify():
+            os.remove(os.path.join(d, "wip.txt"))
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertTrue(os.path.exists(os.path.join(d, "wip.txt")))
+
+    def test_gate_renames_tracked_file_and_new_name_is_removed(self):
+        d = _repo()
+        with open(os.path.join(d, "wip.txt"), "w") as fh:
+            fh.write("owner work\n")
+        def verify():
+            os.rename(os.path.join(d, "wip.txt"), os.path.join(d, "wip2.txt"))
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertTrue(os.path.exists(os.path.join(d, "wip.txt")))
+        self.assertFalse(os.path.exists(os.path.join(d, "wip2.txt")))
+
+    def test_gate_stages_new_file_and_it_is_not_kept(self):
+        d = _repo()
+        def verify():
+            with open(os.path.join(d, "newfile.txt"), "w") as fh:
+                fh.write("gate staged\n")
+            _git(["add", "newfile.txt"], d)
+            return True, "ok"
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("newfile.txt", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "newfile.txt")))
 
     def test_gate_created_ephemeral_output_is_cleaned_not_committed(self):
         d = self._dirty()
