@@ -1002,8 +1002,8 @@ def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
     # false-fail", which the report renders as "Build verification: NOT AVAILABLE
     # ... Fixes in this run were NOT build-verified". In both, node - holding
     # those projects' 8242- and 1034-test suites - was fully bootstrapped, and
-    # `_full_gate` ran its commands. So the line said nothing was verified while
-    # something was, named no action beyond a component the owner may not be able
+    # `_full_gate` ran its commands. So the line implied nothing could be verified while
+    # some components were available for verification, named no action beyond a component the owner may not be able
     # to bootstrap at all, and appeared on every single run. A critical-severity
     # line that is unactionable and always present is one an operator learns to
     # scroll past, which costs the gate its teeth on the day it is real.
@@ -1015,7 +1015,7 @@ def verification_is_real(toolchains: list[Toolchain]) -> tuple[bool, str]:
         note = f"dependencies not installed for {bad} - build gate would false-fail"
         if verifiable:
             ok = ", ".join(f"{t.ecosystem}:{t.root}" for t in verifiable)
-            note += f"; {ok} IS bootstrapped and was verified"
+            note += f"; {ok} IS bootstrapped and available for verification"
         if foreign:
             note += ("; not verifiable on this host "
                      f"({sys.platform}): "

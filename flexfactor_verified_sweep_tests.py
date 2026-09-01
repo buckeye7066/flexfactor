@@ -88,7 +88,8 @@ class VerificationNoteNamesBothHalvesTests(unittest.TestCase):
         ])
         self.assertIs(ok, False, "the refusal is deliberately unchanged")
         self.assertIn("swift:ios/App/CapApp-SPM", note)
-        self.assertIn("IS bootstrapped and was verified", note)
+        self.assertIn("IS bootstrapped and available for verification", note)
+        self.assertNotIn("was verified", note)
         self.assertIn("node:.", note)
 
     def test_the_measured_Ellie_shape_does_the_same_with_a_different_gap(self):
@@ -100,7 +101,8 @@ class VerificationNoteNamesBothHalvesTests(unittest.TestCase):
         ])
         self.assertIs(ok, False)
         self.assertIn("java:android", note)
-        self.assertIn("IS bootstrapped and was verified", note)
+        self.assertIn("IS bootstrapped and available for verification", note)
+        self.assertNotIn("was verified", note)
 
     def test_the_UNVERIFIED_component_is_still_NAMED_not_quietly_dropped(self):
         """Scoping the claim is the point; hiding the gap would be worse."""
@@ -168,8 +170,8 @@ class NeverWeakenRuleReachesTheFixPromptsTests(unittest.TestCase):
         import flexfactor as ff
         self.ff = ff
 
-    def test_the_rule_is_in_BOTH_fix_prompts(self):
-        for name in ("FIX_SYSTEM", "FIX_EDITS_SYSTEM"):
+    def test_the_rule_is_in_every_fix_prompt_including_structural(self):
+        for name in ("FIX_SYSTEM", "FIX_EDITS_SYSTEM", "STRUCTURAL_FIX_SYSTEM"):
             with self.subTest(prompt=name):
                 self.assertIn(self.ff.NEVER_WEAKEN_RULE, getattr(self.ff, name))
 

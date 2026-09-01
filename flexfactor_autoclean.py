@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 
 #: Check conclusions that do not block a merge. A check that has NOT REACHED a
 #: conclusion is deliberately absent: see `_pr_blocking_checks`.
@@ -106,8 +107,46 @@ VERDICT_LABELS = {
 }
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/=]+"),
+    re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{8,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b"),
+    re.compile(
+        r"(?i)\b(authorization|api[ _-]?key|access[ _-]?key|token|secret|"
+        r"password|passwd|pwd|connection[ _-]?string)\b\s*[:=]\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    ),
+    re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^:/\s]+:)[^@/\s]+@"),
+)
+
+
+def _safe_note(value, limit=600):
+    """Return a bounded, single-line-safe verification note with secrets removed.
+
+    Gate output is diagnostic data, not a payload for Git history. It may contain
+    environment dumps, provider errors, or connection strings. Redaction lives at
+    the normalization boundary so the run summary and any persisted result are
+    protected too, not only the commit message.
+    """
+    text = str(value or "").replace("\x00", "").strip()
+    for pattern in _SECRET_PATTERNS:
+        if pattern.pattern.startswith("(?i)([a-z]"):
+            text = pattern.sub(r"\1[REDACTED]@", text)
+        elif "authorization|api" in pattern.pattern:
+            text = pattern.sub(lambda m: m.group(1) + "=[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    if len(text) > limit:
+        text = text[-limit:]
+    return text or "(no detail reported)"
+
+
 def _verdict(result):
-    """Normalise a gate's return into (tri-state, note).
+    """Normalise a gate's return into (tri-state, redacted note).
 
     Accepts either a bare tri-state or the `(ok, log)` pair that
     `_full_gate` / `_publication_gate` return. Any shape that is not
@@ -117,73 +156,72 @@ def _verdict(result):
                 else (result, ""))
     if ok is not True and ok is not False:
         ok = None
-    note = str(note or "").strip()
-    if len(note) > 600:
-        note = note[-600:]
-    return ok, note or "(no detail reported)"
+    return ok, _safe_note(note)
 
 
 def _verdict_line(ok, note):
-    """The commit-message sentence. States the verdict, never softens it."""
-    head = {
-        True: ("Project gate: VERIFIED - the build and this repository's own "
-               "suite ran and passed on this exact tree."),
-        False: ("Project gate: RED - a command ran and FAILED on this exact "
-                "tree. These changes are committed anyway so no work is lost, "
-                "but this commit is NOT a verified state and must not be "
-                "treated as one."),
-        None: ("Project gate: UNVERIFIED - nothing was run, so nothing was "
-               "proven. This is not a pass."),
+    """Safe commit-message sentence: verdict and scope, never raw gate output."""
+    build_only = ok is True and "no project test suite configured" in str(note).lower()
+    if build_only:
+        return ("Project gate: VERIFIED-BUILD-ONLY - the configured build command "
+                "ran and passed on this exact candidate; this repository exposes "
+                "no project test command to run.")
+    return {
+        True: ("Project gate: VERIFIED - the configured publication gate ran and "
+               "passed on this exact candidate."),
+        False: ("Project gate: RED - a configured command ran and FAILED. These "
+                "changes are committed anyway so no work is lost, but this commit "
+                "is NOT a verified state and must not be treated as one."),
+        None: ("Project gate: UNVERIFIED - the exact committed candidate was not "
+               "proven by a completed publication gate. This is not a pass."),
     }[ok]
-    return head + "\n\n" + note
+
+
+_GENERATED_PARTS = {
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "node_modules", ".venv", "venv", ".tox", ".nox", "htmlcov",
+    ".coverage_html", "coverage", "dist", "build",
+}
+_GENERATED_SUFFIXES = (".pyc", ".pyo", ".pyd", ".orig", ".rej")
+
+
+def _generated_path(path):
+    text = str(path or "").replace("\\", "/").strip().strip("/")
+    if not text:
+        return False
+    return (any(part in _GENERATED_PARTS for part in text.split("/"))
+            or text.endswith(_GENERATED_SUFFIXES)
+            or text == ".coverage")
+
+
+def _nul_paths(run, cmd, cwd):
+    code, out = run(cmd, cwd)
+    return (code, [p for p in str(out or "").split("\0") if p])
+
+
+def _run_path_chunks(run, prefix, paths, cwd, chunk=100):
+    for start in range(0, len(paths), chunk):
+        code, out = run(prefix + paths[start:start + chunk], cwd)
+        if code != 0:
+            return False, out
+    return True, ""
 
 
 # --------------------------------------------------------------------------
 # Step 1: uncommitted changes
 # --------------------------------------------------------------------------
 def commit_pending_changes(project_dir, *, run, verify=None):
-    """Commit pre-existing uncommitted changes. Never discards them.
+    """Commit the exact pre-work candidate, never verification side effects.
 
-    VERIFIES WHAT IT COMMITS (owner order 2026-09-01). `verify` is a zero-arg
-    callable returning the project's own publication gate as the SAME TRI-STATE
-    `_full_gate` uses:
+    The candidate is staged *before* the publication gate and its Git tree hash
+    is captured. The gate then runs against that working tree. Build/test output
+    created by the gate is cleaned only when its path is mechanically generated;
+    any source/config/index mutation invalidates a successful verdict. The index
+    is restored to the captured candidate tree before commit, so `git commit`
+    cannot sweep in a file the gate itself created.
 
-        True  - the build and the repo's own suite ran and passed
-        False - a command ran and FAILED: this tree is red
-        None  - there was NO command to run, so NOTHING was verified
-
-    and `None` is never treated as success, exactly as `_full_gate`'s docstring
-    requires of its callers.
-
-    WHY THIS EXISTS. Until now this function ran `git add -A` with no pathspec
-    and no verification of any kind, then committed under a message asserting
-    the changes "were already on disk" - which is true, and which readers take
-    to mean "not ours". That implication is false by construction, and the cost
-    was measured: FlexFactor aborts routinely (~150 crash-<pid>.log files in
-    ~/.flexfactor), nothing restores the tree on abort (`_obituary` touches only
-    status.json and the lock files), and `_gate_file` deliberately KEEPS an
-    unverifiable candidate ("None -> keep, but flagged unverified"). So a run
-    that died mid-fix leaves its OWN half-verified edits on disk, and the next
-    run sweeps them onto the branch labelled as somebody else's pre-existing
-    work. Two independent line-by-line reviews (sermonsmith + genemap-discovery,
-    then GrantFlow + Ellie, 2026-09-01) found 47 real regressions that reached
-    repositories this way, including a deleted `expect()` in an OTP test and a
-    PII gate made green by allowlisting the PII.
-
-    WHAT THIS DOES **NOT** DO, deliberately:
-      - It does not restrict which paths may be committed. Autoclean commits
-        source, and must: a cleanup that can only commit its own artifacts is
-        the report-only failure mode the owner deleted from this tool.
-      - It does not add a dry-run, a simulate mode, or an approval gate.
-      - It does not discard, stash, or refuse the work on a red verdict. The
-        commit ALWAYS happens; nothing the owner or a sibling agent left on
-        disk is ever lost.
-
-    What changes is only that the verdict becomes TRUE and VISIBLE: it is
-    written into the commit message, and it is returned as `res["verified"]` so
-    the caller can hand a red baseline to the repair pass that already exists
-    rather than building a run on top of it and reporting "closed N of M gaps"
-    over a tree that no longer builds.
+    The commit still always happens for the original owner/sibling work, even on
+    RED or UNVERIFIED. Raw gate output never enters Git history.
     """
     res = _result("uncommitted-changes")
     res["verified"] = None
@@ -199,47 +237,137 @@ def commit_pending_changes(project_dir, *, run, verify=None):
         res["verify_note"] = "nothing to verify (clean tree)"
         return res
 
-    # Verify BEFORE staging, so the gate reads the tree exactly as it sits -
-    # the state a reader of the resulting commit will check out.
+    # Freeze the candidate in the index before any command can create output.
+    code, out = run(["git", "add", "-A"], project_dir)
+    if code != 0:
+        for ln in changed:
+            res["failed"].append({"item": ln.strip(),
+                                  "reason": "git add -A: " + str(out)[:160]})
+        return res
+    code, candidate_paths = _nul_paths(
+        run, ["git", "diff", "--cached", "--name-only", "-z"], project_dir)
+    if code != 0:
+        res["failed"].append({"item": "staged candidate",
+                              "reason": "cannot list staged paths"})
+        return res
+    if not candidate_paths:
+        reason = "nothing to commit after staging (ignored by .gitignore)"
+        for ln in changed:
+            _skip(res, ln.strip(), reason)
+        return res
+    res["candidates"] = len(candidate_paths)
+
+    code, tree_out = run(["git", "write-tree"], project_dir)
+    candidate_tree = str(tree_out or "").strip() if code == 0 else ""
+    if not candidate_tree:
+        res["failed"].append({"item": "staged candidate",
+                              "reason": "git write-tree failed: " + str(tree_out)[:160]})
+        return res
+
     if callable(verify):
         try:
             res["verified"], res["verify_note"] = _verdict(verify())
         except Exception as exc:                      # noqa: BLE001
-            # A gate that BLEW UP must never read as a verified tree, for the
-            # same reason `clean_repo` failing must never read as a clean repo.
             res["verified"] = None
-            res["verify_note"] = "verification gate raised: " + str(exc)[:200]
+            res["verify_note"] = _safe_note("verification gate raised: " + str(exc))
     else:
         res["verified"] = None
         res["verify_note"] = "no verification gate supplied by the caller"
 
-    code, out = run(["git", "add", "-A"], project_dir)
-    if code != 0:
-        for ln in changed:
-            res["failed"].append({"item": ln.strip(), "reason": "git add -A: " + out[:160]})
+    # A gate must not be able to stage a different tree. Detect and restore the
+    # exact candidate index FIRST, so cleanup of a tracked generated file reads
+    # from the candidate rather than from an index the gate may have changed.
+    code, after_tree_out = run(["git", "write-tree"], project_dir)
+    after_tree = str(after_tree_out or "").strip() if code == 0 else ""
+    index_changed = after_tree != candidate_tree
+    if index_changed:
+        restore_code, restore_out = run(["git", "read-tree", candidate_tree],
+                                        project_dir)
+        if restore_code != 0:
+            res["failed"].append({"item": "staged candidate",
+                                  "reason": "cannot restore candidate index: "
+                                  + str(restore_out)[:160]})
+            return res
+
+    # The gate may write coverage, caches, generated bundles, or even source.
+    # Generated paths are removed/restored against the frozen candidate. Any
+    # other mutation invalidates a green verdict because the candidate committed
+    # below is no longer the same state that completed the gate.
+    cleanup_failed = []
+    _, tracked_dirty = _nul_paths(
+        run, ["git", "diff", "--name-only", "-z"], project_dir)
+    _, untracked = _nul_paths(
+        run, ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        project_dir)
+    generated_tracked = [p for p in tracked_dirty if _generated_path(p)]
+    generated_untracked = [p for p in untracked if _generated_path(p)]
+    if generated_tracked:
+        ok, detail = _run_path_chunks(
+            run, ["git", "checkout", "--"], generated_tracked, project_dir)
+        if not ok:
+            cleanup_failed.append("tracked generated output: " + str(detail)[:120])
+    if generated_untracked:
+        ok, detail = _run_path_chunks(
+            run, ["git", "clean", "-f", "--"], generated_untracked, project_dir)
+        if not ok:
+            cleanup_failed.append("untracked generated output: " + str(detail)[:120])
+
+    # Cleanup must not alter the staged candidate either. This is a belt-and-
+    # braces exact-byte check before Git history is written.
+    code, final_tree_out = run(["git", "write-tree"], project_dir)
+    final_tree = str(final_tree_out or "").strip() if code == 0 else ""
+    if final_tree != candidate_tree:
+        res["failed"].append({"item": "staged candidate",
+                              "reason": "candidate index changed during cleanup"})
         return res
+
+    _, remaining_tracked = _nul_paths(
+        run, ["git", "diff", "--name-only", "-z"], project_dir)
+    _, remaining_untracked = _nul_paths(
+        run, ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        project_dir)
+    non_generated_mutation = sorted(set(
+        [p for p in remaining_tracked if not _generated_path(p)]
+        + [p for p in remaining_untracked if not _generated_path(p)]
+    ))
+    if index_changed or non_generated_mutation or cleanup_failed:
+        prior = VERDICT_LABELS.get(res["verified"], "UNVERIFIED")
+        reasons = []
+        if index_changed:
+            reasons.append("the gate changed the Git index")
+        if non_generated_mutation:
+            reasons.append("the gate changed non-generated path(s): "
+                           + ", ".join(non_generated_mutation[:8]))
+        reasons.extend(cleanup_failed)
+        res["verified"] = None
+        res["verify_note"] = _safe_note(
+            f"{prior} result invalidated because " + "; ".join(reasons)
+            + ". The original staged candidate is committed, not the gate output.")
+
     msg = ("chore(autoclean): commit pre-existing working-tree changes\n\n"
            "FlexFactor cleans the repo before starting new work. These changes "
            "were already on disk; they are committed here so they stay visible "
            "in history instead of being swept into an unrelated fix commit.\n\n"
            "FlexFactor cannot tell whether these edits are the owner's work in "
            "progress or its own output left behind by an aborted earlier run, "
-           "so it does not claim either. What it CAN state is whether the tree "
-           "it is committing passes this project's own gate:\n\n"
-           + _verdict_line(res["verified"], res["verify_note"]))
+           "so it does not claim either. What it CAN state is whether the exact "
+           "candidate committed below passed this project's own gate:\n\n"
+           + _verdict_line(res["verified"], res["verify_note"])
+           + "\n\nVerification output is retained in the redacted run report, "
+             "not copied into Git history.")
     code, out = run(["git", "commit", "-m", msg], project_dir)
     if code != 0:
-        # "nothing to commit" is a legitimate no-op (e.g. all changes ignored).
         reason = ("nothing to commit after staging (ignored by .gitignore)"
-                  if "nothing to commit" in out.lower() else "git commit: " + out[:160])
-        bucket = res["skipped"] if "nothing to commit" in out.lower() else res["failed"]
-        for ln in changed:
+                  if "nothing to commit" in str(out).lower()
+                  else "git commit: " + str(out)[:160])
+        bucket = res["skipped"] if "nothing to commit" in str(out).lower() else res["failed"]
+        for path in candidate_paths:
             if bucket is res["skipped"]:
-                _skip(res, ln.strip(), reason)
+                _skip(res, path, reason)
             else:
-                bucket.append({"item": ln.strip(), "reason": reason})
+                bucket.append({"item": path, "reason": reason})
         return res
-    res["acted_on"] = [ln.strip() for ln in changed]
+    res["acted_on"] = candidate_paths
     return res
 
 

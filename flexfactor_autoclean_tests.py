@@ -140,7 +140,8 @@ class SweptTreeIsVerifiedTests(unittest.TestCase):
         self.assertIs(res["verified"], False)
         body = _git(["log", "-1", "--format=%B"], d).stdout
         self.assertIn("Project gate: RED", body)
-        self.assertIn("1 failing", body)
+        self.assertNotIn("1 failing", body)
+        self.assertIn("1 failing", res["verify_note"])
 
     def test_NOTHING_RAN_is_UNVERIFIED_and_is_not_success(self):
         """`None` is the value that used to be reported as success."""
@@ -199,6 +200,79 @@ class SweptTreeIsVerifiedTests(unittest.TestCase):
         ac.commit_pending_changes(d, run=_test_runner, verify=verify)
         self.assertTrue(seen["dirty_at_verify_time"])
 
+
+    def test_gate_created_source_is_not_swept_and_invalidates_green(self):
+        d = self._dirty()
+
+        def verify():
+            with open(os.path.join(d, "generated-source.py"), "w") as fh:
+                fh.write("print('gate output')\n")
+            return True, "all passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"])
+        self.assertIn("non-generated path", res["verify_note"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertIn("wip.txt", committed)
+        self.assertNotIn("generated-source.py", committed)
+        self.assertTrue(os.path.exists(os.path.join(d, "generated-source.py")))
+
+    def test_gate_created_ephemeral_output_is_cleaned_not_committed(self):
+        d = self._dirty()
+
+        def verify():
+            cache = os.path.join(d, "__pycache__")
+            os.makedirs(cache, exist_ok=True)
+            with open(os.path.join(cache, "x.pyc"), "wb") as fh:
+                fh.write(b"compiled")
+            return True, "tests passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIs(res["verified"], True)
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertNotIn("__pycache__", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "__pycache__", "x.pyc")))
+
+    def test_gate_staging_generated_output_cannot_change_the_committed_tree(self):
+        d = self._dirty()
+
+        def verify():
+            cache = os.path.join(d, "__pycache__")
+            os.makedirs(cache, exist_ok=True)
+            with open(os.path.join(cache, "staged.pyc"), "wb") as fh:
+                fh.write(b"compiled")
+            _git(["add", "-f", "__pycache__/staged.pyc"], d)
+            return True, "tests passed"
+
+        res = ac.commit_pending_changes(d, run=_test_runner, verify=verify)
+        self.assertIsNone(res["verified"], "a gate that mutates the index is never VERIFIED")
+        self.assertIn("changed the Git index", res["verify_note"])
+        committed = _git(["ls-tree", "-r", "--name-only", "HEAD"], d).stdout
+        self.assertIn("wip.txt", committed)
+        self.assertNotIn("__pycache__/staged.pyc", committed)
+        self.assertFalse(os.path.exists(os.path.join(d, "__pycache__", "staged.pyc")))
+
+    def test_gate_output_is_redacted_and_never_written_to_history(self):
+        d = self._dirty()
+        secret = "sk-proj-supersecret123456789"
+        res = ac.commit_pending_changes(
+            d, run=_test_runner,
+            verify=lambda: (False, "API_KEY=" + secret + "\nfailed"))
+        self.assertNotIn(secret, res["verify_note"])
+        self.assertIn("[REDACTED]", res["verify_note"])
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertNotIn(secret, body)
+        self.assertNotIn("API_KEY", body)
+
+    def test_build_only_success_says_exactly_what_ran(self):
+        d = self._dirty()
+        ac.commit_pending_changes(
+            d, run=_test_runner,
+            verify=lambda: (True, "build ok\n(no project test suite configured)"))
+        body = _git(["log", "-1", "--format=%B"], d).stdout
+        self.assertIn("VERIFIED-BUILD-ONLY", body)
+        self.assertNotIn("suite ran and passed", body)
+
     def test_the_commit_message_stops_claiming_the_changes_are_not_ours(self):
         d = self._dirty()
         ac.commit_pending_changes(d, run=_test_runner, verify=lambda: (True, ""))
@@ -212,9 +286,7 @@ class SweptTreeIsVerifiedTests(unittest.TestCase):
         d = self._dirty()
 
         def fake_run(cmd, cwd, timeout=ac.TIMEOUT_S):
-            if cmd[:2] == ["git", "status"]:
-                return _test_runner(cmd, cwd, timeout)
-            if cmd[:2] in (["git", "add"], ["git", "commit"]):
+            if cmd and cmd[0] == "git":
                 return _test_runner(cmd, cwd, timeout)
             return 1, "not reachable in this test"
         ac.clean_repo(d, repo=None, run=fake_run,
