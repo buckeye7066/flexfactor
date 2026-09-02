@@ -262,6 +262,122 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertIn("rejected before write", outcome["note"])
         self.assertIn("parse error", outcome["note"])
 
+    def test_orchestrated_competitor_gate_rejects_invalid_source_before_write(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Competitors:
+            _ascii = staticmethod(lambda value: str(value))
+
+            @staticmethod
+            def research_competitors(*_args, **_kwargs):
+                return {
+                    "competitors": [],
+                    "sources_skipped": {},
+                    "coverage_note": "three corroborated competitors",
+                    "bridge_ledger": {"bridged": 1, "candidates": 1},
+                }
+
+            @staticmethod
+            def competitor_findings(*_args, **_kwargs):
+                return [("calculator.py", {
+                    "severity": "high",
+                    "line": 1,
+                    "title": "clear errors",
+                    "problem": "opaque input failure",
+                    "fix": "validate inputs",
+                })]
+
+        class Author:
+            model = "test-author"
+            calls = 0
+
+            @classmethod
+            def structured(cls, *_args, **_kwargs):
+                cls.calls += 1
+                return {
+                    "changed": True,
+                    "contents": "The file already has all requested capabilities.\n",
+                    "fixed_titles": ["clear errors"],
+                    "notes": "already done",
+                }
+
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid source reached the worktree")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("invalid source reached the file gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("invalid source reached the reviewer")
+        )
+        args = types.SimpleNamespace(
+            fix_severity="medium",
+            whole_file_fixes=True,
+            fix_prefetch=0,
+            adversarial=True,
+            adversarial_rounds=2,
+            adversarial_materiality="material",
+            structural_fixes=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            with mock.patch.object(
+                    ff, "_competitors_module", return_value=Competitors()), \
+                 mock.patch.object(
+                    ff, "resolve_repo_rewards_url", return_value=(None, "offline")
+                 ), \
+                 mock.patch.object(ff, "_replace_contained", forbidden_write), \
+                 mock.patch.object(ff, "_gate_file", forbidden_gate), \
+                 mock.patch.object(
+                    ff, "_adversarial_verify_fix", forbidden_review
+                 ), \
+                 mock.patch.object(ff, "_report_route_quality", return_value=None):
+                outcome = ff._run_top_competitor_gate(
+                    args=args,
+                    pfx="",
+                    report=lambda **_kwargs: None,
+                    checkpoint=None,
+                    display_name="calculator",
+                    purpose_blob="clear integer addition",
+                    stack={"ecosystems": ["python"]},
+                    purpose_reviewer=Author(),
+                    author=Author(),
+                    cross=object(),
+                    project_dir=tmp,
+                    all_files=["calculator.py"],
+                    meter=ff.CostMeter(limit_usd=None),
+                    baseline_ok=True,
+                    oversized=[],
+                    noop_stats={},
+                    errors_total=0,
+                    done_set=set(),
+                    total_to_review=1,
+                    git=False,
+                    branch="main",
+                    prev_branch="main",
+                    purpose_contract=types.SimpleNamespace(
+                        authored=False, acceptance_criteria=[]
+                    ),
+                )
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(original, retained)
+        self.assertEqual([], outcome["applied"])
+        self.assertEqual([], outcome["unverified"])
+        self.assertEqual(3, Author.calls)
+        self.assertTrue(any(
+            "invalid source rejected before write" in note
+            for note in outcome["notes"]
+        ))
+        forbidden_write.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
     def test_fenced_file_discards_trailing_provider_explanation(self):
         response = (
             "\n```python\n"

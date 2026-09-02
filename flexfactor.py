@@ -14573,7 +14573,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         # is fed back as an objection so the author can SALVAGE the fix instead of
         # the file being abandoned. The file is left as the original unless an
         # attempt fully passes both the build gate AND the cross-model check.
-        outcome = None        # 'fixed' | 'unverified' | 'revert' | 'reject' | 'noop' | 'skip'
+        outcome = None        # 'fixed' | 'unverified' | 'revert' | 'reject' | 'invalid' | 'noop' | 'skip'
         kept_patch = None
         kept_ok = None
         feedback = ""
@@ -14724,9 +14724,35 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 except Exception as ex:
                     outcome = ("skip", str(ex))
                     break
-            if not patch.get("changed") or not (patch.get("contents") or "").strip():
+            candidate_contents = patch.get("contents")
+            if (not patch.get("changed") or candidate_contents is None
+                    or (isinstance(candidate_contents, str)
+                        and not candidate_contents.strip())):
                 outcome = ("noop", patch.get("notes", ""))
                 break
+            if not isinstance(candidate_contents, str):
+                syntax_ok = False
+                syntax_note = "whole-file response contents were not text"
+            else:
+                syntax_ok, syntax_note = _inproc_source_syntax_ok(
+                    rel, candidate_contents
+                )
+            if syntax_ok is False:
+                # This shared writer serves the ordinary Audit/Production Ready
+                # fix stream and their between-pass competitor gate.  Reject a
+                # definite parser failure before the candidate can touch the
+                # worktree, project gate, or independent reviewer.
+                outcome = ("invalid", syntax_note)
+                feedback = (
+                    "Your previous response was not valid whole-file source and "
+                    f"was rejected before write: {syntax_note}. Return the complete "
+                    "file contents in the file's native syntax."
+                )
+                if adv_active:
+                    build_tries += 1
+                    if build_tries >= MAX_FIX_TRIES:
+                        break
+                continue
             # TOCTOU-free write of the candidate (and the rollbacks below), anchored at
             # the repo root and walked per-component on POSIX. CHECK the result: if the
             # contained write is refused (ancestor/leaf swap, or POSIX-fail-closed) we
@@ -14912,6 +14938,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             _report_route_quality(author, "author",
                                   "build_failed" if ("build" in why or "gate" in why
                                                      or "syntax" in why) else "rejected")
+        elif kind == "invalid":
+            _report_route_quality(author, "author", "build_failed")
         elif kind == "noop":
             _report_route_quality(author, "author", "noop")
         if kind == "fixed":
@@ -15045,6 +15073,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             errors += 1
             print(f"  [reject] {rel}: cross-model rejected after {MAX_FIX_TRIES} tries")
             notes.append(f"{rel}: rejected by cross-model review: {outcome[1]}")
+        elif kind == "invalid":
+            errors += 1
+            print(f"  [reject-invalid] {rel}: invalid source rejected before write "
+                  f"after {attempt} attempt(s) ({outcome[1]})")
+            notes.append(
+                f"{rel}: invalid source rejected before write: {outcome[1]}"
+            )
         _tick(rel)
     if prefetch_pool is not None:
         prefetch_pool.shutdown(wait=False, cancel_futures=True)
