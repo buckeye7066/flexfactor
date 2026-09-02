@@ -12,14 +12,8 @@ on:
       - "scripts/phone/**"
       - "flexfactor_web.py"
       - ".github/workflows/android-client.yml"
-      - ".github/workflows/release-command.yml"
       - ".github/workflows/mobile-run.yml"
   workflow_dispatch:
-    inputs:
-      expected_sha:
-        description: Exact current main commit authorized for release
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -34,15 +28,6 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Bind a manual release to the authorized main commit
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
-        run: |
-          printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$EXPECTED_SHA" = "$GITHUB_SHA"
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
@@ -187,8 +172,7 @@ jobs:
     name: android-release-plan
     if: >-
       startsWith(github.ref, 'refs/tags/android-v') ||
-      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-       github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.plan.outputs.release_tag }}
@@ -208,7 +192,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREVIOUS_MAIN_SHA: ${{ github.event.before }}
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           read_version() {
             sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p'
@@ -222,24 +205,16 @@ jobs:
             test "$GITHUB_REF_NAME" = "$release_tag"
             should_publish=true
           else
-            version_changed=false
-            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-              printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' \
-                || { echo "An exact expected_sha is required" >&2; exit 1; }
-              test "$GITHUB_REF" = "refs/heads/main"
-              test "$EXPECTED_SHA" = "$GITHUB_SHA" \
-                || { echo "main moved after release authorization" >&2; exit 1; }
-            else
-              if ! printf '%s' "$PREVIOUS_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$' \
-                  || [ "$PREVIOUS_MAIN_SHA" = "0000000000000000000000000000000000000000" ]; then
-                echo "The previous main revision is unavailable" >&2
-                exit 1
-              fi
-              previous_version=$(git show \
-                "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
-              test -n "$previous_version"
-              if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
+            if ! printf '%s' "$PREVIOUS_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                || [ "$PREVIOUS_MAIN_SHA" = "0000000000000000000000000000000000000000" ]; then
+              echo "The previous main revision is unavailable" >&2
+              exit 1
             fi
+            previous_version=$(git show \
+              "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
+            test -n "$previous_version"
+            version_changed=false
+            if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
 
             set +e
             tag_rows=$(git ls-remote --exit-code --tags origin \
@@ -265,11 +240,6 @@ jobs:
               tag_version=$(git show \
                 "${tag_commit}:android/app/build.gradle.kts" | read_version)
               test "$tag_version" = "$version_name"
-              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] \
-                  && [ "$tag_commit" != "$GITHUB_SHA" ]; then
-                echo "The existing release tag is not the authorized main commit" >&2
-                exit 1
-              fi
               if [ "$version_changed" = true ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
                 echo "The newly declared version already belongs to another commit" >&2
                 exit 1
@@ -291,11 +261,7 @@ jobs:
               fi
               if [ "$release_status" = 404 ]; then
                 should_publish=true
-                if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-                  source_sha="$GITHUB_SHA"
-                else
-                  source_sha="$tag_commit"
-                fi
+                source_sha="$tag_commit"
               elif [ "$release_status" = 200 ]; then
                 jq -e 'type == "object"' "$release_json" >/dev/null \
                   || { echo "GitHub returned invalid release metadata" >&2; exit 1; }
@@ -313,11 +279,7 @@ jobs:
                 set -e
                 if [ "$release_complete_rc" -eq 1 ]; then
                   should_publish=true
-                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-                    source_sha="$GITHUB_SHA"
-                  else
-                    source_sha="$tag_commit"
-                  fi
+                  source_sha="$tag_commit"
                 elif [ "$release_complete_rc" -ne 0 ]; then
                   echo "GitHub returned invalid release asset metadata" >&2
                   exit 1
