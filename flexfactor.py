@@ -7608,7 +7608,12 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     without Git, an origin, a named branch, mandatory publication, or an
     independent reviewer are refused before the first write.
     """
-    raw_files = patch.get("files") or []
+    # Default only an absent/explicit-null field.  A falsey object or string is
+    # still malformed model output and must not be silently converted into an
+    # empty batch while package-only mutations continue.
+    raw_files = patch.get("files")
+    if raw_files is None:
+        raw_files = []
     if not isinstance(raw_files, list):
         return ApplyResult(
             repo_name, "refused-invalid-source",
@@ -13194,7 +13199,13 @@ def _write_and_run_generated_test_batch(
         # duplicate key.  Without this, `tests/x.py` and `./tests//x.py`
         # preflight as two missing files but write the same leaf twice.
         path = "/".join(components)
-        key = os.path.normcase(path)
+        # Reject case-only aliases on every host.  macOS normally uses a
+        # case-insensitive filesystem even though os.path.normcase() retains
+        # POSIX case, so relying on the host path module lets `Same.py` and
+        # `same.py` preflight as two files before both writes hit one leaf.
+        # The universal rejection is intentionally stricter on case-sensitive
+        # hosts: generated tests never need two case-only-distinct identities.
+        key = path.casefold()
         if key in seen_paths:
             return [], None, "", (
                 f"generated test batch names duplicate path {path!r}"

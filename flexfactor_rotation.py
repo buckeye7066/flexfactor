@@ -510,7 +510,8 @@ class RoleCoordinator:
 
 
 _FAMILY_PATTERNS = (
-    ("claude", "anthropic"), ("gpt-oss", "gpt-oss"), ("gpt-", "openai"), ("o1", "openai"),
+    ("claude", "anthropic"), ("gpt-oss", "gpt-oss"), ("gpt-", "openai"),
+    ("codex", "openai"), ("o1", "openai"),
     ("o3", "openai"), ("o4", "openai"), ("gemma", "gemma"), ("gemini", "gemini"),
     ("qwen", "qwen"), ("llama", "llama"), ("mistral", "mistral"), ("mixtral", "mistral"),
     ("codestral", "mistral"), ("deepseek", "deepseek"), ("phi", "phi"), ("grok", "xai"),

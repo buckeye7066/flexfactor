@@ -4045,6 +4045,37 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
 class ScoutSourcePreflightTests(unittest.TestCase):
     """Scout must parse the complete generated batch before its first mutation."""
 
+    def test_falsey_non_list_file_batch_cannot_become_package_only_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("malformed Scout batch reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        for raw_files in ({}, ""):
+            with self.subTest(raw_files=raw_files), \
+                 tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+                 mock.patch.object(ff, "_write_contained", forbidden), \
+                 mock.patch.object(ff, "_run", forbidden), \
+                 mock.patch.object(ff, "_git", forbidden), \
+                 mock.patch.object(ff, "_independent_final_review", forbidden), \
+                 mock.patch.object(ff, "_publish_verified_head", forbidden):
+                result = ff.apply_integration(
+                    project,
+                    "candidate/repo",
+                    {"files": raw_files, "packages": ["safe-package@1.0.0"]},
+                    opts,
+                )
+
+            self.assertEqual("refused-invalid-source", result.status)
+            self.assertIn("'files' is not a list", result.detail)
+        forbidden.assert_not_called()
+
     def test_invalid_later_file_refuses_every_write_and_downstream_gate(self):
         import tempfile
         import types
@@ -4189,6 +4220,31 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         candidates = [
             {"path": "tests/same.py", "contents": "VALUE = 1\n"},
             {"path": "./tests//same.py", "contents": "VALUE = 2\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_case_only_generated_alias_is_refused_on_every_host(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("case-only alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("case-only alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/Same.py", "contents": "VALUE = 1\n"},
+            {"path": "tests/same.py", "contents": "VALUE = 2\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(ff, "_write_contained", forbidden_write), \

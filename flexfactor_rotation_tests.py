@@ -730,6 +730,18 @@ class RotatingProviderTests(RotationTestCase):
         with self.assertRaisesRegex(R.RotationError, "opaque author"):
             prov.grade_independent()
 
+    def test_codex_cli_author_is_treated_as_openai_for_independence(self):
+        prov = self._provider(catalog(
+            route("front/codex", "codex-cli:subscription", tier=R.FRONTIER,
+                  model="codex"),
+            route("light/gpt", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/codex")
+        self.assertEqual(prov.role_coordinator.author_families, {"openai"})
+        with self.assertRaisesRegex(R.RotationError, "no .* route available"):
+            prov.grade_independent()
+
     def test_exact_review_intent_refuses_an_opaque_auto_author(self):
         prov = self._provider(catalog(
             route("front/external", "external-front", tier=R.FRONTIER,
