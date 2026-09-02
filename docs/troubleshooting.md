@@ -15,6 +15,21 @@ before free/local capacity. If every route is unavailable, the run checkpoints
 and reports blocked. Add or restore optional credentials, then rerun the same
 request.
 
+For a ChatGPT/Codex subscription, sign in with the official `codex` client and
+refresh AI Time. AI Time records the concrete account-default model (for
+example `gpt-5.6-sol`), not a guessed `codex` alias. FlexFactor uses an
+account-bound OAuth transport when the local Codex auth file contains an access
+token and account ID, then falls back to the bounded official CLI on older
+installations. `FLEXFACTOR_CODEX_AUTH_FILE` may point to a nonstandard auth-file
+location; it is never copied into a report or catalog.
+
+ChatGPT Work Mode keeps its real credential in the parent service and exposes
+only broker placeholders to child processes. A FlexFactor process launched
+inside that managed session therefore refuses the Codex route during preflight
+instead of starting a nested agent that cannot create a thread. Run FlexFactor
+from the ordinary desktop shell for that subscription, or provide another live
+AI Time route.
+
 ## Independent review is unavailable
 
 The reviewer must be from a family that authored none of the candidate.
