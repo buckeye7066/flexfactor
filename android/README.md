@@ -75,6 +75,12 @@ Pull requests receive an exact-commit debug artifact. A version change merged
 to `main` creates the matching release tag and publishes the signed production
 APK and update manifest.
 
+When an automatic release needs an exact rerun or repair, the repository owner
+may manually dispatch `android-client.yml` from GitHub Actions and provide the
+current 40-character `main` SHA. The workflow rejects other actors, ref drift,
+an older conflicting tag, and any `main` movement before it accesses signing
+material and again immediately before publication.
+
 ## Release signing and updates
 
 The protected `android-release` environment supplies:

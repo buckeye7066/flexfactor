@@ -198,6 +198,16 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         with open(path, encoding="utf-8") as stream:
             workflow = stream.read()
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("expected_sha:", workflow)
+        self.assertIn('test "$EXPECTED_SHA" = "$GITHUB_SHA"', workflow)
+        self.assertGreaterEqual(
+            workflow.count('test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"'), 2)
+        self.assertIn(
+            '"$GITHUB_EVENT_NAME" = "workflow_dispatch"', workflow)
+        self.assertIn('"$tag_commit" != "$GITHUB_SHA"', workflow)
+        self.assertIn(
+            "The existing release tag is not the authorized main commit", workflow)
         push_trigger = workflow.split("  push:", 1)[1].split("  pull_request:", 1)[0]
         pull_request_trigger = workflow.split("  pull_request:", 1)[1].split(
             "  workflow_dispatch:", 1)[0]
@@ -213,6 +223,7 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('if [ "$release_status" = 404 ]', workflow)
         self.assertIn('elif [ "$release_status" = 200 ]', workflow)
         self.assertIn('source_sha="$tag_commit"', workflow)
+        self.assertIn('source_sha="$GITHUB_SHA"', workflow)
         self.assertIn("source_sha: ${{ steps.plan.outputs.source_sha }}", workflow)
         self.assertIn("ref: ${{ needs.release-plan.outputs.source_sha }}", workflow)
         self.assertNotIn('"${GITHUB_SHA}^:android/app/build.gradle.kts"', workflow)
@@ -220,6 +231,10 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64", workflow)
         self.assertIn(".engine_ref == $engine", workflow)
+        self.assertIn("Revalidate live main before accessing signing material", workflow)
+        self.assertIn("Revalidate live main before publication", workflow)
+        self.assertGreaterEqual(
+            workflow.count('test "$live_main" = "$SOURCE_SHA"'), 2)
 
     def test_mobile_refactor_does_not_delete_a_tracked_backup_file(self):
         path = os.path.join(
