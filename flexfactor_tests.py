@@ -4437,6 +4437,33 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         forbidden_write.assert_not_called()
         forbidden_runner.assert_not_called()
 
+    def test_non_test_destination_is_refused_before_every_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("production source reached test writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("non-test source reached test runner")
+        )
+        candidates = [
+            {"path": "tests/good.py", "contents": "def test_ok():\n    assert True\n"},
+            {"path": "src/helper.py", "contents": "VALUE = 1\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("not at a recognized test path", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
     def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
         runner = mock.Mock(return_value=(True, "two tests passed"))
         candidates = [
@@ -6967,6 +6994,30 @@ class SnapshotTriStateTests(unittest.TestCase):
             with open(target, "rb") as fh:
                 self.assertEqual(original, fh.read())
 
+    def test_source_only_plan_does_not_snapshot_unrelated_large_lockfile(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            lock_path = os.path.join(proj, "package-lock.json")
+            with open(lock_path, "w", encoding="utf-8") as fh:
+                fh.write("x" * 300)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            refused_write = mock.Mock(return_value=None)
+            patch = {
+                "files": [{"path": "new.py", "contents": "VALUE = 2\n"}],
+                "packages": [],
+            }
+            with mock.patch.object(ff, "SCOUT_SNAPSHOT_MAX_BYTES", 256), \
+                 mock.patch.object(ff, "_write_contained", refused_write):
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            self.assertEqual("verify-failed", result.status)
+            self.assertIn("could not safely write 'new.py'", result.detail)
+            self.assertNotIn("rollback limit", result.detail)
+            refused_write.assert_called_once_with(proj, "new.py", "VALUE = 2\n")
+
 
 def _try_dir_symlink(link, target_dir):
     try:
@@ -7666,10 +7717,11 @@ class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
     def test_the_test_path_markers_catch_the_real_world_shapes(self):
         for rel in ("src/pages/MyProfiles.test.jsx", "a/b.spec.ts",
                     "src/__tests__/x.js", "backend/tests/health.test.js",
-                    "pkg/test/util.go", "api/test_client.py"):
+                    "pkg/test/util.go", "api/test_client.py", "tests/helper.py"):
             self.assertTrue(ff._is_test_path(rel), f"{rel} not detected as a test")
         for rel in ("src/pages/MyProfiles.jsx", "backend/server.js",
-                    "src/utils/fieldDisplay.js", "src/latest/contest.js"):
+                    "src/utils/fieldDisplay.js", "src/latest/contest.js",
+                    "src/latest_helper.py"):
             self.assertFalse(ff._is_test_path(rel), f"{rel} wrongly called a test")
 
 
@@ -15812,9 +15864,11 @@ class GoverningPurposeCoverageTests(unittest.TestCase):
                 fh.write("VALUE = 1\n")
             with open(os.path.join(tmp, "src", "test_new.py"), "w", encoding="utf-8") as fh:
                 fh.write("def test_value(): pass\n")
+            with open(os.path.join(tmp, "src", "notes.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Changed documentation\n")
             selected = ff._existing_changed_sources(
                 tmp,
-                {"src/deleted.py", "src/new.py", "src/test_new.py"},
+                {"src/deleted.py", "src/new.py", "src/test_new.py", "src/notes.md"},
             )
         self.assertEqual(["src/new.py"], selected)
 

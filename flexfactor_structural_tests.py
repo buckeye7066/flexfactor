@@ -124,6 +124,22 @@ class StructuralApplies(_Base):
         self.assertEqual(self.read("renamed.py"), "y = 3\n")
         self.assertTrue(any("rewrite renamed.py" in note for note in notes))
 
+    def test_invalid_rename_source_can_be_replaced_by_valid_final_contents(self):
+        with open(os.path.join(self.proj, "broken.py"), "w", encoding="utf-8") as stream:
+            stream.write(BAD_PYTHON)
+        author = _Author([
+            plan(changed=False, need_files=["broken.py"]),
+            plan(
+                writes=[{"path": "repaired.py", "contents": "VALUE = 2\n"}],
+                renames=[{"from": "broken.py", "to": "repaired.py"}],
+            ),
+        ])
+        applied, unverified, _notes = self.run_fix(author)
+        self.assertEqual({"bad.py", "broken.py", "repaired.py"}, set(applied))
+        self.assertEqual([], unverified)
+        self.assertIsNone(self.read("broken.py"))
+        self.assertEqual("VALUE = 2\n", self.read("repaired.py"))
+
     def test_rename_preserves_bytes_beyond_the_review_read_ceiling(self):
         source = os.path.join(self.proj, "large.toml")
         payload = ("# " + ("x" * (F.MAX_REVIEW_BYTES + 32)) + "\n").encode()

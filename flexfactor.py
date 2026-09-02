@@ -7933,10 +7933,14 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             # based, not branch based, so it is unaffected.
             pass
 
-        # Snapshot package manifests too: npm install rewrites them and we must be
-        # able to restore them on rollback in the non-git path.
-        for manifest in ("package.json", "package-lock.json"):
-            _snapshot(manifest)
+        # Snapshot package manifests only when this plan can run npm install.
+        # Source-only integrations cannot change an unrelated lockfile, and a
+        # large owner lockfile must not block those otherwise bounded edits.
+        # A manifest explicitly named in ``files`` is still snapshotted by the
+        # ordinary per-file loop below.
+        if packages and is_node:
+            for manifest in ("package.json", "package-lock.json"):
+                _snapshot(manifest)
 
         # Write the generated files (backing up originals / marking new ones).
         # Every path goes through the containment chokepoint: an integration patch
@@ -8025,16 +8029,23 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 return {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
             except (ValueError, UnicodeDecodeError):
                 return {}
-        deps_before = _deps_of(backups.get("package.json"))
-        deps_after_raw = _read_bytes_contained(
-            project_dir, "package.json", cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
+        dependency_manifest_changed = (
+            bool(packages and is_node) or "package.json" in file_list
         )
-        if (deps_after_raw is not None
-                and len(deps_after_raw) > SCOUT_SNAPSHOT_MAX_BYTES):
-            raise ApplyError(
-                "post-install package.json exceeds the bounded rollback limit"
+        if dependency_manifest_changed:
+            deps_before = _deps_of(backups.get("package.json"))
+            deps_after_raw = _read_bytes_contained(
+                project_dir, "package.json", cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
             )
-        deps_after = _deps_of(deps_after_raw)
+            if (deps_after_raw is not None
+                    and len(deps_after_raw) > SCOUT_SNAPSHOT_MAX_BYTES):
+                raise ApplyError(
+                    "post-install package.json exceeds the bounded rollback limit"
+                )
+            deps_after = _deps_of(deps_after_raw)
+        else:
+            deps_before = {}
+            deps_after = {}
         changed_files = sorted(file_list)
         if git:
             st = _git(["status", "--porcelain"], project_dir)
@@ -9873,7 +9884,8 @@ def _existing_changed_sources(project_dir: str, paths) -> list[str]:
         if identity is None:
             continue
         rel = identity[0]
-        if (not _is_test_path(rel)
+        if (os.path.splitext(rel)[1].lower() in _CODE_EXTS
+                and not _is_test_path(rel)
                 and _contained_existence(project_dir, rel) == "exists"):
             current.add(rel)
     return sorted(current)
@@ -10200,7 +10212,8 @@ FIX_WHOLE_MAX_TOKENS = 128000   # generate_file_fix() whole-file regen
 # most 3 extra cheap calls; a file that still cannot emit one edit is genuinely
 # beyond this model, and is reported as such rather than retried forever.
 _EDIT_SHRINK_STEPS = 3
-_TEST_MARKERS = (".test.", ".spec.", "__tests__", "/tests/", "/test/", "test_")
+_TEST_FILE_MARKERS = (".test.", ".spec.")
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__"})
 
 
 def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
@@ -10838,8 +10851,14 @@ def _canon_rel(rel: str) -> str:
 
 
 def _is_test_path(rel: str) -> bool:
-    low = rel.replace("\\", "/").lower()
-    return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
+    low = _canon_rel(rel).lower()
+    parts = low.split("/")
+    base = parts[-1] if parts else ""
+    return (
+        any(part in _TEST_DIR_NAMES for part in parts[:-1])
+        or base.startswith("test_")
+        or any(marker in base for marker in _TEST_FILE_MARKERS)
+    )
 
 
 def _git_real_files(project_dir: str) -> set[str] | None:
@@ -12957,6 +12976,7 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     # type, so they remain eligible for the normal file/project gates.  An
     # unsupported extension-changing move fails closed.
     rename_payloads: dict[tuple[str, str], bytes] = {}
+    write_paths = {path for path, _contents in writes}
     for src_p, dst_p in renames:
         source_bytes = _read_bytes_contained(
             project_dir, src_p, cap=STRUCTURAL_RENAME_MAX_BYTES + 1,
@@ -12982,19 +13002,24 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 f"structural rename source rejected before write for "
                 f"{src_p} -> {dst_p}: invalid UTF-8 ({ex})",
             )
-        syntax_ok, syntax_note = _inproc_source_syntax_ok(
-            dst_p, source, allow_empty=True,
-        )
-        same_type = (
-            os.path.splitext(src_p)[1].casefold()
-            == os.path.splitext(dst_p)[1].casefold()
-        )
-        if syntax_ok is False or (syntax_ok is None and not same_type):
-            return (
-                "failed",
-                f"structural rename source rejected before write for "
-                f"{src_p} -> {dst_p}: {syntax_note}",
+        # A complete validated write to the destination makes these copied
+        # bytes only a transactional move intermediate: they are overwritten
+        # before any gate or reviewer can retain them. Validate the source
+        # against the destination type only for a byte-preserving rename.
+        if dst_p not in write_paths:
+            syntax_ok, syntax_note = _inproc_source_syntax_ok(
+                dst_p, source, allow_empty=True,
             )
+            same_type = (
+                os.path.splitext(src_p)[1].casefold()
+                == os.path.splitext(dst_p)[1].casefold()
+            )
+            if syntax_ok is False or (syntax_ok is None and not same_type):
+                return (
+                    "failed",
+                    f"structural rename source rejected before write for "
+                    f"{src_p} -> {dst_p}: {syntax_note}",
+                )
         rename_payloads[(src_p, dst_p)] = source_bytes
 
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
@@ -13667,6 +13692,11 @@ def _write_and_run_generated_test_batch(
         # duplicate key.  Without this, `tests/x.py` and `./tests//x.py`
         # preflight as two missing files but write the same leaf twice.
         path, key = identity
+        if not _is_test_path(path):
+            return [], None, "", (
+                f"generated test entry {index} is not at a recognized test "
+                f"path: {path!r}"
+            ), []
         # Reject case-only aliases on every host.  macOS normally uses a
         # case-insensitive filesystem even though os.path.normcase() retains
         # POSIX case, so relying on the host path module lets `Same.py` and
