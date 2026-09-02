@@ -96,7 +96,9 @@ removal, virtual-environment executable discovery, finite timeout validation,
 bounded stdout and stderr, timeout/non-zero/malformed-output degradation, cache
 behavior, idempotent runtime installation, the disable switch, parameter and
 global cap lifting, cap restoration, and the invariant that prioritization
-never enlarges a bounded review.
+never enlarges a bounded review. Regression tests also prove that ranked files
+beyond 100,000 candidates remain selectable and that failed uncapped discovery
+falls back to the original capped order with degraded evidence.
 
 The `tenets-context` GitHub Actions workflow runs those tests on Windows and
 Linux. Separate live jobs on both operating systems install the exact pinned
