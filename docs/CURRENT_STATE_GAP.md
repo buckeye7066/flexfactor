@@ -1,7 +1,7 @@
 # FlexFactor current gap register
 
-This register describes product limits that remain after the 0.6.1 / Android
-3.5.1 / cloud 1.1.1 architecture change. Historical measurements belong in
+This register describes product limits that remain after the 0.6.2 / Android
+3.5.2 / cloud 1.1.2 architecture change. Historical measurements belong in
 release reports and are not current-state claims.
 
 ## Closed by this release

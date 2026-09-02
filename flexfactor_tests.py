@@ -198,6 +198,70 @@ class ReleaseIdentityTests(unittest.TestCase):
 
 
 class RefactorResponseNormalizationTests(unittest.TestCase):
+    def test_source_syntax_preflight_rejects_python_prose(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "calculator.py",
+            "Looking at the current file, it is already well-written with:\n",
+        )
+        self.assertFalse(ok)
+        self.assertIn("parse error", reason)
+
+    def test_source_syntax_preflight_parses_data_without_writing(self):
+        self.assertEqual(
+            True, ff._inproc_source_syntax_ok("settings.json", '{"safe": true}')[0]
+        )
+        self.assertEqual(
+            False, ff._inproc_source_syntax_ok("settings.json", "not json")[0]
+        )
+        self.assertEqual(
+            True, ff._inproc_source_syntax_ok("pyproject.toml", 'name = "safe"')[0]
+        )
+        self.assertIsNone(
+            ff._inproc_source_syntax_ok("README.md", "ordinary prose")[0]
+        )
+
+    def test_competitor_gate_rejects_prose_before_grade_or_write(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Competitors:
+            @staticmethod
+            def research_competitors(*_args, **_kwargs):
+                return {"verified": 3, "coverage_note": "three corroborated"}
+
+            @staticmethod
+            def competitor_findings(*_args, **_kwargs):
+                return [("calculator.py", {
+                    "title": "clear errors",
+                    "problem": "opaque input failure",
+                    "fix": "validate inputs",
+                })]
+
+        class Provider:
+            @staticmethod
+            def complete(_prompt):
+                return "The file already has all of these capabilities.\n"
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("invalid source must not reach the grader")
+
+        args = types.SimpleNamespace(goal="keep addition clear", threshold=90)
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(ff, "_competitors_module", return_value=Competitors()), \
+             mock.patch.object(
+                 ff, "resolve_repo_rewards_url", return_value=(None, "offline")
+             ):
+            outcome = ff._refactor_top_three_gate(
+                args, Provider(), tmp, "calculator.py", original, {}, "main"
+            )
+        self.assertEqual([], outcome["implemented_files"])
+        self.assertEqual(original, outcome["current"])
+        self.assertIn("rejected before write", outcome["note"])
+        self.assertIn("parse error", outcome["note"])
+
     def test_fenced_file_discards_trailing_provider_explanation(self):
         response = (
             "\n```python\n"
@@ -292,6 +356,106 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertEqual([], item["passes"][0]["changed_files"])
         self.assertFalse(item["competitor_gate"]["attempted"])
         self.assertTrue(item["competitor_gate"]["not_applicable"])
+
+    def test_unfenced_prose_reviews_the_exact_original_for_verified_noop(self):
+        import tempfile
+        import types
+
+        original = "def add(left: int, right: int) -> int:\n    return left + right\n"
+        prose = "Looking at the current file, it is already well-written with:\n"
+
+        class Provider:
+            prompts = []
+
+            @staticmethod
+            def complete(_instruction):
+                return prose
+
+            @classmethod
+            def grade(cls, prompt):
+                cls.prompts.append(prompt)
+                return ff.Grade(100, True, "The exact original meets the goal.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            before = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            args = types.SimpleNamespace(
+                file=source, goal="retain clear typed addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", return_value=(True, "ok")):
+                rc = ff.run(args)
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(before, after)
+        self.assertEqual("", status)
+        self.assertEqual(original, retained)
+        self.assertEqual(1, len(Provider.prompts))
+        self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
+        self.assertIn(original, Provider.prompts[0])
+        self.assertNotIn(prose.strip(), Provider.prompts[0])
+
+    def test_invalid_author_prose_cannot_claim_noop_without_original_approval(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "Looking at the current file, it is already well-written with:\n"
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(95, False, "The exact original misses validation.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="add input validation", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        self.assertEqual("", status)
+        gate.assert_not_called()
 
     def test_unchanged_near_miss_cannot_become_noop_success(self):
         import tempfile

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""FlexFactor 0.6.1 — managed code improvement with four modes.
+r"""FlexFactor 0.6.2 — managed code improvement with four modes.
 
 Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
 one quality-first paid-to-free model ladder. A request may contain up to 30
@@ -643,7 +643,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.6.1"
+TOOL_VERSION = "0.6.2"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -2954,6 +2954,39 @@ def _strip_code_fences(code: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _inproc_source_syntax_ok(path: str, source: str) -> tuple[bool | None, str]:
+    """Parse a whole-file model response without writing or executing it.
+
+    ``True`` means a stdlib parser accepted the source, ``False`` means the
+    response is definitely invalid for the selected file type, and ``None``
+    means no safe in-process parser is available.  The project publication
+    gate remains authoritative for every type; this earlier gate prevents a
+    reviewer from blessing obvious prose-as-code and lets Refactor assess the
+    *actual original file* when an author answers "already good" in prose.
+
+    Keep this helper side-effect free.  In particular, never import or execute
+    the candidate Python module merely to validate it.
+    """
+    text = str(source or "")
+    if not text.strip():
+        return False, "empty whole-file response"
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    try:
+        if ext in (".py", ".pyi"):
+            compile(text, str(path or "<candidate>"), "exec", dont_inherit=True)
+            return True, "python parse"
+        if ext == ".json":
+            json.loads(text)
+            return True, "json parse"
+        if ext == ".toml":
+            import tomllib
+            tomllib.loads(text)
+            return True, "toml parse"
+    except (SyntaxError, ValueError, TypeError) as exc:
+        return False, f"{ext.lstrip('.') or 'source'} parse error: {exc}"
+    return None, "no safe in-process parser for this file type"
+
+
 def _extract_json_object(text: str):
     """Tolerantly recover a parsed JSON object/array from a model response that may
     wrap it in ```json fences or surround it with prose, even when json_schema
@@ -4921,6 +4954,14 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             outcome["note"] = (outcome["note"] +
                                " The implementation attempt produced no safe delta.").strip()
             return outcome
+        syntax_ok, syntax_note = _inproc_source_syntax_ok(rel, candidate)
+        if syntax_ok is False:
+            outcome["note"] = (
+                outcome["note"]
+                + " The implementation attempt was rejected before write: "
+                + syntax_note
+            ).strip()
+            return outcome
         grade = provider.grade(
             f"GOAL: {args.goal}\n\nCANDIDATE CODE:\n"
             + _fence_untrusted("candidate", candidate)
@@ -5090,12 +5131,64 @@ def run(args) -> int:
             grade = Grade(0, False, "Model returned an empty file.",
                           ["Return the complete file contents, not an empty response."])
         else:
-            grade_prompt = (
-                f"GOAL: {args.goal}\n\n"
-                "CANDIDATE CODE:\n" + _fence_untrusted("candidate", candidate) + "\n\n"
-                "Grade how well the candidate satisfies the goal."
-            )
-            grade = provider.grade(grade_prompt)
+            syntax_ok, syntax_note = _inproc_source_syntax_ok(args.file, candidate)
+            if syntax_ok is False:
+                # Never show the rejected prose/code to the fallback reviewer:
+                # the live Android trial proved that an explanation claiming
+                # "already good" can persuade a judge even though it is not
+                # source.  Review the exact original file instead.  It becomes
+                # a no-op candidate only on an explicit threshold pass; the
+                # unchanged path below still runs the full project gate and
+                # proves this exact baseline is on remote default.
+                original_syntax_ok, original_syntax_note = (
+                    _inproc_source_syntax_ok(args.file, original)
+                )
+                print(
+                    f"[rep {i}] author response rejected before write: "
+                    f"{syntax_note}"
+                )
+                if original_syntax_ok is True:
+                    grade_prompt = (
+                        f"GOAL: {args.goal}\n\n"
+                        "EXACT ORIGINAL FILE (the author's invalid response was "
+                        "discarded and is not evidence):\n"
+                        + _fence_untrusted("original", original)
+                        + "\n\nGrade whether retaining this exact original file fully "
+                          "satisfies the goal. Set meets_goal true only when no "
+                          "source change is required."
+                    )
+                    original_grade = provider.grade(grade_prompt)
+                    if (original_grade.meets_goal is True
+                            and original_grade.grade >= int(args.threshold)):
+                        candidate = original
+                        grade = original_grade
+                    else:
+                        candidate = ""
+                        grade = Grade(
+                            original_grade.grade,
+                            False,
+                            "Author response was invalid source and the exact "
+                            "original file was not approved unchanged: "
+                            + original_grade.rationale,
+                            [f"Author must return valid source ({syntax_note})."]
+                            + list(original_grade.issues),
+                        )
+                else:
+                    candidate = ""
+                    grade = Grade(
+                        0,
+                        False,
+                        "Author response was invalid source and the original "
+                        f"file could not support a verified no-op: {original_syntax_note}",
+                        [f"Return complete valid source ({syntax_note})."],
+                    )
+            else:
+                grade_prompt = (
+                    f"GOAL: {args.goal}\n\n"
+                    "CANDIDATE CODE:\n" + _fence_untrusted("candidate", candidate) + "\n\n"
+                    "Grade how well the candidate satisfies the goal."
+                )
+                grade = provider.grade(grade_prompt)
 
         history.append(grade)
         print(f"[rep {i}] grade={grade.grade} meets_goal={grade.meets_goal} - {grade.rationale}")

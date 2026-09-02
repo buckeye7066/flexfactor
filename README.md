@@ -1,7 +1,7 @@
 # FlexFactor
 
 FlexFactor is a managed, purpose-driven code improvement system with four
-interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.6.1 uses one
+interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.6.2 uses one
 quality-first model ladder, one durable orchestrator, and one fail-closed
 publication contract on desktop and in the signed Android app.
 
@@ -76,7 +76,7 @@ code-model families so the free fallback can still separate author and reviewer.
 
 ## Managed Android product
 
-Android 3.5.1 is a native phone interface, not a Termux or desktop remote-control
+Android 3.5.2 is a native phone interface, not a Termux or desktop remote-control
 screen. The user taps the icon, signs in with GitHub device authorization, picks
 one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so
@@ -103,11 +103,12 @@ Termux launch endpoints are retired; the web dashboard is viewer/steering only.
 See [android/README.md](android/README.md) and
 [cloud/THREAT_MODEL.md](cloud/THREAT_MODEL.md).
 
-Version 3.5.1 normalizes whole-file Markdown responses at their matching outer
-closing fence, preserves nested examples, rejects unclosed wrappers as partial,
-and discards later provider prose. It treats an independently verified
-unchanged refactor as a real no-op only after proving its baseline is already
-on the authoritative remote default branch.
+Version 3.5.2 parses supported whole-file responses before any write. Definite
+prose-as-code or invalid source is discarded, never offered to a reviewer as a
+candidate. If the author meant “already good,” the independent reviewer grades
+the exact original file instead; an unchanged result still needs the complete
+project gate and proof that its baseline is on the authoritative remote default
+branch.
 
 ## Evidence and recovery
 
