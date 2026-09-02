@@ -1,40 +1,32 @@
-name: scout-public-url-proof
+name: scout-heygen-live-run
 
-run-name: "Scout URL proof · ${{ inputs.program_url || 'https://www.heygen.com/' }}"
+run-name: "Scout HeyGen live run"
 
 on:
   push:
     branches: ["codex/scout-url-research"]
   workflow_dispatch:
-    inputs:
-      program_url:
-        description: Public program URL to run through URL-only Scout
-        required: true
-        default: https://www.heygen.com/
-        type: string
 
 permissions:
   actions: read
   contents: read
   copilot-requests: write
 
-concurrency:
-  group: scout-public-url-proof-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   scout:
-    name: Acquire and profile public program
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Start isolated HeyGen Scout run'
+    name: Acquire and profile HeyGen
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
     env:
-      PROGRAM_URL: ${{ inputs.program_url || 'https://www.heygen.com/' }}
+      PROGRAM_URL: https://www.heygen.com/
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
       FLEXFACTOR_CLI_TIMEOUT: "420"
       OLLAMA_BASE_URL: http://127.0.0.1:9
+      PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
 
     steps:
@@ -53,7 +45,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install Scout and Copilot provider
+      - name: Install Scout and its authenticated model provider
         shell: bash
         run: |
           python -m pip install --disable-pip-version-check -r requirements.txt
@@ -62,7 +54,7 @@ jobs:
           npm install --global @github/copilot@1.0.81
           copilot --version
 
-      - name: Prove canonical URL acquisition through Scout transport
+      - name: Acquire HeyGen through Scout transport
         shell: bash
         run: |
           python - <<'PY'
@@ -101,7 +93,7 @@ jobs:
           print(json.dumps(receipt, indent=2, sort_keys=True))
           PY
 
-      - name: Run full URL-only Scout profiling
+      - name: Run the full URL-only Scout command
         shell: bash
         run: |
           set -o pipefail
@@ -110,11 +102,11 @@ jobs:
             --max-cost 50 \
             2>&1 | tee scout-run.log
 
-      - name: Retain Scout evidence and console proof
+      - name: Retain the acquisition receipt and Scout log
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scout-public-url-proof-${{ github.run_id }}
+          name: scout-heygen-live-${{ github.run_id }}
           path: |
             scout-url-acquisition.json
             scout-run.log
