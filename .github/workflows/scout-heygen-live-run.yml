@@ -20,7 +20,9 @@ jobs:
   scout:
     if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Start isolated HeyGen Scout run'
     name: Acquire and profile HeyGen
-    runs-on: ubuntu-latest
+    # Use GitHub's separate single-CPU container pool so a superseded VM job
+    # cannot block this bounded network/profile proof.
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     env:
       PROGRAM_URL: https://www.heygen.com/
