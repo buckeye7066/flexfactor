@@ -5,7 +5,9 @@ The owner-facing shape is deliberately small and fixed:
 * one queue containing at most thirty targets;
 * exactly one target may execute at a time;
 * a repository receives no more than six semantic passes;
-* pass one covers the complete repository;
+* audit/prodready pass one covers every reviewable repository file;
+* refactor pass one covers its explicitly selected file and Scout pass one
+  records repository understanding (neither may claim a whole-repo audit);
 * later passes cover only files changed by the immediately preceding pass; and
 * the three best corroborated competitors are considered between passes one
   and two.
@@ -30,6 +32,13 @@ MAX_TARGETS = 30
 MAX_PASSES = 6
 TOP_COMPETITORS = 3
 MODEL_POLICY = "best-available"
+
+FIRST_PASS_SCOPE = {
+    "audit": "whole-repository",
+    "prodready": "whole-repository",
+    "refactor": "selected-file",
+    "scout": "repository-understanding",
+}
 
 
 class ExecutionContractError(ValueError):
@@ -261,7 +270,9 @@ class SequentialOrchestrator:
             self._save()
 
     def begin_pass(self, number: int, scope: Iterable[object], *,
-                   whole_repository: bool = False) -> list[str]:
+                   whole_repository: bool = False,
+                   scope_kind: str | None = None,
+                   exhaustive: bool | None = None) -> list[str]:
         with self._lock:
             index = self._state["active_index"]
             if index is None:
@@ -273,8 +284,11 @@ class SequentialOrchestrator:
                 raise OrchestrationOrderError(
                     f"pass {count} cannot start; pass {expected} is next"
                 )
-            if count == 1 and not whole_repository:
-                raise OrchestrationOrderError("pass 1 must cover the whole repository")
+            expected_first_scope = FIRST_PASS_SCOPE.get(self.mode, "whole-repository")
+            if count == 1 and expected_first_scope == "whole-repository" \
+                    and not whole_repository:
+                raise OrchestrationOrderError(
+                    "audit/prodready pass 1 must cover the whole repository")
             if count > 1 and whole_repository:
                 raise OrchestrationOrderError("follow-up passes cannot widen to the whole repository")
             if count == 2 and item.get("competitor_gate", {}).get("attempted") is not True:
@@ -295,9 +309,21 @@ class SequentialOrchestrator:
                         f"pass {count} scope must exactly equal the previous "
                         f"verified edit delta (expected {expected_paths!r}, got {paths!r})"
                     )
+            declared_scope = (str(scope_kind or "").strip()
+                              or ("whole-repository" if whole_repository
+                                  else "previous-pass-edits"))
+            if count == 1 and declared_scope != expected_first_scope:
+                raise OrchestrationOrderError(
+                    f"{self.mode} pass 1 scope must be {expected_first_scope!r}, "
+                    f"got {declared_scope!r}"
+                )
+            is_exhaustive = (bool(exhaustive) if exhaustive is not None else
+                             bool(count == 1 and whole_repository
+                                  and self.mode in {"audit", "prodready"}))
             record = {
                 "number": count,
-                "scope": "whole-repository" if whole_repository else "previous-pass-edits",
+                "scope": declared_scope,
+                "exhaustive": is_exhaustive,
                 "files": paths,
                 "status": "running",
                 "started_at": time.time(),
@@ -306,7 +332,11 @@ class SequentialOrchestrator:
             self._save()
             return paths
 
-    def finish_pass(self, number: int, changed_files: Iterable[object]) -> list[str]:
+    def finish_pass(self, number: int, changed_files: Iterable[object], *,
+                    reviewed_files: Iterable[object] | None = None,
+                    incomplete_files: Iterable[object] | None = None,
+                    repair_candidate_files: Iterable[object] | None = None,
+                    repair_attempted_files: Iterable[object] | None = None) -> list[str]:
         with self._lock:
             index = self._state["active_index"]
             if index is None:
@@ -317,7 +347,46 @@ class SequentialOrchestrator:
             record = item["passes"][-1]
             if record["status"] != "running":
                 raise OrchestrationOrderError("the requested pass already finished")
+            reviewed = changed_file_scope(reviewed_files)
+            incomplete = changed_file_scope(incomplete_files)
+            candidates = changed_file_scope(repair_candidate_files)
+            attempted = changed_file_scope(repair_attempted_files)
+            if record.get("exhaustive"):
+                required = list(record.get("files") or [])
+                missing = [path for path in required if path not in set(reviewed)]
+                unattempted = [path for path in candidates
+                               if path not in set(attempted)]
+                failures = []
+                if missing:
+                    failures.append(
+                        f"{len(missing)} scoped file(s) lack a completed review")
+                if incomplete:
+                    failures.append(
+                        f"{len(incomplete)} scoped file(s) are incomplete")
+                if unattempted:
+                    failures.append(
+                        f"{len(unattempted)} repair candidate(s) were not attempted")
+                if failures:
+                    record["reconciliation"] = {
+                        "reviewed_files": reviewed,
+                        "incomplete_files": incomplete,
+                        "repair_candidate_files": candidates,
+                        "repair_attempted_files": attempted,
+                        "missing_review_files": missing,
+                        "unattempted_repair_files": unattempted,
+                    }
+                    self._save()
+                    raise OrchestrationOrderError(
+                        "exhaustive pass cannot complete: " + "; ".join(failures))
             changed = changed_file_scope(changed_files)
+            record["reconciliation"] = {
+                "reviewed_files": reviewed,
+                "incomplete_files": incomplete,
+                "repair_candidate_files": candidates,
+                "repair_attempted_files": attempted,
+                "missing_review_files": [],
+                "unattempted_repair_files": [],
+            }
             record["changed_files"] = changed
             record["status"] = "completed"
             record["finished_at"] = time.time()
@@ -380,9 +449,17 @@ class SequentialOrchestrator:
                 passes = list(item.get("passes") or [])
                 if not passes:
                     failures.append("no repository pass was recorded")
-                elif (passes[0].get("number") != 1
-                      or passes[0].get("scope") != "whole-repository"):
-                    failures.append("pass 1 did not cover the whole repository")
+                else:
+                    expected_scope = FIRST_PASS_SCOPE.get(
+                        self.mode, "whole-repository")
+                    if (passes[0].get("number") != 1
+                            or passes[0].get("scope") != expected_scope):
+                        failures.append(
+                            f"pass 1 did not use required {expected_scope!r} scope")
+                    if (self.mode in {"audit", "prodready"}
+                            and passes[0].get("exhaustive") is not True):
+                        failures.append(
+                            "whole-repository pass 1 was not marked exhaustive")
                 if any(row.get("status") != "completed" for row in passes):
                     failures.append("not every recorded pass completed")
                 gate = item.get("competitor_gate")

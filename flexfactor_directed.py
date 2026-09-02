@@ -11,6 +11,7 @@ namespace.
 """
 from __future__ import annotations
 
+import functools
 import re
 import threading
 
@@ -161,6 +162,7 @@ def install(module_globals: dict) -> None:
         # run_audit rather than stampeding the same provider account.
         prior_audit = module_globals.get("run_audit")
         if callable(prior_audit) and not getattr(prior_audit, "_capacity_wrapped", False):
+            @functools.wraps(prior_audit)
             def run_audit(args):
                 requested = max(1, int(getattr(args, "parallel", 1) or 1))
                 model_mode = str(getattr(args, "model_mode", "free") or "free")

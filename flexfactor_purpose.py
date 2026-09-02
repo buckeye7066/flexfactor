@@ -174,6 +174,12 @@ class PurposeContract:
     name: str
     slug: str = ""
     purpose: str = ""
+    #: Who receives the program's outcome.  Inferred contracts must populate
+    #: this explicitly; otherwise a model can reduce "understand the app" to a
+    #: one-line README paraphrase without identifying whose job is being done.
+    primary_users: list[str] = field(default_factory=list)
+    #: Concrete start-to-finish behaviours that deliver the purpose.
+    core_journeys: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
     repo: str | None = None
@@ -191,6 +197,11 @@ class PurposeContract:
     #: INFERRED contract built from `gather_purpose_evidence()`. An authored
     #: contract needs none - the owner's word is the evidence.
     evidence_ledger: list[dict] = field(default_factory=list)
+    #: Exact ``path_or_ref`` values cited by the inference.  These are kept
+    #: separately from the complete ledger so a receipt can distinguish
+    #: evidence that was merely available from evidence the model actually
+    #: relied on.
+    evidence_refs: list[str] = field(default_factory=list)
     contradictions: list[dict] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
     #: One of PURPOSE_CONFIDENCE_LEVELS. "owner-authored" for authored contracts.
@@ -210,10 +221,20 @@ class PurposeContract:
         `acceptance_ref` by these numbers, which is what makes a gap list
         purpose-derived and auditable instead of a generic lint list.
         """
-        origin = ("AUTHORED BY THE OWNER - this is a requirement, not a guess."
-                  if self.authored else
-                  "INFERRED by FlexFactor from the repository - treat as a "
-                  "working hypothesis, not the owner's stated requirement.")
+        if self.authored and (self.source or {}).get("understanding_enriched"):
+            origin = (
+                "PURPOSE AND ACCEPTANCE CRITERIA AUTHORED BY THE OWNER; "
+                "explicitly named missing users/journeys were enriched by "
+                "FlexFactor from the cited evidence. Owner fields remain "
+                "authoritative."
+            )
+        elif self.authored:
+            origin = "AUTHORED BY THE OWNER - this is a requirement, not a guess."
+        else:
+            origin = (
+                "INFERRED by FlexFactor from the repository - treat as a "
+                "working hypothesis, not the owner's stated requirement."
+            )
         lines = [
             f"PROGRAM: {self.name}",
             f"CONTRACT ORIGIN: {origin}",
@@ -225,6 +246,15 @@ class PurposeContract:
             lines += ["", "ACCEPTANCE CRITERIA (the program is not finished until "
                           "every one of these is true):"]
             lines += [f"  {i}. {c}" for i, c in enumerate(self.acceptance_criteria, 1)]
+        if self.primary_users:
+            lines += ["", "PRIMARY USERS:"]
+            lines += [f"  - {user}" for user in self.primary_users]
+        if self.core_journeys:
+            lines += ["", "CORE END-TO-END JOURNEYS:"]
+            lines += [f"  - {journey}" for journey in self.core_journeys]
+        if self.evidence_refs:
+            lines += ["", "EVIDENCE ACTUALLY CITED FOR THIS INFERENCE:"]
+            lines += [f"  - {ref}" for ref in self.evidence_refs]
         if self.required_design:
             lines += ["", "REQUIRED DESIGN:"]
             lines += [f"  - {d}" for d in self.required_design]
@@ -317,6 +347,8 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
         slug=entry.get("slug") or "",
         purpose=entry.get("purpose") or "",
+        primary_users=list(entry.get("primary_users") or []),
+        core_journeys=list(entry.get("core_journeys") or []),
         acceptance_criteria=list(entry.get("acceptance_criteria") or []),
         aliases=list(entry.get("aliases") or []),
         repo=entry.get("repo"),
@@ -327,6 +359,7 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
         false_substitutes=list(entry.get("false_substitutes") or []),
         authored=True,
         source=entry.get("source") or {"doc": REGISTRY_REL, "authored_by": "owner"},
+        evidence_refs=list(entry.get("evidence_refs") or []),
     )
 
 
@@ -371,6 +404,8 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
             return PurposeContract(
                 name=parsed.get("name") or program_name or os.path.basename(project_dir),
                 purpose=parsed["purpose"],
+                primary_users=parsed.get("primary_users", []),
+                core_journeys=parsed.get("core_journeys", []),
                 acceptance_criteria=parsed.get("acceptance_criteria", []),
                 false_substitutes=parsed.get("false_substitutes", []),
                 authored=True,
@@ -386,22 +421,36 @@ _MD_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$")
 def parse_markdown_contract(text: str) -> dict:
     """Parse a `docs/purpose-contract.md`-style document.
 
-    The owner's own FlexFactor contract uses `## Purpose`, `## Acceptance ...`,
-    `## Forbidden substitutes`, so those are the sections understood here. Prose
-    under Purpose is joined; list items under the other two become entries.
+    Purpose, users, journeys/workflows, acceptance, and forbidden-substitute
+    sections are all load-bearing. Numbered headings such as ``## 2. Production
+    users`` are accepted because that is the format used by the program-specific
+    contracts in this repository.
     """
-    out: dict = {"acceptance_criteria": [], "false_substitutes": []}
+    out: dict = {
+        "primary_users": [], "core_journeys": [],
+        "acceptance_criteria": [], "false_substitutes": [],
+    }
     section = None
     purpose_lines: list[str] = []
     for raw in (text or "").splitlines():
         h = _MD_HEADING.match(raw)
         if h:
-            title = h.group(1).lower()
-            if title.startswith("purpose") and "contract" not in title:
+            title = h.group(1).lower().strip()
+            semantic_title = re.sub(
+                r"^\d+(?:[-–.]\d+)*[.)\s:-]+", "", title).strip()
+            if ((semantic_title.startswith("purpose")
+                 and "contract" not in semantic_title)
+                    or "created to do" in semantic_title):
                 section = "purpose"
-            elif title.startswith("acceptance"):
+            elif (semantic_title.startswith(("primary users", "production users",
+                                              "intended users", "users", "audience"))):
+                section = "users"
+            elif ("journey" in semantic_title
+                  or semantic_title.startswith(("major workflows", "core workflows"))):
+                section = "journeys"
+            elif semantic_title.startswith("acceptance"):
                 section = "acceptance"
-            elif "forbidden" in title or "substitute" in title:
+            elif "forbidden" in semantic_title or "substitute" in semantic_title:
                 section = "forbidden"
             else:
                 section = None
@@ -416,6 +465,14 @@ def parse_markdown_contract(text: str) -> dict:
         item = _MD_ITEM.match(raw)
         if section == "purpose":
             purpose_lines.append(re.sub(r"\*\*", "", line))
+        elif section == "users":
+            value = item.group(1) if item else re.sub(r"\*\*", "", line)
+            if value:
+                out["primary_users"].append(value)
+        elif section == "journeys":
+            value = item.group(1) if item else re.sub(r"\*\*", "", line)
+            if value:
+                out["core_journeys"].append(value)
         elif section == "acceptance" and item:
             out["acceptance_criteria"].append(item.group(1))
         elif section == "forbidden":
@@ -428,7 +485,10 @@ def parse_markdown_contract(text: str) -> dict:
 
 def inferred_contract(program_name: str, purpose_text: str,
                       acceptance: list[str] | None = None,
-                      evidence: dict | None = None) -> PurposeContract:
+                      evidence: dict | None = None, *,
+                      primary_users: list[str] | None = None,
+                      core_journeys: list[str] | None = None,
+                      evidence_refs: list[str] | None = None) -> PurposeContract:
     """Wrap a model-inferred purpose. `authored` stays False so no report can
     present a guess as the owner's requirement.
 
@@ -441,7 +501,10 @@ def inferred_contract(program_name: str, purpose_text: str,
     c = PurposeContract(
         name=program_name,
         purpose=purpose_text or "",
+        primary_users=list(primary_users or []),
+        core_journeys=list(core_journeys or []),
         acceptance_criteria=list(acceptance or []),
+        evidence_refs=list(evidence_refs or []),
         authored=False,
         source={"doc": "(inferred from repository metadata)", "authored_by": "flexfactor"},
     )
@@ -456,6 +519,39 @@ def inferred_contract(program_name: str, purpose_text: str,
         if not c.false_substitutes:
             c.false_substitutes = false_substitutes_default()
     return c
+
+
+def purpose_evidence_refs(evidence: dict | None) -> list[str]:
+    """Return every exact citation identifier an inference is allowed to use.
+
+    A model-written path is not proof that the path was inspected.  The allow
+    list is derived only from the deterministic gatherer's structured output;
+    callers reject citations that do not occur here.
+    """
+    ev = evidence or {}
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def add(value) -> None:
+        ref = str(value or "").strip()
+        if ref and ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+
+    for row in ev.get("sources") or []:
+        if isinstance(row, dict):
+            add(row.get("path_or_ref"))
+    for key in ("product_claims", "integrations", "schemas", "routes"):
+        for row in ev.get(key) or []:
+            if isinstance(row, dict):
+                add(row.get("path_or_ref"))
+    deploy = ev.get("deploy") or {}
+    if isinstance(deploy, dict):
+        for key in ("targets", "ci"):
+            for row in deploy.get(key) or []:
+                if isinstance(row, dict):
+                    add(row.get("path_or_ref"))
+    return refs
 
 
 def infer_purpose_record(program_name: str, purpose_text: str,

@@ -771,6 +771,22 @@ class RotatingProviderTests(RotationTestCase):
         result = prov.complete("x")
         self.assertIn("completed by", result)
 
+    def test_spent_paid_budget_demotes_the_same_call_to_genuine_free_capacity(self):
+        class BudgetExceededError(RuntimeError):
+            pass
+
+        paid = route("paid/frontier", "paid:pool", cost=R.PAID_METERED)
+        free = route("local/qwen", "local:pool", cost=R.LOCAL_UNLIMITED)
+        prov = self._provider(
+            catalog(paid, free),
+            failures={paid.id: BudgetExceededError("USD cap")},
+            allow_paid=True, paid_first=True)
+        self.assertTrue(prov.has_genuine_free_capacity())
+        self.assertEqual(prov.complete("x"), "completed by local/qwen")
+        # A budget policy refusal must not cool or penalize the paid provider.
+        state = self.store.read()
+        self.assertNotIn("route:paid/frontier", state.get("cooldowns", {}))
+
     def test_rotation_exhaustion_reports_the_real_provider_error(self):
         """When every pool has genuinely failed, the raise must carry the last
         provider error as its cause - a bare 'no route available' after a real

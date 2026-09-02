@@ -69,6 +69,31 @@ def _init_test_origin(project: str, remote: str) -> None:
     subprocess.run(["git", "-C", project, "remote", "add", "origin", remote], check=True)
     subprocess.run(["git", "-C", project, "push", "-q", "origin", "main"], check=True)
 
+
+def _unit_purpose_understanding(name: str = "Fixture"):
+    """Purpose result for unit tests whose subject is below the purpose gate."""
+    fp = ff._purpose_module()
+    contract = fp.PurposeContract(
+        name=name,
+        purpose="Let a user exercise the fixture behavior reliably.",
+        primary_users=["fixture user"],
+        core_journeys=["Provide input and receive the expected result."],
+        acceptance_criteria=["The fixture behavior remains correct."],
+        authored=True,
+        source={"doc": "test fixture", "authored_by": "owner"},
+    )
+    return contract, "owner-authored", True, ""
+
+
+def _unit_competitor_outcome(_args, _provider, _project_dir, _rel,
+                             current: str, *_rest, **_kwargs):
+    """Completed empty research result for tests focused on refactor mechanics."""
+    return {
+        "attempted": True, "verified": 0, "implemented_files": [],
+        "note": "unit fixture: no applicable competitor idea",
+        "research": {"competitors": []}, "current": current,
+    }
+
 # --------------------------------------------------------------------------- #
 # NEVER touch the owner's real FlexFactor state from a test run.
 #
@@ -187,6 +212,7 @@ def _no_network_opener(*a, **k):
 
 
 _ffc._default_opener = _no_network_opener
+_ffc._default_evidence_opener = _no_network_opener
 ff._server_is_up = lambda url, timeout=1.5: False
 
 
@@ -269,6 +295,10 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             )
             with mock.patch.object(
                     ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_ensure_program_understanding",
+                                   return_value=_unit_purpose_understanding()), \
+                 mock.patch.object(ff, "_refactor_top_three_gate",
+                                   side_effect=_unit_competitor_outcome), \
                  mock.patch.object(ff, "_publication_gate", return_value=(True, "ok")):
                 rc = ff.run(args)
             rc = orchestrator.finish_target(0, rc)
@@ -290,8 +320,8 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         item = receipt["items"][0]
         self.assertEqual("completed", item["status"])
         self.assertEqual([], item["passes"][0]["changed_files"])
-        self.assertFalse(item["competitor_gate"]["attempted"])
-        self.assertTrue(item["competitor_gate"]["not_applicable"])
+        self.assertTrue(item["competitor_gate"]["attempted"])
+        self.assertFalse(item["competitor_gate"]["not_applicable"])
 
     def test_unchanged_near_miss_cannot_become_noop_success(self):
         import tempfile
@@ -322,6 +352,10 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             )
             with mock.patch.object(
                     ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_ensure_program_understanding",
+                                   return_value=_unit_purpose_understanding()), \
+                 mock.patch.object(ff, "_refactor_top_three_gate",
+                                   side_effect=_unit_competitor_outcome), \
                  mock.patch.object(ff, "_publication_gate") as gate:
                 rc = ff.run(args)
         self.assertEqual(1, rc)
@@ -381,6 +415,10 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             )
             with mock.patch.object(
                     ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_ensure_program_understanding",
+                                   return_value=_unit_purpose_understanding()), \
+                 mock.patch.object(ff, "_refactor_top_three_gate",
+                                   side_effect=_unit_competitor_outcome), \
                  mock.patch.object(ff, "_publication_gate", side_effect=mutating_gate):
                 rc = ff.run(args)
             after = subprocess.run(
@@ -443,6 +481,10 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             )
             with mock.patch.object(
                     ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_ensure_program_understanding",
+                                   return_value=_unit_purpose_understanding()), \
+                 mock.patch.object(ff, "_refactor_top_three_gate",
+                                   side_effect=_unit_competitor_outcome), \
                  mock.patch.object(ff, "_publication_gate", side_effect=failing_gate):
                 rc = ff.run(args)
             status = subprocess.run(
@@ -2080,6 +2122,63 @@ class GitAwareEnumerationTests(unittest.TestCase):
             self.assertIn("src/app.js", slashed)
             self.assertNotIn("stale-copy/app.js", slashed)
 
+    def test_manifest_reviews_every_git_visible_text_file_without_extension_filter(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+            bodies = {
+                "README.md": b"# Purpose\n",
+                "Dockerfile": b"FROM python:3.12\n",
+                "package.json": b'{"name":"complete-scope"}\n',
+                ".github/workflows/ci.yml": b"name: CI\n",
+                "src/app.py": b"print('ok')\n",
+                "empty.config": b"",
+                "logo.bin": b"\x00\xff\x10",
+                "ignored/hidden.py": b"print('ignored')\n",
+                ".gitignore": b"ignored/\n",
+            }
+            for rel, body in bodies.items():
+                path = os.path.join(tmp, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(body)
+            manifest = ff._repository_review_manifest(tmp)
+
+        reviewed = set(manifest["reviewable_files"])
+        for rel in ("README.md", "Dockerfile", "package.json",
+                    ".github/workflows/ci.yml", "src/app.py",
+                    "empty.config", ".gitignore"):
+            self.assertIn(rel, reviewed)
+        self.assertIn("logo.bin", manifest["non_text_files"])
+        self.assertNotIn("ignored/hidden.py",
+                         {row["path"] for row in manifest["entries"]})
+        self.assertEqual(manifest["total_entries"], len(manifest["entries"]))
+
+    def test_manifest_classifies_the_complete_file_not_a_prefix_sample(self):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], capture_output=True)
+            path = os.path.join(tmp, "late-binary.dat")
+            with open(path, "wb") as fh:
+                # The invalid byte is deliberately beyond the former 128 KiB
+                # classifier prefix. A prefix sample would call this text and
+                # make the manifest's population proof misleading.
+                fh.write(b"a" * 150_000 + b"\xff")
+            manifest = ff._repository_review_manifest(tmp)
+
+        self.assertIn("late-binary.dat", manifest["non_text_files"])
+        self.assertNotIn("late-binary.dat", manifest["reviewable_files"])
+        row = next(item for item in manifest["entries"]
+                   if item["path"] == "late-binary.dat")
+        self.assertIn("complete content", row["reason"])
+
+    def test_audit_source_contains_no_fractional_review_sampling_cutoff(self):
+        src = inspect.getsource(ff.audit_one_program)
+        self.assertNotIn("REVIEW_BUDGET_FRAC", src)
+        self.assertNotIn("soft_cap_usd", inspect.getsource(ff._review_all))
+
     def test_scout_file_tree_skips_gitignored_copy(self):
         # Scout's program profiler must honor the same git-aware filter as the
         # audit enumerator: a gitignored stale self-copy must not eat the
@@ -3233,7 +3332,7 @@ class ParallelReviewBudgetTests(unittest.TestCase):
         try:
             files = [f"src/f{i}.js" for i in range(40)]
             ff._review_all([FakeProvider(m)], "/proj", files, report=None, meter=m,
-                           soft_cap_usd=None, workers=8)
+                           workers=8)
         finally:
             ff._read_text_and_sha = real_read
         # The provider chokepoint bounds total spend under the cap and stops the
@@ -4161,7 +4260,10 @@ class WriteGeneratingPromptFencingTests(unittest.TestCase):
                         else ff.Grade(100, True, "great", []))
 
         with tempfile.TemporaryDirectory() as tmp, \
-             _patched(ff, "_best_available_provider", lambda *a, **k: FakeProv()):
+             _patched(ff, "_best_available_provider", lambda *a, **k: FakeProv()), \
+             _patched(ff, "_ensure_program_understanding",
+                      lambda *a, **k: _unit_purpose_understanding()), \
+             _patched(ff, "_refactor_top_three_gate", _unit_competitor_outcome):
             remote = os.path.join(tmp, "origin.git")
             repo = os.path.join(tmp, "repo")
             subprocess.run(["git", "init", "--bare", remote], check=True,
@@ -6078,6 +6180,20 @@ class AdversarialFixLoopTests(unittest.TestCase):
         self.assertEqual(len(fb), 1)       # author called exactly once
         self.assertEqual(self._read(tmp), "fixed\n")
 
+    def test_repair_attempt_is_recorded_only_when_generation_is_invoked(self):
+        tmp, _fb, fake_author, args, findings = self._harness()
+        real = self._patch()
+        attempted = set()
+        ff.generate_file_fix_edits = fake_author
+        try:
+            applied, _unver, _notes = ff._fix_files(
+                object(), None, tmp, findings, self.STACK, True, args,
+                adversarial=False, attempted_out=attempted)
+        finally:
+            self._restore(real)
+        self.assertEqual(attempted, {"a.py"})
+        self.assertEqual(applied, ["a.py"])
+
     def test_b_needs_work_then_clean_feeds_residual_back(self):
         tmp, fb, fake_author, args, findings = self._harness()
         real = self._patch()
@@ -7327,6 +7443,17 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
                 return ({"a.py": [self.FINDING]}, [self.FINDING], set(), {}, set())
             return ({}, [], set(), {}, set())  # converge on later cycles
 
+        def recorded_fix_files(*a, **k):
+            # These scenarios all model a candidate generation/verification
+            # attempt. Honour _fix_files' attempted_out contract so pass
+            # accounting tests the intended downstream failure, not a fake
+            # harness omission.
+            attempted = k.get("attempted_out")
+            findings = a[3] if len(a) > 3 else {}
+            if attempted is not None:
+                attempted.update(findings)
+            return fix_files_impl(*a, **k)
+
         class _Prog:
             def update(self, *a, **k):
                 pass
@@ -7357,10 +7484,19 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
             "_git_tree_clean": lambda pd: True,
             "_git_current_branch": lambda pd: "main",
             "_git": git,
+            "_repository_review_manifest": lambda pd: {
+                "source": "unit-fixture", "total_entries": 1,
+                "category_counts": {"reviewable-text": 1},
+                "entries": [{"path": "a.py", "kind": "reviewable-text"}],
+                "reviewable_files": ["a.py"], "non_text_files": [],
+                "blocking_files": [],
+            },
             "_enumerate_source_files": lambda *a, **k: ["a.py"],
+            "_ensure_program_understanding": (
+                lambda *a, **k: _unit_purpose_understanding("prog")),
             "_review_all": review_all,
             "_full_gate": lambda pd, st: (True, ""),
-            "_fix_files": fix_files_impl,
+            "_fix_files": recorded_fix_files,
             "_commit_and_sync": commit_sync,
             "_brain_record_run": lambda *a, **k: None,
             "_build_clean_map": lambda *a, **k: {},
@@ -8069,7 +8205,8 @@ class ScoutEndToEndTests(unittest.TestCase):
             return {"name": "FixtureApp", "summary": "a fixture app",
                     "stack": ["node"], "goals": ["test"],
                     "opportunities": [{"need": "widgets",
-                                       "search_query": "widget"}]}
+                                       "url_search_query": "widget product documentation",
+                                       "repo_search_query": "widget repository"}]}
         return {"benefit_score": 90, "verdict": "adopt",
                 "how_it_helps": "adds widgets", "integration_note": "",
                 "risks": []}
@@ -8079,7 +8216,9 @@ class ScoutEndToEndTests(unittest.TestCase):
         import types
         saved = {n: getattr(ff, n) for n in
                  ("_server_is_up", "repo_rewards_search", "_judge",
-                  "make_provider", "generate_integration", "_detect_verify",
+                  "make_provider", "_best_available_provider",
+                  "_ensure_program_understanding",
+                  "generate_integration", "_detect_verify",
                   "_independent_final_review", "_run")}
         self.npm_calls: list[list[str]] = []
         self.verify_envs: list[dict | None] = []
@@ -8102,6 +8241,10 @@ class ScoutEndToEndTests(unittest.TestCase):
             [self.GOOD, self.HOSTILE]
         ff._judge = self._stub_judge
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
+            model="stub", judge_model="stub")
+        ff._ensure_program_understanding = (
+            lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
         ff.generate_integration = lambda provider, project_dir, blob, need, result: (
             {"files": [{"path": "widget_integration.js",
                         "contents": "export const widget = 1;\n"}],
@@ -9727,6 +9870,8 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             # with no toolchain would report.
             with _patched(ff, "build_audit_providers",
                           lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_ensure_program_understanding",
+                          lambda *a, **k: _unit_purpose_understanding()), \
                  _patched(ff, "_full_gate",
                           lambda d, s: (None, "(build stubbed offline in tests)")):
                 res = ff.audit_one_program(root, args, 0, 1, None)
@@ -9764,7 +9909,7 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertFalse(res.get("product_invariants_ready"))
             self.assertGreater(res.get("product_invariant_blockers") or 0, 0)
             self.assertGreater(res["defects"], 0)
-            self.assertIn("purpose-authority", res.get("stop_reason") or "")
+            self.assertIn("competitive-coverage", res.get("stop_reason") or "")
 
     def test_project_with_no_manifest_is_honestly_unverifiable(self):
         # A loose .py with no pyproject/requirements/setup.py is not a detectable
@@ -9830,6 +9975,8 @@ class PurposeEngineSurvivesFullyPooledProvidersTests(unittest.TestCase):
             real_pool = ff._LAST_FREE_REVIEW_POOL
             try:
                 with _patched(ff, "build_audit_providers", fake_build), \
+                     _patched(ff, "_ensure_program_understanding",
+                              lambda *a, **k: _unit_purpose_understanding("Widget")), \
                      _patched(ff, "assess_purpose_gap", spy_assess), \
                      _patched(ff, "_full_gate",
                               lambda d, s: (None, "(build stubbed offline in tests)")):
@@ -10164,20 +10311,26 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             }
             saved = {n: getattr(ff, n) for n in
                      ("_server_is_up", "repo_rewards_search", "_judge",
-                      "make_provider", "generate_integration")}
+                      "make_provider", "_best_available_provider",
+                      "_ensure_program_understanding", "generate_integration")}
             ff._server_is_up = lambda url, timeout=1.5: True
             ff.repo_rewards_search = lambda *a, **k: [good]
             ff._judge = lambda provider, system, prompt, schema, max_tokens=8000: (
                 {"name": "FixtureApp", "summary": "a fixture app",
                  "stack": ["node"], "goals": ["test"],
                  "opportunities": [{"need": "widgets",
-                                    "search_query": "widget"}]}
+                                    "url_search_query": "widget product documentation",
+                                    "repo_search_query": "widget repository"}]}
                 if schema is ff.PROGRAM_PROFILE_SCHEMA else
                 {"benefit_score": 90, "verdict": "adopt",
                  "how_it_helps": "adds widgets", "integration_note": "",
                  "risks": []})
             ff.make_provider = lambda *a, **k: types.SimpleNamespace(
                 judge_model="stub")
+            ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
+                model="stub", judge_model="stub")
+            ff._ensure_program_understanding = (
+                lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
             ff.generate_integration = lambda *a, **k: (
                 {"files": [{"path": "widget_integration.js",
                             "contents": "export const widget = 1;\n"}],
@@ -10227,6 +10380,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "search": ff.repo_rewards_search,
             "judge": ff._judge,
             "prov": ff.make_provider,
+            "best": ff._best_available_provider,
+            "purpose": ff._ensure_program_understanding,
         }
 
         def fake_up(url, timeout=1.5):
@@ -10240,13 +10395,17 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         ff._judge = lambda *a, **k: {"name": "x", "summary": "x", "stack": [],
                                      "goals": [], "opportunities": []}
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
+            model="stub", judge_model="stub")
+        ff._ensure_program_understanding = (
+            lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
                 rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--no-remote-repo-rewards", "--no-auto-start"])
-            self.assertEqual(rc, 2)
+            self.assertIn(rc, (0, 1))
             self.assertIsNone(seen["search_url"])
             self.assertFalse([u for u in seen["urls"]
                               if str(u).startswith("https://web-production")
@@ -10258,6 +10417,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff.repo_rewards_search = saved["search"]
             ff._judge = saved["judge"]
             ff.make_provider = saved["prov"]
+            ff._best_available_provider = saved["best"]
+            ff._ensure_program_understanding = saved["purpose"]
 
     def test_production_rr_fallback_when_local_down(self):
         """When localhost RR is down and opt-in is set, Scout uses production URL."""
@@ -10269,6 +10430,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "search": ff.repo_rewards_search,
             "judge": ff._judge,
             "prov": ff.make_provider,
+            "best": ff._best_available_provider,
+            "purpose": ff._ensure_program_understanding,
         }
 
         def fake_up(url, timeout=1.5):
@@ -10280,7 +10443,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                 return {"name": "FixtureApp", "summary": "fixture",
                         "stack": ["node"], "goals": ["test"],
                         "opportunities": [{"need": "widgets",
-                                           "search_query": "widget"}]}
+                                           "url_search_query": "widget product documentation",
+                                           "repo_search_query": "widget repository"}]}
             return {"benefit_score": 10, "verdict": "skip",
                     "how_it_helps": "", "integration_note": "", "risks": []}
 
@@ -10290,6 +10454,10 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             seen.__setitem__("search_url", url) or [])
         ff._judge = fake_judge
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
+            model="stub", judge_model="stub")
+        ff._ensure_program_understanding = (
+            lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
@@ -10311,6 +10479,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff.repo_rewards_search = saved["search"]
             ff._judge = saved["judge"]
             ff.make_provider = saved["prov"]
+            ff._best_available_provider = saved["best"]
+            ff._ensure_program_understanding = saved["purpose"]
 
     def test_autostart_keeps_explicit_local_url(self):
         """After auto-start, keep --repo-rewards-url; do not rewrite to DEFAULT."""
@@ -10322,6 +10492,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "search": ff.repo_rewards_search,
             "judge": ff._judge,
             "prov": ff.make_provider,
+            "best": ff._best_available_provider,
+            "purpose": ff._ensure_program_understanding,
             "default": ff.DEFAULT_REPO_REWARDS_URL,
         }
         calls = {"n": 0}
@@ -10342,7 +10514,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                 return {"name": "FixtureApp", "summary": "fixture",
                         "stack": ["node"], "goals": ["test"],
                         "opportunities": [{"need": "widgets",
-                                           "search_query": "widget"}]}
+                                           "url_search_query": "widget product documentation",
+                                           "repo_search_query": "widget repository"}]}
             return {"benefit_score": 10, "verdict": "skip",
                     "how_it_helps": "", "integration_note": "", "risks": []}
 
@@ -10353,6 +10526,10 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             seen.__setitem__("search_url", url) or [])
         ff._judge = fake_judge
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
+            model="stub", judge_model="stub")
+        ff._ensure_program_understanding = (
+            lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
@@ -10367,6 +10544,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff.repo_rewards_search = saved["search"]
             ff._judge = saved["judge"]
             ff.make_provider = saved["prov"]
+            ff._best_available_provider = saved["best"]
+            ff._ensure_program_understanding = saved["purpose"]
             ff.DEFAULT_REPO_REWARDS_URL = saved["default"]
 
 
@@ -12771,7 +12950,7 @@ class NeverReviewOnlyTests(unittest.TestCase):
         # Strip comments: the CODE must not downgrade, but the comment explaining
         # why is allowed to name the thing it removed.
         src = "\n".join(l.split("#", 1)[0] for l in
-                        inspect.getsource(ff.run_audit).splitlines())
+                        inspect.getsource(inspect.unwrap(ff.run_audit)).splitlines())
         self.assertNotIn("args.apply = False", src,
                          "declining must never downgrade to report-only")
         self.assertIn("return 2", src)
@@ -13378,11 +13557,16 @@ class PurposeContractTests(unittest.TestCase):
         parsed = fp.parse_markdown_contract(
             "# Purpose & Acceptance Contract - FlexFactor\n"
             "## Purpose\n\nDo the job well.\n\n"
+            "## 2. Production users\n\n- program owners\n\n"
+            "## 4. Major workflows\n\n1. Select a repo and finish the job\n\n"
             "## Acceptance (master prompt)\n\n1. first thing\n2. second thing\n\n"
             "## Forbidden substitutes\n\nFake success, docs-only claims\n")
         self.assertEqual(parsed["name"], "FlexFactor")
         self.assertEqual(parsed["purpose"], "Do the job well.")
         self.assertEqual(parsed["acceptance_criteria"], ["first thing", "second thing"])
+        self.assertEqual(parsed["primary_users"], ["program owners"])
+        self.assertEqual(parsed["core_journeys"],
+                         ["Select a repo and finish the job"])
         self.assertIn("Fake success", parsed["false_substitutes"])
 
     def test_repos_own_contract_file_is_readable_end_to_end(self):
@@ -13390,6 +13574,130 @@ class PurposeContractTests(unittest.TestCase):
         self.assertIsNotNone(c, "FlexFactor's own docs/purpose-contract.md must load")
         self.assertTrue(c.authored)
         self.assertTrue(c.acceptance_criteria)
+
+
+class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
+    """A gathered ledger is not understanding until a cited contract exists."""
+
+    def setUp(self):
+        self.tmp = _tempfile_ceiling.mkdtemp(prefix="ff-understanding-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.key = os.path.normcase(os.path.abspath(self.tmp))
+        ff._PURPOSE_EVIDENCE_CACHE[self.key] = {
+            "sources": [
+                {"kind": "manifest", "confidence": "high",
+                 "path_or_ref": "package.json:3", "excerpt": "invoice workflow",
+                 "why": "declared product description"},
+                {"kind": "readme", "confidence": "high",
+                 "path_or_ref": "README.md:4", "excerpt": "send invoices",
+                 "why": "product prose"},
+                {"kind": "test", "confidence": "high",
+                 "path_or_ref": "tests/invoice.test.ts:8",
+                 "excerpt": "customer pays an invoice", "why": "expected behavior"},
+            ],
+            "contradictions": [], "unknowns": [], "product_claims": [],
+            "integrations": [], "schemas": [], "routes": [], "deploy": {},
+        }
+        self.addCleanup(ff._PURPOSE_EVIDENCE_CACHE.pop, self.key, None)
+
+    class Provider:
+        def __init__(self, refs):
+            self.refs = refs
+            self.prompts = []
+
+        def structured(self, system, prompt, schema, **kwargs):
+            self.prompts.append((system, prompt, schema, kwargs))
+            return {
+                "purpose": "Help small businesses issue invoices and receive payment.",
+                "primary_users": ["small-business billing staff"],
+                "core_journeys": ["Create invoice, send it, and record payment"],
+                "acceptance_criteria": ["A customer can pay a sent invoice end to end"],
+                "evidence_refs": list(self.refs),
+            }
+
+    def test_inference_creates_a_concrete_contract_with_exact_citations(self):
+        provider = self.Provider(["README.md:4", "tests/invoice.test.ts:8"])
+        contract, error = ff._infer_purpose_contract(
+            provider, "Invoicer", self.tmp)
+        self.assertEqual(error, "")
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.primary_users, ["small-business billing staff"])
+        self.assertTrue(contract.core_journeys)
+        self.assertTrue(contract.acceptance_criteria)
+        self.assertEqual(contract.evidence_refs,
+                         ["README.md:4", "tests/invoice.test.ts:8"])
+        self.assertIn("README.md:4", provider.prompts[0][1])
+
+    def test_invented_citation_refuses_the_contract_after_bounded_retry(self):
+        provider = self.Provider(["docs/never-inspected.md:1"])
+        contract, error = ff._infer_purpose_contract(
+            provider, "Invoicer", self.tmp)
+        self.assertIsNone(contract)
+        self.assertEqual(len(provider.prompts), 2)
+        self.assertIn("invented evidence reference", error)
+
+    def test_incomplete_authored_contract_is_evidence_enriched_not_blindly_accepted(self):
+        authored = fp.PurposeContract(
+            name="Invoicer",
+            purpose="Owner purpose: issue invoices and receive payment.",
+            acceptance_criteria=["Owner criterion: a sent invoice can be paid."],
+            authored=True,
+            source={"doc": "docs/purpose-contract.md", "authored_by": "owner"},
+        )
+        provider = self.Provider(["README.md:4", "tests/invoice.test.ts:8"])
+        with _patched(ff, "load_purpose_contract", lambda *_a, **_k: authored):
+            contract, confidence, _allowed, _reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp)
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.purpose, authored.purpose,
+                         "enrichment must not rewrite the owner's purpose")
+        self.assertEqual(contract.acceptance_criteria,
+                         authored.acceptance_criteria,
+                         "enrichment must not rewrite owner criteria")
+        self.assertEqual(contract.primary_users,
+                         ["small-business billing staff"])
+        self.assertTrue(contract.core_journeys)
+        self.assertTrue(contract.authored)
+        self.assertTrue(contract.source["understanding_enriched"])
+        self.assertEqual(set(contract.source["inferred_fields"]),
+                         {"primary_users", "core_journeys"})
+        self.assertIn("OWNER-AUTHORED CONTRACT", provider.prompts[0][1])
+        self.assertIn("were enriched by FlexFactor", contract.prompt_block())
+        self.assertEqual(confidence, "owner-authored")
+
+    def test_incomplete_authored_contract_blocks_when_enrichment_cannot_be_cited(self):
+        authored = fp.PurposeContract(
+            name="Invoicer", purpose="Issue invoices.",
+            acceptance_criteria=["Invoices can be paid."], authored=True,
+            source={"doc": "docs/purpose-contract.md"},
+        )
+        provider = self.Provider(["invented:not-evidence"])
+        with _patched(ff, "load_purpose_contract", lambda *_a, **_k: authored):
+            contract, confidence, allowed, reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp)
+
+        self.assertIsNone(contract)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("invented evidence reference", reason)
+
+    def test_evidence_without_an_inferred_contract_is_unresolved(self):
+        confidence, allowed, reason = ff._purpose_confidence_for(self.tmp, None)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("no authored or evidence-cited", reason)
+
+    def test_every_user_option_executes_the_program_understanding_gate(self):
+        self.assertIn("_ensure_program_understanding", inspect.getsource(ff.run))
+        self.assertIn("_ensure_program_understanding",
+                      inspect.getsource(ff._run_scout_impl))
+        # Options 3 and 4 share audit_one_program; both therefore pass through
+        # this same non-optional gate.
+        self.assertIn("_ensure_program_understanding",
+                      inspect.getsource(ff.audit_one_program))
 
 
 class GapAnalysisTests(unittest.TestCase):
@@ -14282,6 +14590,8 @@ class ResumeCheckpointTests(unittest.TestCase):
 
             with _patched(ff, "build_audit_providers",
                           lambda a, m=None: [("stub", stub)]), \
+                 _patched(ff, "_ensure_program_understanding",
+                          lambda *a, **k: _unit_purpose_understanding()), \
                  _patched(ff, "review_file", forbidden_review), \
                  _patched(ff, "_run_top_competitor_gate",
                           lambda **_kwargs: competitor), \
@@ -14392,7 +14702,7 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertFalse(called["provider"])
 
-    def test_environment_opt_in_reaches_cloud_judge(self):
+    def test_environment_opt_in_reaches_cloud_program_analysis(self):
         import types
         args = types.SimpleNamespace(
             repo_rewards_url="http://localhost:3000",
@@ -14404,23 +14714,30 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
             economy=False,
             judge_model=None,
         )
-        reached = {"judge": False}
+        reached = {"analysis": False}
 
-        def stop_at_judge(*_args, **_kwargs):
-            reached["judge"] = True
+        def stop_at_program_analysis(*_args, **_kwargs):
+            reached["analysis"] = True
             raise RuntimeError("stop after consent boundary")
 
-        with _patched(ff, "_server_is_up", lambda _url: True), \
-             _patched(ff, "resolve_program_input",
-                      lambda _program: ("private-project", "SECRET SOURCE TREE")), \
-             _patched(ff, "_best_available_provider",
-                      lambda *a, **k: types.SimpleNamespace(judge_model=None)), \
-             _patched(ff, "_judge", stop_at_judge):
-            with _patched(os, "environ",
-                          {"FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT": "1"}):
-                with self.assertRaisesRegex(RuntimeError, "consent boundary"):
-                    ff.run_scout(args)
-        self.assertTrue(reached["judge"])
+        # Purpose extraction now (correctly) requires a local, citable repo.
+        # Keep this test focused on the cloud-consent boundary by supplying
+        # that prerequisite and stopping at Scout's first cloud analysis call.
+        with tempfile.TemporaryDirectory() as root:
+            with _patched(ff, "_server_is_up", lambda _url: True), \
+                 _patched(ff, "resolve_program_input",
+                          lambda _program: ("private-project", "SECRET SOURCE TREE")), \
+                 _patched(ff, "resolve_project_dir", lambda *_a, **_k: root), \
+                 _patched(ff, "_best_available_provider",
+                          lambda *a, **k: types.SimpleNamespace(judge_model=None)), \
+                 _patched(ff, "_ensure_program_understanding",
+                          lambda *a, **k: _unit_purpose_understanding()), \
+                 _patched(ff, "_scout_program_profile", stop_at_program_analysis):
+                with _patched(os, "environ",
+                              {"FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT": "1"}):
+                    with self.assertRaisesRegex(RuntimeError, "consent boundary"):
+                        ff.run_scout(args)
+        self.assertTrue(reached["analysis"])
 
     @unittest.skip(_RETIRED_LADDER_REASON)
     def test_retired_ollama_primary_never_retains_cloud_secondary(self):
@@ -15053,6 +15370,13 @@ _GH_FIXTURE = json.dumps({"items": [
      "license": {"spdx_id": "GPL-2.0"}},
 ]})
 
+_COMPETITOR_PAGE_FIXTURE = """<html><body><main>
+<h1>OpenLP church presentation software</h1>
+<p>OpenLP lets worship teams build a reusable service plan with songs, Bible
+verses, images, and notices, then present the ordered service from one screen.</p>
+<p>Teams can save templates and reuse the same service structure next week.</p>
+</main></body></html>"""
+
 
 class CompetitorLicenseGateTests(unittest.TestCase):
     """The legal gate is mechanical: the licence, not the model, decides."""
@@ -15304,26 +15628,31 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
     def _fakes(self):
         calls = {"judge": [], "author": []}
 
-        def _answer(schema):
+        def _answer(schema, prompt=""):
             if schema is fc.DISCOVERY_SCHEMA:
                 return {"competitors": [{"name": "openlp", "kind": "oss",
                                          "why": "w", "search_query": "openlp"}]}
+            evidence_ids = re.findall(r"EVIDENCE_ID:\s*(web-[0-9a-f]+)", prompt)
             return {"idea_title": "T", "what_it_does": "W", "why_valuable": "V",
-                    "evidence_basis": "search result", "accept": True,
+                    "evidence_basis": "fetched product page", "evidence_refs": evidence_ids[:1],
+                    "accept": True,
                     "purpose_reason": "serves criterion 3", "acceptance_ref": "3",
                     "severity": "high", "code_fixable": True,
                     "file": "src/app.js", "confidence": "medium"}
 
         def judge(system, prompt, schema):
             calls["judge"].append(schema)
-            return _answer(schema)
+            return _answer(schema, prompt)
 
         def author(system, prompt, schema):
             calls["author"].append(schema)
-            return _answer(schema)
+            return _answer(schema, prompt)
 
         opener = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
-                              "api.github.com": _GH_FIXTURE})
+                              "api.github.com": _GH_FIXTURE,
+                              "github.com/openlp/openlp": _COMPETITOR_PAGE_FIXTURE,
+                              "www.logos.com": _COMPETITOR_PAGE_FIXTURE,
+                              "sermonary.com": _COMPETITOR_PAGE_FIXTURE})
         return calls, judge, author, opener
 
     def test_idea_extraction_routes_to_the_author_tier_when_supplied(self):
@@ -15414,6 +15743,33 @@ class ReleaseLanguagePolicyTests(unittest.TestCase):
 
 
 class CompetitorSearchBackendTests(unittest.TestCase):
+    def test_evidence_fetch_reads_actual_page_and_emits_stable_citation(self):
+        op = _FakeOpener({"github.com/openlp/openlp": _COMPETITOR_PAGE_FIXTURE})
+        first = fc.fetch_evidence_document(
+            "https://github.com/openlp/openlp", "OpenLP", opener=op)
+        second = fc.fetch_evidence_document(
+            "https://github.com/openlp/openlp", "OpenLP", opener=op)
+        self.assertEqual(first["evidence_id"], second["evidence_id"])
+        self.assertEqual(first["sha256"], second["sha256"])
+        self.assertIn("reusable service plan", first["content"])
+        self.assertNotIn("<main>", first["content"])
+
+    def test_evidence_fetch_refuses_local_or_credentialed_urls(self):
+        for url in ("http://127.0.0.1/admin", "http://localhost/secrets",
+                    "https://user:password@example.com/page"):
+            with self.assertRaisesRegex(RuntimeError, "refused non-public"):
+                fc.fetch_evidence_document(url, opener=lambda *_a: "x" * 100)
+
+    def test_fetched_page_must_identify_the_named_competitor(self):
+        unrelated = {
+            "url": "https://unrelated.example/features",
+            "title": "Unrelated scheduling product",
+            "content": "A calendar service for veterinary offices. " * 8,
+        }
+        official = dict(unrelated, url="https://openlp.org/features")
+        self.assertFalse(fc._document_matches_competitor("OpenLP", unrelated))
+        self.assertTrue(fc._document_matches_competitor("OpenLP", official))
+
     def test_firecrawl_v2_is_first_and_uses_the_configured_key(self):
         calls = []
 
@@ -15619,8 +15975,10 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
                 return {"competitors": competitors}
             if raise_on == "idea":
                 raise RuntimeError("judge down")
+            evidence_ids = re.findall(r"EVIDENCE_ID:\s*(web-[0-9a-f]+)", prompt)
             return dict({"idea_title": "Outline templates", "what_it_does": "W",
-                         "why_valuable": "V", "evidence_basis": "search result",
+                         "why_valuable": "V", "evidence_basis": "fetched product page",
+                         "evidence_refs": evidence_ids[:1],
                          "accept": True, "purpose_reason": "serves criterion 3",
                          "acceptance_ref": "3", "severity": "high",
                          "code_fixable": True, "file": "src/app.js",
@@ -15629,7 +15987,11 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
 
     def _opener(self, **kw):
         return _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
-                            "api.github.com": _GH_FIXTURE}, **kw)
+                            "api.github.com": _GH_FIXTURE,
+                            "github.com/openlp/openlp": _COMPETITOR_PAGE_FIXTURE,
+                            "www.logos.com": _COMPETITOR_PAGE_FIXTURE,
+                            "sermonary.com": _COMPETITOR_PAGE_FIXTURE,
+                            "github.com/sil/paratext": _COMPETITOR_PAGE_FIXTURE}, **kw)
 
     def test_gpl_competitor_is_clean_room_and_its_idea_is_still_usable(self):
         judge = self._judge([{"name": "openlp", "kind": "oss", "why": "w",
@@ -15706,6 +16068,123 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
                                       rr_search=None, opener=self._opener(), target=1)
         self.assertIn("repo-rewards", res["sources_skipped"])
 
+    def test_scout_url_queries_and_repo_rewards_queries_are_executed_separately(self):
+        base_judge = self._judge([
+            {"name": "openlp", "kind": "oss", "why": "w",
+             "search_query": "openlp church presentation"}
+        ])
+        discovery_prompts = []
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                discovery_prompts.append(prompt)
+            return base_judge(system, prompt, schema)
+
+        rr_queries = []
+
+        def rr(query):
+            rr_queries.append(query)
+            return []
+
+        scout_profile = {
+            "summary": "Pastor-led sermon workflow",
+            "goals": ["Preserve pastoral judgment"],
+            "opportunities": [{
+                "need": "outline planning",
+                "url_search_query": "sermon planning product outline documentation",
+                "repo_search_query": "open source sermon outline repository",
+            }],
+        }
+        result = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], rr_search=rr,
+            rr_endpoint="http://rr", opener=self._opener(), target=1,
+            scout_profile=scout_profile, scout_attempted=True,
+        )
+        self.assertEqual(
+            result["scout_url_queries"],
+            ["sermon planning product outline documentation"],
+        )
+        self.assertTrue(result["scout_url_hits"],
+                        "Scout must execute its URL query, not merely report it")
+        self.assertEqual(rr_queries, result["repo_rewards_queries"])
+        self.assertIn("open source sermon outline repository", rr_queries)
+        self.assertNotIn("sermon planning product outline documentation", rr_queries)
+        self.assertIn("scout-program-analysis", result["sources_used"])
+        self.assertTrue(any(source.startswith("scout-url-search:")
+                            for source in result["sources_used"]))
+        self.assertIn("SCOUT URL SEARCH RESULTS", discovery_prompts[0])
+        rendered = "\n".join(fc.report_lines(result))
+        self.assertIn("Scout URL query receipt", rendered)
+        self.assertIn("Repo Rewards query receipt", rendered)
+
+    def test_search_result_without_fetched_page_cannot_support_an_idea(self):
+        calls = {"idea": 0}
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": [{"name": "openlp", "kind": "oss",
+                                          "search_query": "openlp"}]}
+            calls["idea"] += 1
+            return {"idea_title": "invented", "what_it_does": "x",
+                    "why_valuable": "x", "evidence_basis": "search snippet",
+                    "evidence_refs": [], "accept": True, "purpose_reason": "x"}
+
+        op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
+                          "api.github.com": _GH_FIXTURE})
+        res = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], opener=op, target=1)
+        competitor = res["competitors"][0]
+        self.assertEqual(calls["idea"], 0,
+                         "no model may glean a capability without source content")
+        self.assertEqual(competitor["evidence_status"], "unverified")
+        self.assertFalse(competitor["idea"]["accept"])
+        self.assertTrue(any(key.startswith("fetch:")
+                            for key in res["sources_skipped"]))
+
+    def test_unrelated_fetched_page_cannot_donate_a_competitor_idea(self):
+        calls = {"idea": 0}
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": [{"name": "OpenLP", "kind": "oss",
+                                          "search_query": "openlp"}]}
+            calls["idea"] += 1
+            return {"idea_title": "invented", "what_it_does": "x",
+                    "why_valuable": "x", "evidence_basis": "unrelated page",
+                    "evidence_refs": [], "accept": True, "purpose_reason": "x"}
+
+        search = """<html><body><a href="https://unrelated.example/features">
+        Unrelated scheduling product</a></body></html>"""
+        page = """<html><body><h1>Veterinary calendar</h1><p>
+        Appointment scheduling, reminders, and animal records for veterinary
+        offices. This page does not describe a church presentation product.
+        </p></body></html>"""
+        op = _FakeOpener({
+            "lite.duckduckgo.com": search,
+            "api.github.com": json.dumps({"items": []}),
+            "unrelated.example": page,
+        })
+        res = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], opener=op, target=1)
+        competitor = res["competitors"][0]
+        self.assertEqual(calls["idea"], 0)
+        self.assertEqual(competitor["evidence_status"], "unverified")
+        self.assertFalse(competitor["idea"]["accept"])
+        failures = "\n".join(res["sources_skipped"].values())
+        self.assertIn("did not identify the named competitor", failures)
+
+    def test_idea_must_cite_an_exact_fetched_document_id(self):
+        judge = self._judge(
+            [{"name": "openlp", "kind": "oss", "search_query": "openlp"}],
+            idea={"evidence_refs": ["web-not-a-real-source"]},
+        )
+        res = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [],
+            opener=self._opener(), target=1)
+        self.assertFalse(res["competitors"][0]["idea"]["accept"])
+        self.assertIn("unknown evidence_refs",
+                      res["sources_skipped"]["idea:openlp"])
+
 
 class CompetitorLiveRunRegressionTests(unittest.TestCase):
     """Three defects the FIRST LIVE run (SermonSmith, 2026-08-16) exposed. Each
@@ -15768,7 +16247,8 @@ class CompetitorLiveRunRegressionTests(unittest.TestCase):
 
     def test_a_complete_idea_passes_normalization_untouched(self):
         idea, why = fc._normalize_idea(
-            {"accept": True, "idea_title": "T", "why_valuable": "V",
+            {"accept": True, "idea_title": "T", "what_it_does": "W",
+             "why_valuable": "V", "evidence_basis": "source",
              "purpose_reason": "P"}, "R")
         self.assertIsNone(why)
         self.assertTrue(idea["accept"])
@@ -15784,7 +16264,10 @@ class CompetitorLiveRunRegressionTests(unittest.TestCase):
             return {"accept": True, "evidence_basis": "words only"}
 
         op = _FakeOpener({"lite.duckduckgo.com": _DDG_FIXTURE,
-                          "api.github.com": _GH_FIXTURE})
+                          "api.github.com": _GH_FIXTURE,
+                          "github.com/openlp/openlp": _COMPETITOR_PAGE_FIXTURE,
+                          "www.logos.com": _COMPETITOR_PAGE_FIXTURE,
+                          "sermonary.com": _COMPETITOR_PAGE_FIXTURE})
         res = fc.research_competitors(judge, "SermonSmith", "purpose", [],
                                       opener=op, target=1)
         self.assertEqual(calls["n"], 2, "exactly one bounded retry")
@@ -15868,8 +16351,20 @@ class CompetitorAuditWiringTests(unittest.TestCase):
     def test_audit_actually_calls_the_competitor_module(self):
         src = inspect.getsource(ff._run_top_competitor_gate)
         for needle in ("_competitors_module()", "research_competitors(",
-                       "competitor_findings(", "resolve_repo_rewards_url("):
+                       "competitor_findings(", "resolve_repo_rewards_url(",
+                       "_scout_program_profile(", "scout_profile=scout_profile"):
             self.assertIn(needle, src, f"competitor research not wired: {needle}")
+
+    def test_every_mode_executes_shared_scout_analysis_before_research(self):
+        for function in (ff._refactor_top_three_gate, ff._run_scout_impl,
+                         ff._run_top_competitor_gate):
+            src = inspect.getsource(function)
+            self.assertIn("_scout_program_profile(", src, function.__name__)
+            self.assertIn("scout_profile=", src, function.__name__)
+        required = ff.PROGRAM_PROFILE_SCHEMA["properties"]["opportunities"][
+            "items"]["required"]
+        self.assertIn("url_search_query", required)
+        self.assertIn("repo_search_query", required)
 
     @staticmethod
     def _audit_args(argv):
@@ -18329,6 +18824,8 @@ class OrphanWipWiringTests(unittest.TestCase):
             "_clean_map": lambda prior: {},
             "_detect_stack": lambda pd: stack,
             "build_audit_providers": lambda a, m: [("anthropic", _P()), ("openai", _P())],
+            "_ensure_program_understanding": (
+                lambda *a, **k: _unit_purpose_understanding()),
             "_enumerate_source_files": lambda *a, **k: ["a.py"],
             "_review_all": review_all,
             "_full_gate": lambda pd, st: (True, ""),

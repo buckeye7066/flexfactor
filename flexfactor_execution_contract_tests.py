@@ -80,11 +80,40 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaises(execution.OrchestrationOrderError):
             coordinator.start_target(1)
 
+    def test_refactor_receipt_cannot_claim_a_whole_repository_pass(self):
+        root = tempfile.mkdtemp(prefix="ff-refactor-scope-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        coordinator = execution.SequentialOrchestrator(
+            "refactor", ["src/a.py"],
+            state_path=os.path.join(root, "queue.json"), queue_id="refactor-scope")
+        coordinator.start_target(0)
+        with self.assertRaisesRegex(execution.OrchestrationOrderError, "selected-file"):
+            coordinator.begin_pass(1, ["src/a.py"], whole_repository=True)
+        coordinator.begin_pass(
+            1, ["src/a.py"], scope_kind="selected-file", exhaustive=False)
+        record = coordinator.snapshot()["items"][0]["passes"][0]
+        self.assertEqual(record["scope"], "selected-file")
+        self.assertFalse(record["exhaustive"])
+
+    def test_scout_receipt_records_understanding_not_a_semantic_audit(self):
+        root = tempfile.mkdtemp(prefix="ff-scout-scope-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        coordinator = execution.SequentialOrchestrator(
+            "scout", ["repo"], state_path=os.path.join(root, "queue.json"),
+            queue_id="scout-scope")
+        coordinator.start_target(0)
+        coordinator.begin_pass(
+            1, ["README.md"], scope_kind="repository-understanding",
+            exhaustive=False)
+        record = coordinator.snapshot()["items"][0]["passes"][0]
+        self.assertEqual(record["scope"], "repository-understanding")
+        self.assertFalse(record["exhaustive"])
+
     def test_pass_two_requires_the_competitor_gate(self):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
         coordinator.begin_pass(1, ["a.py", "b.py"], whole_repository=True)
-        coordinator.finish_pass(1, ["a.py"])
+        coordinator.finish_pass(1, ["a.py"], reviewed_files=["a.py", "b.py"])
         with self.assertRaisesRegex(execution.OrchestrationOrderError, "competitor"):
             coordinator.begin_pass(2, ["a.py"])
         coordinator.record_competitor_gate(
@@ -98,13 +127,49 @@ class OrchestratorTests(unittest.TestCase):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
         coordinator.begin_pass(1, ["a.py", "b.py"], whole_repository=True)
-        coordinator.finish_pass(1, ["a.py"])
+        coordinator.finish_pass(1, ["a.py"], reviewed_files=["a.py", "b.py"])
         coordinator.record_competitor_gate(
             attempted=True, implemented_files=["b.py"], verified=3
         )
         for wrong in (["a.py"], ["a.py", "b.py", "c.py"], ["b.py", "a.py"]):
             with self.assertRaisesRegex(execution.OrchestrationOrderError, "exactly"):
                 coordinator.begin_pass(2, wrong)
+
+    def test_exhaustive_pass_refuses_a_missing_file_review(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py", "README.md"], whole_repository=True)
+        with self.assertRaisesRegex(
+                execution.OrchestrationOrderError, "lack a completed review"):
+            coordinator.finish_pass(
+                1, [], reviewed_files=["a.py"],
+                incomplete_files=["README.md"])
+        record = coordinator.snapshot()["items"][0]["passes"][0]
+        self.assertEqual(record["status"], "running")
+        self.assertEqual(record["reconciliation"]["missing_review_files"],
+                         ["README.md"])
+
+    def test_exhaustive_pass_refuses_an_unattempted_repair(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        with self.assertRaisesRegex(
+                execution.OrchestrationOrderError, "not attempted"):
+            coordinator.finish_pass(
+                1, [], reviewed_files=["a.py"],
+                repair_candidate_files=["a.py"], repair_attempted_files=[])
+
+    def test_exhaustive_pass_accepts_reviewed_and_attempted_population(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py", "README.md"], whole_repository=True)
+        changed = coordinator.finish_pass(
+            1, ["a.py"], reviewed_files=["a.py", "README.md"],
+            repair_candidate_files=["a.py"], repair_attempted_files=["a.py"])
+        self.assertEqual(changed, ["a.py"])
+        record = coordinator.snapshot()["items"][0]["passes"][0]
+        self.assertTrue(record["exhaustive"])
+        self.assertEqual(record["status"], "completed")
 
     def test_success_is_refused_while_a_pass_is_active(self):
         coordinator = self._coordinator(("repo",))
@@ -138,7 +203,7 @@ class OrchestratorTests(unittest.TestCase):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
         coordinator.begin_pass(1, ["a.py"], whole_repository=True)
-        coordinator.finish_pass(1, ["a.py"])
+        coordinator.finish_pass(1, ["a.py"], reviewed_files=["a.py"])
         coordinator.record_competitor_gate(
             attempted=True, implemented_files=[], verified=3
         )
@@ -151,7 +216,7 @@ class OrchestratorTests(unittest.TestCase):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
         coordinator.begin_pass(1, ["a.py"], whole_repository=True)
-        coordinator.finish_pass(1, [])
+        coordinator.finish_pass(1, [], reviewed_files=["a.py"])
         coordinator.record_competitor_gate(
             attempted=False, implemented_files=[], verified=0,
             not_applicable=True,
@@ -166,7 +231,7 @@ class OrchestratorTests(unittest.TestCase):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
         coordinator.begin_pass(1, ["a.py"], whole_repository=True)
-        coordinator.finish_pass(1, ["a.py"])
+        coordinator.finish_pass(1, ["a.py"], reviewed_files=["a.py"])
         with self.assertRaisesRegex(
                 execution.OrchestrationOrderError, "not applicable"):
             coordinator.record_competitor_gate(
@@ -205,8 +270,11 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(active, [])
             active.append(target)
             observed.append((target, index, total))
-            coordinator.begin_pass(1, [target], whole_repository=True)
-            coordinator.finish_pass(1, [])
+            coordinator.begin_pass(
+                1, [target], whole_repository=False,
+                scope_kind="repository-understanding", exhaustive=False,
+            )
+            coordinator.finish_pass(1, [], reviewed_files=[target])
             coordinator.record_competitor_gate(
                 attempted=True, implemented_files=[], verified=3
             )
@@ -232,7 +300,7 @@ class OrchestratorTests(unittest.TestCase):
             if target == "one":
                 raise RuntimeError("first target broke")
             coordinator.begin_pass(1, ["two.py"], whole_repository=True)
-            coordinator.finish_pass(1, [])
+            coordinator.finish_pass(1, [], reviewed_files=["two.py"])
             coordinator.record_competitor_gate(
                 attempted=True, implemented_files=[], verified=3
             )
