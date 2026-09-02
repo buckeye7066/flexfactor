@@ -222,8 +222,10 @@ jobs:
           authorized_main_sha="$GITHUB_SHA"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             test "$GITHUB_REF_NAME" = "$release_tag"
-            authorized_main_sha=$(git ls-remote --exit-code origin refs/heads/main \
-              | awk '$2 == "refs/heads/main" {print $1}')
+            git fetch --no-tags origin \
+              '+refs/heads/main:refs/remotes/origin/release-authorized-main'
+            authorized_main_sha=$(git rev-parse \
+              refs/remotes/origin/release-authorized-main)
             printf '%s' "$authorized_main_sha" | grep -Eq '^[0-9a-f]{40}$' \
               || { echo "Could not bind the tag run to live main" >&2; exit 1; }
             git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha" \
