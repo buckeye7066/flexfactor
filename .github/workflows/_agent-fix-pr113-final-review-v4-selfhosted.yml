@@ -1,0 +1,57 @@
+name: agent-fix-pr113-final-review-v4-selfhosted
+
+on:
+  push:
+    branches: ["ai/futuretools-tenets-context"]
+    paths:
+      - .github/workflows/_agent-fix-pr113-final-review-v4-selfhosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flexfactor-pr113-final-review-v4
+  cancel-in-progress: false
+
+jobs:
+  repair-test-push:
+    runs-on: [self-hosted, linux, x64, flexfactor-hardened]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ai/futuretools-tenets-context
+          fetch-depth: 0
+
+      - name: Apply and verify final review repairs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          import re
+
+          workflow = Path(".github/workflows/_agent-fix-pr113-final-review-v2.yml").read_text(encoding="utf-8")
+          match = re.search(r"printf '%s' '([A-Za-z0-9+/=]+)' \\| base64", workflow)
+          if match is None:
+              raise SystemExit("repair payload not found")
+          Path("/tmp/fix-pr113.py").write_bytes(base64.b64decode(match.group(1), validate=True))
+          PY
+          python3 /tmp/fix-pr113.py
+          rm -f \
+            .github/workflows/_agent-fix-pr113-final-review-v3.yml \
+            .github/workflows/_agent-fix-pr113-final-review-v4-selfhosted.yml
+          git diff --check
+          python3 -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          python3 flexfactor_tenets_tests.py
+          ! grep -n "^[[:space:]]*exec(" flexfactor_tenets_tests.py
+
+      - name: Commit and push verified repairs
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: remove Tenets enumeration ceiling and exec fixture"
+          git push origin HEAD:ai/futuretools-tenets-context
