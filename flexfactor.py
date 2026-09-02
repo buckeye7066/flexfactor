@@ -4186,6 +4186,11 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     if route.api not in ("openai", "anthropic", "gemini", "ollama", "cursor",
                          "codex-cli", "claude-code", "copilot-cli"):
         return f"unsupported api '{route.api}'"
+    quota_status = str(getattr(route, "quota_status", "") or "").strip().lower()
+    if quota_status in ("exhausted", "depleted", "out", "blocked"):
+        reset = str(getattr(route, "resets_at", "") or "").strip()
+        return (f"AI Time reports quota {quota_status}"
+                + (f" until {reset}" if reset else ""))
     # PAID ROUTES ROTATE (owner order 2026-08-21: "Paid can be rotated in until
     # exhausted. Leave no routes blocked."). This filter no longer excludes them;
     # the bound is the one that can actually measure spend:
@@ -4399,18 +4404,13 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     # The sequential orchestrator is the product control plane. A legacy
     # AI_ROTATE=off value may no longer bypass its one best-available policy.
     catalog = fr.load_catalog()
-    builtin = _builtin_route_catalog(fr)
     if catalog is None:
-        catalog = fr.Catalog(routes=builtin, generated_at="built-in",
+        # Bootstrap only when AI Time has not published a catalog. Once its
+        # catalog exists, its measured machine/account availability is the
+        # authority; prepending guessed routes here can resurrect a model AI
+        # Time deliberately omitted or marked exhausted.
+        catalog = fr.Catalog(routes=_builtin_route_catalog(fr), generated_at="built-in",
                              age_seconds=0.0, path="built-in")
-    else:
-        catalog = fr.Catalog(
-            routes=builtin + [route for route in catalog.routes
-                              if route.id not in {item.id for item in builtin}],
-            generated_at=catalog.generated_at,
-            age_seconds=catalog.age_seconds,
-            path=catalog.path,
-        )
     hydrated = _hydrate_route_credentials(catalog.enabled())
     if hydrated and not quiet:
         print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
