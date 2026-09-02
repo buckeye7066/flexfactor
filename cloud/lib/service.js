@@ -316,7 +316,10 @@ export async function repositories(token, requestedPage = 1, fetchImpl = fetch) 
   return {
     repositories: rows,
     page,
-    has_more: result.length === REPOSITORY_PAGE_SIZE && page < MAX_REPOSITORY_PAGES,
+    // Keep this true on page 100 when GitHub returned a full page. The phone
+    // then fails loudly at its matching safety limit instead of presenting a
+    // silently truncated repository list as complete.
+    has_more: result.length === REPOSITORY_PAGE_SIZE,
   };
 }
 

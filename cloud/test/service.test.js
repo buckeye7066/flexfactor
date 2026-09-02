@@ -140,6 +140,9 @@ test("repository discovery returns one bounded page of administrable targets", a
   assert.equal(fetcher.calls.length, 1);
   assert.match(fetcher.calls[0].url, /per_page=100&page=7/);
   assert.equal(result.repositories[0].private, true);
+  const lastPage = await repositories("gho_repository_token", 100,
+    queuedFetch([{ body: first }]));
+  assert.equal(lastPage.has_more, true);
   await assert.rejects(() => repositories("gho_repository_token", 101, fetcher),
     (error) => error instanceof ServiceError && error.code === "invalid_page");
 });
