@@ -80,5 +80,5 @@ its abuse bound, it refuses rather than risk a duplicate dispatch.
 - Windows does not provide OS-enforced network isolation in this release.
 - Explicitly trusted repositories can execute their own declared build/test
   commands with the authority granted by the host.
-- GitHub branch rules or required human approval can keep a PR open; that state
-  remains incomplete and is never reported as published.
+- GitHub branch rules can keep a PR open while an additional approval is
+  outstanding; that state remains incomplete and is never reported as published.
