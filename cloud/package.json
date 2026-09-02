@@ -1,0 +1,13 @@
+{
+  "name": "flexfactor-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check lib/*.js && node --check api/**/*.js"
+  }
+}
