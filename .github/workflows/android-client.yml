@@ -177,6 +177,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.plan.outputs.release_tag }}
       should_publish: ${{ steps.plan.outputs.should_publish }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,6 +190,7 @@ jobs:
         id: plan
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           PREVIOUS_MAIN_SHA: ${{ github.event.before }}
         run: |
           read_version() {
@@ -198,6 +200,7 @@ jobs:
           test -n "$version_name"
           release_tag="android-v${version_name}"
           should_publish=false
+          source_sha="$GITHUB_SHA"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             test "$GITHUB_REF_NAME" = "$release_tag"
             should_publish=true
@@ -210,20 +213,86 @@ jobs:
             previous_version=$(git show \
               "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
             test -n "$previous_version"
-            if [ "$version_name" != "$previous_version" ]; then
+            version_changed=false
+            if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
+
+            set +e
+            tag_rows=$(git ls-remote --exit-code --tags origin \
+              "refs/tags/$release_tag" "refs/tags/$release_tag^{}")
+            tag_lookup_rc=$?
+            set -e
+            if [ "$tag_lookup_rc" -eq 2 ]; then
+              # No matching ref is the only lookup failure that means missing.
               should_publish=true
-            fi
-            # A failed or historically skipped release must be recoverable on
-            # the next reviewed main commit even when the version file itself
-            # is unchanged. The publisher still rejects an existing tag that
-            # points anywhere other than this exact source revision.
-            if ! git ls-remote --exit-code --tags origin \
-                "refs/tags/$release_tag" >/dev/null 2>&1; then
-              should_publish=true
+            elif [ "$tag_lookup_rc" -ne 0 ]; then
+              echo "Could not determine whether $release_tag exists" >&2
+              exit "$tag_lookup_rc"
+            else
+              tag_commit=$(printf '%s\n' "$tag_rows" \
+                | awk -v peeled="refs/tags/$release_tag^{}" \
+                    '$2 == peeled {print $1; found=1} END {if (!found) exit 1}') \
+                || tag_commit=$(printf '%s\n' "$tag_rows" \
+                  | awk -v exact="refs/tags/$release_tag" '$2 == exact {print $1}')
+              printf '%s' "$tag_commit" | grep -Eq '^[0-9a-f]{40}$' \
+                || { echo "Could not resolve $release_tag to a commit" >&2; exit 1; }
+              git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA" \
+                || { echo "$release_tag is not an ancestor of main" >&2; exit 1; }
+              tag_version=$(git show \
+                "${tag_commit}:android/app/build.gradle.kts" | read_version)
+              test "$tag_version" = "$version_name"
+              if [ "$version_changed" = true ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The newly declared version already belongs to another commit" >&2
+                exit 1
+              fi
+
+              release_json="$RUNNER_TEMP/android-release.json"
+              set +e
+              release_status=$(curl --silent --show-error --location \
+                --output "$release_json" --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")
+              release_lookup_rc=$?
+              set -e
+              if [ "$release_lookup_rc" -ne 0 ]; then
+                echo "Could not determine whether the GitHub Release is complete" >&2
+                exit "$release_lookup_rc"
+              fi
+              if [ "$release_status" = 404 ]; then
+                should_publish=true
+                source_sha="$tag_commit"
+              elif [ "$release_status" = 200 ]; then
+                jq -e 'type == "object"' "$release_json" >/dev/null \
+                  || { echo "GitHub returned invalid release metadata" >&2; exit 1; }
+                set +e
+                jq -e \
+                    --arg tag "$release_tag" \
+                    --arg apk "flexfactor-${version_name}.apk" \
+                    --arg aab "flexfactor-${version_name}.aab" \
+                    '.tag_name == $tag and .draft == false and .prerelease == false
+                     and ([.assets[]?.name] | index($apk)) != null
+                     and ([.assets[]?.name] | index($aab)) != null
+                     and ([.assets[]?.name] | index("android-update.json")) != null' \
+                    "$release_json" >/dev/null
+                release_complete_rc=$?
+                set -e
+                if [ "$release_complete_rc" -eq 1 ]; then
+                  should_publish=true
+                  source_sha="$tag_commit"
+                elif [ "$release_complete_rc" -ne 0 ]; then
+                  echo "GitHub returned invalid release asset metadata" >&2
+                  exit 1
+                fi
+              else
+                echo "GitHub Release lookup returned HTTP $release_status" >&2
+                exit 1
+              fi
             fi
           fi
           printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
           printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
 
   release:
     name: android-release
@@ -236,9 +305,11 @@ jobs:
     environment: android-release
     env:
       RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.release-plan.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.release-plan.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
@@ -282,7 +353,7 @@ jobs:
           test -s "$apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" | tee android/app/build/outputs/apk/release/CERTIFICATE.txt
           (cd android/app/build/outputs/apk/release && sha256sum app-release.apk > SHA256SUMS)
-          printf '%s\n' "${GITHUB_SHA}" > android/app/build/outputs/apk/release/SOURCE_COMMIT
+          printf '%s\n' "$SOURCE_SHA" > android/app/build/outputs/apk/release/SOURCE_COMMIT
           aab_dir="android/app/build/outputs/bundle/play"
           aab="$aab_dir/app-play.aab"
           test -s "$aab"
@@ -291,7 +362,7 @@ jobs:
             -keystore "$RUNNER_TEMP/flexfactor-release.jks" \
             -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
-          printf '%s\n' "${GITHUB_SHA}" > "$aab_dir/SOURCE_COMMIT"
+          printf '%s\n' "$SOURCE_SHA" > "$aab_dir/SOURCE_COMMIT"
       - name: Create signed update manifest
         shell: bash
         run: |
@@ -333,8 +404,8 @@ jobs:
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             tag_exists=true
             tag_commit=$(resolve_tag_commit)
-            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
-              echo "Existing tag $RELEASE_TAG targets $tag_commit, not exact source $GITHUB_SHA" >&2
+            if [ "$tag_commit" != "$SOURCE_SHA" ]; then
+              echo "Existing tag $RELEASE_TAG targets $tag_commit, not exact source $SOURCE_SHA" >&2
               exit 1
             fi
           fi
@@ -383,9 +454,9 @@ jobs:
               --prerelease=false \
               --latest \
               --title "FlexFactor Android ${version_name}" \
-              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+              --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
           else
-            create_ref_args=(--target "$GITHUB_SHA")
+            create_ref_args=(--target "$SOURCE_SHA")
             if [ "$tag_exists" = true ]; then
               create_ref_args=(--verify-tag)
             fi
@@ -396,12 +467,12 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               "${create_ref_args[@]}" \
               --title "FlexFactor Android ${version_name}" \
-              --notes "Signed FlexFactor Android release from exact source commit ${GITHUB_SHA}."
+              --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
           fi
       - name: Upload signed exact-commit Android release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: flexfactor-android-${{ env.RELEASE_TAG }}-${{ github.sha }}
+          name: flexfactor-android-${{ env.RELEASE_TAG }}-${{ needs.release-plan.outputs.source_sha }}
           path: |
             android/app/build/outputs/apk/release/app-release.apk
             android/app/build/outputs/apk/release/CERTIFICATE.txt
