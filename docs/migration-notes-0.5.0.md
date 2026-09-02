@@ -17,7 +17,8 @@ Authorize ONE of:
    `{"trusted_repos": ["C:\\Users\\firer\\GrantFlow", "C:\\Users\\firer"]}` -
    a parent directory trusts everything under it (path-prefix match).
 3. `flexfactor audit|prodready|scout ... --trust-repo` for one run. All three
-   accept it; options 1 or 2 make the trust persistent for scheduled runs.
+   accept it; the run grant is scoped and cleared on every success/failure
+   exit, while options 1 or 2 make trust persistent for scheduled runs.
 
 Launchers/schtasks that audit repos under `C:\Users\firer` need 1 or 2 before
 the next scheduled run, or every overnight program will stop at bootstrap.

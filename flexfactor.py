@@ -6129,15 +6129,41 @@ _TARGET_CODE_CLASSES = frozenset({"install", "build", "test"})
 # on what basis (os-sandbox vs trusted-repo), or why it was refused.
 _EXECUTION_LEDGER: list[dict] = []
 
-# Per-run authorization (--trust-repo). Recorded, never the default.
-_RUN_TRUST_OVERRIDE: dict[str, bool] = {}
+# Per-run authorization (--trust-repo). Recorded, never the default. Counts are
+# reference-counted because two independent entry paths can temporarily trust
+# the same repository; one finishing must not revoke the other's live grant.
+_RUN_TRUST_OVERRIDE: dict[str, int] = {}
+_RUN_TRUST_LOCK = threading.Lock()
+
+
+def _grant_run_trust(project_dir: str) -> str:
+    key = os.path.normcase(os.path.abspath(project_dir))
+    with _RUN_TRUST_LOCK:
+        _RUN_TRUST_OVERRIDE[key] = int(_RUN_TRUST_OVERRIDE.get(key, 0)) + 1
+    return key
+
+
+def _revoke_run_trust(key: str | None) -> None:
+    if not key:
+        return
+    with _RUN_TRUST_LOCK:
+        remaining = int(_RUN_TRUST_OVERRIDE.get(key, 0)) - 1
+        if remaining > 0:
+            _RUN_TRUST_OVERRIDE[key] = remaining
+        else:
+            _RUN_TRUST_OVERRIDE.pop(key, None)
+
+
+def _run_trust_allowed(project_dir: str) -> bool:
+    key = os.path.normcase(os.path.abspath(project_dir))
+    with _RUN_TRUST_LOCK:
+        return bool(_RUN_TRUST_OVERRIDE.get(key))
 
 
 def _execution_authorization(cwd: str) -> tuple[dict | None, str]:
     """(basis_dict, refusal_reason). basis_dict is None when execution is refused."""
-    root = os.path.normcase(os.path.abspath(cwd))
     decision = _ff_trust.trust_decision(
-        cwd, allow_untrusted=bool(_RUN_TRUST_OVERRIDE.get(root)))
+        cwd, allow_untrusted=_run_trust_allowed(cwd))
     try:
         basis = _ff_sandbox.require_containment_or_trust(cwd, trust_decision=decision)
     except _ff_sandbox.ContainmentUnavailable as ex:
@@ -8138,7 +8164,7 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
-def run_scout(args) -> int:
+def _run_scout_impl(args) -> int:
     requested_url = args.repo_rewards_url.rstrip("/")
 
     # 1. Pick the Repo Rewards endpoint (the search backend). Local wins when it
@@ -8361,6 +8387,22 @@ def run_scout(args) -> int:
               file=sys.stderr)
         return 4
     return 0
+
+
+def run_scout(args) -> int:
+    """Run Scout with any explicit repository trust scoped to this invocation."""
+    trust_key = None
+    if getattr(args, "trust_repo", False):
+        # Resolve through the same aliases/shortcuts Scout accepts so
+        # --trust-repo authorizes precisely the local repository it will use.
+        display_name, _context = resolve_program_input(args.program)
+        project_dir = resolve_project_dir(args.program, display_name)
+        if project_dir and os.path.isdir(project_dir):
+            trust_key = _grant_run_trust(project_dir)
+    try:
+        return _run_scout_impl(args)
+    finally:
+        _revoke_run_trust(trust_key)
 
 
 def _qualifies_for_apply(evaluation: dict, apply_tier: str) -> bool:
@@ -15174,6 +15216,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     evidence_state_root = ""
     baseline_code_index = None
     initial_commit = None
+    trust_override_key = None
     # Live console meter (spinner/heartbeat). Created up front so `finally` can
     # always stop it; started once the program is resolved and reporting begins.
     console_meter = ConsoleMeter()
@@ -15195,7 +15238,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # click) - they'd share one sandbox branch + status slot and double-spend.
         if getattr(args, "trust_repo", False):
             # Run-level execution authorization for THIS repository (recorded).
-            _RUN_TRUST_OVERRIDE[os.path.normcase(os.path.abspath(project_dir))] = True
+            trust_override_key = _grant_run_trust(project_dir)
             result["trust_repo_override"] = True
         lock_path = _acquire_audit_lock(project_dir)
         if lock_path is None:
@@ -18350,6 +18393,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         _restore_wip_if_active(project_dir if "project_dir" in dir() else None, result, pfx)
         console_meter.stop()  # erase the meter line + restore builtins.print
         _release_audit_lock(lock_path)
+        _revoke_run_trust(trust_override_key)
 
 
 def _launch_dashboard(total: int) -> None:

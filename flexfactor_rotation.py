@@ -1226,7 +1226,11 @@ class RotatingProvider:
         # Best-available mode keeps the descending paid-to-free ladder active
         # for every bounded retry. A quota refusal cools its allowance, so the
         # next attempt chooses the next usable paid tier before reaching free.
-        self._paid_first = bool(paid_first and allow_paid)
+        # Preserve the ordering policy even when metered spend is forbidden.
+        # Subscription routes report is_free=True while still consuming paid
+        # capacity; paid_first must exclude them until genuinely free/local
+        # capacity is reached.
+        self._paid_first = bool(paid_first)
         self.meter = meter
         self._on_route = on_route
         # Called for EVERY route failure, retryable or not, so the run's error

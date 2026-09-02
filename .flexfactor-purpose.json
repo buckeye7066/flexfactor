@@ -36,7 +36,7 @@
     },
     {
       "id": "cb-6",
-      "text": "Android persists a 30-target sequential queue and uses each request UUID to recover an existing GitHub workflow instead of duplicating dispatch after a crash.",
+      "text": "Android persists a 30-target sequential queue; the cloud atomically claims each request UUID, recovers an existing GitHub workflow instead of duplicating dispatch after a crash, and removes phone-supplied secrets at terminal status.",
       "confidence": "verified",
       "evidence_refs": [3, 4, 6]
     }
@@ -195,15 +195,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "60cb47c005fd4dceedbb20cdbf5e00d83e10a3a7bd7e6bd79e667a155e0d3755",
-      "observed_at": "2026-09-02T10:33:33Z",
+      "content_hash": "52fa95b442c79e58159a8d5197ee2b78069e76cae4de62a9d79953c1731c5f80",
+      "observed_at": "2026-09-02T11:32:00Z",
       "excerpt": "Best-available ladder and shared strict author-family exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "f50511c4a090f37101228c0ab394c2ab2b2e3834aafad7ef97c94fcb7c0d942b",
-      "observed_at": "2026-09-02T10:33:33Z",
+      "content_hash": "71a119ec470271d3a6ab024322e0add6021f43a3aa3b8cb8e9dcb2609f755f0e",
+      "observed_at": "2026-09-02T11:32:00Z",
       "excerpt": "Four modes, mutation preflight, verification, review, and exact-default-branch publication."
     },
     {
@@ -216,9 +216,9 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "baa1151507c39e77829ec6885e185bf5a269edcfe25e78e407f673eeb738def3",
-      "observed_at": "2026-09-02T10:33:33Z",
-      "excerpt": "Managed OAuth, validated idempotent dispatch, artifacts, and steering."
+      "content_hash": "f1be10592463ca73a9d42cfe825867591b09bf1a8d1c1ebaaa437aa165469972",
+      "observed_at": "2026-09-02T11:48:00Z",
+      "excerpt": "Managed OAuth, atomic idempotent dispatch, ephemeral provider-secret cleanup, artifacts, and steering."
     },
     {
       "kind": "documentation",
@@ -230,8 +230,8 @@
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
-      "content_hash": "52c8e29261f93a6f227ee75a81d6b790d097c22d09253f9b8e535dac0be61aec",
-      "observed_at": "2026-09-02T10:33:33Z",
+      "content_hash": "5748e2f6a152a308854d6abf3f71ed66b5328216f7130a03f0605cf937402acb",
+      "observed_at": "2026-09-02T11:32:00Z",
       "excerpt": "Managed sign-in, sequential dispatch, crash recovery, and fail-closed durable queue advancement."
     },
     {

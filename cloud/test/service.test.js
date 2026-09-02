@@ -56,6 +56,56 @@ function resolvedRef() {
   return { body: { sha: "a".repeat(40) } };
 }
 
+function missingRequestClaim() {
+  return { status: 404, body: { message: "Not Found" } };
+}
+
+function createdRequestClaim() {
+  return { status: 201, body: {} };
+}
+
+function markedRequestClaim() {
+  return { status: 204 };
+}
+
+function installedWorkflow() {
+  return {
+    status: 200,
+    body: {
+      sha: "workflow-sha",
+      content: Buffer.from(mobileWorkflow()).toString("base64"),
+    },
+  };
+}
+
+function acceptedDispatch(id) {
+  return {
+    status: 200,
+    body: {
+      workflow_run_id: id,
+      run_url: `https://api.github.com/repos/owner/project/actions/runs/${id}`,
+      html_url: `https://github.com/owner/project/actions/runs/${id}`,
+    },
+  };
+}
+
+function storedClaim(request, overrides = {}) {
+  return {
+    body: {
+      name: "FLEXFACTOR_RUN_4D32C8E56F2B4A98A7F5",
+      value: JSON.stringify({
+        schema: 1,
+        request_id: request.request_id,
+        state: "claimed",
+        run_id: 0,
+        ephemeral_secrets: [],
+        created_at: "2026-09-02T00:00:00.000Z",
+        ...overrides,
+      }),
+    },
+  };
+}
+
 test("the reusable workflow is pinned to the release that carries this client", () => {
   assert.equal(ENGINE_REF, "android-v3.5.0");
   assert.match(mobileWorkflow(), /mobile-run\.yml@android-v3\.5\.0/);
@@ -170,31 +220,34 @@ test("provider public keys are fetched through the managed service", async () =>
 });
 
 test("dispatch uses the default-branch caller and GitHub's authoritative run ID", async () => {
-  const expectedWorkflow = mobileWorkflow();
   const fetcher = queuedFetch([
     { body: { workflow_runs: [] } },
     { status: 200, body: { default_branch: "main" } },
     resolvedRef(),
-    { status: 200, body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
-    { status: 200, body: {
-      workflow_run_id: 987654,
-      run_url: "https://api.github.com/repos/owner/project/actions/runs/987654",
-      html_url: "https://github.com/owner/project/actions/runs/987654",
-    } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
+    acceptedDispatch(987654),
+    markedRequestClaim(),
   ]);
   const state = await dispatch("gho_dispatch_token", validRun({ ref: "feature/release" }),
     {}, fetcher, async () => {});
   assert.equal(state.id, 987654);
-  assert.equal(fetcher.calls.length, 5);
+  assert.equal(fetcher.calls.length, 8);
   assert.match(fetcher.calls[0].url, /actions\/runs\?event=workflow_dispatch/);
   assert.doesNotMatch(fetcher.calls[0].url, /branch=|flexfactor-mobile\.yml/);
   assert.match(fetcher.calls[2].url, /commits\/feature%2Frelease$/);
-  assert.match(fetcher.calls[3].url, /flexfactor-mobile\.yml\?ref=main$/);
-  assert.match(fetcher.calls[4].url, /flexfactor-mobile\.yml\/dispatches$/);
-  const dispatchBody = JSON.parse(fetcher.calls[4].options.body);
+  assert.match(fetcher.calls[3].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.equal(fetcher.calls[4].options.method, "POST");
+  assert.match(fetcher.calls[5].url, /flexfactor-mobile\.yml\?ref=main$/);
+  assert.match(fetcher.calls[6].url, /flexfactor-mobile\.yml\/dispatches$/);
+  const dispatchBody = JSON.parse(fetcher.calls[6].options.body);
   assert.equal(dispatchBody.ref, "main");
   assert.equal(dispatchBody.inputs.target_ref, "feature/release");
-  assert.doesNotMatch(fetcher.calls[4].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
+  assert.equal(dispatchBody.return_run_details, true);
+  assert.doesNotMatch(fetcher.calls[6].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
+  const marked = JSON.parse(fetcher.calls[7].options.body);
+  assert.equal(JSON.parse(marked.value).run_id, 987654);
 });
 
 test("dispatch request IDs are idempotent across phone crash recovery", async () => {
@@ -258,6 +311,38 @@ test("idempotency history failure blocks every dispatch mutation", async () => {
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
 });
 
+test("idempotency scan stops at GitHub's ten-page filtered-run ceiling", async () => {
+  const pages = Array.from({ length: 10 }, () => ({
+    headers: { link: '<https://api.github.com/next>; rel="next"' },
+    body: { workflow_runs: [] },
+  }));
+  const fetcher = queuedFetch(pages);
+  await assert.rejects(
+    () => dispatch("gho_scan_ceiling", validRun(), {}, fetcher, async () => {}),
+    (error) => error instanceof ServiceError && error.code === "idempotency_scan_incomplete",
+  );
+  assert.equal(fetcher.calls.length, 10);
+  assert.match(fetcher.calls.at(-1).url, /per_page=100&page=10$/);
+  assert.equal(fetcher.calls.some((call) => call.options.method !== "GET"), false);
+});
+
+test("an atomic request claim blocks a duplicate during GitHub history lag", async () => {
+  const request = validRun();
+  const fetcher = queuedFetch([
+    { body: { workflow_runs: [] } },
+    { body: { default_branch: "main" } },
+    resolvedRef(),
+    storedClaim(request),
+  ]);
+  await assert.rejects(
+    () => dispatch("gho_claimed_request", request, {}, fetcher, async () => {}),
+    (error) => error instanceof ServiceError && error.code === "dispatch_pending",
+  );
+  assert.equal(fetcher.calls.length, 4);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "POST"), false);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
+});
+
 test("a stale target ref fails before workflow or credential mutation", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
@@ -277,41 +362,99 @@ test("a stale target ref fails before workflow or credential mutation", async ()
 });
 
 test("sealed provider values are forwarded without accepting plaintext key fields", async () => {
-  const expectedWorkflow = mobileWorkflow();
   const fetcher = queuedFetch([
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
+    { status: 404, body: { message: "Not Found" } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
     { status: 204 },
-    { status: 200, body: { workflow_run_id: 12,
-      run_url: "https://api.github.com/repos/owner/project/actions/runs/12",
-      html_url: "https://github.com/owner/project/actions/runs/12" } },
+    acceptedDispatch(12),
+    markedRequestClaim(),
   ]);
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   await dispatch("gho_sealed_token", validRun(),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
-  const secretWrite = fetcher.calls[4];
+  const secretWrite = fetcher.calls[7];
   assert.match(secretWrite.url, /actions\/secrets\/OPENAI_API_KEY$/);
   assert.equal(JSON.parse(secretWrite.options.body).encrypted_value, sealed.encrypted_value);
   assert.doesNotMatch(secretWrite.options.body, /sk-|api[_-]?key/i);
 });
 
-test("every configured paid credential is accepted for the one ladder", async () => {
-  const expectedWorkflow = mobileWorkflow();
+test("phone credentials never overwrite an owner's existing repository secret", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
+    { body: { name: "OPENAI_API_KEY", created_at: "2026-01-01T00:00:00Z" } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
+    acceptedDispatch(13),
+    markedRequestClaim(),
+  ]);
+  const result = await dispatch("gho_durable_secret", validRun(),
+    { OPENAI_API_KEY: sealed }, fetcher, async () => {});
+  assert.equal(result.id, 13);
+  const secretCalls = fetcher.calls.filter((call) => /actions\/secrets\/OPENAI_API_KEY$/.test(call.url));
+  assert.equal(secretCalls.length, 1);
+  assert.equal(secretCalls[0].options.method, "GET");
+  const claimCreate = JSON.parse(fetcher.calls[5].options.body);
+  assert.deepEqual(JSON.parse(claimCreate.value).ephemeral_secrets, []);
+});
+
+test("a partial credential-write failure removes every phone credential and its request claim", async () => {
+  const request = validRun();
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([
+    { body: { workflow_runs: [] } },
+    { body: { default_branch: "main" } },
+    resolvedRef(),
+    { status: 404, body: { message: "Not Found" } },
+    { status: 404, body: { message: "Not Found" } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
+    { status: 204 },
+    { status: 500, body: { message: "secret unavailable" } },
+    storedClaim(request, {
+      ephemeral_secrets: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+    }),
     { status: 204 },
     { status: 204 },
-    { status: 200, body: {
-      workflow_run_id: 45,
-      run_url: "https://api.github.com/repos/owner/project/actions/runs/45",
-      html_url: "https://github.com/owner/project/actions/runs/45",
-    } },
+    { status: 204 },
+  ]);
+  await assert.rejects(
+    () => dispatch("gho_cleanup_failure", request,
+      { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {}),
+    (error) => error instanceof ServiceError && error.code === "github_request_failed",
+  );
+  assert.equal(fetcher.calls[11].options.method, "DELETE");
+  assert.match(fetcher.calls[11].url, /actions\/secrets\/OPENAI_API_KEY$/);
+  assert.equal(fetcher.calls[12].options.method, "DELETE");
+  assert.match(fetcher.calls[12].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.equal(fetcher.calls[13].options.method, "DELETE");
+  assert.match(fetcher.calls[13].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+});
+
+test("every configured paid credential is accepted for the one ladder", async () => {
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([
+    { body: { workflow_runs: [] } },
+    { body: { default_branch: "main" } },
+    resolvedRef(),
+    { status: 404, body: { message: "Not Found" } },
+    { status: 404, body: { message: "Not Found" } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
+    { status: 204 },
+    { status: 204 },
+    acceptedDispatch(45),
+    markedRequestClaim(),
   ]);
   const result = await dispatch("gho_ladder_token",
     validRun({ mode: "scout" }),
@@ -331,17 +474,15 @@ test("every configured paid credential is accepted for the one ladder", async ()
 });
 
 test("the free fallback makes provider credentials optional", async () => {
-  const expectedWorkflow = mobileWorkflow();
   const fetcher = queuedFetch([
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
-    { status: 200, body: {
-      workflow_run_id: 46,
-      run_url: "https://api.github.com/repos/owner/project/actions/runs/46",
-      html_url: "https://github.com/owner/project/actions/runs/46",
-    } },
+    missingRequestClaim(),
+    createdRequestClaim(),
+    installedWorkflow(),
+    acceptedDispatch(46),
+    markedRequestClaim(),
   ]);
   const result = await dispatch("gho_free_fallback",
     validRun({ max_iterations: 6 }), {}, fetcher, async () => {});
@@ -362,13 +503,95 @@ test("unknown secret names fail before workflow mutation", async () => {
   assert.equal(fetcher.calls.length, 3);
 });
 test("run status reports the active engine step", async () => {
+  const request = validRun();
   const fetcher = queuedFetch([
-    { body: { id: 99, status: "in_progress", conclusion: null, html_url: "https://example.invalid/run" } },
+    { body: { id: 99, status: "in_progress", conclusion: null,
+      display_title: `FlexFactor audit · ${request.request_id}`,
+      html_url: "https://example.invalid/run" } },
     { body: { jobs: [{ steps: [{ name: "Build", status: "completed" },
       { name: "Independent review", status: "in_progress" }] }] } },
   ]);
-  const result = await runStatus("gho_status_token", "owner/project", 99, fetcher);
+  const result = await runStatus("gho_status_token", "owner/project", 99,
+    request.request_id, fetcher);
   assert.equal(result.step, "Independent review");
+});
+
+test("completed status deletes only this request's ephemeral secrets and claim", async () => {
+  const request = validRun();
+  const fetcher = queuedFetch([
+    { body: { id: 99, status: "completed", conclusion: "success",
+      display_title: `FlexFactor audit · ${request.request_id}`,
+      html_url: "https://github.com/owner/project/actions/runs/99" } },
+    storedClaim(request, {
+      state: "dispatched",
+      run_id: 99,
+      ephemeral_secrets: ["OPENAI_API_KEY"],
+    }),
+    { status: 204 },
+    { status: 204 },
+  ]);
+  const result = await runStatus("gho_cleanup_token", "owner/project", 99,
+    request.request_id, fetcher);
+  assert.equal(result.conclusion, "success");
+  assert.match(fetcher.calls[2].url, /actions\/secrets\/OPENAI_API_KEY$/);
+  assert.equal(fetcher.calls[2].options.method, "DELETE");
+  assert.match(fetcher.calls[3].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.equal(fetcher.calls[3].options.method, "DELETE");
+});
+
+test("status refuses a mismatched run title without touching the request claim", async () => {
+  const request = validRun();
+  const fetcher = queuedFetch([
+    { body: { id: 99, status: "completed", conclusion: "success",
+      display_title: `Unrelated build · ${request.request_id}`,
+      html_url: "https://github.com/owner/project/actions/runs/99" } },
+  ]);
+  await assert.rejects(
+    () => runStatus("gho_wrong_run", "owner/project", 99, request.request_id, fetcher),
+    (error) => error instanceof ServiceError && error.code === "run_identity_mismatch",
+  );
+  assert.equal(fetcher.calls.length, 1);
+});
+
+test("status never deletes credentials when the durable claim names another run", async () => {
+  const request = validRun();
+  const fetcher = queuedFetch([
+    { body: { id: 99, status: "completed", conclusion: "success",
+      display_title: `FlexFactor audit · ${request.request_id}`,
+      html_url: "https://github.com/owner/project/actions/runs/99" } },
+    storedClaim(request, {
+      state: "dispatched",
+      run_id: 100,
+      ephemeral_secrets: ["OPENAI_API_KEY"],
+    }),
+  ]);
+  await assert.rejects(
+    () => runStatus("gho_wrong_claim", "owner/project", 99, request.request_id, fetcher),
+    (error) => error instanceof ServiceError && error.code === "run_identity_mismatch",
+  );
+  assert.equal(fetcher.calls.length, 2);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "DELETE"), false);
+});
+
+test("an authoritatively missing run is terminal cleanup for phone credentials", async () => {
+  const request = validRun();
+  const fetcher = queuedFetch([
+    { status: 404, body: { message: "Not Found" } },
+    storedClaim(request, {
+      state: "dispatched",
+      run_id: 99,
+      ephemeral_secrets: ["ANTHROPIC_API_KEY"],
+    }),
+    { status: 204 },
+    { status: 204 },
+  ]);
+  await assert.rejects(
+    () => runStatus("gho_missing_run", "owner/project", 99, request.request_id, fetcher),
+    (error) => error instanceof ServiceError && error.status === 404,
+  );
+  assert.match(fetcher.calls[2].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.equal(fetcher.calls[2].options.method, "DELETE");
+  assert.equal(fetcher.calls[3].options.method, "DELETE");
 });
 
 test("artifact downloads reject a redirect outside GitHub's signed storage", async () => {

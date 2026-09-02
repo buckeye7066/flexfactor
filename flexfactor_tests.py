@@ -17769,6 +17769,60 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
             cp2 = ff._run(["npm", "test"], other, timeout=60)
             self.assertTrue(getattr(cp2, "flexfactor_containment_blocked", False))
 
+    def test_scout_trust_repo_is_scoped_and_cleared_on_success_and_failure(self):
+        import types
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            args = types.SimpleNamespace(program=d, trust_repo=True)
+            key = os.path.normcase(os.path.abspath(d))
+            observed = []
+
+            def succeeds(_args):
+                observed.append(ff._run_trust_allowed(d))
+                return 0
+
+            with _patched(ff, "resolve_program_input", lambda _p: ("demo", "")), \
+                 _patched(ff, "resolve_project_dir", lambda *_a: d), \
+                 _patched(ff, "_run_scout_impl", succeeds):
+                self.assertEqual(ff.run_scout(args), 0)
+            self.assertEqual(observed, [True])
+            self.assertNotIn(key, ff._RUN_TRUST_OVERRIDE)
+
+            def fails(_args):
+                self.assertTrue(ff._run_trust_allowed(d))
+                raise RuntimeError("scout stopped")
+
+            with _patched(ff, "resolve_program_input", lambda _p: ("demo", "")), \
+                 _patched(ff, "resolve_project_dir", lambda *_a: d), \
+                 _patched(ff, "_run_scout_impl", fails):
+                with self.assertRaisesRegex(RuntimeError, "scout stopped"):
+                    ff.run_scout(args)
+            self.assertNotIn(key, ff._RUN_TRUST_OVERRIDE)
+
+    def test_overlapping_run_trust_grants_do_not_revoke_each_other(self):
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            first = ff._grant_run_trust(d)
+            second = ff._grant_run_trust(d)
+            self.assertEqual(first, second)
+            ff._revoke_run_trust(first)
+            self.assertTrue(ff._run_trust_allowed(d))
+            ff._revoke_run_trust(second)
+            self.assertFalse(ff._run_trust_allowed(d))
+
+    def test_audit_trust_repo_is_cleared_on_early_return(self):
+        import types
+        self._untrusted()
+        with _tempfile.TemporaryDirectory() as d:
+            args = types.SimpleNamespace(trust_repo=True)
+            key = os.path.normcase(os.path.abspath(d))
+            with _patched(ff, "resolve_program_input", lambda _p: ("demo", "")), \
+                 _patched(ff, "resolve_project_dir", lambda *_a: d), \
+                 _patched(ff, "_acquire_audit_lock", lambda _p: None):
+                result = ff.audit_one_program(d, args, 1, 1, 0)
+            self.assertIn("already running", result["error"])
+            self.assertNotIn(key, ff._RUN_TRUST_OVERRIDE)
+
     def test_every_ecosystem_install_build_test_is_classified_not_unknown(self):
         """'unknown' bypasses the broker, so a package manager the classifier
         does not know is an uncontained execution path."""

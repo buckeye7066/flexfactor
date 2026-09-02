@@ -67,4 +67,14 @@ public final class GitHubDeviceFlowTest {
         assertFalse(GitHubApi.isAuthoritativelyMissing(
                 new IllegalStateException("retry")));
     }
+
+    @Test
+    public void runStatusIdentityRequiresACanonicalRequestUuid() {
+        GitHubApi.requireCanonicalUuid(
+                "4d32c8e5-6f2b-4a98-a7f5-99594c49b2f8", "Run request ID");
+        assertThrows(IllegalArgumentException.class,
+                () -> GitHubApi.requireCanonicalUuid("not-a-request", "Run request ID"));
+        assertThrows(IllegalArgumentException.class,
+                () -> GitHubApi.requireCanonicalUuid("", "Run request ID"));
+    }
 }

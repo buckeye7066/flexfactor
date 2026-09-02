@@ -102,10 +102,13 @@ target evidence.
 ## Managed mobile request
 
 The cloud validates the request, resolves the selected ref, preflights sealed
-credentials, searches paginated workflow history for the request UUID, installs
-the exact pinned caller, writes sealed secrets, and dispatches. If history
-cannot be exhaustively checked within its abuse bound, it refuses rather than
-risk a duplicate.
+credentials, searches at most GitHub's 1,000 filtered workflow runs for the
+request UUID, and atomically creates a repository-variable claim before it
+installs the exact pinned caller, writes sealed phone credentials, and
+dispatches. If history cannot be proven absent or the UUID is already claimed,
+it refuses rather than risk a duplicate. Owner-managed provider secrets are
+never overwritten; phone-supplied secrets and the request claim are deleted at
+terminal status, and cleanup failure blocks queue advancement.
 
 The reusable workflow checks out Android's exact release tag and the requested
 target. Its final result is successful only when the engine exits 0 and any

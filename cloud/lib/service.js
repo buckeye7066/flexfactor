@@ -21,6 +21,8 @@ const RUN_FIELDS = new Set([
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 const REPOSITORY_PAGE_SIZE = 100;
 const MAX_REPOSITORY_PAGES = 100;
+const MAX_IDEMPOTENCY_SCAN_PAGES = 10;
+const REQUEST_VARIABLE_PREFIX = "FLEXFACTOR_RUN_";
 
 export class ServiceError extends Error {
   constructor(status, code, message) {
@@ -417,10 +419,7 @@ async function putRepositorySecret(token, repository, name, value, fetchImpl) {
   }, fetchImpl);
 }
 
-async function prepareProviderSecrets(token, request, provided, fetchImpl) {
-  void token;
-  void request;
-  void fetchImpl;
+async function prepareProviderSecrets(provided) {
   const values = provided && typeof provided === "object" && !Array.isArray(provided)
     ? provided : {};
 
@@ -438,6 +437,25 @@ async function prepareProviderSecrets(token, request, provided, fetchImpl) {
     }
   }
   return writes;
+}
+
+async function ephemeralProviderWrites(token, repository, writes, fetchImpl) {
+  const ephemeral = [];
+  for (const item of writes) {
+    const existing = await githubRaw(token, "GET",
+      `/repos/${repository}/actions/secrets/${item.name}`, undefined, fetchImpl);
+    if (existing.status === 200) {
+      // Never overwrite an owner's durable repository secret with a phone key.
+      // The existing credential already participates in the same model ladder.
+      continue;
+    }
+    if (existing.status !== 404) {
+      throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
+        "github_request_failed", safeGitHubError(existing));
+    }
+    ephemeral.push(item);
+  }
+  return ephemeral;
 }
 
 async function applyProviderSecrets(token, repository, writes, fetchImpl) {
@@ -579,6 +597,123 @@ function workflowInputs(request) {
   };
 }
 
+function requestVariableName(requestId) {
+  const compact = String(requestId || "").replaceAll("-", "");
+  if (!/^[A-Fa-f0-9]{32}$/.test(compact)) {
+    throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
+  }
+  return REQUEST_VARIABLE_PREFIX + compact.slice(0, 20).toUpperCase();
+}
+
+function normalizeRequestClaim(value, request, label = "GitHub request claim") {
+  let claim;
+  try { claim = JSON.parse(value || ""); }
+  catch { claim = null; }
+  const names = claim?.ephemeral_secrets;
+  if (!claim || claim.schema !== 1 || claim.request_id !== request.request_id
+      || !["claimed", "dispatched"].includes(claim.state)
+      || !Array.isArray(names)
+      || names.some((name) => !ALLOWED_SECRETS.has(name))
+      || !Number.isSafeInteger(Number(claim.run_id || 0))
+      || Number(claim.run_id || 0) < 0) {
+    throw new ServiceError(409, "idempotency_claim_invalid",
+      `${label} is invalid or belongs to another request.`);
+  }
+  return {
+    schema: 1,
+    request_id: claim.request_id,
+    state: claim.state,
+    run_id: Number(claim.run_id || 0),
+    ephemeral_secrets: [...new Set(names)],
+    created_at: typeof claim.created_at === "string" ? claim.created_at : "",
+  };
+}
+
+function requestClaimValue(request, ephemeralSecrets, state = "claimed", runId = 0,
+    createdAt = new Date().toISOString()) {
+  return JSON.stringify({
+    schema: 1,
+    request_id: request.request_id,
+    state,
+    run_id: runId,
+    ephemeral_secrets: [...new Set(ephemeralSecrets)],
+    created_at: createdAt,
+  });
+}
+
+async function readRequestClaim(token, request, fetchImpl) {
+  const name = requestVariableName(request.request_id);
+  const path = `/repos/${request.repository}/actions/variables/${name}`;
+  const existing = await githubRaw(token, "GET", path, undefined, fetchImpl);
+  if (existing.status === 404) return null;
+  if (existing.status < 200 || existing.status >= 300) {
+    throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
+      "github_request_failed", safeGitHubError(existing));
+  }
+  const stored = parseJson(existing.body, "GitHub request claim");
+  return normalizeRequestClaim(stored.value, request);
+}
+
+async function claimRequest(token, request, ephemeralSecrets, fetchImpl) {
+  const prior = await readRequestClaim(token, request, fetchImpl);
+  if (prior) return { owned: false, claim: prior };
+  const name = requestVariableName(request.request_id);
+  const claim = requestClaimValue(request, ephemeralSecrets);
+  const created = await githubRaw(token, "POST",
+    `/repos/${request.repository}/actions/variables`, {
+      name,
+      value: claim,
+    }, fetchImpl);
+  if (created.status >= 200 && created.status < 300) {
+    return { owned: true, claim: normalizeRequestClaim(claim, request) };
+  }
+  if ([409, 422].includes(created.status)) {
+    const raced = await readRequestClaim(token, request, fetchImpl);
+    if (raced) return { owned: false, claim: raced };
+  }
+  throw new ServiceError(created.status >= 500 ? 502 : created.status,
+    "github_request_failed", safeGitHubError(created));
+}
+
+async function markRequestDispatched(token, request, claim, runId, fetchImpl) {
+  const name = requestVariableName(request.request_id);
+  await githubJson(token, "PATCH",
+    `/repos/${request.repository}/actions/variables/${name}`, {
+      name,
+      value: requestClaimValue(
+        request, claim.ephemeral_secrets, "dispatched", runId, claim.created_at),
+    }, fetchImpl);
+}
+
+async function deleteEphemeralSecret(token, repository, name, fetchImpl) {
+  const removed = await githubRaw(token, "DELETE",
+    `/repos/${repository}/actions/secrets/${name}`, undefined, fetchImpl);
+  if (removed.status !== 204 && removed.status !== 404) {
+    throw new ServiceError(removed.status >= 500 ? 502 : removed.status,
+      "provider_cleanup_failed", safeGitHubError(removed));
+  }
+}
+
+async function cleanupRequestClaim(token, request, fetchImpl, expectedRunId = 0) {
+  const claim = await readRequestClaim(token, request, fetchImpl);
+  if (!claim) return false;
+  if (expectedRunId > 0 && claim.run_id > 0 && claim.run_id !== expectedRunId) {
+    throw new ServiceError(409, "run_identity_mismatch",
+      "The request claim belongs to a different GitHub run; no credential was deleted.");
+  }
+  for (const name of claim.ephemeral_secrets) {
+    await deleteEphemeralSecret(token, request.repository, name, fetchImpl);
+  }
+  const variable = requestVariableName(request.request_id);
+  const removed = await githubRaw(token, "DELETE",
+    `/repos/${request.repository}/actions/variables/${variable}`, undefined, fetchImpl);
+  if (removed.status !== 204 && removed.status !== 404) {
+    throw new ServiceError(removed.status >= 500 ? 502 : removed.status,
+      "idempotency_cleanup_failed", safeGitHubError(removed));
+  }
+  return true;
+}
+
 function parseInstant(value) {
   const parsed = Date.parse(value || "");
   return Number.isFinite(parsed) ? parsed : 0;
@@ -594,6 +729,14 @@ function runState(run, step = "Queued") {
   };
 }
 
+function runBelongsToRequest(run, requestId) {
+  const title = typeof run?.display_title === "string" ? run.display_title : "";
+  const suffix = ` · ${requestId}`;
+  if (!title.startsWith("FlexFactor ") || !title.endsWith(suffix)) return false;
+  const mode = title.slice("FlexFactor ".length, -suffix.length);
+  return MODES.has(mode);
+}
+
 async function locateDispatchedRun(token, request, workflowRef, submittedAt, fetchImpl, sleepImpl) {
   const path = `/repos/${request.repository}/actions/workflows/${WORKFLOW_FILE}/runs?event=workflow_dispatch&branch=${encode(workflowRef)}&per_page=30`;
   const earliest = submittedAt - 10_000;
@@ -601,7 +744,7 @@ async function locateDispatchedRun(token, request, workflowRef, submittedAt, fet
     const page = await githubJson(token, "GET", path, undefined, fetchImpl);
     if (Array.isArray(page.workflow_runs)) {
       const found = page.workflow_runs.find((run) =>
-        typeof run.display_title === "string" && run.display_title.includes(request.request_id)
+        runBelongsToRequest(run, request.request_id)
         && parseInstant(run.created_at) >= earliest && Number(run.id) > 0);
       if (found) return runState(found);
     }
@@ -617,8 +760,7 @@ async function existingDispatchedRun(token, request, fetchImpl) {
   // original request instead of starting a duplicate. The ceiling is a
   // fail-closed abuse/rate bound: if a repository has more history than we can
   // prove absent, the service refuses to dispatch rather than guessing.
-  const maximumPages = 100;
-  for (let pageNumber = 1; pageNumber <= maximumPages; pageNumber += 1) {
+  for (let pageNumber = 1; pageNumber <= MAX_IDEMPOTENCY_SCAN_PAGES; pageNumber += 1) {
     // Search repository-wide history rather than the currently installed
     // workflow path or current default branch. Either can be renamed between
     // GitHub accepting the original dispatch and a phone crash/retry; the
@@ -635,8 +777,7 @@ async function existingDispatchedRun(token, request, fetchImpl) {
         "GitHub returned an invalid workflow run list.");
     }
     const found = page.workflow_runs.find((item) =>
-      typeof item?.display_title === "string"
-      && item.display_title.includes(request.request_id)
+      runBelongsToRequest(item, request.request_id)
       && Number.isSafeInteger(Number(item.id)) && Number(item.id) > 0);
     if (found) return runState(found);
     const link = response.headers.get("link") || "";
@@ -669,59 +810,91 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // Validate every optional sealed credential before installing a workflow or
   // replacing any repository secret. With none configured, the same ladder
   // continues through its subscription and free/local routes.
-  const providerSecretWrites = await prepareProviderSecrets(
-    token, run, encryptedSecrets, fetchImpl);
-  const workflowChanged = await ensureTargetWorkflow(
-    token, run.repository, workflowRef, fetchImpl);
-  await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);
-  const submittedAt = Date.now();
-  const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
-  let result;
-  for (let attempt = 0; attempt < (workflowChanged ? 15 : 1); attempt += 1) {
-    result = await githubRaw(token, "POST", path, {
-      ref: workflowRef,
-      inputs: workflowInputs(run),
-    }, fetchImpl);
-    if (result.status >= 200 && result.status < 300) break;
-    if (!workflowChanged || ![404, 422].includes(result.status)) {
-      throw new ServiceError(result.status >= 500 ? 502 : result.status,
-        "github_request_failed", safeGitHubError(result));
+  const suppliedWrites = await prepareProviderSecrets(encryptedSecrets);
+  const providerSecretWrites = await ephemeralProviderWrites(
+    token, run.repository, suppliedWrites, fetchImpl);
+  const ephemeralNames = providerSecretWrites.map((item) => item.name);
+  const ownership = await claimRequest(token, run, ephemeralNames, fetchImpl);
+  if (!ownership.owned) {
+    if (ownership.claim.run_id > 0) {
+      const recovered = await githubJson(token, "GET",
+        `/repos/${run.repository}/actions/runs/${ownership.claim.run_id}`,
+        undefined, fetchImpl);
+      if (!runBelongsToRequest(recovered, run.request_id)) {
+        throw new ServiceError(409, "run_identity_mismatch",
+          "The claimed GitHub run does not belong to this request.");
+      }
+      return runState(recovered);
     }
-    await sleepImpl(1_000);
+    throw new ServiceError(409, "dispatch_pending",
+      "This run request is already claimed. FlexFactor will recover its GitHub run instead of dispatching a duplicate.");
   }
-  if (!result || result.status < 200 || result.status >= 300) {
-    throw new ServiceError(502, "workflow_dispatch_failed",
-      result ? safeGitHubError(result) : "The workflow dispatch was not attempted.");
-  }
-  if (result.status === 200 && result.body.length) {
-    const created = parseJson(result.body, "GitHub workflow dispatch");
-    const id = Number(created.workflow_run_id);
-    let htmlUrl;
-    try { htmlUrl = new URL(created.html_url); } catch { htmlUrl = null; }
-    const expectedPath = `/${run.repository}/actions/runs/${id}`.toLowerCase();
-    if (!Number.isSafeInteger(id) || id <= 0
-        || !htmlUrl || htmlUrl.protocol !== "https:" || htmlUrl.hostname !== "github.com"
-        || htmlUrl.pathname.toLowerCase() !== expectedPath) {
+  let dispatchAttempted = false;
+  try {
+    const workflowChanged = await ensureTargetWorkflow(
+      token, run.repository, workflowRef, fetchImpl);
+    await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);
+    const submittedAt = Date.now();
+    const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
+    let result;
+    for (let attempt = 0; attempt < (workflowChanged ? 15 : 1); attempt += 1) {
+      dispatchAttempted = true;
+      result = await githubRaw(token, "POST", path, {
+        ref: workflowRef,
+        inputs: workflowInputs(run),
+        return_run_details: true,
+      }, fetchImpl);
+      if (result.status >= 200 && result.status < 300) break;
+      dispatchAttempted = false;
+      if (!workflowChanged || ![404, 422].includes(result.status)) {
+        throw new ServiceError(result.status >= 500 ? 502 : result.status,
+          "github_request_failed", safeGitHubError(result));
+      }
+      await sleepImpl(1_000);
+    }
+    if (!result || result.status < 200 || result.status >= 300) {
+      throw new ServiceError(502, "workflow_dispatch_failed",
+        result ? safeGitHubError(result) : "The workflow dispatch was not attempted.");
+    }
+    let state;
+    if (result.status === 200 && result.body.length) {
+      const created = parseJson(result.body, "GitHub workflow dispatch");
+      const id = Number(created.workflow_run_id);
+      let htmlUrl;
+      try { htmlUrl = new URL(created.html_url); } catch { htmlUrl = null; }
+      const expectedPath = `/${run.repository}/actions/runs/${id}`.toLowerCase();
+      if (!Number.isSafeInteger(id) || id <= 0
+          || !htmlUrl || htmlUrl.protocol !== "https:" || htmlUrl.hostname !== "github.com"
+          || htmlUrl.pathname.toLowerCase() !== expectedPath) {
+        throw new ServiceError(502, "invalid_dispatch_response",
+          "GitHub returned an invalid workflow run identifier.");
+      }
+      state = {
+        id,
+        status: "queued",
+        conclusion: "",
+        html_url: htmlUrl.toString(),
+        step: "Queued",
+      };
+    } else if (result.status === 204) {
+      // Compatibility only. The request remains claimed throughout correlation,
+      // so an eventual-consistency gap can strand safely but cannot duplicate.
+      state = await locateDispatchedRun(
+        token, run, workflowRef, submittedAt, fetchImpl, sleepImpl);
+    } else {
       throw new ServiceError(502, "invalid_dispatch_response",
-        "GitHub returned an invalid workflow run identifier.");
+        "GitHub accepted the workflow request without a run identifier.");
     }
-    return {
-      id,
-      status: "queued",
-      conclusion: "",
-      html_url: htmlUrl.toString(),
-      step: "Queued",
-    };
+    await markRequestDispatched(token, run, ownership.claim, state.id, fetchImpl);
+    return state;
+  } catch (error) {
+    // Before the dispatch request is attempted, the claim and any partially
+    // written phone secrets are safe to remove. Once the request crosses the
+    // network boundary, acceptance is ambiguous: retain the claim so a retry
+    // can recover but can never dispatch the UUID twice.
+    if (!dispatchAttempted) await cleanupRequestClaim(token, run, fetchImpl);
+    throw error;
   }
-  // GitHub's current API returns the run ID directly. Keep correlation only
-  // for older 204 responses so a transient rollout difference does not lose
-  // an already-accepted run.
-  if (result.status === 204) {
-    return locateDispatchedRun(
-      token, run, workflowRef, submittedAt, fetchImpl, sleepImpl);
-  }
-  throw new ServiceError(502, "invalid_dispatch_response",
-    "GitHub accepted the workflow request without a run identifier.");
 }
 
 function validateRunIdentity(repository, runId) {
@@ -735,10 +908,29 @@ function validateRunIdentity(repository, runId) {
   return id;
 }
 
-export async function runStatus(token, repository, runId, fetchImpl = fetch) {
+export async function runStatus(token, repository, runId, requestId, fetchImpl = fetch) {
   const id = validateRunIdentity(repository, runId);
-  const run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
-    undefined, fetchImpl);
+  const cleanRequestId = typeof requestId === "string" ? requestId.trim() : "";
+  if (!UUID.test(cleanRequestId)) {
+    throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
+  }
+  const request = { request_id: cleanRequestId, repository };
+  let run;
+  try {
+    run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
+      undefined, fetchImpl);
+  } catch (error) {
+    if (error instanceof ServiceError && error.status === 404) {
+      // A deleted/expired run is terminal too. Remove only secrets named by
+      // this exact request's durable claim before the phone advances its queue.
+      await cleanupRequestClaim(token, request, fetchImpl, id);
+    }
+    throw error;
+  }
+  if (!runBelongsToRequest(run, request.request_id)) {
+    throw new ServiceError(409, "run_identity_mismatch",
+      "GitHub returned a run that does not belong to this request.");
+  }
   let step = typeof run.status === "string" ? run.status : "unknown";
   if (run.status !== "completed") {
     const jobs = await githubJson(token, "GET",
@@ -751,6 +943,9 @@ export async function runStatus(token, repository, runId, fetchImpl = fetch) {
         }
       }
     }
+  }
+  if (run.status === "completed") {
+    await cleanupRequestClaim(token, request, fetchImpl, id);
   }
   return runState(run, step);
 }

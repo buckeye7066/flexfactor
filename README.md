@@ -89,8 +89,13 @@ The managed control plane:
 2. resolves the exact target ref before any workflow or secret mutation;
 3. installs a caller pinned to the matching FlexFactor release;
 4. seals optional provider credentials to the selected repository;
-5. dispatches ephemeral multi-toolchain compute;
-6. correlates and returns the authoritative run and bounded evidence artifact.
+5. atomically claims the request UUID before dispatching ephemeral compute;
+6. correlates and returns the authoritative run and bounded evidence artifact;
+7. removes phone-supplied repository secrets and the claim at terminal status.
+
+An existing owner-managed provider secret is never replaced by a phone-supplied
+credential. A terminal cleanup failure blocks queue advancement and retries;
+it is not reported as a completed target.
 
 GitHub Actions is the compute substrate, not the user-facing product. The cloud
 service never stores GitHub sessions or plaintext provider keys. The legacy

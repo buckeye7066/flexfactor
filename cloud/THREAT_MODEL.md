@@ -19,8 +19,11 @@
 3. **Provider credentials.** Provider keys remain encrypted on the phone until a run needs one. The
    APK validates each newly entered value independently against the provider's fixed HTTPS origin
    before saving it and again before transmission. It seals only credentials required by the effective run policy with the
-   repository public key. The cloud preflights every required repository secret before any write,
-   forwards only sealed ciphertext and key IDs to GitHub, and never receives a plaintext provider key.
+   repository public key. The cloud preflights every supplied repository secret before any write,
+   never replaces an owner-managed secret, forwards only sealed ciphertext and key IDs to GitHub,
+   and never receives a plaintext provider key. Phone-supplied secrets are recorded in the
+   request's durable claim and deleted when the run completes or a pre-dispatch failure occurs;
+   cleanup failure is fail-closed and prevents queue advancement.
 4. **Artifacts.** Only the run-correlated `mobile-phone-*` artifact is selected. Redirects must be
    HTTPS and use GitHub's signed storage host families. The download is capped at 2 MiB and the OAuth
    bearer is not sent to the signed storage URL. The APK separately caps each extracted entry.
@@ -30,7 +33,9 @@
 6. **Mutation.** A user confirms a run before dispatch. Workflow installation writes the exact pinned
    caller; protected branches fall back to a PR and fail with a pending state when repository rules
    require approval. The selected checkout ref must resolve to a GitHub commit before workflow or
-   credential mutation begins. No generic GitHub proxy endpoint exists.
+   credential mutation begins. A repository variable atomically claims the request UUID before the
+   non-idempotent GitHub dispatch call; retries recover that claim/run instead of starting a second
+   workflow. No generic GitHub proxy endpoint exists.
 
 ## Deliberate non-features
 

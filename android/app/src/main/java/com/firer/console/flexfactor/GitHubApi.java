@@ -23,6 +23,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -264,10 +265,12 @@ final class GitHubApi {
         return runState(cloudJson(cleanToken, "POST", "/api/runs/dispatch", body, false));
     }
 
-    RunState run(String token, String repository, long runId) throws Exception {
+    RunState run(String token, String repository, String requestId, long runId) throws Exception {
         validateRunIdentity(repository, runId);
+        requireCanonicalUuid(requestId, "Run request ID");
         return runState(cloudJson(token, "GET", "/api/runs/status?repository="
-                + encode(repository) + "&run_id=" + runId, null, true));
+                + encode(repository) + "&request_id=" + encode(requestId)
+                + "&run_id=" + runId, null, true));
     }
 
     RunDetails runDetails(String token, String repository, long runId) throws Exception {
@@ -432,6 +435,16 @@ final class GitHubApi {
         if (runId <= 0) throw new IllegalArgumentException("Run ID is invalid.");
         if (repository == null || !repository.matches("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")) {
             throw new IllegalArgumentException("Run repository is invalid.");
+        }
+    }
+
+    static void requireCanonicalUuid(String value, String label) {
+        try {
+            if (value == null || !UUID.fromString(value).toString().equalsIgnoreCase(value)) {
+                throw new IllegalArgumentException(label + " is invalid.");
+            }
+        } catch (IllegalArgumentException invalid) {
+            throw new IllegalArgumentException(label + " is invalid.");
         }
     }
 

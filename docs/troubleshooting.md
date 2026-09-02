@@ -48,7 +48,9 @@ Confirm the installed build is the current signed release, complete GitHub's
 device flow, and ensure the selected repository is writable. A stale selected
 ref is rejected before workflow or secret mutation. Reopening the app safely
 reuses the stable request UUID; the cloud recovers an existing workflow rather
-than dispatching twice.
+than dispatching twice. If GitHub accepted a request but has not exposed its run
+yet, FlexFactor reports the request as pending and retries the same UUID. It
+does not bypass or delete the atomic claim to force another dispatch.
 
 ## Android shows an incomplete result
 

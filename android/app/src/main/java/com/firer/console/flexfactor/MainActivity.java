@@ -952,7 +952,7 @@ public final class MainActivity extends Activity {
                 if (!record.complete) {
                     try {
                         GitHubApi.RunState state = api.run(
-                                githubToken(), record.repository,
+                                githubToken(), record.repository, record.requestId,
                                 record.id);
                         String label = state.complete()
                                 ? ("success".equals(state.conclusion)

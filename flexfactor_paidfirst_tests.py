@@ -112,6 +112,16 @@ class _Provider:
 
 
 class RetryFallthrough(_Base):
+    def test_provider_keeps_paid_first_policy_when_metered_spend_is_forbidden(self):
+        observed = []
+        provider = R.RotatingProvider(
+            self.rot(), _Provider, tier=R.FRONTIER, judge_tier=R.FRONTIER,
+            allow_paid=False, paid_first=True, on_route=observed.append,
+        )
+        result = provider.structured("system", "prompt", {})
+        self.assertEqual([selection.route.id for selection in observed], [FREE_STRONG.id])
+        self.assertEqual(result["served_by"], FREE_STRONG.id)
+
     def test_one_call_descends_through_paid_pools_then_free(self):
         observed = []
         provider = R.RotatingProvider(
