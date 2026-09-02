@@ -5213,7 +5213,9 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             outcome["note"] = (outcome["note"] +
                                " The implementation attempt produced no safe delta.").strip()
             return outcome
-        syntax_ok, syntax_note = _inproc_source_syntax_ok(rel, candidate)
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, rel, candidate, stack,
+        )
         if syntax_ok is not True:
             outcome["note"] = (
                 outcome["note"]
@@ -5380,6 +5382,12 @@ def run(args) -> int:
               file=sys.stderr)
         return 2
     purpose_blob = purpose_contract.prompt_block(max_chars=10000)
+    # Detect the selected repository's native parser before the first model
+    # candidate.  Python/JSON/TOML can be parsed in-process; JavaScript,
+    # TypeScript, Go and the other fast-gated languages require the repository
+    # toolchain.  A candidate must pass that parser in a disposable file before
+    # it is eligible for grading or an owner-worktree write.
+    stack = _detect_stack(root)
     print(f"Program understanding: {purpose_confidence}; "
           f"{len(purpose_contract.primary_users)} primary user(s), "
           f"{len(purpose_contract.core_journeys)} core journey(s), "
@@ -5414,7 +5422,9 @@ def run(args) -> int:
             grade = Grade(0, False, "Model returned an empty file.",
                           ["Return the complete file contents, not an empty response."])
         else:
-            syntax_ok, syntax_note = _inproc_source_syntax_ok(args.file, candidate)
+            syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                root, args.file, candidate, stack,
+            )
             if syntax_ok is not True or candidate_matches_original:
                 # Never let an author response authorize an unchanged result.
                 # This covers both invalid prose/code and syntactically-valid
@@ -5466,8 +5476,9 @@ def run(args) -> int:
                             )
                         else:
                             original_syntax_ok, original_syntax_note = (
-                                _inproc_source_syntax_ok(
-                                    args.file, exact_original, allow_empty=True,
+                                _prewrite_source_syntax_ok(
+                                    root, args.file, exact_original, stack,
+                                    allow_empty=True,
                                 )
                             )
                 if candidate_matches_original:
@@ -5651,7 +5662,6 @@ def run(args) -> int:
             )
             return okay, detail
 
-        stack = _detect_stack(root)
         try:
             final_ok, gate_log = _publication_gate(root, stack)
         except Exception as exc:
@@ -5770,7 +5780,6 @@ def run(args) -> int:
                 file=sys.stderr,
             )
             return 1
-        stack = _detect_stack(root)
         try:
             checkpoint_status = _commit_and_sync(
                 root, branch, branch, args, f"refactor {rel}", stack
@@ -8384,6 +8393,8 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                            f"{bad_specs!r} (only plain registry names, optionally @scoped "
                            "and @versioned, are installable)")
 
+    stack = _detect_stack(project_dir)
+
     # Scout's integration patch is model-authored source just like Refactor,
     # Audit, Production Ready, and structural escalation output.  Validate the
     # complete batch before even detecting a verifier or taking the first
@@ -8408,8 +8419,9 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 f"generated file path could not be safely inspected: {path!r}",
             )
         allow_empty_create = existence == "missing" and not item["contents"].strip()
-        syntax_ok, syntax_note = _inproc_source_syntax_ok(
-            path, item["contents"], allow_empty=allow_empty_create,
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, path, item["contents"], stack,
+            allow_empty=allow_empty_create,
         )
         if syntax_ok is not True:
             return ApplyResult(
@@ -8670,7 +8682,6 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         if not candidate_sha or candidate_sha == baseline_sha:
             raise ApplyError("candidate commit could not be resolved")
 
-        stack = _detect_stack(project_dir)
         review_summary = {
             "mode": "scout",
             "repository": repo_name,
@@ -10430,6 +10441,11 @@ _SUITE_EXECUTION_EVIDENCE = re.compile(
     r"|tests run:\s*[1-9]\d*)"                # maven/surefire
 )
 
+_NODE_TEST_SUMMARY_LINE = re.compile(
+    r"(?im)^[ \t]*(?:[#ℹ]\s*)?"
+    r"(tests|pass|fail|skipped|todo)\s*:?\s*(\d+)\b"
+)
+
 
 def _suite_reported_tests(suite_log: str) -> bool:
     """Did the project's suite actually EXECUTE tests, per its own output?
@@ -10447,12 +10463,29 @@ def _suite_reported_tests(suite_log: str) -> bool:
     forcing a genuine re-run, because `test_status` is None on that path so the
     generated-files clause cannot carry the evidence either.
 
+    Node's summary reports both discovery and outcomes. A nonzero ``tests``
+    count is not execution evidence when every discovered test was skipped or
+    TODO, so a detected Node summary must include at least one pass and zero
+    failures. This check runs before the looser cross-ecosystem patterns.
+
     Go's empty case is `?  example/pkg [no test files]`, which starts with `?`
     and cannot match the `^ok ` clause - the distinction is already in the
     output, it just was not being read. Zero counts never match, by
     construction: every numeric clause requires [1-9] first.
     """
-    return bool(_SUITE_EXECUTION_EVIDENCE.search(suite_log or ""))
+    log = suite_log or ""
+    node_counts: dict[str, int] = {}
+    for key, raw_count in _NODE_TEST_SUMMARY_LINE.findall(log):
+        normalized = key.lower()
+        node_counts[normalized] = node_counts.get(normalized, 0) + int(raw_count)
+    if "tests" in node_counts and any(
+            key in node_counts for key in ("pass", "fail", "skipped", "todo")):
+        return bool(
+            node_counts["tests"] > 0
+            and node_counts.get("pass", 0) > 0
+            and node_counts.get("fail", 0) == 0
+        )
+    return bool(_SUITE_EXECUTION_EVIDENCE.search(log))
 
 
 def _review_residue_is_not_an_outage(reviewed: int, candidates: int) -> bool:
@@ -10871,6 +10904,9 @@ UNIT_TEST_SYSTEM = (
     "For JavaScript and TypeScript, declare unskipped test()/it() calls directly at "
     "module scope, never inside describe(), a conditional, or a helper. For Python, "
     "use unskipped module-level test_ functions or methods on a Test* class. "
+    "Every returned file must itself be an executable test selected by its exact "
+    "path; never return conftest, runner config, setup, plugin, fixture-only, or "
+    "other support files. "
     "Tests must run as-is with no network or external services (stub/mock those). "
     "Return only the test file(s). Respond with JSON only."
 )
@@ -13977,8 +14013,9 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
             and existence == "missing"
             and not contents.strip()
         )
-        syntax_ok, syntax_note = _inproc_source_syntax_ok(
-            p, contents, allow_empty=allow_empty_create,
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, p, contents, stack,
+            allow_empty=allow_empty_create,
         )
         if syntax_ok is not True:
             return (
@@ -14024,8 +14061,8 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
         # before any gate or reviewer can retain them. Validate the source
         # against the destination type only for a byte-preserving rename.
         if dst_p not in write_paths:
-            syntax_ok, syntax_note = _inproc_source_syntax_ok(
-                dst_p, source, allow_empty=True,
+            syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                project_dir, dst_p, source, stack, allow_empty=True,
             )
             same_type = (
                 os.path.splitext(src_p)[1].casefold()
@@ -15088,16 +15125,22 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
     return False
 
 
-def _generated_test_source_syntax_ok(
-        project_dir: str, path: str, source: str, stack: dict,
+def _prewrite_source_syntax_details(
+        project_dir: str, path: str, source: str, stack: dict, *,
+        allow_empty: bool = False,
 ) -> tuple[bool | None, str, str | None]:
-    """Parse generated tests and return safe declaration-matching source.
+    """Parse model-authored source in a disposable file before owner mutation.
 
     JSX/TSX is transformed by the already-required esbuild parser so markup
     text becomes quoted JavaScript data and TypeScript generics disappear before
-    declaration matching.  Other languages return their unchanged parsed source.
+    generated-test declaration matching. Other languages return their unchanged
+    parsed source. No candidate is imported, evaluated, or written inside the
+    target repository. ``None`` means the required parser was unavailable and
+    every mutation caller must fail closed.
     """
-    inproc_ok, inproc_note = _inproc_source_syntax_ok(path, source)
+    inproc_ok, inproc_note = _inproc_source_syntax_ok(
+        path, source, allow_empty=allow_empty,
+    )
     if inproc_ok is not None:
         return inproc_ok, inproc_note, source if inproc_ok else None
 
@@ -15196,11 +15239,58 @@ def _generated_test_source_syntax_ok(
                 return ok, (
                     _tail(result.stderr or result.stdout) or "gofmt syntax check"
                 ), source if ok else None
+
+            # Reuse the same parse-only gates that protect an applied Audit or
+            # Production Ready edit, but point them at this disposable file.
+            # Python and Go took stricter paths above. Only the gates known not
+            # to execute compile-time user hooks are eligible here: `perl -c`,
+            # for example, executes BEGIN/CHECK blocks and is therefore not a
+            # safe pre-write parser for model-authored source.
+            try:
+                import flexfactor_prodready as _pr
+            except Exception:
+                _pr = None
+            safe_external_exts = {".rb", ".php", ".sh", ".bash", ".lua"}
+            command = (
+                _pr.syntax_gate_cmd(candidate)
+                if _pr is not None and ext in safe_external_exts else None
+            )
+            if command:
+                if not shutil.which(command[0]):
+                    return None, f"{command[0]} parser is not installed", None
+                result = _run(command, project_dir, timeout=60)
+                if getattr(result, "flexfactor_launch_error", False):
+                    return None, f"{command[0]} parser did not run", None
+                ok = result.returncode == 0
+                return ok, (
+                    _tail(result.stderr or result.stdout)
+                    or f"{command[0]} syntax check"
+                ), source if ok else None
     except OSError as exc:
         return None, f"temporary syntax preflight failed: {exc}", None
     return None, (
-        f"no safe generated-test parser is available for {ext or 'this type'}"
+        f"no safe pre-write parser is available for {ext or 'this type'}"
     ), None
+
+
+def _prewrite_source_syntax_ok(
+        project_dir: str, path: str, source: str, stack: dict, *,
+        allow_empty: bool = False,
+) -> tuple[bool | None, str]:
+    """Two-field mutation preflight shared by all four product modes."""
+    ok, note, _case_source = _prewrite_source_syntax_details(
+        project_dir, path, source, stack, allow_empty=allow_empty,
+    )
+    return ok, note
+
+
+def _generated_test_source_syntax_ok(
+        project_dir: str, path: str, source: str, stack: dict,
+) -> tuple[bool | None, str, str | None]:
+    """Generated-test preflight plus parser-normalized case source."""
+    return _prewrite_source_syntax_details(
+        project_dir, path, source, stack,
+    )
 
 
 def _selected_test_command(command: list[str], path: str) -> list[str]:
@@ -15353,6 +15443,19 @@ def _write_and_run_generated_test_batch(
                 f"generated test batch names duplicate path {path!r}"
             ), []
         seen_paths.add(key)
+        # Every generated file must be the executable test whose exact path is
+        # selected below. Runner-autoloaded support/config files (most notably
+        # pytest's conftest.py) can install hooks that turn unrelated failures
+        # into passes while receiving no file-specific execution proof of their
+        # own. Self-contained tests need no such artifact, so reject the whole
+        # batch before its first write rather than letting one influence either
+        # the broad suite or an exact-file verification.
+        credit_as_test = _runner_collectable_generated_test_path(path)
+        if not credit_as_test:
+            return [], None, "", (
+                "generated runner support/config artifacts are not permitted; "
+                f"every generated file must be an executable exact-run test: {path}"
+            ), []
         existence = _contained_existence(project_dir, path)
         if existence != "missing":
             return [], None, "", (
@@ -15368,7 +15471,6 @@ def _write_and_run_generated_test_batch(
                 f"{syntax_note}"
             ), []
         normalized = dict(item)
-        credit_as_test = _runner_collectable_generated_test_path(path)
         case_path = path
         if os.path.splitext(path)[1].lower() in (".jsx", ".tsx"):
             case_path = os.path.splitext(path)[0] + ".js"
@@ -15386,12 +15488,6 @@ def _write_and_run_generated_test_batch(
 
     if not prepared:
         return [], None, "", "no non-empty generated test source was produced", []
-    if not any(item["_candidate_test"] for item in prepared):
-        return [], None, "", (
-            "generated batch contains support artifacts but no runner-collectable "
-            "executable test"
-        ), []
-
     written_entries: list[dict] = []
 
     def _rollback_created(entries: list[dict]) -> list[str]:
@@ -17238,8 +17334,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 syntax_ok = False
                 syntax_note = "whole-file response contents were not text"
             else:
-                syntax_ok, syntax_note = _inproc_source_syntax_ok(
-                    rel, candidate_contents
+                syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                    project_dir, rel, candidate_contents, stack,
                 )
             if syntax_ok is not True:
                 # This shared writer serves the ordinary Audit/Production Ready

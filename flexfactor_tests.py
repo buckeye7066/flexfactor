@@ -277,6 +277,79 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             ff._inproc_source_syntax_ok("README.md", "ordinary prose")[0]
         )
 
+    def test_external_source_languages_use_disposable_native_preflight(self):
+        cases = (
+            ("src/app.js", "export const value = 1;\n", {}, "node"),
+            ("src/app.ts", "export const value: number = 1;\n",
+             {"esbuild": "esbuild"}, "esbuild"),
+            ("cmd/app.go", "package main\nfunc main() {}\n", {}, "gofmt"),
+            ("lib/app.rb", "VALUE = 1\n", {}, "ruby"),
+        )
+        for path, source, stack, expected_tool in cases:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+                 mock.patch.object(
+                     ff, "_run",
+                     return_value=ff.subprocess.CompletedProcess([], 0, "", ""),
+                 ) as parser:
+                ok, note = ff._prewrite_source_syntax_ok(
+                    project, path, source, stack,
+                )
+                self.assertIs(ok, True, note)
+                command = parser.call_args.args[0]
+                self.assertEqual(expected_tool, os.path.basename(command[0]))
+                candidate_arg = next(
+                    arg for arg in command[1:]
+                    if arg.endswith(os.path.splitext(path)[1])
+                )
+                self.assertFalse(
+                    candidate_arg.startswith(os.path.realpath(project))
+                )
+
+    def test_external_parser_failure_refuses_source_before_write(self):
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+             mock.patch.object(
+                 ff, "_run",
+                 return_value=ff.subprocess.CompletedProcess(
+                     [], 1, "", "SyntaxError: unexpected token",
+                 ),
+             ):
+            ok, note = ff._prewrite_source_syntax_ok(
+                project, "src/app.js", "export const = ;\n", {},
+            )
+        self.assertIs(ok, False)
+        self.assertIn("unexpected token", note)
+
+    def test_perl_compile_time_hooks_are_never_run_as_a_parser(self):
+        forbidden = mock.Mock(
+            side_effect=AssertionError("perl -c would execute a BEGIN block")
+        )
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff.shutil, "which", return_value="/usr/bin/perl"), \
+             mock.patch.object(ff, "_run", forbidden):
+            ok, note = ff._prewrite_source_syntax_ok(
+                project,
+                "script.pl",
+                "BEGIN { unlink 'owner-data' }\nprint 'safe';\n",
+                {},
+            )
+        self.assertIsNone(ok)
+        self.assertIn("no safe pre-write parser", note)
+        forbidden.assert_not_called()
+
+    def test_all_mutation_modes_use_the_shared_native_source_preflight(self):
+        for function in (
+                ff.run,
+                ff._refactor_top_three_gate,
+                ff._apply_integration_impl,
+                ff.attempt_structural_fix,
+                ff._fix_files):
+            with self.subTest(function=function.__name__):
+                self.assertIn(
+                    "_prewrite_source_syntax_ok(", inspect.getsource(function)
+                )
+
     def test_source_syntax_preflight_rejects_nonfinite_json_constants(self):
         for constant in ("NaN", "Infinity", "-Infinity"):
             ok, reason = ff._inproc_source_syntax_ok(
@@ -4728,11 +4801,10 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         forbidden_runner.assert_not_called()
 
     def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
-        runner = mock.Mock(return_value=(True, "2 tests passed"))
+        runner = mock.Mock(return_value=(True, "1 test passed"))
         focused = mock.Mock(return_value=(True, "exact file passed"))
         candidates = [
             {"path": "tests/test_one.py", "contents": "def test_one():\n    assert True\n"},
-            {"path": "tests/capability.json", "contents": '{"case": 2}\n'},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(ff, "_run_unit_tests", runner), \
@@ -4743,13 +4815,12 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 )
             )
             self.assertTrue(os.path.isfile(os.path.join(project, "tests", "test_one.py")))
-            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "capability.json")))
-        self.assertEqual(["tests/test_one.py", "tests/capability.json"],
+        self.assertEqual(["tests/test_one.py"],
                          [item["path"] for item in written])
-        self.assertEqual([True, False],
+        self.assertEqual([True],
                          [item["_credit_as_test"] for item in written])
         self.assertIs(status, True)
-        self.assertEqual("2 tests passed", log)
+        self.assertEqual("1 test passed", log)
         self.assertEqual("", refusal)
         self.assertEqual([], rollback_failed)
         runner.assert_called_once()
@@ -4815,7 +4886,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("case-only alias reached runner")
         )
         candidates = [
-            {"path": "tests/Test_same.py",
+            {"path": "tests/test_Same.py",
              "contents": "def test_one():\n    assert True\n"},
             {"path": "tests/test_same.py",
              "contents": "def test_two():\n    assert True\n"},
@@ -4888,7 +4959,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         forbidden_write.assert_not_called()
         forbidden_runner.assert_not_called()
 
-    def test_support_artifacts_alone_are_not_credited_as_tests(self):
+    def test_support_artifacts_are_refused_before_write(self):
         forbidden_write = mock.Mock(
             side_effect=AssertionError("support-only batch reached writer")
         )
@@ -4909,7 +4980,45 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertEqual([], written)
         self.assertIsNone(status)
         self.assertEqual("", log)
-        self.assertIn("no runner-collectable executable test", refusal)
+        self.assertIn("support/config artifacts are not permitted", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_pytest_conftest_cannot_modify_a_generated_test_run(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("autoloaded plugin reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("autoloaded plugin reached runner")
+        )
+        candidates = [
+            {
+                "path": "tests/test_generated.py",
+                "contents": "def test_generated():\n    assert True\n",
+            },
+            {
+                "path": "tests/conftest.py",
+                "contents": (
+                    "def pytest_runtest_makereport(item, call):\n"
+                    "    call.excinfo = None\n"
+                ),
+            },
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates,
+                    {"test_cmd": ["python", "-m", "pytest"]},
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("support/config artifacts are not permitted", refusal)
+        self.assertIn("tests/conftest.py", refusal)
         self.assertEqual([], rollback_failed)
         forbidden_write.assert_not_called()
         forbidden_runner.assert_not_called()
@@ -5269,6 +5378,35 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIs(ok, True, note)
         self.assertEqual(2, len(calls))
         self.assertEqual(path, calls[1][-1])
+
+    def test_javascript_exact_file_with_only_skips_gets_no_credit(self):
+        path = "tests/generated.test.js"
+        calls = []
+
+        def runner(command, _project, timeout=900, env=None):
+            del timeout, env
+            calls.append(command)
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", "no matching test file",
+                )
+            return ff.subprocess.CompletedProcess(
+                command, 0,
+                "ℹ tests 1\nℹ pass 0\nℹ fail 0\nℹ skipped 1\n",
+                "",
+            )
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run", side_effect=runner):
+            ok, note = ff._run_generated_test_file(
+                project,
+                {"path": path, "contents": "test.skip('later', () => {});\n"},
+                {"test_cmd": ["npm", "test"]},
+            )
+        self.assertIs(ok, False)
+        self.assertIn("no executed-test evidence", note)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(["npm", "test", "--", path], calls[1])
 
     def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
         for source in (
@@ -8987,7 +9125,7 @@ class CanonicalFileKeyTests(unittest.TestCase):
             done_set = set()
             real_edits = ff.generate_file_fix_edits
             real_gate = ff._gate_file
-            real_syntax = ff._inproc_source_syntax_ok
+            real_syntax = ff._prewrite_source_syntax_ok
             try:
                 ff.generate_file_fix_edits = fake_edits
                 ff._gate_file = lambda *a, **k: (True, "")
@@ -8996,7 +9134,7 @@ class CanonicalFileKeyTests(unittest.TestCase):
                 # production source type must provide; the dedicated
                 # normalization tests prove parser-unavailable types fail
                 # closed before any write.
-                ff._inproc_source_syntax_ok = lambda *a, **k: (
+                ff._prewrite_source_syntax_ok = lambda *a, **k: (
                     True, "fixture parser"
                 )
                 applied, _unver, _notes = ff._fix_files(
@@ -9005,7 +9143,7 @@ class CanonicalFileKeyTests(unittest.TestCase):
             finally:
                 ff.generate_file_fix_edits = real_edits
                 ff._gate_file = real_gate
-                ff._inproc_source_syntax_ok = real_syntax
+                ff._prewrite_source_syntax_ok = real_syntax
 
         self.assertEqual(len(gen_calls), 1,
                          f"the file was fixed more than once: {gen_calls}")
@@ -12984,6 +13122,20 @@ class SuiteExecutionEvidenceTests(unittest.TestCase):
     def test_node_spec_reporter_nonzero_summary_counts(self):
         self.assertTrue(ff._suite_reported_tests("ℹ tests 1\nℹ pass 1"))
         self.assertFalse(ff._suite_reported_tests("ℹ tests 0\nℹ pass 0"))
+
+    def test_node_discovery_without_a_pass_gets_no_execution_credit(self):
+        for log in (
+                "ℹ tests 1\nℹ pass 0\nℹ fail 0\nℹ skipped 1\nℹ todo 0",
+                "# tests 1\n# pass 0\n# fail 0\n# skipped 0\n# todo 1",
+                "ok 1 - generated # SKIP unavailable\n"
+                "# tests 1\n# pass 0\n# fail 0\n# skipped 1"):
+            with self.subTest(log=log):
+                self.assertFalse(ff._suite_reported_tests(log))
+
+    def test_node_summary_with_any_failure_gets_no_execution_credit(self):
+        self.assertFalse(ff._suite_reported_tests(
+            "ℹ tests 2\nℹ pass 1\nℹ fail 1\nℹ skipped 0"
+        ))
 
     def test_the_original_shapes_still_count(self):
         for log in (" Test Files  19 passed (20)\n      Tests  108 passed",

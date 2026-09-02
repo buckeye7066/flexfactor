@@ -437,7 +437,7 @@ class StructuralRollsBack(_Base):
             )
         self.assertEqual("failed", kind)
         self.assertIn("rejected before write", detail)
-        self.assertIn("no safe in-process parser", detail)
+        self.assertIn("no safe pre-write parser", detail)
         self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
         self.assertIsNone(self.read("ui.tsx"))
         forbidden_write.assert_not_called()
@@ -473,7 +473,7 @@ class StructuralRollsBack(_Base):
             )
         self.assertEqual("failed", kind)
         self.assertIn("rename source rejected before write", detail)
-        self.assertIn("no safe in-process parser", detail)
+        self.assertIn("no safe pre-write parser", detail)
         self.assertEqual(self.read("notes.txt"),
                          "This is documentation, not TSX source.\n")
         self.assertIsNone(self.read("src/new.tsx"))
