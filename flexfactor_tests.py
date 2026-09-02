@@ -4381,12 +4381,22 @@ class PathContainmentTests(unittest.TestCase):
         aliases = (
             "tests/case.py.", "tests/trailing /case.py", "tests/file.py:stream",
             "tests/NUL.txt", "tests/con.py", "tests/COM1", "tests/lpt9.js",
+            "tests/COM¹.py", "tests/com²", "tests/LPT³.txt",
             "tests/bad?.py", "tests/control\x01.py",
         )
         with tempfile.TemporaryDirectory() as tmp:
             for bad in aliases:
                 self.assertIsNone(ff._rel_components(bad), bad)
                 self.assertIsNone(ff._contained_path(tmp, bad), bad)
+            for device_alias in ("COM¹.py", "com²", "LPT³.txt"):
+                self.assertIsNone(
+                    ff._write_contained(tmp, device_alias, "blocked"), device_alias
+                )
+                self.assertIsNone(
+                    ff._replace_contained(tmp, device_alias, "blocked"), device_alias
+                )
+                self.assertFalse(ff._unlink_contained(tmp, device_alias), device_alias)
+                self.assertFalse(os.path.lexists(os.path.join(tmp, device_alias)))
 
     def test_safe_relative_paths_are_allowed(self):
         import tempfile

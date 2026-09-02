@@ -10124,7 +10124,10 @@ def _rel_components(rel: str) -> list[str] | None:
             return None
         device_stem = part.split(".", 1)[0].casefold()
         if (device_stem in {"con", "prn", "aux", "nul"}
-                or re.fullmatch(r"(?:com|lpt)[1-9]", device_stem)):
+                # Win32 also recognizes the Latin-1 superscript digits as
+                # device numbers. COM¹.py and LPT³.txt are reserved aliases,
+                # not ordinary repository files.
+                or re.fullmatch(r"(?:com|lpt)(?:[1-9]|[¹²³])", device_stem)):
             return None
         comps.append(part)
     return comps or None
