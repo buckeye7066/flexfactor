@@ -3955,11 +3955,11 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             res = ff.apply_integration(
                 project, "demo",
-                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                  "packages": []},
                 self._opts(True))
             self.assertEqual(res.status, "skipped-unverified")
-            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertFalse(os.path.exists(os.path.join(project, "new.py")))
 
     def test_python_project_uses_its_real_test_gate(self):
         import tempfile
@@ -4024,12 +4024,70 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
             before = open(os.path.join(project, "package.json"), "rb").read()
             res = ff.apply_integration(
                 project, "demo",
-                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                  "packages": []},
                 self._opts(False))
             self.assertEqual(res.status, "skipped-unverified")
-            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertFalse(os.path.exists(os.path.join(project, "new.py")))
             self.assertEqual(open(os.path.join(project, "package.json"), "rb").read(), before)
+
+
+class ScoutSourcePreflightTests(unittest.TestCase):
+    """Scout must parse the complete generated batch before its first mutation."""
+
+    def test_invalid_later_file_refuses_every_write_and_downstream_gate(self):
+        import tempfile
+        import types
+
+        forbidden_snapshot = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached snapshot")
+        )
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached write")
+        )
+        forbidden_verify = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached verification")
+        )
+        forbidden_git = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached commit")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached reviewer")
+        )
+        forbidden_publish = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached publication")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": "good.py", "contents": "VALUE = 1\n"},
+                {"path": "broken.py", "contents": "This is prose, not Python.\n"},
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden_snapshot), \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_detect_verify", forbidden_verify), \
+             mock.patch.object(ff, "_run", forbidden_verify), \
+             mock.patch.object(ff, "_git", forbidden_git), \
+             mock.patch.object(ff, "_independent_final_review", forbidden_review), \
+             mock.patch.object(ff, "_publish_verified_head", forbidden_publish):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("broken.py", result.detail)
+        self.assertIn("rejected before write", result.detail)
+        forbidden_snapshot.assert_not_called()
+        forbidden_write.assert_not_called()
+        forbidden_verify.assert_not_called()
+        forbidden_git.assert_not_called()
+        forbidden_review.assert_not_called()
+        forbidden_publish.assert_not_called()
 
 
 class PathContainmentTests(unittest.TestCase):
@@ -4074,7 +4132,7 @@ class PathContainmentTests(unittest.TestCase):
                      "packages": []}
             res = ff.apply_integration(proj, "repo", patch, Opts)
             self.assertFalse(os.path.exists(outside))  # <-- escapes + writes on pre-fix
-            self.assertIn(res.status, ("verify-failed", "error"))
+            self.assertEqual(res.status, "refused-invalid-source")
 
 
 class CommitSyncGitRcTests(unittest.TestCase):
@@ -6316,15 +6374,15 @@ class SnapshotTriStateTests(unittest.TestCase):
                     return ff.subprocess.CompletedProcess(cmd, 1, "", "npm mock fail")
                 return real_run(cmd, cwd, timeout=timeout, **kwargs)
             ff._run = fail_install
-            patch = {"files": [{"path": "new.js", "contents": "console.log(1)"}],
+            patch = {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                      "packages": ["lodash"]}
             try:
                 res = ff.apply_integration(proj, "repo", patch, self._Opts)
             finally:
                 ff._run = real_run
             self.assertIn(res.status, ("verify-failed", "error"))    # npm mock failed -> rollback
-            # The genuinely-created new.js was snapshotted 'created' and unlinked on rollback.
-            self.assertFalse(os.path.exists(os.path.join(proj, "new.js")))
+            # The genuinely-created new.py was snapshotted 'created' and unlinked on rollback.
+            self.assertFalse(os.path.exists(os.path.join(proj, "new.py")))
 
 
 def _try_dir_symlink(link, target_dir):
@@ -8606,8 +8664,8 @@ class ScoutEndToEndTests(unittest.TestCase):
         ff._judge = self._stub_judge
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         ff.generate_integration = lambda provider, project_dir, blob, need, result: (
-            {"files": [{"path": "widget_integration.js",
-                        "contents": "export const widget = 1;\n"}],
+            {"files": [{"path": "widget_integration.json",
+                        "contents": '{"widget": 1}\n'}],
              "packages": ["left-pad"], "commit_message": "Integrate good/widget",
              "post_steps": []}, "plan")
         ff._independent_final_review = (
@@ -8662,7 +8720,7 @@ class ScoutEndToEndTests(unittest.TestCase):
             # The hostile candidate (higher finalScore, LLM said ADOPT) must
             # have NO branch and NO applied change.
             self.assertNotIn("injector", branches)
-            self.assertTrue(os.path.exists(os.path.join(tmp, "widget_integration.js")))
+            self.assertTrue(os.path.exists(os.path.join(tmp, "widget_integration.json")))
             log = self._git_out(tmp, "log", "--oneline", "-3")
             self.assertIn("Integrate good/widget", log)
             report = os.path.join(tmp, "fixtureapp_repo_rewards_report.md")
@@ -17996,7 +18054,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
         return proj, remote
 
     def _apply(self, proj):
-        patch = {"files": [{"path": "added.js", "contents": "export const a = 1;\n"}],
+        patch = {"files": [{"path": "added.py", "contents": "VALUE = 1\n"}],
                  "packages": [], "commit_message": "Integrate demo"}
         def approve(_reviewer, _project, _baseline, candidate, _evidence):
             return {"verdict": "approve", "commit": candidate,

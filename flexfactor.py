@@ -7576,8 +7576,34 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     without Git, an origin, a named branch, mandatory publication, or an
     independent reviewer are refused before the first write.
     """
-    files = [f for f in (patch.get("files") or [])
-             if f.get("path") and f.get("contents") is not None]
+    raw_files = patch.get("files") or []
+    if not isinstance(raw_files, list):
+        return ApplyResult(
+            repo_name, "refused-invalid-source",
+            f"generated 'files' is not a list ({type(raw_files).__name__})",
+        )
+    files: list[dict[str, str]] = []
+    for index, item in enumerate(raw_files):
+        if not isinstance(item, dict):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} is not an object "
+                f"({type(item).__name__})",
+            )
+        path = item.get("path")
+        contents = item.get("contents")
+        if not isinstance(path, str) or not path.strip():
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} has no valid repository path",
+            )
+        if not isinstance(contents, str):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file {path!r} has non-text contents "
+                f"({type(contents).__name__})",
+            )
+        files.append({"path": path, "contents": contents})
     # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
     # mutation, so a malformed or option-like entry can never write a file,
     # raise past the rollback, or reach npm.
@@ -7591,6 +7617,40 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                            f"refused unsafe package spec(s) from the generated plan: "
                            f"{bad_specs!r} (only plain registry names, optionally @scoped "
                            "and @versioned, are installable)")
+
+    # Scout's integration patch is model-authored source just like Refactor,
+    # Audit, Production Ready, and structural escalation output.  Validate the
+    # complete batch before even detecting a verifier or taking the first
+    # rollback snapshot: an earlier valid entry must not be written merely
+    # because a later entry is invalid.  Requiring an affirmative parser result
+    # also makes parser-unavailable source types an explicit refusal.  A valid
+    # empty file is permitted only when creating a definitively missing path;
+    # an integration may never erase an existing file with an empty rewrite.
+    for item in files:
+        path = item["path"]
+        full = _contained_path(project_dir, path)
+        literal = os.path.join(project_dir, path.replace("\\", "/"))
+        if full is None or os.path.islink(literal):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file path escapes the repo or is a symlink: {path!r}",
+            )
+        existence = _contained_existence(project_dir, path)
+        if existence == "refused":
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file path could not be safely inspected: {path!r}",
+            )
+        allow_empty_create = existence == "missing" and not item["contents"].strip()
+        syntax_ok, syntax_note = _inproc_source_syntax_ok(
+            path, item["contents"], allow_empty=allow_empty_create,
+        )
+        if syntax_ok is not True:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated Scout source rejected before write for {path}: "
+                f"{syntax_note}",
+            )
     if not files and not packages:
         return ApplyResult(repo_name, "infeasible", "No concrete edits were produced.")
 
