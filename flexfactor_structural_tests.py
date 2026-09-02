@@ -109,6 +109,17 @@ class StructuralApplies(_Base):
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 2\n")
 
+    def test_rename_destination_can_be_rewritten_after_the_move(self):
+        author = _Author([plan(
+            writes=[{"path": "renamed.py", "contents": "y = 3\n"}],
+            renames=[{"from": "other.py", "to": "renamed.py"}],
+        )])
+        applied, _, notes = self.run_fix(author)
+        self.assertEqual(applied, ["bad.py"])
+        self.assertIsNone(self.read("other.py"))
+        self.assertEqual(self.read("renamed.py"), "y = 3\n")
+        self.assertTrue(any("rewrite renamed.py" in note for note in notes))
+
     def test_rename_preserves_bytes_beyond_the_review_read_ceiling(self):
         source = os.path.join(self.proj, "large.toml")
         payload = ("# " + ("x" * (F.MAX_REVIEW_BYTES + 32)) + "\n").encode()
@@ -313,6 +324,31 @@ class StructuralRollsBack(_Base):
         forbidden_write.assert_not_called()
         forbidden_gate.assert_not_called()
         forbidden_review.assert_not_called()
+
+    def test_rename_write_exemption_rejects_portable_alias_spelling(self):
+        author = _Author([plan(
+            writes=[{"path": "RENAMED.py", "contents": "y = 3\n"}],
+            renames=[{"from": "other.py", "to": "renamed.py"}],
+        )])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("rename alias reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("rename alias reached an unlink")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("aliases one repository path", detail)
+        self.assertEqual(self.read("other.py"), "y = 2\n")
+        self.assertIsNone(self.read("renamed.py"))
+        self.assertIsNone(self.read("RENAMED.py"))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
 
     def test_broken_python_rolls_back_every_operation(self):
         author = _Author([plan(writes=[

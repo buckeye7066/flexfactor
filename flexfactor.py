@@ -12583,9 +12583,9 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     if len(renames) > STRUCTURAL_MAX_RENAMES:
         return f"plan renames {len(renames)} files (max {STRUCTURAL_MAX_RENAMES})"
 
-    seen_paths: dict[str, str] = {}
+    seen_paths: dict[str, tuple[str, str]] = {}
 
-    def bad_path(p) -> str:
+    def bad_path(p, role: str) -> str:
         if not isinstance(p, str) or not p.strip():
             return "empty path in plan"
         cp = _canon_rel(p)
@@ -12599,14 +12599,30 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
         canonical, key = identity
         previous = seen_paths.get(key)
         if previous is not None:
+            previous_path, previous_role = previous
+            # The apply transaction deliberately performs renames before
+            # writes, so one exact destination may be rewritten with complete
+            # generated contents after its owner bytes move.  This is the only
+            # repeated identity that has deterministic semantics.  Portable
+            # aliases with different spelling and every third/other occurrence
+            # remain a preflight refusal.
+            intentional_move_then_write = bool(
+                canonical == previous_path
+                and {role, previous_role} == {"write", "rename-destination"}
+            )
+            if intentional_move_then_write:
+                seen_paths[key] = (
+                    canonical, "write+rename-destination"
+                )
+                return ""
             return (f"plan aliases one repository path more than once: "
-                    f"{previous!r} and {canonical!r}")
-        seen_paths[key] = canonical
+                    f"{previous_path!r} and {canonical!r}")
+        seen_paths[key] = (canonical, role)
         return ""
 
     for w in writes:
         p = w.get("path") if isinstance(w, dict) else None
-        why = bad_path(p)
+        why = bad_path(p, "write")
         if why:
             return why
         if not isinstance(w.get("contents"), str):
@@ -12621,8 +12637,9 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     for r in renames:
         src_p = r.get("from") if isinstance(r, dict) else None
         dst_p = r.get("to") if isinstance(r, dict) else None
-        for p in (src_p, dst_p):
-            why = bad_path(p)
+        for p, role in ((src_p, "rename-source"),
+                        (dst_p, "rename-destination")):
+            why = bad_path(p, role)
             if why:
                 return why
         if _contained_existence(project_dir, _canon_rel(src_p)) != "exists":
@@ -12853,7 +12870,10 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
         if _replace_contained(project_dir, p, contents) is None:
             _rollback()
             return ("failed", f"contained write refused for {p} (rolled back)")
-        applied_ops.append(("rewrite " if was is not None else "create ") + p)
+        moved_here = p in rename_destinations
+        applied_ops.append(
+            ("rewrite " if was is not None or moved_here else "create ") + p
+        )
 
     unverified = False
     to_gate = [p for p, _ in writes] + [dst for _, dst in renames]
@@ -12870,8 +12890,13 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
 
     if cross is not None:
         parts = []
+        moved_payloads = {
+            dst: rename_payloads[(src, dst)] for src, dst in renames
+        }
         for p, contents in writes:
             was = snapshots.get(p)
+            if was is None:
+                was = moved_payloads.get(p)
             if was is not None:
                 try:
                     parts.append(_fix_diff(was.decode("utf-8", "replace"), contents, p))
