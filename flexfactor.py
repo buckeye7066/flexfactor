@@ -12572,8 +12572,15 @@ def _structural_repo_listing(project_dir: str, cap_files: int = 400,
 def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     """Validate a plan against containment + policy rules. Returns '' when
     acceptable, else the refusal reason (the plan is then NOT applied)."""
-    writes = plan.get("writes") or []
-    renames = plan.get("renames") or []
+    # The schema requires arrays.  Default only an absent/explicit-null field;
+    # falsey model values such as False, "", and {} remain malformed and must
+    # stop the entire plan before even a different valid operation is inspected.
+    writes = plan.get("writes")
+    renames = plan.get("renames")
+    if writes is None:
+        writes = []
+    if renames is None:
+        renames = []
     if not isinstance(writes, list) or not isinstance(renames, list):
         return "plan is malformed (writes/renames not lists)"
     if not writes and not renames:

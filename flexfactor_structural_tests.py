@@ -163,6 +163,45 @@ class StructuralApplies(_Base):
 
 
 class StructuralRollsBack(_Base):
+    def _assert_malformed_operation_field_is_preflight_refused(self, malformed):
+        author = _Author([malformed])
+        forbidden = mock.Mock(
+            side_effect=AssertionError("malformed plan passed preflight")
+        )
+        with mock.patch.object(F, "_contained_existence", forbidden), \
+             mock.patch.object(F, "_read_bytes_contained", forbidden), \
+             mock.patch.object(F, "_replace_contained", forbidden), \
+             mock.patch.object(F, "_unlink_contained", forbidden), \
+             mock.patch.object(F, "_gate_file", forbidden), \
+             mock.patch.object(F, "_cross_verify_structural", forbidden):
+            kind, detail = F.attempt_structural_fix(
+                author, object(), self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("not lists", detail)
+        self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
+        self.assertEqual(self.read("other.py"), "y = 2\n")
+        forbidden.assert_not_called()
+
+    def test_falsey_non_list_renames_refuse_an_otherwise_valid_write(self):
+        self._assert_malformed_operation_field_is_preflight_refused({
+            "changed": True,
+            "writes": [{"path": "bad.py", "contents": GOOD_FIXED}],
+            "renames": False,
+            "fixed_titles": [FINDING["title"]],
+            "notes": "malformed renames",
+        })
+
+    def test_falsey_non_list_writes_refuse_an_otherwise_valid_rename(self):
+        self._assert_malformed_operation_field_is_preflight_refused({
+            "changed": True,
+            "writes": {},
+            "renames": [{"from": "other.py", "to": "renamed.py"}],
+            "fixed_titles": [FINDING["title"]],
+            "notes": "malformed writes",
+        })
+
     def test_oversized_rename_is_refused_before_every_mutation(self):
         source = os.path.join(self.proj, "large.toml")
         with open(source, "wb") as stream:
