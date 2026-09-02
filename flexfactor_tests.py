@@ -1333,6 +1333,18 @@ class BestAvailableProviderContractTests(unittest.TestCase):
         self.assertIn("deepseek", families)
         self.assertGreaterEqual(len(families), 2)
 
+    def test_transport_dead_route_does_not_enter_capacity_wait_loop(self):
+        import flexfactor_capacity as capacity
+        exc = RuntimeError("every frontier pool failed; route cooling down")
+        self.assertFalse(capacity._capacity_should_wait(
+            exc, {"state": "running", "detail": "provider capacity available"}))
+
+    def test_real_shared_allowance_wait_remains_retryable(self):
+        import flexfactor_capacity as capacity
+        exc = RuntimeError("no frontier route available; allowance cooling down")
+        self.assertTrue(capacity._capacity_should_wait(
+            exc, {"state": "waiting-for-provider", "detail": "quota exhausted"}))
+
     def test_legacy_selectors_cannot_bypass_the_ladder(self):
         class Args:
             provider = "ollama"
