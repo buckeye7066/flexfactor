@@ -4825,7 +4825,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         ))
 
     def test_go_skip_and_skipnow_tests_never_receive_execution_credit(self):
-        for call in ("Skip", "SkipNow"):
+        for call in ("Skip", "Skipf", "SkipNow"):
             source = (
                 "package x\nimport \"testing\"\n"
                 f"func TestGenerated(t *testing.T) {{ t.{call}() }}\n"

@@ -14243,7 +14243,7 @@ def _go_runnable_test_names(source: str) -> list[str]:
         parameter = re.escape(match.group(2))
         body = projected[match.end():cursor - 1]
         if re.search(
-                rf"\b{parameter}\s*\.\s*Skip(?:Now)?\s*\(", body):
+                rf"\b{parameter}\s*\.\s*Skip(?:f|Now)?\s*\(", body):
             continue
         runnable.append(match.group(1))
     return runnable
