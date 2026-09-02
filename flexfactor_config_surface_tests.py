@@ -33,6 +33,8 @@ NOT_OURS = {
     "TEMP", "TMP", "USERPROFILE", "HOME", "COMSPEC", "SYSTEMROOT",
     "PYTHONIOENCODING", "PYTHONPATH", "VIRTUAL_ENV", "CI", "NODE_OPTIONS",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",   # the machine's proxy config
+    "CODEX_HOME",  # owned by the official Codex client
+    "FLEXFACTOR_CLI_PROVIDER_ACTIVE",  # internal child-recursion marker
     # Another program's state directory, honoured for interop, not a FlexFactor
     # setting - but it IS documented in the template anyway, which is allowed:
     # the check below is one-directional for this set.
@@ -61,6 +63,11 @@ def _runtime_sources() -> list:
             if base.startswith("test_") or base.endswith(TEST_SUFFIXES):
                 continue
             out.append(path)
+    providers = os.path.join(HERE, "providers")
+    if os.path.isdir(providers):
+        for name in os.listdir(providers):
+            if name.endswith(".py") and not name.startswith("test_"):
+                out.append(os.path.join(providers, name))
     cloud = os.path.join(HERE, "cloud")
     if os.path.isdir(cloud):
         for base, _, files in os.walk(cloud):

@@ -175,15 +175,64 @@ class SteeringTests(unittest.TestCase):
                     def structured(self, system, prompt, schema, max_tokens=8000,
                                    model=None, **kw):
                         self.calls.append(prompt)
+                        if schema is ff.PROGRAM_UNDERSTANDING_SCHEMA:
+                            # This end-to-end fixture predates the mandatory
+                            # purpose-understanding gate.  Cite one exact ref
+                            # from the rendered evidence instead of bypassing
+                            # that gate with a schema-incomplete fake response.
+                            evidence_ref = next(
+                                line.split("] ", 1)[1].split(": ", 1)[0]
+                                for line in prompt.splitlines()
+                                if line.startswith("- [") and "] " in line
+                            )
+                            return {
+                                "purpose": "Provide the target application's documented outcome",
+                                "primary_users": ["Target application operators"],
+                                "core_journeys": ["Run the application and obtain its output"],
+                                "acceptance_criteria": [
+                                    "The documented application journey completes successfully"
+                                ],
+                                "evidence_refs": [evidence_ref],
+                            }
                         return {"findings": [], "summary": "clean"}
 
                 stub = ContextRecordingProvider()
                 state = os.path.join(self.root, "state")
+
+                def offline_competitor_gate(**_kwargs):
+                    # This test owns the HTTP steering boundary, not public
+                    # competitor discovery.  Return a completed, empty research
+                    # receipt so a developer's configured Scout/Repo Rewards
+                    # endpoints can never leak into the unit test process.
+                    return {
+                        "research": {
+                            "researched_at": "test-fixture",
+                            "target": 3,
+                            "competitors": [],
+                            "verified": 0,
+                            "sources_used": [],
+                            "sources_skipped": {
+                                "test": "public research replaced by offline fixture"
+                            },
+                            "coverage_note": "offline steering fixture; no competitors",
+                        },
+                        "findings": [],
+                        "purpose_files": [],
+                        "applied": [],
+                        "unverified": [],
+                        "notes": [],
+                        "dirty_abort": False,
+                        "committed": False,
+                        "attempted": True,
+                    }
+
                 with ft._patched(ff, "BRAIN_PATH", os.path.join(state, "brain.json")), \
                      ft._patched(ff, "RUNS_PATH", os.path.join(state, "runs")), \
                      ft._patched(ff, "STATUS_PATH", os.path.join(state, "status.json")), \
                      ft._patched(ff, "build_audit_providers",
                                  lambda a, m=None: [("stub", stub)]), \
+                     ft._patched(ff, "_run_top_competitor_gate",
+                                 offline_competitor_gate), \
                      ft._patched(ff, "_full_gate",
                                  lambda d, s: (None, "offline E2E build stub")):
                     result = ff.audit_one_program(project, args, 0, 1, None)
