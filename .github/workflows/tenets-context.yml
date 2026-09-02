@@ -1,0 +1,80 @@
+name: tenets-context
+
+on:
+  push:
+    branches: [main, "ai/futuretools-tenets-context"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adapter-tests:
+    name: adapter-tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Compile and run hermetic adapter tests
+        shell: bash
+        run: |
+          python -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          python flexfactor_tenets_tests.py
+      - name: Verify the packaged command without optional dependencies
+        shell: bash
+        run: |
+          python -m pip install .
+          python -m pip check
+          flexfactor-context --help > /dev/null
+
+  live-tenets:
+    name: live-tenets (pinned local CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install FlexFactor with the pinned Tenets integration
+        run: |
+          python -m pip install ".[context]"
+          python -m pip check
+          python - <<'PY'
+          from importlib.metadata import version
+          assert version("tenets") == "0.13.3", version("tenets")
+          PY
+      - name: Rank the real checkout and validate contained evidence
+        env:
+          CONTEXT_OUTPUT: ${{ runner.temp }}/tenets-context.json
+        run: |
+          flexfactor-context . \
+            "identify production-readiness defects, broken user journeys, security risks, release blockers, and missing tests" \
+            --top 20 --timeout 180 --strict --output "$CONTEXT_OUTPUT"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(".").resolve()
+          payload = json.loads(Path(os.environ["CONTEXT_OUTPUT"]).read_text(encoding="utf-8"))
+          assert payload["status"] == "ok", payload
+          assert payload["expected_version"] == "0.13.3", payload
+          assert payload["files"], payload
+          assert len(payload["files"]) <= 20, payload
+          for item in payload["files"]:
+              resolved = (root / item["path"]).resolve(strict=False)
+              resolved.relative_to(root)
+          print("validated", len(payload["files"]), "contained ranked files")
+          PY
