@@ -2135,6 +2135,17 @@ class RotationDefaultProviderTests(unittest.TestCase):
         # A genuinely unknown, unregistered id still bills fail-closed premium.
         self.assertEqual(ff._price_for("some-unknown-model-id"), ff._DEFAULT_PRICE)
 
+    def test_rotated_anthropic_route_disables_hidden_cross_family_rescue(self):
+        import flexfactor_rotation as fr
+        route = fr.Route.from_json(
+            self._route("anthropic/claude-sonnet-4.6", api="anthropic")
+        )
+        stub = mock.Mock()
+        with mock.patch.object(ff, "AnthropicProvider", return_value=stub):
+            provider = ff._rotation_route_provider(route)
+        self.assertIs(provider, stub)
+        self.assertIs(provider._allow_cross_family_rescue, False)
+
     def test_unusable_routes_are_dropped_with_named_reasons(self):
         import flexfactor_rotation as fr
         cases = [
@@ -4327,6 +4338,31 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         forbidden_write.assert_not_called()
         forbidden_runner.assert_not_called()
 
+    def test_windows_trailing_dot_alias_is_refused_before_every_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("Windows trailing-dot alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("Windows trailing-dot alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/case.py", "contents": "VALUE = 1\n"},
+            {"path": "tests/case.py.", "contents": "VALUE = 2\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("invalid repository path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
 
 class PathContainmentTests(unittest.TestCase):
     """Round-3 defect 2: model-generated paths must be contained to the repo; a
@@ -4339,6 +4375,18 @@ class PathContainmentTests(unittest.TestCase):
                         "../outside.js", "C:evil", r"\\host\share\x", "~/secrets",
                         "sub/../../escape.js"):
                 self.assertIsNone(ff._contained_path(tmp, bad), f"should reject {bad!r}")
+
+    def test_windows_alias_components_are_rejected_on_every_host(self):
+        import tempfile
+        aliases = (
+            "tests/case.py.", "tests/trailing /case.py", "tests/file.py:stream",
+            "tests/NUL.txt", "tests/con.py", "tests/COM1", "tests/lpt9.js",
+            "tests/bad?.py", "tests/control\x01.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in aliases:
+                self.assertIsNone(ff._rel_components(bad), bad)
+                self.assertIsNone(ff._contained_path(tmp, bad), bad)
 
     def test_safe_relative_paths_are_allowed(self):
         import tempfile
@@ -13033,6 +13081,28 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertEqual(out, {"ok": True})
         self.assertEqual(seen["model"], ff.DEFAULT_MODELS["openai"],
                          "an author-tier call must map to the OpenAI author tier")
+
+    def test_rotating_reviewer_refuses_hidden_openai_rescue(self):
+        os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
+        prov = self._provider()
+        prov._allow_cross_family_rescue = False
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            raise ConnectionError("anthropic route unavailable")
+
+        ff._stream_with_deadline = fake_swd
+        rescue = mock.Mock()
+        rescue.structured.return_value = {"verdict": "approve"}
+        prov._oai_rescue = rescue
+
+        with self.assertRaises(ff.CrossFamilyRescueRequired) as cm:
+            prov.structured("review", "candidate", {"type": "object"},
+                            model=prov.judge_model)
+        self.assertIn("outer-ladder failover required", str(cm.exception))
+        import flexfactor_rotation as fr
+        self.assertTrue(fr.is_transport_dead_error(cm.exception))
+        self.assertTrue(fr._is_retryable(cm.exception))
+        rescue.structured.assert_not_called()
 
     @_needs_anthropic_sdk
     def test_garbage_output_rescues_when_keys_present(self):

@@ -1601,7 +1601,7 @@ _ROUTE_CAPABILITY_MARKERS = (
 # entitlements and its deadline all belong to that one entry in the catalog, so
 # `codex.CMD` exiting 1 or `claude.EXE` being killed says nothing whatever about
 # the payload or about any of the other 640 routes.
-_TRANSPORT_FAULT_TYPES = ("CliUnavailable",)
+_TRANSPORT_FAULT_TYPES = ("CliUnavailable", "CrossFamilyRescueRequired")
 
 # A refusal of the REQUEST BODY. No route can accept it, so rotating is pure
 # waste -- and, worse, `Rotator.report` would charge the refusal to whichever

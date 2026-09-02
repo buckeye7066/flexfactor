@@ -612,18 +612,12 @@ def _contained_path(project_dir: str, rel) -> str | None:
     drive-relative paths ('C:x'), UNC paths ('\\\\host\\share'), '~' home paths, and
     any '..' traversal that resolves outside the repo root - so a hostile or confused
     model response can never overwrite files outside the target repo."""
-    if not rel or not isinstance(rel, str):
-        return None
-    r = rel.strip().strip('"').replace("\\", "/")
-    if not r or r.startswith("~"):
-        return None
-    # Absolute (POSIX '/x' or Windows 'C:/x'), UNC ('//host'), or drive-relative
-    # ('C:x' - which os.path.join would let DISCARD project_dir on Windows).
-    if os.path.isabs(rel) or os.path.isabs(r) or r.startswith("//") or re.match(r"^[A-Za-z]:", r):
+    comps = _rel_components(rel)
+    if comps is None:
         return None
     try:
         root = os.path.realpath(project_dir)
-        full = os.path.realpath(os.path.join(root, r))
+        full = os.path.realpath(os.path.join(root, *comps))
     except OSError:
         return None
     # Must be the root itself or strictly below it (blocks '..' escapes + symlinks).
@@ -1891,6 +1885,24 @@ class PaidRescueNeeded(RuntimeError):
         self.original = original
 
 
+class CrossFamilyRescueRequired(RuntimeError):
+    """Tell the outer rotator to select and record a different provider route.
+
+    A rotated Anthropic adapter may rescue through paid Anthropic transparently,
+    because the model family is unchanged. It may not return an OpenAI result
+    under the selected Anthropic route identity; raising this route-scoped
+    transport failure lets the quality-first ladder try a separately recorded
+    route instead.
+    """
+
+    def __init__(self, original: BaseException):
+        super().__init__(
+            "selected provider family exhausted; outer-ladder failover required: "
+            f"{type(original).__name__}: {original}"
+        )
+        self.original = original
+
+
 class AnthropicProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import anthropic  # imported lazily so OpenAI-only users need not install it
@@ -1903,6 +1915,11 @@ class AnthropicProvider:
         self.client = anthropic.Anthropic()
         self._paid_client_obj = None   # lazy real-API rescue client (paid key)
         self._oai_rescue = None        # lazy OpenAIProvider rescue delegate
+        # Fixed-provider callers retain the legacy same-call OpenAI rescue.
+        # RotatingProvider factories turn this off because their route ledger
+        # must describe the family that actually produced the result; the outer
+        # ladder performs cross-family failover with an auditable new route.
+        self._allow_cross_family_rescue = True
 
     def _paid_client(self):
         """Real-API Anthropic client built from the rescue key, or None. Explicit
@@ -2049,6 +2066,8 @@ class AnthropicProvider:
                             message = self._paid_message(kwargs, exc2)
                 self._meter(message, self.model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2076,6 +2095,8 @@ class AnthropicProvider:
                 text = next((b.text for b in message.content if b.type == "text"), None)
                 last_text = text
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2115,6 +2136,8 @@ class AnthropicProvider:
                     messages=[{"role": "user", "content": prompt}], fmt=fmt)
                 self._meter(message, use_model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2300,6 +2323,8 @@ class AnthropicProvider:
                             message = self._paid_message(kwargs, exc2)
                 self._meter(message, self.judge_model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -3869,8 +3894,15 @@ def _rotation_route_provider(route):
             # that succeeded.
             prov._paid_client_obj = None
             prov._oai_rescue = None
+            prov._allow_cross_family_rescue = False
             return prov
-        return AnthropicProvider(wire, judge_model=wire)
+        prov = AnthropicProvider(wire, judge_model=wire)
+        # A route selected as Anthropic may use paid Anthropic rescue, but it
+        # must never return an OpenAI result under an Anthropic identity. Let
+        # RotatingProvider observe the failure and select OpenAI as a distinct
+        # outer-ladder route so author/reviewer separation stays provable.
+        prov._allow_cross_family_rescue = False
+        return prov
     if route.api == "gemini":
         import openai
         # Google serves an OpenAI-compatible surface, so the existing
@@ -10067,7 +10099,8 @@ def _same_id(a, b) -> bool:
 
 def _rel_components(rel: str) -> list[str] | None:
     """Split a repo-relative path into safe components, or None if it is absolute,
-    drive-relative, UNC, '~'-rooted, or contains any '..' traversal."""
+    drive-relative, UNC, '~'-rooted, contains traversal, or has a component
+    whose Windows pathname semantics could alias a different repository leaf."""
     if not rel or not isinstance(rel, str):
         return None
     if "\x00" in rel:  # NUL byte: truncation/injection guard
@@ -10080,6 +10113,18 @@ def _rel_components(rel: str) -> list[str] | None:
         if part in ("", "."):
             continue
         if part == "..":
+            return None
+        # Win32 strips trailing spaces/periods, treats these punctuation marks
+        # and ASCII controls specially, exposes ':' as an alternate-data-stream
+        # separator, and reserves device stems even when an extension follows.
+        # Reject those spellings on every host so an all-before-any preflight
+        # cannot validate two names that become one leaf on Windows.
+        if (part[-1] in " ."
+                or any(ord(ch) < 32 or ch in '<>:"|?*' for ch in part)):
+            return None
+        device_stem = part.split(".", 1)[0].casefold()
+        if (device_stem in {"con", "prn", "aux", "nul"}
+                or re.fullmatch(r"(?:com|lpt)[1-9]", device_stem)):
             return None
         comps.append(part)
     return comps or None
@@ -10338,18 +10383,23 @@ def _replace_contained(project_dir: str, rel: str, content) -> str | None:
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=False)
 
 
-def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> bytes | None:
+def _read_bytes_contained(project_dir: str, rel: str,
+                          cap: int | None = MAX_REVIEW_BYTES) -> bytes | None:
     """Read a repo-relative file's RAW BYTES through the same fd chokepoint as
     _read_contained (for backups/snapshots that must round-trip exactly). Returns the
     bytes, or None on any refusal (missing / symlink / junction ancestor / escape /
-    fail-closed). Distinguishes 'no original' (None) from 'empty file' (b"")."""
+    fail-closed). Distinguishes 'no original' (None) from 'empty file' (b"").
+    ``cap=None`` reads the complete payload for exact-copy and rollback paths."""
     with _open_contained_fd(project_dir, rel) as fd:
         if fd is None:
             return None
         try:
             buf = bytearray()
-            while len(buf) < cap:
-                chunk = os.read(fd, min(65536, cap - len(buf)))
+            while cap is None or len(buf) < cap:
+                want = 65536 if cap is None else min(65536, cap - len(buf))
+                if want <= 0:
+                    break
+                chunk = os.read(fd, want)
                 if not chunk:
                     break
                 buf += chunk
@@ -12593,11 +12643,21 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     # unrelated write occurs. Existing empty owner files may remain valid when
     # that destination parser accepts an empty module.
     for src_p, dst_p in renames:
-        source = _read_contained(project_dir, src_p, cap=None)
-        if source is None:
+        source_bytes = _read_bytes_contained(project_dir, src_p, cap=None)
+        if source_bytes is None:
             return (
                 "failed",
                 f"structural rename source read was refused for {src_p}",
+            )
+        try:
+            # The rename below copies these exact bytes. A replacement-decoded
+            # preview is not evidence that the on-disk payload is valid source.
+            source = source_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as ex:
+            return (
+                "failed",
+                f"structural rename source rejected before write for "
+                f"{src_p} -> {dst_p}: invalid UTF-8 ({ex})",
             )
         syntax_ok, syntax_note = _inproc_source_syntax_ok(
             dst_p, source, allow_empty=True,
@@ -12615,7 +12675,8 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
         ex = _contained_existence(project_dir, p)
         if ex == "refused":
             return ("failed", f"existence check refused for {p}")
-        snapshots[p] = _read_bytes_contained(project_dir, p) if ex == "exists" else None
+        snapshots[p] = (_read_bytes_contained(project_dir, p, cap=None)
+                        if ex == "exists" else None)
 
     def _rollback() -> bool:
         ok = True
@@ -12629,7 +12690,7 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
 
     applied_ops = []
     for src_p, dst_p in renames:
-        data = _read_bytes_contained(project_dir, src_p)
+        data = _read_bytes_contained(project_dir, src_p, cap=None)
         moved = (data is not None
                  and _replace_contained(project_dir, dst_p, data) is not None
                  and _unlink_contained(project_dir, src_p))

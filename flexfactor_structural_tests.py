@@ -109,6 +109,19 @@ class StructuralApplies(_Base):
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 2\n")
 
+    def test_rename_preserves_bytes_beyond_the_review_read_ceiling(self):
+        source = os.path.join(self.proj, "large.toml")
+        payload = ("# " + ("x" * (F.MAX_REVIEW_BYTES + 32)) + "\n").encode()
+        with open(source, "wb") as stream:
+            stream.write(payload)
+        author = _Author([plan(
+            renames=[{"from": "large.toml", "to": "moved.toml"}],
+        )])
+        self.run_fix(author)
+        self.assertFalse(os.path.exists(source))
+        with open(os.path.join(self.proj, "moved.toml"), "rb") as stream:
+            self.assertEqual(payload, stream.read())
+
     def test_need_files_round_grants_rewrite_of_requested_file(self):
         author = _Author([
             plan(changed=False, need_files=["other.py"]),
@@ -184,6 +197,45 @@ class StructuralRollsBack(_Base):
         self.assertEqual(self.read("notes.txt"),
                          "This is documentation, not TSX source.\n")
         self.assertIsNone(self.read("src/new.tsx"))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
+    def test_non_utf8_rename_is_rejected_using_the_exact_source_bytes(self):
+        notes = os.path.join(self.proj, "notes.bin")
+        original = b"# invalid byte in a comment: \xff\nvalue: int\n"
+        with open(notes, "wb") as stream:
+            stream.write(original)
+        author = _Author([plan(
+            renames=[{"from": "notes.bin", "to": "types/new.pyi"}],
+        )])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("non-UTF-8 rename reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("non-UTF-8 rename reached an unlink")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("non-UTF-8 rename reached a gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("non-UTF-8 rename reached review")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink), \
+             mock.patch.object(F, "_gate_file", forbidden_gate), \
+             mock.patch.object(F, "_cross_verify_structural", forbidden_review):
+            kind, detail = F.attempt_structural_fix(
+                author, object(), self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("rename source rejected before write", detail)
+        self.assertIn("invalid UTF-8", detail)
+        with open(notes, "rb") as stream:
+            self.assertEqual(original, stream.read())
+        self.assertFalse(os.path.exists(os.path.join(self.proj, "types", "new.pyi")))
         forbidden_write.assert_not_called()
         forbidden_unlink.assert_not_called()
         forbidden_gate.assert_not_called()
