@@ -397,14 +397,15 @@ export async function providerPublicKey(token, repository, fetchImpl = fetch) {
 }
 
 async function hasRepositorySecret(token, repository, name, fetchImpl) {
-  for (let page = 1; page <= 10; page += 1) {
-    const response = await githubJson(token, "GET",
-      `/repos/${repository}/actions/secrets?per_page=100&page=${page}`, undefined, fetchImpl);
-    if (!Array.isArray(response.secrets)) return false;
-    if (response.secrets.some((item) => item?.name === name)) return true;
-    if (response.secrets.length < 100) return false;
+  const response = await githubRaw(token, "GET",
+    `/repos/${repository}/actions/secrets/${name}`, undefined, fetchImpl);
+  if (response.status === 200) return true;
+  if (response.status === 404) return false;
+  if (response.status === 401) {
+    throw new ServiceError(401, "session_invalid", "Your GitHub session is no longer valid.");
   }
-  return false;
+  throw new ServiceError(response.status >= 500 ? 502 : response.status,
+    "github_request_failed", safeGitHubError(response));
 }
 
 async function putRepositorySecret(token, repository, name, value, fetchImpl) {
@@ -421,17 +422,45 @@ async function putRepositorySecret(token, repository, name, value, fetchImpl) {
 async function prepareProviderSecrets(token, request, provided, fetchImpl) {
   const values = provided && typeof provided === "object" && !Array.isArray(provided)
     ? provided : {};
-  const ensure = async (name, required) => {
-    if (values[name]) {
-      await putRepositorySecret(token, request.repository, name, values[name], fetchImpl);
-    } else if (required && !(await hasRepositorySecret(token, request.repository, name, fetchImpl))) {
-      const label = name === "OPENAI_API_KEY" ? "OpenAI" : "Anthropic";
-      throw new ServiceError(400, "provider_key_missing",
-        `${label} is selected, but this repository has no ${name}. Save the key once in Credentials.`);
+  const dualPaid = request.use_both
+    && (request.mode === "audit" || request.mode === "prodready")
+    && (request.provider === "openai" || request.provider === "anthropic");
+  const required = new Set();
+  if (request.provider === "openai" || dualPaid) required.add("OPENAI_API_KEY");
+  if (request.provider === "anthropic" || dualPaid) required.add("ANTHROPIC_API_KEY");
+
+  for (const name of Object.keys(values)) {
+    if (!ALLOWED_SECRETS.has(name)) {
+      throw new ServiceError(400, "invalid_secret_name",
+        "The provider credential name is invalid.");
     }
-  };
-  await ensure("OPENAI_API_KEY", request.provider === "openai");
-  await ensure("ANTHROPIC_API_KEY", request.provider === "anthropic");
+    if (!required.has(name)) {
+      throw new ServiceError(400, "unexpected_provider_key",
+        "This run does not use the supplied provider credential.");
+    }
+  }
+
+  const writes = [];
+  const missing = [];
+  for (const name of required) {
+    if (Object.prototype.hasOwnProperty.call(values, name)) {
+      writes.push({ name, value: validateEncryptedSecret(values[name]) });
+    } else if (!(await hasRepositorySecret(token, request.repository, name, fetchImpl))) {
+      missing.push(name);
+    }
+  }
+  if (missing.length) {
+    const labels = missing.map((name) => name === "OPENAI_API_KEY" ? "OpenAI" : "Anthropic");
+    throw new ServiceError(400, "provider_key_missing",
+      `${labels.join(" and ")} ${labels.length === 1 ? "is" : "are"} required, but this repository is missing ${missing.join(" and ")}. Save ${labels.length === 1 ? "the key" : "both keys"} in Provider settings.`);
+  }
+  return writes;
+}
+
+async function applyProviderSecrets(token, repository, writes, fetchImpl) {
+  for (const item of writes) {
+    await putRepositorySecret(token, repository, item.name, item.value, fetchImpl);
+  }
 }
 
 async function installWorkflowThroughPullRequest(token, repository, baseBranch, expected, fetchImpl) {
@@ -591,9 +620,13 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
     throw new ServiceError(502, "invalid_default_branch",
       "GitHub returned an invalid default branch for this repository.");
   }
+  // Prove every credential needed by the effective model policy before
+  // installing a workflow or replacing any repository secret.
+  const providerSecretWrites = await prepareProviderSecrets(
+    token, run, encryptedSecrets, fetchImpl);
   const workflowChanged = await ensureTargetWorkflow(
     token, run.repository, workflowRef, fetchImpl);
-  await prepareProviderSecrets(token, run, encryptedSecrets, fetchImpl);
+  await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);
   const submittedAt = Date.now();
   const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
   let result;

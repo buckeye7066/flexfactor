@@ -159,6 +159,13 @@ final class GitHubApi {
         return new ConfigurationResult(login);
     }
 
+    ConfigurationResult configure(String githubToken, String openAiKey, String anthropicKey)
+            throws Exception {
+        ConfigurationResult configured = configure(githubToken);
+        validateProviderKeys(openAiKey, anthropicKey);
+        return configured;
+    }
+
     DeviceAuthorization beginDeviceAuthorization() throws Exception {
         JSONObject response = cloudJson("", "POST", "/api/oauth/device", new JSONObject(), true);
         return requireDeviceAuthorization(response, System.currentTimeMillis());
@@ -307,13 +314,22 @@ final class GitHubApi {
             String openAiKey, String anthropicKey) throws Exception {
         String openAi = cleanSecret(openAiKey);
         String anthropic = cleanSecret(anthropicKey);
+        boolean dualPaid = request.useBoth
+                && (request.mode == MobileRunRequest.Mode.AUDIT
+                    || request.mode == MobileRunRequest.Mode.PRODREADY)
+                && (request.provider == MobileRunRequest.Provider.OPENAI
+                    || request.provider == MobileRunRequest.Provider.ANTHROPIC);
         boolean sendOpenAi = request.provider == MobileRunRequest.Provider.OPENAI
-                || (request.useBoth && !openAi.isEmpty());
+                || dualPaid;
         boolean sendAnthropic = request.provider == MobileRunRequest.Provider.ANTHROPIC
-                || (request.useBoth && !anthropic.isEmpty());
+                || dualPaid;
         if ((!sendOpenAi || openAi.isEmpty()) && (!sendAnthropic || anthropic.isEmpty())) {
             return new JSONObject();
         }
+        // Validate only credentials this run will transmit. This keeps unused
+        // keys on the phone and prevents a stale or mistyped local value from
+        // replacing a working repository secret.
+        validateProviderKeys(sendOpenAi ? openAi : "", sendAnthropic ? anthropic : "");
         JSONObject key = cloudJson(token, "GET", "/api/provider-key?repository="
                 + encode(request.repository), null, true);
         byte[] publicKey;
@@ -336,6 +352,38 @@ final class GitHubApi {
             encrypted.put("ANTHROPIC_API_KEY", seal(anthropic, keyId, publicKey));
         }
         return encrypted;
+    }
+
+    private void validateProviderKeys(String openAiKey, String anthropicKey) throws Exception {
+        String openAi = cleanSecret(openAiKey);
+        String anthropic = cleanSecret(anthropicKey);
+        if (!openAi.isEmpty()) verifyOpenAi(openAi);
+        if (!anthropic.isEmpty()) verifyAnthropic(anthropic);
+    }
+
+    private void verifyOpenAi(String key) throws Exception {
+        HttpURLConnection connection = connection(
+                new URL("https://api.openai.com/v1/models"), DEFAULT_READ_TIMEOUT_MS);
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + key);
+        HttpResult result = execute(connection, null);
+        if (result.status != 200) {
+            throw new ApiException("OpenAI rejected this key (HTTP " + result.status + ").");
+        }
+    }
+
+    private void verifyAnthropic(String key) throws Exception {
+        HttpURLConnection connection = connection(
+                new URL("https://api.anthropic.com/v1/models"), DEFAULT_READ_TIMEOUT_MS);
+        connection.setRequestMethod("GET");
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("x-api-key", key);
+        connection.setRequestProperty("anthropic-version", "2023-06-01");
+        HttpResult result = execute(connection, null);
+        if (result.status != 200) {
+            throw new ApiException("Anthropic rejected this key (HTTP " + result.status + ").");
+        }
     }
 
     private JSONObject seal(String value, String keyId, byte[] publicKey) throws Exception {

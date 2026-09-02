@@ -25,10 +25,12 @@ After sign-in, **Provider settings** optionally accepts:
 FlexFactor Cloud validates the GitHub account before saving anything. A pinned Ollama
 runtime and coding model run in the disposable Actions runner by default. Optional
 provider values are encrypted at rest with a non-exportable Android Keystore key and
-are validated by the selected provider when a run uses them. Vendor keys are sealed on the phone with the
-repository's GitHub Actions public key and written to protected Actions secrets by
-the service, which receives ciphertext rather than plaintext during dispatch. They
-are never workflow inputs, URLs, command arguments, artifacts, or log fields.
+are validated directly against the provider before the phone saves them and again
+before a run transmits them. Only keys required by the selected run are sealed on
+the phone with the repository's GitHub Actions public key and written to protected
+Actions secrets by the service, which receives ciphertext rather than plaintext
+during dispatch. They are never workflow inputs, URLs, command arguments, artifacts,
+or log fields.
 The owner OAuth session is not copied into repositories: each run uses GitHub's
 short-lived, repository-scoped `GITHUB_TOKEN`, including for Copilot requests.
 

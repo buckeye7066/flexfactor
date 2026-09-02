@@ -476,7 +476,7 @@ public final class MainActivity extends Activity {
                     anthropicValue = secrets.get(SecureStore.ANTHROPIC_KEY);
                 }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Saving…");
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
                 configureCredentials(dialog, openAiValue, anthropicValue);
             });
         });
@@ -486,7 +486,8 @@ public final class MainActivity extends Activity {
     private void configureCredentials(AlertDialog dialog, String openAi, String anthropic) {
         worker.execute(() -> {
             try {
-                GitHubApi.ConfigurationResult result = api.configure(githubToken());
+                GitHubApi.ConfigurationResult result = api.configure(
+                        githubToken(), openAi, anthropic);
                 secrets.put(SecureStore.OPENAI_KEY, openAi);
                 secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
                 preferences.edit().putString(LOGIN, result.login).apply();

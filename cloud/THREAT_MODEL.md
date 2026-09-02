@@ -15,8 +15,10 @@
    budgets, file paths, and steering text are validated again server-side. GitHub error bodies are
    not reflected wholesale.
 3. **Provider credentials.** Provider keys remain encrypted on the phone until a run needs one. The
-   APK uses a LibSodium sealed box with the repository public key, and the cloud forwards only the
-   sealed ciphertext and key ID to GitHub. The service never receives a plaintext provider key.
+   APK validates a new value against the provider's fixed HTTPS origin before saving it and again
+   before transmission. It seals only credentials required by the effective run policy with the
+   repository public key. The cloud preflights every required repository secret before any write,
+   forwards only sealed ciphertext and key IDs to GitHub, and never receives a plaintext provider key.
 4. **Artifacts.** Only the run-correlated `mobile-phone-*` artifact is selected. Redirects must be
    HTTPS and use GitHub's signed storage host families. The download is capped at 2 MiB and the OAuth
    bearer is not sent to the signed storage URL. The APK separately caps each extracted entry.

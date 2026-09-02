@@ -198,12 +198,62 @@ test("sealed provider values are forwarded without accepting plaintext key field
       html_url: "https://github.com/owner/project/actions/runs/12" } },
   ]);
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
-  await dispatch("gho_sealed_token", validRun({ provider: "openai" }),
+  await dispatch("gho_sealed_token", validRun({ provider: "openai", use_both: false }),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
   const secretWrite = fetcher.calls[2];
   assert.match(secretWrite.url, /actions\/secrets\/OPENAI_API_KEY$/);
   assert.equal(JSON.parse(secretWrite.options.body).encrypted_value, sealed.encrypted_value);
   assert.doesNotMatch(secretWrite.options.body, /sk-|api[_-]?key/i);
+});
+
+test("unused provider credentials are rejected before any repository mutation", async () => {
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([{ body: { default_branch: "main" } }]);
+  await assert.rejects(() => dispatch("gho_unused_token",
+    validRun({ mode: "scout", provider: "ollama", use_both: true }),
+    { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {}),
+  (error) => error instanceof ServiceError && error.code === "unexpected_provider_key");
+  assert.equal(fetcher.calls.length, 1);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
+});
+
+test("dual-paid runs require both credentials before workflow or secret writes", async () => {
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([
+    { body: { default_branch: "main" } },
+    { status: 404, body: { message: "Not Found" } },
+  ]);
+  await assert.rejects(() => dispatch("gho_dual_token",
+    validRun({ mode: "audit", provider: "openai", use_both: true }),
+    { OPENAI_API_KEY: sealed }, fetcher, async () => {}),
+  (error) => error instanceof ServiceError && error.code === "provider_key_missing"
+    && /Anthropic/.test(error.message));
+  assert.equal(fetcher.calls.length, 2);
+  assert.match(fetcher.calls[1].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
+  assert.equal(fetcher.calls.some((call) => /workflows\/flexfactor-mobile/.test(call.url)), false);
+});
+
+test("dual-paid runs accept a supplied key when the paired repository secret exists", async () => {
+  const expectedWorkflow = mobileWorkflow();
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([
+    { body: { default_branch: "main" } },
+    { status: 200, body: { name: "ANTHROPIC_API_KEY" } },
+    { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
+    { status: 204 },
+    { status: 200, body: {
+      workflow_run_id: 45,
+      run_url: "https://api.github.com/repos/owner/project/actions/runs/45",
+      html_url: "https://github.com/owner/project/actions/runs/45",
+    } },
+  ]);
+  const result = await dispatch("gho_dual_existing_token",
+    validRun({ mode: "prodready", provider: "openai", use_both: true }),
+    { OPENAI_API_KEY: sealed }, fetcher, async () => {});
+  assert.equal(result.id, 45);
+  assert.match(fetcher.calls[1].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.match(fetcher.calls[3].url, /actions\/secrets\/OPENAI_API_KEY$/);
 });
 
 test("run status reports the active engine step", async () => {

@@ -218,6 +218,12 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertNotIn("putRepositorySecret", configure)
         self.assertNotIn("deleteRepositorySecret", api)
         self.assertNotIn("deleteRepositorySecret", service)
+        self.assertIn("validateProviderKeys(openAiKey, anthropicKey)", api)
+        self.assertIn("https://api.openai.com/v1/models", api)
+        self.assertIn("https://api.anthropic.com/v1/models", api)
+        self.assertIn("githubToken(), openAi, anthropic", (ANDROID / "java" / "com" /
+                      "firer" / "console" / "flexfactor" / "MainActivity.java").read_text(
+                          encoding="utf-8"))
 
     def test_dispatch_uses_the_authoritative_run_id_with_legacy_correlation_fallback(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -318,6 +324,13 @@ class ManagedAndroidInvariants(unittest.TestCase):
         provider = api.split("private JSONObject encryptedProviderSecrets", 1)[1]
         provider = provider.split("private JSONObject seal", 1)[0]
         self.assertIn("request.useBoth", provider)
+        self.assertIn("request.mode == MobileRunRequest.Mode.AUDIT", provider)
+        self.assertIn("request.mode == MobileRunRequest.Mode.PRODREADY", provider)
+        self.assertIn("request.provider == MobileRunRequest.Provider.OPENAI", provider)
+        self.assertIn("request.provider == MobileRunRequest.Provider.ANTHROPIC", provider)
+        self.assertNotIn("request.useBoth && !openAi.isEmpty()", provider)
+        self.assertNotIn("request.useBoth && !anthropic.isEmpty()", provider)
+        self.assertIn("validateProviderKeys(sendOpenAi ? openAi : \"\"", provider)
         self.assertIn("OPENAI_API_KEY", provider)
         self.assertIn("ANTHROPIC_API_KEY", provider)
         self.assertIn("cryptoBoxSeal", api)
