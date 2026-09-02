@@ -225,16 +225,36 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('source_sha="$tag_commit"', workflow)
         self.assertIn('source_sha="$GITHUB_SHA"', workflow)
         self.assertIn("source_sha: ${{ steps.plan.outputs.source_sha }}", workflow)
+        self.assertIn(
+            "authorized_main_sha: ${{ steps.plan.outputs.authorized_main_sha }}",
+            workflow,
+        )
         self.assertIn("ref: ${{ needs.release-plan.outputs.source_sha }}", workflow)
         self.assertNotIn('"${GITHUB_SHA}^:android/app/build.gradle.kts"', workflow)
-        self.assertIn('if [ "$tag_commit" != "$SOURCE_SHA" ]', workflow)
+        self.assertIn('test "$tag_commit" = "$SOURCE_SHA"', workflow)
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64", workflow)
         self.assertIn(".engine_ref == $engine", workflow)
-        self.assertIn("Revalidate live main before accessing signing material", workflow)
+        self.assertIn("Reauthorize a manual rerun and live main before signing", workflow)
+        self.assertIn(
+            'test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"',
+            workflow,
+        )
         self.assertIn("Revalidate live main before publication", workflow)
         self.assertGreaterEqual(
-            workflow.count('test "$live_main" = "$SOURCE_SHA"'), 2)
+            workflow.count('test "$live_main" = "$AUTHORIZED_MAIN_SHA"'), 2)
+        self.assertIn('source_sha="$tag_commit"', workflow)
+        self.assertIn('authorized_main_sha="$GITHUB_SHA"', workflow)
+        self.assertIn('git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha"', workflow)
+        self.assertIn("require_exact_tag()", workflow)
+        self.assertGreaterEqual(workflow.count("require_exact_tag"), 8)
+        self.assertIn("--draft", workflow)
+        self.assertIn("--verify-tag", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertIn(
+            "group: android-release-${{ needs.release-plan.outputs.release_tag }}",
+            workflow,
+        )
 
     def test_mobile_refactor_does_not_delete_a_tracked_backup_file(self):
         path = os.path.join(

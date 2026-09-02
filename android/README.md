@@ -80,6 +80,10 @@ may manually dispatch `android-client.yml` from GitHub Actions and provide the
 current 40-character `main` SHA. The workflow rejects other actors, ref drift,
 an older conflicting tag, and any `main` movement before it accesses signing
 material and again immediately before publication.
+Manual reruns reauthorize the current triggering actor. Automatic recovery may
+rebuild an older exact tag already contained in the authorized `main` tip; it
+stages a draft and rechecks the live branch, tag target, and complete asset set
+before and after publication.
 
 ## Release signing and updates
 

@@ -151,5 +151,9 @@ If an automatic release needs an exact rerun or repair, the repository owner
 may dispatch `android-client.yml` from GitHub Actions with the current 40-digit
 `main` SHA. The workflow independently refuses a non-owner, ref drift, an older
 conflicting tag, or any `main` movement before signing and before publication.
+A rerun reauthorizes the current triggering actor instead of trusting the
+original actor. Recovery binds the current authorized `main` tip separately
+from an older exact source tag, and every release stays draft until all three
+assets and the tag target are verified immediately around publication.
 
 For failure diagnosis, see [docs/troubleshooting.md](docs/troubleshooting.md).
