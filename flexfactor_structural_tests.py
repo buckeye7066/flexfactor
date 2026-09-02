@@ -151,6 +151,44 @@ class StructuralRollsBack(_Base):
         forbidden_gate.assert_not_called()
         forbidden_review.assert_not_called()
 
+    def test_unparsed_rename_destination_is_rejected_before_every_write(self):
+        notes = os.path.join(self.proj, "notes.txt")
+        with open(notes, "w", encoding="utf-8") as stream:
+            stream.write("This is documentation, not TSX source.\n")
+        author = _Author([plan(
+            renames=[{"from": "notes.txt", "to": "src/new.tsx"}],
+        )])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("unparsed rename reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("unparsed rename reached an unlink")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("unparsed rename reached a gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("unparsed rename reached review")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink), \
+             mock.patch.object(F, "_gate_file", forbidden_gate), \
+             mock.patch.object(F, "_cross_verify_structural", forbidden_review):
+            kind, detail = F.attempt_structural_fix(
+                author, object(), self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("rename source rejected before write", detail)
+        self.assertIn("no safe in-process parser", detail)
+        self.assertEqual(self.read("notes.txt"),
+                         "This is documentation, not TSX source.\n")
+        self.assertIsNone(self.read("src/new.tsx"))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
     def test_broken_python_rolls_back_every_operation(self):
         author = _Author([plan(writes=[
             {"path": "bad.py", "contents": BAD_PYTHON},

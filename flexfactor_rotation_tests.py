@@ -730,6 +730,21 @@ class RotatingProviderTests(RotationTestCase):
         with self.assertRaisesRegex(R.RotationError, "opaque author"):
             prov.grade_independent()
 
+    def test_exact_review_intent_refuses_an_opaque_auto_author(self):
+        prov = self._provider(catalog(
+            route("front/external", "external-front", tier=R.FRONTIER,
+                  model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/external")
+        final_review = R.CallIntent(
+            R.ROLE_REVIEWER,
+            (R.CAP_CODE_REVIEW, R.CAP_STRUCTURED_JSON),
+        )
+        with self.assertRaisesRegex(R.RotationError, "opaque author"):
+            prov.structured("system", "exact patch", {}, intent=final_review)
+
     def test_independent_grader_refuses_an_opaque_auto_reviewer(self):
         prov = self._provider(catalog(
             route("front/qwen", "qwen-front", tier=R.FRONTIER,
@@ -737,7 +752,7 @@ class RotatingProviderTests(RotationTestCase):
             route("light/auto", "opaque-light", tier=R.LIGHT, model="auto"),
         ))
         self.assertEqual(prov.complete("x"), "completed by front/qwen")
-        with self.assertRaisesRegex(R.RotationError, "reviewer family"):
+        with self.assertRaisesRegex(R.RotationError, "reviewer.?family|independent"):
             prov.grade_independent()
 
     def test_separate_ladder_instances_share_author_identity(self):

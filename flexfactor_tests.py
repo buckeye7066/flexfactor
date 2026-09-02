@@ -558,7 +558,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             @classmethod
             def grade_independent(cls, prompt):
                 cls.prompts.append(prompt)
-                return ff.Grade(100, True, "The exact original meets the goal.", [])
+                return json.dumps({
+                    "grade": 100,
+                    "meets_goal": True,
+                    "rationale": "The exact original meets the goal.",
+                    "issues": [],
+                })
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")
@@ -670,7 +675,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
 
             @staticmethod
             def grade_independent(_prompt):
-                return ff.Grade(95, False, "The exact original misses validation.", [])
+                return json.dumps({
+                    "grade": 95,
+                    "meets_goal": "false",
+                    "rationale": "The exact original misses validation.",
+                    "issues": [],
+                })
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")

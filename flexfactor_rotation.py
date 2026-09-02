@@ -1303,14 +1303,30 @@ class RotatingProvider:
         if intent.role == ROLE_REVIEWER:
             with self._family_lock:
                 author_families = tuple(sorted(self._author_families))
-            if author_families:
-                intent = CallIntent(
-                    intent.role,
-                    intent.needs,
-                    intent.avoid_family,
-                    intent.purpose,
-                    tuple(dict.fromkeys(intent.avoid_families + author_families)),
+            opaque_authors = set(author_families).intersection(
+                _OPAQUE_MODEL_FAMILIES
+            )
+            if opaque_authors:
+                raise RotationError(
+                    "independent review cannot prove separation from opaque "
+                    "author model identity: "
+                    + ", ".join(sorted(opaque_authors))
                 )
+            # Every reviewer authorization—not only grade_independent—must use
+            # a concrete family outside every author family. FINAL_REVIEW_SCHEMA
+            # is sent through structured(), so enforcing the role here covers
+            # each exact-commit review chunk as well as adversarial reviews.
+            intent = CallIntent(
+                intent.role,
+                intent.needs,
+                intent.avoid_family,
+                intent.purpose,
+                tuple(dict.fromkeys(
+                    intent.avoid_families
+                    + author_families
+                    + tuple(sorted(_OPAQUE_MODEL_FAMILIES))
+                )),
+            )
         return intent
 
     # -- plumbing ----------------------------------------------------------

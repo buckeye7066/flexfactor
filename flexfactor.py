@@ -2908,6 +2908,10 @@ def _parse_grade(text: str) -> Grade:
     data, _ = _extract_json_object(text)
     if data is None:
         raise ValueError(f"grade response was not JSON; head={text[:200]!r}")
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"grade response was {type(data).__name__}, expected an object"
+        )
     try:
         grade = max(0, min(100, int(float(data.get("grade") or 0))))  # clamp to 0..100
     except (TypeError, ValueError):
@@ -2917,9 +2921,31 @@ def _parse_grade(text: str) -> Grade:
         raw_issues = [raw_issues]
     return Grade(
         grade=grade,
-        meets_goal=bool(data.get("meets_goal", False)),
+        # Only a real JSON boolean can authorize acceptance. Strings such as
+        # "false" are truthy in Python and must therefore fail closed.
+        meets_goal=data.get("meets_goal") is True,
         rationale=str(data.get("rationale", "")),
         issues=[_coerce_issue(x) for x in raw_issues],
+    )
+
+
+def _normalize_grade(value) -> Grade:
+    """Return one provider grade as the core ``Grade`` contract.
+
+    HTTP adapters already return ``Grade``. Subscription CLI adapters return
+    their JSON response as text, and a rotating provider deliberately preserves
+    the backing adapter's value. Normalize at this shared boundary so a raw CLI
+    response cannot escape a guarded provider call and fail later during field
+    access. Malformed or non-object responses raise and therefore fail closed.
+    """
+    if isinstance(value, Grade):
+        return value
+    if isinstance(value, str):
+        return _parse_grade(value)
+    if isinstance(value, dict):
+        return _parse_grade(json.dumps(value))
+    raise TypeError(
+        f"grader returned {type(value).__name__}, expected Grade, JSON text, or object"
     )
 
 
@@ -4976,12 +5002,12 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
                 + syntax_note
             ).strip()
             return outcome
-        grade = provider.grade(
+        grade = _normalize_grade(provider.grade(
             f"GOAL: {args.goal}\n\nCANDIDATE CODE:\n"
             + _fence_untrusted("candidate", candidate)
             + "\n\nGrade whether the goal and applicable competitor capabilities are "
               "implemented without regression."
-        )
+        ))
         if grade.meets_goal is not True or grade.grade < int(args.threshold):
             outcome["note"] = (outcome["note"] +
                                f" Implementation was rejected at grade {grade.grade}.").strip()
@@ -5183,7 +5209,9 @@ def run(args) -> int:
                                 "the active model ladder cannot prove a "
                                 "non-author reviewer"
                             )
-                        original_grade = independent_grade(grade_prompt)
+                        original_grade = _normalize_grade(
+                            independent_grade(grade_prompt)
+                        )
                     except Exception as exc:
                         candidate = ""
                         grade = Grade(
@@ -5225,7 +5253,7 @@ def run(args) -> int:
                     "CANDIDATE CODE:\n" + _fence_untrusted("candidate", candidate) + "\n\n"
                     "Grade how well the candidate satisfies the goal."
                 )
-                grade = provider.grade(grade_prompt)
+                grade = _normalize_grade(provider.grade(grade_prompt))
 
         history.append(grade)
         print(f"[rep {i}] grade={grade.grade} meets_goal={grade.meets_goal} - {grade.rationale}")
@@ -5468,11 +5496,11 @@ def run(args) -> int:
             )
             execution_orchestrator.begin_pass(2, delta)
             current = str(competitor.get("current") or current)
-            follow_up = provider.grade(
+            follow_up = _normalize_grade(provider.grade(
                 f"GOAL: {args.goal}\n\nFINAL EXACT-DELTA FILE:\n"
                 + _fence_untrusted("candidate", current)
                 + "\n\nRe-check only this edited file for goal satisfaction and regression."
-            )
+            ))
             if (follow_up.meets_goal is not True
                     or follow_up.grade < int(args.threshold)):
                 print(
@@ -12532,6 +12560,28 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
             return (
                 "failed",
                 f"structural source rejected before write for {p}: {syntax_note}",
+            )
+
+    # A rename changes the source identity just as surely as a generated write:
+    # bytes that were harmless as notes.txt can become executable as new.py.
+    # Parse every source against its DESTINATION type before any rename or
+    # unrelated write occurs. Existing empty owner files may remain valid when
+    # that destination parser accepts an empty module.
+    for src_p, dst_p in renames:
+        source = _read_contained(project_dir, src_p, cap=None)
+        if source is None:
+            return (
+                "failed",
+                f"structural rename source read was refused for {src_p}",
+            )
+        syntax_ok, syntax_note = _inproc_source_syntax_ok(
+            dst_p, source, allow_empty=True,
+        )
+        if syntax_ok is not True:
+            return (
+                "failed",
+                f"structural rename source rejected before write for "
+                f"{src_p} -> {dst_p}: {syntax_note}",
             )
 
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
