@@ -385,6 +385,7 @@ jobs:
             test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER" \
               || { echo "Only the repository owner may run or rerun a manual release" >&2; exit 1; }
           fi
+          printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
           printf '%s' "$AUTHORIZED_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$'
           live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
             --jq '.object.sha')
@@ -520,6 +521,8 @@ jobs:
               --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
             require_exact_tag
           fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq 'select(.isDraft == true)' >/dev/null
           existing_dir="$RUNNER_TEMP/existing-release-assets"
           mkdir -p "$existing_dir"
           asset_names=$(gh release view "$RELEASE_TAG" \
@@ -532,21 +535,20 @@ jobs:
             local asset_label="$3"
             require_live_main
             require_exact_tag
-            if printf '%s\n' "$asset_names" | grep -Fqx "$asset_name"; then
-              rm -f "$existing_dir/$asset_name"
-              gh release download "$RELEASE_TAG" \
-                --repo "$GITHUB_REPOSITORY" \
-                --pattern "$asset_name" \
-                --dir "$existing_dir"
-              require_exact_tag
-              cmp -s "$asset_path" "$existing_dir/$asset_name" \
-                || { echo "Existing release asset $asset_name does not match this exact build" >&2; return 1; }
-            else
+            if ! printf '%s\n' "$asset_names" | grep -Fqx "$asset_name"; then
               gh release upload "$RELEASE_TAG" \
                 "$asset_path#$asset_label" \
                 --repo "$GITHUB_REPOSITORY"
               require_exact_tag
             fi
+            rm -f "$existing_dir/$asset_name"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" \
+              --dir "$existing_dir"
+            require_exact_tag
+            cmp -s "$asset_path" "$existing_dir/$asset_name" \
+              || { echo "Staged release asset $asset_name does not match this exact build" >&2; return 1; }
             require_live_main
           }
           ensure_asset \
