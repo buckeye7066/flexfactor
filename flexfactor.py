@@ -13834,6 +13834,68 @@ _GENERATED_JS_TEST_EXTS = frozenset(
 )
 
 
+def _javascript_code_projection(source: str) -> str:
+    """Mask comments and literals while preserving JavaScript line structure.
+
+    This deliberately masks complete template literals, including interpolation,
+    because generated tests do not need to hide their declarations inside a
+    template expression.  Preserving newlines lets the caller require a direct,
+    statement-level test declaration without executing model-authored source.
+    """
+    projected: list[str] = []
+    index = 0
+    state = "code"
+    quote = ""
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if char == "/" and following == "/":
+                projected.extend((" ", " "))
+                index += 2
+                state = "line-comment"
+                continue
+            if char == "/" and following == "*":
+                projected.extend((" ", " "))
+                index += 2
+                state = "block-comment"
+                continue
+            if char in ("'", '"', "`"):
+                projected.append(" ")
+                quote = char
+                state = "literal"
+                index += 1
+                continue
+            projected.append(char)
+            index += 1
+            continue
+        if state == "line-comment":
+            projected.append("\n" if char == "\n" else " ")
+            index += 1
+            if char == "\n":
+                state = "code"
+            continue
+        if state == "block-comment":
+            if char == "*" and following == "/":
+                projected.extend((" ", " "))
+                index += 2
+                state = "code"
+                continue
+            projected.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(source):
+            projected.append(" ")
+            projected.append("\n" if following == "\n" else " ")
+            index += 2
+            continue
+        projected.append("\n" if char == "\n" else " ")
+        index += 1
+        if char == quote:
+            state = "code"
+    return "".join(projected)
+
+
 def _runner_collectable_generated_test_path(path: str) -> bool:
     """Whether a default native runner can collect this executable test path."""
     canonical = _canon_rel(path)
@@ -13876,8 +13938,8 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
             # Only declarations that can execute count. ``skip``/``todo`` are
             # deliberately absent: an unrelated existing test can make the
             # suite green while every generated declaration is skipped.
-            r"(?<![\w$])(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\(",
-            source,
+            r"(?m)^[ \t]*(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\(",
+            _javascript_code_projection(source),
         ))
     return False
 
