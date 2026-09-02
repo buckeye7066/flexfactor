@@ -1,0 +1,64 @@
+name: agent-fix-pr113-final-review-v5-hosted
+
+on:
+  push:
+    branches: ["ai/futuretools-tenets-context"]
+    paths:
+      - .github/workflows/_agent-fix-pr113-final-review-v5-hosted.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flexfactor-pr113-final-review-v5
+  cancel-in-progress: true
+
+jobs:
+  repair-test-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ai/futuretools-tenets-context
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply and verify final review repairs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64
+          from pathlib import Path
+
+          workflow = Path(".github/workflows/_agent-fix-pr113-final-review-v2.yml").read_text(encoding="utf-8")
+          prefix = "printf '%s' '"
+          suffix = "' | base64"
+          start = workflow.index(prefix) + len(prefix)
+          end = workflow.index(suffix, start)
+          payload = workflow[start:end]
+          Path("/tmp/fix-pr113.py").write_bytes(base64.b64decode(payload, validate=True))
+          PY
+          python /tmp/fix-pr113.py
+          rm -f \
+            .github/workflows/_agent-fix-pr113-final-review-v3.yml \
+            .github/workflows/_agent-fix-pr113-final-review-v4-selfhosted.yml \
+            .github/workflows/_agent-fix-pr113-final-review-v5-hosted.yml
+          git diff --check
+          python -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          python flexfactor_tenets_tests.py
+          python -m pip install "ruff==0.16.3"
+          python -m ruff check --select S102 flexfactor_tenets_tests.py
+
+      - name: Commit and push verified repairs
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: remove Tenets enumeration ceiling and exec fixture"
+          git push origin HEAD:ai/futuretools-tenets-context
