@@ -4734,6 +4734,77 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertFalse(ff._runner_collectable_generated_test_path(rel))
 
+    def test_nested_and_unconditionally_skipped_python_tests_get_no_credit(self):
+        cases = (
+            "def helper():\n"
+            "    def test_hidden():\n"
+            "        assert True\n",
+            "import pytest\n"
+            "@pytest.mark.skip(reason='not running')\n"
+            "def test_skipped():\n"
+            "    assert True\n",
+            "import pytest\n"
+            "@pytest.mark.skip(reason='class skipped')\n"
+            "class TestSkipped:\n"
+            "    def test_member(self):\n"
+            "        assert True\n",
+            "import pytest\n"
+            "pytestmark = pytest.mark.skip(reason='module skipped')\n"
+            "def test_module():\n"
+            "    assert True\n",
+            "import pytest\n"
+            "pytest.skip('module skipped', allow_module_level=True)\n"
+            "def test_module():\n"
+            "    assert True\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("non-collectable Python reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/test_hidden_{index}.py",
+                          "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_module_and_test_class_python_cases_are_collectable(self):
+        for source in (
+                "def test_module():\n    assert True\n",
+                "class TestGroup:\n    def test_member(self):\n        assert True\n",
+                "import unittest\nclass Group(unittest.TestCase):\n"
+                "    def test_member(self):\n        self.assertTrue(True)\n"):
+            with self.subTest(source=source):
+                self.assertTrue(ff._generated_test_source_has_case(
+                    "tests/test_generated.py", source,
+                ))
+
+    def test_go_comment_and_raw_string_examples_are_not_test_cases(self):
+        for source in (
+                "package x\n/*\nfunc TestFake(t *testing.T) {}\n*/\n",
+                "package x\nvar example = `\nfunc TestFake(t *testing.T) {}\n`\n"):
+            with self.subTest(source=source):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+        self.assertTrue(ff._generated_test_source_has_case(
+            "generated_test.go",
+            "package x\nvar example = `path\\`\n"
+            "func TestReal(t *testing.T) {}\n",
+        ))
+
     def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
         cases = (
             "test.skip('skipped', () => {});\n",
@@ -4752,7 +4823,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                  _tempfile_ceiling.TemporaryDirectory() as project, \
                  mock.patch.object(
                      ff, "_generated_test_source_syntax_ok",
-                     return_value=(True, "javascript parse"),
+                     return_value=(True, "javascript parse", source),
                  ), \
                  mock.patch.object(ff, "_create_contained", forbidden_write), \
                  mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
@@ -4786,7 +4857,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                  _tempfile_ceiling.TemporaryDirectory() as project, \
                  mock.patch.object(
                      ff, "_generated_test_source_syntax_ok",
-                     return_value=(True, "javascript parse"),
+                     return_value=(True, "javascript parse", source),
                  ), \
                  mock.patch.object(ff, "_create_contained", forbidden_write), \
                  mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
@@ -4803,6 +4874,49 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             self.assertIn("declares no collectable test case", refusal)
             forbidden_write.assert_not_called()
             passing_existing_suite.assert_not_called()
+
+    def test_javascript_hidden_scope_declarations_never_receive_credit(self):
+        cases = (
+            "function register() {\n  test('hidden', () => {});\n}\n",
+            "if (false) {\n  it('hidden', () => {});\n}\n",
+            "describe('group', () => {\n  test('nested', () => {});\n});\n",
+            "function register() {\n  const pattern = /}/;\n"
+            "  test('hidden after regex', () => {});\n}\n",
+            "const register = () =>\ntest('arrow body', () => {});\n",
+            "if (false)\nit('conditional body', () => {});\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("hidden JavaScript reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "javascript parse", source),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/hidden_{index}.test.js",
+                          "contents": source}],
+                        {"test_cmd": ["npm", "test"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_module_javascript_case_after_regex_literal_is_collectable(self):
+        source = "const pattern = /{/;\ntest('runs', () => pattern.test('{'));\n"
+        self.assertTrue(ff._generated_test_source_has_case(
+            "tests/regex.test.js", source,
+        ))
 
     def test_jsx_text_never_receives_execution_credit(self):
         cases = (
@@ -4821,11 +4935,17 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 side_effect=AssertionError("JSX text reached writer")
             )
             passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            transformed = (
+                "const view = React.createElement(\"div\", null, "
+                f"\"{text}\");\n"
+            )
             with self.subTest(path=path), \
                  _tempfile_ceiling.TemporaryDirectory() as project, \
                  mock.patch.object(
                      ff, "_generated_test_source_syntax_ok",
-                     return_value=(True, "esbuild syntax check"),
+                     return_value=(
+                         True, "esbuild syntax and JSX transform", transformed,
+                     ),
                  ), \
                  mock.patch.object(ff, "_create_contained", forbidden_write), \
                  mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
@@ -4842,6 +4962,42 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             forbidden_write.assert_not_called()
             passing_existing_suite.assert_not_called()
 
+    def test_tsx_generic_before_real_case_remains_collectable(self):
+        path = "tests/generic.test.tsx"
+        source = (
+            "const identity = <T,>(value: T) => value;\n\n"
+            "test('runs', () => {\n"
+            "  expect(identity(1)).toBe(1);\n"
+            "});\n"
+        )
+        transformed = (
+            "const identity = (value) => value;\n\n"
+            "test('runs', () => {\n"
+            "  expect(identity(1)).toBe(1);\n"
+            "});\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_generated_test_source_syntax_ok",
+                 return_value=(
+                     True, "esbuild syntax and JSX transform", transformed,
+                 ),
+             ), \
+             mock.patch.object(
+                 ff, "_run_unit_tests", return_value=(True, "1 passed"),
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project,
+                    [{"path": path, "contents": source}],
+                    {"test_cmd": ["npm", "test"], "esbuild": "esbuild"},
+                )
+            )
+        self.assertEqual([path], [item["path"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
     def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
         for source in (
                 "test('runs', () => {});",
@@ -4852,11 +5008,10 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 self.assertTrue(ff._generated_test_source_has_case(
                     "tests/generated.test.js", source,
                 ))
-        for path in ("tests/generated.test.jsx", "tests/generated.test.tsx"):
-            with self.subTest(path=path):
-                self.assertTrue(ff._generated_test_source_has_case(
-                    path, "test('renders', () => {\n  return <Widget />;\n});\n",
-                ))
+        self.assertFalse(ff._generated_test_source_has_case(
+            "tests/generated.test.tsx",
+            "test('raw TSX is not parser-backed', () => <Widget />);\n",
+        ))
 
     def test_success_exit_without_collection_evidence_is_a_failure(self):
         candidates = [
@@ -4893,10 +5048,11 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                      ff, "_run",
                      return_value=ff.subprocess.CompletedProcess([], 0, "", ""),
                  ) as parser:
-                ok, note = ff._generated_test_source_syntax_ok(
+                ok, note, case_source = ff._generated_test_source_syntax_ok(
                     project, path, source, stack,
                 )
                 self.assertIs(ok, True, note)
+                self.assertEqual(source, case_source)
                 command = parser.call_args.args[0]
                 self.assertEqual(expected_tool, os.path.basename(command[0]))
                 candidate_arg = next(
@@ -4904,6 +5060,36 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                     if arg.endswith(os.path.splitext(path)[1])
                 )
                 self.assertFalse(candidate_arg.startswith(os.path.realpath(project)))
+
+    def test_tsx_preflight_returns_parser_transformed_case_source(self):
+        source = (
+            "const identity = <T,>(value: T) => value;\n"
+            "test('runs', () => <Widget />);\n"
+        )
+        transformed = (
+            "const identity = (value) => value;\n"
+            "test(\"runs\", () => React.createElement(Widget, null));\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run",
+                 return_value=ff.subprocess.CompletedProcess(
+                     [], 0, transformed, "",
+                 ),
+             ) as parser:
+            ok, note, case_source = ff._generated_test_source_syntax_ok(
+                project,
+                "tests/generic.test.tsx",
+                source,
+                {"esbuild": "esbuild"},
+            )
+        self.assertIs(ok, True, note)
+        self.assertEqual(transformed, case_source)
+        command = parser.call_args.args[0]
+        self.assertIn("--format=esm", command)
+        self.assertIn("--jsx=transform", command)
+        self.assertIn("--tree-shaking=false", command)
+        self.assertFalse(any(arg.startswith("--outfile=") for arg in command))
 
     def test_atomic_create_refuses_raced_in_owner_file_without_overwrite(self):
         candidates = [
@@ -4963,6 +5149,37 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             ))
             with open(target, encoding="utf-8") as handle:
                 self.assertEqual("OWNER = True\n", handle.read())
+
+    def test_in_place_test_rewrite_revokes_execution_credit(self):
+        rel = "tests/test_self_rewrite.py"
+        original = "def test_generated():\n    assert True\n"
+        replacement = "def test_substituted():\n    assert True\n"
+
+        def rewrite_during_run(project, _stack):
+            target = os.path.join(project, *rel.split("/"))
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(replacement)
+            return True, "1 passed"
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run_unit_tests", side_effect=rewrite_during_run,
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project,
+                    [{"path": rel, "contents": original}],
+                    {"test_cmd": ["python", "-m", "pytest"]},
+                )
+            )
+            target = os.path.join(project, *rel.split("/"))
+            self.assertTrue(os.path.isfile(target))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual(replacement, handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("changed during execution", refusal)
+        self.assertEqual([rel], rollback_failed)
 
 
 class PathContainmentTests(unittest.TestCase):

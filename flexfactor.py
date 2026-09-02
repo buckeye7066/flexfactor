@@ -10166,6 +10166,9 @@ UNIT_TEST_SYSTEM = (
     "You are a test engineer writing REAL, runnable unit tests using the project's "
     "existing test framework and conventions. Cover each exported function, "
     "including edge cases and error paths. Import from the actual module path shown. "
+    "For JavaScript and TypeScript, declare unskipped test()/it() calls directly at "
+    "module scope, never inside describe(), a conditional, or a helper. For Python, "
+    "use unskipped module-level test_ functions or methods on a Test* class. "
     "Tests must run as-is with no network or external services (stub/mock those). "
     "Return only the test file(s). Respond with JSON only."
 )
@@ -10556,13 +10559,14 @@ def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> 
 
 
 def _create_contained(project_dir: str, rel: str, content
-                      ) -> tuple[str, os.stat_result] | None:
-    """Atomically create a missing contained file and return its identity.
+                      ) -> tuple[str, tuple[os.stat_result, bytes]] | None:
+    """Atomically create a missing file and return identity plus content digest.
 
     Unlike `_write_contained`, this never replaces an existing regular leaf.
     Generated tests use it after a missing-path preflight so a file raced in by
     the owner cannot be overwritten.  The returned identity binds any later
-    rollback to the file this call actually created.
+    rollback to the file this call actually created.  The digest also prevents
+    an in-place rewrite on the same inode from retaining execution credit.
     """
     comps = _rel_components(rel)
     if comps is None:
@@ -10596,7 +10600,7 @@ def _create_contained(project_dir: str, rel: str, content
                 fd = None
                 return (
                     os.path.join(os.path.realpath(project_dir), *comps),
-                    final_identity,
+                    (final_identity, hashlib.sha256(data).digest()),
                 )
             except OSError:
                 if fd is not None:
@@ -10639,7 +10643,7 @@ def _create_contained(project_dir: str, rel: str, content
         fd = None
         if not _same_id(os.stat(parent_full), parent_identity):
             raise OSError("created-file parent identity changed")
-        return literal, final_identity
+        return literal, (final_identity, hashlib.sha256(data).digest())
     except OSError:
         if fd is not None:
             try:
@@ -10657,25 +10661,39 @@ def _create_contained(project_dir: str, rel: str, content
 
 
 def _created_contained_matches(project_dir: str, rel: str,
-                               identity: os.stat_result) -> bool:
-    """Whether `rel` still names the exact regular file in a create receipt."""
+                               receipt: tuple[os.stat_result, bytes]) -> bool:
+    """Whether `rel` still has the exact identity and bytes in a create receipt."""
+    try:
+        identity, expected_digest = receipt
+    except (TypeError, ValueError):
+        return False
     with _open_contained_fd(project_dir, rel) as fd:
         if fd is None:
             return False
         try:
-            return _same_id(os.fstat(fd), identity)
+            current = os.fstat(fd)
+            if (not _same_id(current, identity)
+                    or stat.S_IMODE(current.st_mode) != stat.S_IMODE(identity.st_mode)):
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.digest() == expected_digest
         except OSError:
             return False
 
 
 def _unlink_created_contained(project_dir: str, rel: str,
-                              identity: os.stat_result) -> bool:
-    """Remove a generated file only while its create-time identity still owns the path."""
+                              receipt: tuple[os.stat_result, bytes]) -> bool:
+    """Remove a generated file only while its complete create receipt still matches."""
     existence = _contained_existence(project_dir, rel)
     if existence == "missing":
         return True
     if existence != "exists" or not _created_contained_matches(
-            project_dir, rel, identity):
+            project_dir, rel, receipt):
         return False
     return _unlink_contained(project_dir, rel)
 
@@ -13834,18 +13852,63 @@ _GENERATED_JS_TEST_EXTS = frozenset(
 )
 
 
-def _javascript_code_projection(source: str) -> str:
-    """Mask comments and literals while preserving JavaScript line structure.
+def _javascript_regex_can_start(projected: list[str]) -> bool:
+    """Conservatively identify a JavaScript regular-expression literal slash."""
+    index = len(projected) - 1
+    while index >= 0 and projected[index].isspace():
+        index -= 1
+    if index < 0:
+        return True
+    previous = projected[index]
+    if previous in "([{:;,=!?&|+-*%^~<>":
+        return True
+    if previous == ")":
+        depth = 1
+        cursor = index - 1
+        while cursor >= 0 and depth:
+            if projected[cursor] == ")":
+                depth += 1
+            elif projected[cursor] == "(":
+                depth -= 1
+            cursor -= 1
+        if depth == 0:
+            while cursor >= 0 and projected[cursor].isspace():
+                cursor -= 1
+            end = cursor + 1
+            while cursor >= 0 and (
+                    projected[cursor].isalnum() or projected[cursor] in "_$"):
+                cursor -= 1
+            if "".join(projected[cursor + 1:end]) in {
+                    "if", "for", "while", "with", "switch", "catch"}:
+                return True
+    if previous.isalnum() or previous in "_$":
+        end = index + 1
+        while index >= 0 and (
+                projected[index].isalnum() or projected[index] in "_$"):
+            index -= 1
+        return "".join(projected[index + 1:end]) in {
+            "await", "case", "delete", "do", "else", "in", "instanceof",
+            "new", "of", "return", "throw", "typeof", "void", "yield",
+        }
+    return False
+
+
+def _slash_language_code_projection(
+        source: str, *, mask_regex: bool, raw_backticks: bool,
+) -> str:
+    """Mask inert lexical regions in JavaScript-like slash-comment syntax.
 
     This deliberately masks complete template literals, including interpolation,
     because generated tests do not need to hide their declarations inside a
     template expression.  Preserving newlines lets the caller require a direct,
-    statement-level test declaration without executing model-authored source.
+    statement-level declaration without executing model-authored source.  Go
+    callers disable regex handling and select raw-backtick semantics.
     """
     projected: list[str] = []
     index = 0
     state = "code"
     quote = ""
+    regex_class = False
     while index < len(source):
         char = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
@@ -13859,6 +13922,13 @@ def _javascript_code_projection(source: str) -> str:
                 projected.extend((" ", " "))
                 index += 2
                 state = "block-comment"
+                continue
+            if (mask_regex and char == "/"
+                    and _javascript_regex_can_start(projected)):
+                projected.append(" ")
+                index += 1
+                state = "regex"
+                regex_class = False
                 continue
             if char in ("'", '"', "`"):
                 projected.append(" ")
@@ -13884,7 +13954,30 @@ def _javascript_code_projection(source: str) -> str:
             projected.append("\n" if char == "\n" else " ")
             index += 1
             continue
-        if char == "\\" and index + 1 < len(source):
+        if state == "regex":
+            if char == "\\" and index + 1 < len(source):
+                projected.extend((" ", "\n" if following == "\n" else " "))
+                index += 2
+                continue
+            if char == "\n":
+                projected.append("\n")
+                index += 1
+                state = "code"
+                continue
+            projected.append(" ")
+            index += 1
+            if char == "[":
+                regex_class = True
+            elif char == "]":
+                regex_class = False
+            elif char == "/" and not regex_class:
+                while index < len(source) and source[index].isalpha():
+                    projected.append(" ")
+                    index += 1
+                state = "code"
+            continue
+        if (char == "\\" and index + 1 < len(source)
+                and not (raw_backticks and quote == "`")):
             projected.append(" ")
             projected.append("\n" if following == "\n" else " ")
             index += 2
@@ -13896,46 +13989,64 @@ def _javascript_code_projection(source: str) -> str:
     return "".join(projected)
 
 
-def _jsx_code_projection(source: str) -> str:
-    """Mask JSX elements in an already literal-free JavaScript projection.
+def _javascript_code_projection(source: str) -> str:
+    """Return only executable JavaScript/TypeScript lexical structure."""
+    return _slash_language_code_projection(
+        source, mask_regex=True, raw_backticks=False,
+    )
 
-    The projection is intentionally conservative: expressions inside JSX are
-    masked with their surrounding element because a call embedded in rendered
-    markup is not evidence of a module-level test declaration.  Syntax preflight
-    separately rejects malformed JSX/TSX before this helper is consulted.
-    """
-    projected = list(source)
-    index = 0
-    depth = 0
-    while index < len(source):
-        char = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
-        opens_tag = following.isalpha() or following in ("_", "$", ">")
-        closes_tag = following == "/"
-        if char != "<" or (depth == 0 and not opens_tag) or (
-                depth > 0 and not (opens_tag or closes_tag)):
-            if depth > 0 and char != "\n":
-                projected[index] = " "
-            index += 1
-            continue
 
-        end = source.find(">", index + 1)
-        if end < 0:
-            for masked in range(index, len(source)):
-                if source[masked] != "\n":
-                    projected[masked] = " "
-            break
-        is_closing = closes_tag
-        is_self_closing = source[index + 1:end].rstrip().endswith("/")
-        for masked in range(index, end + 1):
-            if source[masked] != "\n":
-                projected[masked] = " "
-        if is_closing:
-            depth = max(0, depth - 1)
-        elif not is_self_closing:
-            depth += 1
-        index = end + 1
-    return "".join(projected)
+def _go_code_projection(source: str) -> str:
+    """Return Go code with comments, interpreted strings, and raw strings masked."""
+    return _slash_language_code_projection(
+        source, mask_regex=False, raw_backticks=True,
+    )
+
+
+def _javascript_source_has_module_test(source: str) -> bool:
+    """Find a direct, runnable module-level JavaScript test declaration."""
+    projected = _javascript_code_projection(source)
+    declaration = re.compile(
+        r"^[ \t]*(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\("
+    )
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    statement_tail = ""
+    for line in projected.splitlines(keepends=True):
+        tail = statement_tail.rstrip()
+        deferred_tail = tail.endswith((
+            "=>", "&&", "||", "??", "?", ",", "=", "+", "-", "*", "/", "%",
+        ))
+        conditional_tail = bool(re.search(
+            r"(?:^|\W)(?:if|for|while|with)\s*\([^;{}]*\)\s*$"
+            r"|(?:^|\W)(?:else|do)\s*$",
+            tail,
+            flags=re.DOTALL,
+        ))
+        if (brace_depth == 0 and paren_depth == 0 and bracket_depth == 0
+                and not deferred_tail and not conditional_tail
+                and declaration.match(line)):
+            return True
+        for char in line:
+            if char == "{":
+                brace_depth += 1
+            elif char == "}":
+                brace_depth = max(0, brace_depth - 1)
+            elif char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            statement_tail += char
+            if char in ";{}":
+                statement_tail = ""
+        if len(statement_tail) > 4096:
+            statement_tail = statement_tail[-4096:]
+    return False
 
 
 def _runner_collectable_generated_test_path(path: str) -> bool:
@@ -13957,6 +14068,101 @@ def _runner_collectable_generated_test_path(path: str) -> bool:
     return False
 
 
+def _ast_dotted_name(node: ast.AST) -> str:
+    """Return a conservative dotted name for decorator and base expressions."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _ast_dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _python_test_is_unconditionally_skipped(
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> bool:
+    """Whether pytest/unittest will unconditionally skip this test container."""
+    for decorator in node.decorator_list:
+        call = decorator if isinstance(decorator, ast.Call) else None
+        target = call.func if call is not None else decorator
+        leaf = _ast_dotted_name(target).lower().rsplit(".", 1)[-1]
+        if leaf == "skip":
+            return True
+        if leaf in ("skipif", "skipunless"):
+            condition = call.args[0] if call is not None and call.args else None
+            if isinstance(condition, ast.Constant):
+                active = bool(condition.value)
+                if leaf == "skipunless":
+                    active = not active
+                if not active:
+                    continue
+            # A runtime-dependent conditional skip cannot prove this generated
+            # test will execute in the current runner, so it receives no credit.
+            return True
+    return False
+
+
+def _python_value_has_skip_marker(node: ast.AST) -> bool:
+    """Whether a module-level pytestmark value can suppress test execution."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_python_value_has_skip_marker(item) for item in node.elts)
+    target = node.func if isinstance(node, ast.Call) else node
+    return _ast_dotted_name(target).lower().rsplit(".", 1)[-1] in {
+        "skip", "skipif", "skipunless",
+    }
+
+
+def _python_source_has_collectable_test(tree: ast.Module) -> bool:
+    """Find an unskipped module/class-level test that pytest can collect."""
+    function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    for statement in tree.body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            if (_ast_dotted_name(call.func).lower().endswith("pytest.skip")
+                    and any(keyword.arg == "allow_module_level"
+                            and isinstance(keyword.value, ast.Constant)
+                            and keyword.value.value is True
+                            for keyword in call.keywords)):
+                return False
+        value = None
+        targets: list[ast.AST] = []
+        if isinstance(statement, ast.Assign):
+            value, targets = statement.value, list(statement.targets)
+        elif isinstance(statement, ast.AnnAssign):
+            value, targets = statement.value, [statement.target]
+        if (value is not None
+                and any(isinstance(target, ast.Name)
+                        and target.id == "pytestmark" for target in targets)
+                and _python_value_has_skip_marker(value)):
+            return False
+    for node in tree.body:
+        if isinstance(node, function_types):
+            if (node.name.startswith("test_")
+                    and not _python_test_is_unconditionally_skipped(node)):
+                return True
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {_ast_dotted_name(base) for base in node.bases}
+        collectable_class = node.name.startswith("Test") or any(
+            base.rsplit(".", 1)[-1] == "TestCase" for base in bases if base
+        )
+        has_constructor = any(
+            isinstance(member, function_types) and member.name == "__init__"
+            for member in node.body
+        )
+        if (not collectable_class or has_constructor
+                or _python_test_is_unconditionally_skipped(node)):
+            continue
+        if any(
+                isinstance(member, function_types)
+                and member.name.startswith("test_")
+                and not _python_test_is_unconditionally_skipped(member)
+                for member in node.body):
+            return True
+    return False
+
+
 def _generated_test_source_has_case(path: str, source: str) -> bool:
     """Conservative source-level evidence that an executable test declares a case."""
     ext = os.path.splitext(path)[1].lower()
@@ -13965,43 +14171,43 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
             tree = ast.parse(source, filename=path)
         except (SyntaxError, ValueError, RecursionError):
             return False
-        return any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-            for node in ast.walk(tree)
-        )
+        return _python_source_has_collectable_test(tree)
     if ext == ".go":
         return bool(re.search(
             r"(?m)^\s*func\s+Test[A-Z0-9_]\w*\s*\(\s*\w+\s+\*testing\.T\s*\)",
-            source,
+            _go_code_projection(source),
         ))
     if ext in _GENERATED_JS_TEST_EXTS:
-        projected = _javascript_code_projection(source)
+        # Raw JSX/TSX needs parser-backed transformation before declaration
+        # matching.  The batch preflight supplies the transformed JavaScript
+        # under a .js identity; direct raw-source calls fail closed.
         if ext in (".jsx", ".tsx"):
-            projected = _jsx_code_projection(projected)
-        return bool(re.search(
-            # Only declarations that can execute count. ``skip``/``todo`` are
-            # deliberately absent: an unrelated existing test can make the
-            # suite green while every generated declaration is skipped.
-            r"(?m)^[ \t]*(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\(",
-            projected,
-        ))
+            return False
+        # Only direct module-level declarations execute deterministically when
+        # the runner loads the generated file.  Calls hidden in an uncalled
+        # helper or conditional cannot inherit credit from unrelated tests.
+        return _javascript_source_has_module_test(source)
     return False
 
 
 def _generated_test_source_syntax_ok(
         project_dir: str, path: str, source: str, stack: dict,
-) -> tuple[bool | None, str]:
-    """Parse generated tests without executing them or writing into the repo."""
+) -> tuple[bool | None, str, str | None]:
+    """Parse generated tests and return safe declaration-matching source.
+
+    JSX/TSX is transformed by the already-required esbuild parser so markup
+    text becomes quoted JavaScript data and TypeScript generics disappear before
+    declaration matching.  Other languages return their unchanged parsed source.
+    """
     inproc_ok, inproc_note = _inproc_source_syntax_ok(path, source)
     if inproc_ok is not None:
-        return inproc_ok, inproc_note
+        return inproc_ok, inproc_note, source if inproc_ok else None
 
     ext = os.path.splitext(path)[1].lower()
     try:
         encoded = source.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
-        return False, f"source is not UTF-8 encodable: {exc}"
+        return False, f"source is not UTF-8 encodable: {exc}", None
     try:
         with tempfile.TemporaryDirectory(prefix="flexfactor-test-parse-") as temp_dir:
             candidate = os.path.join(temp_dir, "candidate" + ext)
@@ -14023,28 +14229,43 @@ def _generated_test_source_syntax_ok(
                 os.close(fd)
 
             if ext in _ESBUILD_EXTS and stack.get("esbuild"):
-                devnull = "NUL" if os.name == "nt" else "/dev/null"
-                result = _run([
+                command = [
                     stack["esbuild"], candidate, "--bundle=false",
-                    "--log-level=error", f"--outfile={devnull}",
-                ], project_dir, timeout=60)
+                    "--log-level=error",
+                ]
+                if ext in (".jsx", ".tsx"):
+                    command.extend((
+                        "--format=esm", "--jsx=transform",
+                        "--tree-shaking=false",
+                    ))
+                else:
+                    devnull = "NUL" if os.name == "nt" else "/dev/null"
+                    command.append(f"--outfile={devnull}")
+                result = _run(command, project_dir, timeout=60)
                 if getattr(result, "flexfactor_launch_error", False):
-                    return None, "esbuild parser did not run"
-                return (
-                    result.returncode == 0,
-                    _tail(result.stderr or result.stdout) or "esbuild syntax check",
-                )
+                    return None, "esbuild parser did not run", None
+                if result.returncode != 0:
+                    return False, (
+                        _tail(result.stderr or result.stdout)
+                        or "esbuild syntax check failed"
+                    ), None
+                if ext in (".jsx", ".tsx"):
+                    transformed = result.stdout or ""
+                    if not transformed.strip():
+                        return False, "esbuild returned no transformed source", None
+                    return True, "esbuild syntax and JSX transform", transformed
+                return True, "esbuild syntax check", source
 
             if ext in (".js", ".cjs", ".mjs"):
                 if not shutil.which("node"):
-                    return None, "node parser is not installed"
+                    return None, "node parser is not installed", None
                 result = _run(["node", "--check", candidate], project_dir, timeout=60)
                 if getattr(result, "flexfactor_launch_error", False):
-                    return None, "node parser did not run"
-                return (
-                    result.returncode == 0,
-                    _tail(result.stderr or result.stdout) or "node --check",
-                )
+                    return None, "node parser did not run", None
+                ok = result.returncode == 0
+                return ok, (
+                    _tail(result.stderr or result.stdout) or "node --check"
+                ), source if ok else None
 
             if ext in (".ts", ".cts", ".mts") and shutil.which("node"):
                 unsupported = ("bad option", "unknown option", "not allowed")
@@ -14056,28 +14277,32 @@ def _generated_test_source_syntax_ok(
                     )
                     output = (result.stderr or "") + "\n" + (result.stdout or "")
                     if getattr(result, "flexfactor_launch_error", False):
-                        return None, "node TypeScript parser did not run"
+                        return None, "node TypeScript parser did not run", None
                     if result.returncode == 0:
-                        return True, f"node {flag} --check"
+                        return True, f"node {flag} --check", source
                     if not any(marker in output.lower() for marker in unsupported):
-                        return False, _tail(output) or "TypeScript syntax check failed"
+                        return False, (
+                            _tail(output) or "TypeScript syntax check failed"
+                        ), None
 
             if ext == ".go":
                 if not shutil.which("gofmt"):
-                    return None, "gofmt parser is not installed"
+                    return None, "gofmt parser is not installed", None
                 result = _run(
                     ["gofmt", "-e", "-l", candidate],
                     project_dir, timeout=60,
                 )
                 if getattr(result, "flexfactor_launch_error", False):
-                    return None, "gofmt parser did not run"
-                return (
-                    result.returncode == 0,
-                    _tail(result.stderr or result.stdout) or "gofmt syntax check",
-                )
+                    return None, "gofmt parser did not run", None
+                ok = result.returncode == 0
+                return ok, (
+                    _tail(result.stderr or result.stdout) or "gofmt syntax check"
+                ), source if ok else None
     except OSError as exc:
-        return None, f"temporary syntax preflight failed: {exc}"
-    return None, f"no safe generated-test parser is available for {ext or 'this type'}"
+        return None, f"temporary syntax preflight failed: {exc}", None
+    return None, (
+        f"no safe generated-test parser is available for {ext or 'this type'}"
+    ), None
 
 
 def _write_and_run_generated_test_batch(
@@ -14135,7 +14360,7 @@ def _write_and_run_generated_test_batch(
                 f"generated test refused overwrite of {path!r} "
                 f"({existence}); existing tests are owner code"
             ), []
-        syntax_ok, syntax_note = _generated_test_source_syntax_ok(
+        syntax_ok, syntax_note, case_source = _generated_test_source_syntax_ok(
             project_dir, path, contents, stack,
         )
         if syntax_ok is not True:
@@ -14145,7 +14370,12 @@ def _write_and_run_generated_test_batch(
             ), []
         normalized = dict(item)
         credit_as_test = _runner_collectable_generated_test_path(path)
-        if credit_as_test and not _generated_test_source_has_case(path, contents):
+        case_path = path
+        if os.path.splitext(path)[1].lower() in (".jsx", ".tsx"):
+            case_path = os.path.splitext(path)[0] + ".js"
+        if credit_as_test and (
+                case_source is None
+                or not _generated_test_source_has_case(case_path, case_source)):
             return [], None, "", (
                 f"generated executable test declares no collectable test case: {path}"
             ), []
@@ -14201,7 +14431,7 @@ def _write_and_run_generated_test_batch(
     if changed:
         rollback_failed = _rollback_created(written_entries)
         return [], None, "", (
-            "generated test path identity changed before execution: "
+            "generated test content or identity changed before execution: "
             + ", ".join(changed)
         ), rollback_failed
 
@@ -14210,7 +14440,7 @@ def _write_and_run_generated_test_batch(
     if changed:
         rollback_failed = _rollback_created(written_entries)
         return [], None, "", (
-            "generated test path identity changed during execution: "
+            "generated test content or identity changed during execution: "
             + ", ".join(changed)
         ), rollback_failed
     if status is True and not _suite_reported_tests(log):
