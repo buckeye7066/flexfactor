@@ -4630,6 +4630,22 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             "free-tier, or local route"
         )
         return []
+    # Catalog presence, credentials and an executable are necessary but not
+    # sufficient.  Prove that the selected transport can return inference
+    # before repository understanding begins; otherwise one dead CLI can burn
+    # the full per-call deadline after the run already claims it has started.
+    if not getattr(args, "no_preflight", False):
+        ping = getattr(primary, "ping", None)
+        if callable(ping):
+            try:
+                if ping() is False:
+                    raise RuntimeError("model route returned a failed health verdict")
+            except Exception as exc:  # route/pool is already benched by rotation
+                _PROVIDER_DIAGNOSIS = (
+                    "the best-available model ladder has no live inference route: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return []
     providers: list[tuple[str, object]] = [("best-available", primary)]
     if _LAST_ROTATION_USABLE > 1:
         coordinator = getattr(primary, "role_coordinator", None)

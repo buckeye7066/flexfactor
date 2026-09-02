@@ -114,8 +114,12 @@ def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
             argv += ["--append-system-prompt", system]
         return argv
     if api == "codex-cli":
-        # `exec` is codex's non-interactive one-shot mode.
-        return [binary, "exec", "--skip-git-repo-check", "-"]
+        # `exec` is codex's non-interactive one-shot mode. Keep provider calls
+        # ephemeral and read-only: FlexFactor owns every filesystem mutation;
+        # this nested process supplies inference only.
+        return [binary, "exec", "--ephemeral", "--ignore-user-config",
+                "--sandbox", "read-only", "--color", "never",
+                "--skip-git-repo-check", "-"]
     if api == "copilot-cli":
         # Silent programmatic mode reads the prompt from stdin. No tools are
         # allowlisted: FlexFactor needs model inference here, not a second agent
@@ -233,20 +237,10 @@ class CliProvider:
     meter: Any = None
 
     def ping(self, **_: Any) -> bool:
-        """Is the CLI actually runnable? A PATH hit is not proof."""
-        if self.api == "copilot-cli":
-            # Unlike a version check, this proves the supplied GitHub token has
-            # a usable Copilot entitlement before a long audit begins.
-            return bool(_run_cli(self.api, self._binary, "Reply with OK only.",
-                                 system=None, timeout=min(self._timeout, 90)))
-        try:
-            proc = subprocess.run(
-                [self._binary, "--version"], capture_output=True, text=True,
-                timeout=30, env=_recursion_guard_env(), shell=False,
-            )
-            return proc.returncode == 0
-        except Exception:
-            return False
+        """Prove authenticated inference, not merely executable presence."""
+        answer = _run_cli(self.api, self._binary, "Reply with OK only.",
+                          system=None, timeout=min(self._timeout, 60))
+        return bool(answer.strip())
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
                  max_tokens: int = 4096, **_: Any) -> str:

@@ -1370,6 +1370,24 @@ class BestAvailableProviderContractTests(unittest.TestCase):
         finally:
             ff._build_rotating_provider = real
 
+    def test_rotation_must_prove_live_inference_before_audit(self):
+        class Args:
+            model_mode = "best"
+            no_preflight = False
+
+        class DeadRoute:
+            def ping(self):
+                raise RuntimeError("transport timed out")
+
+        real = ff._build_rotating_provider
+        ff._build_rotating_provider = lambda *_a, **_kw: DeadRoute()
+        try:
+            self.assertEqual(ff.build_audit_providers(Args), [])
+            self.assertIn("no live inference route", ff._PROVIDER_DIAGNOSIS)
+            self.assertIn("transport timed out", ff._PROVIDER_DIAGNOSIS)
+        finally:
+            ff._build_rotating_provider = real
+
     def test_independent_capacity_gets_an_orchestrated_verifier(self):
         class Args:
             model_mode = "best"
@@ -1456,10 +1474,12 @@ class RotationDefaultProviderTests(unittest.TestCase):
     def test_best_available_rotates_by_default_when_a_catalog_exists(self):
         self._write_catalog([self._route("groq/llama-x", tier="frontier"),
                              self._route("cerebras/qwen-y", tier="light")])
+        class ArgsNoPreflight(self.Args):
+            no_preflight = True
         import io, contextlib
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            providers = ff.build_audit_providers(self.Args)
+            providers = ff.build_audit_providers(ArgsNoPreflight)
         self.assertEqual([n for n, _ in providers],
                          ["best-available", "best-available-verifier"])
         import flexfactor_rotation as fr
@@ -1511,6 +1531,7 @@ class RotationDefaultProviderTests(unittest.TestCase):
         # already pinned elsewhere, and it would stop measuring rotation at all.
         class Args(self.Args):
             model_mode = "paid"
+            no_preflight = True
         self._write_catalog([self._route("groq/llama-x")])
         os.environ["AI_ROTATE"] = "off"
         providers = self._providers_with_stubbed_backends(Args)
@@ -1545,9 +1566,11 @@ class RotationDefaultProviderTests(unittest.TestCase):
                                    self._route("openrouter/z", tier="light",
                                                pool="openrouter:free-tier")])
         ff._ROTATION_STALE_PRINTED.clear()
+        class ArgsNoPreflight(self.Args):
+            no_preflight = True
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            providers = ff.build_audit_providers(self.Args)
+            providers = ff.build_audit_providers(ArgsNoPreflight)
             provider = dict(providers)["best-available"]
             # Drive the per-route announcement for EVERY route, exactly as a
             # long run does. Before the fix each of these carried the suffix.
