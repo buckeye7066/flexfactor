@@ -7644,7 +7644,12 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
     # mutation, so a malformed or option-like entry can never write a file,
     # raise past the rollback, or reach npm.
-    packages = patch.get("packages") or []
+    # As with ``files``, default only an absent/explicit-null field.  Falsey
+    # non-list model output is malformed and must not disappear into an empty
+    # list while otherwise-valid source proceeds toward publication.
+    packages = patch.get("packages")
+    if packages is None:
+        packages = []
     if not isinstance(packages, list):
         return ApplyResult(repo_name, "refused-unsafe-packages",
                            f"generated 'packages' is not a list ({type(packages).__name__})")

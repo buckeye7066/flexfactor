@@ -4076,6 +4076,42 @@ class ScoutSourcePreflightTests(unittest.TestCase):
             self.assertIn("'files' is not a list", result.detail)
         forbidden.assert_not_called()
 
+    def test_falsey_non_list_packages_cannot_publish_valid_source(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("malformed packages reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        for raw_packages in ({}, "", False):
+            with self.subTest(raw_packages=raw_packages), \
+                 tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+                 mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+                 mock.patch.object(ff, "_write_contained", forbidden), \
+                 mock.patch.object(ff, "_detect_verify", forbidden), \
+                 mock.patch.object(ff, "_run", forbidden), \
+                 mock.patch.object(ff, "_git", forbidden), \
+                 mock.patch.object(ff, "_independent_final_review", forbidden), \
+                 mock.patch.object(ff, "_publish_verified_head", forbidden):
+                result = ff.apply_integration(
+                    project,
+                    "candidate/repo",
+                    {
+                        "files": [{"path": "valid.py", "contents": "VALUE = 1\n"}],
+                        "packages": raw_packages,
+                    },
+                    opts,
+                )
+
+            self.assertEqual("refused-unsafe-packages", result.status)
+            self.assertIn("'packages' is not a list", result.detail)
+        forbidden.assert_not_called()
+
     def test_invalid_later_file_refuses_every_write_and_downstream_gate(self):
         import tempfile
         import types
