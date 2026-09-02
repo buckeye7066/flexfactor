@@ -1,0 +1,116 @@
+name: scout-public-url-proof
+
+run-name: "Scout URL proof · ${{ inputs.program_url || 'https://www.heygen.com/' }}"
+
+on:
+  push:
+    branches: ["codex/scout-url-research"]
+  workflow_dispatch:
+    inputs:
+      program_url:
+        description: Public program URL to run through URL-only Scout
+        required: true
+        default: https://www.heygen.com/
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  copilot-requests: write
+
+jobs:
+  scout:
+    name: Acquire and profile public program
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PROGRAM_URL: ${{ inputs.program_url || 'https://www.heygen.com/' }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      COPILOT_GITHUB_TOKEN: ${{ github.token }}
+      FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install Scout and Copilot provider
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m pip install --disable-pip-version-check .
+          python -m pip check
+          npm install --global @github/copilot@1.0.81
+          copilot --version
+
+      - name: Prove canonical URL acquisition through Scout transport
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          from flexfactor_scout_research import crawl_public_program
+
+          bundle = crawl_public_program(os.environ["PROGRAM_URL"])
+          receipt = {
+              "schema": "scout-public-url-acquisition-v1",
+              "requested_url": os.environ["PROGRAM_URL"],
+              "canonical_url": bundle.get("canonical_url"),
+              "coverage": bundle.get("coverage"),
+              "evidence": [
+                  {
+                      "id": row.get("id"),
+                      "kind": row.get("kind"),
+                      "title": row.get("title"),
+                      "url": row.get("url"),
+                      "text_sha256": hashlib.sha256(
+                          str(row.get("text") or "").encode("utf-8")
+                      ).hexdigest(),
+                  }
+                  for row in bundle.get("evidence", [])
+              ],
+          }
+          with open("scout-url-acquisition.json", "w", encoding="utf-8") as handle:
+              json.dump(receipt, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          if not bundle.get("evidence"):
+              raise SystemExit("Scout retrieved zero public evidence pages")
+          if (bundle.get("coverage") or {}).get("error"):
+              raise SystemExit("Scout URL acquisition reported a transport error")
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          PY
+
+      - name: Run full URL-only Scout profiling
+        shell: bash
+        run: |
+          set -o pipefail
+          python flexfactor.py scout \
+            --program "$PROGRAM_URL" \
+            --max-cost 50 \
+            2>&1 | tee scout-run.log
+
+      - name: Retain Scout evidence and console proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scout-public-url-proof-${{ github.run_id }}
+          path: |
+            scout-url-acquisition.json
+            scout-run.log
+          if-no-files-found: warn
+          retention-days: 30
