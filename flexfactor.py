@@ -10857,6 +10857,7 @@ def _is_test_path(rel: str) -> bool:
     return (
         any(part in _TEST_DIR_NAMES for part in parts[:-1])
         or base.startswith("test_")
+        or base.endswith(("_test.py", "_test.go"))
         or any(marker in base for marker in _TEST_FILE_MARKERS)
     )
 

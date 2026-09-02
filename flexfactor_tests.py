@@ -7717,7 +7717,8 @@ class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
     def test_the_test_path_markers_catch_the_real_world_shapes(self):
         for rel in ("src/pages/MyProfiles.test.jsx", "a/b.spec.ts",
                     "src/__tests__/x.js", "backend/tests/health.test.js",
-                    "pkg/test/util.go", "api/test_client.py", "tests/helper.py"):
+                    "pkg/test/util.go", "api/test_client.py", "tests/helper.py",
+                    "widget_test.py", "pkg/widget_test.go"):
             self.assertTrue(ff._is_test_path(rel), f"{rel} not detected as a test")
         for rel in ("src/pages/MyProfiles.jsx", "backend/server.js",
                     "src/utils/fieldDisplay.js", "src/latest/contest.js",
