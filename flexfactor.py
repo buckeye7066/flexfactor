@@ -2929,25 +2929,28 @@ def _strip_code_fences(code: str) -> str:
     Providers sometimes append an explanation *after* the closing fence.  In
     that shape, removing only the first and last lines leaves the closing fence
     inside the candidate and turns otherwise valid source into invalid code.
-    Once a response begins with a fence, the first exact closing-fence line is
-    authoritative and any later prose is not part of the requested file.  An
+    Once a response begins with a fence, its final matching closing-fence line
+    is authoritative and any later prose is not part of the requested file. An
     opening fence with no exact close is incomplete output and becomes an empty
-    candidate so the acceptance loop rejects it rather than guessing.
+    candidate so the acceptance loop rejects it rather than guessing. Choosing
+    the final match preserves nested fenced examples in Markdown source.
     """
     text = str(code or "").strip()
     if not text:
         return "\n"
     lines = text.splitlines()
-    if lines[0].lstrip().startswith("```"):
-        lines = lines[1:]
-        closed = False
-        for index, line in enumerate(lines):
-            if re.fullmatch(r"\s*`{3,}\s*", line):
-                lines = lines[:index]
-                closed = True
-                break
-        if not closed:
+    opening = re.match(r"\s*(`{3,})", lines[0])
+    if opening:
+        body = lines[1:]
+        minimum = len(opening.group(1))
+        closing = re.compile(rf"\s*`{{{minimum},}}\s*")
+        matches = [
+            index for index, line in enumerate(body)
+            if closing.fullmatch(line)
+        ]
+        if not matches:
             return "\n"
+        lines = body[:matches[-1]]
     return "\n".join(lines).strip() + "\n"
 
 
@@ -5063,6 +5066,7 @@ def run(args) -> int:
     current = original
     history: list[Grade] = []
     best_code, best_grade = original, -1
+    best_review: Grade | None = None
     feedback = ""  # previous grader's complaints, fed into the next rewrite (empty on rep 1)
 
     for i in range(1, args.max_iterations + 1):
@@ -5100,6 +5104,7 @@ def run(args) -> int:
 
         if candidate.strip() and grade.grade > best_grade:
             best_grade, best_code = grade.grade, candidate
+            best_review = grade
 
         decision = should_accept(grade, args.threshold, history, args.max_iterations)
         if decision == "accept":
@@ -5126,18 +5131,104 @@ def run(args) -> int:
     # commit.  This path also prevents explanatory model wrappers from being
     # mistaken for a meaningful edit after normalization above.
     if current == original:
-        stack = _detect_stack(root)
-        final_ok, gate_log = _publication_gate(root, stack)
-        if final_ok is not True:
-            state = "failed" if final_ok is False else "did not run"
+        if (best_review is None or best_review.meets_goal is not True
+                or best_review.grade < int(args.threshold)):
             print(
-                f"error: unchanged refactor project verification {state}: "
-                + _tail(gate_log, 4), file=sys.stderr,
+                "error: unchanged refactor was not explicitly approved at the "
+                "required grade; no-op success is refused.",
+                file=sys.stderr,
             )
             return 1
-        if not _git_tree_clean(root):
+
+        # The no-op rollback below may use reset/clean only because this strict
+        # precondition proves there was no owner change or untracked file to
+        # erase. The tolerant tree predicate used elsewhere intentionally
+        # ignores build/report artifacts and is too weak for this boundary.
+        strict_before = _git(
+            ["status", "--porcelain", "--untracked-files=all"], root
+        )
+        if strict_before.returncode != 0 or (strict_before.stdout or ""):
             print(
-                "error: project verification changed the untouched refactor tree.",
+                "error: unchanged refactor verification requires a strictly "
+                "clean Git worktree.",
+                file=sys.stderr,
+            )
+            return 1
+
+        def _restore_noop_baseline() -> tuple[bool, str]:
+            untracked = _git(
+                ["ls-files", "--others", "--exclude-standard", "-z"], root
+            )
+            untracked_paths = [
+                path for path in (untracked.stdout or "").split("\0") if path
+            ]
+            checkout = _git(["checkout", "--force", branch], root)
+            reset = _git(["reset", "--hard", baseline_sha], root)
+            clean_results = [
+                _unlink_contained(root, path) for path in untracked_paths
+            ]
+            clean_ok = bool(
+                untracked.returncode == 0
+                and all(clean_results)
+            )
+            restored_head = _git(["rev-parse", "HEAD"], root)
+            restored_status = _git(
+                ["status", "--porcelain", "--untracked-files=all"], root
+            )
+            restored_branch = _git_current_branch(root)
+            okay = bool(
+                checkout.returncode == 0
+                and reset.returncode == 0
+                and clean_ok
+                and restored_head.returncode == 0
+                and (restored_head.stdout or "").strip() == baseline_sha
+                and restored_branch == branch
+                and restored_status.returncode == 0
+                and not (restored_status.stdout or "")
+            )
+            detail = (
+                f"checkout={checkout.returncode}, reset={reset.returncode}, "
+                f"clean={clean_ok} ({len(untracked_paths)} path(s)), "
+                f"branch={restored_branch!r}, "
+                f"head={(restored_head.stdout or '').strip()[:12]!r}"
+            )
+            return okay, detail
+
+        stack = _detect_stack(root)
+        try:
+            final_ok, gate_log = _publication_gate(root, stack)
+        except Exception as exc:
+            final_ok = False
+            gate_log = f"{type(exc).__name__}: {exc}"
+        post_head = _git(["rev-parse", "HEAD"], root)
+        post_branch = _git_current_branch(root)
+        post_status = _git(
+            ["status", "--porcelain", "--untracked-files=all"], root
+        )
+        state_errors = []
+        if final_ok is not True:
+            state_errors.append(
+                "project verification "
+                + ("failed" if final_ok is False else "did not run")
+            )
+        if (post_head.returncode != 0
+                or (post_head.stdout or "").strip() != baseline_sha):
+            state_errors.append("verification moved HEAD away from the baseline")
+        if post_branch != branch:
+            state_errors.append("verification changed the checked-out branch")
+        if post_status.returncode != 0 or (post_status.stdout or ""):
+            state_errors.append("verification changed the worktree")
+        if state_errors:
+            restored, restore_detail = _restore_noop_baseline()
+            restoration = (
+                "baseline restored" if restored
+                else f"BASELINE RESTORATION FAILED ({restore_detail})"
+            )
+            print(
+                "error: unchanged refactor rejected: "
+                + "; ".join(state_errors)
+                + f"; {restoration}: "
+                + _tail(gate_log, 4),
                 file=sys.stderr,
             )
             return 1
@@ -5145,19 +5236,45 @@ def run(args) -> int:
             root, default_branch, baseline_sha
         )
         if not contained:
+            restored, restore_detail = _restore_noop_baseline()
+            restoration = (
+                "baseline restored" if restored
+                else f"BASELINE RESTORATION FAILED ({restore_detail})"
+            )
             print(
                 "error: unchanged refactor baseline is not on the remote "
-                f"default branch: {detail}", file=sys.stderr,
+                f"default branch; {restoration}: {detail}", file=sys.stderr,
+            )
+            return 1
+        proof_head = _git(["rev-parse", "HEAD"], root)
+        proof_status = _git(
+            ["status", "--porcelain", "--untracked-files=all"], root
+        )
+        if (proof_head.returncode != 0
+                or (proof_head.stdout or "").strip() != baseline_sha
+                or _git_current_branch(root) != branch
+                or proof_status.returncode != 0
+                or (proof_status.stdout or "")):
+            restored, restore_detail = _restore_noop_baseline()
+            restoration = (
+                "baseline restored" if restored
+                else f"BASELINE RESTORATION FAILED ({restore_detail})"
+            )
+            print(
+                "error: repository state changed during remote-default proof; "
+                + restoration,
+                file=sys.stderr,
             )
             return 1
         if execution_orchestrator is not None:
             execution_orchestrator.finish_pass(1, [])
             execution_orchestrator.record_competitor_gate(
-                attempted=True,
+                attempted=False,
                 implemented_files=[],
                 verified=0,
-                note=("Gate completed without implementation because pass 1 "
-                      "retained no verified edit delta."),
+                not_applicable=True,
+                note=("Not applicable: pass 1 retained no verified edit delta, "
+                      "so no competitor implementation or pass 2 may begin."),
             )
         print(
             f"\nSwole. {args.file} already satisfies the goal; project "

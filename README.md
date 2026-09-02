@@ -103,10 +103,11 @@ Termux launch endpoints are retired; the web dashboard is viewer/steering only.
 See [android/README.md](android/README.md) and
 [cloud/THREAT_MODEL.md](cloud/THREAT_MODEL.md).
 
-Version 3.5.1 normalizes whole-file Markdown responses at their first exact
-closing fence, discards later provider prose, and treats an independently
-verified unchanged refactor as a real no-op only after proving its baseline is
-already on the authoritative remote default branch.
+Version 3.5.1 normalizes whole-file Markdown responses at their matching outer
+closing fence, preserves nested examples, rejects unclosed wrappers as partial,
+and discards later provider prose. It treats an independently verified
+unchanged refactor as a real no-op only after proving its baseline is already
+on the authoritative remote default branch.
 
 ## Evidence and recovery
 

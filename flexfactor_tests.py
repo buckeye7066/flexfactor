@@ -219,6 +219,17 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         response = "```python\ndef calculate():\n    return 42\n"
         self.assertEqual("\n", ff._strip_code_fences(response))
 
+    def test_fenced_markdown_keeps_nested_code_blocks(self):
+        response = (
+            "```markdown\n# Guide\n\n```bash\npython app.py\n```\n\n"
+            "The command starts the app.\n```\nTrailing provider prose.\n"
+        )
+        expected = (
+            "# Guide\n\n```bash\npython app.py\n```\n\n"
+            "The command starts the app.\n"
+        )
+        self.assertEqual(expected, ff._strip_code_fences(response))
+
     def test_verified_unchanged_refactor_succeeds_without_a_fake_commit(self):
         import tempfile
         import types
@@ -279,7 +290,172 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         item = receipt["items"][0]
         self.assertEqual("completed", item["status"])
         self.assertEqual([], item["passes"][0]["changed_files"])
-        self.assertTrue(item["competitor_gate"]["attempted"])
+        self.assertFalse(item["competitor_gate"]["attempted"])
+        self.assertTrue(item["competitor_gate"]["not_applicable"])
+
+    def test_unchanged_near_miss_cannot_become_noop_success(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "```python\n" + original + "```\n"
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(89, False, "The requested goal remains unmet.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="add input validation", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+        self.assertEqual(1, rc)
+        gate.assert_not_called()
+
+    def test_noop_gate_branch_and_head_drift_is_restored(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "```python\n" + original + "```\n"
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(100, True, "Already satisfies the goal.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            generated = os.path.join(repo, "generated.txt")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            baseline = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+            def mutating_gate(_root, _stack):
+                with open(source, "w", encoding="utf-8") as stream:
+                    stream.write("raise RuntimeError('unreviewed')\n")
+                with open(generated, "w", encoding="utf-8") as stream:
+                    stream.write("unreviewed\n")
+                subprocess.run(
+                    ["git", "-C", repo, "add", "-A"], check=True,
+                    capture_output=True, text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", repo, "commit", "-m", "verification side effect"],
+                    check=True, capture_output=True, text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", repo, "checkout", "-b", "verification-drift"],
+                    check=True, capture_output=True, text=True,
+                )
+                return True, "gate reported success"
+
+            args = types.SimpleNamespace(
+                file=source, goal="retain clear addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", side_effect=mutating_gate):
+                rc = ff.run(args)
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            branch = subprocess.run(
+                ["git", "-C", repo, "branch", "--show-current"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+            generated_exists = os.path.exists(generated)
+        self.assertEqual(1, rc)
+        self.assertEqual(baseline, after)
+        self.assertEqual("main", branch)
+        self.assertEqual("", status)
+        self.assertEqual(original, retained)
+        self.assertFalse(generated_exists)
+
+    def test_failed_noop_gate_restores_tracked_and_untracked_writes(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "```python\n" + original + "```\n"
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(100, True, "Already satisfies the goal.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            generated = os.path.join(repo, "gate-output.txt")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+
+            def failing_gate(_root, _stack):
+                with open(source, "w", encoding="utf-8") as stream:
+                    stream.write("broken = True\n")
+                with open(generated, "w", encoding="utf-8") as stream:
+                    stream.write("temporary\n")
+                return False, "tests failed"
+
+            args = types.SimpleNamespace(
+                file=source, goal="retain clear addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", side_effect=failing_gate):
+                rc = ff.run(args)
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+            generated_exists = os.path.exists(generated)
+        self.assertEqual(1, rc)
+        self.assertEqual("", status)
+        self.assertEqual(original, retained)
+        self.assertFalse(generated_exists)
 
 
 class TestSessionIsolationTests(unittest.TestCase):

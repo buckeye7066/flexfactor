@@ -147,6 +147,33 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(item["status"], "failed")
         self.assertIn("exact-delta", item["note"])
 
+    def test_no_delta_can_mark_the_competitor_gate_not_applicable(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, [])
+        coordinator.record_competitor_gate(
+            attempted=False, implemented_files=[], verified=0,
+            not_applicable=True,
+        )
+        self.assertEqual(coordinator.finish_target(0, 0), 0)
+        item = coordinator.snapshot()["items"][0]
+        self.assertEqual(item["status"], "completed")
+        self.assertFalse(item["competitor_gate"]["attempted"])
+        self.assertTrue(item["competitor_gate"]["not_applicable"])
+
+    def test_competitor_gate_cannot_be_not_applicable_after_an_edit(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, ["a.py"])
+        with self.assertRaisesRegex(
+                execution.OrchestrationOrderError, "not applicable"):
+            coordinator.record_competitor_gate(
+                attempted=False, implemented_files=[], verified=0,
+                not_applicable=True,
+            )
+
     def test_interrupted_target_resumes_without_replaying_prior_targets(self):
         root = tempfile.mkdtemp(prefix="ff-queue-resume-")
         self.addCleanup(__import__("shutil").rmtree, root, True)

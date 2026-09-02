@@ -325,7 +325,8 @@ class SequentialOrchestrator:
             return changed
 
     def record_competitor_gate(self, *, attempted: bool, implemented_files: Iterable[object],
-                               verified: int = 0, note: str = "") -> None:
+                               verified: int = 0, note: str = "",
+                               not_applicable: bool = False) -> None:
         with self._lock:
             index = self._state["active_index"]
             if index is None:
@@ -338,11 +339,23 @@ class SequentialOrchestrator:
                 )
             if "competitor_gate" in item:
                 raise OrchestrationOrderError("the competitor gate already ran")
+            implemented = changed_file_scope(implemented_files)
+            verified_count = max(0, int(verified))
+            no_delta = not changed_file_scope(
+                passes[0].get("changed_files") or []
+            )
+            if not_applicable and (
+                    attempted or implemented or verified_count or not no_delta):
+                raise OrchestrationOrderError(
+                    "the competitor gate is not applicable only when pass 1 "
+                    "retained no verified edit delta"
+                )
             item["competitor_gate"] = {
                 "attempted": bool(attempted),
+                "not_applicable": bool(not_applicable),
                 "target": TOP_COMPETITORS,
-                "verified": max(0, int(verified)),
-                "implemented_files": changed_file_scope(implemented_files),
+                "verified": verified_count,
+                "implemented_files": implemented,
                 "note": str(note or "")[:1000],
                 "finished_at": time.time(),
             }
@@ -373,8 +386,23 @@ class SequentialOrchestrator:
                 if any(row.get("status") != "completed" for row in passes):
                     failures.append("not every recorded pass completed")
                 gate = item.get("competitor_gate")
-                if not isinstance(gate, dict) or gate.get("attempted") is not True:
-                    failures.append("the top-three competitor gate was not attempted")
+                gate_valid = isinstance(gate, dict) and gate.get("attempted") is True
+                if isinstance(gate, dict) and gate.get("not_applicable") is True:
+                    pass_one_delta = changed_file_scope(
+                        passes[0].get("changed_files") or []
+                    ) if passes else []
+                    gate_valid = bool(
+                        not pass_one_delta
+                        and not changed_file_scope(
+                            gate.get("implemented_files") or []
+                        )
+                        and int(gate.get("verified") or 0) == 0
+                    )
+                if not gate_valid:
+                    failures.append(
+                        "the top-three competitor gate was neither attempted "
+                        "nor truthfully marked not applicable"
+                    )
                 if passes and len(passes) < MAX_PASSES:
                     pending = changed_file_scope(passes[-1].get("changed_files") or [])
                     if len(passes) == 1 and isinstance(gate, dict):
