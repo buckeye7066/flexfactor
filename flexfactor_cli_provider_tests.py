@@ -296,13 +296,17 @@ class CliProviderBehaviourTests(unittest.TestCase):
         real = subprocess.run
         subprocess.run = fake_run
         try:
-            cp.CliProvider("copilot-cli", "auto", "copilot").complete(
+            cp.CliProvider(
+                "copilot-cli", "claude-sonnet-4.6", "copilot"
+            ).complete(
                 "PROMPT", system="SYSTEM")
         finally:
             subprocess.run = real
         self.assertIn("-s", seen["argv"])
         self.assertIn("--no-ask-user", seen["argv"])
         self.assertNotIn("--allow-all-tools", seen["argv"])
+        self.assertIn("--model", seen["argv"])
+        self.assertIn("claude-sonnet-4.6", seen["argv"])
         self.assertIn("SYSTEM", seen["input"])
         self.assertIn("PROMPT", seen["input"])
 

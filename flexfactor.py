@@ -4259,7 +4259,13 @@ def _builtin_route_catalog(fr):
         ),
         fr.Route(
             id="builtin/copilot", backend="copilot", backend_label="GitHub Copilot",
-            model="auto", wire_model="auto", api="copilot-cli", base_url="",
+            # Programmatic Copilot calls must pin a concrete model.  An opaque
+            # `auto` route cannot prove that a later OpenAI/Anthropic reviewer
+            # belongs to a different family from the model that authored the
+            # candidate.  The CLI adapter forwards this exact identity with
+            # --model rather than merely labelling an auto-selected response.
+            model="claude-sonnet-4.6", wire_model="claude-sonnet-4.6",
+            api="copilot-cli", base_url="",
             pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
             tier=fr.STRONG, capabilities=model_capabilities,
             capabilities_source="declared",
@@ -12448,6 +12454,26 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     writes = [(_canon_rel(w["path"]), w["contents"]) for w in plan.get("writes") or []]
     renames = [(_canon_rel(r["from"]), _canon_rel(r["to"]))
                for r in plan.get("renames") or []]
+
+    # Structural escalation is still model-authored source.  Validate EVERY
+    # generated file before the first worktree mutation, just like the ordinary
+    # single-file fix path.  A parser-unavailable result is a refusal, not an
+    # invitation to rely on a later broad build or semantic reviewer.  Empty
+    # source is allowed only for a newly-created file whose parser says it is
+    # valid (for example an empty Python package marker); a plan may never erase
+    # an existing file by calling an empty rewrite syntactically valid.
+    for p, contents in writes:
+        existence = _contained_existence(project_dir, p)
+        allow_empty_create = existence == "missing" and not contents.strip()
+        syntax_ok, syntax_note = _inproc_source_syntax_ok(
+            p, contents, allow_empty=allow_empty_create,
+        )
+        if syntax_ok is not True:
+            return (
+                "failed",
+                f"structural source rejected before write for {p}: {syntax_note}",
+            )
+
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
     snapshots = {}
     for p in dict.fromkeys(touched):

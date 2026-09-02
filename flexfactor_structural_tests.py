@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import flexfactor as F
 
@@ -120,6 +121,36 @@ class StructuralApplies(_Base):
 
 
 class StructuralRollsBack(_Base):
+    def test_unparsed_structural_source_is_rejected_before_every_write(self):
+        author = _Author([plan(writes=[
+            {"path": "bad.py", "contents": GOOD_FIXED},
+            {"path": "ui.tsx", "contents": "This is not TSX source.\n"},
+        ])])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("unparsed structural source reached a write")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("unparsed structural source reached a gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("unparsed structural source reached review")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_gate_file", forbidden_gate), \
+             mock.patch.object(F, "_cross_verify_structural", forbidden_review):
+            kind, detail = F.attempt_structural_fix(
+                author, object(), self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("rejected before write", detail)
+        self.assertIn("no safe in-process parser", detail)
+        self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
+        self.assertIsNone(self.read("ui.tsx"))
+        forbidden_write.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
     def test_broken_python_rolls_back_every_operation(self):
         author = _Author([plan(writes=[
             {"path": "bad.py", "contents": BAD_PYTHON},

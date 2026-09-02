@@ -533,6 +533,16 @@ def model_family(model_id: str) -> str:
     return seg.split(":")[0].split("-")[0] or "unknown"
 
 
+# These labels describe a routing decision, not the concrete model that served
+# the call.  They cannot establish cross-family independence.  Ordinary work
+# may still use such routes, but a semantic authorization that explicitly
+# requires a non-author family must fail closed until the route is pinned or
+# reports its actual model identity.
+_OPAQUE_MODEL_FAMILIES = frozenset({
+    "auto", "automatic", "best", "default", "latest", "recommended", "unknown",
+})
+
+
 @dataclass
 class Selection:
     route: Route
@@ -1483,12 +1493,23 @@ class RotatingProvider:
             raise RotationError(
                 "independent grading requires a recorded candidate author family"
             )
+        opaque_authors = author_families.intersection(_OPAQUE_MODEL_FAMILIES)
+        if opaque_authors:
+            raise RotationError(
+                "independent grading cannot prove separation from opaque author "
+                "model identity: " + ", ".join(sorted(opaque_authors))
+            )
         result = self.grade(*args, **kwargs)
         with self._family_lock:
             selection = self._last_selection.get(ROLE_REVIEWER)
         if selection is None:
             raise RotationError("independent grading did not record a reviewer route")
         reviewer_family = model_family(selection.route.model)
+        if reviewer_family in _OPAQUE_MODEL_FAMILIES:
+            raise RotationError(
+                "independent grading cannot prove the reviewer family from "
+                f"opaque model identity '{reviewer_family}'"
+            )
         if reviewer_family in author_families:
             raise RotationError(
                 f"reviewer family '{reviewer_family}' also authored the candidate"

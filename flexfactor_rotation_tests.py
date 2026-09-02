@@ -720,6 +720,26 @@ class RotatingProviderTests(RotationTestCase):
         with self.assertRaisesRegex(R.RotationError, "recorded candidate author"):
             prov.grade_independent()
 
+    def test_independent_grader_refuses_an_opaque_auto_author(self):
+        prov = self._provider(catalog(
+            route("front/copilot", "copilot", tier=R.FRONTIER, model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/copilot")
+        with self.assertRaisesRegex(R.RotationError, "opaque author"):
+            prov.grade_independent()
+
+    def test_independent_grader_refuses_an_opaque_auto_reviewer(self):
+        prov = self._provider(catalog(
+            route("front/qwen", "qwen-front", tier=R.FRONTIER,
+                  model="qwen3-coder"),
+            route("light/auto", "opaque-light", tier=R.LIGHT, model="auto"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/qwen")
+        with self.assertRaisesRegex(R.RotationError, "reviewer family"):
+            prov.grade_independent()
+
     def test_separate_ladder_instances_share_author_identity(self):
         coordinator = R.RoleCoordinator()
         cat = catalog(
