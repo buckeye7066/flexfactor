@@ -74,9 +74,8 @@ flexfactor_assets = ["*.js"]
 where = ["."]
 include = ["providers*", "competitors*", "tests*", "flexfactor_assets*"]
 
-# Test runner: the suite is stdlib unittest and needs no API keys or network.
-#   python flexfactor_tests.py
-# or, if pytest is installed:
-#   pytest flexfactor_tests.py
+# Test runner: the suite needs no API keys or network. Pytest collects the
+# monolith, focused contract modules, and conventional test packages; leaving
+# the focused modules out previously hid a failed process-containment sweep.
 [tool.pytest.ini_options]
-python_files = ["flexfactor_tests.py"]
+python_files = ["flexfactor_tests.py", "flexfactor_*_tests.py", "test_*.py"]

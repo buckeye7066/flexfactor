@@ -247,11 +247,22 @@ class MixedPoolRotationTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_path = os.path.join(self._tmp.name, "state.json")
         self.store = R.StateStore(self.state_path)
-        for var in ("AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
-                    "AI_ROTATE_STATE", "AITIME_STATE_DIR"):
+        self._isolated_env_names = (
+            "AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
+            "AI_ROTATE_STATE", "AITIME_STATE_DIR",
+        )
+        self._prior_isolated_env = {
+            var: os.environ.get(var) for var in self._isolated_env_names
+        }
+        for var in self._isolated_env_names:
             os.environ.pop(var, None)
 
     def tearDown(self):
+        for var, value in self._prior_isolated_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
         self._tmp.cleanup()
 
     def _make_route(self, rid: str, pool: str, tier: str = R.FRONTIER,

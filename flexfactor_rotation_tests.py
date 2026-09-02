@@ -49,8 +49,14 @@ class RotationTestCase(unittest.TestCase):
         # discovered catalog from being merged into them; extension discovery has
         # its own dedicated suite.
         os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
-        for var in ("AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
-                    "AI_ROTATE_STATE", "AITIME_STATE_DIR"):
+        self._isolated_env_names = (
+            "AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
+            "AI_ROTATE_STATE", "AITIME_STATE_DIR",
+        )
+        self._prior_isolated_env = {
+            var: os.environ.get(var) for var in self._isolated_env_names
+        }
+        for var in self._isolated_env_names:
             os.environ.pop(var, None)
 
     def tearDown(self) -> None:
@@ -58,6 +64,11 @@ class RotationTestCase(unittest.TestCase):
             os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
         else:
             os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prior_extensions
+        for var, value in self._prior_isolated_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
         self._tmp.cleanup()
 
     def rotator(self, cat: R.Catalog, app: str = "flexfactor") -> R.Rotator:

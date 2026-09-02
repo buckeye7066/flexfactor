@@ -93,7 +93,7 @@ class StructuralApplies(_Base):
             {"path": "pkg/__init__.py", "contents": ""},
         ])])
         applied, unverified, notes = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual(applied, ["bad.py", "pkg/__init__.py"])
         self.assertEqual(unverified, [])          # .py files gate via py_compile
         self.assertEqual(self.read("bad.py"), GOOD_FIXED)
         self.assertEqual(self.read("pkg/__init__.py"), "")
@@ -104,7 +104,7 @@ class StructuralApplies(_Base):
             writes=[{"path": "bad.py", "contents": GOOD_FIXED}],
             renames=[{"from": "other.py", "to": "renamed.py"}])])
         applied, _, _ = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual(applied, ["bad.py", "renamed.py"])
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 2\n")
 
@@ -114,7 +114,7 @@ class StructuralApplies(_Base):
             plan(writes=[{"path": "other.py", "contents": "y = 3\n"}]),
         ])
         applied, _, _ = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual(applied, ["other.py"])
         self.assertEqual(author.structural_calls, 2)
         self.assertEqual(self.read("other.py"), "y = 3\n")
 

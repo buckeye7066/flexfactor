@@ -24,6 +24,7 @@ import types
 import unittest
 
 import tempfile
+from unittest import mock
 
 sys.argv = sys.argv[:1]          # flexfactor parses argv at import time
 # Isolate the measured-speed gate: without this the tests read the REAL
@@ -138,10 +139,15 @@ class WiredIntoTheRealFilter(unittest.TestCase):
         self.assertIn("excluded from rotation", why)
 
     def test_filter_admits_a_normal_local_route(self):
-        self.assertEqual(
-            F._route_unusable_reason(
-                route("ollama/qwen3-coder:30b", "qwen3-coder:30b"), "free"),
-            "")
+        # Availability is now part of the route contract.  Keep this an
+        # offline filter test by supplying the successful health result that a
+        # live Ollama /api/tags response would establish.
+        with mock.patch.object(F, "_ollama_route_health",
+                               return_value=(True, "ok")):
+            self.assertEqual(
+                F._route_unusable_reason(
+                    route("ollama/qwen3-coder:30b", "qwen3-coder:30b"), "free"),
+                "")
 
     def test_filter_admits_the_free_cloud_glimmer(self):
         r = route("nvidia_nim/meta/muse-glimmer-30b", "meta/muse-glimmer-30b",
