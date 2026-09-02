@@ -29,13 +29,14 @@ jobs:
           python3 - <<'PY'
           import base64
           from pathlib import Path
-          import re
 
           workflow = Path(".github/workflows/_agent-fix-pr113-final-review-v2.yml").read_text(encoding="utf-8")
-          match = re.search(r"printf '%s' '([A-Za-z0-9+/=]+)' \\| base64", workflow)
-          if match is None:
-              raise SystemExit("repair payload not found")
-          Path("/tmp/fix-pr113.py").write_bytes(base64.b64decode(match.group(1), validate=True))
+          prefix = "printf '%s' '"
+          suffix = "' | base64"
+          start = workflow.index(prefix) + len(prefix)
+          end = workflow.index(suffix, start)
+          payload = workflow[start:end]
+          Path("/tmp/fix-pr113.py").write_bytes(base64.b64decode(payload, validate=True))
           PY
           python3 /tmp/fix-pr113.py
           rm -f \
