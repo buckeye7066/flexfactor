@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: flexfactor-pr113-final-review-v4
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   repair-test-push:
