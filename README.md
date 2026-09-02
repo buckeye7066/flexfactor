@@ -239,7 +239,8 @@ managed sign-in, session rotation, repositories, dispatch, results, and steering
 GitHub Actions is an implementation detail used for disposable multi-toolchain compute.
 
 First launch uses GitHub device sign-in; nobody creates or pastes a personal access
-token. OAuth access and refresh tokens are encrypted with Android Keystore. OpenAI
+token. Each OAuth access/refresh/expiry tuple is stored as one atomic Android
+Keystore-encrypted record. OpenAI
 and Anthropic keys are optional; the provider selector also exposes GitHub Copilot
 and a hosted open model. For a run, vendor keys are LibSodium-sealed on the phone to
 the selected repository's Actions public key before crossing FlexFactor Cloud; they

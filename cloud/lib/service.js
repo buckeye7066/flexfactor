@@ -463,6 +463,26 @@ async function applyProviderSecrets(token, repository, writes, fetchImpl) {
   }
 }
 
+async function assertTargetRef(token, repository, ref, fetchImpl) {
+  const response = await githubRaw(token, "GET",
+    `/repos/${repository}/commits/${encode(ref)}`, undefined, fetchImpl);
+  if (response.status === 200) {
+    const commit = parseJson(response.body, "GitHub target ref");
+    if (typeof commit?.sha === "string" && /^[0-9a-f]{40}$/i.test(commit.sha)) return;
+    throw new ServiceError(502, "invalid_target_ref_response",
+      "GitHub returned an invalid target ref response.");
+  }
+  if (response.status === 404 || response.status === 422) {
+    throw new ServiceError(409, "target_ref_unresolved",
+      `The selected target ref '${ref}' no longer exists. Select a current branch, tag, or commit and try again.`);
+  }
+  if (response.status === 401) {
+    throw new ServiceError(401, "session_invalid", "Your GitHub session is no longer valid.");
+  }
+  throw new ServiceError(response.status >= 500 ? 502 : response.status,
+    "github_request_failed", safeGitHubError(response));
+}
+
 async function installWorkflowThroughPullRequest(token, repository, baseBranch, expected, fetchImpl) {
   const metadata = await githubJson(token, "GET", `/repos/${repository}`, undefined, fetchImpl);
   const ownerLogin = typeof metadata?.owner?.login === "string" ? metadata.owner.login : "";
@@ -620,6 +640,10 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
     throw new ServiceError(502, "invalid_default_branch",
       "GitHub returned an invalid default branch for this repository.");
   }
+  // Resolve the exact checkout target before installing/updating the caller or
+  // replacing any credential. A deleted or renamed saved ref must be a
+  // mutation-free failure, including for paid runs.
+  await assertTargetRef(token, run.repository, run.ref, fetchImpl);
   // Prove every credential needed by the effective model policy before
   // installing a workflow or replacing any repository secret.
   const providerSecretWrites = await prepareProviderSecrets(

@@ -274,7 +274,8 @@ public final class MainActivity extends Activity {
     }
 
     private boolean configured() {
-        return secrets.contains(SecureStore.GITHUB_TOKEN);
+        return secrets.contains(SecureStore.GITHUB_SESSION)
+                || secrets.contains(SecureStore.GITHUB_TOKEN);
     }
 
     private void startGitHubSignIn() {
@@ -358,28 +359,81 @@ public final class MainActivity extends Activity {
     }
 
     private synchronized void saveGitHubSession(GitHubApi.OAuthToken token) throws Exception {
-        secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, token.refreshToken);
-        secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, Long.toString(token.expiresAt));
-        // Store the access token last: configured() must not become true for a
-        // half-written rotating session.
-        secrets.put(SecureStore.GITHUB_TOKEN, token.accessToken);
+        String access = token == null || token.accessToken == null
+                ? "" : token.accessToken.trim();
+        String refresh = token == null || token.refreshToken == null
+                ? "" : token.refreshToken.trim();
+        long expiresAt = token == null ? 0L : token.expiresAt;
+        if (access.isEmpty() || expiresAt <= 0L
+                || (expiresAt != Long.MAX_VALUE && refresh.isEmpty())) {
+            throw new GitHubApi.ApiException("FlexFactor received an incomplete GitHub session.");
+        }
+        JSONObject record = new JSONObject();
+        record.put("access_token", access);
+        record.put("refresh_token", refresh);
+        record.put("expires_at", expiresAt);
+        // One encrypted SharedPreferences value is the transaction boundary:
+        // access, refresh, and expiry can never be mixed across rotations.
+        secrets.put(SecureStore.GITHUB_SESSION, record.toString());
+        secrets.remove(SecureStore.GITHUB_TOKEN, SecureStore.GITHUB_REFRESH_TOKEN,
+                SecureStore.GITHUB_TOKEN_EXPIRES_AT);
     }
 
     private synchronized String githubToken() throws Exception {
-        String token = secrets.get(SecureStore.GITHUB_TOKEN);
-        String expiry = secrets.get(SecureStore.GITHUB_TOKEN_EXPIRES_AT);
-        long expiresAt = Long.MAX_VALUE;
-        try { if (!expiry.isEmpty()) expiresAt = Long.parseLong(expiry); }
-        catch (NumberFormatException ignored) { expiresAt = 0L; }
-        if (!token.isEmpty() && System.currentTimeMillis() + 300_000L < expiresAt) return token;
-        String refresh = secrets.get(SecureStore.GITHUB_REFRESH_TOKEN);
-        if (!token.isEmpty() && !refresh.isEmpty()) {
-            GitHubApi.OAuthToken rotated = api.refreshOAuthToken(refresh);
+        GitHubApi.OAuthToken session = loadGitHubSession();
+        if (session != null
+                && System.currentTimeMillis() + 300_000L < session.expiresAt) {
+            return session.accessToken;
+        }
+        if (session != null && !session.refreshToken.isEmpty()) {
+            GitHubApi.OAuthToken rotated = api.refreshOAuthToken(session.refreshToken);
             saveGitHubSession(rotated);
             return rotated.accessToken;
         }
         clearGitHubSession();
         throw new GitHubApi.ApiException("Your GitHub session expired. Reconnect GitHub to continue.");
+    }
+
+    private GitHubApi.OAuthToken loadGitHubSession() throws Exception {
+        String stored = secrets.get(SecureStore.GITHUB_SESSION);
+        if (!stored.isEmpty()) {
+            try {
+                JSONObject record = new JSONObject(stored);
+                String access = record.optString("access_token", "").trim();
+                String refresh = record.optString("refresh_token", "").trim();
+                long expiresAt = record.optLong("expires_at", 0L);
+                if (access.isEmpty() || expiresAt <= 0L
+                        || (expiresAt != Long.MAX_VALUE && refresh.isEmpty())) {
+                    throw new IllegalArgumentException("incomplete session");
+                }
+                return new GitHubApi.OAuthToken(access, refresh, expiresAt);
+            } catch (Exception invalid) {
+                secrets.remove(SecureStore.GITHUB_SESSION, SecureStore.GITHUB_TOKEN,
+                        SecureStore.GITHUB_REFRESH_TOKEN, SecureStore.GITHUB_TOKEN_EXPIRES_AT);
+                throw new GitHubApi.ApiException(
+                        "Your saved GitHub session is invalid. Reconnect GitHub to continue.");
+            }
+        }
+
+        // One-time migration for installations upgrading from the separate
+        // pre-3.4 credential entries. The new record is committed before all
+        // legacy entries are removed together.
+        String access = secrets.get(SecureStore.GITHUB_TOKEN);
+        if (access.isEmpty()) return null;
+        String refresh = secrets.get(SecureStore.GITHUB_REFRESH_TOKEN);
+        String expiry = secrets.get(SecureStore.GITHUB_TOKEN_EXPIRES_AT);
+        long expiresAt = Long.MAX_VALUE;
+        try { if (!expiry.isEmpty()) expiresAt = Long.parseLong(expiry); }
+        catch (NumberFormatException ignored) { expiresAt = 0L; }
+        if (expiresAt <= 0L || (expiresAt != Long.MAX_VALUE && refresh.isEmpty())) {
+            secrets.remove(SecureStore.GITHUB_SESSION, SecureStore.GITHUB_TOKEN,
+                    SecureStore.GITHUB_REFRESH_TOKEN, SecureStore.GITHUB_TOKEN_EXPIRES_AT);
+            throw new GitHubApi.ApiException(
+                    "Your saved GitHub session is invalid. Reconnect GitHub to continue.");
+        }
+        GitHubApi.OAuthToken migrated = new GitHubApi.OAuthToken(access, refresh, expiresAt);
+        saveGitHubSession(migrated);
+        return migrated;
     }
 
     private void savePendingAuthorization(GitHubApi.DeviceAuthorization authorization) {
@@ -428,9 +482,8 @@ public final class MainActivity extends Activity {
 
     private void clearGitHubSession() {
         try {
-            secrets.put(SecureStore.GITHUB_TOKEN, "");
-            secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, "");
-            secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, "");
+            secrets.remove(SecureStore.GITHUB_SESSION, SecureStore.GITHUB_TOKEN,
+                    SecureStore.GITHUB_REFRESH_TOKEN, SecureStore.GITHUB_TOKEN_EXPIRES_AT);
         } catch (Exception ignored) { }
         preferences.edit().remove(LOGIN).remove(REPOSITORY).remove(REF).apply();
     }
@@ -471,10 +524,6 @@ public final class MainActivity extends Activity {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
                 String openAiValue = openAi.getText().toString().trim();
                 String anthropicValue = anthropic.getText().toString().trim();
-                if (openAiValue.isEmpty()) openAiValue = secrets.get(SecureStore.OPENAI_KEY);
-                if (anthropicValue.isEmpty()) {
-                    anthropicValue = secrets.get(SecureStore.ANTHROPIC_KEY);
-                }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
                 configureCredentials(dialog, openAiValue, anthropicValue);
@@ -488,8 +537,10 @@ public final class MainActivity extends Activity {
             try {
                 GitHubApi.ConfigurationResult result = api.configure(
                         githubToken(), openAi, anthropic);
-                secrets.put(SecureStore.OPENAI_KEY, openAi);
-                secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
+                // Blank fields preserve the existing value. Only newly entered
+                // credentials are validated and replaced independently.
+                if (!openAi.isEmpty()) secrets.put(SecureStore.OPENAI_KEY, openAi);
+                if (!anthropic.isEmpty()) secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
                 preferences.edit().putString(LOGIN, result.login).apply();
                 post(() -> {
                     dialog.dismiss();

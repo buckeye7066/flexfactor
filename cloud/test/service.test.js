@@ -54,6 +54,10 @@ function validRun(overrides = {}) {
   };
 }
 
+function resolvedRef() {
+  return { body: { sha: "a".repeat(40) } };
+}
+
 test("the reusable workflow is pinned to the release that carries this client", () => {
   assert.equal(ENGINE_REF, "android-v3.4.0");
   assert.match(mobileWorkflow(), /mobile-run\.yml@android-v3\.4\.0/);
@@ -168,6 +172,7 @@ test("dispatch uses the default-branch caller and GitHub's authoritative run ID"
   const expectedWorkflow = mobileWorkflow();
   const fetcher = queuedFetch([
     { status: 200, body: { default_branch: "main" } },
+    resolvedRef(),
     { status: 200, body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
     { status: 200, body: {
       workflow_run_id: 987654,
@@ -178,19 +183,38 @@ test("dispatch uses the default-branch caller and GitHub's authoritative run ID"
   const state = await dispatch("gho_dispatch_token", validRun({ ref: "feature/release" }),
     {}, fetcher, async () => {});
   assert.equal(state.id, 987654);
-  assert.equal(fetcher.calls.length, 3);
-  assert.match(fetcher.calls[1].url, /flexfactor-mobile\.yml\?ref=main$/);
-  assert.match(fetcher.calls[2].url, /flexfactor-mobile\.yml\/dispatches$/);
-  const dispatchBody = JSON.parse(fetcher.calls[2].options.body);
+  assert.equal(fetcher.calls.length, 4);
+  assert.match(fetcher.calls[1].url, /commits\/feature%2Frelease$/);
+  assert.match(fetcher.calls[2].url, /flexfactor-mobile\.yml\?ref=main$/);
+  assert.match(fetcher.calls[3].url, /flexfactor-mobile\.yml\/dispatches$/);
+  const dispatchBody = JSON.parse(fetcher.calls[3].options.body);
   assert.equal(dispatchBody.ref, "main");
   assert.equal(dispatchBody.inputs.target_ref, "feature/release");
-  assert.doesNotMatch(fetcher.calls[2].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
+  assert.doesNotMatch(fetcher.calls[3].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
+});
+
+test("a stale target ref fails before workflow or credential mutation", async () => {
+  const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
+  const fetcher = queuedFetch([
+    { body: { default_branch: "main" } },
+    { status: 404, body: { message: "Not Found" } },
+  ]);
+  await assert.rejects(() => dispatch("gho_stale_ref_token",
+    validRun({ provider: "openai", use_both: false, ref: "deleted/paid-branch" }),
+    { OPENAI_API_KEY: sealed }, fetcher, async () => {}),
+  (error) => error instanceof ServiceError && error.code === "target_ref_unresolved");
+  assert.equal(fetcher.calls.length, 2);
+  assert.match(fetcher.calls[1].url, /commits\/deleted%2Fpaid-branch$/);
+  assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
+  assert.equal(fetcher.calls.some((call) => /actions\/secrets/.test(call.url)), false);
+  assert.equal(fetcher.calls.some((call) => /workflows\/flexfactor-mobile/.test(call.url)), false);
 });
 
 test("sealed provider values are forwarded without accepting plaintext key fields", async () => {
   const expectedWorkflow = mobileWorkflow();
   const fetcher = queuedFetch([
     { body: { default_branch: "main" } },
+    resolvedRef(),
     { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
     { status: 204 },
     { status: 200, body: { workflow_run_id: 12,
@@ -200,7 +224,7 @@ test("sealed provider values are forwarded without accepting plaintext key field
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   await dispatch("gho_sealed_token", validRun({ provider: "openai", use_both: false }),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
-  const secretWrite = fetcher.calls[2];
+  const secretWrite = fetcher.calls[3];
   assert.match(secretWrite.url, /actions\/secrets\/OPENAI_API_KEY$/);
   assert.equal(JSON.parse(secretWrite.options.body).encrypted_value, sealed.encrypted_value);
   assert.doesNotMatch(secretWrite.options.body, /sk-|api[_-]?key/i);
@@ -208,12 +232,15 @@ test("sealed provider values are forwarded without accepting plaintext key field
 
 test("unused provider credentials are rejected before any repository mutation", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
-  const fetcher = queuedFetch([{ body: { default_branch: "main" } }]);
+  const fetcher = queuedFetch([
+    { body: { default_branch: "main" } },
+    resolvedRef(),
+  ]);
   await assert.rejects(() => dispatch("gho_unused_token",
     validRun({ mode: "scout", provider: "ollama", use_both: true }),
     { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {}),
   (error) => error instanceof ServiceError && error.code === "unexpected_provider_key");
-  assert.equal(fetcher.calls.length, 1);
+  assert.equal(fetcher.calls.length, 2);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
 });
 
@@ -221,6 +248,7 @@ test("dual-paid runs require both credentials before workflow or secret writes",
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
     { body: { default_branch: "main" } },
+    resolvedRef(),
     { status: 404, body: { message: "Not Found" } },
   ]);
   await assert.rejects(() => dispatch("gho_dual_token",
@@ -228,8 +256,8 @@ test("dual-paid runs require both credentials before workflow or secret writes",
     { OPENAI_API_KEY: sealed }, fetcher, async () => {}),
   (error) => error instanceof ServiceError && error.code === "provider_key_missing"
     && /Anthropic/.test(error.message));
-  assert.equal(fetcher.calls.length, 2);
-  assert.match(fetcher.calls[1].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.equal(fetcher.calls.length, 3);
+  assert.match(fetcher.calls[2].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
   assert.equal(fetcher.calls.some((call) => /workflows\/flexfactor-mobile/.test(call.url)), false);
 });
@@ -239,6 +267,7 @@ test("dual-paid runs accept a supplied key when the paired repository secret exi
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
     { body: { default_branch: "main" } },
+    resolvedRef(),
     { status: 200, body: { name: "ANTHROPIC_API_KEY" } },
     { body: { sha: "workflow-sha", content: Buffer.from(expectedWorkflow).toString("base64") } },
     { status: 204 },
@@ -252,8 +281,8 @@ test("dual-paid runs accept a supplied key when the paired repository secret exi
     validRun({ mode: "prodready", provider: "openai", use_both: true }),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
   assert.equal(result.id, 45);
-  assert.match(fetcher.calls[1].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
-  assert.match(fetcher.calls[3].url, /actions\/secrets\/OPENAI_API_KEY$/);
+  assert.match(fetcher.calls[2].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
+  assert.match(fetcher.calls[4].url, /actions\/secrets\/OPENAI_API_KEY$/);
 });
 
 test("run status reports the active engine step", async () => {

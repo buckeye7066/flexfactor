@@ -122,7 +122,14 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertNotIn("GITHUB_OAUTH_CLIENT_SECRET", service)
         self.assertIn("refreshOAuthToken", api)
         self.assertIn("token.refreshToken", activity)
-        self.assertIn("api.refreshOAuthToken(refresh)", activity)
+        self.assertIn("api.refreshOAuthToken(session.refreshToken)", activity)
+        saved = activity.split("private synchronized void saveGitHubSession", 1)[1]
+        saved = saved.split("private synchronized String githubToken", 1)[0]
+        self.assertIn("SecureStore.GITHUB_SESSION", saved)
+        self.assertIn('record.put("access_token"', saved)
+        self.assertIn('record.put("refresh_token"', saved)
+        self.assertIn('record.put("expires_at"', saved)
+        self.assertNotIn("secrets.put(SecureStore.GITHUB_TOKEN", saved)
         self.assertNotIn("GITHUB_OAUTH_CLIENT_SECRET", api)
         self.assertNotIn("OAUTH_CLIENT_ID", api)
 
@@ -224,6 +231,16 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("githubToken(), openAi, anthropic", (ANDROID / "java" / "com" /
                       "firer" / "console" / "flexfactor" / "MainActivity.java").read_text(
                           encoding="utf-8"))
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        setup = activity.split("private void showCredentialSetup", 1)[1]
+        setup = setup.split("private void showCredentialLinks", 1)[0]
+        self.assertNotIn("openAiValue = secrets.get", setup)
+        self.assertNotIn("anthropicValue = secrets.get", setup)
+        configure = activity.split("private void configureCredentials", 1)[1]
+        configure = configure.split("private void showCredentialLinks", 1)[0]
+        self.assertIn("if (!openAi.isEmpty())", configure)
+        self.assertIn("if (!anthropic.isEmpty())", configure)
 
     def test_dispatch_uses_the_authoritative_run_id_with_legacy_correlation_fallback(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -233,6 +250,12 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("locateDispatchedRun", service)
         self.assertIn("workflow_run_id", service)
         self.assertIn("metadata?.default_branch", service)
+        dispatch = service.split("export async function dispatch", 1)[1]
+        dispatch = dispatch.split("function validateRunIdentity", 1)[0]
+        self.assertLess(dispatch.index("assertTargetRef"),
+                        dispatch.index("ensureTargetWorkflow"))
+        self.assertLess(dispatch.index("assertTargetRef"),
+                        dispatch.index("applyProviderSecrets"))
         self.assertIn("display_title", service)
         self.assertIn("request.request_id", service)
         self.assertIn("DISPATCH_READ_TIMEOUT_MS = 330_000", api)

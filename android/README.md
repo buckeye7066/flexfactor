@@ -14,7 +14,8 @@ needed to audit real repositories. The APK contains no direct GitHub API fallbac
 
 Tap **Sign in with GitHub**. FlexFactor displays a one-time GitHub device code,
 opens GitHub's authorization page, and stores the resulting short-lived session
-encrypted by Android Keystore. The app refreshes that session automatically;
+encrypted by Android Keystore. Access token, refresh token, and expiry are one
+atomic encrypted record. The app refreshes that session automatically;
 the user never creates or pastes a personal access token.
 
 After sign-in, **Provider settings** optionally accepts:
@@ -25,8 +26,8 @@ After sign-in, **Provider settings** optionally accepts:
 FlexFactor Cloud validates the GitHub account before saving anything. A pinned Ollama
 runtime and coding model run in the disposable Actions runner by default. Optional
 provider values are encrypted at rest with a non-exportable Android Keystore key and
-are validated directly against the provider before the phone saves them and again
-before a run transmits them. Only keys required by the selected run are sealed on
+each newly entered value is validated independently against its provider before the
+phone saves it and again before a run transmits it. Only keys required by the selected run are sealed on
 the phone with the repository's GitHub Actions public key and written to protected
 Actions secrets by the service, which receives ciphertext rather than plaintext
 during dispatch. They are never workflow inputs, URLs, command arguments, artifacts,
@@ -38,6 +39,8 @@ After setup, choose any writable public or private repository and use any origin
 mode. FlexFactor installs a small pinned caller workflow into that selected
 repository and runs there, so private names, inputs, logs, and artifacts stay in
 the private repository rather than crossing the public control repository.
+The cloud resolves the selected checkout ref before it installs a workflow or
+writes a provider secret, so a deleted or renamed branch fails without mutation.
 
 1. **Refactor a file** — improve a selected file toward a stated goal and open a
    publication PR when the verified output changes it.

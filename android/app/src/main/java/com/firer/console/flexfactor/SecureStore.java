@@ -16,6 +16,9 @@ import javax.crypto.spec.GCMParameterSpec;
 
 /** App-private credential storage backed by a non-exportable Android Keystore key. */
 final class SecureStore {
+    static final String GITHUB_SESSION = "github_session_v2";
+    // Legacy keys are read once during the 3.4 upgrade and then removed after
+    // the complete session has been committed as one encrypted record.
     static final String GITHUB_TOKEN = "github_token";
     static final String GITHUB_REFRESH_TOKEN = "github_refresh_token";
     static final String GITHUB_TOKEN_EXPIRES_AT = "github_token_expires_at";
@@ -38,7 +41,9 @@ final class SecureStore {
     synchronized void put(String name, String value) throws Exception {
         String clean = value == null ? "" : value.trim();
         if (clean.isEmpty()) {
-            preferences.edit().remove(name).apply();
+            if (!preferences.edit().remove(name).commit()) {
+                throw new IllegalStateException("Secure credential storage failed.");
+            }
             return;
         }
         Cipher cipher = Cipher.getInstance(TRANSFORMATION);
@@ -47,7 +52,9 @@ final class SecureStore {
         byte[] encrypted = cipher.doFinal(clean.getBytes(StandardCharsets.UTF_8));
         String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)
                 + "." + Base64.encodeToString(encrypted, Base64.NO_WRAP);
-        preferences.edit().putString(name, encoded).commit();
+        if (!preferences.edit().putString(name, encoded).commit()) {
+            throw new IllegalStateException("Secure credential storage failed.");
+        }
     }
 
     synchronized String get(String name) {
@@ -70,6 +77,14 @@ final class SecureStore {
 
     boolean contains(String name) {
         return !get(name).isEmpty();
+    }
+
+    synchronized void remove(String... names) throws Exception {
+        SharedPreferences.Editor editor = preferences.edit();
+        for (String name : names) editor.remove(name);
+        if (!editor.commit()) {
+            throw new IllegalStateException("Secure credential storage failed.");
+        }
     }
 
     synchronized void clear() {
