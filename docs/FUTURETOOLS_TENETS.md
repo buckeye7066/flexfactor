@@ -68,7 +68,9 @@ directly without activating it.
 Tenets is an enhancement, not a release authority. If the executable is absent,
 times out, exits non-zero, emits malformed JSON, exceeds either output safety
 limit, or returns no safe paths, the adapter records `unavailable` or `degraded`
-evidence and preserves FlexFactor's original file order and cap.
+evidence and preserves FlexFactor's original file order and cap. If
+uncapped candidate discovery cannot complete, the adapter records degraded
+evidence and reruns the original capped enumerator unchanged.
 `flexfactor-context --strict` returns non-zero in those cases for CI or operator
 verification.
 

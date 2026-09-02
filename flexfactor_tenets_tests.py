@@ -281,9 +281,53 @@ class TenetsInstallTests(unittest.TestCase):
         ):
             ft.install(runtime)
             result = runtime["_enumerate_source_files"](str(self.root), max_files=2)
-        self.assertEqual(observed_caps, [ft.MAX_ENUMERATION_FILES])
+        self.assertEqual(observed_caps, [sys.maxsize])
         self.assertEqual(result, ["src/target.py", "src/first.py"])
         self.assertEqual(len(result), 2)
+
+    def test_lifted_parameter_cap_has_no_fixed_repository_ceiling(self) -> None:
+        observed_caps: list[int] = []
+
+        def enumerate_source_files(project_dir: str, max_files: int = 2):
+            observed_caps.append(max_files)
+            files = ["src/first.py", "src/second.py"]
+            if max_files > 100_000:
+                files.append("src/target.py")
+            return files[:max_files]
+
+        runtime = {"_enumerate_source_files": enumerate_source_files}
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("src/target.py"),
+        ):
+            ft.install(runtime)
+            result = runtime["_enumerate_source_files"](str(self.root), max_files=2)
+        self.assertEqual(observed_caps, [sys.maxsize])
+        self.assertEqual(result, ["src/target.py", "src/first.py"])
+
+    def test_uncapped_enumeration_failure_preserves_original_and_reports_degraded(self) -> None:
+        original = ["src/first.py", "src/second.py", "src/target.py"]
+
+        def enumerate_source_files(project_dir: str, max_files: int = 2):
+            if max_files == sys.maxsize:
+                raise MemoryError("candidate set exceeds available memory")
+            return list(original[:max_files])
+
+        runtime = {"_enumerate_source_files": enumerate_source_files}
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("src/target.py"),
+        ):
+            ft.install(runtime)
+            result = runtime["_enumerate_source_files"](str(self.root), max_files=2)
+        self.assertEqual(result, ["src/first.py", "src/second.py"])
+        evidence = runtime["_TENETS_CONTEXT_LAST"]
+        self.assertIsInstance(evidence, dict)
+        assert isinstance(evidence, dict)
+        self.assertEqual(evidence["status"], "degraded")
+        self.assertIn("original order preserved", evidence["message"])
 
     def test_ranked_file_beyond_positional_cap_enters_budget(self) -> None:
         original = ["src/first.py", "src/second.py", "src/target.py"]
@@ -303,12 +347,14 @@ class TenetsInstallTests(unittest.TestCase):
 
     def test_ranked_file_beyond_global_cap_enters_budget_and_cap_is_restored(self) -> None:
         runtime: dict[str, object] = {"MAX_FILES_PER_RUN": 2}
-        exec(
-            "def _enumerate_source_files(project_dir):\n"
-            "    files = ['src/first.py', 'src/second.py', 'src/target.py']\n"
-            "    return files[:MAX_FILES_PER_RUN]\n",
-            runtime,
-        )
+
+        def enumerate_source_files(project_dir: str):
+            files = ["src/first.py", "src/second.py", "src/target.py"]
+            limit = runtime["MAX_FILES_PER_RUN"]
+            assert isinstance(limit, int)
+            return files[:limit]
+
+        runtime["_enumerate_source_files"] = enumerate_source_files
         with mock.patch.object(
             ft,
             "cached_tenets_context",

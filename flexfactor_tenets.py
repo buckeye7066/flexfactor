@@ -36,7 +36,10 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_TOP = 200
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
-MAX_ENUMERATION_FILES = 100_000
+# Python sequences cannot contain more than sys.maxsize elements. Using
+# that interpreter bound neutralizes the caller's review quota without
+# imposing a smaller, arbitrary repository cutoff before prioritization.
+_UNBOUNDED_ENUMERATION_LIMIT = sys.maxsize
 
 _DISABLE_VALUES = {"0", "false", "no", "off"}
 _CAP_PARAMETER_NAMES = (
@@ -620,20 +623,20 @@ def _call_with_lifted_cap(
             cap = _positive_cap(supplied)
             if cap is None:
                 continue
-            if cap >= MAX_ENUMERATION_FILES:
+            if cap >= _UNBOUNDED_ENUMERATION_LIMIT:
                 return prior(*args, **kwargs), cap
-            bound.arguments[name] = MAX_ENUMERATION_FILES
+            bound.arguments[name] = _UNBOUNDED_ENUMERATION_LIMIT
             return prior(*bound.args, **bound.kwargs), cap
 
     for name in _CAP_GLOBAL_NAMES:
         cap = _positive_cap(module_globals.get(name))
         if cap is None:
             continue
-        if cap >= MAX_ENUMERATION_FILES:
+        if cap >= _UNBOUNDED_ENUMERATION_LIMIT:
             return prior(*args, **kwargs), cap
         with _ENUMERATION_LOCK:
             original = module_globals[name]
-            module_globals[name] = MAX_ENUMERATION_FILES
+            module_globals[name] = _UNBOUNDED_ENUMERATION_LIMIT
             try:
                 return prior(*args, **kwargs), cap
             finally:
@@ -675,12 +678,25 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
             if result.status != "ok":
                 return prior(*args, **kwargs)
 
-            source_files, cap = _call_with_lifted_cap(
-                prior,
-                module_globals,
-                args,
-                kwargs,
-            )
+            try:
+                source_files, cap = _call_with_lifted_cap(
+                    prior,
+                    module_globals,
+                    args,
+                    kwargs,
+                )
+            except Exception as exc:
+                # Tenets is optional. If uncapped discovery cannot complete,
+                # retry the canonical capped call and report degraded ranking.
+                message = _bounded_text(
+                    f"uncapped enumeration failed; original order preserved: {exc}"
+                )
+                degraded = result.to_dict()
+                degraded["status"] = "degraded"
+                degraded["message"] = message
+                module_globals["_TENETS_CONTEXT_LAST"] = degraded
+                module_globals["_TENETS_CONTEXT_LAST_ERROR"] = message
+                return prior(*args, **kwargs)
             prioritized = _prioritize_paths(source_files, result.files, canonicalize)
             return _limit_paths(prioritized, cap)
 
