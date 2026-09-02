@@ -2684,6 +2684,13 @@ class CopilotProvider:
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Route admission asks Ollama for its installed tags before the rotator is
+# built. Cache that answer per endpoint/model inside this process so a catalog
+# with several local routes performs one cheap liveness/model probe per route,
+# not one probe per semantic call or per file.
+_OLLAMA_ROUTE_HEALTH: dict[tuple[str, str, str], tuple[bool, str]] = {}
+_OLLAMA_ROUTE_HEALTH_LOCK = threading.Lock()
+
 # ---- Global ollama concurrency gate (2026-08-11 live failure) --------------- #
 # One local server serves EVERY OllamaProvider call in this process - including
 # all programs of a --parallel run and all REVIEW_WORKERS threads per program.
@@ -2913,12 +2920,67 @@ class OllamaProvider:
         return data
 
     def ping(self) -> None:
-        """Liveness = the local server answers /api/tags. Raises on failure so
-        preflight can drop an ollama that isn't running."""
+        """Prove the local server and both configured model tags are usable.
+
+        Merely having a localhost URL is not availability. A route may enter
+        the paid-to-free ladder only when Ollama answers and advertises the
+        author/judge model it would actually be asked to run.
+        """
         import urllib.request
         req = urllib.request.Request(self.base_url + "/api/tags", method="GET")
         with self._opener.open(req, timeout=10) as resp:
-            resp.read(64)
+            data = json.loads(resp.read(4 * 1024 * 1024).decode("utf-8"))
+        installed = {
+            str(row.get("name") or row.get("model") or "").strip()
+            for row in (data.get("models") or []) if isinstance(row, dict)
+        }
+        installed.discard("")
+
+        def present(required: str) -> bool:
+            required = str(required or "").strip()
+            if not required:
+                return False
+            if required in installed:
+                return True
+            # Ollama commonly reports an implicit tag as ``name:latest`` while
+            # a catalog names it as ``name`` (or vice versa).
+            if ":" not in required and f"{required}:latest" in installed:
+                return True
+            return required.endswith(":latest") and required[:-7] in installed
+
+        missing = [model for model in dict.fromkeys(
+            (self.model, self.judge_model)) if not present(model)]
+        if missing:
+            raise RuntimeError(
+                "local Ollama is running but required model tag(s) are not "
+                f"installed: {', '.join(missing)}")
+
+
+def _ollama_route_health(route) -> tuple[bool, str]:
+    """Return whether one catalog route is genuinely runnable right now."""
+    model = str(getattr(route, "wire_model", "")
+                or getattr(route, "model", "")).strip()
+    base_url = str(getattr(route, "base_url", "") or OLLAMA_BASE_URL).rstrip("/")
+    judge_model = model
+    key = (base_url, model, judge_model)
+    with _OLLAMA_ROUTE_HEALTH_LOCK:
+        cached = _OLLAMA_ROUTE_HEALTH.get(key)
+    if cached is not None:
+        return cached
+    try:
+        OllamaProvider(model, judge_model=judge_model,
+                       base_url=base_url).ping()
+        result = (True, "ok")
+    except Exception as exc:  # noqa: BLE001 - route exclusion needs the reason
+        detail = " ".join(str(exc).split())[:240]
+        result = (
+            False,
+            "local Ollama route unavailable"
+            + (f" ({detail})" if detail else f" ({type(exc).__name__})"),
+        )
+    with _OLLAMA_ROUTE_HEALTH_LOCK:
+        _OLLAMA_ROUTE_HEALTH[key] = result
+    return result
 
 
 def _coerce_issue(item) -> str:
@@ -3726,7 +3788,7 @@ def _provider_key_present(name: str) -> bool:
         return bool(os.environ.get("COPILOT_GITHUB_TOKEN")
                     or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
     if name == "ollama":
-        return True  # local server, no key; the preflight PING is the real check
+        return True  # Credential prerequisite only; route health proves availability.
     return False
 
 
@@ -4158,6 +4220,10 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     if route.api in ("codex-cli", "claude-code", "copilot-cli", "cursor"):
         reason = _extended_route_unusable(route)
         if reason:
+            return reason
+    if route.api == "ollama":
+        healthy, reason = _ollama_route_health(route)
+        if not healthy:
             return reason
     if route.auth_env and not os.environ.get(route.auth_env):
         return f"missing {route.auth_env}"
@@ -16417,8 +16483,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             _free_pool = list(_LAST_FREE_REVIEW_POOL)
         if not providers:
             why = _diagnosis or "no LLM API key found"
-            print(f"{pfx}error: {why}. Set/repair ANTHROPIC_API_KEY and/or OPENAI_API_KEY "
-                  f"(or pass --no-preflight to skip the live key check).", file=sys.stderr)
+            print(
+                f"{pfx}error: {why}. Configure a usable paid/subscription "
+                "route (for example ANTHROPIC_API_KEY or OPENAI_API_KEY), or "
+                "start Ollama with the required model tags. --no-preflight "
+                "cannot supply a missing route.",
+                file=sys.stderr,
+            )
             result["error"] = why
             _ledger("setup", result["error"])
             return result
