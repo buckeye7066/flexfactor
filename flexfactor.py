@@ -5217,20 +5217,22 @@ def run(args) -> int:
             "Rewrite the entire file to achieve the goal. Return only the new file contents."
         )
         candidate = _strip_code_fences(provider.complete(rewrite_instruction))
+        candidate_matches_original = candidate == original
 
-        if not candidate.strip():
+        if not candidate.strip() and not candidate_matches_original:
             # A blank rewrite would erase the file if accepted - score it 0 so the
             # policy never selects it, and tell the next rep to return the full file.
             grade = Grade(0, False, "Model returned an empty file.",
                           ["Return the complete file contents, not an empty response."])
         else:
             syntax_ok, syntax_note = _inproc_source_syntax_ok(args.file, candidate)
-            if syntax_ok is not True:
-                # Never show the rejected prose/code to the fallback reviewer:
-                # the live Android trial proved that an explanation claiming
-                # "already good" can persuade a judge even though it is not
-                # source.  Review the exact original file instead.  It becomes
-                # a no-op candidate only on an explicit threshold pass; the
+            if syntax_ok is not True or candidate_matches_original:
+                # Never let an author response authorize an unchanged result.
+                # This covers both invalid prose/code and syntactically-valid
+                # text equal to the newline-normalized preview: the latter may
+                # conceal CRLF or other exact-byte differences.  Review the
+                # exact original file independently instead.  It becomes a
+                # no-op candidate only on an explicit threshold pass; the
                 # unchanged path below still runs the full project gate and
                 # proves this exact baseline is on remote default.
                 # `_load_source_text` intentionally returns a bounded,
@@ -5272,16 +5274,24 @@ def run(args) -> int:
                                 args.file, exact_original, allow_empty=True,
                             )
                         )
-                print(
-                    f"[rep {i}] author response rejected before write: "
-                    f"{syntax_note}"
-                )
+                if candidate_matches_original:
+                    response_description = "unchanged author candidate"
+                    print(
+                        f"[rep {i}] unchanged author candidate requires "
+                        "exact-byte independent review"
+                    )
+                else:
+                    response_description = "invalid author response"
+                    print(
+                        f"[rep {i}] author response rejected before write: "
+                        f"{syntax_note}"
+                    )
                 if original_syntax_ok is True:
                     grade_prompt = (
                         f"GOAL: {args.goal}\n\n"
-                        "EXACT ORIGINAL FILE (the author's invalid response was "
-                        "discarded and is not evidence):\n"
-                        + _fence_untrusted("original", exact_original)
+                        "EXACT ORIGINAL FILE (the author response is not "
+                        "authorization for a no-op):\n"
+                        + _fence_exact_utf8_text("original", exact_original)
                         + "\n\nGrade whether retaining this exact original file fully "
                           "satisfies the goal. Set meets_goal true only when no "
                           "source change is required."
@@ -5303,9 +5313,10 @@ def run(args) -> int:
                         grade = Grade(
                             0,
                             False,
-                            "Author response was invalid source and independent "
+                            f"The {response_description} required independent "
                             f"no-op review was unavailable: {type(exc).__name__}: {exc}",
-                            [f"Author must return valid source ({syntax_note})."],
+                            ["Return changed, complete valid source or obtain "
+                             "independent approval of the exact original."],
                         )
                     else:
                         if (original_grade.meets_goal is True
@@ -5321,10 +5332,11 @@ def run(args) -> int:
                             grade = Grade(
                                 original_grade.grade,
                                 False,
-                                "Author response was invalid source and the exact "
-                                "original file was not approved unchanged: "
+                                f"The {response_description} did not authorize a "
+                                "no-op; the exact original file was not approved "
+                                "unchanged: "
                                 + original_grade.rationale,
-                                [f"Author must return valid source ({syntax_note})."]
+                                ["Return changed, complete valid source."]
                                 + list(original_grade.issues),
                             )
                 else:
@@ -5332,9 +5344,10 @@ def run(args) -> int:
                     grade = Grade(
                         0,
                         False,
-                        "Author response was invalid source and the original "
+                        f"The {response_description} could not authorize a no-op; "
+                        "the original "
                         f"file could not support a verified no-op: {original_syntax_note}",
-                        [f"Return complete valid source ({syntax_note})."],
+                        ["Return changed, complete valid source."],
                     )
             else:
                 grade_prompt = (
@@ -8204,6 +8217,28 @@ def _fence_untrusted(label: str, text: str) -> str:
     body = body.replace("<<<UNTRUSTED", "<< <UNTRUSTED").replace("UNTRUSTED>>>", "UNTRUSTED> >>")
     return (f"{_UNTRUSTED_PREAMBLE}\n"
             f"<<<UNTRUSTED {label} START>>>\n{body}\n<<<UNTRUSTED {label} END>>>")
+
+
+def _fence_exact_utf8_text(label: str, text: str) -> str:
+    """Frame complete strict-UTF-8 text without changing any source character.
+
+    Ordinary untrusted fencing deliberately breaks forged marker substrings.
+    That is safe for contextual source, but it cannot prove an exact-file no-op.
+    A JSON string is reversible, and escaping angle brackets prevents its data
+    from spelling either boundary in the prompt.  Because callers first decode
+    strict UTF-8, decoding this JSON string and re-encoding UTF-8 reconstructs
+    the original bytes exactly, including CRLF and literal delimiter text.
+    """
+    encoded = json.dumps(text, ensure_ascii=True)
+    encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"{_UNTRUSTED_PREAMBLE}\n"
+        f"<<<UNTRUSTED {label} JSON START>>>\n"
+        "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+        "review and preserve every character):\n"
+        f"{encoded}\n"
+        f"<<<UNTRUSTED {label} JSON END>>>"
+    )
 
 
 def _summarize_repo_for_judge(result: dict) -> str:
@@ -12584,6 +12619,12 @@ def _structural_plan_shape_error(plan) -> str:
             and (not isinstance(need_files, list)
                  or any(not isinstance(path, str) for path in need_files))):
         return "plan 'need_files' is not a list of paths"
+    fixed_titles = plan.get("fixed_titles")
+    if (not isinstance(fixed_titles, list)
+            or any(not isinstance(title, str) for title in fixed_titles)):
+        return "plan 'fixed_titles' is not a list of strings"
+    if not isinstance(plan.get("notes"), str):
+        return "plan 'notes' is not a string"
     return ""
 
 
@@ -12612,6 +12653,22 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
         return f"plan renames {len(renames)} files (max {STRUCTURAL_MAX_RENAMES})"
 
     seen_paths: dict[str, tuple[str, str]] = {}
+    # A write to an exact rename destination rewrites the moved owner file, not
+    # a newly-created path. Resolve that ownership before validating writes so
+    # the source must have been shown and empty-file policy cannot misclassify
+    # the still-missing destination as a safe empty creation.
+    rename_destination_sources: dict[str, str] = {}
+    for rename in renames:
+        if not isinstance(rename, dict):
+            continue
+        raw_source = rename.get("from")
+        raw_destination = rename.get("to")
+        if not isinstance(raw_source, str) or not isinstance(raw_destination, str):
+            continue
+        source_identity = _portable_rel_identity(raw_source)
+        destination_identity = _portable_rel_identity(raw_destination)
+        if source_identity is not None and destination_identity is not None:
+            rename_destination_sources[destination_identity[0]] = source_identity[0]
 
     def bad_path(p, role: str) -> str:
         if not isinstance(p, str) or not p.strip():
@@ -12657,10 +12714,17 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
             return f"write without string contents: {p}"
         if len(w["contents"]) > STRUCTURAL_WRITE_MAX_CHARS:
             return f"write exceeds {STRUCTURAL_WRITE_MAX_CHARS} chars: {p}"
-        ex = _contained_existence(project_dir, _canon_rel(p))
+        canonical_write = _portable_rel_identity(p)[0]
+        owner_path = rename_destination_sources.get(
+            canonical_write, canonical_write
+        )
+        ex = _contained_existence(project_dir, owner_path)
         if ex == "refused":
             return f"existence check refused for {p}"
-        if ex == "exists" and _canon_rel(p) not in shown:
+        if ex == "exists" and owner_path not in shown:
+            if owner_path != canonical_write:
+                return (f"plan rewrites {p} after moving {owner_path} without "
+                        "having seen its contents")
             return f"plan rewrites {p} without having seen its contents"
     for r in renames:
         src_p = r.get("from") if isinstance(r, dict) else None
@@ -12789,9 +12853,14 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     # source is allowed only for a newly-created file whose parser says it is
     # valid (for example an empty Python package marker); a plan may never erase
     # an existing file by calling an empty rewrite syntactically valid.
+    rename_destinations = {dst: src for src, dst in renames}
     for p, contents in writes:
         existence = _contained_existence(project_dir, p)
-        allow_empty_create = existence == "missing" and not contents.strip()
+        allow_empty_create = (
+            p not in rename_destinations
+            and existence == "missing"
+            and not contents.strip()
+        )
         syntax_ok, syntax_note = _inproc_source_syntax_ok(
             p, contents, allow_empty=allow_empty_create,
         )
@@ -12850,12 +12919,12 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
 
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
     snapshots = {}
-    rename_destinations = {dst for _, dst in renames}
+    rename_destination_paths = set(rename_destinations)
     for p in dict.fromkeys(touched):
         ex = _contained_existence(project_dir, p)
         if ex == "refused":
             return ("failed", f"existence check refused for {p}")
-        if p in rename_destinations and ex != "missing":
+        if p in rename_destination_paths and ex != "missing":
             return ("failed", f"rename target changed before apply: {p}")
         if ex == "exists":
             snapshot = _read_bytes_contained(
@@ -12904,7 +12973,7 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
         if _replace_contained(project_dir, p, contents) is None:
             _rollback()
             return ("failed", f"contained write refused for {p} (rolled back)")
-        moved_here = p in rename_destinations
+        moved_here = p in rename_destination_paths
         applied_ops.append(
             ("rewrite " if was is not None or moved_here else "create ") + p
         )

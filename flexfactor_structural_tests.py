@@ -110,12 +110,16 @@ class StructuralApplies(_Base):
         self.assertEqual(self.read("renamed.py"), "y = 2\n")
 
     def test_rename_destination_can_be_rewritten_after_the_move(self):
-        author = _Author([plan(
-            writes=[{"path": "renamed.py", "contents": "y = 3\n"}],
-            renames=[{"from": "other.py", "to": "renamed.py"}],
-        )])
+        author = _Author([
+            plan(changed=False, need_files=["other.py"]),
+            plan(
+                writes=[{"path": "renamed.py", "contents": "y = 3\n"}],
+                renames=[{"from": "other.py", "to": "renamed.py"}],
+            ),
+        ])
         applied, _, notes = self.run_fix(author)
         self.assertEqual(applied, ["bad.py"])
+        self.assertEqual(author.structural_calls, 2)
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 3\n")
         self.assertTrue(any("rewrite renamed.py" in note for note in notes))
@@ -243,6 +247,68 @@ class StructuralRollsBack(_Base):
         self.assertIn("need_files", detail)
         self.assertEqual(1, author.structural_calls)
         self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
+
+    def test_malformed_fixed_titles_is_refused_before_every_operation(self):
+        for malformed_titles in (1, [1]):
+            with self.subTest(fixed_titles=malformed_titles):
+                malformed = {
+                    "changed": True,
+                    "writes": [{"path": "bad.py", "contents": GOOD_FIXED}],
+                    "renames": [],
+                    "fixed_titles": malformed_titles,
+                    "notes": "malformed fixed titles",
+                }
+                self._assert_malformed_operation_field_is_preflight_refused(
+                    malformed, expected="fixed_titles"
+                )
+
+    def test_rename_destination_rewrite_requires_source_contents(self):
+        author = _Author([plan(
+            writes=[{"path": "renamed.py", "contents": "y = 3\n"}],
+            renames=[{"from": "other.py", "to": "renamed.py"}],
+        )])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("unseen owner reached a write")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("after moving other.py", detail)
+        self.assertIn("without having seen", detail)
+        self.assertEqual("y = 2\n", self.read("other.py"))
+        self.assertIsNone(self.read("renamed.py"))
+        forbidden_write.assert_not_called()
+
+    def test_empty_rename_destination_rewrite_cannot_erase_moved_owner(self):
+        author = _Author([
+            plan(changed=False, need_files=["other.py"]),
+            plan(
+                writes=[{"path": "renamed.py", "contents": ""}],
+                renames=[{"from": "other.py", "to": "renamed.py"}],
+            ),
+        ])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("empty rename rewrite reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("empty rename rewrite reached an unlink")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("source rejected before write", detail)
+        self.assertIn("empty whole-file response", detail)
+        self.assertEqual("y = 2\n", self.read("other.py"))
+        self.assertIsNone(self.read("renamed.py"))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
 
     def test_oversized_rename_is_refused_before_every_mutation(self):
         source = os.path.join(self.proj, "large.toml")

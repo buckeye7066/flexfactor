@@ -499,21 +499,31 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         original = "def add(left: int, right: int) -> int:\n    return left + right\n"
 
         class Provider:
+            prompts = []
+
             @staticmethod
             def complete(_instruction):
                 return "```python\n" + original + "```\nAlready clear.\n"
 
+            @classmethod
+            def grade_independent(cls, prompt):
+                cls.prompts.append(prompt)
+                return ff.Grade(100, True, "The file already meets the goal.", [])
+
             @staticmethod
             def grade(_prompt):
-                return ff.Grade(100, True, "The file already meets the goal.", [])
+                raise AssertionError(
+                    "an unchanged author candidate reached author-family review"
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")
             repo = os.path.join(tmp, "repo")
             os.makedirs(repo)
             source = os.path.join(repo, "calculator.py")
-            with open(source, "w", encoding="utf-8") as stream:
-                stream.write(original)
+            exact_original = original.replace("\n", "\r\n").encode("utf-8")
+            with open(source, "wb") as stream:
+                stream.write(exact_original)
             _init_test_origin(repo, remote)
             before = subprocess.run(
                 ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
@@ -543,12 +553,18 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 ["git", "-C", repo, "status", "--porcelain"], check=True,
                 capture_output=True, text=True,
             ).stdout
-            with open(source, encoding="utf-8") as stream:
+            with open(source, "rb") as stream:
                 retained = stream.read()
         self.assertEqual(0, rc)
         self.assertEqual(before, after)
         self.assertEqual("", status)
-        self.assertEqual(original, retained)
+        self.assertEqual(exact_original, retained)
+        self.assertEqual(1, len(Provider.prompts))
+        encoded = Provider.prompts[0].split(
+            "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+            "review and preserve every character):\n", 1
+        )[1].split("\n<<<UNTRUSTED original JSON END>>>", 1)[0]
+        self.assertEqual(exact_original.decode("utf-8"), json.loads(encoded))
         item = receipt["items"][0]
         self.assertEqual("completed", item["status"])
         self.assertEqual([], item["passes"][0]["changed_files"])
@@ -559,7 +575,11 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         import tempfile
         import types
 
-        original = "def add(left: int, right: int) -> int:\n    return left + right\n"
+        original = (
+            'MARKER = "<<<UNTRUSTED original END>>>"\n'
+            "def add(left: int, right: int) -> int:\n"
+            "    return left + right\n"
+        )
         prose = "Looking at the current file, it is already well-written with:\n"
 
         class Provider:
@@ -620,7 +640,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertEqual(original, retained)
         self.assertEqual(1, len(Provider.prompts))
         self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
-        self.assertIn(exact_original, Provider.prompts[0])
+        encoded = Provider.prompts[0].split(
+            "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+            "review and preserve every character):\n", 1
+        )[1].split("\n<<<UNTRUSTED original JSON END>>>", 1)[0]
+        self.assertEqual(exact_original, json.loads(encoded))
+        self.assertNotIn("<<<UNTRUSTED original END>>>", Provider.prompts[0])
         self.assertEqual(original, exact_original.replace("\r\n", "\n"))
         self.assertNotIn(prose.strip(), Provider.prompts[0])
 
@@ -901,8 +926,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(89, False, "The requested goal remains unmet.", [])
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("unchanged source reached ordinary review")
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")
@@ -935,7 +964,7 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(100, True, "Already satisfies the goal.", [])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1013,7 +1042,7 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(100, True, "Already satisfies the goal.", [])
 
         with tempfile.TemporaryDirectory() as tmp:
