@@ -187,11 +187,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          # The previous main tip can be several commits behind after a
+          # fast-forwarded pull request. The release decision must compare the
+          # branch transition, not merely GITHUB_SHA^.
+          fetch-depth: 0
           persist-credentials: false
       - name: Require an Android version change on main
         id: plan
         shell: bash
+        env:
+          PREVIOUS_MAIN_SHA: ${{ github.event.before }}
         run: |
           read_version() {
             sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p'
@@ -204,9 +209,23 @@ jobs:
             test "$GITHUB_REF_NAME" = "$release_tag"
             should_publish=true
           else
-            previous_version=$(git show "${GITHUB_SHA}^:android/app/build.gradle.kts" | read_version)
+            if ! printf '%s' "$PREVIOUS_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                || [ "$PREVIOUS_MAIN_SHA" = "0000000000000000000000000000000000000000" ]; then
+              echo "The previous main revision is unavailable" >&2
+              exit 1
+            fi
+            previous_version=$(git show \
+              "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
             test -n "$previous_version"
             if [ "$version_name" != "$previous_version" ]; then
+              should_publish=true
+            fi
+            # A failed or historically skipped release must be recoverable on
+            # the next reviewed main commit even when the version file itself
+            # is unchanged. The publisher still rejects an existing tag that
+            # points anywhere other than this exact source revision.
+            if ! git ls-remote --exit-code --tags origin \
+                "refs/tags/$release_tag" >/dev/null 2>&1; then
               should_publish=true
             fi
           fi
