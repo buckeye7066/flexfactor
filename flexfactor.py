@@ -12569,9 +12569,30 @@ def _structural_repo_listing(project_dir: str, cap_files: int = 400,
     return text[:cap_chars]
 
 
+def _structural_plan_shape_error(plan) -> str:
+    """Validate model-returned container types before any plan field is used."""
+    if not isinstance(plan, dict):
+        return f"plan is not an object ({type(plan).__name__})"
+    if type(plan.get("changed")) is not bool:
+        return "plan 'changed' is not a boolean"
+    for field in ("writes", "renames"):
+        value = plan.get(field)
+        if value is not None and not isinstance(value, list):
+            return "plan is malformed (writes/renames not lists)"
+    need_files = plan.get("need_files")
+    if (need_files is not None
+            and (not isinstance(need_files, list)
+                 or any(not isinstance(path, str) for path in need_files))):
+        return "plan 'need_files' is not a list of paths"
+    return ""
+
+
 def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     """Validate a plan against containment + policy rules. Returns '' when
     acceptable, else the refusal reason (the plan is then NOT applied)."""
+    shape_error = _structural_plan_shape_error(plan)
+    if shape_error:
+        return shape_error
     # The schema requires arrays.  Default only an absent/explicit-null field;
     # falsey model values such as False, "", and {} remain malformed and must
     # stop the entire plan before even a different valid operation is inspected.
@@ -12715,6 +12736,9 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                                       STRUCTURAL_FIX_SCHEMA,
                                       max_tokens=FIX_WHOLE_MAX_TOKENS, **kwargs),
             FIX_FILE_MAX_SECONDS)
+        shape_error = _structural_plan_shape_error(plan)
+        if shape_error:
+            return ("failed", f"structural plan refused: {shape_error}")
         need = [str(p) for p in (plan.get("need_files") or [])][:STRUCTURAL_MAX_NEED_FILES]
         if not plan.get("changed") and need:
             extra_parts = []
@@ -12735,6 +12759,9 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                     STRUCTURAL_FIX_SCHEMA,
                     max_tokens=FIX_WHOLE_MAX_TOKENS, **kwargs),
                 FIX_FILE_MAX_SECONDS)
+            shape_error = _structural_plan_shape_error(plan)
+            if shape_error:
+                return ("failed", f"structural plan refused: {shape_error}")
     except _AbandonedCallTimeout:
         return ("failed", "structural planning exceeded the per-file wall clock")
     except BudgetExceededError:

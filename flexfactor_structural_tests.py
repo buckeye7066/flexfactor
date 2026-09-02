@@ -163,7 +163,8 @@ class StructuralApplies(_Base):
 
 
 class StructuralRollsBack(_Base):
-    def _assert_malformed_operation_field_is_preflight_refused(self, malformed):
+    def _assert_malformed_operation_field_is_preflight_refused(
+            self, malformed, expected="not lists"):
         author = _Author([malformed])
         forbidden = mock.Mock(
             side_effect=AssertionError("malformed plan passed preflight")
@@ -179,7 +180,7 @@ class StructuralRollsBack(_Base):
                 {}, True, NOFIX_NOTE,
             )
         self.assertEqual("failed", kind)
-        self.assertIn("not lists", detail)
+        self.assertIn(expected, detail)
         self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
         self.assertEqual(self.read("other.py"), "y = 2\n")
         forbidden.assert_not_called()
@@ -201,6 +202,47 @@ class StructuralRollsBack(_Base):
             "fixed_titles": [FINDING["title"]],
             "notes": "malformed writes",
         })
+
+    def test_non_object_structural_plan_is_refused_without_raising(self):
+        author = _Author([False])
+        kind, detail = F.attempt_structural_fix(
+            author, None, self.proj, "bad.py", [dict(FINDING)],
+            {}, True, NOFIX_NOTE,
+        )
+        self.assertEqual("failed", kind)
+        self.assertIn("not an object", detail)
+        self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
+
+    def test_non_boolean_changed_is_refused_before_valid_write(self):
+        malformed = {
+            "changed": "true",
+            "writes": [{"path": "bad.py", "contents": GOOD_FIXED}],
+            "renames": [],
+            "fixed_titles": [FINDING["title"]],
+            "notes": "malformed changed",
+        }
+        self._assert_malformed_operation_field_is_preflight_refused(
+            malformed, expected="changed"
+        )
+
+    def test_falsey_non_list_need_files_is_refused_before_second_round(self):
+        malformed = {
+            "changed": False,
+            "need_files": {},
+            "writes": [],
+            "renames": [],
+            "fixed_titles": [],
+            "notes": "malformed need_files",
+        }
+        author = _Author([malformed])
+        kind, detail = F.attempt_structural_fix(
+            author, None, self.proj, "bad.py", [dict(FINDING)],
+            {}, True, NOFIX_NOTE,
+        )
+        self.assertEqual("failed", kind)
+        self.assertIn("need_files", detail)
+        self.assertEqual(1, author.structural_calls)
+        self.assertEqual(self.read("bad.py"), GOOD_PRIMARY)
 
     def test_oversized_rename_is_refused_before_every_mutation(self):
         source = os.path.join(self.proj, "large.toml")
