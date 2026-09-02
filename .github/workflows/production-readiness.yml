@@ -90,6 +90,7 @@ jobs:
           set -e
           python flexfactor_release_policy.py
           for t in flexfactor_tests.py \
+                   flexfactor_execution_contract_tests.py \
                    test_flexfactor_release_policy.py \
                    flexfactor_product_invariants_tests.py \
                    flexfactor_steering_tests.py \
@@ -204,7 +205,7 @@ jobs:
           python - "$src_manifest" "$inst_manifest" <<'PY'
           import json, sys
           src, inst = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-          assert inst["tool_version"] == "0.5.0" == src["tool_version"], (inst["tool_version"], src["tool_version"])
+          assert inst["tool_version"] == "0.6.0" == src["tool_version"], (inst["tool_version"], src["tool_version"])
           for key in ("modes", "wired", "exit_codes"):
               assert inst[key] == src[key], (key, inst[key], src[key])
           missing = [k for k, v in inst["modules"].items() if not v["importable"]]
@@ -230,7 +231,7 @@ jobs:
       - name: Upload exact-commit release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: flexfactor-0.5.0-${{ github.sha }}
+          name: flexfactor-0.6.0-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 90

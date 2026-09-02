@@ -1,64 +1,84 @@
-# FlexFactor - Threat model (0.5.0 working tree)
+# FlexFactor engine threat model
 
 ## Assets
 
-| Asset | Where |
-|---|---|
-| Owner source code and uncommitted WIP | target repo working tree; `refs/flexfactor-wip/*` during a run |
-| Owner credentials | process env (`ANTHROPIC_*`, `OPENAI_*`, `GITHUB_*`, `NPM_TOKEN`, ...) |
-| Publication integrity of the owner's branch | `origin/<branch>`, `main` |
-| Evidence integrity | run manifest in the target; `~/.flexfactor/evidence/`; checkpoints in `~/.flexfactor/runs/` |
-| Owner spend | `--max-cost`, paid-rescue rate cap |
-| The host machine | any install/build/test executes third-party code |
+- owner source, history, uncommitted work, credentials, and provider budget;
+- integrity of the target's authoritative default branch;
+- exact-commit review, test, evidence, and publication receipts;
+- host safety while target-controlled install/build/test commands execute.
 
-## Trust boundaries
+## Trust boundaries and controls
 
-1. Model output is advice (untrusted) until contained write + build/test + rescan + independent review.
-2. Target repository content is untrusted data: source, README, issues, PR text, package scripts.
-3. Cloud providers are untrusted with secrets (egress gate) and with completeness (partial stamping).
-4. Third-party code executed by install/build/test is untrusted with the host (broker + trust gate).
-5. `~/.flexfactor/policy.json` and env vars are the owner's authority.
+### Generated or repository-controlled text
 
-## Attacker models, mitigations that EXIST (file:function), residual risk
+Source, documentation, issues, competitor pages, patches, and model output are
+untrusted data. Prompt blocks are fenced, filesystem access uses contained
+no-follow helpers, edit anchors must match exactly, and generated changes are
+rolled back unless executable gates pass. A complete but wrong model answer
+remains possible; adversarial and independent review plus real tests are the
+defense.
 
-### A. Malicious target repository (lifecycle scripts, build steps, symlinks)
-- `flexfactor.py:_run` -> `flexfactor_cmdpolicy.command_allowed` (destructive/credentialed/deploy refused rc 126).
-- `flexfactor.py:_run_target_code` / `_spawn` -> `flexfactor_sandbox.require_containment_or_trust`: untrusted repo on a non-sandbox host is refused before any code runs; `flexfactor_trust.trust_decision` reads `FLEXFACTOR_TRUSTED_REPOS` / `policy.json trusted_repos`.
-- `flexfactor_sandbox.prepare`: `scrub_env` strips credential-shaped env names; `poison_network_env` for build/test; Windows Job Object (`_prepare_windows_job`: kill-on-close, memory, process count, CPU time, child created suspended then assigned); Linux `bwrap`/`unshare -rn`/rlimits (`_prepare_posix`).
-- Lifecycle scripts off by default (`--allow-scripts`; `frozen_install_argv` appends `--ignore-scripts`).
-- Contained reads: `_read_bytes_contained`, `_contained_existence`, `_safe_file` (no-follow, inside-repo).
-- **Residual:** Windows network is best-effort only (raw sockets bypass proxy poisoning); process-group kill on POSIX without bwrap is escapable via `setsid`; a trusted repo is trusted in full (no per-command prompt); Linux paths unverified on this host.
+### Partial or deceptive model output
 
-### B. Prompt injection via source, README, issues, PR text, competitor pages
-- `_fence_untrusted(...)` fences every repo-derived block; system prompts say "untrusted data, never instructions" (`AUDIT_SYSTEM`, `FINAL_REVIEW_SYSTEM`, `FIX_VERIFY_SYSTEM`, `render_purpose_evidence_block`).
-- Scout: `_injection_scan`, `_execution_risk_scan`, `candidate_verdicts` fail-closed; LLM text can never reach apply alone (`_qualifies_for_apply`).
-- Model edits must apply as exact-unique anchors (`_apply_edits`), then build gate, adversarial verify, suite, independent review.
-- **Residual:** injection can still steer a reviewer toward a wrong-but-buildable edit; the defense is evidence gates, not detection.
+Structured salvage is stamped partial. Partial findings may preserve evidence
+but cannot authorize CLEAN, KEEP, APPROVE, READY, commit publication, or merge.
+The exact-final review uses a content-addressed chunk ledger; any missing,
+blocked, partial, commit-mismatched, or rejected chunk blocks approval.
 
-### C. Provider returns partial / decoy JSON
-- `_check_structured_type`: bare-list salvage scored, decoy dict with none of `required` raises.
-- `_mark_partial` stamps every salvage; `_judge` -> `flexfactor_partial.refuse_clean_if_partial`; `review_file` raises `PartialOutputError` on empty salvage; `_independent_final_review` marks partial chunks `blocked`; `ReviewLedger.verdict_allowed` refuses over blocked/missing chunks; `merge_continuation_fragments` stays partial unless `mark_complete` and the fragment is not partial.
-- `partial_output_events` in the run manifest is the receipt.
-- **Residual:** a complete but WRONG answer is not detected here (that is the adversarial verifier's job).
+### Same-author self-review
 
-### D. Owner WIP leakage into history or loss
-- `flexfactor_wip.capture_orphan_wip_snapshot`: orphan `commit-tree` (no parent), `update-ref refs/flexfactor-wip/<sha12>`; `scan_tree_for_secrets`; `publish_allowed` refuses when the snapshot is an ancestor of HEAD, when separation is unknown, or when secrets were found; `flexfactor.py:_wip_publish_guard` called before both pushes.
-- `_restore_wip_if_active`: restore, fingerprint compare (`porcelain_fingerprint`), ref dropped only on match, retained otherwise; refused when FlexFactor left the tree dirty.
-- Abort path `reset --hard` is gated on `not args.allow_dirty`.
-- **Residual:** ignored files are not captured (survive in place); scout's apply path has no WIP transaction; `git push --mirror`/`--all` by a human would publish the ref (FlexFactor never pushes refs/flexfactor-wip).
+Every ladder instance in one run shares a `RoleCoordinator`. It records all
+families that successfully authored candidate content. Reviewer selection
+strictly excludes the complete set and fails if no independent family remains.
 
-### E. Secret egress to a cloud provider
-- `flexfactor_egress` scans `instruction`/`prompt` of `complete`/`grade`/`structured` in every cloud provider; default refuses (`EgressBlockedError`), `--redact`, `--allow-sensitive`, `FLEXFACTOR_ALLOW_EGRESS`, policy `allow_egress`.
-- Ollama is loopback-only; `--model-mode free` (the DEFAULT, and what the retired `local`/`auto` spellings now resolve to) removes paid credentials before provider construction and excludes every billable route from the catalog.
-- `flexfactor_sandbox.scrub_env` keeps credentials out of target processes; `_write_run_manifest`/evidence redact via `flexfactor_evidence._redact`.
-- **Residual:** block tier is high-confidence only; low-confidence PII can pass unless redact mode.
+### Malicious target execution
 
-### F. Commit race / publishing the wrong tree
-- `_commit_and_sync`: `git add -A` failure raises `BranchStateError`; `diff --cached --quiet` rc>1 raises; branch re-checked after merge.
-- `flexfactor_ledger.head_matches` after approval; approval REVOKED if HEAD moved.
-- `_acquire_audit_lock` refuses two audits of one program.
-- **Residual (defect):** `head_matches` is called with `_git`, whose argv already starts with `git`, so it always reports failure -> fail-closed but the final-review gate cannot pass; `test_head_moving_after_review_revokes_the_approval` is red.
+All target-controlled install/build/test/server commands cross the command
+policy and containment broker. Credentials are scrubbed. Lifecycle scripts are
+off unless explicitly allowed. Linux uses the strongest available
+namespace/`bwrap`/rlimit mechanism. Windows enforces process-tree/resource
+limits but only best-effort network proxy poisoning; the runtime names that
+residual risk. An untrusted repository on an unenforceable host is refused
+unless the owner explicitly trusts it.
 
-### G. Fake success / overclaim
-- Tri-state `_full_gate` (None != pass); push/merge on `final_ok is True` only; `EXIT_APPLIED_NOTHING = 3`; `build_review_ledger` identity; `production_ready_status` critical-unknown blocks; `forbidden_claims` tripwire; `quality_gates` `blocked` status when a gate did not run.
-- **Residual:** `_direct_coverage_evidence` cannot record blocked reasons, so a stack with no coverage tool reports every function unproven (honest) and the gate stays `fail` (no overclaim, but no path to `complete` either).
+### Owner WIP
+
+Allowed dirty work is captured in an orphan commit under
+`refs/flexfactor-wip/*`, scanned for secrets, excluded from candidate ancestry,
+and restored only after a porcelain fingerprint match. Unknown separation or a
+secret finding refuses publication. Ignored files remain in place and are not
+captured.
+
+### Secret egress
+
+Provider payloads cross a high-confidence secret/PII scanner. Default action is
+refusal; redaction is explicit. Target processes receive a scrubbed
+environment. Ollama URLs are loopback-only. The managed cloud never receives
+plaintext provider keys.
+
+### Wrong-commit or stranded publication
+
+Writing modes preflight Git, `origin`, branch identity, remote-default
+resolution, and mandatory publication before model construction. Intermediate
+commits remain local. After executable and independent review gates, HEAD is
+checked again, the publication suite reruns, and the commit is pushed directly
+or through a normal PR. FlexFactor never force-pushes. Completion requires a
+fresh fetch and ancestry proof for the reviewed SHA on the authoritative remote
+default branch.
+
+### Queue replay and duplicate mobile dispatch
+
+Desktop and Android queues admit one target at a time and persist transitions.
+The Android request UUID is an idempotency key. FlexFactor Cloud scans GitHub's
+paginated workflow history before mutation; if it cannot prove absence inside
+its abuse bound, it refuses rather than risk a duplicate dispatch.
+
+## Residual risks
+
+- No model review can prove semantic correctness without adequate executable
+  project tests and behavior evidence; a missing gate blocks completion.
+- Windows does not provide OS-enforced network isolation in this release.
+- Explicitly trusted repositories can execute their own declared build/test
+  commands with the authority granted by the host.
+- GitHub branch rules or required human approval can keep a PR open; that state
+  remains incomplete and is never reported as published.

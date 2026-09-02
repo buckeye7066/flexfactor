@@ -1,29 +1,70 @@
 # Troubleshooting
 
-## Launcher does not open
+## A writing mode refuses before calling a model
 
-The shortcut must target Windows PowerShell with `-ExecutionPolicy Bypass -NoProfile -File "C:\Users\firer\flexfactor\flexfactor_launch.ps1"` and use `C:\Users\firer\flexfactor` as its working directory. Run the PowerShell file directly to expose parsing or Python-path errors. Keep the launcher ASCII for Windows PowerShell 5.1.
+Refactor, Scout apply, Audit, and Production Ready require a Git repository with
+an `origin`, a named branch, a resolvable remote default branch, and mandatory
+push/merge. Configure the correct remote and retry. Local-only or
+`--no-push`/`--no-merge` mutation is intentionally unsupported.
 
-## Free/local mode cannot start
+## The strongest model is unavailable
 
-The desktop launcher expects the FCC health endpoint at `http://127.0.0.1:8082/health` and attempts to start `fcc-server`. An explicit Ollama run expects a loopback `OLLAMA_BASE_URL`. Start the selected local service and retry the same command; the checkpoint reuses SHA-matching reviews. FlexFactor does not silently substitute a paid provider for explicit local-only mode.
+Do not choose another route. The single best-available ladder records quota,
+credit, rate, or transport failure and continues through lower paid capacity
+before free/local capacity. If every route is unavailable, the run checkpoints
+and reports blocked. Add or restore optional credentials, then rerun the same
+request.
 
-## Paid mode reports missing credentials
+## Independent review is unavailable
 
-Set the provider credential in the process environment and retry. A paid request with no credential is a hard, explicit error. Never place credentials in the repository, command output, or report.
+The reviewer must be from a family that authored none of the candidate.
+Restoring capacity in a different model family is required; same-family review
+cannot be used as a substitute.
 
 ## A run is quiet or interrupted
 
-Inspect `~/.flexfactor/status.json`, the dashboard, and `~/.flexfactor/runs/<run>/checkpoint.json`. Re-run the identical command. Reviews are resumed only when the exact file SHA and policy version still match; changed entries are re-run. A stale audit lock is reclaimed only when its recorded process is dead.
+Inspect `~/.flexfactor/status.json`, `~/.flexfactor/queues/`, and the matching
+`~/.flexfactor/runs/` checkpoint. Repeat the identical request or reopen the
+Android app. SHA-matching work resumes; stale or changed entries rerun. The
+orchestrator will not start the next queued target while one remains active.
 
-## A green suite still does not complete
+## A green build still does not complete
 
-Open `~/.flexfactor/evidence/<project>/<run>/quality-gates.json`. Typical blockers are zero tests collected, incomplete function evidence, skipped destructive/unnamed controls, accessibility or performance smoke failures, an incomplete changed-file rescan, or an unavailable exact-commit reviewer. Correct the named cause; do not delete or suppress the gate.
+Read the run's `quality-gates.json` and publication record. Common blockers
+include a red strongest suite, zero tests collected, incomplete changed-file
+rescan, missing direct behavior evidence, unexecuted UI controls, secret
+findings, partial reviewer output, same-family review, moved HEAD, or the exact
+SHA not yet merged to the remote default branch.
+
+## A protected branch leaves a PR open
+
+FlexFactor never bypasses checks or approvals. It waits for a normal merge up to
+`FLEXFACTOR_PUBLISH_WAIT_SECONDS`; an unmerged PR remains incomplete. Satisfy
+the branch rule and retry/resume so the final remote ancestry proof can run.
+
+## Android sign-in or dispatch fails
+
+Confirm the installed build is the current signed release, complete GitHub's
+device flow, and ensure the selected repository is writable. A stale selected
+ref is rejected before workflow or secret mutation. Reopening the app safely
+reuses the stable request UUID; the cloud recovers an existing workflow rather
+than dispatching twice.
+
+## Android shows an incomplete result
+
+Open the correlated run details and bounded error ledger. A GitHub Actions job
+being green is not by itself publication proof: a changed run also needs its
+reviewed SHA on the repository's authoritative default branch.
 
 ## Playwright behavior evidence is blocked
 
-Install the target's declared Playwright dependency and ensure its dev/start command answers the configured loopback URL. Destructive controls require a disposable target with `FLEXFACTOR_E2E_ISOLATED=1`. Unnamed controls fail low-confidence targeting; add an accessible role/name instead of forcing an index click. Trace and screenshots are under the run's UI artifact directory.
+Install the target's declared browser dependency and provide a working local
+start command. Destructive controls require a disposable environment with
+`FLEXFACTOR_E2E_ISOLATED=1`. Give controls accessible names; skipped or
+untargetable controls block completeness.
 
-## Push or merge is refused
+## Launcher does not open on Windows
 
-FlexFactor never force-pushes. Confirm the working tree is clean, integrate the current remote branch, rerun the final gates, and publish the exact tested tree. Protected branches use a pull request. A red project suite, unverified build, or failed publication check blocks the push/merge claim.
+Run `flexfactor_launch.ps1` directly in Windows PowerShell 5.1 to expose
+parsing or interpreter errors. Set `FLEXFACTOR_PYTHON` when the checkout's
+virtual environment is not the intended Python 3.12 installation.

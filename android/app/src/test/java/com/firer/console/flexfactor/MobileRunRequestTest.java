@@ -10,10 +10,18 @@ import org.junit.Test;
 import java.util.Map;
 
 public final class MobileRunRequestTest {
+    @Test
+    public void rejectsNonCanonicalRunIdentifier() {
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                "000000000000-0000-0000-0000-00000000",
+                MobileRunRequest.Mode.AUDIT, "owner/project", "main",
+                "", "", false, 25));
+    }
+
     private static final String ID = "123e4567-e89b-12d3-a456-426614174000";
 
     @Test
-    public void allFourOriginalModesHaveStableWorkflowValues() {
+    public void allFourModesHaveStableWorkflowValues() {
         assertEquals("refactor", request(MobileRunRequest.Mode.REFACTOR,
                 "src/app.py", "Make startup deterministic", false).workflowInputs().get("mode"));
         assertEquals("scout", request(MobileRunRequest.Mode.SCOUT,
@@ -25,39 +33,33 @@ public final class MobileRunRequestTest {
     }
 
     @Test
-    public void requestCarriesExactTargetAndBudget() {
+    public void requestCarriesOneAutomaticPolicyAndSixPasses() {
         Map<String, String> values = request(MobileRunRequest.Mode.AUDIT,
                 "", "", false).workflowInputs();
         assertEquals(ID, values.get("request_id"));
         assertEquals("buckeye7066/flexfactor", values.get("target_repository"));
         assertEquals("main", values.get("target_ref"));
         assertEquals("25", values.get("max_cost"));
-        assertEquals("false", values.get("scout_apply"));
-        assertEquals("ollama", values.get("provider"));
-        assertEquals("90", values.get("threshold"));
-        assertEquals("5", values.get("max_iterations"));
-        assertEquals("true", values.get("economy"));
-        assertEquals("true", values.get("use_both"));
+        assertEquals("auto", values.get("provider"));
+        assertEquals("6", values.get("max_iterations"));
+        assertFalse(values.containsKey("economy"));
+        assertFalse(values.containsKey("use_both"));
     }
 
     @Test
-    public void everyDesktopProviderHasAStableWorkflowValue() {
-        assertEquals("openai", provider(MobileRunRequest.Provider.OPENAI));
-        assertEquals("anthropic", provider(MobileRunRequest.Provider.ANTHROPIC));
-        assertEquals("copilot", provider(MobileRunRequest.Provider.COPILOT));
-        assertEquals("ollama", provider(MobileRunRequest.Provider.OLLAMA));
+    public void onlyTheAutomaticProviderPolicyExists() {
+        assertEquals(1, MobileRunRequest.Provider.values().length);
+        assertEquals(MobileRunRequest.Provider.AUTO,
+                MobileRunRequest.Provider.values()[0]);
     }
 
     @Test
     public void scoutApplyCannotLeakIntoAnotherMode() {
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
-                "buckeye7066/flexfactor", "main",
-                "", "", true, 25));
-        assertTrue(request(MobileRunRequest.Mode.SCOUT, "", "", true)
-                .scoutApply);
-        assertFalse(request(MobileRunRequest.Mode.SCOUT, "", "", false)
-                .scoutApply);
+                ID, MobileRunRequest.Mode.AUDIT,
+                "buckeye7066/flexfactor", "main", "", "", true, 25));
+        assertTrue(request(MobileRunRequest.Mode.SCOUT, "", "", true).scoutApply);
+        assertFalse(request(MobileRunRequest.Mode.SCOUT, "", "", false).scoutApply);
     }
 
     @Test
@@ -71,39 +73,22 @@ public final class MobileRunRequestTest {
     }
 
     @Test
-    public void invalidRepositoryRefAndBudgetFailClosed() {
+    public void passSevenAndInvalidTargetsFailClosed() {
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                ID, MobileRunRequest.Mode.AUDIT,
                 "not-a-repo", "main", "", "", false, 25));
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
+                ID, MobileRunRequest.Mode.AUDIT,
                 "owner/repo", "../main", "", "", false, 25));
         assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                ID, MobileRunRequest.Mode.AUDIT, MobileRunRequest.Provider.OLLAMA,
-                "owner/repo", "main", "", "", false, 151));
-    }
-
-    @Test
-    public void invalidRefactorControlsFailClosed() {
-        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                MobileRunRequest.Mode.REFACTOR, MobileRunRequest.Provider.OPENAI,
+                MobileRunRequest.Mode.REFACTOR,
                 "owner/repo", "main", "src/app.py", "Improve it", false, 25,
-                101, 5, true, true));
-        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
-                MobileRunRequest.Mode.REFACTOR, MobileRunRequest.Provider.OPENAI,
-                "owner/repo", "main", "src/app.py", "Improve it", false, 25,
-                90, 0, true, true));
-    }
-
-    private String provider(MobileRunRequest.Provider provider) {
-        return new MobileRunRequest(ID, MobileRunRequest.Mode.AUDIT, provider,
-                "owner/repo", "main", "", "", false, 25)
-                .workflowInputs().get("provider");
+                90, 7));
     }
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file,
             String goal, boolean scoutApply) {
-        return new MobileRunRequest(ID, mode, MobileRunRequest.Provider.OLLAMA,
+        return new MobileRunRequest(ID, mode,
                 "buckeye7066/flexfactor", "main",
                 file, goal, scoutApply, 25);
     }

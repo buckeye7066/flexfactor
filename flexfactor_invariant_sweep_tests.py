@@ -355,10 +355,10 @@ _GIT_MUTATIONS = frozenset({"commit", "push", "merge"})
 # declare its gate instead of inheriting trust by proximity.
 _MUTATION_SITES = {
     "_commit_and_sync": (
-        "audit/prodready publication. Guarded by `if final_ok is not True` - "
+        "audit/prodready local checkpoint. Guarded by `if final_ok is not True` - "
         "catches None (nothing ran) AND False (ran and failed) - which hard-"
         "resets, cleans newly added paths and returns REJECTED with no local "
-        "commit and no push. Behaviourally pinned by "
+        "commit. This function has no push or merge authority. Behaviourally pinned by "
         "flexfactor_tests.VacuousGateTests."
     ),
     "commit_pending_changes": (
@@ -376,10 +376,12 @@ _MUTATION_SITES = {
         "verify command is enabled; every command must exit zero before commit. "
         "Any failure raises ApplyError and restores every touched file."
     ),
-    "_gh_pr_automerge": (
-        "protected-base publication helper. The helper itself reruns "
-        "_publication_gate and requires final_ok is exactly True before any "
-        "gh pr merge call, so a new caller cannot bypass verification."
+    "_publish_verified_head": (
+        "the sole final publication authority. It reruns _publication_gate and "
+        "requires final_ok is exactly True, a clean tree, and the owner-WIP "
+        "guard before any push or PR merge. It then fetches origin's "
+        "authoritative default branch and proves the exact reviewed commit is "
+        "an ancestor before setting complete=True."
     ),
 }
 
@@ -808,17 +810,19 @@ class GitMutationGateSweepTests(unittest.TestCase):
                       "the publication gate stopped distinguishing None "
                       "(nothing ran) from True (verified)")
 
-    def test_the_auto_merge_helper_has_its_own_gate(self):
+    def test_the_final_publisher_has_its_own_gate_and_remote_proof(self):
         import inspect
         import flexfactor as ff
-        src = inspect.getsource(ff._gh_pr_automerge)
+        src = inspect.getsource(ff._publish_verified_head)
         gate = src.index("_publication_gate(")
         exact = src.index("final_ok is not True")
         mutation = src.index('"gh", "pr", "merge"')
         self.assertLess(gate, exact)
         self.assertLess(exact, mutation,
-                        "auto-merge mutation must stay behind the helper's own "
+                        "merge mutation must stay behind the publisher's own "
                         "exact-True publication gate")
+        self.assertIn("_remote_branch_contains", src,
+                      "publisher must prove the exact reviewed commit on default")
 
     def test_canary_a_new_mutation_site_IS_caught(self):
         canary = (
@@ -951,13 +955,22 @@ class FalseSubstituteSweepTests(unittest.TestCase):
                              "verification")
 
     def test_4_a_merge_is_not_evidence_the_work_is_verified(self):
-        # The merge happens BECAUSE the gate was True, never the other way
-        # round: the merge arm must sit behind the `is True` test.
+        # Checkpoints cannot publish at all. The one publication owner must
+        # require an explicit True gate before any push or merge operation.
         import inspect
         import flexfactor as ff
-        src = inspect.getsource(ff._commit_and_sync)
-        self.assertIn("args.merge and final_ok is True", src,
-                      "the merge arm no longer requires a verified gate")
+        checkpoint = inspect.getsource(ff._commit_and_sync)
+        publisher = inspect.getsource(ff._publish_verified_head)
+        self.assertNotIn('_git(["push"', checkpoint,
+                         "an intermediate checkpoint regained publication authority")
+        self.assertNotIn('"gh", "pr", "merge"', checkpoint,
+                         "an intermediate checkpoint regained merge authority")
+        gate = publisher.index("if final_ok is not True")
+        first_push = publisher.index('_git(\n            ["push"')
+        self.assertLess(gate, first_push,
+                        "publication can occur before the explicit verified gate")
+        self.assertIn("_remote_branch_contains", publisher,
+                      "publisher no longer proves the exact commit on remote default")
 
     def test_5_module_import_is_not_direct_function_coverage(self):
         import flexfactor_coverage as cov

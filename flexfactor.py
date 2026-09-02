@@ -1,44 +1,17 @@
 #!/usr/bin/env python3
-r"""
-FlexFactor - a self-improving code agent with four modes.
+r"""FlexFactor 0.6.0 — managed code improvement with four modes.
 
-REFACTOR (default): does reps on ONE source file.
-    Reads a source file and a plain-English goal, asks an LLM to rewrite the file
-    to meet that goal, then asks the LLM to grade its own work. The rewrite is
-    only accepted once the grade clears a threshold (default 90/100) - it keeps
-    lifting until the code is swole. On success it backs up the original to
-    <file>.bak, writes the improved code, and prints an "insertion prompt".
+Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
+one quality-first paid-to-free model ladder. A request may contain up to 30
+targets, which always run one at a time. Audit and Production Ready use at most
+six semantic passes: the whole repository first, the exact preceding edit delta
+thereafter, with the top-three competitor capability gate between passes 1 and
+2.
 
-SCOUT: searches Repo Rewards on behalf of a whole PROGRAM, then APPLIES the wins.
-    You enter a program (a project folder, a file, a .lnk shortcut like
-    "Mind Over Math", a URL, or a description). FlexFactor profiles it, turns its
-    needs into searches against the Repo Rewards service (the "Repo Rewards"
-    desktop app, http://localhost:3000), then has the LLM judge each returned
-    repo for how much it would actually BENEFIT that program. It writes a ranked
-    report to <program>_repo_rewards_report.md. By default scout is REPORT-ONLY and
-    changes nothing. Pass --apply (and confirm, or --yes) to have it, for the
-    recommendations that clear the bar (ADOPT tier by default), generate the
-    integration, verify it with the project's own build, and commit it LOCALLY on a
-    flexfactor/adopt-* branch (only pushed with --push). A change that fails to build
-    is rolled back, never shipped.
-
-Two providers are supported behind one interface:
-  - anthropic  (Claude - default; set ANTHROPIC_API_KEY)
-  - openai     (GPT - set OPENAI_API_KEY)
-
-Usage:
-    pip install anthropic            # and/or: pip install openai
-    setx ANTHROPIC_API_KEY ...       # or set OPENAI_API_KEY for --provider openai
-
-    # Refactor one file (the bare/legacy form still works without "refactor"):
-    python flexfactor.py refactor --file path\to\module.py --goal "Add greet()"
-
-    # Scout Repo Rewards for repos that would help a program, and apply the wins:
-    python flexfactor.py scout --program "G:\...\Mind Over Math.lnk"
-    python flexfactor.py scout --program C:\Users\firer\mind-over-math --provider openai
-    python flexfactor.py scout --program C:\Users\firer\mind-over-math                 # report only (default)
-    python flexfactor.py scout --program C:\Users\firer\mind-over-math --apply --yes    # apply the wins locally
-    python flexfactor.py scout --program C:\Users\firer\mind-over-math --apply --apply-tier consider --merge
+Code-changing runs fail closed. They require Git, an ``origin``, a named branch,
+project verification, independent exact-commit review by a non-author model
+family, and proof that the reviewed commit reached the authoritative remote
+default branch. A local commit or open pull request is not success.
 """
 from __future__ import annotations
 
@@ -112,9 +85,11 @@ except ImportError:
 # of the CANONICAL runtime now - no launcher-side monkey-patching. Hard import.
 try:
     import flexfactor_directed as _ff_directed
+    import flexfactor_execution as _ff_execution
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_directed as _ff_directed
+    import flexfactor_execution as _ff_execution
 
 # Partial structured-output evidence (truncation/malformed-tail salvage). Hard
 # import: a salvaged, incomplete answer must never pass as a complete one.
@@ -160,12 +135,13 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_scout_contract as _scout_contract
 
-# Model defaults per provider. Claude Opus 4.8 is the strongest current Claude
-# model; override either with --model. This is the AUTHOR tier - used only where
-# the model writes code (whole-file rewrite, defect fix, integration, test-gen).
+# Model defaults per provider. These are the first metered routes in the
+# orchestrator-owned best-available ladder. They are intentionally not exposed
+# as a user-selectable paid/free fork: route health and allowance state decide
+# when the orchestrator advances to the next paid model and eventually to free.
 DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-4o",
+    "anthropic": "claude-fable-5-1",
+    "openai": "gpt-5.6-sol",
     "copilot": "auto",
     # LOCAL tier. qwen3-coder:30b and deepseek-coder:33b (~18GB each) were both
     # tried and BOTH fail to load on this machine's hardware - measured 2026-08-12:
@@ -185,8 +161,8 @@ DEFAULT_MODELS = {
 # per call - with no loss of code-generation quality (the author tier is unchanged).
 # Override with --judge-model. Set to the SAME id as the author model to opt out.
 JUDGE_MODELS = {
-    "anthropic": "claude-haiku-4-5",
-    "openai": "gpt-4o-mini",
+    "anthropic": "claude-fable-5-1",
+    "openai": "gpt-5.6-sol",
     "copilot": "auto",
     "ollama": "llama3.2:latest",  # small + fast local judge
 }
@@ -213,9 +189,11 @@ ECONOMY_MODELS = {
 # past its --max-cost cap. The pricing table below is the versioned source of
 # truth; bump PRICING_VERSION when it changes.
 # --------------------------------------------------------------------------- #
-PRICING_VERSION = "2026-07-18"  # bump when MODEL_PRICING changes (audited/validated)
+PRICING_VERSION = "2026-09-02"  # bump when MODEL_PRICING changes (audited/validated)
 MODEL_PRICING = {
+    "claude-fable-5-1": (10.0, 50.0),
     "claude-fable-5": (10.0, 50.0),
+    "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
@@ -224,6 +202,9 @@ MODEL_PRICING = {
     "claude-haiku-4-5": (1.0, 5.0),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.0),
+    "gpt-5.6-sol": (4.0, 20.0),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.20, 1.20),
 }
 # Fail-closed default: the most expensive known model on each axis, so budget
 # enforcement over-counts (stops early) rather than under-counts an unknown id.
@@ -662,7 +643,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.5.0"
+TOOL_VERSION = "0.6.0"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -2463,7 +2444,7 @@ class OpenAIProvider:
         # The request's output cap MUST equal the reservation, or the API could bill
         # more output than reserved and let concurrent workers exceed --max-cost.
         instruction = _egress_gate(instruction)
-        out_cap = 16384
+        out_cap = min(64000, _openai_output_ceiling(self.model))
         with _budget_guard(self.meter, self.model, len(instruction), out_cap):
             resp = _chat_create(
                 self.client,
@@ -3400,6 +3381,23 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
     return prov
 
 
+def _best_available_provider(args, meter: CostMeter | None = None):
+    """Build the sole production model path or fail explicitly.
+
+    A fixed-provider fallback would recreate the paid/free/provider forks the
+    product has retired. The caller may cap spend, but provider and cost-class
+    selection always belongs to the shared availability ladder.
+    """
+    _auto_activate_fcc_proxy()
+    provider = _build_rotating_provider(args, meter, "best")
+    if provider is None:
+        raise RuntimeError(
+            "the best-available model ladder could not be constructed; "
+            "rotation must be enabled and at least one paid or free route must be usable"
+        )
+    return provider
+
+
 _PURPOSE_VISION_HINTS = ("screenshot", "screen shot", "ui ", "user interface", "visual",
                          "image", "photo", "render", "pixel", "layout", "ocr", "diagram",
                          "video frame", "camera")
@@ -3640,7 +3638,7 @@ def _judge_intent(provider, schema: dict) -> dict:
     the author's family). Everything else is a judge that must emit JSON.
     """
     try:
-        if schema is ADVERSARIAL_VERIFY_SCHEMA:
+        if schema is ADVERSARIAL_VERIFY_SCHEMA or schema is FINAL_REVIEW_SCHEMA:
             return _intent_kw(provider, "reviewer", "code_review", "structured_json", "honest")
         if schema is AUDIT_FINDINGS_SCHEMA:
             return _intent_kw(provider, "reviewer", "code_review", "structured_json")
@@ -3726,7 +3724,7 @@ def _rotation_route_provider(route):
     wire = route.wire_model or route.model
     if route.is_free and wire:
         _FREE_ROUTE_MODELS.add(wire)   # $0 pricing; see _price_for
-    if route.api in ("codex-cli", "claude-code"):
+    if route.api in ("codex-cli", "claude-code", "copilot-cli"):
         # Flat-rate local CLIs. Transport is a bounded subprocess, not HTTP;
         # see providers/cli_provider.py for the stdin/recursion/timeout rules.
         from providers.cli_provider import make_cli_provider
@@ -4018,85 +4016,25 @@ def _rotation_excluded_reason(model_or_route_id: str) -> str:
     return ""
 
 
-# --------------------------------------------------------------------------- #
-# MODEL MODE: exactly two choices (owner order 2026-08-24)
-#
-#   "currently I am given three choices as for pay, local is a choice and auto
-#    is a choice. I don't fully understand the difference. My choices should be
-#    either paid or free. that's it. paid uses both anthropic and openai
-#    exclusively until credits expire and free uses free exclusively."
-#
-# The old three were confusing for good reason, and two of them were costing
-# reviewed files outright:
-#   - 'local' meant LOOPBACK ONLY. It reads like "free", but it excluded all 126
-#     credentialed cloud free-tier routes and pinned the run to Ollama, which is
-#     CPU-only on this machine (measured 20+ min for one large-file review).
-#     It was also the launcher's DEFAULT, so the safe-sounding choice was the
-#     slowest possible one.
-#   - 'auto' meant free-first with paid allowed to rotate in. Measured on the
-#     2026-08-24 GrantFlow run: spend_usd 0.0 while every free allowance was
-#     exhausted and 0 of 3537 files were reviewed - so in practice it was
-#     neither reliably free nor reliably paid.
-#
-# The two modes now mean exactly what they say:
-#   free  - free routes EXCLUSIVELY: cloud free tiers (NVIDIA NIM, Gemini, Groq,
-#           Cerebras, OpenRouter free) plus local Ollama/FCC. Paid routes are
-#           FILTERED OUT of the catalog, not merely ordered last. Ordering is a
-#           preference; a filter is a guarantee, and this is the enforcement
-#           point for the standing "FREE must never silently become PAID" rule.
-#   paid  - the owner's Anthropic and OpenAI accounts EXCLUSIVELY, until their
-#           credits expire. Nothing else: not OpenRouter credits (a reseller,
-#           not the owner's account), not Groq/NIM/Gemini/Cerebras, not Ollama.
-#
-# SUPERSEDES the 2026-08-21 "paid can be rotated in until exhausted" order for
-# MODE SELECTION. Paid still rotates until exhausted - but inside 'paid' mode,
-# which is where the owner asked for it, instead of leaking into a free run.
-MODEL_MODES = ("free", "paid")
+# One model policy: strongest available paid/subscription capacity first, then
+# progressively lower paid tiers, then free/local capacity. Legacy spellings
+# remain input-compatible but cannot select a different route graph.
+MODEL_MODES = ("best",)
 # Retired spellings stay ACCEPTED (never offered as a third choice) so an
 # invocation nobody found - a desktop shortcut, a scheduled task, a saved
 # command line - degrades to the safe mode with a warning instead of dying on
 # argparse exit 2, which is this repo's documented launcher-drift trap.
-_MODEL_MODE_ALIASES = {"auto": "free", "local": "free"}
+_MODEL_MODE_ALIASES = {
+    "auto": "best",
+    "local": "best",
+    "free": "best",
+    "paid": "best",
+    "best-available": "best",
+}
 _MODEL_MODE_WARNED: set = set()
 
-# The backends that ARE the owner's Anthropic and OpenAI accounts. Enumerated
-# against the live catalogs, not guessed: routes.json carries anthropic_sub (4),
-# anthropic_api (4) and openai_api (104), and catalog.auto.json carries the two
-# locally-installed coding CLIs.
-#   anthropic_sub  - the flat-rate Claude subscription
-#   anthropic_api  - the metered Anthropic key
-#   openai_api     - the metered OpenAI key
-#   claude-code    - the SAME Anthropic subscription, reached through the `claude`
-#                    CLI (flexfactor_discovery._CLI_ROUTES, cost_class
-#                    'subscription')
-#   codex-cli      - likewise the owner's OpenAI account through `codex`
-# The two CLI lanes are named explicitly because they are excluded from FREE by
-# cost_class 'subscription' (correctly - see _FREE_MODE_COST_CLASSES below), so
-# omitting them here would strand them in NEITHER mode and silently retire two
-# whole route lanes that are exactly what the owner asked 'paid' to be.
-#
-# Deliberately absent: 'cursor' and 'openrouter'. Both are subscriptions or
-# credits the owner holds, but they are RESELLERS - a cursor seat is not an
-# Anthropic account, and 383 of the 385 paid openrouter routes are somebody
-# else's rebilling. "Anthropic and OpenAI exclusively" is a statement about
-# whose account is billed, not about which model answers.
-_PAID_MODE_BACKENDS = frozenset({"anthropic_sub", "anthropic_api", "openai_api",
-                                 "claude-code", "codex-cli"})
-# Cost classes that cost the owner NOTHING MORE to use.
-#
-# Deliberately NOT flexfactor_rotation.FREE_COST_CLASSES, and the difference is
-# the point: that tuple includes SUBSCRIPTION because the rotator reasons about
-# MARGINAL cost, and a flat-rate plan bills nothing extra per call. This set
-# reasons about WHOSE ACCOUNT it is, which is what the owner's two modes are
-# about - so `anthropic:max-plan` (cost_class 'subscription') is PAID here. It
-# is an Anthropic account the owner pays for, so it belongs in 'paid' where they
-# asked for Anthropic, not smuggled into a run they asked to keep free.
-_FREE_MODE_COST_CLASSES = frozenset({"free-tier", "local-unlimited", "free"})
-
-
 def normalize_model_mode(raw) -> str:
-    """Any accepted spelling -> one of MODEL_MODES. Unknown input is 'free',
-    because the failure that costs money is the one that guesses 'paid'."""
+    """Resolve every legacy spelling to the sole best-available policy."""
     val = str(raw or "").strip().lower()
     if val in MODEL_MODES:
         return val
@@ -4109,40 +4047,20 @@ def normalize_model_mode(raw) -> str:
         return mapped
     if val and val not in _MODEL_MODE_WARNED:
         _MODEL_MODE_WARNED.add(val)
-        print(f"[model-mode] unknown mode '{val}'; running as 'free'. "
-              f"The only modes are: {', '.join(MODEL_MODES)}.", file=sys.stderr)
-    return "free"
+        print(f"[model-mode] unknown mode '{val}'; running as 'best'. "
+              "FlexFactor now has one best-available paid-to-free ladder.",
+              file=sys.stderr)
+    return "best"
 
 
 def model_mode_refusal(route, model_mode: str) -> str:
-    """THE MODE BOUNDARY, on its own so it can be tested on its own.
+    """The single ladder admits every otherwise usable route.
 
-    '' when this route is allowed in this mode, else why not.
-
-    It is a separate function because `_route_unusable_reason` returns EARLY for
-    unrelated reasons - a missing credential, an unfit model, an unbuildable
-    transport - so asking that function "did the mode allow this?" cannot
-    distinguish "the mode admitted it" from "the mode never got a look in". A
-    test written against the combined answer silently passes; this seam makes
-    the boundary answerable by itself.
-
-    Enforced by EXCLUSION rather than by ordering in `_pick_in_tier`, because
-    the owner's two modes are promises about what a run can SPEND, and a
-    preference is not a promise: COST_ORDER only decides what is tried FIRST, so
-    under ordering alone a paid route stays reachable the moment free capacity
-    runs out - which is the exact night this rule was written after.
+    The rotator—not a paid/free mode filter—orders paid subscription and
+    metered capacity from strongest to weakest, then free/local capacity.
     """
-    mode = normalize_model_mode(model_mode)
-    cost = str(getattr(route, "cost_class", "") or "").lower()
-    backend = str(getattr(route, "backend", "") or "").lower()
-    if mode == "free":
-        if cost not in _FREE_MODE_COST_CLASSES:
-            return (f"model mode 'free' excludes paid route "
-                    f"(cost_class {cost or 'unset'!r})")
-    elif mode == "paid":
-        if backend not in _PAID_MODE_BACKENDS:
-            return (f"model mode 'paid' is the owner's Anthropic/OpenAI accounts "
-                    f"only (backend {backend or 'unset'!r})")
+    del route
+    normalize_model_mode(model_mode)
     return ""
 
 
@@ -4154,7 +4072,7 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     across 600+ routes that turns the first sweep into an error tour.
     """
     if route.api not in ("openai", "anthropic", "gemini", "ollama", "cursor",
-                         "codex-cli", "claude-code"):
+                         "codex-cli", "claude-code", "copilot-cli"):
         return f"unsupported api '{route.api}'"
     # PAID ROUTES ROTATE (owner order 2026-08-21: "Paid can be rotated in until
     # exhausted. Leave no routes blocked."). This filter no longer excludes them;
@@ -4165,9 +4083,9 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     #   - per-pool depletion: the rotator's own `quota_exhausted` outcome puts the
     #     POOL on cooldown and moves to the next one, which is what "until
     #     exhausted" means mechanically.
-    # Free routes are still PREFERRED, not by filtering here but by COST_ORDER in
-    # _pick_in_tier — so the cheapest usable pool is still tried first and paid
-    # capacity is what the run falls through to, never what it reaches for.
+    # Route cost does not create a second mode here. In production, paid_first
+    # orders the strongest available paid/subscription capacity ahead of free;
+    # quota cooldowns then advance the same call down to free/local capacity.
     # NON-CODING free routes (owner 2026-08-20): prompt-guards, TTS, vision-
     # only, content-safety, etc. land in the catalog as free-tier/light and
     # were selected for semantic CODE review. Batches completed zero files and
@@ -4187,7 +4105,7 @@ def _route_unusable_reason(route, model_mode: str) -> str:
     # sweep into an error tour. A PATH hit is not proof: `claude` and `codex`
     # are both installed on this machine, so a missing adapter module would
     # have been admitted and then raised ModuleNotFoundError on selection.
-    if route.api in ("codex-cli", "claude-code", "cursor"):
+    if route.api in ("codex-cli", "claude-code", "copilot-cli", "cursor"):
         reason = _extended_route_unusable(route)
         if reason:
             return reason
@@ -4208,7 +4126,7 @@ def _extended_route_unusable(route) -> str:
     """
     api = getattr(route, "api", "")
     try:
-        if api in ("codex-cli", "claude-code"):
+        if api in ("codex-cli", "claude-code", "copilot-cli"):
             from providers.cli_provider import cli_binary_for, _extensions_enabled
             if not _extensions_enabled():
                 return "extended providers off (FLEXFACTOR_ROTATION_EXTENSIONS)"
@@ -4225,6 +4143,113 @@ def _extended_route_unusable(route) -> str:
     return ""
 
 
+def _builtin_route_catalog(fr):
+    """Return the minimum production ladder for a fresh runner.
+
+    Desktop installations may contribute a much larger AI Time catalog. The
+    managed phone workflow starts from a clean VM, so routing cannot depend on
+    that unrelated local file. These curated current-model routes lead the
+    merged catalog; every route still passes the normal credential and
+    transport checks.
+    """
+    model_capabilities = (
+        fr.CAP_CODE_AUTHOR,
+        fr.CAP_CODE_REVIEW,
+        fr.CAP_STRUCTURED_JSON,
+        fr.CAP_HONEST,
+    )
+    routes = [
+        fr.Route(
+            id="builtin/anthropic-fable-5-1", backend="anthropic_api",
+            backend_label="Anthropic", model="claude-fable-5-1",
+            wire_model="claude-fable-5-1", api="anthropic",
+            base_url="", pool="anthropic_api:paid", auth_env="ANTHROPIC_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.FRONTIER,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/openai-gpt-5-6-sol", backend="openai_api",
+            backend_label="OpenAI", model="gpt-5.6-sol",
+            wire_model="gpt-5.6-sol", api="openai",
+            base_url="", pool="openai_api:paid", auth_env="OPENAI_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.FRONTIER,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/anthropic-opus-5", backend="anthropic_api",
+            backend_label="Anthropic", model="claude-opus-5",
+            wire_model="claude-opus-5", api="anthropic",
+            base_url="", pool="anthropic_api:paid", auth_env="ANTHROPIC_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.STRONG,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/openai-gpt-5-6-terra", backend="openai_api",
+            backend_label="OpenAI", model="gpt-5.6-terra",
+            wire_model="gpt-5.6-terra", api="openai",
+            base_url="", pool="openai_api:paid", auth_env="OPENAI_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.STRONG,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/copilot", backend="copilot", backend_label="GitHub Copilot",
+            model="auto", wire_model="auto", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/anthropic-sonnet-5", backend="anthropic_api",
+            backend_label="Anthropic", model="claude-sonnet-5",
+            wire_model="claude-sonnet-5", api="anthropic",
+            base_url="", pool="anthropic_api:paid", auth_env="ANTHROPIC_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.LIGHT,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/openai-gpt-5-6-luna", backend="openai_api",
+            backend_label="OpenAI", model="gpt-5.6-luna",
+            wire_model="gpt-5.6-luna", api="openai",
+            base_url="", pool="openai_api:paid", auth_env="OPENAI_API_KEY",
+            cost_class=fr.PAID_METERED, tier=fr.LIGHT,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/ollama", backend="ollama", backend_label="Hosted open model",
+            model=DEFAULT_MODELS["ollama"], wire_model=DEFAULT_MODELS["ollama"],
+            api="ollama", base_url="", pool="ollama:local",
+            cost_class=fr.LOCAL_UNLIMITED, tier=fr.STRONG,
+            capabilities=model_capabilities, capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/ollama-deepseek-review", backend="ollama",
+            backend_label="Hosted independent open reviewer",
+            model="deepseek-coder:6.7b", wire_model="deepseek-coder:6.7b",
+            api="ollama", base_url="", pool="ollama:deepseek-local",
+            cost_class=fr.LOCAL_UNLIMITED, tier=fr.LIGHT,
+            capabilities=model_capabilities, capabilities_source="declared",
+        ),
+    ]
+    if _provider_free_routed("anthropic"):
+        routes.append(fr.Route(
+            id="builtin/fcc", backend="anthropic_fcc",
+            backend_label="Free Claude-compatible proxy",
+            model=DEFAULT_MODELS["anthropic"], wire_model=DEFAULT_MODELS["anthropic"],
+            api="anthropic", base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
+            pool="anthropic_fcc:free", auth_env="ANTHROPIC_AUTH_TOKEN",
+            cost_class=fr.FREE_TIER, tier=fr.STRONG,
+            capabilities=model_capabilities,
+            capabilities_source="declared",
+        ))
+    return routes
+
+
 # Route fitness, skip-dir and directed-theme helpers are OWNED by the
 # flexfactor_directed sidecar (single source of truth, packaged in the wheel).
 # The tuple below stays importable under its old name for callers/tests.
@@ -4233,7 +4258,7 @@ _unfit_for_code_reason = _ff_directed.unfit_for_code_reason
 
 
 def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
-                             quiet: bool = False):
+                             quiet: bool = False, role_coordinator=None):
     """Return a RotatingProvider, or None with the reason PRINTED (never silent).
 
     None means "keep the existing provider selection" — rotation is the default
@@ -4255,13 +4280,21 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     except ImportError as ex:
         _say(f"flexfactor_rotation unavailable ({ex})")
         return None
-    if not fr.rotation_enabled():
-        _say("AI_ROTATE=off")
-        return None
+    # The sequential orchestrator is the product control plane. A legacy
+    # AI_ROTATE=off value may no longer bypass its one best-available policy.
     catalog = fr.load_catalog()
-    if catalog is None or not catalog.enabled():
-        _say(fr.unavailable_reason() or "route catalog is empty")
-        return None
+    builtin = _builtin_route_catalog(fr)
+    if catalog is None:
+        catalog = fr.Catalog(routes=builtin, generated_at="built-in",
+                             age_seconds=0.0, path="built-in")
+    else:
+        catalog = fr.Catalog(
+            routes=builtin + [route for route in catalog.routes
+                              if route.id not in {item.id for item in builtin}],
+            generated_at=catalog.generated_at,
+            age_seconds=catalog.age_seconds,
+            path=catalog.path,
+        )
     hydrated = _hydrate_route_credentials(catalog.enabled())
     if hydrated and not quiet:
         print(f"  [rotation] credentials loaded from {_FCC_ENV_FILE}: "
@@ -4281,9 +4314,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     filtered = fr.Catalog(routes=usable, generated_at=catalog.generated_at,
                           age_seconds=catalog.age_seconds, path=catalog.path)
     rotator = fr.Rotator(catalog=filtered, store=fr.StateStore(), app="flexfactor")
-    # --economy maps to the catalog's cheaper author tier, same intent as
-    # ECONOMY_MODELS for fixed providers. Judging always rides the light tier.
-    author_tier = fr.STRONG if getattr(args, "economy", False) else fr.FRONTIER
+    # One quality-first policy: both authoring and judging begin at the
+    # strongest paid tier. Exhaustion advances the shared ladder.
+    author_tier = fr.FRONTIER
     if not any(r.tier == author_tier for r in usable):
         # A catalog with no route in the requested author tier would make every
         # authoring call fail; fall back to whichever author-capable tier exists.
@@ -4319,8 +4352,8 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     # printed by the same code whether or not that was true, so once paid routes
     # were admitted it would have kept asserting the run was free while metering
     # dollars — the exact class of claim this repo's honesty rule exists to stop.
-    n_free = sum(1 for r in usable if r.is_free)
-    n_paid = len(usable) - n_free
+    n_paid = sum(1 for r in usable if r.uses_paid_capacity)
+    n_free = len(usable) - n_paid
     mix = f"{n_free} free" + (f" + {n_paid} paid (billed against --max-cost "
                               f"${getattr(args, 'max_cost', 0) or 0:g})" if n_paid else "")
     if not quiet:
@@ -4330,17 +4363,19 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     global _LAST_ROTATION_USABLE
     _LAST_ROTATION_USABLE = len(usable)
     return fr.RotatingProvider(rotator, _rotation_route_provider,
-                               tier=author_tier, judge_tier=fr.LIGHT,
+                               tier=author_tier, judge_tier=author_tier,
                                allow_paid=True, meter=meter,
                                on_route=_announce,
                                # every route failure lands in the run's error
                                # ledger, even the ones rotation absorbs
                                on_error=lambda route, exc: _ledger(
                                    "rotation", exc, route=route.id),
-                               # AUTO MODE (owner 2026-08-23): paid pools first
-                               # for ONE attempt per call, then free. --max-cost
-                               # still bounds the spend.
-                               paid_first=(str(model_mode).lower() == "paid"))
+                               # One quality-first ladder: retry the highest
+                               # non-exhausted paid capacity, descend through
+                               # paid tiers, then use independent free families.
+                               # --max-cost still bounds the total spend.
+                               paid_first=(normalize_model_mode(model_mode) == "best"),
+                               role_coordinator=role_coordinator)
 
 
 # Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
@@ -4457,362 +4492,43 @@ _OLLAMA_POOL_CONCURRENCY = 2
 
 
 def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[str, object]]:
-    """Build the active provider list for audit, keyed by which API keys exist.
+    """Build audit/prodready providers from the sole production model ladder.
 
-    Primary = args.provider if its key is present; otherwise we swap to whichever
-    provider DOES have a key. With --no --single off (use_both) and the OTHER
-    provider's key present, the second provider is appended for cross-model
-    verification. All providers share `meter` so token spend bills into one
-    budget. Returns [] if no key is set at all (caller errors out)."""
+    Provider names, explicit model ids, economy flags, and the retired
+    paid/free spellings are accepted only so old shortcuts do not crash. They
+    cannot select a second execution path. Both the author and (when the
+    catalog has independent capacity) verifier are governed by the same
+    strongest-paid-to-free availability policy.
+    """
     global _PROVIDER_DIAGNOSIS, _LAST_FREE_REVIEW_POOL
     _PROVIDER_DIAGNOSIS = ""
     _LAST_FREE_REVIEW_POOL = []
-    primary = args.provider
-    model_mode = normalize_model_mode(getattr(args, "model_mode", "free"))
-    if primary == "ollama":
-        # LOCAL-ONLY: never silently add a CLOUD cross-checker to a run the
-        # owner pointed at the local provider - that would defeat the whole
-        # zero-egress point. (Dual-model rigor is a cloud-provider feature.)
-        other = None
-    else:
-        other = "openai" if primary == "anthropic" else "anthropic"
-
-    # OWNER CHOICE OF PAID ACCOUNTS (2026-08-29). `--paid-models anthropic|openai`
-    # is a deliberate single-model paid run on that account: it makes the primary
-    # that account and lifts the pair requirement, which is exactly what is
-    # wanted when the other account is out of credit. It is NOT the silent
-    # downgrade the pair rule below exists to stop - the owner asked for one
-    # model, the flag rides in the run manifest, and the report never implies a
-    # second opinion.
-    #
-    # IT IS RESOLVED HERE, BEFORE PREFLIGHT, and that placement is the point.
-    # The first version reassigned `primary` AFTER the only mandatory
-    # `_usable(primary)` check, which got the answer wrong in both directions:
-    #   - `--provider anthropic --paid-models openai` with a healthy Anthropic
-    #     key passed preflight on ANTHROPIC and then built an OpenAI provider
-    #     nobody had checked, so a keyless or unfunded OpenAI account failed on
-    #     the first model call instead of returning the setup diagnosis;
-    #   - `--provider ollama --model-mode paid --paid-models openai` refused for
-    #     ollama's sake before a perfectly healthy OpenAI account was ever
-    #     considered.
-    # Resolving it here makes the SELECTED account the one every downstream
-    # check - preflight, fallback, and the three-way diagnosis - is asked about.
-    # Falling back to ollama cannot happen from here: `_usable` goes through
-    # `_permitted`, which excludes ollama entirely in paid mode.
-    paid_choice = str(getattr(args, "paid_models", "both") or "both").lower()
-    if model_mode == "paid" and paid_choice in ("anthropic", "openai"):
-        primary = paid_choice
-        other = None
-
-    # "Usable" = key present AND (unless --no-preflight) verified live. A present
-    # but dead key (out of credits / revoked) must NOT be chosen as the author,
-    # or the audit crashes on the first fix call. Preflight defaults ON.
-    preflight = not getattr(args, "no_preflight", False)
-    # Default TRUE = "assume the owner chose this provider". Only `main` knows
-    # whether --provider was actually typed, and it says so explicitly. Every other
-    # caller (tests, embedders) keeps the pre-existing obey-the-argument contract,
-    # so free-first can never silently displace a deliberate provider choice.
-    _free_first_applies = (model_mode != "paid" and primary != "ollama"
-                           and not getattr(args, "explicit_provider", True))
-
-    def _permitted(name: str | None) -> bool:
-        if not name:
-            return False
-        if model_mode == "paid":
-            # The owner's own two accounts, and they must be REAL: a key that is
-            # actually present, and not one silently re-pointed at the free FCC
-            # proxy (which would make a 'paid' run quietly free - the mirror of
-            # the failure the free mode guards against).
-            return (name in {"anthropic", "openai", "copilot"}
-                    and _provider_key_present(name)
-                    and not _provider_free_routed(name))
-        # free: Ollama always, and a vendor name only while it is free-routed
-        # through the local FCC proxy. A direct billable client is never
-        # permitted in a mode whose whole promise is that it cannot spend.
-        return name == "ollama" or _provider_free_routed(name)
-
-    def _usable(name: str | None) -> bool:
-        if not _permitted(name):
-            return False
-        if not _provider_key_present(name):
-            return False
-        if not preflight:
-            return True
-        ok, reason = _provider_health(name, meter)
-        if not ok:
-            print(f"  [preflight] {name} key is set but unusable: {reason}", file=sys.stderr)
-        return ok
-
-    # Fall back when the primary is unusable. Owner order 2026-08-11: "the
-    # preflight should be the free ollama as well - openai and anthropic are
-    # fallbacks", i.e. FREE-FIRST: the local ollama server is tried BEFORE the
-    # other (paid) cloud key. An owner-CHOSEN primary still wins when usable.
-    # NOTE on the LOCAL-ONLY rule: when the owner POINTS at ollama, no cloud
-    # secondary is ever added (zero-egress intent, handled above). Falling back
-    # to ollama from a cloud primary is different - the owner asked for a cloud
-    # run, so a usable cloud provider is KEPT as the cross-check reviewer.
-    # FREE-FIRST PREFERENCE (owner order 2026-08-11: "the preflight should be the
-    # free ollama as well - openai and anthropic are fallbacks"). Free-first used to
-    # live ONLY inside the `if not _usable(primary)` crash-handler below, which meant
-    # a HEALTHY paid key caused ollama to never even be considered - the precise
-    # condition under which free-first is supposed to engage. Measured 2026-08-11:
-    # a prodready run with a healthy Anthropic key billed real money at ~$2.85/hr
-    # while a loaded local qwen3-coder sat idle. So: when the owner did not NAME a
-    # provider, the local (free) model AUTHORS and the cloud provider stays on as the
-    # cross-check reviewer that keeps it on target. An EXPLICIT `--provider ollama`
-    # still means LOCAL-ONLY / zero-egress and adds no cloud secondary (set above).
-    #
-    # CONCURRENT FREE POOL (owner correction 2026-08-12): the FCC proxy and
-    # local Ollama are BOTH genuinely free, but not equally fast on this
-    # machine (Ollama is CPU-only - a large-file review measured 20+ minutes
-    # locally vs under a minute through the proxy). The old free-first check
-    # only ever asked "_usable('ollama')?" and picked a single winner,
-    # leaving a usable second free backend completely idle. "make sure these
-    # different models are not working independently, but are orchestrated
-    # within FlexFactor so their work is optimized" (owner) - so when more
-    # than one free backend is usable, build a POOL that _review_all puts ALL
-    # of them to work on simultaneously via a shared file queue (self-
-    # balancing: a fast backend's semaphore frees up sooner, so it naturally
-    # pulls more files - see _ReviewerPool). The single-provider AUTHOR/FIX
-    # phase (inherently more serial - build-gating, cross-verification,
-    # commits) is deliberately NOT pooled; it stays on whichever pool member
-    # is fastest, exactly as a single free-first primary always has.
-    free_pool_cross: str | None = None
-    if _free_first_applies:
-        _auto_activate_fcc_proxy()  # zero-setup: give the fast free tier a chance too
-        # POOL-FIRST ROTATION (owner order 2026-08-18): when the owner named
-        # neither a provider nor a model, the default is to rotate every free
-        # catalog route — the FCC/ollama pool below is the fallback when no
-        # catalog is usable (_build_rotating_provider prints why). An explicit
-        # --model / --judge-model is a fixed-model request, which rotation by
-        # definition cannot honor — prior behaviour applies, no new CLI flag
-        # needed (pinning one route is AI_ROTATE_PIN / the state-file pin, and
-        # AI_ROTATE=off restores prior behaviour outright).
-        if not args.model and not getattr(args, "judge_model", None):
-            rotating = _build_rotating_provider(args, meter, model_mode)
-            if rotating is not None:
-                out_rot: list[tuple[str, object]] = [("rotation", rotating)]
-                # A SECOND ROTATED ROUTE VERIFIES EVERY FIX.
-                #
-                # Rotation is the default whenever a usable catalog exists, so
-                # this - not the FCC/ollama pool below - is the free path almost
-                # every run actually takes. It returned ONE provider, and every
-                # fix-approval gate in this file is conditional on a second one
-                # (`cross = providers[1][1] if len(providers) > 1 else None`).
-                # So the normal free run authored a fix and accepted it on the
-                # author's own say-so while 120 other free routes stood idle:
-                # the run rotated hard for reviewing and not at all for the one
-                # decision that actually writes to the repo.
-                #
-                # The verifier is a second independent RotatingProvider over the
-                # same catalog. Both share the rotator's LRU state store, and
-                # the rotator already keeps a reviewer off the author's model
-                # family, so the two land on genuinely different models. Every
-                # route here is free in free mode, so this costs nothing but the
-                # latency of the check it performs.
-                if (args.use_both and _LAST_ROTATION_USABLE > 1
-                        and model_mode != "paid"):
-                    verifier = _build_rotating_provider(
-                        args, meter, model_mode, quiet=True)
-                    if verifier is not None:
-                        out_rot.append(("rotation-verify", verifier))
-                        print("  [rotation] every fix is cross-verified by a "
-                              "second rotated route (free).", file=sys.stderr)
-                return out_rot
-        fcc_usable = _usable("anthropic") and _provider_free_routed("anthropic")
-        ollama_usable = _usable("ollama")
-        if fcc_usable or ollama_usable:
-            judge_override = getattr(args, "judge_model", None)
-            pool: list[tuple[str, object, int]] = []
-            if fcc_usable:
-                pool.append(("anthropic",
-                             make_provider("anthropic", DEFAULT_MODELS["anthropic"], meter,
-                                          judge_model=judge_override),
-                             _FCC_POOL_CONCURRENCY))
-            if ollama_usable:
-                pool.append(("ollama",
-                             make_provider("ollama", DEFAULT_MODELS["ollama"], meter,
-                                          judge_model=judge_override),
-                             _OLLAMA_POOL_CONCURRENCY))
-            _LAST_FREE_REVIEW_POOL = pool
-            # The fastest usable free backend authors and fixes. When a SECOND
-            # free backend is up, it becomes the cross-model verifier rather
-            # than review-only (owner order 2026-08-28: on the free path
-            # "optimize the use of the free platforms available where they work
-            # harmoniously towards a common goal").
-            #
-            # This matters because every fix-approval gate in the run is
-            # conditional on a second provider existing. With `other = None` the
-            # free path reviewed with both backends and then accepted every fix
-            # on the author's own say-so - the one step where a second opinion
-            # is worth the most was the one step that did not get one, while a
-            # perfectly good second free backend sat idle for it. Both members
-            # are free, so this buys the adversarial verify loop at no cost.
-            # An EXPLICIT `--provider ollama` never reaches here (local-only /
-            # zero-egress is settled above), so this cannot add egress the owner
-            # did not ask for.
-            primary = pool[0][0]
-            other = pool[1][0] if len(pool) > 1 else None
-            free_pool_cross = other
-            if len(pool) > 1:
-                names = " + ".join(f"{n}({c}x concurrent)" for n, _, c in pool)
-                print(f"  [preflight] FREE-FIRST POOL: {names} all usable - reviewing "
-                      f"concurrently across every free backend instead of picking one "
-                      f"and leaving the rest idle; authoring/fixing with '{primary}' "
-                      f"(the fastest) and cross-verifying every fix with "
-                      f"'{other}' (also free).", file=sys.stderr)
-            else:
-                print(f"  [preflight] FREE-FIRST: authoring locally with '{primary}'"
-                      + (("; cloud cross-check disabled to preserve local-only "
-                          "source handling.") if primary == "ollama" else "."),
-                      file=sys.stderr)
-
-    if not _usable(primary):
-        # ENV-MISMATCH GUARD (2026-08-11 live failure): a stale script passed
-        # `--provider openai` while the launch environment deliberately BLANKED
-        # OPENAI_API_KEY and configured anthropic through the FREE local proxy
-        # (ANTHROPIC_BASE_URL=127.0.0.1:8082 + ANTHROPIC_AUTH_TOKEN). The old
-        # free-first chain then picked local ollama - which could not sustain
-        # the run - while the intended free cloud proxy sat idle. When the
-        # chosen primary has NO credential at all (never configured, as opposed
-        # to a present-but-dead key) and the OTHER cloud provider is FREE-routed
-        # and usable, the environment - not the argument - is authoritative:
-        # prefer the configured free route. This does not violate FREE-FIRST
-        # (both candidates are free; the proxy is the stronger one).
-        if (other and not _provider_key_present(primary)
-                and _provider_free_routed(other) and _usable(other)):
-            print(f"  [preflight] '--provider {primary}' has no credential in this "
-                  f"environment, but '{other}' is configured via the free local "
-                  f"proxy - using '{other}' as primary (env wins over a stale "
-                  f"--provider argument).", file=sys.stderr)
-            primary, other = other, primary
-        elif primary != "ollama" and _usable("ollama"):
-            print(f"  [preflight] falling back: primary '{primary}' unusable, using FREE "
-                  "'ollama' without a cloud secondary.",
-                  file=sys.stderr)
-            primary, other = "ollama", None
-        elif _usable(other):
-            print(f"  [preflight] falling back: primary '{primary}' unusable, using '{other}'.",
-                  file=sys.stderr)
-            primary, other = other, primary
-    if not _usable(primary):
-        # Distinguish three materially different failures for the caller:
-        #   1. a route permitted by the selected mode has a credential, but its
-        #      live preflight rejected it (out of credits/revoked);
-        #   2. credentials exist only on routes the selected mode forbids; or
-        #   3. no credential exists at all.
-        #
-        # The old code checked only ``any_key and model_mode != 'auto'``.  That
-        # made an explicitly paid OpenAI run whose funded route returned 429 say
-        # "paid mode excludes the configured routes" -- the exact opposite of
-        # what happened.  Diagnose permission before exclusion, using the same
-        # _permitted chokepoint that selected providers above.
-        candidates = ("anthropic", "openai", "ollama", "copilot")
-        permitted_key = any(_permitted(name) and _provider_key_present(name)
-                            for name in candidates)
-        excluded_key = any(not _permitted(name) and _provider_key_present(name)
-                           for name in candidates)
-        if permitted_key:
-            _PROVIDER_DIAGNOSIS = (
-                "every configured API key permitted by model mode "
-                f"'{model_mode}' was rejected at preflight (out of credits or "
-                "revoked); top up credits or set a working key")
-        elif excluded_key:
-            _PROVIDER_DIAGNOSIS = (
-                f"model mode '{model_mode}' excludes the configured routes")
-        else:
-            _PROVIDER_DIAGNOSIS = "no LLM API key found"
-        return []
-
-    # PAID MODE MEANS BOTH MODELS (owner order 2026-08-28: "For the paid path,
-    # allow both Anthropic and OpenAI API keys to be used. Each edit must be
-    # approved by both models.").
-    #
-    # Every fix-approval gate in this file - the adversarial verify loop and the
-    # legacy single-shot veto alike - is conditional on a SECOND provider
-    # existing (`cross is not None`). So a paid run whose other key is missing,
-    # unfunded, or preflight-rejected used to fall straight through this `if`
-    # and audit with one model and no approval gate at all, while still
-    # reporting itself as a normal paid run. That is the shape of a silent
-    # downgrade: the promise the mode is named for quietly stops holding, and
-    # nothing in the output says so.
-    #
-    # So in paid mode the pair is REQUIRED unless the owner typed `--single`.
-    # A missing half is a refusal with a diagnosis, never a weaker run.
-    # `other` is only ever the OTHER member of the anthropic/openai pair, so a
-    # paid run whose primary is copilot (a permitted paid provider) would leave
-    # this false and proceed alone - the pair promise broken by the one provider
-    # choice that never had a partner. Any paid cloud primary now has to produce
-    # the pair; for copilot that means BOTH named models, since it is neither.
-    # `paid_choice` and the single-account override are resolved ABOVE, before
-    # preflight, so the account the owner named is the one that was health-
-    # checked. Only the pair requirement is decided here.
-    paid_pair_required = (model_mode == "paid" and args.use_both
-                          and paid_choice == "both"
-                          and primary in {"anthropic", "openai", "copilot"})
-    if primary == "copilot" and paid_pair_required:
-        missing_pair = [n for n in ("anthropic", "openai") if not _usable(n)]
-        if missing_pair:
-            _PROVIDER_DIAGNOSIS = (
-                f"paid mode requires BOTH models: '{primary}' authors, but "
-                f"{' and '.join(repr(n) for n in missing_pair)} "
-                f"{'is' if len(missing_pair) == 1 else 'are'} not usable, so "
-                "no second model can approve its fixes. Set working keys for "
-                "both, or pass --single to accept a deliberately single-model "
-                "run, or use free mode.")
-            print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
-            return []
-        other = "anthropic"
-    if paid_pair_required and not (other and _usable(other)):
-        missing = other or ("openai" if primary == "anthropic" else "anthropic")
+    _auto_activate_fcc_proxy()
+    mode = normalize_model_mode(getattr(args, "model_mode", "best"))
+    primary = _build_rotating_provider(args, meter, mode)
+    if primary is None:
         _PROVIDER_DIAGNOSIS = (
-            f"paid mode requires BOTH models: '{primary}' is usable but "
-            f"'{missing}' is not (no key, an unfunded/revoked key, or a key "
-            f"re-pointed at the free proxy). Every fix in paid mode is approved "
-            f"by the second model, so a one-model paid run is refused. Set a "
-            f"working {missing.upper()}_API_KEY, or pass --single to accept a "
-            f"deliberately single-model run, or use free mode.")
-        print(f"  [preflight] {_PROVIDER_DIAGNOSIS}", file=sys.stderr)
+            "the best-available model ladder has no usable paid, subscription, "
+            "free-tier, or local route"
+        )
         return []
-    judge_override = getattr(args, "judge_model", None)
-    out: list[tuple[str, object]] = []
-    # Author model: explicit --model wins; --economy routes authoring to the
-    # cheaper economy tier (Sonnet 5 on Anthropic); otherwise the default tier.
-    economy = getattr(args, "economy", False)
-    primary_model = (args.model
-                     or (ECONOMY_MODELS.get(primary) if economy else None)
-                     or DEFAULT_MODELS[primary])
-    out.append((primary, make_provider(primary, primary_model, meter,
-                                       judge_model=judge_override)))
-    if (args.use_both and free_pool_cross and other == free_pool_cross
-            and _usable(other)):
-        # Free pool cross-checker: the judge tier of the second free backend,
-        # unless --secondary-model named one. That flag is documented as the
-        # override for "the 2nd (cross-check) provider", and this is that
-        # provider - honouring it only on the paid branch would discard an
-        # explicit choice with no message, which is how a flag becomes a lie.
-        out.append((other, make_provider(
-            other,
-            args.secondary_model or JUDGE_MODELS.get(other) or DEFAULT_MODELS[other],
-            meter, judge_model=judge_override)))
-    elif args.use_both and model_mode == "paid" and other and _usable(other):
-        # The secondary provider only ever REVIEWS and CROSS-VERIFIES (never
-        # authors code), and both of those are routed to the judge tier - so it
-        # defaults to the cheap model, not a second frontier model. This keeps the
-        # dual-model rigor at a fraction of the old cost. Override with
-        # --secondary-model to force a stronger cross-checker.
-        other_model = args.secondary_model or JUDGE_MODELS.get(other) or DEFAULT_MODELS[other]
-        out.append((other, make_provider(other, other_model, meter,
-                                         judge_model=judge_override)))
-    # Dedupe by provider name (keep first).
-    seen: set[str] = set()
-    deduped: list[tuple[str, object]] = []
-    for name, prov in out:
-        if name in seen:
-            continue
-        seen.add(name)
-        deduped.append((name, prov))
-    return deduped
+    providers: list[tuple[str, object]] = [("best-available", primary)]
+    if _LAST_ROTATION_USABLE > 1:
+        coordinator = getattr(primary, "role_coordinator", None)
+        if coordinator is None:
+            # Preserve the injected-provider protocol used by embedders and
+            # tests. A real RotatingProvider always exposes the coordinator;
+            # an opaque compatible provider cannot share model-family state,
+            # so its own verifier remains responsible for independence.
+            verifier = _build_rotating_provider(args, meter, mode, quiet=True)
+        else:
+            verifier = _build_rotating_provider(
+                args, meter, mode, quiet=True,
+                role_coordinator=coordinator,
+            )
+        if verifier is not None:
+            providers.append(("best-available-verifier", verifier))
+    return providers
 
 
 # --------------------------------------------------------------------------- #
@@ -5119,18 +4835,68 @@ def run(args) -> int:
         return 2
     # From here on, operate on the resolved path (a .lnk becomes its real target).
     args.file = resolved_path
+    file_abs = os.path.abspath(args.file)
+    root, rel = _project_root_and_rel(file_abs)
+    git = _is_git_repo(root)
+    if not git:
+        print(
+            "error: refactor is a production mutation and requires a Git "
+            "repository; local-only code is refused.",
+            file=sys.stderr,
+        )
+        return 1
+    if not _git_has_remote(root):
+        print(
+            "error: refactor requires an origin remote so the exact verified "
+            "commit can land on the authoritative default branch.",
+            file=sys.stderr,
+        )
+        return 1
+    if not getattr(args, "push", False) or not getattr(args, "merge", False):
+        print(
+            "error: refactor requires push and merge; local or branch-only "
+            "success paths are disabled.",
+            file=sys.stderr,
+        )
+        return 1
+    baseline_sha = None
+    branch = None
+    if git:
+        if not _git_tree_clean(root):
+            print(
+                "error: refactor requires a clean Git worktree so only the "
+                "selected file can enter its verified commit.",
+                file=sys.stderr,
+            )
+            return 1
+        head = _git(["rev-parse", "HEAD"], root)
+        if head.returncode != 0:
+            print("error: could not resolve the refactor baseline commit.",
+                  file=sys.stderr)
+            return 1
+        baseline_sha = (head.stdout or "").strip()
+        branch = _git_current_branch(root)
+        if not branch:
+            print("error: refactor requires a named Git branch.", file=sys.stderr)
+            return 1
+        default_branch, default_basis = _remote_default_branch(root)
+        if not default_branch:
+            print(
+                "error: refactor could not resolve origin's authoritative "
+                f"default branch: {default_basis}",
+                file=sys.stderr,
+            )
+            return 1
 
-    # Same resolution rule as build_audit_providers: explicit --model wins,
-    # --economy routes authoring to the cheaper tier, else the default tier.
-    # One flag, one meaning, every mode - the owner should never have to
-    # remember which mode a cost switch belongs to.
-    model = (args.model
-             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
-             or DEFAULT_MODELS[args.provider])
-    provider = make_provider(args.provider, model,
-                             judge_model=getattr(args, "judge_model", None))
-    print(f"FlexFactor | provider={args.provider} model={model} "
-          f"judge={provider.judge_model} threshold={args.threshold} "
+    # Every mode uses the same orchestrator-owned paid-to-free ladder.
+    meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
+    try:
+        provider = _best_available_provider(args, meter)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"FlexFactor | model_policy=best-available "
+          f"threshold={args.threshold} "
           f"max_iterations={args.max_iterations}\n")
 
     current = original
@@ -5196,16 +4962,89 @@ def run(args) -> int:
     # contained no-follow writer anchored at the file's git root so the FULL ancestor
     # chain is walked (a symlink swapped in at any component is replaced, never
     # followed to overwrite an outside target). args.file == the resolved source path.
-    file_abs = os.path.abspath(args.file)
-    root, rel = _project_root_and_rel(file_abs)
     backup = args.file + ".bak"
-    if _replace_contained(root, rel + ".bak", original) is None:
-        print(f"error: could not safely write backup {backup}", file=sys.stderr)
-        return 1
+    if not git:
+        if _replace_contained(root, rel + ".bak", original) is None:
+            print(f"error: could not safely write backup {backup}", file=sys.stderr)
+            return 1
     if _replace_contained(root, rel, current) is None:
         print(f"error: could not safely write {args.file}", file=sys.stderr)
         return 1
-    print(f"\nSwole. Backup written to {backup}; {args.file} updated.\n")
+    if git:
+        changed = _git_changed_paths(root)
+        if changed != [rel.replace("\\", "/")]:
+            _replace_contained(root, rel, original)
+            print(
+                "error: refactor changed paths outside the selected file; "
+                f"restored the source and refused publication ({changed!r}).",
+                file=sys.stderr,
+            )
+            return 1
+        stack = _detect_stack(root)
+        try:
+            checkpoint_status = _commit_and_sync(
+                root, branch, branch, args, f"refactor {rel}", stack
+            )
+        except BranchStateError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        final_head = _git(["rev-parse", "HEAD"], root)
+        final_sha = ((final_head.stdout or "").strip()
+                     if final_head.returncode == 0 else "")
+        if not final_sha or final_sha == baseline_sha:
+            print("error: accepted refactor produced no committed source change.",
+                  file=sys.stderr)
+            return 1
+        review_summary = {
+            "mode": "refactor",
+            "selected_file": rel.replace("\\", "/"),
+            "accepted_grade": best_grade,
+            "acceptance_threshold": args.threshold,
+            "project_gate": "passed",
+            "checkpoint": checkpoint_status,
+        }
+        try:
+            independent = _independent_final_review(
+                provider, root, baseline_sha, final_sha, review_summary
+            )
+        except Exception as exc:
+            independent = {
+                "verdict": "reject", "evidence_consistent": False,
+                "commit": final_sha, "reason": f"reviewer unavailable: {exc}",
+            }
+        approved = bool(
+            independent.get("verdict") == "approve"
+            and independent.get("evidence_consistent") is True
+            and independent.get("commit") == final_sha
+        )
+        if not approved:
+            restored = _git(["reset", "--hard", baseline_sha], root)
+            suffix = "" if restored.returncode == 0 else (
+                f"; WARNING rollback failed: {_tail(restored.stderr, 3)}"
+            )
+            print(
+                "error: independent exact-commit review rejected the refactor: "
+                + str(independent.get("reason") or "no approval") + suffix,
+                file=sys.stderr,
+            )
+            return 1
+        publication = _publish_verified_head(
+            root, branch, args, stack, final_sha
+        )
+        if publication.get("complete") is not True:
+            print(
+                "error: verified refactor remains incomplete because it is not "
+                "on the remote default branch: "
+                + str(publication.get("reason") or "publication failed"),
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"\nSwole. {args.file} was independently reviewed, verified, and "
+            f"landed on origin/{publication.get('default_branch')}.\n"
+        )
+    else:
+        print(f"\nSwole. Backup written to {backup}; {args.file} updated.\n")
 
     print("=== Insertion prompt ===")
     print(build_insertion_prompt(args.file, args.goal, current))
@@ -6060,7 +5899,7 @@ class ApplyResult:
     repo: str
     # No "dry-run" status any longer: the mode that produced it was removed
     # outright 2026-08-21 (owner: "I don't want dry runs, I want work").
-    status: str          # applied-pushed | applied | applied-local | verify-failed | infeasible | skipped-dirty | error
+    status: str          # applied-published | publication-incomplete | review-rejected | verify-failed | infeasible | skipped-* | error
     detail: str
     branch: str | None = None
     files: list[str] | None = None
@@ -6310,6 +6149,309 @@ def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
     return _run(["git", *args], cwd, timeout=300)
 
 
+def _remote_default_branch(project_dir: str) -> tuple[str | None, str]:
+    """Resolve origin's default branch from authoritative remote metadata."""
+    symbolic = _git(
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        project_dir,
+    )
+    if symbolic.returncode == 0:
+        value = (symbolic.stdout or "").strip()
+        if value.startswith("origin/") and len(value) > len("origin/"):
+            return value[len("origin/"):], "origin/HEAD"
+    remote = _git(["ls-remote", "--symref", "origin", "HEAD"], project_dir)
+    if remote.returncode == 0:
+        match = re.search(r"^ref:\s+refs/heads/([^\s]+)\s+HEAD$",
+                          remote.stdout or "", re.MULTILINE)
+        if match:
+            return match.group(1), "origin HEAD"
+    return None, (_tail(remote.stderr or symbolic.stderr, 3)
+                  or "origin did not identify a default branch")
+
+
+def _remote_branch_contains(project_dir: str, branch: str,
+                            commit: str) -> tuple[bool, str]:
+    """Prove that the exact verified commit is in origin/<branch>."""
+    fetched = _git(["fetch", "--quiet", "origin",
+                    f"refs/heads/{branch}:refs/remotes/origin/{branch}"], project_dir)
+    if fetched.returncode != 0:
+        return False, f"could not fetch origin/{branch}: {_tail(fetched.stderr, 3)}"
+    contained = _git(
+        ["merge-base", "--is-ancestor", commit, f"refs/remotes/origin/{branch}"],
+        project_dir,
+    )
+    if contained.returncode == 0:
+        tip = _git(["rev-parse", f"refs/remotes/origin/{branch}"], project_dir)
+        return True, (tip.stdout or "").strip()
+    return False, f"verified commit {commit[:12]} is not in origin/{branch}"
+
+
+def _git_changed_paths(project_dir: str) -> list[str] | None:
+    """Return every tracked or untracked worktree path, or None on git error."""
+    tracked = _git(["diff", "--name-only", "-z", "HEAD"], project_dir)
+    untracked = _git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], project_dir
+    )
+    if tracked.returncode != 0 or untracked.returncode != 0:
+        return None
+    return sorted({
+        path.replace("\\", "/")
+        for raw in (tracked.stdout or "", untracked.stdout or "")
+        for path in raw.split("\0")
+        if path
+    })
+
+
+def _needs_final_publication(project_dir: str, initial_commit: str | None,
+                             commit: str | None) -> bool:
+    """Whether HEAD still needs landing, including recovered prior-run work.
+
+    Comparing only this run's starting and ending SHAs misses the dangerous
+    resume case: a prior run may have committed a verified checkpoint locally,
+    then died before publication. An unchanged recovery must still publish it
+    when that exact SHA is absent from the remote default branch.
+    """
+    if not commit:
+        return initial_commit is not None
+    if initial_commit != commit:
+        return True
+    if not _git_has_remote(project_dir):
+        return False
+    default_branch, _basis = _remote_default_branch(project_dir)
+    if not default_branch:
+        return True
+    contained, _detail = _remote_branch_contains(project_dir, default_branch, commit)
+    return not contained
+
+
+def _publish_verified_head(project_dir: str, branch: str | None, args,
+                           stack: dict, commit: str | None) -> dict:
+    """Publish only a fully verified HEAD and prove it landed on default.
+
+    Direct default-branch pushes are attempted first. A protected branch falls
+    back to a normal PR with auto-merge; the orchestrator waits for that PR to
+    merge before returning success. It never force-pushes or bypasses checks.
+    """
+    result = {
+        "required": True, "complete": False, "commit": commit,
+        "default_branch": None, "remote_tip": None, "reason": "",
+    }
+    if not commit:
+        result["reason"] = "could not resolve the verified commit"
+        return result
+    if not getattr(args, "push", False):
+        result["reason"] = "publication disabled by --no-push"
+        return result
+    if not _git_has_remote(project_dir):
+        result["reason"] = "origin remote is unavailable"
+        return result
+
+    def exact_reviewed_head(stage: str) -> tuple[bool, str, str]:
+        """Bind every publication transition to the reviewed commit + branch.
+
+        The project gate is allowed to execute arbitrary repository tooling.
+        A hook, formatter, concurrent process, or compromised test can move
+        HEAD while that tooling runs.  An approval for an ancestor is not an
+        approval for the new tip, so a mismatch is a hard stop.  The refspecs
+        below also name ``commit`` rather than HEAD; this guard supplies the
+        human-readable failure and prevents opening a PR from another branch.
+        """
+        resolved = _git(["rev-parse", "HEAD"], project_dir)
+        if resolved.returncode != 0:
+            return False, "", (
+                f"could not resolve HEAD {stage}: {_tail(resolved.stderr, 3)}"
+            )
+        head = (resolved.stdout or "").strip()
+        if head != commit:
+            return False, head, (
+                f"exact-commit guard refused {stage}: reviewed {commit[:12]} "
+                f"but HEAD is {(head or 'unresolved')[:12]}"
+            )
+        current_branch = str(_git_current_branch(project_dir) or "").strip()
+        if not current_branch or current_branch == head:
+            return False, head, (
+                f"exact-commit guard refused {stage}: publication requires a "
+                "named branch, not detached HEAD"
+            )
+        if branch and current_branch != str(branch).strip():
+            return False, head, (
+                f"exact-commit guard refused {stage}: reviewed branch "
+                f"{branch!r} changed to {current_branch!r}"
+            )
+        return True, head, current_branch
+
+    exact, _head, current = exact_reviewed_head("before final verification")
+    if not exact:
+        result["reason"] = current
+        return result
+    if not _git_tree_clean(project_dir):
+        result["reason"] = "working tree is not clean at the final publication gate"
+        return result
+    wip_ok, wip_reason = _wip_publish_guard(project_dir)
+    if not wip_ok:
+        result["reason"] = f"owner WIP publication guard refused: {wip_reason}"
+        return result
+    final_ok, gate_log = _publication_gate(project_dir, stack)
+    if final_ok is not True:
+        state = "failed" if final_ok is False else "did not run"
+        result["reason"] = (
+            f"final publication verification {state}: {_tail(gate_log, 4)}"
+        )
+        return result
+    exact, _head, current = exact_reviewed_head("after final verification")
+    if not exact:
+        result["reason"] = current
+        return result
+    if not _git_tree_clean(project_dir):
+        result["reason"] = (
+            "working tree changed during final publication verification"
+        )
+        return result
+    wip_ok, wip_reason = _wip_publish_guard(project_dir)
+    if not wip_ok:
+        result["reason"] = (
+            "owner WIP publication guard refused after verification: "
+            + wip_reason
+        )
+        return result
+    default_branch, basis = _remote_default_branch(project_dir)
+    result["default_branch"] = default_branch
+    if not default_branch:
+        result["reason"] = f"default branch unresolved: {basis}"
+        return result
+
+    source_branch = current
+    exact, _head, current = exact_reviewed_head("immediately before publication")
+    if not exact:
+        result["reason"] = current
+        return result
+    if current == default_branch:
+        pushed = _git(
+            ["push", "origin", f"{commit}:refs/heads/{default_branch}"], project_dir
+        )
+        if pushed.returncode == 0:
+            okay, detail = _remote_branch_contains(project_dir, default_branch, commit)
+            result.update(complete=okay, remote_tip=detail if okay else None,
+                          reason=("verified commit is on the remote default branch"
+                                  if okay else detail))
+            return result
+        source_branch = f"flexfactor/land-{commit[:12]}"
+        side = _git(
+            ["push", "origin", f"{commit}:refs/heads/{source_branch}"], project_dir
+        )
+        if side.returncode != 0:
+            result["reason"] = (
+                "default push was rejected and the landing branch could not be "
+                f"published: {_tail(side.stderr or pushed.stderr, 4)}"
+            )
+            return result
+    else:
+        side = _git(
+            ["push", "-u", "origin", f"{commit}:refs/heads/{source_branch}"],
+            project_dir,
+        )
+        if side.returncode != 0:
+            source_branch = f"flexfactor/land-{commit[:12]}"
+            fallback = _git(
+                ["push", "origin", f"{commit}:refs/heads/{source_branch}"],
+                project_dir,
+            )
+            if fallback.returncode != 0:
+                result["reason"] = (
+                    "source and landing branch pushes failed: "
+                    + _tail((side.stderr or "") + (fallback.stderr or ""), 4)
+                )
+                return result
+
+    if not getattr(args, "merge", False):
+        result["reason"] = "verified branch was pushed but --no-merge forbids landing it"
+        return result
+    source_exact, source_tip = _remote_branch_contains(
+        project_dir, source_branch, commit
+    )
+    if not source_exact or source_tip != commit:
+        result["reason"] = (
+            f"landing branch is not the exact reviewed commit {commit[:12]}"
+            + (f": remote tip is {source_tip[:12]}" if source_tip else "")
+        )
+        return result
+    if not shutil.which("gh"):
+        result["reason"] = "verified branch was pushed but GitHub CLI is unavailable"
+        return result
+    title = f"FlexFactor: land verified {commit[:12]}"
+    body = ("Exact commit verified by FlexFactor's project suite, evidence gates, "
+            "and independent final review. No force push or check bypass.")
+    created = _run(
+        ["gh", "pr", "create", "--head", source_branch, "--base", default_branch,
+         "--title", title, "--body", body], project_dir, timeout=120
+    )
+    create_text = (created.stdout or "") + (created.stderr or "")
+    if created.returncode != 0 and "already exists" not in create_text.lower():
+        result["reason"] = f"landing PR creation failed: {_tail(create_text, 4)}"
+        return result
+    enabled = _run(
+        ["gh", "pr", "merge", source_branch, "--auto", "--merge",
+         "--match-head-commit", commit],
+        project_dir, timeout=120
+    )
+    if enabled.returncode != 0:
+        immediate = _run(
+            ["gh", "pr", "merge", source_branch, "--merge",
+             "--match-head-commit", commit],
+            project_dir, timeout=120
+        )
+        if immediate.returncode != 0:
+            result["reason"] = (
+                "landing PR exists but merge could not be enabled: "
+                + _tail((enabled.stdout or "") + (enabled.stderr or "")
+                        + (immediate.stdout or "") + (immediate.stderr or ""), 4)
+            )
+            return result
+
+    try:
+        wait_seconds = int(os.environ.get("FLEXFACTOR_PUBLISH_WAIT_SECONDS", "900"))
+    except ValueError:
+        wait_seconds = 900
+    deadline = time.time() + max(0, min(wait_seconds, 3600))
+    last = ""
+    while True:
+        viewed = _run(
+            ["gh", "pr", "view", source_branch,
+             "--json", "state,mergedAt,url,mergeCommit,headRefOid"],
+            project_dir, timeout=120
+        )
+        last = ((viewed.stdout or "") + (viewed.stderr or "")).strip()
+        if viewed.returncode == 0:
+            try:
+                status = json.loads(viewed.stdout or "{}")
+            except ValueError:
+                status = {}
+            if status.get("headRefOid") != commit:
+                result["reason"] = (
+                    "landing PR head no longer matches the independently "
+                    f"reviewed commit {commit[:12]}"
+                )
+                return result
+            if status.get("state") == "MERGED" or status.get("mergedAt"):
+                okay, detail = _remote_branch_contains(project_dir, default_branch, commit)
+                result.update(complete=okay,
+                              remote_tip=detail if okay else None,
+                              reason=("verified commit merged into the remote "
+                                      "default branch" if okay else detail),
+                              pull_request=status.get("url"))
+                return result
+            if status.get("state") == "CLOSED":
+                result["reason"] = "landing PR closed without merging"
+                return result
+        if time.time() >= deadline:
+            result["reason"] = (
+                "landing PR is not merged yet; the run remains incomplete"
+                + (f": {_tail(last, 2)}" if last else "")
+            )
+            return result
+        time.sleep(10)
+
+
 def _git_argv(argv: list[str], cwd: str) -> subprocess.CompletedProcess:
     """Runner for helpers that hand over a COMPLETE argv (["git", ...]) - the
     flexfactor_ledger/flexfactor_wip GitRunner contract. Same chokepoint."""
@@ -6391,8 +6533,8 @@ def _is_git_repo(path: str) -> bool:
 
 
 def _git_has_remote(path: str) -> bool:
-    r = _git(["remote"], path)
-    return r.returncode == 0 and bool(r.stdout.strip())
+    r = _git(["remote", "get-url", "origin"], path)
+    return r.returncode == 0 and bool((r.stdout or "").strip())
 
 
 def _persist_baseline_failure(checkpoint, program: str, log_text: str) -> "str | None":
@@ -6902,12 +7044,11 @@ def apply_integration(project_dir: str, repo_name: str, patch: dict, opts) -> Ap
 def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts) -> ApplyResult:
     """Apply a generated patch with a build-gated, reversible workflow.
 
-    git repo:  work on the branch the repo is ALREADY on - there is no
-               flexfactor/adopt-* branch and nothing here runs `checkout -b`
-               (sandbox branches were removed 2026-08-11). Commit + push only
-               if the project's build passes; on any failure restore the
-               snapshotted files so the repo is untouched.
-    no git:    write with .bak backups; restore them on failure.
+    Production mutation has one outcome: the exact build-tested commit is
+    independently reviewed and proven reachable from origin's authoritative
+    default branch.  A local-only commit is never an applied result.  Targets
+    without Git, an origin, a named branch, mandatory publication, or an
+    independent reviewer are refused before the first write.
     """
     files = [f for f in (patch.get("files") or [])
              if f.get("path") and f.get("contents") is not None]
@@ -6953,7 +7094,41 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                            "no build/test/lint/typecheck command was detected; refusing to retain "
                            "generated changes that nothing can verify")
 
-    prev_branch = _git_current_branch(project_dir) if git else None
+    if not git:
+        return ApplyResult(
+            repo_name, "skipped-no-git",
+            "production mutation requires a Git repository whose exact verified "
+            "commit can be landed on the remote default branch")
+    if not _git_has_remote(project_dir):
+        return ApplyResult(
+            repo_name, "skipped-no-origin",
+            "production mutation requires an origin remote; local-only code is refused")
+    if not getattr(opts, "push", False) or not getattr(opts, "merge", False):
+        return ApplyResult(
+            repo_name, "skipped-publication-required",
+            "production mutation requires push and merge; local or branch-only "
+            "success paths are disabled")
+    reviewer = getattr(opts, "final_reviewer", None)
+    if reviewer is None:
+        return ApplyResult(
+            repo_name, "skipped-independent-review",
+            "production mutation requires a fresh independent exact-commit reviewer")
+    if os.path.normcase(os.path.abspath(project_dir)) in _WIP_ACTIVE:
+        return ApplyResult(
+            repo_name, "skipped-dirty-publication",
+            "owner work-in-progress is safely snapshotted, but publication is "
+            "refused until that work is restored; start from a clean worktree")
+
+    prev_branch = _git_current_branch(project_dir)
+    if not prev_branch:
+        return ApplyResult(repo_name, "skipped-detached-head",
+                           "production mutation requires a named Git branch")
+    baseline = _git(["rev-parse", "HEAD"], project_dir)
+    baseline_sha = ((baseline.stdout or "").strip()
+                    if baseline.returncode == 0 else "")
+    if not baseline_sha:
+        return ApplyResult(repo_name, "error",
+                           "could not resolve the exact pre-mutation commit")
     branch = prev_branch  # no sandbox branch: apply onto the current branch
     # Backups are keyed by REPO-RELATIVE path and read/written through the contained
     # no-follow helpers, so an ancestor swapped after validation can never redirect a
@@ -7049,6 +7224,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         # carries the same truth into the RESULT, which is what the apply summary
         # and the scout report render afterwards.
         verify_note = ""
+        verify_receipts: list[dict] = []
         if not opts.verify:
             verify_note = ("NOT VERIFIED - verification disabled (--no-verify); "
                            "nothing executed the project's code")
@@ -7062,6 +7238,10 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 print(f"    verifying: {' '.join(cmd)}"
                       + ("  [network-isolated]" if verify_env else ""))
                 r = _run(cmd, project_dir, timeout=1200, env=verify_env)
+                verify_receipts.append({
+                    "command": list(cmd), "exit_code": r.returncode,
+                    "output_tail": _tail((r.stdout or "") + "\n" + (r.stderr or ""), 40),
+                })
                 if r.returncode != 0:
                     raise ApplyError(f"verify '{' '.join(cmd)}' failed:\n"
                                      + _tail(r.stdout + "\n" + r.stderr))
@@ -7094,79 +7274,93 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                                  else "blocked (--ignore-scripts)",
         }
 
-        # Commit (and push / merge) - the change lands in the repo.
-        if git:
-            _git(["add", "-A"], project_dir)
-            msg = patch.get("commit_message") or f"Integrate {repo_name} (FlexFactor scout)"
-            full_msg = msg + "\n\nApplied by FlexFactor scout.\n" \
-                       "Co-Authored-By: FlexFactor <noreply@flexfactor.local>"
-            rc = _git(["commit", "-m", full_msg], project_dir)
-            if rc.returncode != 0:
-                raise ApplyError("nothing committed: " + _tail(rc.stdout + rc.stderr, 5))
+        # Commit locally only as a review candidate. Nothing below can label it
+        # applied until a separate reviewer approves this exact SHA and the
+        # publication gate proves the SHA is contained by origin/default.
+        added = _git(["add", "-A"], project_dir)
+        if added.returncode != 0:
+            raise ApplyError("could not stage candidate: " + _tail(added.stderr, 5))
+        msg = patch.get("commit_message") or f"Integrate {repo_name} (FlexFactor scout)"
+        full_msg = msg + "\n\nApplied by FlexFactor scout.\n" \
+                   "Co-Authored-By: FlexFactor <noreply@flexfactor.local>"
+        rc = _git(["commit", "-m", full_msg], project_dir)
+        if rc.returncode != 0:
+            raise ApplyError("nothing committed: " + _tail(rc.stdout + rc.stderr, 5))
+        head = _git(["rev-parse", "HEAD"], project_dir)
+        candidate_sha = ((head.stdout or "").strip() if head.returncode == 0 else "")
+        if not candidate_sha or candidate_sha == baseline_sha:
+            raise ApplyError("candidate commit could not be resolved")
 
-            status, detail = "applied", f"committed on branch {branch}"
-            wip_ok, wip_why = _wip_publish_guard(project_dir)
-            if opts.push and not wip_ok:
-                detail += f"; PUSH REFUSED - owner WIP snapshot: {wip_why}"
-            elif opts.push and _git_has_remote(project_dir):
-                pr = _git(["push", "-u", "origin", branch], project_dir)
-                if pr.returncode == 0:
-                    status, detail = "applied-pushed", f"pushed branch {branch} to origin"
-                else:
-                    detail += f"; push failed: {_tail(pr.stderr, 3)}"
-            # `branch IS prev_branch` here - there is no apply branch (see the
-            # assignment above). Two defects lived in this block until
-            # 2026-08-19, both of the same family as the audit-path holes:
-            #
-            #  1. A SELF-MERGE REPORTED AS A MERGE. `git merge --no-ff X` while
-            #     already on X prints "Already up to date." and exits 0
-            #     (measured), so `detail` gained "; merged into main" on every
-            #     --merge run while nothing whatsoever was merged.
-            #     `_commit_and_sync` guards the identical case with
-            #     `prev_branch != branch` and calls the alternative "faked".
-            #  2. A DISCARDED PUSH RESULT. The push below had its return code
-            #     thrown away, so a protected trunk rejecting it left the line
-            #     reading "merged into main" with no failure anywhere - the
-            #     exact silent half-success the audit path was fixed for.
-            if opts.merge and prev_branch and prev_branch == branch:
-                detail += ("; no merge step - the work is already on "
-                           f"{prev_branch} (there is no separate apply branch)")
-            elif opts.merge and prev_branch:
-                co = _git(["checkout", prev_branch], project_dir)
-                if co.returncode != 0:
-                    # Never merge from the wrong ref: without this the merge
-                    # below ran on whatever branch we were still on.
-                    detail += (f"; merge skipped (could not checkout "
-                               f"{prev_branch}: {_tail(co.stderr, 2)})")
-                else:
-                    mr = _git(["merge", "--no-ff", "-m", f"Merge {branch}", branch],
-                              project_dir)
-                    if mr.returncode == 0:
-                        detail += f"; merged into {prev_branch}"
-                        if opts.push and _git_has_remote(project_dir):
-                            mp = _git(["push", "origin", prev_branch], project_dir)
-                            detail += (" (pushed)" if mp.returncode == 0 else
-                                       f" (push of {prev_branch} REJECTED: "
-                                       f"{_tail(mp.stderr, 2)} - the merge is "
-                                       "local only, origin does NOT have it)")
-                    else:
-                        _git(["merge", "--abort"], project_dir)
-                        _git(["checkout", branch], project_dir)
-                        detail += f"; auto-merge into {prev_branch} skipped (conflicts)"
-            if verify_note:
-                detail += "; " + verify_note
-            return ApplyResult(repo_name, status, detail, branch=branch, files=file_list,
-                               packages=packages, commit_message=msg,
-                               post_steps=patch.get("post_steps") or [],
-                               manifest=manifest)
+        stack = _detect_stack(project_dir)
+        review_summary = {
+            "mode": "scout",
+            "repository": repo_name,
+            "manifest": manifest,
+            "verification": verify_receipts,
+            "candidate_commit": candidate_sha,
+        }
+        try:
+            independent = _independent_final_review(
+                reviewer, project_dir, baseline_sha, candidate_sha, review_summary)
+        except Exception as exc:  # an unavailable reviewer is a rejection
+            independent = {
+                "verdict": "reject", "commit": candidate_sha,
+                "evidence_consistent": False,
+                "reason": f"independent reviewer unavailable: {exc}",
+            }
+        same_head, head_reason = _ff_ledger.head_matches(
+            _git_argv, project_dir, candidate_sha)
+        approved = bool(
+            same_head
+            and independent.get("verdict") == "approve"
+            and independent.get("evidence_consistent") is True
+            and independent.get("commit") == candidate_sha
+        )
+        if not approved:
+            if not same_head:
+                independent["reason"] = (
+                    "approval invalid because HEAD moved: " + str(head_reason))
+            restored = _git(["reset", "--hard", baseline_sha], project_dir)
+            suffix = ("" if restored.returncode == 0 else
+                      "; WARNING candidate rollback failed: " + _tail(restored.stderr, 3))
+            manifest.update(candidate_commit=candidate_sha,
+                            independent_review=independent,
+                            publication={"required": True, "complete": False})
+            return ApplyResult(
+                repo_name, "review-rejected",
+                "independent exact-commit review did not approve the candidate: "
+                + str(independent.get("reason") or "no approval") + suffix,
+                branch=branch, files=file_list, packages=packages,
+                commit_message=msg, post_steps=patch.get("post_steps") or [],
+                manifest=manifest)
 
-        local_detail = f"wrote {len(file_list)} file(s); .bak backups kept"
-        if verify_note:
-            local_detail += "; " + verify_note
-        return ApplyResult(repo_name, "applied-local", local_detail,
-                           files=file_list, packages=packages,
-                           post_steps=patch.get("post_steps") or [],
-                           manifest=manifest)
+        publication = _publish_verified_head(
+            project_dir, branch, opts, stack, candidate_sha)
+        manifest.update(candidate_commit=candidate_sha,
+                        independent_review=independent,
+                        publication=publication)
+        if publication.get("complete") is not True:
+            # The candidate is still locally reversible. Preserve no misleading
+            # success status: a branch push or open PR is explicitly incomplete.
+            restored = _git(["reset", "--hard", baseline_sha], project_dir)
+            suffix = ("" if restored.returncode == 0 else
+                      "; WARNING local candidate rollback failed: "
+                      + _tail(restored.stderr, 3))
+            return ApplyResult(
+                repo_name, "publication-incomplete",
+                "verified candidate is not on the remote default branch: "
+                + str(publication.get("reason") or "publication failed") + suffix,
+                branch=branch, files=file_list, packages=packages,
+                commit_message=msg, post_steps=patch.get("post_steps") or [],
+                manifest=manifest)
+
+        return ApplyResult(
+            repo_name, "applied-published",
+            f"exact commit {candidate_sha[:12]} independently reviewed, verified, "
+            f"and landed on origin/{publication.get('default_branch')}",
+            branch=branch, files=file_list, packages=packages,
+            commit_message=msg, post_steps=patch.get("post_steps") or [],
+            manifest=manifest)
 
     except (ApplyError, OSError, subprocess.SubprocessError) as e:
         failed = _rollback(project_dir, git, created_branch, branch, prev_branch, backups, created)
@@ -7778,24 +7972,25 @@ def run_scout(args) -> int:
     # 2. Characterize the entered program locally, then enforce the separate
     # cloud-context boundary before constructing or calling a remote provider.
     display_name, context = resolve_program_input(args.program)
-    if (args.provider != "ollama"
-            and not allow_remote_program_context(args)):
+    if not allow_remote_program_context(args):
         print("error: Scout profiling would send this program's source/README/file tree "
               "to a cloud LLM, but remote program-context sharing is not enabled.",
               file=sys.stderr)
         print("Re-run with --allow-remote-program-context or set "
               "FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1. "
-              "Use --provider ollama to keep profiling local.", file=sys.stderr)
+              "The best-available ladder may use a hosted model before its free "
+              "fallback.", file=sys.stderr)
         return 2
 
-    model = (args.model
-             or (ECONOMY_MODELS.get(args.provider) if getattr(args, "economy", False) else None)
-             or DEFAULT_MODELS[args.provider])
-    provider = make_provider(args.provider, model,
-                             judge_model=getattr(args, "judge_model", None))
+    meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
+    try:
+        provider = _best_available_provider(args, meter)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(_scout_contract.scout_config_banner())
-    print(f"FlexFactor scout | program='{display_name}' provider={args.provider} "
-          f"model={model} judge={provider.judge_model}")
+    print(f"FlexFactor scout | program='{display_name}' "
+          "model_policy=best-available")
     print("Repo Rewards results are METADATA-SCREENED CANDIDATES ONLY "
           "(never safe-to-install).\n")
     print("Profiling the program...")
@@ -8148,6 +8343,11 @@ def _apply_phase(args, profile_name: str, profile: dict,
         print("\nCannot apply changes: no local source folder resolved for this program "
               "(looks like a URL/description with no local checkout). Report written only.")
         return []
+    # The same orchestrator owns author selection and final review routing. A
+    # RotatingProvider sends reviewer-intent calls away from the last author
+    # family when independent capacity exists; failure to obtain that review
+    # blocks publication rather than silently accepting self-review.
+    args.final_reviewer = provider
 
     print("\n" + "=" * 70)
     print(f"  Scout apply phase for {project_dir}")
@@ -8216,6 +8416,27 @@ def _apply_phase(args, profile_name: str, profile: dict,
                       "refusing before generation")
             print(f"   skipped-unverified: {detail}")
             results.append(ApplyResult(name, "skipped-unverified", detail))
+            continue
+        # Check publication prerequisites only after deterministic candidate
+        # inspection and verifier discovery, but before either generation call.
+        # That preserves precise fail-closed reasons without spending model
+        # credits on a target whose code could never land.
+        if not _is_git_repo(project_dir):
+            detail = ("production mutation requires a Git repository so the "
+                      "exact verified commit can land on main")
+            print(f"   skipped-no-git: {detail}")
+            results.append(ApplyResult(name, "skipped-no-git", detail))
+            continue
+        if not _git_has_remote(project_dir):
+            detail = "target has no origin remote; local-only code is refused"
+            print(f"   skipped-no-origin: {detail}")
+            results.append(ApplyResult(name, "skipped-no-origin", detail))
+            continue
+        if not getattr(args, "push", False) or not getattr(args, "merge", False):
+            detail = "push and merge to the remote default branch are mandatory"
+            print(f"   skipped-publication-required: {detail}")
+            results.append(ApplyResult(
+                name, "skipped-publication-required", detail))
             continue
         try:
             patch, plan = generate_integration(provider, project_dir, blob, e["need"], e["result"])
@@ -10495,18 +10716,167 @@ def _merge_unresolved_file_findings(current: dict[str, list[dict]],
             list(current.get(rel) or []) + [dict(row) for row in rows])
 
 
-def _next_cycle_review_paths(changed_files, incomplete_files) -> list[str]:
+def _next_cycle_review_paths(changed_files, incomplete_files=()) -> list[str]:
     """Build the only legitimate scope for a follow-up semantic pass.
 
     Cycle 1 is the complete line-by-line sweep. A later cycle may re-read only
     files whose verified candidate was actually applied in the immediately
     preceding cycle. Merely finding a defect, attempting a fix, producing a
-    no-op, or rejecting/rolling back a candidate does not make that file part
-    of the next pass. The sole fail-closed exception is a review that never
-    completed: unproven files remain queued until a reviewer returns a verdict.
+    no-op, rejecting/rolling back a candidate, or failing to complete a review
+    does not widen the next pass. Incomplete reviews remain explicit blockers;
+    they do not violate the owner's changed-files-only follow-up contract.
     """
-    return _unique_review_paths(
-        list(changed_files) + sorted(str(rel) for rel in incomplete_files))
+    del incomplete_files  # compatibility with old callers; deliberately excluded
+    return _unique_review_paths(_ff_execution.changed_file_scope(changed_files))
+
+
+def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
+                             display_name: str, purpose_blob: str,
+                             stack: dict, purpose_reviewer, author, cross,
+                             project_dir: str, all_files: list[str], meter,
+                             baseline_ok, oversized, noop_stats: dict,
+                             errors_total: int, done_set: set[str],
+                             total_to_review: int, git: bool, branch: str,
+                             prev_branch: str, purpose_contract) -> dict:
+    """Research and implement the top three competitors after pass one.
+
+    This is the orchestrator's mandatory pass-1/pass-2 gate. Research failure
+    is recorded, not fatal; unsafe or unverified mutations remain fail-closed.
+    The return value is deliberately explicit so the caller can merge every
+    changed path into pass two's exact delta scope.
+    """
+    outcome = {
+        "research": None,
+        "findings": [],
+        "purpose_files": [],
+        "applied": [],
+        "unverified": [],
+        "notes": [],
+        "dirty_abort": False,
+        "committed": False,
+        "attempted": True,
+    }
+    report(phase="top-three competitor gate (between passes 1 and 2)")
+    if checkpoint is not None:
+        checkpoint.set_phase("top-three competitor gate (between passes 1 and 2)")
+    module = _competitors_module()
+    if module is None:
+        outcome["research"] = {
+            "competitors": [], "sources_used": [],
+            "target": _ff_execution.TOP_COMPETITORS,
+            "sources_skipped": {
+                "module": "flexfactor_competitors could not be imported"
+            },
+            "coverage_note": "competitor gate could not run",
+            "rr_endpoint": "(not used)",
+        }
+        outcome["notes"].append("top-three competitor gate: module unavailable")
+        print(f"{pfx}competitor gate INCOMPLETE: module unavailable", file=sys.stderr)
+        return outcome
+
+    rr_url, rr_note = resolve_repo_rewards_url(args, auto_start=False)
+    print(f"{pfx}BETWEEN PASSES 1 AND 2 - top three competitors: "
+          f"Repo Rewards -> {rr_note}")
+    rr_fn = (lambda query: repo_rewards_search(rr_url, query)) if rr_url else None
+    try:
+        research = module.research_competitors(
+            lambda system, prompt, schema: _judge(
+                purpose_reviewer, system, prompt, schema
+            ),
+            display_name,
+            purpose_blob or f"Program: {display_name}",
+            stack.get("ecosystems") or [],
+            author=lambda system, prompt, schema: purpose_reviewer.structured(
+                system, prompt, schema, max_tokens=8000,
+                salvage_truncated=True
+            ),
+            rr_search=rr_fn,
+            rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
+            target=_ff_execution.TOP_COMPETITORS,
+            allow_credentialed_firecrawl=True,
+            log=lambda message: print(f"{pfx}{message}"),
+            file_list=all_files,
+        )
+    except BudgetExceededError:
+        outcome["notes"].append("top-three competitor gate stopped at the cost cap")
+        print(f"{pfx}competitor gate INCOMPLETE: cost cap reached", file=sys.stderr)
+        return outcome
+    except Exception as exc:
+        outcome["notes"].append(
+            f"top-three competitor gate failed: {type(exc).__name__}: {exc}"
+        )
+        print(f"{pfx}competitor gate INCOMPLETE: {module._ascii(exc)}", file=sys.stderr)
+        return outcome
+
+    outcome["research"] = research
+    safe = module._ascii
+    print(f"{pfx}{safe(research.get('coverage_note', ''))}")
+    for source, reason in sorted((research.get("sources_skipped") or {}).items()):
+        print(f"{pfx}  [skipped source] {safe(source)}: {safe(reason)}")
+    for competitor in research.get("competitors") or []:
+        idea = competitor.get("idea") or {}
+        print(f"{pfx}  {safe(competitor.get('name', '(unnamed)'))}: "
+              f"{'ACCEPT' if idea.get('accept') else 'reject'} - "
+              f"{safe(idea.get('idea_title', '(no idea)'))}")
+
+    pairs = module.competitor_findings(
+        research,
+        max_findings=_ff_execution.TOP_COMPETITORS,
+        severity_floor_rank=SEVERITY_RANK.get(str(args.fix_severity).lower(), 3),
+        severity_rank=SEVERITY_RANK,
+        file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
+        acceptance_total=(
+            len(getattr(purpose_contract, "acceptance_criteria", []) or [])
+            if getattr(purpose_contract, "authored", False) else 0
+        ),
+    )
+    for rel, finding in pairs:
+        outcome["findings"].append(dict(finding, file=rel))
+        outcome["purpose_files"].append(rel)
+    ledger = research.get("bridge_ledger") or {}
+    print(f"{pfx}competitor gate: {ledger.get('bridged', 0)}/"
+          f"{ledger.get('candidates', 0)} candidate idea(s) entered the fix stream")
+    if not pairs or meter.over_limit():
+        return outcome
+
+    findings_by_file: dict[str, list[dict]] = {}
+    for rel, finding in pairs:
+        findings_by_file.setdefault(rel, []).append(finding)
+    try:
+        applied, unverified, notes = _fix_files(
+            author, cross, project_dir, findings_by_file, stack, baseline_ok, args,
+            meter=meter, oversized=oversized, report=report,
+            noop_stats=noop_stats, err_base=errors_total,
+            done_set=done_set, total_overall=total_to_review,
+            commit_cb=None,
+            adversarial=getattr(args, "adversarial", True),
+            adversarial_rounds=getattr(args, "adversarial_rounds", 2),
+            materiality=getattr(args, "adversarial_materiality", "material"),
+        )
+        outcome["applied"] = sorted(set(applied))
+        outcome["unverified"] = sorted(set(unverified))
+        outcome["notes"].extend(notes)
+        research["applied_files"] = outcome["applied"]
+        research["unverified_files"] = outcome["unverified"]
+        if git and applied:
+            status = _commit_and_sync(
+                project_dir, branch, prev_branch, args,
+                "top-three competitor improvements (between passes 1 and 2)",
+                stack,
+            )
+            outcome["committed"] = "committed" in status
+            print(f"{pfx}git (competitor gate): {status}")
+    except DirtyTreeError as exc:
+        outcome["dirty_abort"] = True
+        for rel in exc.files:
+            if git:
+                _git(["checkout", "--", rel], project_dir)
+        outcome["notes"].append(
+            "competitor gate aborted: refused rollback left an unverified candidate"
+        )
+    except BudgetExceededError:
+        outcome["notes"].append("competitor implementation stopped at the cost cap")
+    return outcome
 
 
 def _gap_to_finding(g: dict) -> dict:
@@ -14141,43 +14511,6 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
     return applied, unverified, notes
 
 
-def _gh_pr_automerge(project_dir: str, branch: str, base: str,
-                     stack: dict) -> str:
-    """Protected-base fallback with its own fail-closed publication gate.
-
-    The gate lives inside this mutation helper, so adding a new caller cannot
-    bypass it. Only an exact True may reach `gh pr merge --auto`; False and
-    None both refuse before PR creation.
-    """
-    final_ok, gate_log = _publication_gate(project_dir, stack)
-    if final_ok is not True:
-        state = ("failed" if final_ok is False else
-                 "did not run (no build/verify command exists)")
-        return (f"PR auto-merge REFUSED - publication verification {state}: "
-                f"{_tail(gate_log, 3)}")
-    if not shutil.which("gh"):
-        return (f"gh CLI not available - branch {branch} is pushed; "
-                f"open a PR to land it on {base}")
-    make = _run(["gh", "pr", "create", "--head", branch, "--base", base,
-                 "--title", f"FlexFactor: {branch}",
-                 "--body", "Automated FlexFactor fixes (build-gated + cross-model "
-                           "verified). Auto-merge enabled; lands when checks pass."],
-                cwd=project_dir, timeout=120)
-    out = (make.stdout or "") + (make.stderr or "")
-    url = next((w for w in out.split()
-                if w.startswith("https://") and "/pull/" in w), None)
-    if make.returncode != 0 and "already exists" not in out.lower():
-        return f"PR creation failed: {_tail(out, 2)}"
-    mr = _run(["gh", "pr", "merge", branch, "--auto", "--merge"],
-              cwd=project_dir, timeout=120)
-    if mr.returncode == 0:
-        return (f"PR opened with auto-merge - lands on {base} when checks pass"
-                + (f": {url}" if url else ""))
-    return (f"PR opened{': ' + url if url else ''} but auto-merge could not be "
-            f"enabled: {_tail((mr.stdout or '') + (mr.stderr or ''), 2)} - "
-            "merge it once checks pass")
-
-
 # Build droppings a repository without a .gitignore would otherwise receive as
 # FlexFactor's work. Measured 2026-08-29 on a real free-path run: the commit
 # FlexFactor pushed to a target's main carried three `__pycache__/*.pyc` files
@@ -14267,9 +14600,12 @@ def _unstage_ephemeral_additions(project_dir: str) -> list[str]:
 
 def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
                      label: str, stack: dict) -> str:
-    """Commit (and optionally push/merge) this cycle's work BEFORE the next cycle
-    re-reads the code, so each cycle builds on saved progress. Always leaves the
-    repo checked out on the audit branch for the next cycle."""
+    """Commit a verified local checkpoint for the next semantic pass.
+
+    This function deliberately has no publication switch. Intermediate work
+    cannot be pushed or merged; only `_publish_verified_head`, after the final
+    evidence and independent-review gates, owns that capability.
+    """
     def _discard_bootstrap_side_effects() -> None:
         for path in stack.get("bootstrap_dirty_paths") or []:
             tracked = _git(["ls-files", "--error-unmatch", "--", path], project_dir)
@@ -14362,133 +14698,6 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     else:
         verification_word = "build + project tests ok" if has_suite else "build ok"
     status = f"{label}: committed on {branch} ({verification_word})"
-    if args.push and _git_has_remote(project_dir):
-        # PUBLICATION GATE (live GrantFlow 2026-08-14 - FlexFactor pushed a RED
-        # BUILD to main). The gate below the commit was ALREADY tri-state and
-        # ALREADY correct: it ran `npm run typecheck` + `npm run build`, they
-        # failed, and it returned False. The bug was that this push was never
-        # gated on it AT ALL - only the merge was. Since the 2026-08-11 order
-        # removed sandbox branches, `branch` IS the owner's real branch (the run
-        # commits "on main"), so prev_branch == branch, the merge block is
-        # skipped entirely, and this unconditional push was the ONLY thing
-        # publishing - which made the merge gate decorative. Measured across one
-        # run's five batches: 4 pushed green, 1 pushed FAILED - roughly a 1-in-5
-        # chance per batch of putting a repo's main red, unattended.
-        #
-        # `is True` is load-bearing, exactly as it is for the merge: False =
-        # the build genuinely failed; None = no build/verify command existed so
-        # NOTHING was verified. Neither may be published.
-        #
-        # CORRECTED 2026-08-30 - this comment used to claim "the local COMMIT
-        # above still happens in every case - the work is never lost". That has
-        # not been true since the `final_ok is not True` early return above was
-        # added: a red or unverified tree is `git reset --hard HEAD`-ed and the
-        # function returns "no local commit or push". Nothing reaches this point
-        # unless final_ok is True, so the `else` below and the `final_ok is None`
-        # block after it are UNREACHABLE; they are retained only because the
-        # regression guards assert on their text. Do not trust them as a
-        # description of behaviour, and do not "restore" a local commit on the
-        # strength of the old sentence - retaining a tree the repository itself
-        # rejected is the defect the early return exists to prevent.
-        wip_ok, wip_why = _wip_publish_guard(project_dir)
-        if final_ok is True and not wip_ok:
-            status += f"; PUSH REFUSED - owner WIP snapshot: {wip_why}"
-        elif final_ok is True:
-            # NEVER force-push (owner order 2026-08-11 removed sandbox branches). This is
-            # now the owner's REAL branch, not a disposable sandbox that legitimately
-            # diverges - a --force-with-lease here could discard commits pushed from
-            # another machine. A fast-forward push or an honest rejection, nothing else.
-            pr = _git(["push", "-u", "origin", branch], project_dir)
-            if pr.returncode == 0:
-                status += "; pushed"
-            else:
-                # A PROTECTED trunk (required checks / enforce_admins - any
-                # production main) REJECTS a direct push. Until 2026-08-19 that
-                # ended the story right here: verified, cross-model-reviewed
-                # work sat committed LOCALLY, unmerged, with no PR and nothing
-                # asking a human to finish it, while the status line said only
-                # "branch push failed". The merge block further down already
-                # had the correct recovery (_gh_pr_automerge) but it is dead in
-                # this topology - prev_branch == branch, so it never runs.
-                #
-                # Owner rule: all work must be pushed and MERGED into
-                # production. So land the same commits through the repo's own
-                # gate instead of around it: publish them on a side branch and
-                # open a PR with auto-merge onto the trunk. Never a force-push,
-                # and the trunk still decides via its own required checks.
-                #
-                # No `_git_has_remote` re-check here on purpose: this whole
-                # block already sits under `args.push and _git_has_remote(...)`,
-                # so a second test could never fail and would only read like a
-                # guard that does something.
-                status += f"; direct push to {branch} rejected: {_tail(pr.stderr, 2)}"
-                head = (_git(["rev-parse", "HEAD"], project_dir).stdout or "").strip()
-                if not head:
-                    status += ("; could not resolve HEAD, so no landing branch was "
-                               f"published - the work is committed locally on {branch}")
-                else:
-                    land = f"flexfactor/land-{head[:8]}"
-                    lp = _git(["push", "origin", f"HEAD:refs/heads/{land}"], project_dir)
-                    if lp.returncode == 0:
-                        status += f"; {_gh_pr_automerge(project_dir, land, branch, stack)}"
-                    else:
-                        status += (f"; could not publish {land}: {_tail(lp.stderr, 2)}"
-                                   f" - the work is committed locally on {branch}")
-        else:
-            status += ("; PUSH REFUSED - the final verification gate "
-                       + ("FAILED" if final_ok is False else
-                          "did not run (no build/verify command exists), so "
-                          "NOTHING was verified")
-                       + f"; the work is committed LOCALLY on {branch} and will "
-                         "be pushed by the first cycle whose gate passes")
-    # prev_branch == branch happens when a repo was left PARKED on the sandbox
-    # branch by an earlier interrupted run (live SermonSmith 2026-08-11): a
-    # "merge" would be a meaningless self-merge, so it is skipped rather than
-    # faked. The end-of-run original-branch restore prevents new parking.
-    # `is True` is load-bearing. `final_ok is None` means the build gate had NO
-    # command to run, so nothing was verified - and until 2026-08-11 that vacuous
-    # gate read as green and auto-merged unverified work to the default branch on
-    # every repo whose toolchain FlexFactor cannot drive. Unverified never ships.
-    if final_ok is None:
-        # Until 2026-08-14 this message was HALF A LIE: the merge really was
-        # refused, but the push above had already published the work. The push
-        # is now gated too, so the sentence is finally true as written.
-        status += ("; merge+push REFUSED - no build/verify command exists for this "
-                   "repo, so the final gate proved nothing (work is committed on "
-                   f"{branch}; merge it yourself once you can verify it)")
-    if args.merge and final_ok is True and prev_branch and prev_branch != branch:
-        co = _git(["checkout", prev_branch], project_dir)
-        if co.returncode != 0:
-            # Could not leave the audit branch: do NOT merge (we'd be on the wrong
-            # ref). Skip the merge and fall through to the branch-state check below.
-            status += f"; merge skipped (could not checkout {prev_branch}: {_tail(co.stderr, 2)})"
-        else:
-            base_sha = (_git(["rev-parse", "HEAD"], project_dir).stdout or "").strip()
-            mr = _git(["merge", "--no-ff", "-m", f"Merge {branch}", branch], project_dir)
-            if mr.returncode == 0:
-                status += f"; merged into {prev_branch}"
-                wip_ok2, wip_why2 = _wip_publish_guard(project_dir)
-                if args.push and not wip_ok2:
-                    status += f" (PUSH REFUSED - owner WIP snapshot: {wip_why2})"
-                elif args.push and _git_has_remote(project_dir):
-                    mp = _git(["push", "origin", prev_branch], project_dir)
-                    if mp.returncode == 0:
-                        status += " (pushed)"
-                    elif base_sha:
-                        # Protected base (required checks / enforce_admins, e.g. a
-                        # production main). Undo the LOCAL merge so local and origin
-                        # never silently diverge, then land the same outcome through
-                        # the repo's own gate: a PR with auto-merge.
-                        _git(["reset", "--hard", base_sha], project_dir)
-                        status += (f" (direct push to {prev_branch} rejected; local merge "
-                                   f"undone; {_gh_pr_automerge(project_dir, branch, prev_branch, stack)})")
-                    else:
-                        status += f" (main push failed: {_tail(mp.stderr, 2)})"
-            else:
-                ab = _git(["merge", "--abort"], project_dir)
-                status += "; merge skipped (conflicts)"
-                if ab.returncode != 0:
-                    status += "; WARNING merge --abort failed"
     # CRUCIAL: the next cycle must continue on the audit branch reading saved code.
     # If we cannot CONFIRM HEAD is back on the audit branch, STOP the audit - silently
     # returning success here would write/commit the next cycle onto whatever branch is
@@ -14502,6 +14711,8 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
             f"{label}: could not return to audit branch '{branch}' (HEAD now on "
             f"'{now_on or '?'}'); stopping to avoid writing on the wrong branch. "
             f"{_tail(back.stderr, 2)}")
+    if getattr(args, "push", False):
+        status += "; publication deferred to the final orchestrator gate"
     return status
 
 
@@ -14898,10 +15109,49 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             _ledger("setup", result["error"], kind="program-defect")
             return result
         git = _is_git_repo(project_dir)
-        if git:
-            _head = _git(["rev-parse", "HEAD"], project_dir)
-            if _head.returncode == 0:
-                initial_commit = (_head.stdout or "").strip() or None
+        if not git:
+            result["error"] = (
+                "production mutation requires a Git repository; local-only "
+                "code is refused before review or writing"
+            )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        if not _git_has_remote(project_dir):
+            result["error"] = (
+                "production mutation requires an origin remote; local-only "
+                "or branch-only code is refused before review or writing"
+            )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        if not getattr(args, "push", False) or not getattr(args, "merge", False):
+            result["error"] = (
+                "production mutation requires push and merge; publication "
+                "opt-outs are incompatible with audit and prodready"
+            )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        if not _git_current_branch(project_dir):
+            result["error"] = (
+                "production mutation requires a named Git branch; detached "
+                "HEAD is refused before review or writing"
+            )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        _default_branch, _default_basis = _remote_default_branch(project_dir)
+        if not _default_branch:
+            result["error"] = (
+                "origin's authoritative default branch could not be resolved: "
+                + _default_basis
+            )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        _head = _git(["rev-parse", "HEAD"], project_dir)
+        if _head.returncode == 0:
+            initial_commit = (_head.stdout or "").strip() or None
+        if not initial_commit:
+            result["error"] = "could not resolve the exact pre-mutation commit"
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
 
         # Purpose context: the program's own metadata (README, package metadata,
         # file tree) travels with every per-file review so defects are judged
@@ -15258,10 +15508,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # WHOLE codebase (src + backend); clean files from prior runs are skipped.
         files = _enumerate_source_files(project_dir, args.max_files,
                                         args.include or None, args.exclude or None,
-                                        skip_clean=clean_files)
+                                        skip_clean=None)
         # --until-clean loops until found==fixed (no fixable defects), bounded by
         # --max-cycles and the cost cap; otherwise it stops after --cycles.
-        cycle_cap = args.max_cycles if getattr(args, "until_clean", True) else args.cycles
+        requested_cycle_cap = (
+            args.max_cycles if getattr(args, "until_clean", True) else args.cycles
+        )
+        cycle_cap = _ff_execution.pass_count(requested_cycle_cap)
         scope = "entire codebase" if args.max_files <= 0 else f"top {args.max_files}"
         print(f"{pfx}Reviewing {len(files)} source file(s) ({scope}) line by line; "
               + ("looping until clean" if getattr(args, "until_clean", True)
@@ -15320,6 +15573,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         completed_review_files: set[str] = set()
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
+        execution_orchestrator = getattr(args, "execution_orchestrator", None)
 
         # ================= PHASE 0: RED BASELINE FIRST ========================
         # A full project suite that was already red used to be discovered only
@@ -15635,159 +15889,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     fix_notes.append(stop_reason)
                 except BudgetExceededError:
                     fix_notes.append("purpose bridging stopped at cost cap")
-        # ================== PHASE 1b - COMPETITOR RESEARCH ====================
-        # Owner order 2026-08-16. The purpose contract says what job this program
-        # must do; competitor research says what ELSE already does that job, so a
-        # program cannot score 10/10 against its own criteria while shipping less
-        # than anything its users could switch to. The purpose contract stays the
-        # authority: every competitor idea is judged against it and a
-        # purpose-irrelevant idea is REJECTED, however good it is in the abstract.
-        # Failure here is always a NAMED skip in the report, never a crash and
-        # never a silent no-op.
-        if (getattr(args, "competitors", True) and not dirty_abort
-                and not meter.over_limit()):
-            report(phase="competitor research")
-            if checkpoint is not None:
-                checkpoint.set_phase("competitor research")
-            _fc = _competitors_module()
-            if _fc is None:
-                print(f"{pfx}competitor research SKIPPED: flexfactor_competitors "
-                      "module could not be imported")
-                competitor_research = {
-                    "competitors": [], "sources_used": [], "target": 0,
-                    "sources_skipped": {"module": "flexfactor_competitors "
-                                                  "could not be imported"},
-                    "coverage_note": "competitor research did not run",
-                    "rr_endpoint": "(not used)"}
-            else:
-                rr_url, rr_note = resolve_repo_rewards_url(
-                    args, auto_start=False)
-                print(f"{pfx}PHASE 1b - competitors: Repo Rewards -> {rr_note}")
-                rr_fn = ((lambda q: repo_rewards_search(rr_url, q))
-                         if rr_url else None)
-                try:
-                    competitor_research = _fc.research_competitors(
-                        lambda system, prompt, schema: _judge(
-                            purpose_reviewer, system, prompt, schema),
-                        display_name,
-                        purpose_blob or f"Program: {display_name}",
-                        stack.get("ecosystems") or [],
-                        author=lambda system, prompt, schema: purpose_reviewer.structured(
-                            system, prompt, schema, max_tokens=8000,
-                            salvage_truncated=True),
-                        rr_search=rr_fn,
-                        rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-                        target=max(1, int(getattr(args, "competitor_count", 5) or 5)),
-                        allow_credentialed_firecrawl=(
-                            normalize_model_mode(
-                                getattr(args, "model_mode", "free")
-                            ) == "paid"
-                        ),
-                        log=lambda m: print(f"{pfx}{m}"),
-                        file_list=all_files)
-                except BudgetExceededError:
-                    competitor_research = None
-                    print(f"{pfx}competitor research stopped at the cost cap")
-                except Exception as ex:   # never abort an audit over research
-                    competitor_research = None
-                    print(f"{pfx}competitor research failed (non-fatal): "
-                          f"{_fc._ascii(ex)}")
-            if competitor_research:
-                # Everything printed below is MODEL- or REPO-derived text, so it
-                # goes through _ascii first: a U+2011 in a competitor name raised
-                # UnicodeEncodeError on this machine's cp1252 console (live
-                # 2026-08-16) from inside an except handler, which escaped the
-                # phase entirely and would have failed the program's audit.
-                _sfe = _fc._ascii if _fc is not None else str
-                print(f"{pfx}{_sfe(competitor_research.get('coverage_note', ''))}")
-                for _cn, _cw in sorted((competitor_research.get("sources_skipped")
-                                        or {}).items()):
-                    print(f"{pfx}  [skipped source] {_sfe(_cn)}: {_sfe(_cw)}")
-                for _c in competitor_research.get("competitors") or []:
-                    _idea = _c.get("idea") or {}
-                    print(f"{pfx}  {_sfe(_c['name'])} [{_sfe(_c.get('license'))}"
-                          f" -> {_c.get('reuse_mode')}]: "
-                          f"{'ACCEPT' if _idea.get('accept') else 'reject'} - "
-                          f"{_sfe(_idea.get('idea_title', '(no idea)'))}")
-                # Accepted, corroborated, licence-permitted, code-fixable ideas
-                # enter the SAME build-gated fix stream as purpose gaps - capped,
-                # because a competitor idea is an opinion about the market, not a
-                # defect. Everything filtered out still appears in the report.
-                comp_pairs = _fc.competitor_findings(
-                    competitor_research,
-                    max_findings=max(0, int(getattr(args, "competitor_fixes", 5) or 0)),
-                    severity_floor_rank=SEVERITY_RANK.get(
-                        str(args.fix_severity).lower(), 3),
-                    severity_rank=SEVERITY_RANK,
-                    file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
-                    acceptance_total=(len(getattr(purpose_contract, "acceptance_criteria", []) or [])
-                                      if getattr(purpose_contract, "authored", False) else 0))
-                # NOT appended to all_findings here: the cycle loop REPLACES
-                # all_findings wholesale with each cycle's review output, so an
-                # early append would be silently dropped. They are merged in
-                # after the loop, exactly where purpose gaps are.
-                for _rel, _f in comp_pairs:
-                    competitor_bridged_findings.append(dict(_f, file=_rel))
-                    purpose_files.append(_rel)
-                # The bridge ledger reaches the console, not just the report:
-                # "2 accepted" with zero bridged and no stated reason is the
-                # silent-skip defect this whole phase exists to prevent.
-                _bl = competitor_research.get("bridge_ledger") or {}
-                if _bl.get("candidates"):
-                    print(f"{pfx}PHASE 1b - bridge ledger: "
-                          f"{_bl.get('bridged', 0)}/{_bl.get('candidates', 0)} "
-                          "candidate idea(s) entered the fix stream")
-                    for _reason, _names in (_bl.get("dropped") or {}).items():
-                        print(f"{pfx}  not bridged ({len(_names)}): "
-                              f"{_fc._ascii(', '.join(_names))} - {_fc._ascii(_reason)}")
-                    if not _bl.get("accounted", False):
-                        print(f"{pfx}  WARNING: bridge accounting gap - a candidate "
-                              "was discarded without a recorded reason (FlexFactor "
-                              "defect; the run continues)")
-                if comp_pairs and not meter.over_limit():
-                    print(f"{pfx}PHASE 1b - applying {len(comp_pairs)} "
-                          "competitor-derived improvement(s) (build-gated"
-                          + (" + cross-checked" if cross is not None else "") + ")...")
-                    comp_ff: dict[str, list[dict]] = {}
-                    for _rel, _f in comp_pairs:
-                        comp_ff.setdefault(_rel, []).append(_f)
-                    try:
-                        applied_c, unver_c, notes_c = _fix_files(
-                            author, cross, project_dir, comp_ff, stack, baseline_ok, args,
-                            meter=meter, oversized=oversized, report=report,
-                            noop_stats=noop_stats, err_base=errors_total,
-                            done_set=done_set, total_overall=total_to_review,
-                            commit_cb=None,
-                            adversarial=getattr(args, "adversarial", True),
-                            adversarial_rounds=getattr(args, "adversarial_rounds", 2),
-                            materiality=getattr(args, "adversarial_materiality", "material"))
-                        applied_set |= set(applied_c)
-                        unverified_set |= set(unver_c)
-                        fix_notes += notes_c
-                        bridged_early = sorted(set(bridged_early) | set(applied_c))
-                        competitor_research["applied_files"] = sorted(set(applied_c))
-                        competitor_research["unverified_files"] = sorted(set(unver_c))
-                        if git and applied_c:
-                            s = _commit_and_sync(project_dir, branch, prev_branch, args,
-                                                 "competitor-derived improvements (phase 1b)",
-                                                 stack)
-                            if "committed" in s:
-                                committed_any = True
-                            print(f"{pfx}git (competitors phase 1b): {s}")
-                    except DirtyTreeError as dte:
-                        dirty_abort = True
-                        for df in dte.files:
-                            if git:
-                                _git(["checkout", "--", df], project_dir)
-                        stop_reason = ("aborted in competitor phase: refused rollback "
-                                       "left an unverified candidate")
-                        fix_notes.append(stop_reason)
-                    except BudgetExceededError:
-                        fix_notes.append("competitor bridging stopped at cost cap")
-        elif getattr(args, "competitors", True):
-            print(f"{pfx}competitor research SKIPPED: "
-                  + ("cost cap reached" if meter.over_limit() else "run aborted earlier"))
-        # ================== END PHASE 1b ======================================
+        # Competitor implementation is orchestrator-owned and intentionally
+        # does not run here. The sole gate executes after pass 1 completes and
+        # before pass 2 may begin.
 
         # ================== PHASE 1c - RUNTIME-DATA EVIDENCE ==================
         # Owner order 2026-08-25. Reading source can only ever produce a CODE
@@ -15929,6 +16033,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if cycle == 1 and resume_findings:
                 skip = set(resume_findings)
                 sweep_files = [f for f in files if f not in skip]
+            if execution_orchestrator is not None:
+                execution_orchestrator.begin_pass(
+                    cycle,
+                    all_files if cycle == 1 else sweep_files,
+                    whole_repository=(cycle == 1),
+                )
 
             # BATCHED review-then-fix (owner fix 2026-08-12; see REVIEW_FIX_BATCH_SIZE
             # above). Review a chunk of the sweep, immediately fix whatever THAT chunk
@@ -16263,6 +16373,59 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if cycle_stopped:
                 break  # a hard-stop fired inside a batch; stop the whole run here
 
+            if execution_orchestrator is not None:
+                cycle_applied_files = execution_orchestrator.finish_pass(
+                    cycle, cycle_applied_files
+                )
+
+            # The orchestrator owns this boundary. The complete repository was
+            # reviewed and its verified edits were committed in pass one; now,
+            # and only now, FlexFactor researches and attempts the best
+            # applicable capabilities from the top three competitors. Every
+            # resulting verified edit joins pass two's exact delta scope.
+            if cycle == 1:
+                competitor_gate = _run_top_competitor_gate(
+                    args=args, pfx=pfx, report=report, checkpoint=checkpoint,
+                    display_name=display_name, purpose_blob=purpose_blob,
+                    stack=stack, purpose_reviewer=purpose_reviewer,
+                    author=author, cross=cross, project_dir=project_dir,
+                    all_files=all_files, meter=meter, baseline_ok=baseline_ok,
+                    oversized=oversized, noop_stats=noop_stats,
+                    errors_total=errors_total, done_set=done_set,
+                    total_to_review=total_to_review, git=git, branch=branch,
+                    prev_branch=prev_branch, purpose_contract=purpose_contract,
+                )
+                competitor_research = competitor_gate["research"]
+                competitor_bridged_findings.extend(competitor_gate["findings"])
+                purpose_files.extend(competitor_gate["purpose_files"])
+                applied_set.update(competitor_gate["applied"])
+                unverified_set.update(competitor_gate["unverified"])
+                fix_notes.extend(competitor_gate["notes"])
+                bridged_early = sorted(
+                    set(bridged_early) | set(competitor_gate["applied"])
+                )
+                committed_any = committed_any or competitor_gate["committed"]
+                cycle_applied_files = _unique_review_paths(
+                    list(cycle_applied_files) + competitor_gate["applied"]
+                )
+                if competitor_gate["applied"]:
+                    any_fixable_this_cycle = True
+                    any_applied_this_cycle = True
+                if execution_orchestrator is not None:
+                    execution_orchestrator.record_competitor_gate(
+                        attempted=competitor_gate["attempted"],
+                        implemented_files=competitor_gate["applied"],
+                        verified=int((competitor_research or {}).get("verified") or 0),
+                        note=(competitor_research or {}).get("coverage_note", ""),
+                    )
+                if competitor_gate["dirty_abort"]:
+                    dirty_abort = True
+                    stop_reason = (
+                        "aborted in competitor gate: refused rollback left an "
+                        "unverified candidate"
+                    )
+                    break
+
             if not any_fixable_this_cycle:
                 if all_review_incomplete:
                     # "Nothing to fix" is UNPROVEN: files whose review errored
@@ -16315,12 +16478,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "remaining defects not auto-fixable (see report notes)")
                 break
 
-            # Cycle 1 covered the entire codebase. Every follow-up is an exact
-            # delta pass: only verified files whose bytes changed THIS cycle.
-            # Rejected/no-op candidates are not requeued. Unproven reviews are
-            # the explicit fail-closed exception and remain until completed.
-            files = _next_cycle_review_paths(
-                cycle_applied_files, all_review_incomplete)
+            # Pass 1 covered the entire codebase. Every follow-up is an exact
+            # delta pass: only verified files whose bytes changed THIS pass,
+            # including verified competitor-gate edits before pass 2.
+            files = _next_cycle_review_paths(cycle_applied_files)
 
         # Reattach findings that were outside a later changed-files-only pass.
         # This happens before purpose/readiness/evidence phases so every consumer
@@ -17456,6 +17617,104 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                "Complete the invariant with executable evidence."),
                 })
 
+        # FINAL PUBLICATION GATE. Checkpoint commits deliberately remain local
+        # until every semantic, executable, deterministic, and independent
+        # review above approves the exact HEAD. A successful run with changes
+        # must then prove that HEAD is contained in origin's default branch.
+        publication_commit = None
+        if git:
+            _pub_head = _git(["rev-parse", "HEAD"], project_dir)
+            if _pub_head.returncode == 0:
+                publication_commit = (_pub_head.stdout or "").strip() or None
+        if git:
+            publication_required = _needs_final_publication(
+                project_dir, initial_commit, publication_commit
+            )
+        else:
+            publication_required = bool(
+                applied_files or test_files or e2e.get("spec_files")
+            )
+        prepublication_complete = bool(
+            converged
+            and suite_status is not False
+            and (readiness is None or readiness.get("ready") is not False)
+            and product_invariants.get("ready") is True
+            and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+        )
+        if not publication_required:
+            publication = {
+                "required": False, "complete": True,
+                "commit": publication_commit,
+                "default_branch": None, "remote_tip": None,
+                "reason": "no repository change requires publication",
+            }
+        elif not prepublication_complete:
+            publication = {
+                "required": True, "complete": False,
+                "commit": publication_commit,
+                "default_branch": None, "remote_tip": None,
+                "reason": "final verification is incomplete; publication was not attempted",
+            }
+        elif not git:
+            publication = {
+                "required": True, "complete": False, "commit": None,
+                "default_branch": None, "remote_tip": None,
+                "reason": "changed target is not a Git repository",
+            }
+        else:
+            publication = _publish_verified_head(
+                project_dir, branch, args, stack, publication_commit
+            )
+        if evidence is not None:
+            try:
+                evidence_mod.record_publication_gate(
+                    evidence["quality_gates"], evidence_paths, publication
+                )
+            except Exception as exc:
+                # A successful push without a durable proof artifact is still
+                # not a complete run. Keep the remote fact, but fail the final
+                # evidence ledger loudly so supervisors cannot call it green.
+                gate_rows = evidence["quality_gates"].setdefault("gates", [])
+                gate_rows.append({
+                    "id": "publication-evidence-persistence",
+                    "name": "Publication evidence persistence",
+                    "category": "publication", "ran": True,
+                    "passed": False, "status": "fail",
+                    "evidence": {"error": f"{type(exc).__name__}: {exc}"},
+                })
+                evidence["quality_gates"]["totals"] = {
+                    "pass": sum(g.get("status") == "pass" for g in gate_rows),
+                    "fail": sum(g.get("status") == "fail" for g in gate_rows),
+                    "blocked": sum(g.get("status") == "blocked" for g in gate_rows),
+                }
+                evidence["quality_gates"]["passed"] = False
+                converged = False
+                publication["evidence_error"] = f"{type(exc).__name__}: {exc}"
+        if publication.get("evidence_error"):
+            _publication_reason = (
+                "publication proof could not be persisted: "
+                + str(publication["evidence_error"])
+            )
+            if stop_reason and stop_reason != "converged: found == fixed":
+                stop_reason += "; additionally, " + _publication_reason
+            else:
+                stop_reason = _publication_reason
+            commit_status += "; " + _publication_reason
+        elif publication_required and not publication.get("complete"):
+            converged = False
+            _publication_reason = "publication incomplete: " + str(
+                publication.get("reason") or "verified commit is not on main"
+            )
+            if stop_reason and stop_reason != "converged: found == fixed":
+                stop_reason += "; additionally, " + _publication_reason
+            else:
+                stop_reason = _publication_reason
+            commit_status += "; " + _publication_reason
+        elif publication_required:
+            commit_status += "; merged/present on origin/" + str(
+                publication.get("default_branch") or "default"
+            )
+
         print(f"{pfx}Git: {commit_status}")
         suite_txt = ("GREEN" if suite_status else "RED" if suite_status is False else "not run")
         print(f"{pfx}Outcome: {stop_reason} | full suite: {suite_txt} | "
@@ -17513,6 +17772,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             "competitor_research": competitor_research,
             "competitors_enabled": bool(getattr(args, "competitors", True)),
             "product_invariants": product_invariants,
+            "publication": publication,
             "runtime_evidence": runtime_evidence,
             "purpose_contract": result.get("purpose_contract"),
             "purpose_before": purpose_before,
@@ -17609,6 +17869,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             purpose_bridged=len(bridged_files),
             product_invariants_ready=product_invariants.get("ready") is True,
             product_invariant_blockers=len(product_invariants.get("blockers") or []),
+            publication_required=publication.get("required") is True,
+            publication_complete=publication.get("complete") is True,
+            publication=publication,
             review_incomplete=len(all_review_incomplete),
             # The accounting identity travels with the RESULT, not just the
             # report, because `_audit_exit_code` is the layer supervisors read.
@@ -17658,7 +17921,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         and suite_status is not False
                         and (readiness is None or readiness.get("ready") is not False)
                         and product_invariants.get("ready") is True
-                        and ((evidence or {}).get("quality_gates") or {}).get("passed") is True)
+                        and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+                        and (publication.get("required") is not True
+                             or publication.get("complete") is True))
         if evidence_ledger is not None:
             with contextlib.suppress(Exception):
                 evidence_ledger.emit(
@@ -17927,13 +18192,19 @@ def _confirm_audit_apply(args, programs) -> bool:
 
 
 def run_audit(args) -> int:
-    # 1. Validate the program list (1..10).
-    programs = list(args.program or [])
-    if len(programs) < 1 or len(programs) > 10:
-        print("audit accepts 1 to 10 programs", file=sys.stderr)
+    # 1. One orchestrator owns one ordered queue (1..30). The legacy
+    # --parallel flag is accepted by the parser so saved launchers do not die,
+    # but it cannot widen execution: target N+1 is not admitted until target N
+    # has reached a terminal state.
+    try:
+        programs = _ff_execution.target_queue(args.program)
+    except _ff_execution.ExecutionContractError as exc:
+        print(f"audit target queue rejected: {exc}", file=sys.stderr)
         return 2
     total = len(programs)
-    parallel = max(1, min(args.parallel, total))
+    if int(getattr(args, "parallel", 1) or 1) != 1:
+        print("[orchestrator] --parallel is retired; targets run one at a time ",
+              "in the selected order.", file=sys.stderr, sep="")
 
     # Apply is confirmed ONCE, up front (workers run on threads and can't prompt).
     # Declining ABORTS. It used to set args.apply = False, i.e. quietly spend
@@ -17952,34 +18223,101 @@ def run_audit(args) -> int:
     if getattr(args, "dashboard", True):
         _launch_dashboard(total)
 
-    # 2. Audit each program in full isolation. e2e_port = 5180 for a single program
-    #    (unchanged from before); 5180 + index for concurrent ones so dev servers
-    #    never collide.
+    # 2. Audit each program in full isolation under the durable coordinator.
+    queue_mode = "prodready" if getattr(args, "readiness", False) else "audit"
+    orchestrator = _ff_execution.SequentialOrchestrator(
+        queue_mode,
+        programs,
+        state_path=os.environ.get("FLEXFACTOR_QUEUE_STATE") or None,
+        queue_id=os.environ.get("FLEXFACTOR_QUEUE_ID") or None,
+    )
+    print(f"[orchestrator] queue {orchestrator.queue_id}: {total} target(s), "
+          f"strictly sequential; receipt {orchestrator.state_path}")
+    saved = orchestrator.snapshot()
+    prior_codes = [int(row.get("exit_code") or 0)
+                   for row in saved["items"][:orchestrator.next_index]]
+    if orchestrator.next_index:
+        print(f"[orchestrator] resuming at target {orchestrator.next_index + 1}; "
+              f"{orchestrator.next_index} prior terminal outcome(s) remain in "
+              "the receipt")
     results: list[dict] = []
-    if parallel == 1:
-        for i, prog in enumerate(programs):
-            results.append(audit_one_program(prog, args, i + 1, total, 5180))
-    else:
-        print(f"Auditing {total} program(s), {parallel} at a time...\n")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
-            futures = {
-                pool.submit(audit_one_program, prog, args, i + 1, total, 5180 + i): i
-                for i, prog in enumerate(programs)
-            }
-            done = {}
-            for fut in concurrent.futures.as_completed(futures):
-                done[futures[fut]] = fut.result()
-            results = [done[i] for i in range(total)]  # restore input order
+    for index in range(orchestrator.next_index, total):
+        program = programs[index]
+        orchestrator.start_target(index)
+        child_args = argparse.Namespace(**vars(args))
+        child_args.execution_orchestrator = orchestrator
+        print(f"[orchestrator] target {index + 1}/{total}: {program}")
+        result = audit_one_program(program, child_args, index + 1, total, 5180)
+        results.append(result)
+        target_code = _audit_exit_code([result], apply_requested=True)
+        orchestrator.finish_target(
+            index, target_code,
+            note=str(result.get("stop_reason") or result.get("error") or "")
+        )
 
     # 3. Batch summary + combined report.
-    _print_batch_summary(results)
-    if total > 1:
+    if results:
+        _print_batch_summary(results)
+    if len(results) > 1:
         batch_path = _write_batch_report(results)
         print(f"\nCombined batch report: {batch_path}")
 
     # Every run is an apply run now (review-only was removed outright), so the
     # applied-nothing exit-code contract applies unconditionally.
-    return _audit_exit_code(results, apply_requested=True)
+    return (next((code for code in prior_codes if code != 0), 0)
+            or _audit_exit_code(results, apply_requested=True))
+
+
+def _run_simple_target_queue(args, attribute: str, runner, mode: str) -> int:
+    """Run refactor or Scout targets through the same sequential authority."""
+    try:
+        targets = _ff_execution.target_queue(getattr(args, attribute, None))
+    except _ff_execution.ExecutionContractError as exc:
+        print(f"{mode} target queue rejected: {exc}", file=sys.stderr)
+        return 2
+    orchestrator = _ff_execution.SequentialOrchestrator(
+        mode,
+        targets,
+        state_path=os.environ.get("FLEXFACTOR_QUEUE_STATE") or None,
+        queue_id=os.environ.get("FLEXFACTOR_QUEUE_ID") or None,
+    )
+    print(f"[orchestrator] queue {orchestrator.queue_id}: {len(targets)} "
+          f"target(s), strictly sequential; receipt {orchestrator.state_path}")
+    saved = orchestrator.snapshot()
+    codes: list[int] = [int(row.get("exit_code") or 0)
+                        for row in saved["items"][:orchestrator.next_index]]
+    if orchestrator.next_index:
+        print(f"[orchestrator] resuming at target {orchestrator.next_index + 1}; "
+              f"{orchestrator.next_index} prior terminal outcome(s) remain in "
+              "the receipt")
+    for index in range(orchestrator.next_index, len(targets)):
+        target = targets[index]
+        orchestrator.start_target(index)
+        child = argparse.Namespace(**vars(args))
+        setattr(child, attribute, target)
+        child.execution_orchestrator = orchestrator
+        print(f"[orchestrator] target {index + 1}/{len(targets)}: {target}")
+        try:
+            code = int(runner(child))
+        except (KeyboardInterrupt, SystemExit):
+            orchestrator.finish_target(index, 130, note="operator interruption")
+            raise
+        except BaseException as exc:
+            orchestrator.finish_target(
+                index, 1, note=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+        orchestrator.finish_target(index, code)
+        codes.append(code)
+    return next((code for code in codes if code != 0), 0)
+
+
+def run_refactor_queue(args) -> int:
+    return _run_simple_target_queue(args, "file", run, "refactor")
+
+
+def run_scout_queue(args) -> int:
+    return _run_simple_target_queue(args, "program", run_scout, "scout")
 
 
 #: Exit code for "the run completed, applied nothing, and was supposed to apply".
@@ -18075,12 +18413,17 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     incomplete = [r for r in results
                   if r.get("converged") is False
                   or r.get("suite_status") is False
-                  or r.get("readiness_ready") is False]
+                  or r.get("readiness_ready") is False
+                  or r.get("quality_gate_passed") is False
+                  or r.get("product_invariants_ready") is False
+                  or (r.get("publication_required") is True
+                      and r.get("publication_complete") is not True)]
     if incomplete:
         names = ", ".join(str(r.get("name")) for r in incomplete)
         print(f"\nFAILED: {len(incomplete)} program(s) ({names}) did not reach a "
-              "verified complete state (review convergence, project suite, or "
-              "production-readiness gate is still red).", file=sys.stderr)
+              "verified complete state (review, project suite, evidence, product "
+              "invariants, production readiness, or main-branch publication is "
+              "still open).", file=sys.stderr)
         return 1
     # A run that REVIEWED NOTHING is a failure whether or not apply was asked
     # for, and regardless of how many defects it "found". This is the hole the
@@ -18888,7 +19231,7 @@ def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) ->
 _TOP_LEVEL_USAGE = """\
 usage: flexfactor [-h] {refactor,scout,audit,prodready,policy} ...
 
-FlexFactor - local, build-gated, budget-capped dual-provider code tool.
+FlexFactor - orchestrated, independently reviewed, fail-closed code improvement.
 
 modes:
   refactor   Self-grading rewrite loop on ONE source file (the default: any
@@ -18900,7 +19243,8 @@ modes:
              project. EVERY RUN IS REAL: fixes are written and committed onto
              the branch the repo is already on, and pushed + merged to origin
              by default (green build + the project's own suite gate the push).
-             There is no report-only mode; --no-push/--no-merge keep it local.
+             There is no report-only or local-only mutation mode. Compatibility
+             flags that disable publication make the request fail preflight.
   prodready  Point it at any program and walk away: detect every toolchain,
              install its dependencies, hunt and fix defects (down to medium),
              then score it against a production-readiness rubric and write a
@@ -19114,18 +19458,24 @@ def main(argv=None) -> int:
             prog="flexfactor scout",
             description="Scout Repo Rewards for repos that would benefit a program you enter.",
         )
-        parser.add_argument("--program", required=True,
-                            help="The program to help: a project folder, file, .lnk shortcut, URL, or description.")
-        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
-                            help="LLM backend (default: anthropic).")
-        parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+        parser.add_argument("--program", required=True, action="append",
+                            help="Program to help: folder, file, shortcut, URL, or description. "
+                                 "Repeat up to 30 times; the orchestrator runs them in order.")
+        parser.add_argument("--provider",
+                            choices=["auto", "anthropic", "openai", "ollama", "copilot"],
+                            default="auto", help=argparse.SUPPRESS)
+        parser.add_argument("--model-mode",
+                            choices=["best", "best-available", "free", "paid", "auto", "local"],
+                            default="best", dest="model_mode", help=argparse.SUPPRESS)
+        parser.add_argument("--model", default=None, help=argparse.SUPPRESS)
         parser.add_argument("--economy", action="store_true", dest="economy",
-                            help="Cheapest-credits mode, same switch as audit/prodready: author "
-                                 "integrations with claude-sonnet-5 instead of the Opus tier. "
-                                 "--model overrides this; no-op on providers with no economy tier.")
+                            help=argparse.SUPPRESS)
         parser.add_argument("--judge-model", default=None, dest="judge_model",
-                            help="Cheap model for judging calls (profile/benefit). "
-                                 "Default: the provider's small tier. Pass the author model id to disable tiering.")
+                            help=argparse.SUPPRESS)
+        parser.add_argument("--max-cost", type=float, default=150.0,
+                            dest="max_cost",
+                            help="Hard USD ceiling for the single paid-to-free ladder "
+                                 "(default: 150.0).")
         parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
                             dest="repo_rewards_url", help="Base URL of the Repo Rewards service.")
         parser.add_argument("--top", type=int, default=8,
@@ -19185,11 +19535,10 @@ def main(argv=None) -> int:
                                  "installs use --ignore-scripts, because lifecycle scripts are "
                                  "arbitrary code execution (the safe_to_execute verdict is never "
                                  "granted automatically).")
-        parser.add_argument("--push", action="store_true", dest="push", default=False,
-                            help="Push the apply branch to origin (default: OFF - commit locally only, "
-                                 "never auto-push).")
-        parser.add_argument("--merge", action="store_true", dest="merge",
-                            help="After a verified commit, also merge the branch into the current branch.")
+        parser.add_argument("--push", action="store_true", dest="push", default=True,
+                            help=argparse.SUPPRESS)
+        parser.add_argument("--merge", action="store_true", dest="merge", default=True,
+                            help=argparse.SUPPRESS)
         parser.add_argument("--branch-prefix", default="flexfactor/adopt-", dest="branch_prefix",
                             help="ACCEPTED BUT INERT: it does NOT name a branch. Sandbox "
                                  "branches were removed 2026-08-11 and nothing runs "
@@ -19239,8 +19588,9 @@ def main(argv=None) -> int:
         # bypassed was the approval gate itself.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        args.model_mode = "best"
         _set_egress_mode(args)
-        return run_scout(args)
+        return run_scout_queue(args)
 
     if mode in ("audit", "prodready"):
         _prod = (mode == "prodready")
@@ -19255,41 +19605,25 @@ def main(argv=None) -> int:
         )
         parser.add_argument("--program", required=True, action="append",
                             help="Program to audit: a project folder, file, .lnk, URL, or name. "
-                                 "Repeatable: pass up to 10 to audit several programs in one run.")
+                                 "Repeatable up to 30; the orchestrator runs them one at a time.")
         parser.add_argument("--parallel", type=int, default=1, dest="parallel",
-                            help="How many programs to audit concurrently (default: 1).")
-        parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
-                            help="LLM backend (default: anthropic).")
+                            help=argparse.SUPPRESS)
+        parser.add_argument("--provider",
+                            choices=["auto", "anthropic", "openai", "ollama", "copilot"],
+                            default="auto", help=argparse.SUPPRESS)
         # choices still ACCEPTS the retired spellings so an invocation we did not
         # find degrades with a warning instead of argparse exit 2 (the documented
         # launcher-drift trap), but metavar OFFERS exactly the two the owner asked
         # for, so --help and any error message show two choices and only two.
         parser.add_argument("--model-mode",
-                            choices=["free", "paid", "auto", "local"],
-                            metavar="{free,paid}",
-                            default="free", dest="model_mode",
-                            help="free (default): free routes only - cloud free tiers plus local "
-                                 "Ollama/FCC; the run cannot spend. paid: the owner's Anthropic and "
-                                 "OpenAI accounts only, until their credits expire. "
-                                 "('auto' and 'local' are retired and run as 'free'.)")
+                            choices=["best", "best-available", "free", "paid", "auto", "local"],
+                            default="best", dest="model_mode", help=argparse.SUPPRESS)
         parser.add_argument("--paid-models", choices=["both", "anthropic", "openai"],
                             default="both", dest="paid_models",
-                            help="Which of the owner's accounts a PAID run may use "
-                                 "(default: both). 'both' keeps the contract that every "
-                                 "applied fix is approved by the model that did not "
-                                 "write it, and refuses to start if either account is "
-                                 "unusable. 'anthropic' or 'openai' is a deliberate "
-                                 "SINGLE-MODEL paid run on that account alone - useful "
-                                 "when the other one is out of credit - and the report "
-                                 "says so rather than implying a second opinion. No "
-                                 "effect in free mode.")
-        parser.add_argument("--model", default=None, help="Override the AUTHOR model id (code generation).")
+                            help=argparse.SUPPRESS)
+        parser.add_argument("--model", default=None, help=argparse.SUPPRESS)
         parser.add_argument("--economy", action="store_true", dest="economy",
-                            help="Cheapest-credits mode: author fixes/tests with claude-sonnet-5 "
-                                 "($3/$15 per 1M vs Opus 4.8's $5/$25; near-Opus code quality). "
-                                 "Review + cross-verify already run on the cheap judge tier. "
-                                 "The build gate / cross-model veto / rollback safety net is "
-                                 "unchanged. --model overrides this; no-op on openai.")
+                            help=argparse.SUPPRESS)
         parser.add_argument("--judge-model", default=None, dest="judge_model",
                             help="Cheap model for judging calls (line-by-line review + cross-model "
                                  "fix verification - the bulk of the calls). Default: the provider's "
@@ -19324,18 +19658,19 @@ def main(argv=None) -> int:
                             help="Skip the live 1-token key check that drops providers whose key "
                                  "is set but dead (out of credits / revoked). By default a dead "
                                  "primary auto-falls-back to a working provider.")
-        parser.add_argument("--cycles", type=int, default=3,
-                            help="Cycle cap when NOT --until-clean (default: 3).")
+        parser.add_argument("--cycles", type=_ff_execution.pass_count, default=6,
+                            help="Pass cap when NOT --until-clean (default and maximum: 6).")
         parser.add_argument("--no-until-clean", action="store_false", dest="until_clean",
                             help="Stop after --cycles instead of looping until found==fixed.")
-        parser.add_argument("--max-cycles", type=int, default=12, dest="max_cycles",
-                            help="Hard cycle ceiling for --until-clean (default: 12).")
+        parser.add_argument("--max-cycles", type=_ff_execution.pass_count, default=6,
+                            dest="max_cycles",
+                            help="Hard pass ceiling for --until-clean (maximum: 6).")
         parser.add_argument("--max-cost", type=float, default=150.0, dest="max_cost",
                             help="Hard USD budget per program; stop spending once reached "
                                  "(default: 150.0). Use 0 to disable the cap. HEADROOM, not a "
-                                 "target: with FREE-FIRST the local model does the reviewing "
-                                 "at $0 and only the cloud cross-check bills, so a correct run "
-                                 "should land far below even the old $50. The cap exists so a "
+                                 "target: the strongest available paid capacity runs first, then "
+                                 "the ladder descends through lower tiers to free capacity. The "
+                                 "cap exists so a "
                                  "misroute cannot run away, not because a run is expected to "
                                  "approach it.")
         parser.add_argument("--no-full-suite", action="store_false", dest="full_suite",
@@ -19383,15 +19718,12 @@ def main(argv=None) -> int:
                                  "source may be reused, or only its documented behaviour.")
         parser.add_argument("--no-competitors", action="store_false", dest="competitors",
                             help="Skip competitor research entirely.")
-        parser.add_argument("--competitor-count", type=int, default=5,
+        parser.add_argument("--competitor-count", type=int, default=3,
                             dest="competitor_count",
-                            help="How many competitors to cover (default: 5). A shortfall is "
-                                 "reported as a shortfall, never padded.")
-        parser.add_argument("--competitor-fixes", type=int, default=5,
+                            help=argparse.SUPPRESS)
+        parser.add_argument("--competitor-fixes", type=int, default=3,
                             dest="competitor_fixes",
-                            help="Max competitor-derived findings allowed into the FIX stream "
-                                 "(default: 5). Reference-only and unverified candidates are "
-                                 "never bridged, whatever this is set to.")
+                            help=argparse.SUPPRESS)
         parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
                             dest="repo_rewards_url",
                             help="Base URL of the Repo Rewards service used by competitor "
@@ -19472,20 +19804,17 @@ def main(argv=None) -> int:
         parser.add_argument("--app-url", default=None, dest="app_url",
                             help="Base URL the dev server serves on (default: guessed from framework).")
         parser.add_argument("--push", action="store_true", dest="push", default=False,
-                            help="Push the audit branch (and the merged base) to origin. "
-                                 "Default: ON in both audit --apply and prodready (owner "
-                                 "directive 2026-08-11: verified results go to main "
-                                 "automatically); --no-push turns it off.")
+                            help="Require verified publication to origin's default branch "
+                                 "(always ON for writing runs; retained for compatibility).")
         parser.add_argument("--no-push", action="store_false", dest="push",
-                            help="Keep commits local (audit and prodready both default "
-                                 "push ON; this turns it back off).")
+                            help="Compatibility flag: writing runs reject this at preflight; "
+                                 "local-only mutation is not a supported success path.")
         parser.add_argument("--merge", action="store_true", dest="merge",
-                            help="If the final build passes, merge the audit branch into the "
-                                 "current branch (default: ON; --no-merge turns it off).")
+                            help="Require the exact reviewed commit to reach the remote "
+                                 "default branch (always ON for writing runs).")
         parser.add_argument("--no-merge", action="store_false", dest="merge",
-                            help="Do not merge into the current branch (audit and prodready "
-                                 "both default merge ON, gated on a green final build; "
-                                 "this turns it off).")
+                            help="Compatibility flag: writing runs reject this at preflight; "
+                                 "an unmerged branch is never a completed run.")
         parser.add_argument("--branch-prefix", default="flexfactor/audit-", dest="branch_prefix",
                             help="Does NOT name a branch: sandbox branches were removed "
                                  "2026-08-11 and fixes commit onto the branch the repo is "
@@ -19518,6 +19847,11 @@ def main(argv=None) -> int:
         # invocation (exit 2) before anything runs or spends.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        # One product contract: the competitor gate is mandatory and fixed at
+        # the top three, whatever a retired saved invocation requested.
+        args.competitors = True
+        args.competitor_count = _ff_execution.TOP_COMPETITORS
+        args.competitor_fixes = _ff_execution.TOP_COMPETITORS
 
         def _asked(*full: str) -> bool:
             """Was this flag actually TYPED? argparse cannot distinguish 'left at
@@ -19582,12 +19916,7 @@ def main(argv=None) -> int:
             args.push = True
         if not _asked("--no-merge"):
             args.merge = True
-        if normalize_model_mode(args.model_mode) == "free":
-            # The provider adapters have a transport-rescue path that can use
-            # these captured keys after a loopback timeout. Local means local:
-            # remove that escape hatch before any provider is constructed.
-            os.environ.pop("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY", None)
-            os.environ.pop("FLEXFACTOR_FALLBACK_OPENAI_KEY", None)
+        args.model_mode = "best"
         _set_egress_mode(args)
         return run_audit(args)
 
@@ -19595,25 +19924,38 @@ def main(argv=None) -> int:
         prog="flexfactor",
         description="FlexFactor - a self-improving refactoring agent that does reps on your code.",
     )
-    parser.add_argument("--file", required=True, help="Path to the source file to refactor.")
+    parser.add_argument("--file", required=True, action="append",
+                        help="Source file to refactor. Repeat up to 30 times; the "
+                             "orchestrator runs them one at a time.")
     parser.add_argument("--goal", required=True, help="Plain-English description of the desired change.")
-    parser.add_argument("--provider", choices=["anthropic", "openai", "ollama", "copilot"], default="anthropic",
-                        help="LLM backend (default: anthropic).")
-    parser.add_argument("--model", default=None, help="Override the model id for the chosen provider.")
+    parser.add_argument("--provider",
+                        choices=["auto", "anthropic", "openai", "ollama", "copilot"],
+                        default="auto", help=argparse.SUPPRESS)
+    parser.add_argument("--model-mode",
+                        choices=["best", "best-available", "free", "paid", "auto", "local"],
+                        default="best", dest="model_mode", help=argparse.SUPPRESS)
+    parser.add_argument("--model", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--economy", action="store_true", dest="economy",
-                        help="Cheapest-credits mode, same switch as audit/prodready: author the "
-                             "rewrite with claude-sonnet-5 instead of the Opus tier. --model "
-                             "overrides this; no-op on providers with no economy tier.")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--judge-model", default=None, dest="judge_model",
-                        help="Cheap model used for grading reps. Default: the provider's small tier. "
-                             "Pass the author model id to grade with the same model that rewrites.")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--threshold", type=int, default=90, help="Minimum grade to accept (default: 90).")
-    parser.add_argument("--max-iterations", type=int, default=5, dest="max_iterations",
-                        help="Maximum rewrite/grade reps (default: 5).")
+    parser.add_argument("--max-iterations", type=_ff_execution.pass_count, default=6,
+                        dest="max_iterations",
+                        help="Maximum rewrite/grade passes (default and maximum: 6).")
+    parser.add_argument("--max-cost", type=float, default=150.0, dest="max_cost",
+                        help="Hard USD ceiling for the single paid-to-free ladder "
+                             "(default: 150.0).")
     _add_egress_args(parser)
     args = parser.parse_args(rest)
+    # Refactor is a production mutation, not a local-only side path. The
+    # selected file is committed only after the repository's real gate and the
+    # exact commit must land on the remote default branch before exit 0.
+    args.push = True
+    args.merge = True
+    args.model_mode = "best"
     _set_egress_mode(args)
-    return run(args)
+    return run_refactor_queue(args)
 
 
 def runtime_manifest() -> dict:

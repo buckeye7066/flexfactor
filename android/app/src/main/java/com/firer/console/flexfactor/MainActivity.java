@@ -43,7 +43,6 @@ public final class MainActivity extends Activity {
     private static final String LOGIN = "github_login";
     private static final String REPOSITORY = "selected_repository";
     private static final String REF = "selected_ref";
-    private static final String PROVIDER = "selected_provider";
     private static final String LAST_RUN_ID = "last_run_id";
     private static final String LAST_RUN_REPOSITORY = "last_run_repository";
     private static final String LAST_RUN_REQUEST_ID = "last_run_request_id";
@@ -51,6 +50,7 @@ public final class MainActivity extends Activity {
     private static final String LAST_RUN_URL = "last_run_url";
     private static final String LAST_RUN_STATUS = "last_run_status";
     private static final String RUN_HISTORY = "run_history";
+    private static final String RUN_QUEUE = "run_queue";
     private static final long POLL_MS = 5_000L;
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -62,13 +62,15 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private LinearLayout content;
     private Button repositoryButton;
-    private Button providerButton;
     private Button settingsButton;
     private Button updateButton;
     private TextView accountState;
     private TextView runState;
     private boolean destroyed;
     private boolean polling;
+    private volatile boolean queueDispatching;
+    private volatile String queueLoadFailure = "";
+    private boolean queueLoadWarningShown;
     private boolean pendingStartupUpdate;
     private volatile Thread authorizationThread;
 
@@ -91,6 +93,7 @@ public final class MainActivity extends Activity {
             main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
         }
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
+        main.postDelayed(this::resumeRunQueue, 500L);
     }
 
     @Override
@@ -98,6 +101,7 @@ public final class MainActivity extends Activity {
         super.onResume();
         refreshHeader();
         if (preferences.getLong(LAST_RUN_ID, 0L) > 0L) pollLastRun();
+        resumeRunQueue();
         if (directUpdatesEnabled() && pendingStartupUpdate
                 && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
                 || getPackageManager().canRequestPackageInstalls())) {
@@ -134,7 +138,7 @@ public final class MainActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        settingsButton = button(configured() ? "Provider settings" : "Sign in with GitHub");
+        settingsButton = button(configured() ? "Settings" : "Sign in with GitHub");
         settingsButton.setOnClickListener(view -> {
             if (configured()) showCredentialSetup(); else startGitHubSignIn();
         });
@@ -153,11 +157,10 @@ public final class MainActivity extends Activity {
         repositoryButton.setOnClickListener(view -> chooseRepository());
         content.addView(repositoryButton, margins(0, 4, 0, 12));
 
-        content.addView(section("Model provider"));
-        providerButton = button("Choose provider");
-        providerButton.setContentDescription("Choose a model provider");
-        providerButton.setOnClickListener(view -> chooseProvider());
-        content.addView(providerButton, margins(0, 4, 0, 12));
+        content.addView(section("Model policy"));
+        content.addView(text("Best available automatically: strongest paid capacity first, "
+                + "then each lower tier, then the hosted open model.",
+                14, Color.rgb(156, 168, 181)));
 
         content.addView(section("What do you want FlexFactor to do?"));
         addMode("1 · Refactor a file",
@@ -213,7 +216,7 @@ public final class MainActivity extends Activity {
         String login = preferences.getString(LOGIN, "");
         if (configured()) {
             accountState.setText("Signed in as " + (login.isEmpty() ? "GitHub user" : login)
-                    + " · Provider: " + providerLabel(selectedProvider())
+                    + " · Model policy: best available"
                     + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
@@ -225,52 +228,9 @@ public final class MainActivity extends Activity {
             String ref = preferences.getString(REF, "main");
             repositoryButton.setText(repo.isEmpty() ? "Choose repository" : repo + " · " + ref);
         }
-        if (providerButton != null) providerButton.setText(providerLabel(selectedProvider()));
         if (settingsButton != null) {
-            settingsButton.setText(configured() ? "Provider settings" : "Sign in with GitHub");
+            settingsButton.setText(configured() ? "Settings" : "Sign in with GitHub");
         }
-    }
-
-    private MobileRunRequest.Provider selectedProvider() {
-        String saved = preferences.getString(PROVIDER, "");
-        for (MobileRunRequest.Provider provider : MobileRunRequest.Provider.values()) {
-            if (provider.wire.equals(saved)) return provider;
-        }
-        return secrets.contains(SecureStore.OPENAI_KEY)
-                ? MobileRunRequest.Provider.OPENAI : MobileRunRequest.Provider.OLLAMA;
-    }
-
-    private static String providerLabel(MobileRunRequest.Provider provider) {
-        if (provider == MobileRunRequest.Provider.OPENAI) return "OpenAI";
-        if (provider == MobileRunRequest.Provider.ANTHROPIC) return "Anthropic";
-        if (provider == MobileRunRequest.Provider.COPILOT) return "GitHub Copilot";
-        return "Hosted open model";
-    }
-
-    private void chooseProvider() {
-        String[] labels = {"OpenAI", "Anthropic", "GitHub Copilot", "Hosted open model"};
-        MobileRunRequest.Provider[] providers = {
-                MobileRunRequest.Provider.OPENAI,
-                MobileRunRequest.Provider.ANTHROPIC,
-                MobileRunRequest.Provider.COPILOT,
-                MobileRunRequest.Provider.OLLAMA,
-        };
-        new AlertDialog.Builder(this)
-                .setTitle("Choose provider")
-                .setSingleChoiceItems(labels, indexOfProvider(providers, selectedProvider()),
-                        (dialog, which) -> {
-                            preferences.edit().putString(PROVIDER, providers[which].wire).apply();
-                            dialog.dismiss();
-                            refreshHeader();
-                        })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private static int indexOfProvider(MobileRunRequest.Provider[] values,
-            MobileRunRequest.Provider selected) {
-        for (int i = 0; i < values.length; i++) if (values[i] == selected) return i;
-        return 0;
     }
 
     private boolean configured() {
@@ -621,16 +581,18 @@ public final class MainActivity extends Activity {
     private void showRefactorDialog() {
         if (!requireReadyTarget()) return;
         LinearLayout form = form();
-        EditText file = input("Repository-relative file, for example src/app.ts");
+        EditText file = input("Repository-relative files, one per line (up to 30)");
+        file.setSingleLine(false);
+        file.setMinLines(3);
         EditText goal = input("What should this file do better?");
         goal.setMinLines(3);
         goal.setSingleLine(false);
         EditText threshold = input("Acceptance threshold (0–100)");
         threshold.setInputType(InputType.TYPE_CLASS_NUMBER);
         threshold.setText("90");
-        EditText iterations = input("Maximum refactor iterations (1–20)");
+        EditText iterations = input("Maximum refactor passes (1–6)");
         iterations.setInputType(InputType.TYPE_CLASS_NUMBER);
-        iterations.setText("5");
+        iterations.setText("6");
         form.addView(file);
         form.addView(goal);
         form.addView(threshold);
@@ -645,16 +607,23 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 .setOnClickListener(view -> {
                     try {
-                        MobileRunRequest request = new MobileRunRequest(
-                                MobileRunRequest.Mode.REFACTOR, selectedProvider(),
-                                preferences.getString(REPOSITORY, ""),
-                                preferences.getString(REF, "main"),
-                                file.getText().toString(), goal.getText().toString(), false, 25,
-                                Integer.parseInt(threshold.getText().toString().trim()),
-                                Integer.parseInt(iterations.getText().toString().trim()),
-                                true, true);
+                        String[] paths = file.getText().toString().split("\\r?\\n");
+                        List<MobileRunRequest> requests = new ArrayList<>();
+                        for (String path : paths) {
+                            if (path.trim().isEmpty()) continue;
+                            requests.add(new MobileRunRequest(
+                                    MobileRunRequest.Mode.REFACTOR,
+                                    preferences.getString(REPOSITORY, ""),
+                                    preferences.getString(REF, "main"),
+                                    path, goal.getText().toString(), false, 25,
+                                    Integer.parseInt(threshold.getText().toString().trim()),
+                                    Integer.parseInt(iterations.getText().toString().trim())));
+                        }
+                        if (requests.isEmpty() || requests.size() > MobileRunQueue.MAX_TARGETS) {
+                            throw new IllegalArgumentException("Choose from 1 through 30 files.");
+                        }
                         dialog.dismiss();
-                        confirmAndDispatch(request);
+                        confirmAndDispatchBatch(requests);
                     } catch (NumberFormatException rejected) {
                         showError("Check refactor settings", "Threshold and iterations must be numbers.");
                     } catch (IllegalArgumentException rejected) {
@@ -674,14 +643,23 @@ public final class MainActivity extends Activity {
         form.addView(text("Report mode researches improvements without changing the target. Enable apply to process proposals through FlexFactor's approval and verification gates.",
                 14, Color.rgb(170, 181, 194)));
         form.addView(apply);
+        CheckBox batch = new CheckBox(this);
+        batch.setText("Choose up to 30 repositories (run one at a time)");
+        batch.setTextColor(Color.WHITE);
+        form.addView(batch);
         new AlertDialog.Builder(this)
                 .setTitle("Option 2 · Scout")
                 .setView(form)
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Run FlexFactor", (dialog, which) -> {
                     try {
-                        confirmAndDispatch(request(MobileRunRequest.Mode.SCOUT,
-                                "", "", apply.isChecked(), 25));
+                        if (batch.isChecked()) {
+                            chooseBatchRepositories(
+                                    MobileRunRequest.Mode.SCOUT, 25, apply.isChecked());
+                        } else {
+                            confirmAndDispatch(request(MobileRunRequest.Mode.SCOUT,
+                                    "", "", apply.isChecked(), 25));
+                        }
                     } catch (IllegalArgumentException rejected) {
                         showError("Check the run details", rejected.getMessage());
                     }
@@ -691,27 +669,15 @@ public final class MainActivity extends Activity {
 
     private void showRunDialog(MobileRunRequest.Mode mode) {
         if (!requireReadyTarget()) return;
-        EditText cost = input(secrets.contains(SecureStore.OPENAI_KEY)
-                ? "Maximum OpenAI cost in USD (1–150)"
-                : "Maximum provider budget (1–150)");
+        EditText cost = input("Maximum paid-model cost in USD (1–150)");
         cost.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         cost.setText(mode == MobileRunRequest.Mode.PRODREADY ? "150" : "50");
         LinearLayout form = form();
         form.addView(cost);
-        CheckBox economy = new CheckBox(this);
-        economy.setText("Economy author model (desktop default)");
-        economy.setTextColor(Color.WHITE);
-        economy.setChecked(true);
-        CheckBox useBoth = new CheckBox(this);
-        useBoth.setText("Use independent cross-model verification when available");
-        useBoth.setTextColor(Color.WHITE);
-        useBoth.setChecked(true);
         CheckBox batch = new CheckBox(this);
-        batch.setText("Run up to 10 repositories in parallel");
+        batch.setText("Choose up to 30 repositories (run one at a time)");
         batch.setTextColor(Color.WHITE);
         batch.setChecked(false);
-        form.addView(economy);
-        form.addView(useBoth);
         form.addView(batch);
         String title = mode == MobileRunRequest.Mode.AUDIT
                 ? "Option 3 · Audit and repair" : "Option 4 · Production ready";
@@ -724,11 +690,9 @@ public final class MainActivity extends Activity {
                     try {
                         double cap = Double.parseDouble(cost.getText().toString().trim());
                         if (batch.isChecked()) {
-                            chooseBatchRepositories(mode, cap,
-                                    economy.isChecked(), useBoth.isChecked());
+                            chooseBatchRepositories(mode, cap, false);
                         } else {
-                            confirmAndDispatch(request(mode, "", "", false, cap,
-                                    economy.isChecked(), useBoth.isChecked()));
+                            confirmAndDispatch(request(mode, "", "", false, cap));
                         }
                     } catch (NumberFormatException rejected) {
                         showError("Check the cost cap", "Enter a number from 1 through 150.");
@@ -741,44 +705,39 @@ public final class MainActivity extends Activity {
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
             boolean scoutApply, double cost) {
-        return request(mode, file, goal, scoutApply, cost, true, true);
-    }
-
-    private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
-            boolean scoutApply, double cost, boolean economy, boolean useBoth) {
-        return new MobileRunRequest(mode, selectedProvider(),
+        return new MobileRunRequest(mode,
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
-                file, goal, scoutApply, cost, 90, 5, economy, useBoth);
+                file, goal, scoutApply, cost, 90, 6);
     }
 
     private void confirmAndDispatch(MobileRunRequest request) {
         String detail = request.repository + " · " + request.ref;
-        detail += "\nProvider: " + providerLabel(request.provider);
+        detail += "\nModel policy: best available, paid to free";
         if (request.mode == MobileRunRequest.Mode.AUDIT
                 || request.mode == MobileRunRequest.Mode.PRODREADY) {
             detail += "\nMaximum provider cost: $"
                     + String.format(Locale.US, "%.2f", request.maxCost);
-            detail += "\nCross-model verification: " + (request.useBoth ? "on" : "off");
         }
         new AlertDialog.Builder(this)
                 .setTitle("Start " + request.mode.wire + "?")
                 .setMessage(detail)
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Start", (dialog, which) -> dispatch(request))
+                .setPositiveButton("Start", (dialog, which) ->
+                        dispatchBatch(java.util.Collections.singletonList(request)))
                 .show();
     }
 
     private void chooseBatchRepositories(MobileRunRequest.Mode mode, double cost,
-            boolean economy, boolean useBoth) {
+            boolean scoutApply) {
         if (!requireConfiguration()) return;
-        runState.setText("Loading repositories for the parallel run…");
+        runState.setText("Loading repositories for the sequential queue…");
         worker.execute(() -> {
             try {
                 List<GitHubApi.Repository> repositories = api.repositories(
                         githubToken());
                 post(() -> showBatchRepositoryList(
-                        repositories, mode, cost, economy, useBoth));
+                        repositories, mode, cost, scoutApply));
             } catch (Exception failed) {
                 invalidateRejectedSession(failed);
                 post(() -> {
@@ -790,7 +749,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showBatchRepositoryList(List<GitHubApi.Repository> repositories,
-            MobileRunRequest.Mode mode, double cost, boolean economy, boolean useBoth) {
+            MobileRunRequest.Mode mode, double cost, boolean scoutApply) {
         refreshRunLabel();
         if (repositories.isEmpty()) {
             showError("No writable repositories",
@@ -806,7 +765,7 @@ public final class MainActivity extends Activity {
             checked[i] = repository.fullName.equals(selected);
         }
         new AlertDialog.Builder(this)
-                .setTitle("Choose up to 10 repositories")
+                .setTitle("Choose up to 30 repositories")
                 .setMultiChoiceItems(labels, checked,
                         (dialog, which, isChecked) -> checked[which] = isChecked)
                 .setNegativeButton("Cancel", null)
@@ -815,13 +774,13 @@ public final class MainActivity extends Activity {
                     for (int i = 0; i < checked.length; i++) {
                         if (!checked[i]) continue;
                         GitHubApi.Repository repository = repositories.get(i);
-                        requests.add(new MobileRunRequest(mode, selectedProvider(),
+                        requests.add(new MobileRunRequest(mode,
                                 repository.fullName, repository.defaultBranch,
-                                "", "", false, cost, 90, 5, economy, useBoth));
+                                "", "", scoutApply, cost, 90, 6));
                     }
-                    if (requests.isEmpty() || requests.size() > 10) {
-                        showError("Check the parallel run",
-                                "Choose from 1 through 10 repositories.");
+                    if (requests.isEmpty() || requests.size() > MobileRunQueue.MAX_TARGETS) {
+                        showError("Check the queue",
+                                "Choose from 1 through 30 repositories.");
                         return;
                     }
                     confirmAndDispatchBatch(requests);
@@ -832,65 +791,106 @@ public final class MainActivity extends Activity {
     private void confirmAndDispatchBatch(List<MobileRunRequest> requests) {
         MobileRunRequest first = requests.get(0);
         new AlertDialog.Builder(this)
-                .setTitle("Start " + requests.size() + " parallel " + first.mode.wire + " runs?")
-                .setMessage("Each repository gets an independent, private-aware FlexFactor workflow and run. The app will keep every run in Active and recent runs.")
+                .setTitle("Queue " + requests.size() + " " + first.mode.wire + " runs?")
+                .setMessage("The orchestrator starts exactly one target at a time and persists the remaining queue on this phone.")
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Start all", (dialog, which) -> dispatchBatch(requests))
+                .setPositiveButton("Start queue", (dialog, which) -> dispatchBatch(requests))
                 .show();
     }
 
     private void dispatchBatch(List<MobileRunRequest> requests) {
-        runState.setText("Starting 0 of " + requests.size() + " repositories…");
-        worker.execute(() -> {
-            int started = 0;
-            List<String> failures = new ArrayList<>();
-            for (MobileRunRequest request : requests) {
-                try {
-                    GitHubApi.RunState state = api.dispatch(
-                            githubToken(),
-                            secrets.get(SecureStore.OPENAI_KEY),
-                            secrets.get(SecureStore.ANTHROPIC_KEY), request);
-                    recordRun(state, request);
-                    preferences.edit()
-                            .putLong(LAST_RUN_ID, state.id)
-                            .putString(LAST_RUN_REPOSITORY, request.repository)
-                            .putString(LAST_RUN_REQUEST_ID, request.requestId)
-                            .putString(LAST_RUN_MODE, request.mode.wire)
-                            .putString(LAST_RUN_URL, state.htmlUrl)
-                            .putString(LAST_RUN_STATUS, "Queued · " + request.repository)
-                            .apply();
-                    started++;
-                    int progress = started;
-                    post(() -> runState.setText("Started " + progress + " of "
-                            + requests.size() + " repositories…"));
-                } catch (Exception failed) {
-                    failures.add(request.repository + ": " + safeMessage(failed));
-                    if (invalidateRejectedSession(failed)) break;
-                }
-            }
-            int totalStarted = started;
-            post(() -> {
-                refreshRunLabel();
-                pollLastRun();
-                if (!failures.isEmpty()) {
-                    showError("Some parallel runs did not start",
-                            totalStarted + " started.\n\n" + String.join("\n", failures));
-                } else {
-                    Toast.makeText(this, "All " + totalStarted
-                            + " FlexFactor runs started", Toast.LENGTH_LONG).show();
-                }
-            });
-        });
+        MobileRunQueue existingQueue = loadRunQueue();
+        if (!queueLoadFailure.isEmpty()) {
+            showError("The saved queue needs attention", queueLoadFailure);
+            return;
+        }
+        if (existingQueue != null && !existingQueue.isComplete()) {
+            showError("A FlexFactor queue is already active",
+                    "The orchestrator will not replace pending work. Let the saved queue finish first.");
+            return;
+        }
+        if (runHistory().stream().anyMatch(record -> !record.complete)) {
+            showError("A FlexFactor target is already active",
+                    "The orchestrator will not overlap targets. Wait for the active run to finish.");
+            return;
+        }
+        try {
+            MobileRunQueue queue = new MobileRunQueue(requests);
+            saveRunQueue(queue);
+            runState.setText("Queued 0 of " + queue.size() + " targets…");
+            dispatchNextQueued();
+        } catch (RuntimeException rejected) {
+            showError("Check the queue", rejected.getMessage());
+        }
     }
 
-    private void dispatch(MobileRunRequest request) {
-        runState.setText("Submitting " + request.mode.wire + " to FlexFactor Cloud…");
+    private synchronized MobileRunQueue loadRunQueue() {
+        String raw = preferences.getString(RUN_QUEUE, "");
+        if (raw.isEmpty()) return null;
+        try {
+            MobileRunQueue queue = MobileRunQueue.fromJson(raw);
+            queueLoadFailure = "";
+            return queue;
+        } catch (IllegalArgumentException damaged) {
+            queueLoadFailure = "FlexFactor preserved the unreadable queue instead of risking "
+                    + "overlapping its remote work. Clear the app's storage only after confirming "
+                    + "that no queued GitHub run is active.";
+            return null;
+        }
+    }
+
+    private synchronized void saveRunQueue(MobileRunQueue queue) {
+        boolean saved;
+        if (queue == null || queue.isComplete()) {
+            saved = preferences.edit().remove(RUN_QUEUE).commit();
+        } else {
+            saved = preferences.edit().putString(RUN_QUEUE, queue.toJson()).commit();
+        }
+        if (!saved) {
+            throw new IllegalStateException("The FlexFactor queue could not be saved durably.");
+        }
+    }
+
+    private void resumeRunQueue() {
+        MobileRunQueue queue = loadRunQueue();
+        if (queue == null) {
+            if (!queueLoadFailure.isEmpty() && !queueLoadWarningShown) {
+                queueLoadWarningShown = true;
+                showError("The saved queue could not be resumed", queueLoadFailure);
+            }
+            return;
+        }
+        if (queue.isComplete() || !configured()) return;
+        if (queue.hasActiveRun()) pollLastRun(); else dispatchNextQueued();
+    }
+
+    private void dispatchNextQueued() {
+        MobileRunQueue queue = loadRunQueue();
+        if (queue == null || queue.isComplete() || destroyed || queueDispatching) return;
+        if (queue.hasActiveRun()) {
+            pollLastRun();
+            return;
+        }
+        MobileRunRequest request = queue.nextRequest();
+        if (request == null) return;
+        queueDispatching = true;
+        runState.setText("Starting target " + (queue.completedCount() + 1) + " of "
+                + queue.size() + " · " + request.repository);
         worker.execute(() -> {
             try {
                 GitHubApi.RunState state = api.dispatch(
                         githubToken(),
                         secrets.get(SecureStore.OPENAI_KEY),
                         secrets.get(SecureStore.ANTHROPIC_KEY), request);
+                MobileRunQueue current = loadRunQueue();
+                if (current == null || current.hasActiveRun()
+                        || current.nextRequest() == null
+                        || !current.nextRequest().requestId.equals(request.requestId)) {
+                    throw new IllegalStateException("The persisted queue changed during dispatch.");
+                }
+                current.markDispatched(state.id);
+                saveRunQueue(current);
+                recordRun(state, request);
                 preferences.edit()
                         .putLong(LAST_RUN_ID, state.id)
                         .putString(LAST_RUN_REPOSITORY, request.repository)
@@ -899,22 +899,36 @@ public final class MainActivity extends Activity {
                         .putString(LAST_RUN_URL, state.htmlUrl)
                         .putString(LAST_RUN_STATUS, "Queued · " + request.repository)
                         .apply();
-                recordRun(state, request);
                 post(() -> {
+                    queueDispatching = false;
                     refreshRunLabel();
                     pollLastRun();
                 });
             } catch (Exception failed) {
                 invalidateRejectedSession(failed);
-                post(() -> showError("FlexFactor did not start", safeMessage(failed)));
+                post(() -> {
+                    queueDispatching = false;
+                    showError("The next FlexFactor target did not start",
+                            safeMessage(failed) + "\n\nThe persisted queue will retry when FlexFactor resumes.");
+                });
             }
         });
     }
-
     private void pollLastRun() {
         main.removeCallbacks(pollRun);
         if (!configured() || destroyed || polling) return;
         List<RunRecord> records = runHistory();
+        MobileRunQueue savedQueue = loadRunQueue();
+        if (savedQueue != null && savedQueue.hasActiveRun()) {
+            long activeId = savedQueue.activeRunId();
+            boolean recorded = records.stream().anyMatch(record -> record.id == activeId);
+            MobileRunRequest activeRequest = savedQueue.activeRequest();
+            if (!recorded && activeRequest != null) {
+                records.add(0, new RunRecord(activeId, activeRequest.repository,
+                        activeRequest.requestId, activeRequest.mode.wire, "",
+                        "Queued · " + activeRequest.repository, false));
+            }
+        }
         if (records.isEmpty()) {
             long id = preferences.getLong(LAST_RUN_ID, 0L);
             String repository = lastRunRepository();
@@ -963,12 +977,27 @@ public final class MainActivity extends Activity {
                 updated.add(next);
             }
             saveRunHistory(updated);
+            boolean advanced = false;
+            MobileRunQueue queue = loadRunQueue();
+            if (queue != null && queue.hasActiveRun()) {
+                long queuedRun = queue.activeRunId();
+                for (RunRecord record : updated) {
+                    if (record.id == queuedRun && record.complete) {
+                        queue.markActiveComplete(queuedRun);
+                        saveRunQueue(queue);
+                        advanced = true;
+                        break;
+                    }
+                }
+            }
             boolean pollAgain = active;
             boolean toast = latestSucceeded;
+            boolean startNext = advanced;
             post(() -> {
                 polling = false;
                 refreshRunLabel();
-                if (pollAgain) main.postDelayed(pollRun, POLL_MS);
+                if (startNext) dispatchNextQueued();
+                else if (pollAgain) main.postDelayed(pollRun, POLL_MS);
                 if (toast) Toast.makeText(this, "FlexFactor completed successfully",
                         Toast.LENGTH_LONG).show();
             });
@@ -1059,7 +1088,7 @@ public final class MainActivity extends Activity {
         String raw = preferences.getString(RUN_HISTORY, "[]");
         try {
             JSONArray rows = new JSONArray(raw);
-            for (int i = 0; i < rows.length() && records.size() < 10; i++) {
+            for (int i = 0; i < rows.length() && records.size() < 30; i++) {
                 JSONObject row = rows.optJSONObject(i);
                 if (row == null) continue;
                 long id = row.optLong("id", 0L);
@@ -1078,7 +1107,7 @@ public final class MainActivity extends Activity {
 
     private synchronized void saveRunHistory(List<RunRecord> records) {
         JSONArray rows = new JSONArray();
-        for (int i = 0; i < records.size() && i < 10; i++) {
+        for (int i = 0; i < records.size() && i < 30; i++) {
             RunRecord record = records.get(i);
             JSONObject row = new JSONObject();
             try {

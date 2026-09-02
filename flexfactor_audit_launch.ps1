@@ -1,194 +1,63 @@
-# FlexFactor Audit launcher - double-click the icon, or drag a project folder /
-# .lnk / file / URL onto it. Goes straight into audit mode: a line-by-line
-# review that fixes every defect it finds, committing each verified cycle on
-# the audit branch and merging+pushing green results automatically. EVERY RUN
-# IS REAL (owner order 2026-08-11): there is no report-only mode. When both
-# API keys are present it runs TWO models (primary + cross-check).
+# FlexFactor Audit shortcut: up to 30 repositories, strictly sequential.
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# Directed entry: unfit-route filter + theme stamp + skip-dir (same rule as Factory Deck).
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
-# ONE interpreter answer for all three launchers (see the file's header).
 . (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
 
-Write-Host ""
-Write-Host "  [##]  FlexFactor Audit" -ForegroundColor Cyan
-Write-Host "  Line-by-line, tests every function and button, fixes it all." -ForegroundColor DarkGray
-Write-Host ""
-
-# Program targets: audit can take UP TO TEN programs in one run (flexfactor.py's
-# run_audit() validates 1..10 - owner order 2026-08-13). Accept anything for
-# each - a folder, a file, a .lnk shortcut, a URL, or a plain name.
-$programs = @()
-$dropped = @($args | Where-Object { $_ })
-if ($dropped.Count -ge 1) {
-    # Multiple dropped paths: use them all (capped at 10), no prompting.
-    $programs = @($dropped | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
-    Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
-} else {
-    # Ask how many, then read each one. Bad input falls back to 1.
-    $countRaw = Read-Host "How many programs to audit? (1-10, Enter = 1)"
-    $count = 1
-    if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
-    for ($i = 1; $i -le $count; $i++) {
-        $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
-        if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
-    }
-    # Cap at 10 collected entries.
-    $programs = @($programs | Select-Object -First 10)
+$programs = @($args | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") } |
+    ForEach-Object { "$($_)".Trim('"') })
+if ($programs.Count -gt 30) {
+    Write-Host "Choose no more than 30 repositories." -ForegroundColor Red
+    Read-Host "Press Enter to close"
+    exit 2
 }
 if ($programs.Count -eq 0) {
-    Write-Host "No program given." -ForegroundColor Red
-    Read-Host "Press Enter to close"; exit 1
+    $countRaw = Read-Host "How many repositories to audit? (1-30, Enter = 1)"
+    $count = 1
+    if (-not [string]::IsNullOrWhiteSpace($countRaw) -and
+        (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 30)) {
+        Write-Host "Repository count must be from 1 through 30." -ForegroundColor Red
+        Read-Host "Press Enter to close"
+        exit 2
+    }
+    for ($index = 1; $index -le $count; $index++) {
+        $program = (Read-Host "Repository $index (folder, file, shortcut, URL, or name)").Trim('"')
+        if ([string]::IsNullOrWhiteSpace($program)) {
+            Write-Host "Repository $index cannot be blank." -ForegroundColor Red
+            Read-Host "Press Enter to close"
+            exit 2
+        }
+        $programs += $program
+    }
 }
 
-# Key detection. Audit wants BOTH models when it can get them. Figure out what
-# keys are available and pick the primary provider accordingly. Anthropic also
-# counts a Bearer credential (ANTHROPIC_AUTH_TOKEN, e.g. the free FCC proxy) -
-# same rule as flexfactor.py's _provider_key_present (2026-08-11).
-$haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
-$haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
-
-# extraArgs collects every optional flag we add below (apply, economy, etc).
-$extraArgs = @()
-
-if ($haveAnthropic -and $haveOpenai) {
-    # Both keys present: run primary + cross-check. Do NOT pass --single - we
-    # WANT both models reviewing the code.
-    Write-Host "Both keys detected - audit prefers both models (primary + cross-check)." -ForegroundColor Green
-    Write-Host "FlexFactor live-checks each key at start and auto-falls-back if one is dead (e.g. out of credits)." -ForegroundColor DarkGray
-    $defaultProvider = "anthropic"
-} elseif ($haveAnthropic) {
-    Write-Host "Only ANTHROPIC_API_KEY detected - using anthropic." -ForegroundColor Yellow
-    $defaultProvider = "anthropic"
-} elseif ($haveOpenai) {
-    Write-Host "Only OPENAI_API_KEY detected - using openai." -ForegroundColor Yellow
-    $defaultProvider = "openai"
-} else {
-    Write-Host "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set in this environment." -ForegroundColor Red
-    Write-Host "Set at least one valid key and retry." -ForegroundColor Red
-    Read-Host "Press Enter to close"; exit 1
+$costRaw = Read-Host "Maximum paid-model cost in USD (1-150, Enter = 150)"
+$cost = 150
+if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
+    (-not [int]::TryParse($costRaw, [ref]$cost) -or $cost -lt 1 -or $cost -gt 150)) {
+    Write-Host "Cost must be from 1 through 150." -ForegroundColor Red
+    Read-Host "Press Enter to close"
+    exit 2
 }
 
-# Let the user pick the primary ONLY when both providers are usable. With a
-# single usable provider the guards below force every answer back to the
-# default, so asking was pure noise (owner feedback 2026-08-11 evening).
-if ($haveAnthropic -and $haveOpenai) {
-    $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
-    if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
-} else {
-    $provider = $defaultProvider
-}
-# GUARD (2026-08-11 live failure): never pass a provider whose credential this
-# environment does not carry - a keyless '--provider openai' demoted a whole
-# 5-program run to local ollama at preflight. The env wins over the answer.
-if ($provider -ne "openai" -and $provider -ne "anthropic") {
-    Write-Host "Unknown provider '$provider' - using $defaultProvider." -ForegroundColor Yellow
-    $provider = $defaultProvider
-}
-if ($provider -eq "openai" -and -not $haveOpenai) {
-    Write-Host "OPENAI_API_KEY is not set in this environment - using anthropic instead." -ForegroundColor Yellow
-    $provider = "anthropic"
-}
-if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
-    Write-Host "No Anthropic credential in this environment - using openai instead." -ForegroundColor Yellow
-    $provider = "openai"
-}
-$primary = $provider
-
-# Every run is REAL (owner order 2026-08-11, stronger form: "I do not want test
-# runs as part of the app's functions. Each run must be for real."). The CLI no
-# longer has --report-only/--dry-run in ANY mode as of 2026-08-21 (scout's
-# --dry-run, the last survivor, was removed outright that day), so the old
-# apply-vs-report prompt is gone. Merge+push are CLI defaults, green-build gated.
-# LAUNCHER-DRIFT RULE: both .ps1 launchers must be swept in the SAME commit as
-# any CLI flag change - a stale flag is argparse exit 2 and a dead run.
-$extraArgs += "--apply"
-$extraArgs += "--yes"
-Write-Host "Apply mode: verified fixes are committed each cycle, merged into the current" -ForegroundColor Yellow
-Write-Host "branch, and pushed to origin automatically (green-build gated)." -ForegroundColor Yellow
-
-# Economy mode: author fixes/tests with Claude Sonnet 5 (about 40% cheaper than
-# Opus, near-Opus code quality; the build gate + cross-model veto still protect
-# every fix). Default is YES because credits are the scarce resource here.
-$econ = Read-Host "Economy mode (Sonnet 5 author, cheaper credits)? [Y/n] (Enter = yes)"
-if ($econ -match '^(n|no)$') {
-    Write-Host "Full mode: Opus 4.8 authors every fix." -ForegroundColor DarkGray
-} else {
-    $extraArgs += "--economy"
-    Write-Host "Economy mode: Sonnet 5 authors fixes; review stays on the cheap judge tier." -ForegroundColor DarkGray
-}
-
-# Merge+push into the current branch are automatic now (CLI defaults ON,
-# owner order 2026-08-11); pass --no-merge/--no-push at the CLI to opt out.
-
-# Repo cleanup is AUTOMATIC and unconditional (owner order 2026-08-20).
-# There is no question here any more. The old prompt asked whether to continue
-# on a dirty working tree; the owner read it as "take care of whatever is left
-# red in the repo first", answered yes, and the run still refused sermonsmith.
-# So the intent is now the implementation: every run cleans the repo BEFORE it
-# starts new work - pre-existing uncommitted changes, open PRs, Dependabot
-# alerts and open issues - then does the new work, then pushes and MERGES to
-# main. Nothing is left dangling and nothing is silently skipped.
-$extraArgs += "--allow-dirty"
-$extraArgs += "--auto-clean"
-Write-Host "Repo cleanup: automatic. Pre-existing changes, open PRs, Dependabot alerts and open issues are cleared FIRST, then the new work runs, then it is pushed and merged to main." -ForegroundColor DarkGray
-
-# 2+ programs always run at the same time now, no question asked (owner order
-# 2026-08-13: "I want all programs to run at the same time"). Real concurrency -
-# run_audit() fans these out onto a ThreadPoolExecutor of this width.
-if ($programs.Count -ge 2) {
-    $extraArgs += "--parallel"
-    $extraArgs += "$($programs.Count)"
-    Write-Host "Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
-}
-
-# Build a repeatable --program list, one flag per program.
-$programArgs = @()
-foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
-$providerArgs = @('--provider', $primary)
-
-# MODEL MODE IS NOT OPTIONAL (launcher-drift fix 2026-08-30). This launcher was
-# never swept when --model-mode landed, so it detected the owner's paid keys,
-# announced "audit prefers both models (primary + cross-check)", and then passed
-# no mode at all - leaving the CLI on its `free` default. free is an EXCLUSION,
-# not an ordering: it admits only ollama or an FCC-free-routed anthropic, so BOTH
-# paid keys were refused and every run silently demoted to CPU-only Ollama with
-# no cross-check - or died with "model mode 'free' excludes the configured
-# routes". Every claim this launcher printed about the run was false.
-#
-# ANTHROPIC_AUTH_TOKEN is the FCC proxy's Bearer credential, which is FREE-routed;
-# only ANTHROPIC_API_KEY / OPENAI_API_KEY are paid. So the mode follows the kind
-# of credential actually present, and is printed so the run says what it is.
-$havePaidAnthropic = -not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)
-$modeArgs = @()
-if ($havePaidAnthropic -and $haveOpenai) {
-    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'both')
-    Write-Host "Model mode: PAID (both providers credentialed - primary + cross-check)." -ForegroundColor Cyan
-} elseif ($havePaidAnthropic) {
-    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'anthropic')
-    Write-Host "Model mode: PAID (anthropic only)." -ForegroundColor Cyan
-} elseif ($haveOpenai) {
-    $modeArgs = @('--model-mode', 'paid', '--paid-models', 'openai')
-    Write-Host "Model mode: PAID (openai only)." -ForegroundColor Cyan
-} else {
-    $modeArgs = @('--model-mode', 'free')
-    Write-Host "Model mode: FREE (no paid key present; free routes / local model only)." -ForegroundColor Cyan
-}
+$cliArgs = @("audit", "--model-mode", "best", "--max-cost", "$cost",
+             "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean")
+foreach ($program in $programs) { $cliArgs += @("--program", $program) }
 
 Write-Host ""
-# audit auto-detects keys; when both are set it cross-checks with both models.
-Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script, "audit") + $providerArgs + $modeArgs + $programArgs + $extraArgs)
-$auditExit = $LASTEXITCODE
-if ($auditExit -eq 3) {
-    Write-Host ""
-    Write-Host "Exit code 3: the run FIXED NOTHING despite finding defects." -ForegroundColor Red
-    Write-Host "See the audit report for why nothing could be applied." -ForegroundColor Red
-}
+Write-Host "FlexFactor Audit" -ForegroundColor Cyan
+Write-Host "$($programs.Count) target(s), one at a time, in the selected order." -ForegroundColor DarkGray
+Write-Host "The orchestrator starts with the strongest paid capacity and descends to free." -ForegroundColor DarkGray
+Write-Host "Pass 1 covers the repository; later passes cover only the preceding verified edit delta." -ForegroundColor DarkGray
+Write-Host "Between passes 1 and 2, the top three competitor capabilities are attempted." -ForegroundColor DarkGray
+Write-Host "Success requires independent review and the exact commit on origin's default branch." -ForegroundColor DarkGray
+Write-Host ""
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $cliArgs)
+$exitCode = $LASTEXITCODE
 Write-Host ""
 Read-Host "Done. Press Enter to close"
-exit $auditExit
+exit $exitCode

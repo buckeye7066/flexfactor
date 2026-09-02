@@ -394,6 +394,12 @@ def _host_label(env=None):
 
 # --------------------------------------------------------- phone launcher
 
+LEGACY_PHONE_LAUNCH_MESSAGE = (
+    "The local Termux launcher is retired. Use the signed FlexFactor Mobile "
+    "app; its managed orchestrator verifies and lands successful code on the "
+    "authoritative default branch."
+)
+
 def _is_phone_environment(env=None) -> bool:
     env = os.environ if env is None else env
     prefix = str(env.get("PREFIX") or "")
@@ -486,6 +492,7 @@ def save_phone_provider(body: dict, *, env=None,
     The response deliberately contains readiness metadata only. There is no API
     for reading a stored key back out of the phone engine.
     """
+    raise ValueError(LEGACY_PHONE_LAUNCH_MESSAGE)
     env = os.environ if env is None else env
     if not _is_phone_environment(env):
         raise ValueError("provider setup is only available on the phone")
@@ -554,6 +561,7 @@ def start_phone_provider_install(body: dict, *, env=None,
                                  popen=subprocess.Popen,
                                  start_reaper=None) -> dict:
     """Start one fixed, allowlisted SDK install without accepting shell input."""
+    raise ValueError(LEGACY_PHONE_LAUNCH_MESSAGE)
     env = os.environ if env is None else env
     if not _is_phone_environment(env):
         raise ValueError("provider installation is only available on the phone")
@@ -831,20 +839,14 @@ def _start_provider_install_reaper(process, pid_path: str, status_path: str,
 
 
 def phone_launch_state(env=None, provider_path=PHONE_PROVIDER_PATH) -> dict:
-    env = os.environ if env is None else env
-    phone = _is_phone_environment(env)
-    effective = _effective_provider_env(env, provider_path) if phone else env
     return {
-        "available": phone,
-        "programs": _available_phone_programs(env) if phone else [],
-        "providers": _provider_readiness(effective) if phone else [],
-        "provider_install_pid": (_running_audit_pid(PROVIDER_INSTALL_PID_PATH)
-                                 if phone else None),
-        "provider_install": (_load_provider_install_status()
-                             if phone else {}),
-        "running_pid": _running_audit_pid() if phone else None,
-        "default_max_cost": 10,
-        "policy": "Changes stay on this phone; launch never pushes or merges.",
+        "available": False,
+        "programs": [],
+        "providers": [],
+        "provider_install_pid": None,
+        "provider_install": {},
+        "running_pid": None,
+        "policy": LEGACY_PHONE_LAUNCH_MESSAGE,
     }
 
 
@@ -855,6 +857,7 @@ def start_phone_run(body: dict, *, env=None, programs=None, readiness=None,
                     popen=subprocess.Popen,
                     start_reaper=_start_audit_reaper) -> dict:
     """Validate and spawn one detached phone run without invoking a shell."""
+    raise ValueError(LEGACY_PHONE_LAUNCH_MESSAGE)
     env = os.environ if env is None else env
     if not _is_phone_environment(env):
         raise ValueError("runs can only be started from the on-phone engine")
@@ -1329,8 +1332,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send(401, b'{"error":"bad or missing token"}', "application/json")
             return
-        if path not in ("/api/steering", "/api/launch", "/api/provider",
-                        "/api/provider/install"):
+        if path in ("/api/launch", "/api/provider", "/api/provider/install"):
+            self._send(
+                410,
+                json.dumps({"error": LEGACY_PHONE_LAUNCH_MESSAGE}).encode("utf-8"),
+                "application/json",
+            )
+            return
+        if path != "/api/steering":
             self._send(404, b'{"error":"not found"}', "application/json")
             return
         try:
@@ -1344,18 +1353,6 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("request body must be an object")
-            if path == "/api/launch":
-                result = start_phone_run(body, provider_path=self.provider_path)
-                self._send(201, json.dumps(result).encode("utf-8"), "application/json")
-                return
-            if path == "/api/provider":
-                result = save_phone_provider(body, provider_path=self.provider_path)
-                self._send(201, json.dumps(result).encode("utf-8"), "application/json")
-                return
-            if path == "/api/provider/install":
-                result = start_phone_provider_install(body)
-                self._send(202, json.dumps(result).encode("utf-8"), "application/json")
-                return
             program = str(body.get("program") or "")
             project_dir = str(body.get("project_dir") or "")
             active = build_state(self.sampler).get("programs") or []

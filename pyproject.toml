@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flexfactor"
-version = "0.5.0"
+version = "0.6.0"
 description = "Purpose-driven autonomous code audit, repair, behavioral verification, and evidence tool."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -40,6 +40,7 @@ py-modules = [
   "flexfactor_discovery",
   "flexfactor_egress",
   "flexfactor_errors",
+  "flexfactor_execution",
   "flexfactor_evidence",
   "flexfactor_flags",
   "flexfactor_journeys",

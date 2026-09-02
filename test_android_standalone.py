@@ -146,10 +146,14 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
         self.assertIn("@github/copilot@1.0.81", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
-        self.assertIn('--judge-model "$FLEXFACTOR_PHONE_MODEL"', workflow)
+        self.assertIn("deepseek-coder:6.7b", workflow)
+        self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
-        self.assertIn('--provider "$PROVIDER"', workflow)
+        self.assertIn("options: [auto]", workflow)
+        self.assertNotIn('--provider "$PROVIDER"', workflow)
+        self.assertIn("publication_complete", workflow)
+        self.assertIn("merge-base --is-ancestor", workflow)
         self.assertNotIn("${{ inputs.github_token }}", workflow)
         self.assertNotIn("${{ inputs.openai", workflow.lower())
         self.assertNotIn("inputs.target_repository }} ·", workflow)
@@ -300,14 +304,24 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("flexfactor_steering.submit", workflow)
         self.assertIn('source="android"', workflow)
 
-    def test_audit_and_prodready_support_parallel_repository_runs(self):
+    def test_all_modes_support_a_durable_thirty_target_sequential_queue(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /
                     "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
-        self.assertIn("Run up to 10 repositories in parallel", activity)
+        queue = (ANDROID / "java" / "com" / "firer" / "console" /
+                 "flexfactor" / "MobileRunQueue.java").read_text(encoding="utf-8")
+        self.assertIn("Choose up to 30 repositories (run one at a time)", activity)
+        self.assertIn("Repository-relative files, one per line (up to 30)", activity)
         self.assertIn("showBatchRepositoryList", activity)
         self.assertIn("dispatchBatch", activity)
         self.assertIn("Active and recent runs", activity)
         self.assertIn("RUN_HISTORY", activity)
+        self.assertIn("MAX_TARGETS = 30", queue)
+        self.assertIn("activeRunId", queue)
+        saved = activity.split("private synchronized void saveRunQueue", 1)[1]
+        saved = saved.split("private void resumeRunQueue", 1)[0]
+        self.assertIn(".commit()", saved)
+        self.assertNotIn(".apply()", saved)
+        self.assertIn("could not be saved durably", saved)
 
     def test_pre_32_run_ids_migrate_to_the_legacy_control_repository(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -319,23 +333,16 @@ class ManagedAndroidInvariants(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" /
                     "mobile-run.yml").read_text(encoding="utf-8")
         for provider in ("ollama", "openai", "anthropic", "copilot"):
-            self.assertIn(provider, workflow)
+            self.assertIn(provider, workflow.lower())
         self.assertIn('--threshold "$THRESHOLD"', workflow)
         self.assertIn('--max-iterations "$MAX_ITERATIONS"', workflow)
-        self.assertIn("audit_args+=(--economy)", workflow)
-        self.assertIn("provider_args+=(--economy)", workflow)
-        self.assertIn("audit_args+=(--single)", workflow)
-        # ...but ONLY where a pair is impossible or was not asked for. A phone
-        # run whose second key is merely missing must reach the engine's paid
-        # refusal, not be quietly handed --single: that removes the approval
-        # step paid mode is named for while the run still reports as ordinary,
-        # which is the exact downgrade the desktop path refuses.
-        self.assertNotIn('elif [ "$PROVIDER" = openai ] && [ -z "$ANTHROPIC_API_KEY" ]',
-                         workflow)
-        self.assertNotIn('elif [ "$PROVIDER" = anthropic ] && [ -z "$OPENAI_API_KEY" ]',
-                         workflow)
+        self.assertIn("--model-mode best", workflow)
+        self.assertNotIn("--economy", workflow)
+        self.assertNotIn("--single", workflow)
         self.assertIn("--auto-clean", workflow)
         self.assertNotIn("--no-auto-clean", workflow)
+        self.assertIn("publication_complete", workflow)
+        self.assertIn("merge-base --is-ancestor", workflow)
 
     def test_oauth_session_is_encrypted_and_provider_keys_are_sealed_before_cloud_dispatch(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -346,13 +353,10 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertNotIn("openai_key", dispatch.lower())
         provider = api.split("private JSONObject encryptedProviderSecrets", 1)[1]
         provider = provider.split("private JSONObject seal", 1)[0]
-        self.assertIn("request.useBoth", provider)
-        self.assertIn("request.mode == MobileRunRequest.Mode.AUDIT", provider)
-        self.assertIn("request.mode == MobileRunRequest.Mode.PRODREADY", provider)
-        self.assertIn("request.provider == MobileRunRequest.Provider.OPENAI", provider)
-        self.assertIn("request.provider == MobileRunRequest.Provider.ANTHROPIC", provider)
-        self.assertNotIn("request.useBoth && !openAi.isEmpty()", provider)
-        self.assertNotIn("request.useBoth && !anthropic.isEmpty()", provider)
+        self.assertNotIn("request.useBoth", provider)
+        self.assertNotIn("request.provider ==", provider)
+        self.assertIn("boolean sendOpenAi = !openAi.isEmpty()", provider)
+        self.assertIn("boolean sendAnthropic = !anthropic.isEmpty()", provider)
         self.assertIn("validateProviderKeys(sendOpenAi ? openAi : \"\"", provider)
         self.assertIn("OPENAI_API_KEY", provider)
         self.assertIn("ANTHROPIC_API_KEY", provider)
@@ -361,10 +365,12 @@ class ManagedAndroidInvariants(unittest.TestCase):
                  "flexfactor" / "SecureStore.java").read_text(encoding="utf-8")
         self.assertIn("AndroidKeyStore", store)
 
-    def test_android_release_gate_proves_the_default_hosted_provider(self):
+    def test_android_release_gate_proves_both_independent_hosted_families(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "android-client.yml").read_text(encoding="utf-8")
         self.assertIn("qwen2.5-coder:7b", workflow)
+        self.assertIn("deepseek-coder:6.7b", workflow)
+        self.assertIn("division_by_zero", workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
         self.assertIn("FLEXFACTOR_READY", workflow)
@@ -376,7 +382,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("-storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD", workflow)
         self.assertNotIn("bundle/play/app-release.aab", workflow)
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
-        build_gate = build_gate.split("- name: Verify the default phone model provider live", 1)[0]
+        build_gate = build_gate.split(
+            "- name: Verify both independent free model families live", 1)[0]
         self.assertIn("testPlayUnitTest", build_gate)
         self.assertIn("bundlePlay", build_gate)
 

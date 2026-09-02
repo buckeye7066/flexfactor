@@ -15,11 +15,11 @@ on:
         type: choice
         options: [refactor, scout, audit, prodready]
       provider:
-        description: Model provider selected by the signed Android app
+        description: Orchestrator-owned model policy
         required: true
-        default: ollama
+        default: auto
         type: choice
-        options: [ollama, openai, anthropic, copilot]
+        options: [auto]
       target_repository:
         description: Target owner/repository
         required: true
@@ -43,7 +43,7 @@ on:
         default: false
         type: boolean
       max_cost:
-        description: OpenAI cost cap in USD (audit and prodready only)
+        description: Paid-model cost cap in USD
         required: true
         default: "50"
         type: string
@@ -53,20 +53,10 @@ on:
         default: "90"
         type: string
       max_iterations:
-        description: Refactor iteration cap
+        description: Semantic pass cap
         required: true
-        default: "5"
+        default: "6"
         type: string
-      economy:
-        description: Use the desktop economy author-model policy
-        required: true
-        default: true
-        type: boolean
-      use_both:
-        description: Use independent cross-model verification when available
-        required: true
-        default: true
-        type: boolean
   workflow_call:
     inputs:
       request_id: {required: true, type: string}
@@ -80,8 +70,6 @@ on:
       max_cost: {required: true, type: string}
       threshold: {required: true, type: string}
       max_iterations: {required: true, type: string}
-      economy: {required: true, type: boolean}
-      use_both: {required: true, type: boolean}
     secrets:
       OPENAI_API_KEY: {required: false}
       ANTHROPIC_API_KEY: {required: false}
@@ -111,9 +99,12 @@ jobs:
       COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_HOST_LABEL: GitHub Actions for this phone
       FLEXFACTOR_PHONE_MODEL: qwen2.5-coder:7b
+      FLEXFACTOR_PHONE_REVIEW_MODEL: deepseek-coder:6.7b
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
       FLEXFACTOR_OLLAMA_TIMEOUT: "1800"
       PYTHONUTF8: "1"
+      FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+      FLEXFACTOR_QUEUE_ID: ${{ inputs.request_id }}
 
     steps:
       - name: Validate the mobile request
@@ -146,8 +137,8 @@ jobs:
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
-          if provider not in {"ollama", "openai", "anthropic", "copilot"}:
-              raise SystemExit("unsupported provider")
+          if provider != "auto":
+              raise SystemExit("model policy must be auto")
           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9_.-]{1,100}",
                               repository):
               raise SystemExit("invalid repository")
@@ -161,8 +152,8 @@ jobs:
           iterations = int(os.environ["INPUT_MAX_ITERATIONS"])
           if not 0 <= threshold <= 100:
               raise SystemExit("threshold must be between 0 and 100")
-          if not 1 <= iterations <= 20:
-              raise SystemExit("max iterations must be between 1 and 20")
+          if not 1 <= iterations <= 6:
+              raise SystemExit("passes must be between 1 and 6")
           if mode == "refactor":
               candidate = pathlib.PurePosixPath(file)
               if (not file or candidate.is_absolute() or ".." in candidate.parts
@@ -194,18 +185,12 @@ jobs:
         shell: bash
         run: |
           test -n "$GH_TOKEN" || { echo "GitHub workflow credential is unavailable" >&2; exit 1; }
-          if [ "${{ inputs.provider }}" = openai ]; then
-            test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY is missing" >&2; exit 1; }
-          fi
-          if [ "${{ inputs.provider }}" = anthropic ]; then
-            test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY is missing" >&2; exit 1; }
-          fi
 
       - name: Check out the exact FlexFactor engine
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.4.0
+          ref: android-v3.5.0
           path: engine
           persist-credentials: false
 
@@ -232,7 +217,6 @@ jobs:
           node-version: "22"
 
       - name: Install and start the hosted open model
-        if: inputs.provider == 'ollama'
         shell: bash
         run: |
           archive="$RUNNER_TEMP/ollama-linux-amd64.tar.zst"
@@ -251,9 +235,9 @@ jobs:
             sleep 1
           done
           ollama pull qwen2.5-coder:7b
+          ollama pull deepseek-coder:6.7b
 
       - name: Install GitHub Copilot CLI
-        if: inputs.provider == 'copilot'
         shell: bash
         run: |
           npm install --global @github/copilot@1.0.81
@@ -279,7 +263,6 @@ jobs:
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
-          PROVIDER: ${{ inputs.provider }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
@@ -287,8 +270,6 @@ jobs:
           MAX_COST: ${{ inputs.max_cost }}
           THRESHOLD: ${{ inputs.threshold }}
           MAX_ITERATIONS: ${{ inputs.max_iterations }}
-          ECONOMY: ${{ inputs.economy }}
-          USE_BOTH: ${{ inputs.use_both }}
           TARGET_REF: ${{ inputs.target_ref }}
           REQUEST_ID: ${{ inputs.request_id }}
         run: |
@@ -336,16 +317,7 @@ jobs:
           PY
           steering_pid=$!
           trap 'kill "$steering_pid" 2>/dev/null || true' EXIT
-          provider_args=(--provider "$PROVIDER")
-          if [ "$PROVIDER" = ollama ]; then
-            provider_args+=(--model "$FLEXFACTOR_PHONE_MODEL"
-              --judge-model "$FLEXFACTOR_PHONE_MODEL")
-          elif [ "$PROVIDER" = copilot ]; then
-            provider_args+=(--model auto --judge-model auto)
-          fi
-
           if [ "$MODE" = refactor ]; then
-            if [ "$ECONOMY" = true ]; then provider_args+=(--economy); fi
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?
             backup_path="target/$TARGET_FILE.bak"
@@ -366,90 +338,78 @@ jobs:
                 --goal "$TARGET_GOAL" \
                 --threshold "$THRESHOLD" \
                 --max-iterations "$MAX_ITERATIONS" \
-                "${provider_args[@]}" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
+                --max-cost "$MAX_COST" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
               rm -f -- "$backup_path"
             fi
             if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
-            if [ "$rc" -eq 0 ] && ! git -C target diff --quiet; then
-              git -C target add -A || rc=$?
-              if [ "$rc" -eq 0 ]; then
-                git -C target commit -m "Refactor $TARGET_FILE with FlexFactor" || rc=$?
-              fi
-              if [ "$rc" -eq 0 ]; then git -C target push -u origin "$branch" || rc=$?; fi
-              if [ "$rc" -eq 0 ]; then
-                gh pr create --repo "$TARGET_REPOSITORY" \
-                  --base "$TARGET_REF" --head "$branch" \
-                  --title "Refactor $TARGET_FILE with FlexFactor" \
-                  --body "Created by FlexFactor Android Option 1. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-                  2>&1 | tee mobile-publication.txt || rc=${PIPESTATUS[0]}
-              fi
-            fi
           elif [ "$MODE" = scout ]; then
-            args=(scout --program "$GITHUB_WORKSPACE/target" "${provider_args[@]}"
+            args=(scout --program "$GITHUB_WORKSPACE/target"
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
-              --allow-remote-repo-rewards)
+              --allow-remote-repo-rewards --max-cost "$MAX_COST")
             if [ "$SCOUT_APPLY" = true ]; then args+=(--apply --yes); fi
             python engine/flexfactor.py "${args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           else
-            model_mode=paid
-            if [ "$PROVIDER" = ollama ]; then model_mode=free; fi
-            audit_args=(--model-mode "$model_mode" --max-cost "$MAX_COST"
+            audit_args=(--model-mode best --max-cost "$MAX_COST"
               --no-dashboard --yes --apply --trust-repo --allow-dirty --auto-clean)
-            if [ "$ECONOMY" = true ]; then audit_args+=(--economy); fi
-            # --single is for the cases where a PAIR is impossible or was not
-            # asked for: the owner turned the cross-check off, or the provider
-            # is not one of the two named accounts (ollama is local; copilot has
-            # no vendor key of its own).
-            #
-            # It is deliberately NOT added when a pair member's key is simply
-            # missing. That branch used to quietly hand the run --single, which
-            # removes the approval step paid mode is named for and reports the
-            # run as ordinary - the same silent downgrade the desktop path was
-            # refusing at the same moment. The engine now refuses that run and
-            # names the missing key, so the phone shows the reason and the fix
-            # instead of a weaker run that looks like a normal one.
-            if [ "$USE_BOTH" != true ] || [ "$PROVIDER" = ollama ] || [ "$PROVIDER" = copilot ]; then
-              audit_args+=(--single)
-            fi
-            # SAME CHOICE THE DESKTOP OFFERS, from the controls the app already
-            # has: leaving "independent cross-model verification" ticked means
-            # both accounts and the approval contract; unticking it with OpenAI
-            # or Anthropic selected is a deliberate single-model paid run on that
-            # account - what you want when the other one is out of credit.
-            if [ "$model_mode" = paid ]; then
-              if [ "$USE_BOTH" != true ] && [ "$PROVIDER" = openai ]; then
-                audit_args+=(--paid-models openai)
-              elif [ "$USE_BOTH" != true ] && [ "$PROVIDER" = anthropic ]; then
-                audit_args+=(--paid-models anthropic)
-              else
-                audit_args+=(--paid-models both)
-              fi
-            fi
             python engine/flexfactor.py "$MODE" \
               --program "$GITHUB_WORKSPACE/target" \
-              "${provider_args[@]}" "${audit_args[@]}" 2>&1 | tee mobile-run.log \
+              "${audit_args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           fi
 
           after="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$after" > mobile-after.txt
+          publication_required=false
+          publication_complete=true
+          publication_reason="no committed source change"
+          default_branch=""
+          if [ "$after" != "$before" ]; then
+            publication_required=true
+            publication_complete=false
+            publication_reason="could not prove the exact commit on the remote default branch"
+            default_branch="$(git -C target ls-remote --symref origin HEAD 2>/dev/null \
+              | sed -n 's#^ref:[[:space:]]*refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' \
+              | head -n 1)"
+            if [ -n "$default_branch" ] \
+                && git -C target fetch --quiet origin \
+                  "refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+                && git -C target merge-base --is-ancestor \
+                  "$after" "refs/remotes/origin/$default_branch"; then
+              publication_complete=true
+              publication_reason="exact verified commit is contained in the remote default branch"
+            else
+              rc=1
+            fi
+          fi
+          export PUBLICATION_REQUIRED="$publication_required"
+          export PUBLICATION_COMPLETE="$publication_complete"
+          export PUBLICATION_REASON="$publication_reason"
+          export DEFAULT_BRANCH="$default_branch"
           python - "$rc" "$before" "$after" <<'PY'
           import json, os, sys
           rc, before, after = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+          publication_required = os.environ["PUBLICATION_REQUIRED"] == "true"
+          publication_complete = os.environ["PUBLICATION_COMPLETE"] == "true"
           with open("mobile-result.json", "w", encoding="utf-8") as fh:
               json.dump({
                   "schema": 1,
                   "request_id": os.environ["REQUEST_ID"],
                   "mode": os.environ["MODE"],
+                  "model_policy": "best-available",
+                  "pass_limit": 6,
                   "repository": os.environ.get("GITHUB_REPOSITORY", ""),
                   "target_repository": os.environ["TARGET_REPOSITORY"],
                   "target_ref": os.environ["TARGET_REF"],
                   "source_before": before,
                   "source_after": after,
+                  "publication_required": publication_required,
+                  "publication_complete": publication_complete,
+                  "default_branch": os.environ["DEFAULT_BRANCH"],
+                  "publication_reason": os.environ["PUBLICATION_REASON"],
                   "exit_code": rc,
-                  "success": rc == 0,
+                  "success": rc == 0 and publication_complete,
                   "run_url": (os.environ.get("GITHUB_SERVER_URL", "") + "/" +
                               os.environ.get("GITHUB_REPOSITORY", "") + "/actions/runs/" +
                               os.environ.get("GITHUB_RUN_ID", "")),
@@ -476,13 +436,18 @@ jobs:
         if: always()
         shell: python
         run: |
-          import json, pathlib, shutil
+          import json, os, pathlib, shutil
 
           destination = pathlib.Path("mobile-phone-summary")
           destination.mkdir(exist_ok=True)
           result = pathlib.Path("mobile-result.json")
           if result.is_file():
               shutil.copyfile(result, destination / "mobile-result.json")
+
+          queue = (pathlib.Path.home() / ".flexfactor" / "queues"
+                   / (os.environ.get("FLEXFACTOR_QUEUE_ID", "") + ".json"))
+          if queue.is_file():
+              shutil.copyfile(queue, destination / "orchestrator-receipt.json")
 
           runs = pathlib.Path.home() / ".flexfactor" / "runs"
           ledgers = sorted(
@@ -525,9 +490,9 @@ jobs:
           path: |
             mobile-result.json
             mobile-run.log
-            mobile-publication.txt
             mobile-before.txt
             mobile-after.txt
+            mobile-phone-summary/orchestrator-receipt.json
             target/*_repo_rewards_report.md
             target/_scout_report.json
             target/.flexfactor-scout-proposals.json

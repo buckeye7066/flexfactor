@@ -14,7 +14,10 @@ const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const FILE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[^\r\n]{1,500}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODES = new Set(["refactor", "scout", "audit", "prodready"]);
-const PROVIDERS = new Set(["ollama", "openai", "anthropic", "copilot"]);
+const RUN_FIELDS = new Set([
+  "request_id", "mode", "provider", "repository", "ref", "file", "goal",
+  "scout_apply", "max_cost", "threshold", "max_iterations",
+]);
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 const REPOSITORY_PAGE_SIZE = 100;
 const MAX_REPOSITORY_PAGES = 100;
@@ -314,6 +317,12 @@ export function validateRunRequest(source) {
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     throw new ServiceError(400, "invalid_run", "The run request is missing.");
   }
+  for (const name of Object.keys(source)) {
+    if (!RUN_FIELDS.has(name)) {
+      throw new ServiceError(400, "invalid_run",
+        `The run request contains an unsupported field: ${name}.`);
+    }
+  }
   const request = {
     request_id: typeof source.request_id === "string" ? source.request_id.trim() : "",
     mode: typeof source.mode === "string" ? source.mode.trim() : "",
@@ -326,12 +335,13 @@ export function validateRunRequest(source) {
     max_cost: Number(source.max_cost),
     threshold: Number(source.threshold),
     max_iterations: Number(source.max_iterations),
-    economy: source.economy === true,
-    use_both: source.use_both === true,
   };
   if (!UUID.test(request.request_id)) throw new ServiceError(400, "invalid_run", "The run identifier is invalid.");
   if (!MODES.has(request.mode)) throw new ServiceError(400, "invalid_run", "Choose a FlexFactor mode.");
-  if (!PROVIDERS.has(request.provider)) throw new ServiceError(400, "invalid_run", "Choose a model provider.");
+  if (request.provider !== "auto") {
+    throw new ServiceError(400, "invalid_run",
+      "FlexFactor has one model policy: best available, paid to free.");
+  }
   if (!REPOSITORY.test(request.repository) || request.repository.endsWith(".")) {
     throw new ServiceError(400, "invalid_run", "Repository must be written as owner/name.");
   }
@@ -345,8 +355,8 @@ export function validateRunRequest(source) {
     throw new ServiceError(400, "invalid_run", "The acceptance threshold must be between 0 and 100.");
   }
   if (!Number.isInteger(request.max_iterations) || request.max_iterations < 1
-      || request.max_iterations > 20) {
-    throw new ServiceError(400, "invalid_run", "Refactor iterations must be between 1 and 20.");
+      || request.max_iterations > 6) {
+    throw new ServiceError(400, "invalid_run", "FlexFactor passes must be between 1 and 6.");
   }
   if (request.mode === "refactor") {
     if (!FILE.test(request.file)) {
@@ -396,18 +406,6 @@ export async function providerPublicKey(token, repository, fetchImpl = fetch) {
   return { key: key.key, key_id: key.key_id };
 }
 
-async function hasRepositorySecret(token, repository, name, fetchImpl) {
-  const response = await githubRaw(token, "GET",
-    `/repos/${repository}/actions/secrets/${name}`, undefined, fetchImpl);
-  if (response.status === 200) return true;
-  if (response.status === 404) return false;
-  if (response.status === 401) {
-    throw new ServiceError(401, "session_invalid", "Your GitHub session is no longer valid.");
-  }
-  throw new ServiceError(response.status >= 500 ? 502 : response.status,
-    "github_request_failed", safeGitHubError(response));
-}
-
 async function putRepositorySecret(token, repository, name, value, fetchImpl) {
   if (!ALLOWED_SECRETS.has(name)) {
     throw new ServiceError(400, "invalid_secret_name", "The provider credential name is invalid.");
@@ -420,39 +418,24 @@ async function putRepositorySecret(token, repository, name, value, fetchImpl) {
 }
 
 async function prepareProviderSecrets(token, request, provided, fetchImpl) {
+  void token;
+  void request;
+  void fetchImpl;
   const values = provided && typeof provided === "object" && !Array.isArray(provided)
     ? provided : {};
-  const dualPaid = request.use_both
-    && (request.mode === "audit" || request.mode === "prodready")
-    && (request.provider === "openai" || request.provider === "anthropic");
-  const required = new Set();
-  if (request.provider === "openai" || dualPaid) required.add("OPENAI_API_KEY");
-  if (request.provider === "anthropic" || dualPaid) required.add("ANTHROPIC_API_KEY");
 
   for (const name of Object.keys(values)) {
     if (!ALLOWED_SECRETS.has(name)) {
       throw new ServiceError(400, "invalid_secret_name",
         "The provider credential name is invalid.");
     }
-    if (!required.has(name)) {
-      throw new ServiceError(400, "unexpected_provider_key",
-        "This run does not use the supplied provider credential.");
-    }
   }
 
   const writes = [];
-  const missing = [];
-  for (const name of required) {
+  for (const name of ALLOWED_SECRETS) {
     if (Object.prototype.hasOwnProperty.call(values, name)) {
       writes.push({ name, value: validateEncryptedSecret(values[name]) });
-    } else if (!(await hasRepositorySecret(token, request.repository, name, fetchImpl))) {
-      missing.push(name);
     }
-  }
-  if (missing.length) {
-    const labels = missing.map((name) => name === "OPENAI_API_KEY" ? "OpenAI" : "Anthropic");
-    throw new ServiceError(400, "provider_key_missing",
-      `${labels.join(" and ")} ${labels.length === 1 ? "is" : "are"} required, but this repository is missing ${missing.join(" and ")}. Save ${labels.length === 1 ? "the key" : "both keys"} in Provider settings.`);
   }
   return writes;
 }
@@ -585,7 +568,7 @@ function workflowInputs(request) {
   return {
     request_id: request.request_id,
     mode: request.mode,
-    provider: request.provider,
+    provider: "auto",
     target_ref: request.ref,
     file: request.file,
     goal: request.goal,
@@ -593,8 +576,6 @@ function workflowInputs(request) {
     max_cost: cost,
     threshold: String(request.threshold),
     max_iterations: String(request.max_iterations),
-    economy: String(request.economy),
-    use_both: String(request.use_both),
   };
 }
 
@@ -630,6 +611,41 @@ async function locateDispatchedRun(token, request, workflowRef, submittedAt, fet
     "GitHub accepted the run, but FlexFactor could not correlate its run ID within 30 seconds.");
 }
 
+async function existingDispatchedRun(token, request, fetchImpl) {
+  // GitHub does not expose a display-title search. Follow its authoritative
+  // pagination links so a phone that was offline for days still recovers the
+  // original request instead of starting a duplicate. The ceiling is a
+  // fail-closed abuse/rate bound: if a repository has more history than we can
+  // prove absent, the service refuses to dispatch rather than guessing.
+  const maximumPages = 100;
+  for (let pageNumber = 1; pageNumber <= maximumPages; pageNumber += 1) {
+    // Search repository-wide history rather than the currently installed
+    // workflow path or current default branch. Either can be renamed between
+    // GitHub accepting the original dispatch and a phone crash/retry; the
+    // UUID is the stable correlation key across both changes.
+    const path = `/repos/${request.repository}/actions/runs?event=workflow_dispatch&per_page=100&page=${pageNumber}`;
+    const response = await githubRaw(token, "GET", path, undefined, fetchImpl);
+    if (response.status < 200 || response.status >= 300) {
+      throw new ServiceError(response.status >= 500 ? 502 : response.status,
+        "github_request_failed", safeGitHubError(response));
+    }
+    const page = parseJson(response.body, "GitHub workflow runs");
+    if (!Array.isArray(page.workflow_runs)) {
+      throw new ServiceError(502, "invalid_workflow_runs",
+        "GitHub returned an invalid workflow run list.");
+    }
+    const found = page.workflow_runs.find((item) =>
+      typeof item?.display_title === "string"
+      && item.display_title.includes(request.request_id)
+      && Number.isSafeInteger(Number(item.id)) && Number(item.id) > 0);
+    if (found) return runState(found);
+    const link = response.headers.get("link") || "";
+    if (!/(?:^|,)\s*<[^>]+>;\s*rel="next"(?:\s*,|$)/i.test(link)) return null;
+  }
+  throw new ServiceError(503, "idempotency_scan_incomplete",
+    "FlexFactor could not prove this request ID was absent from workflow history; no duplicate was dispatched.");
+}
+
 export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl = fetch,
     sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))) {
   const run = validateRunRequest(source);
@@ -644,10 +660,16 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // replacing any credential. A deleted or renamed saved ref must be a
   // mutation-free failure, including for paid runs.
   await assertTargetRef(token, run.repository, run.ref, fetchImpl);
-  // Prove every credential needed by the effective model policy before
-  // installing a workflow or replacing any repository secret.
+  // Validate every optional sealed credential before installing a workflow or
+  // replacing any repository secret. With none configured, the same ladder
+  // continues through its subscription and free/local routes.
   const providerSecretWrites = await prepareProviderSecrets(
     token, run, encryptedSecrets, fetchImpl);
+  // request_id is the idempotency key shared with the durable phone queue. If
+  // the app dies after GitHub accepts a dispatch but before it stores the run
+  // ID, retrying must recover the existing run instead of starting a duplicate.
+  const existingRun = await existingDispatchedRun(token, run, fetchImpl);
+  if (existingRun) return existingRun;
   const workflowChanged = await ensureTargetWorkflow(
     token, run.repository, workflowRef, fetchImpl);
   await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);

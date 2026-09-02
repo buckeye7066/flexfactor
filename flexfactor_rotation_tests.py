@@ -653,6 +653,71 @@ class RotatingProviderTests(RotationTestCase):
         self.assertEqual(prov.complete("x"), "completed by front/big")
         self.assertEqual(prov.grade()["by"], "light/small")
 
+    def test_grader_avoids_the_author_model_family_when_an_alternative_exists(self):
+        prov = self._provider(catalog(
+            route("front/gpt-5.6-sol", "openai-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/gpt-5.6-luna", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+            route("light/claude-sonnet-5", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
+        self.assertEqual(prov.grade()["by"], "light/claude-sonnet-5")
+
+    def test_grader_fails_closed_when_only_an_author_family_exists(self):
+        prov = self._provider(catalog(
+            route("front/gpt-5.6-sol", "openai-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/gpt-5.6-luna", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+        ), judge_tier=R.LIGHT)
+        self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
+        with self.assertRaisesRegex(R.RotationError, "independent"):
+            prov.grade()
+
+    def test_separate_ladder_instances_share_author_identity(self):
+        coordinator = R.RoleCoordinator()
+        cat = catalog(
+            route("front/claude-opus", "anthropic-front", tier=R.FRONTIER,
+                  model="claude-opus-5"),
+            route("light/claude-sonnet", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+            route("light/qwen", "open-light", tier=R.LIGHT,
+                  model="qwen3-coder"),
+        )
+        author = R.RotatingProvider(
+            self.rotator(cat), lambda rt: FakeProvider(rt),
+            role_coordinator=coordinator)
+        reviewer = R.RotatingProvider(
+            self.rotator(cat), lambda rt: FakeProvider(rt),
+            judge_tier=R.LIGHT, role_coordinator=coordinator)
+
+        self.assertEqual(author.complete("x"), "completed by front/claude-opus")
+        self.assertEqual(reviewer.grade()["by"], "light/qwen")
+
+    def test_reviewer_avoids_every_family_that_authored_the_candidate(self):
+        coordinator = R.RoleCoordinator()
+        openai = route("light/gpt", "openai", tier=R.LIGHT,
+                       model="gpt-5.6-luna")
+        anthropic = route("light/claude", "anthropic", tier=R.LIGHT,
+                          model="claude-sonnet-5")
+        qwen = route("light/qwen", "open", tier=R.LIGHT, model="qwen3-coder")
+        first_author = R.RotatingProvider(
+            self.rotator(catalog(openai)), lambda rt: FakeProvider(rt),
+            tier=R.LIGHT, judge_tier=R.LIGHT, role_coordinator=coordinator)
+        second_author = R.RotatingProvider(
+            self.rotator(catalog(anthropic)), lambda rt: FakeProvider(rt),
+            tier=R.LIGHT, judge_tier=R.LIGHT, role_coordinator=coordinator)
+        reviewer = R.RotatingProvider(
+            self.rotator(catalog(openai, anthropic, qwen)),
+            lambda rt: FakeProvider(rt), tier=R.LIGHT, judge_tier=R.LIGHT,
+            role_coordinator=coordinator)
+        first_author.complete("first")
+        second_author.complete("second")
+        self.assertEqual(coordinator.author_families, {"openai", "anthropic"})
+        self.assertEqual(reviewer.grade()["by"], "light/qwen")
+
     def test_paid_mode_rotates_to_the_second_paid_pool_after_a_failure(self):
         """Owner order 2026-08-21: paid rotates until exhausted.
 

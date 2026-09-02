@@ -99,15 +99,12 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
             self.assertNotIn("unsupported api",
                              ff._route_unusable_reason(Route(api), "free"))
 
-    def test_the_claude_code_CLI_lane_is_reachable_in_paid_mode(self):
-        """The `claude` CLI IS the owner's Anthropic subscription, so 'paid'
-        ("anthropic and openai exclusively") has to be able to reach it.
+    def test_the_claude_code_subscription_lane_is_reachable_from_the_one_policy(self):
+        """Legacy mode spellings cannot exclude subscription capacity.
 
-        It carries cost_class 'subscription' (flexfactor_discovery._CLI_ROUTES),
-        which FREE correctly excludes - so if PAID did not name the backend, this
-        lane would belong to neither mode and would be silently retired. Same for
-        `codex-cli`. Rotation stays bounded by --max-cost and the pool cooldown,
-        which is where the 2026-08-21 "leave no routes blocked" order lives now.
+        The `claude` CLI is a paid Anthropic subscription and therefore belongs
+        near the front of the sole best-available ladder. ``paid`` and ``free``
+        remain accepted only as saved-command aliases for that same policy.
         """
         import shutil
         import tempfile
@@ -125,9 +122,7 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
                 route = Route("claude-code", is_free=False, backend="claude-code",
                               cost_class="subscription")
                 self.assertEqual(ff._route_unusable_reason(route, "paid"), "")
-                # ...and free still refuses it: a flat-rate plan bills nothing
-                # extra per call, but it is an account the owner PAYS FOR.
-                self.assertNotEqual(ff._route_unusable_reason(route, "free"), "")
+                self.assertEqual(ff._route_unusable_reason(route, "free"), "")
             finally:
                 os.environ["PATH"] = prior_path
 

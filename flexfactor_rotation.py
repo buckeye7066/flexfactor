@@ -17,12 +17,11 @@ Rotating across MODELS does not spread quota. Rotating across POOLS does.
 alternating between them exhausts it at exactly the same rate as hammering one.
 So selection walks POOLS, and only picks a model once a pool is chosen.
 
-The other idea worth holding on to
-----------------------------------
-A $0 call must never silently become a paid one. `allow_paid` defaults False,
-and when a tier runs dry the router demotes DOWN a capability tier -- it never
-promotes UP a cost class to keep working. Spending money stays a decision the
-caller's budget gate makes explicitly.
+Best-available mode is an explicit product policy, not an accidental retry.
+It consumes the strongest usable paid/subscription capacity first, descends
+through weaker paid tiers only when that capacity is unavailable, and reaches
+free/local capacity last. Quota and credit refusals cool their real allowance,
+so the next attempt continues down the ladder instead of hammering it.
 """
 
 from __future__ import annotations
@@ -147,6 +146,16 @@ class Route:
     @property
     def is_free(self) -> bool:
         return self.cost_class in FREE_COST_CLASSES
+
+    @property
+    def uses_paid_capacity(self) -> bool:
+        """Whether this route consumes an account the owner pays for.
+
+        Subscription routes have zero marginal token price, but they still
+        consume a paid account's allowance and belong above genuinely free
+        tiers in the owner's best-available ladder.
+        """
+        return self.cost_class in (SUBSCRIPTION, PAID_METERED)
 
     @classmethod
     def from_json(cls, raw: Dict[str, Any]) -> "Route":
@@ -470,10 +479,10 @@ class CallIntent:
 
     role          -- author | reviewer | judge | vision
     needs         -- capabilities the route MUST have (when its list is known)
-    avoid_family  -- model family the route must NOT be, when any alternative
-                     exists (author/reviewer independence). Soft: if every
-                     candidate is that family the call still runs, and the
-                     selection says so.
+    avoid_family  -- optional soft exclusion used by legacy callers.
+    avoid_families -- strict exclusions. Production reviewer calls carry every
+                      family that authored any part of the candidate; if no
+                      different family is available, review fails closed.
     purpose       -- short slug of the program purpose this call serves; it is
                      recorded on the selection so the journal can answer "what
                      was this model working toward?".
@@ -482,10 +491,22 @@ class CallIntent:
     needs: Tuple[str, ...] = ()
     avoid_family: Optional[str] = None
     purpose: str = ""
+    avoid_families: Tuple[str, ...] = ()
 
     def with_purpose(self, purpose: str, extra_needs: Sequence[str] = ()) -> "CallIntent":
         needs = tuple(dict.fromkeys(tuple(self.needs) + tuple(extra_needs)))
-        return CallIntent(self.role, needs, self.avoid_family, purpose or self.purpose)
+        return CallIntent(self.role, needs, self.avoid_family,
+                          purpose or self.purpose, self.avoid_families)
+
+
+@dataclass
+class RoleCoordinator:
+    """Run-scoped author/reviewer identity shared by all ladder instances."""
+
+    last_family: Dict[str, str] = field(default_factory=dict)
+    last_selection: Dict[str, "Selection"] = field(default_factory=dict)
+    author_families: set[str] = field(default_factory=set)
+    lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
 _FAMILY_PATTERNS = (
@@ -674,9 +695,15 @@ class Rotator:
         outcome: Dict[str, Any] = {}
 
         def transaction(state: Dict[str, Any]) -> None:
-            resolved_pin = (pin or os.environ.get("AI_ROTATE_PIN")
-                            or state.get("pin", {}).get(self.app)
-                            or state.get("pin", {}).get("global"))
+            # A best-available call is policy-owned: an old environment or
+            # state-file pin may not jump ahead of the strongest unexhausted
+            # paid route. Pins remain available to non-product/legacy rotator
+            # clients that do not request the paid-first ladder.
+            resolved_pin = None if paid_first else (
+                pin or os.environ.get("AI_ROTATE_PIN")
+                or state.get("pin", {}).get(self.app)
+                or state.get("pin", {}).get("global")
+            )
             if resolved_pin:
                 outcome["selection"] = self._resolve_pin(
                     resolved_pin, state, now, pin_strict, tier, allow_paid, reasons)
@@ -685,22 +712,29 @@ class Rotator:
                 return
 
             start = TIER_CHAIN.index(requested)
-            for depth, candidate_tier in enumerate(TIER_CHAIN[start:]):
-                selection = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons, intent,
-                    paid_first=paid_first and allow_paid)
-                if selection is None:
-                    continue
-                selection.requested_tier = requested
-                if depth:
-                    selection.demoted_from = requested
-                selection.catalog_stale = self.catalog.is_stale
-                if intent is not None:
-                    selection.intent_role = intent.role
-                    selection.purpose = intent.purpose
-                self._stamp(state, selection, now)
-                outcome["selection"] = selection
-                return
+            tiers = TIER_CHAIN[start:]
+            # Best-available is a single descending ladder: every paid or
+            # subscription tier, strongest first, followed by every free tier.
+            # The ordinary rotator keeps its original per-tier behavior.
+            cost_phases = (True, False) if paid_first and allow_paid else (None,)
+            for paid_capacity in cost_phases:
+                for depth, candidate_tier in enumerate(tiers):
+                    selection = self._pick_in_tier(
+                        candidate_tier, allow_paid, state, now, reasons, intent,
+                        paid_first=paid_first,
+                        paid_capacity=paid_capacity)
+                    if selection is None:
+                        continue
+                    selection.requested_tier = requested
+                    if depth:
+                        selection.demoted_from = requested
+                    selection.catalog_stale = self.catalog.is_stale
+                    if intent is not None:
+                        selection.intent_role = intent.role
+                        selection.purpose = intent.purpose
+                    self._stamp(state, selection, now)
+                    outcome["selection"] = selection
+                    return
 
         try:
             self.store.update(transaction)
@@ -771,7 +805,8 @@ class Rotator:
     def _pick_in_tier(self, tier: str, allow_paid: bool, state: Dict[str, Any],
                       now: float, reasons: Dict[str, str],
                       intent: Optional[CallIntent] = None,
-                      paid_first: bool = False) -> Optional[Selection]:
+                      paid_first: bool = False,
+                      paid_capacity: Optional[bool] = None) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
             if route.tier != tier:
@@ -779,8 +814,14 @@ class Rotator:
             if not route.enabled:
                 reasons.setdefault(route.pool, route.disabled_reason or "disabled")
                 continue
-            if not allow_paid and not route.is_free:
+            paid_when_forbidden = (
+                route.uses_paid_capacity if paid_first else not route.is_free
+            )
+            if not allow_paid and paid_when_forbidden:
                 reasons.setdefault(route.pool, "paid-metered, and allow_paid is off")
+                continue
+            if (paid_capacity is not None
+                    and route.uses_paid_capacity is not paid_capacity):
                 continue
             if _cooling(state, route.pool, now):
                 reasons[route.pool] = "pool cooling down"
@@ -824,11 +865,22 @@ class Rotator:
             return None
 
         family_note = ""
-        if intent is not None and intent.avoid_family:
+        strict_families = set(intent.avoid_families) if intent is not None else set()
+        soft_families = ({intent.avoid_family}
+                         if intent is not None and intent.avoid_family else set())
+        excluded_families = strict_families | soft_families
+        if excluded_families:
             others = [r for r in candidates
-                      if model_family(r.model) != intent.avoid_family]
+                      if model_family(r.model) not in excluded_families]
             if others:
                 candidates = others
+            elif strict_families:
+                label = ",".join(sorted(strict_families))
+                reasons.setdefault(
+                    f"reviewer-family:{label}",
+                    "no model family independent from every candidate author",
+                )
+                return None
             else:
                 family_note = (f"no alternative to family '{intent.avoid_family}' "
                                f"for {intent.role}; independence NOT achieved")
@@ -847,20 +899,31 @@ class Rotator:
         # end AND the cursor stepped past it, landing back on the same pool
         # every time. Two rotation mechanisms are one too many; the cursor
         # survives in state as a monotonic call counter for diagnostics only.
-        # AUTO MODE (owner 2026-08-23): "paid models first followed by free.
-        # Only do one round." With paid_first, every pool whose candidates are
-        # all paid ranks ahead of the free pools; LRU still orders within each
-        # group. The caller (RotatingProvider._run) grants paid_first to the
-        # FIRST attempt only, so a failed paid attempt falls to free pools and
-        # never loops back to spend again on the same call.
+        # Best-available mode ranks by observed verified yield and then by the
+        # catalog's declared order. It deliberately does not rotate a healthy
+        # top route to the back: the owner asked to keep using the best paid
+        # model until its allowance is unavailable, then work down to free.
         def _paid_pool(p: str) -> bool:
-            return all(not r.is_free for r in pools[p])
+            return all(r.uses_paid_capacity for r in pools[p])
 
-        ordered = sorted(
-            pools.keys(),
-            key=lambda p: ((0 if _paid_pool(p) else 1) if paid_first else 0,
-                           self._pool_last_used(state, p),
-                           self._pool_calls(state, p), p))
+        catalog_order = {route.id: index for index, route in enumerate(self.catalog.routes)}
+        purpose = intent.purpose if intent is not None else ""
+
+        def _best_pool_yield(pool_name: str) -> float:
+            return max(_route_yield(state, route, purpose) for route in pools[pool_name])
+
+        def _pool_catalog_order(pool_name: str) -> int:
+            return min(catalog_order.get(route.id, len(catalog_order))
+                       for route in pools[pool_name])
+
+        if paid_first:
+            pool_key = lambda p: (0 if _paid_pool(p) else 1,
+                                  _pool_catalog_order(p),
+                                  -_best_pool_yield(p), p)
+        else:
+            pool_key = lambda p: (self._pool_last_used(state, p),
+                                  self._pool_calls(state, p), p)
+        ordered = sorted(pools.keys(), key=pool_key)
         pool = ordered[0]
 
         def _fit_rank(r: Route) -> int:
@@ -872,14 +935,16 @@ class Rotator:
                 return 2
             return 0 if r.capabilities_source == "measured" else 1
 
-        purpose = intent.purpose if intent is not None else ""
-        routes = sorted(pools[pool], key=lambda r: (_fit_rank(r),
-                                                    # higher yield first; ties fall
-                                                    # through to LRU as before
-                                                    -_route_yield(state, r, purpose),
-                                                    self._route_last_used(state, r),
-                                                    COST_ORDER.get(r.cost_class, 9),
-                                                    r.id))
+        if paid_first:
+            route_key = lambda r: (
+                _fit_rank(r), catalog_order.get(r.id, len(catalog_order)),
+                -_route_yield(state, r, purpose), r.id)
+        else:
+            route_key = lambda r: (
+                _fit_rank(r), -_route_yield(state, r, purpose),
+                self._route_last_used(state, r),
+                COST_ORDER.get(r.cost_class, 9), r.id)
+        routes = sorted(pools[pool], key=route_key)
         chosen = routes[0]
         fit = ("" if intent is None or not intent.needs else
                (chosen.capabilities_source or "declared") if chosen.capabilities else "unknown")
@@ -1146,15 +1211,16 @@ class RotatingProvider:
                  allow_paid: bool = False, meter: Any = None,
                  on_route: Optional[Callable[[Selection], None]] = None,
                  on_error: Optional[Callable[[Route, BaseException], None]] = None,
-                 paid_first: bool = False):
+                 paid_first: bool = False,
+                 role_coordinator: Optional[RoleCoordinator] = None):
         self.rotator = rotator
         self._factory = factory
         self._tier = tier
         self._judge_tier = judge_tier
         self._allow_paid = allow_paid
-        # Auto mode: the first attempt of every call may go to a paid pool
-        # (paid ranked ahead of free); every later attempt of the SAME call is
-        # free-only. One paid round, never a paid retry loop.
+        # Best-available mode keeps the descending paid-to-free ladder active
+        # for every bounded retry. A quota refusal cools its allowance, so the
+        # next attempt chooses the next usable paid tier before reaching free.
         self._paid_first = bool(paid_first and allow_paid)
         self.meter = meter
         self._on_route = on_route
@@ -1179,9 +1245,11 @@ class RotatingProvider:
         # own work.
         self._purpose: str = ""
         self._purpose_needs: Tuple[str, ...] = ()
-        self._last_family: Dict[str, str] = {}
-        self._last_selection: Dict[str, Selection] = {}
-        self._family_lock = threading.Lock()
+        self.role_coordinator = role_coordinator or RoleCoordinator()
+        self._last_family = self.role_coordinator.last_family
+        self._last_selection = self.role_coordinator.last_selection
+        self._author_families = self.role_coordinator.author_families
+        self._family_lock = self.role_coordinator.lock
 
     def set_purpose(self, purpose: str, needs: Sequence[str] = ()) -> None:
         self._purpose = str(purpose or "")[:80]
@@ -1213,11 +1281,17 @@ class RotatingProvider:
         # reviewer that must see screenshots asks with ROLE_VISION.
         intent = intent.with_purpose(
             self._purpose, self._purpose_needs if intent.role == ROLE_VISION else ())
-        if intent.role == ROLE_REVIEWER and intent.avoid_family is None:
+        if intent.role == ROLE_REVIEWER:
             with self._family_lock:
-                author_fam = self._last_family.get(ROLE_AUTHOR)
-            if author_fam:
-                intent = CallIntent(intent.role, intent.needs, author_fam, intent.purpose)
+                author_families = tuple(sorted(self._author_families))
+            if author_families:
+                intent = CallIntent(
+                    intent.role,
+                    intent.needs,
+                    intent.avoid_family,
+                    intent.purpose,
+                    tuple(dict.fromkeys(intent.avoid_families + author_families)),
+                )
         return intent
 
     # -- plumbing ----------------------------------------------------------
@@ -1266,26 +1340,32 @@ class RotatingProvider:
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
         for attempt in range(attempts):
-            first = attempt == 0
             # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
             extra: Dict[str, Any] = {}
             if intent is not None:
                 extra["intent"] = intent
             if self._paid_first:
-                extra["paid_first"] = first
+                extra["paid_first"] = True
             try:
-                # paid_first is ORDERING only (extra["paid_first"] = first is
-                # the sole one-round mechanism, see _pick_in_tier). The old
-                # `and (first or not self._paid_first)` revoked allow_paid on
-                # attempts 1..N, which was written for the RETIRED auto mode
-                # whose fallback was free routes; in paid mode the catalog has
-                # no free tier, so one metered failure stranded the whole call.
-                # Paid still rotates until exhausted (owner order 2026-08-21).
-                selection = self.rotator.next_route(
-                    tier=tier,
-                    allow_paid=self._allow_paid,
-                    **extra)
+                # The ladder remains active on every attempt. Failed and
+                # exhausted routes are excluded by the rotator's cooldowns;
+                # silently jumping straight to free would violate the policy.
+                try:
+                    selection = self.rotator.next_route(
+                        tier=tier,
+                        allow_paid=self._allow_paid,
+                        **extra)
+                except TypeError as exc:
+                    # Compatibility with injected/test rotators that implement
+                    # the original two-argument protocol. Never mask a TypeError
+                    # raised by a current implementation: retry only for the
+                    # precise signature-drift message and only when optional
+                    # policy metadata was supplied.
+                    if not extra or "unexpected keyword argument" not in str(exc):
+                        raise
+                    selection = self.rotator.next_route(
+                        tier=tier, allow_paid=self._allow_paid)
             except RotationError as exc:
                 if last_error is None:
                     raise
@@ -1299,10 +1379,6 @@ class RotatingProvider:
                     getattr(exc, "reasons", None)) from last_error
             route = selection.route
             self.model = route.model
-            if intent is not None and intent.role:
-                with self._family_lock:
-                    self._last_family[intent.role] = model_family(route.model)
-                    self._last_selection[intent.role] = selection
             if self._on_route:
                 self._on_route(selection)
             try:
@@ -1328,6 +1404,13 @@ class RotatingProvider:
                     raise
                 continue
             self.rotator.report(route, "ok")
+            if intent is not None and intent.role:
+                family = model_family(route.model)
+                with self._family_lock:
+                    self._last_family[intent.role] = family
+                    self._last_selection[intent.role] = selection
+                    if intent.role == ROLE_AUTHOR:
+                        self._author_families.add(family)
             return result
         raise RotationError(
             f"every {tier} pool failed this call; last error was "
@@ -1340,6 +1423,9 @@ class RotatingProvider:
 
     # -- provider surface --------------------------------------------------
     def complete(self, *args, **kwargs):
+        kwargs.setdefault(
+            "intent", CallIntent(ROLE_AUTHOR, (CAP_CODE_AUTHOR,))
+        )
         return self._run("complete", self._tier, *args, **kwargs)
 
     def structured(self, *args, **kwargs):
@@ -1354,11 +1440,21 @@ class RotatingProvider:
             kwargs.pop("model")
             if requested == ROTATING_JUDGE_MODEL:
                 tier = self._judge_tier
+        kwargs.setdefault(
+            "intent", CallIntent(ROLE_AUTHOR, (CAP_CODE_AUTHOR, CAP_STRUCTURED_JSON))
+        )
         return self._run("structured", tier, *args, **kwargs)
 
     def grade(self, *args, **kwargs):
         # Grading is classification, not authoring: it belongs on the cheap
         # tier, exactly as JUDGE_MODELS already does for the fixed providers.
+        # It is also an independent reviewer role, so the rotator avoids the
+        # family that produced the immediately preceding author candidate when
+        # any alternative family is usable.
+        kwargs.setdefault(
+            "intent",
+            CallIntent(ROLE_REVIEWER, (CAP_CODE_REVIEW, CAP_STRUCTURED_JSON)),
+        )
         return self._run("grade", self._judge_tier, *args, **kwargs)
 
     def ping(self, *args, **kwargs):

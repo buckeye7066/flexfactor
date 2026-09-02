@@ -968,6 +968,54 @@ def write_evidence_bundle(state_root: str, project_root: str, run_id: str, *,
     return paths
 
 
+def record_publication_gate(gates: dict, paths: dict | None,
+                            publication: dict) -> dict:
+    """Add the remote-default proof to the final gate ledger and persist it.
+
+    Publication happens after exact-commit review, so the initial evidence
+    bundle cannot truthfully contain this outcome. This is the one supported
+    post-review amendment: it never changes the reviewed commit or any earlier
+    gate, and it rewrites both the gate artifact and its manifest claim.
+    """
+    required = publication.get("required") is True
+    complete = publication.get("complete") is True
+    passed = complete if required else True
+    gate = {
+        "id": "remote-default-publication",
+        "name": "Verified commit on remote default branch",
+        "category": "publication",
+        "ran": required,
+        "passed": passed,
+        "status": "pass" if passed else "blocked",
+        "evidence": dict(publication),
+    }
+    rows = [row for row in (gates.get("gates") or [])
+            if row.get("id") != gate["id"]]
+    rows.append(gate)
+    gates["gates"] = rows
+    gates["totals"] = {
+        "pass": sum(row.get("status") == "pass" for row in rows),
+        "fail": sum(row.get("status") == "fail" for row in rows),
+        "blocked": sum(row.get("status") == "blocked" for row in rows),
+    }
+    gates["passed"] = all(row.get("status") == "pass" for row in rows)
+
+    if paths:
+        quality_path = paths.get("quality_gates")
+        if quality_path:
+            atomic_json(quality_path, gates)
+        manifest_path = paths.get("manifest")
+        if manifest_path:
+            with open(manifest_path, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            claims = manifest.setdefault("claims", {})
+            claims["quality_gate_passed"] = gates["passed"]
+            claims["remote_default_publication"] = passed
+            manifest["publication"] = dict(publication)
+            atomic_json(manifest_path, manifest)
+    return gate
+
+
 @dataclasses.dataclass(frozen=True)
 class RuntimeMode:
     mode: str
@@ -980,43 +1028,16 @@ class RuntimeMode:
 def resolve_runtime_mode(mode: str, provider: str, model: str | None,
                          credentials_present: bool, local_available: bool,
                          cloud_free_available: bool = False) -> RuntimeMode:
-    """Provider-neutral, fail-explicit free/paid mode policy.
-
-    TWO modes, matching the CLI exactly (owner order 2026-08-24): a second mode
-    vocabulary living in the evidence module is how the launcher-drift trap
-    starts - one surface says free/paid while another still says auto/local/paid,
-    and the run records a mode name the operator was never offered.
-
-    Free capacity is TWO things and the caller must say so separately: the cloud
-    free tiers and the loopback ones. Collapsing them into one flag is the exact
-    mistake the retired 'local' mode made - it shut out 126 credentialed cloud
-    free-tier routes and pinned runs to CPU-only Ollama. ``cloud_free_available``
-    defaults to False so an existing caller resolves exactly as it did before.
-
-    ``local_only`` is therefore a property of the RESOLVED run, not of the mode:
-    a free run is local-only only when loopback is the only free capacity there
-    is. That distinction is load-bearing because ``local_only`` is what the
-    egress record claims, and claiming zero egress for a run that reached a
-    cloud free tier would be a false record, not a conservative one.
-    """
-    raw = str(mode or "free").strip().lower()
-    # Retired spellings are ACCEPTED, never offered - a saved command or
-    # scheduled task must degrade to the safe mode, not die. Both meant free.
-    mode = {"auto": "free", "local": "free"}.get(raw, raw)
-    if mode not in {"free", "paid"}:
-        raise ValueError("mode must be free or paid")
-    free_available = bool(local_available or cloud_free_available)
-    if mode == "paid":
-        # Unchanged, and deliberately so: paid must never resolve to something
-        # cheaper behind the operator's back any more than free may resolve to
-        # something billable. Both directions are silent-substitution bugs.
-        if not credentials_present:
-            hint = " Free routes are available." if free_available else ""
-            raise RuntimeError("paid mode requested but credentials are absent." + hint)
-        return RuntimeMode("paid", provider, model, False, "explicit paid mode")
-    if not free_available:
-        raise RuntimeError("free mode requested but no free route is reachable")
-    local_only = bool(local_available and not cloud_free_available)
-    return RuntimeMode("free", provider, model, local_only,
-                       "explicit free mode (loopback only)" if local_only
-                       else "explicit free mode (cloud free tiers reachable)")
+    """Resolve the sole quality-first paid-to-free runtime policy."""
+    raw = str(mode or "best").strip().lower()
+    aliases = {"auto", "local", "free", "paid", "best-available"}
+    if raw not in aliases | {"best"}:
+        raise ValueError("mode must be best")
+    if not (credentials_present or local_available or cloud_free_available):
+        raise RuntimeError("best-available mode has no reachable model route")
+    local_only = bool(local_available and not credentials_present
+                      and not cloud_free_available)
+    return RuntimeMode(
+        "best", "auto", model, local_only,
+        "best available: paid capacity first, then free capacity",
+    )

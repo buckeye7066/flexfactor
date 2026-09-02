@@ -112,7 +112,7 @@ class SteeringTests(unittest.TestCase):
         """One real path: HTTP boundary -> journal -> audit -> final receipt."""
         helper = ft.AuditPipelineIntegrationTests()
         with ft._RepoFixture({"pyproject.toml": "[project]\nname='target'\nversion='1'\n",
-                              "app.py": "value = 1\n"}) as project:
+                              "app.py": "value = 1\n"}, production=True) as project:
             args = helper._args(["prodready", "--program", project,
                                  "--no-bootstrap", "--no-preflight",
                                  "--no-dashboard", "--no-tests", "--no-e2e",

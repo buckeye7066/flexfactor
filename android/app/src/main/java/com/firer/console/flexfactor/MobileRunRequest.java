@@ -8,10 +8,7 @@ import java.util.regex.Pattern;
 /** Immutable, validated input for the managed FlexFactor Cloud runner. */
 public final class MobileRunRequest {
     public enum Provider {
-        OLLAMA("ollama"),
-        OPENAI("openai"),
-        ANTHROPIC("anthropic"),
-        COPILOT("copilot");
+        AUTO("auto");
 
         final String wire;
         Provider(String wire) { this.wire = wire; }
@@ -43,34 +40,32 @@ public final class MobileRunRequest {
     public final double maxCost;
     public final int threshold;
     public final int maxIterations;
-    public final boolean economy;
-    public final boolean useBoth;
 
-    public MobileRunRequest(Mode mode, Provider provider, String repository, String ref, String file,
+    public MobileRunRequest(Mode mode, String repository, String ref, String file,
             String goal, boolean scoutApply, double maxCost) {
-        this(UUID.randomUUID().toString(), mode, provider, repository, ref, file, goal,
-                scoutApply, maxCost, 90, 5, true, true);
+        this(UUID.randomUUID().toString(), mode, repository, ref, file, goal,
+                scoutApply, maxCost, 90, 6);
     }
 
-    public MobileRunRequest(Mode mode, Provider provider, String repository, String ref, String file,
-            String goal, boolean scoutApply, double maxCost, int threshold, int maxIterations,
-            boolean economy, boolean useBoth) {
-        this(UUID.randomUUID().toString(), mode, provider, repository, ref, file, goal,
-                scoutApply, maxCost, threshold, maxIterations, economy, useBoth);
+    public MobileRunRequest(Mode mode, String repository, String ref, String file,
+            String goal, boolean scoutApply, double maxCost, int threshold,
+            int maxIterations) {
+        this(UUID.randomUUID().toString(), mode, repository, ref, file, goal,
+                scoutApply, maxCost, threshold, maxIterations);
     }
 
-    MobileRunRequest(String requestId, Mode mode, Provider provider, String repository, String ref,
+    MobileRunRequest(String requestId, Mode mode, String repository, String ref,
             String file, String goal, boolean scoutApply, double maxCost) {
-        this(requestId, mode, provider, repository, ref, file, goal, scoutApply, maxCost,
-                90, 5, true, true);
+        this(requestId, mode, repository, ref, file, goal, scoutApply, maxCost,
+                90, 6);
     }
 
-    MobileRunRequest(String requestId, Mode mode, Provider provider, String repository, String ref,
+    MobileRunRequest(String requestId, Mode mode, String repository, String ref,
             String file, String goal, boolean scoutApply, double maxCost, int threshold,
-            int maxIterations, boolean economy, boolean useBoth) {
+            int maxIterations) {
         this.requestId = clean(requestId);
         this.mode = mode;
-        this.provider = provider;
+        this.provider = Provider.AUTO;
         this.repository = clean(repository);
         this.ref = clean(ref);
         this.file = clean(file);
@@ -79,17 +74,14 @@ public final class MobileRunRequest {
         this.maxCost = maxCost;
         this.threshold = threshold;
         this.maxIterations = maxIterations;
-        this.economy = economy;
-        this.useBoth = useBoth;
         validate();
     }
 
     private void validate() {
-        if (!requestId.matches("[0-9a-fA-F-]{36}")) {
+        if (!isCanonicalUuid(requestId)) {
             throw new IllegalArgumentException("The run identifier is invalid.");
         }
         if (mode == null) throw new IllegalArgumentException("Choose a FlexFactor mode.");
-        if (provider == null) throw new IllegalArgumentException("Choose a model provider.");
         if (!REPOSITORY.matcher(repository).matches() || repository.endsWith(".")) {
             throw new IllegalArgumentException("Repository must be written as owner/name.");
         }
@@ -102,8 +94,8 @@ public final class MobileRunRequest {
         if (threshold < 0 || threshold > 100) {
             throw new IllegalArgumentException("The acceptance threshold must be between 0 and 100.");
         }
-        if (maxIterations < 1 || maxIterations > 20) {
-            throw new IllegalArgumentException("Refactor iterations must be between 1 and 20.");
+        if (maxIterations < 1 || maxIterations > 6) {
+            throw new IllegalArgumentException("FlexFactor passes must be between 1 and 6.");
         }
         if (mode == Mode.REFACTOR) {
             if (!FILE.matcher(file).matches()) {
@@ -134,8 +126,6 @@ public final class MobileRunRequest {
         values.put("max_cost", formatCost(maxCost));
         values.put("threshold", Integer.toString(threshold));
         values.put("max_iterations", Integer.toString(maxIterations));
-        values.put("economy", Boolean.toString(economy));
-        values.put("use_both", Boolean.toString(useBoth));
         return values;
     }
 
@@ -146,5 +136,13 @@ public final class MobileRunRequest {
 
     private static String clean(String value) {
         return value == null ? "" : value.trim();
+    }
+
+    private static boolean isCanonicalUuid(String value) {
+        try {
+            return UUID.fromString(value).toString().equalsIgnoreCase(value);
+        } catch (IllegalArgumentException invalid) {
+            return false;
+        }
     }
 }

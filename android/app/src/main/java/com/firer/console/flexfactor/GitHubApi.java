@@ -130,11 +130,21 @@ final class GitHubApi {
             if (!result.isEmpty()) {
                 try {
                     JSONObject row = new JSONObject(result);
-                    text.append(row.optBoolean("success", false)
+                    boolean publicationRequired = row.optBoolean(
+                            "publication_required", false);
+                    boolean publicationComplete = row.optBoolean(
+                            "publication_complete", !publicationRequired);
+                    text.append(row.optBoolean("success", false) && publicationComplete
                             ? "Run completed successfully." : "Run did not complete successfully.");
                     text.append("\nRepository: ").append(row.optString("target_repository", "unknown"));
                     text.append("\nMode: ").append(row.optString("mode", "unknown"));
                     text.append("\nExit code: ").append(row.optInt("exit_code", -1));
+                    if (publicationRequired) {
+                        text.append("\nRemote default branch: ")
+                                .append(row.optString("default_branch", "unresolved"));
+                        text.append("\nPublication: ")
+                                .append(publicationComplete ? "verified" : "incomplete");
+                    }
                 } catch (JSONException ignored) {
                     text.append(result.trim());
                 }
@@ -314,21 +324,14 @@ final class GitHubApi {
             String openAiKey, String anthropicKey) throws Exception {
         String openAi = cleanSecret(openAiKey);
         String anthropic = cleanSecret(anthropicKey);
-        boolean dualPaid = request.useBoth
-                && (request.mode == MobileRunRequest.Mode.AUDIT
-                    || request.mode == MobileRunRequest.Mode.PRODREADY)
-                && (request.provider == MobileRunRequest.Provider.OPENAI
-                    || request.provider == MobileRunRequest.Provider.ANTHROPIC);
-        boolean sendOpenAi = request.provider == MobileRunRequest.Provider.OPENAI
-                || dualPaid;
-        boolean sendAnthropic = request.provider == MobileRunRequest.Provider.ANTHROPIC
-                || dualPaid;
-        if ((!sendOpenAi || openAi.isEmpty()) && (!sendAnthropic || anthropic.isEmpty())) {
+        boolean sendOpenAi = !openAi.isEmpty();
+        boolean sendAnthropic = !anthropic.isEmpty();
+        if (!sendOpenAi && !sendAnthropic) {
             return new JSONObject();
         }
-        // Validate only credentials this run will transmit. This keeps unused
-        // keys on the phone and prevents a stale or mistyped local value from
-        // replacing a working repository secret.
+        // The one ladder may need either paid account before reaching its free
+        // fallback, so every configured key is sent—still sealed directly to
+        // the selected repository's Actions public key.
         validateProviderKeys(sendOpenAi ? openAi : "", sendAnthropic ? anthropic : "");
         JSONObject key = cloudJson(token, "GET", "/api/provider-key?repository="
                 + encode(request.repository), null, true);
@@ -406,7 +409,7 @@ final class GitHubApi {
             if ("target_repository".equals(key)) key = "repository";
             if ("target_ref".equals(key)) key = "ref";
             String value = entry.getValue();
-            if ("scout_apply".equals(key) || "economy".equals(key) || "use_both".equals(key)) {
+            if ("scout_apply".equals(key)) {
                 body.put(key, Boolean.parseBoolean(value));
             } else if ("max_cost".equals(key)) {
                 body.put(key, Double.parseDouble(value));

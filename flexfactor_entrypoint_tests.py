@@ -141,7 +141,8 @@ class InterpreterResolutionTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.RESOLVER))
         for name in ("flexfactor_launch.ps1", "flexfactor_scout_launch.ps1",
                      "flexfactor_audit_launch.ps1"):
-            text = open(os.path.join(HERE, name), encoding="utf-8").read()
+            with open(os.path.join(HERE, name), encoding="utf-8") as launcher:
+                text = launcher.read()
             self.assertIn("scripts\\flexfactor_python.ps1", text, name)
             self.assertIn("Invoke-FlexFactorPython", text, name)
             # The bare call is what this change exists to remove.
@@ -272,29 +273,23 @@ class EntryPointParityTests(unittest.TestCase):
         script = os.path.join(HERE, "flexfactor_run.py")
         target = "portfolio-target"
         cases = (
-            ("flexfactor_launch.ps1", [target], ["2", "anthropic", ""],
+            ("flexfactor_launch.ps1", [target], ["2", "", ""],
              {"ANTHROPIC_API_KEY": "test-placeholder", "OPENAI_API_KEY": ""},
-             [script, "scout", "--program", target, "--provider", "anthropic"]),
-            # --model-mode is REQUIRED output since 2026-08-30: with only a paid
-            # OpenAI key present, omitting it left the CLI on its `free` default,
-            # which EXCLUDES that key - the run silently demoted to CPU-only
-            # ollama while the launcher claimed otherwise (ledger L11).
-            ("flexfactor_audit_launch.ps1", [target], ["n", ""],
+             [script, "scout", "--max-cost", "150", "--model-mode", "best",
+              "--allow-remote-program-context", "--program", target]),
+            ("flexfactor_audit_launch.ps1", [target], ["", ""],
              {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
               "OPENAI_API_KEY": "test-placeholder"},
-             [script, "audit", "--provider", "openai",
-              "--model-mode", "paid", "--paid-models", "openai",
-              "--program", target,
-              "--apply", "--yes", "--allow-dirty", "--auto-clean"]),
-            ("flexfactor_scout_launch.ps1", [target], ["openai", "YES", "report", ""],
+             [script, "audit", "--model-mode", "best", "--max-cost", "150",
+              "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean",
+              "--program", target]),
+            ("flexfactor_scout_launch.ps1", [target], ["", ""],
              {"OPENAI_API_KEY": "test-placeholder",
               "FLEXFACTOR_REPO_REWARDS_URL": "http://127.0.0.1:3000"},
-             [script, "scout", "--program", target, "--provider", "openai",
-              "--repo-rewards-url", "http://127.0.0.1:3000", "--no-auto-start",
-              "--allow-remote-program-context"]),
+             [script, "scout", "--model-mode", "best", "--max-cost", "150",
+              "--allow-remote-program-context", "--program", target]),
             ("flexfactor_glimmer_launch.ps1", ["audit", "--program", target], [], {},
-             [script, "audit", "--program", target, "--provider", "ollama",
-              "--model", "muse-glimmer:30b"]),
+             [script, "audit", "--program", target, "--model-mode", "best"]),
         )
         for name, args, answers, env, expected in cases:
             with self.subTest(launcher=name):

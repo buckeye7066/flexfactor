@@ -1,535 +1,116 @@
-# FlexFactor launcher - double-click the desktop icon, or drag a source file onto it.
+# FlexFactor desktop launcher. All modes share one production contract:
+# up to 30 ordered targets, exactly one active target, at most six passes, and
+# the strongest available paid model first before descending to free capacity.
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-# Python otherwise inherits the active Windows ANSI code page in some console
-# hosts. A worker printing an arrow/non-breaking hyphen then raises
-# UnicodeEncodeError and aborts that program lane. Pin both the interpreter and
-# its child-facing stream contract before any FlexFactor process is started.
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-# ---- Route ALL model calls through the local FCC proxy (Free Claude Code, ----
-# ---- the same backend the "Claude Code - FREE (Ollama)" desktop shortcut  ----
-# ---- uses). The proxy on 127.0.0.1:8082 exposes the Anthropic Messages    ----
-# ---- API with Bearer token 'freecc' and maps any Claude model id by tier  ----
-# ---- to a free upstream (free cloud or local Ollama, per fcc-toggle       ----
-# ---- routing), so FlexFactor's claude-* ids route fine.                   ----
-# ---- The paid keys are BLANKED for the SDKs but CAPTURED first as RESCUE  ----
-# ---- fallbacks (owner order 2026-08-10 evening): the free proxy stays     ----
-# ---- PRIMARY for every call; the paid keys' only job is to keep a run     ----
-# ---- going when the free backend is overwhelmed, stale, or down. Paid     ----
-# ---- rescue spend stays inside FlexFactor's --max-cost budget.            ----
-# To run on the real paid APIs again: copy flexfactor_launch.ps1.bak-preproxy
-# over this file and your real ANTHROPIC_API_KEY/OPENAI_API_KEY will be used.
-$env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = $env:ANTHROPIC_API_KEY
-$env:FLEXFACTOR_FALLBACK_OPENAI_KEY    = $env:OPENAI_API_KEY
-$env:ANTHROPIC_BASE_URL  = "http://127.0.0.1:8082"
-$env:ANTHROPIC_AUTH_TOKEN = "freecc"      # Bearer auth the proxy expects
-$env:ANTHROPIC_API_KEY   = ""             # blank any real key so the SDK uses the Bearer token
-$env:OPENAI_API_KEY      = ""             # blank: no billable OpenAI calls on the free path
-$env:OPENAI_BASE_URL     = ""
-
-function Test-FccProxyUp {
-    try { return ((Invoke-WebRequest "http://127.0.0.1:8082/health" -TimeoutSec 2 -UseBasicParsing).StatusCode -eq 200) } catch { return $false }
-}
-
-function Ensure-FccProxy {
-    # Make sure the free FCC proxy is serving; start it if not, the same way
-    # fcc-toggle.ps1's Start-Server does (hidden, logs under ~/.fcc/logs,
-    # messaging off, bound to 127.0.0.1:8082). Returns $true when healthy.
-    if (Test-FccProxyUp) { return $true }
-    Write-Host "  FCC proxy not running - starting it (same free backend as the desktop shortcut) ..." -ForegroundColor Yellow
-    $fccServer = $null
-    try { $fccServer = (Get-Command -Name 'fcc-server' -CommandType Application -ErrorAction Stop).Path } catch {}
-    if (-not $fccServer) {
-        Write-Host "  fcc-server not found on PATH. Run the 'Claude Code - FREE (Ollama)' desktop" -ForegroundColor Red
-        Write-Host "  shortcut once (it starts the proxy), then retry FlexFactor." -ForegroundColor Red
-        return $false
-    }
-    $fccHome = Join-Path $HOME '.fcc'
-    $fccLogs = Join-Path $fccHome 'logs'
-    if (-not (Test-Path $fccLogs)) { New-Item -ItemType Directory -Path $fccLogs -Force | Out-Null }
-    $prevMessaging = $env:MESSAGING_PLATFORM; $prevHost = $env:HOST; $prevPort = $env:PORT
-    try {
-        if ($env:FCC_ENABLE_MESSAGING -ne '1') { $env:MESSAGING_PLATFORM = 'none' }
-        $env:HOST = '127.0.0.1'; $env:PORT = '8082'
-        Start-Process -FilePath $fccServer -WorkingDirectory $fccHome `
-            -RedirectStandardOutput (Join-Path $fccLogs 'server.stdout.log') `
-            -RedirectStandardError (Join-Path $fccLogs 'server.stderr.log') `
-            -WindowStyle Hidden
-    } finally {
-        if ($null -eq $prevMessaging) { Remove-Item Env:\MESSAGING_PLATFORM -ErrorAction SilentlyContinue } else { $env:MESSAGING_PLATFORM = $prevMessaging }
-        if ($null -eq $prevHost) { Remove-Item Env:\HOST -ErrorAction SilentlyContinue } else { $env:HOST = $prevHost }
-        if ($null -eq $prevPort) { Remove-Item Env:\PORT -ErrorAction SilentlyContinue } else { $env:PORT = $prevPort }
-    }
-    $deadline = (Get-Date).AddSeconds(90)
-    while ((Get-Date) -lt $deadline -and -not (Test-FccProxyUp)) { Start-Sleep -Milliseconds 500 }
-    if (Test-FccProxyUp) { return $true }
-    Write-Host "  The FCC proxy did not come up within 90s." -ForegroundColor Red
-    Write-Host "  See $HOME\.fcc\logs\server.stderr.log, or run the desktop shortcut" -ForegroundColor Red
-    Write-Host "  'Claude Code - FREE (Ollama)' to diagnose, then retry." -ForegroundColor Red
-    return $false
-}
-
-function Invoke-FlexFactorJob {
-    # Supervisor: the free backend drops connections / hangs under load, so a
-    # FlexFactor job that dies is RELAUNCHED (up to 5 attempts) after re-ensuring
-    # the proxy is up. Safe by design: the audit sandbox branch is recreated with
-    # `git checkout -B` on every run, brain.json's clean_files skip makes a rerun
-    # converge instead of starting over, and in-process retries mean a restart
-    # only happens when the process genuinely died. Exit 2 (argparse usage
-    # error) never retries - rerunning a doomed command 5x helps nobody.
-    # THE EXIT CODE LEAVES BY $script:FlexFactorJobExit, NEVER BY return.
-    # In PowerShell a native command's stdout IS the success stream, so the old
-    # `$null = Invoke-FlexFactorJob ...` shape - needed to stop the return value
-    # printing - swallowed EVERY stdout line the Python child produced: the
-    # ConsoleMeter progress line, every per-file [fixed]/[skip]/[no-op]/[timeout]
-    # outcome, the totals, the purpose score, the review ledger. 326 of
-    # flexfactor.py's 399 print() calls go to stdout, so the desktop shortcut ran
-    # blind - including option 4, the very mode the meter was built for in
-    # 2026-08-11 after the owner reported "no progress meter in option 4".
-    # Writing the code to a script-scoped variable lets callers invoke this BARE,
-    # so the child's stdout reaches the console, and still read the real code.
-    param([string[]]$JobArgs)
-    $maxAttempts = 5
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        if ($selectedRuntimeMode -ne 'paid' -and -not (Ensure-FccProxy)) {
-            Write-Host "  Proxy unavailable - cannot run this attempt." -ForegroundColor Red
-            $script:FlexFactorJobExit = 1
-            return
-        }
-        if ($attempt -gt 1) {
-            Write-Host ""
-            Write-Host "  RESTART $attempt/$maxAttempts - relaunching the job (free backend dropped it) ..." -ForegroundColor Yellow
-        }
-        Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $JobArgs)
-        $code = $LASTEXITCODE
-        if ($code -eq 0) { $script:FlexFactorJobExit = 0; return }
-        if ($code -eq 2) {
-            Write-Host "  Exit code 2 (usage error / cancelled) - not retrying." -ForegroundColor Red
-            $script:FlexFactorJobExit = $code
-            return
-        }
-        if ($code -eq 3) {
-            # Exit 3 = the run completed but APPLIED NOTHING despite finding
-            # defects (2026-08-11). Relaunching that 4 more times just spends the
-            # same money again for the same nothing. Surface it and stop.
-            Write-Host "  Exit code 3: the run FIXED NOTHING despite finding defects." -ForegroundColor Red
-            Write-Host "  Not retrying - a repeat would re-spend the same budget for the" -ForegroundColor Red
-            Write-Host "  same result. See the audit report for why nothing could be applied." -ForegroundColor Red
-            $script:FlexFactorJobExit = $code
-            return
-        }
-        Write-Host "  FlexFactor exited with code $code." -ForegroundColor Yellow
-        if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 15 }
-    }
-    Write-Host "  Gave up after $maxAttempts attempts - see output above." -ForegroundColor Red
-    $script:FlexFactorJobExit = 1
-}
-
-# flexfactor_run.py is a thin shim onto flexfactor.run_cli (the same entry the
-# installed console script uses); directed orchestration is native to the runtime.
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
-# ONE interpreter answer for all three launchers (see the file's header).
 . (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
-$selectedRuntimeMode = "free"   # two modes only: free (default) / paid
+
+function Read-FlexFactorTargets {
+    param(
+        [string]$Label,
+        [object[]]$Dropped
+    )
+
+    $targets = @($Dropped | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") })
+    if ($targets.Count -gt 30) {
+        throw "Choose no more than 30 $Label targets."
+    }
+    if ($targets.Count -gt 0) {
+        return @($targets | ForEach-Object { "$($_)".Trim('"') })
+    }
+
+    $countRaw = Read-Host "How many $Label targets? (1-30, Enter = 1)"
+    $count = 1
+    if (-not [string]::IsNullOrWhiteSpace($countRaw)) {
+        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 30) {
+            throw "Target count must be from 1 through 30."
+        }
+    }
+    for ($index = 1; $index -le $count; $index++) {
+        $value = (Read-Host "$Label target $index").Trim('"')
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            throw "Target $index cannot be blank."
+        }
+        $targets += $value
+    }
+    return $targets
+}
+
+function Read-BoundedInteger {
+    param(
+        [string]$Prompt,
+        [int]$Default,
+        [int]$Minimum,
+        [int]$Maximum
+    )
+    $raw = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $Default }
+    $value = 0
+    if (-not [int]::TryParse($raw, [ref]$value) -or $value -lt $Minimum -or $value -gt $Maximum) {
+        throw "Value must be from $Minimum through $Maximum."
+    }
+    return $value
+}
 
 Write-Host ""
-Write-Host "  ____  _           ____         _             " -ForegroundColor Cyan
-Write-Host " |  _ \| | _____  _|  _ \ __ _  | |_ ___  _ __ " -ForegroundColor Cyan
-Write-Host " | |_) | |/ _ \ \/ / |_) / _` | | __/ _ \| '__|" -ForegroundColor Cyan
-Write-Host " |  __/| |  __/>  <|  _ < (_| | | || (_) | |   " -ForegroundColor Cyan
-Write-Host " |_|   |_|\___/_/\_\_| \_\__,_|  \__\___/|_|  FlexFactor" -ForegroundColor Cyan
-Write-Host "  It does reps on your code until the grade is swole." -ForegroundColor DarkGray
+Write-Host "FlexFactor" -ForegroundColor Cyan
+Write-Host "One orchestrator. Up to 30 targets. One at a time. Six passes maximum." -ForegroundColor DarkGray
+Write-Host "Model policy: strongest paid capacity first, then lower paid tiers, then free." -ForegroundColor DarkGray
 Write-Host ""
-
-# Four modes. Keep these descriptions matched to what the CLI actually does -
-# a prompt that overstates the mode is how a report-only run gets read as work.
-#   refactor - rewrite/grade reps on ONE file until it meets a numeric threshold.
-#   scout    - Repo Rewards search for ONE program; PROPOSES, never applies here.
-#   audit    - review + fix + publish, up to 10 programs.
-#   prodready- audit plus dependency bootstrap and a readiness scorecard.
-# A dropped file/folder skips straight to that target; otherwise we ask.
-$dropped = if ($args.Count -ge 1) { $args[0] } else { $null }
-
-Write-Host "What do you want to do?" -ForegroundColor Yellow
-Write-Host "  1) refactor  - ONE source file + a plain-English goal. Rewrites it, grades the"
-Write-Host "                 result, repeats until it scores your threshold (default 90) or"
-Write-Host "                 5 reps run out. Writes the file in place."
-Write-Host "  2) scout     - ONE program. Searches Repo Rewards for repos that would help it,"
-Write-Host "                 judges each against that program's purpose, and REPORTS what is"
-Write-Host "                 worth adopting. Proposal only - it changes nothing."
-Write-Host "  3) audit     - UP TO 10 programs. Reviews every file against the program's"
-Write-Host "                 purpose, researches competitors, exercises its functions, and"
-Write-Host "                 fixes what it finds - a second model has to agree each fix is"
-Write-Host "                 sound. Commits, and pushes only what builds AND passes the"
-Write-Host "                 project's own test suite. Every run is real; no review mode."
-Write-Host "  4) prodready - UP TO 10 programs, nothing else to answer. Detects the toolchains"
-Write-Host "                 and installs the dependencies first, does everything audit does,"
-Write-Host "                 then scores the result against a production-readiness rubric"
-Write-Host "                 (unproven gates block; they never pass by default). All programs"
-Write-Host "                 run at the same time."
+Write-Host "  1) Refactor files"
+Write-Host "  2) Scout repository improvements"
+Write-Host "  3) Audit and repair repositories"
+Write-Host "  4) Make repositories production ready"
 $mode = Read-Host "Choose [1/2/3/4] (Enter = 1)"
+if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "1" }
+if ($mode -notin @("1", "2", "3", "4")) {
+    Write-Host "Choose 1, 2, 3, or 4." -ForegroundColor Red
+    Read-Host "Press Enter to close"
+    exit 2
+}
 
-# Audit/prodready expose the cost/privacy boundary directly. Local is the
-# shortcut-compatible default; paid restores captured real credentials and
-# clears the loopback route. The CLI receives the same boundary and refuses
-# to cross it even if environment variables are later changed.
-if ($mode -eq "3" -or $mode -eq "4") {
-    # TWO choices, and each says what it costs (owner order 2026-08-24). The old
-    # menu offered local / paid / auto, and the two non-paid names did not mean
-    # what they looked like: 'local' was LOOPBACK ONLY (it shut out all 126
-    # credentialed cloud free-tier routes and pinned the run to CPU-only Ollama)
-    # and it was the DEFAULT, while 'auto' was free-first-then-paid and in
-    # practice reached neither - the 2026-08-24 run spent $0.00 with every free
-    # allowance exhausted and reviewed 0 of 3537 files.
-    $selectedRuntimeMode = Read-Host "Model mode [free / paid] (Enter = free)"
-    if ([string]::IsNullOrWhiteSpace($selectedRuntimeMode)) { $selectedRuntimeMode = "free" }
-    $selectedRuntimeMode = $selectedRuntimeMode.ToLowerInvariant()
-    # Retired spellings stay ACCEPTED but are never OFFERED, so muscle memory or
-    # a saved command does not dead-end on 'exit 2'. Both meant free in practice.
-    if ($selectedRuntimeMode -in @("local", "auto")) {
-        Write-Host "  '$selectedRuntimeMode' is retired - running as 'free'." -ForegroundColor Yellow
-        $selectedRuntimeMode = "free"
-    }
-    if ($selectedRuntimeMode -notin @("free", "paid")) {
-        Write-Host "Unknown model mode '$selectedRuntimeMode'. Choose free or paid." -ForegroundColor Red
-        Read-Host "Press Enter to close"; exit 2
-    }
-    if ($selectedRuntimeMode -eq "paid") {
-        $env:ANTHROPIC_API_KEY = $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY
-        $env:OPENAI_API_KEY = $env:FLEXFACTOR_FALLBACK_OPENAI_KEY
-        Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
-        Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
-        Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
-        # WHICH ACCOUNTS (owner request 2026-08-29). 'both' keeps the contract
-        # that every applied fix is approved by the model that did not write it,
-        # and needs both keys. Naming one account is a DELIBERATE single-model
-        # run on it - what you want when the other one is out of credit - and it
-        # is asked for here rather than discovered as a refusal several minutes
-        # into a run.
-        $selectedPaidModels = Read-Host "Paid accounts [both / anthropic / openai] (Enter = both)"
-        if ([string]::IsNullOrWhiteSpace($selectedPaidModels)) { $selectedPaidModels = "both" }
-        $selectedPaidModels = $selectedPaidModels.ToLowerInvariant()
-        if ($selectedPaidModels -notin @("both", "anthropic", "openai")) {
-            Write-Host "Unknown choice '$selectedPaidModels'. Choose both, anthropic or openai." -ForegroundColor Red
-            Read-Host "Press Enter to close"; exit 2
-        }
-        $missingPaid = @()
-        if ($selectedPaidModels -in @("both", "anthropic") -and
-            [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) { $missingPaid += "ANTHROPIC_API_KEY" }
-        if ($selectedPaidModels -in @("both", "openai") -and
-            [string]::IsNullOrEmpty($env:OPENAI_API_KEY))    { $missingPaid += "OPENAI_API_KEY" }
-        if ($missingPaid.Count -gt 0) {
-            Write-Host ("Paid mode '$selectedPaidModels' needs: " + ($missingPaid -join ", ") +
-                        " - not set in this environment.") -ForegroundColor Red
-            Read-Host "Press Enter to close"; exit 1
-        }
-        Write-Host "  Paid mode: your own accounts ONLY, until their credits expire." -ForegroundColor Yellow
-        Write-Host "             No free routes, no Ollama, no OpenRouter resale." -ForegroundColor Yellow
-        if ($selectedPaidModels -eq "both") {
-            Write-Host "             Both models: each applied fix is approved by the one that" -ForegroundColor Yellow
-            Write-Host "             did not write it." -ForegroundColor Yellow
-        } else {
-            Write-Host ("             SINGLE MODEL ($selectedPaidModels): no second opinion on each") -ForegroundColor Yellow
-            Write-Host "             fix. The build gate and the project's own suite still gate" -ForegroundColor Yellow
-            Write-Host "             every commit, and the report says the run was single-model." -ForegroundColor Yellow
-        }
+try {
+    $cost = Read-BoundedInteger "Maximum paid-model cost in USD (1-150, Enter = 150)" 150 1 150
+    if ($mode -eq "1") {
+        $targets = @(Read-FlexFactorTargets "file" @($args))
+        $goal = Read-Host "Goal to apply to each selected file"
+        if ([string]::IsNullOrWhiteSpace($goal)) { throw "A refactor goal is required." }
+        $threshold = Read-BoundedInteger "Acceptance threshold (0-100, Enter = 90)" 90 0 100
+        $cliArgs = @("refactor", "--goal", $goal, "--threshold", "$threshold",
+                     "--max-iterations", "6", "--max-cost", "$cost",
+                     "--model-mode", "best")
+        foreach ($target in $targets) { $cliArgs += @("--file", $target) }
+    } elseif ($mode -eq "2") {
+        $targets = @(Read-FlexFactorTargets "program" @($args))
+        $cliArgs = @("scout", "--max-cost", "$cost", "--model-mode", "best",
+                     "--allow-remote-program-context")
+        foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     } else {
-        $env:FLEXFACTOR_FALLBACK_ANTHROPIC_KEY = ""
-        $env:FLEXFACTOR_FALLBACK_OPENAI_KEY = ""
-        Write-Host "  Free mode: free routes ONLY - cloud free tiers (NVIDIA NIM, Gemini, Groq," -ForegroundColor Green
-        Write-Host "             Cerebras, OpenRouter free) plus local Ollama/FCC. Paid routes are" -ForegroundColor Green
-        Write-Host "             filtered out, so this run cannot spend." -ForegroundColor Green
+        $label = if ($mode -eq "3") { "audit program" } else { "production program" }
+        $targets = @(Read-FlexFactorTargets $label @($args))
+        $command = if ($mode -eq "3") { "audit" } else { "prodready" }
+        $cliArgs = @($command, "--model-mode", "best", "--max-cost", "$cost",
+                     "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean")
+        foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     }
-}
-
-# prodready asks NOTHING beyond the program. That is the point of the mode: the
-# owner should not have to know which of ~40 audit flags make a run trustworthy.
-if ($mode -eq "4") {
-    # Programs: prodready takes UP TO TEN in one run, same as audit (flexfactor.py's
-    # run_audit() validates 1..10 - owner order 2026-08-13). Each can be a folder,
-    # file, .lnk, URL, or name. Dropped paths are used as-is.
-    $programs = @()
-    $droppedAll = @($args | Where-Object { $_ })
-    if ($droppedAll.Count -ge 1) {
-        $programs = @($droppedAll | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
-        Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
-    } else {
-        $countRaw = Read-Host "How many programs to make production ready? (1-10, Enter = 1)"
-        $count = 1
-        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
-        for ($i = 1; $i -le $count; $i++) {
-            $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
-            if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
-        }
-        $programs = @($programs | Select-Object -First 10)
-    }
-    if ($programs.Count -eq 0) {
-        Write-Host "No program given." -ForegroundColor Red
-        Read-Host "Press Enter to close"; exit 1
-    }
-    $programArgs = @()
-    foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
-    # prodready runs every program at the same time, no question asked (owner
-    # order 2026-08-13: "I want all programs to run at the same time"). run_audit()
-    # genuinely fans these out onto a ThreadPoolExecutor of that width - not a
-    # cosmetic flag - so N programs really do progress concurrently, each with
-    # its own free-proxy/FCC-backed review pool.
-    if ($programs.Count -ge 2) {
-        $programArgs += '--parallel'
-        $programArgs += "$($programs.Count)"
-    }
-    Write-Host ""
-    Write-Host "  Running: detect toolchains -> install dependencies -> review + fix" -ForegroundColor DarkGray
-    Write-Host "           -> build gate -> tests -> readiness scorecard" -ForegroundColor DarkGray
-    Write-Host "  Verified fixes commit straight to your CURRENT branch and push to" -ForegroundColor DarkGray
-    Write-Host "  origin (green-build gated). No sandbox branch, no merge step." -ForegroundColor DarkGray
-    if ($programs.Count -ge 2) {
-        Write-Host "  Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
-    }
-    Write-Host ""
-    # NO '--provider' (owner order 2026-08-11). Passing one marks the choice as
-    # EXPLICIT, which suppresses FREE-FIRST and sends the whole run to a paid cloud
-    # key - measured that day at ~$2.85/hr while a loaded local qwen3-coder idled.
-    # Omitting it lets preflight pick the free local model as author and keep a
-    # usable cloud key as the cross-check reviewer. The free-proxy env this launcher
-    # sets above still applies to whichever cloud provider is chosen.
-    # '--yes': prodready implies --apply, and the CLI still asks for apply
-    # confirmation; without a TTY (schtask / piped answers) that gate refuses
-    # and the whole run silently degrades to report-only (2026-08-11: 6h /
-    # $17.75 GrantFlow review, 3464 defects found, 0 fixed). This menu already
-    # IS the owner's confirmation - same reasoning as audit mode above.
-    $paidArgs = @()
-    if ($selectedRuntimeMode -eq 'paid') { $paidArgs = @('--paid-models', $selectedPaidModels) }
-    Invoke-FlexFactorJob (@('prodready') + $programArgs + @('--model-mode', $selectedRuntimeMode) + $paidArgs + @('--economy', '--yes'))
-    Write-Host ""
-    Read-Host "Done. Press Enter to close"
-    exit $script:FlexFactorJobExit
-}
-
-# Audit has its own provider handling: it auto-detects keys and (when both are
-# set) cross-checks with both models. Branch off before the single-provider
-# sanity check used by refactor/scout.
-if ($mode -eq "3") {
-    # Key detection. Audit wants BOTH models when it can get them.
-    $haveAnthropic = (-not [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY)) -or (-not [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN))
-    $haveOpenai    = -not [string]::IsNullOrEmpty($env:OPENAI_API_KEY)
-    $extraArgs = @('--model-mode', $selectedRuntimeMode)
-    if ($selectedRuntimeMode -eq 'paid') { $extraArgs += @('--paid-models', $selectedPaidModels) }
-    # NAMING ONE PAID ACCOUNT SETTLES THE PROVIDER QUESTION. The engine makes
-    # the named account the primary and adds no second one, so anything this
-    # launcher says about a different primary - or about a cross-check that
-    # cannot happen - is simply untrue. Choosing 'openai' and pressing Enter at
-    # the primary prompt used to announce "anthropic authors, openai reviews"
-    # and then run OpenAI alone. There is no choice left to offer here, so the
-    # prompt is skipped and the messages report the account actually running.
-    $paidSingleAccount = ($selectedRuntimeMode -eq 'paid' -and $selectedPaidModels -ne 'both')
-
-    if ($paidSingleAccount) {
-        Write-Host ("Paid accounts: $selectedPaidModels only - $selectedPaidModels authors and fixes; no second model reviews.") -ForegroundColor Yellow
-        $defaultProvider = $selectedPaidModels
-    } elseif ($haveAnthropic -and $haveOpenai) {
-        # Both keys present: run primary + cross-check. Do NOT pass --single.
-        Write-Host "Both keys detected - audit will use both models (primary + cross-check)." -ForegroundColor Green
-        $defaultProvider = "anthropic"
-    } elseif ($haveAnthropic) {
-        # In this launcher the real key was blanked above; what's detected is
-        # the free-proxy Bearer token. Say so instead of claiming a paid key.
-        Write-Host "Anthropic route detected (free-proxy token) - using anthropic." -ForegroundColor Yellow
-        $defaultProvider = "anthropic"
-    } elseif ($haveOpenai) {
-        Write-Host "Only OPENAI_API_KEY detected - using openai." -ForegroundColor Yellow
-        $defaultProvider = "openai"
-    } else {
-        Write-Host "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set in this environment." -ForegroundColor Red
-        Write-Host "Set at least one valid key and retry." -ForegroundColor Red
-        Read-Host "Press Enter to close"; exit 1
-    }
-
-    # Only ask when there is a REAL choice (both providers usable). With one
-    # usable provider the guards below force every answer back to the default,
-    # so the question was pure noise (owner feedback 2026-08-11 evening). In
-    # this free-proxy launcher OPENAI_API_KEY is always blanked above, so the
-    # prompt never fires here at all.
-    if ($haveAnthropic -and $haveOpenai -and -not $paidSingleAccount) {
-        $provider = Read-Host "Primary provider [openai / anthropic] (Enter = $defaultProvider)"
-        if ([string]::IsNullOrWhiteSpace($provider)) { $provider = $defaultProvider }
-    } else {
-        $provider = $defaultProvider
-    }
-    # GUARD (2026-08-11 live failure): this launcher BLANKS OPENAI_API_KEY for the
-    # free-proxy env, so '--provider openai' is guaranteed unusable here and used
-    # to demote the whole run to local ollama at preflight. Never pass a provider
-    # whose credential this environment does not carry - the env wins.
-    if ($provider -ne "openai" -and $provider -ne "anthropic") {
-        Write-Host "Unknown provider '$provider' - using $defaultProvider." -ForegroundColor Yellow
-        $provider = $defaultProvider
-    }
-    if ($provider -eq "openai" -and -not $haveOpenai) {
-        Write-Host "OPENAI_API_KEY is blank in this environment (free-proxy mode) - using anthropic (free proxy) instead." -ForegroundColor Yellow
-        $provider = "anthropic"
-    }
-    if ($provider -eq "anthropic" -and -not $haveAnthropic -and $haveOpenai) {
-        Write-Host "No Anthropic credential in this environment - using openai instead." -ForegroundColor Yellow
-        $provider = "openai"
-    }
-    $primary = $provider
-
-    # Programs: audit can take UP TO TEN in one run (flexfactor.py's run_audit()
-    # validates 1..10 - owner order 2026-08-13). Each can be a folder, file, .lnk,
-    # URL, or name. Multiple dropped paths are used as-is (capped at 10).
-    $programs = @()
-    $droppedAll = @($args | Where-Object { $_ })
-    if ($droppedAll.Count -ge 1) {
-        $programs = @($droppedAll | Select-Object -First 10 | ForEach-Object { $_.Trim('"') })
-        Write-Host "Programs (dropped): $($programs -join ', ')" -ForegroundColor Green
-    } else {
-        $countRaw = Read-Host "How many programs to audit? (1-10, Enter = 1)"
-        $count = 1
-        if (-not [int]::TryParse($countRaw, [ref]$count) -or $count -lt 1 -or $count -gt 10) { $count = 1 }
-        for ($i = 1; $i -le $count; $i++) {
-            $p = (Read-Host "Program $i (folder, file, .lnk, URL, or name)").Trim('"')
-            if (-not [string]::IsNullOrWhiteSpace($p)) { $programs += $p }
-        }
-        $programs = @($programs | Select-Object -First 10)
-    }
-    if ($programs.Count -eq 0) {
-        Write-Host "No program given." -ForegroundColor Red
-        Read-Host "Press Enter to close"; exit 1
-    }
-
-    # Every run is REAL (owner order 2026-08-11, stronger form: "I do not want
-    # test runs as part of the app's functions. Each run must be for real.").
-    # The CLI has no --report-only/--dry-run in ANY mode as of 2026-08-21 (the
-    # last survivor, scout's --dry-run, was removed outright that day), so this
-    # launcher no longer offers a report choice either. --apply --yes keeps the
-    # invocation unambiguous for the non-TTY confirmation path.
-    # LAUNCHER-DRIFT RULE: both .ps1 launchers must be swept in the SAME commit
-    # as any CLI flag change - a stale flag is argparse exit 2 and a dead run.
-    if ($true) {
-        $extraArgs += "--apply"
-        $extraArgs += "--yes"
-        Write-Host "Apply mode: verified fixes are committed each cycle, merged into the" -ForegroundColor DarkGray
-        Write-Host "current branch, and pushed to origin/main automatically (green-build" -ForegroundColor DarkGray
-        Write-Host "gated; owner order 2026-08-11). CLI --no-push/--no-merge opt out." -ForegroundColor DarkGray
-    }
-
-    # Repo cleanup is AUTOMATIC and unconditional (owner order 2026-08-20).
-    # There is no question here any more. The old prompt asked whether to continue
-    # on a dirty working tree; the owner read it as "take care of whatever is left
-    # red in the repo first", answered yes, and the run still refused sermonsmith.
-    # So the intent is now the implementation: every run cleans the repo BEFORE it
-    # starts new work - pre-existing uncommitted changes, open PRs, Dependabot
-    # alerts and open issues - then does the new work, then pushes and MERGES to
-    # main. Nothing is left dangling and nothing is silently skipped.
-    $extraArgs += "--allow-dirty"
-    $extraArgs += "--auto-clean"
-    Write-Host "Repo cleanup: automatic. Pre-existing changes, open PRs, Dependabot alerts and open issues are cleared FIRST, then the new work runs, then it is pushed and merged to main." -ForegroundColor DarkGray
-
-    # 2+ programs always run at the same time now, no question asked (owner
-    # order 2026-08-13: "I want all programs to run at the same time"). Real
-    # concurrency - run_audit() fans these out onto a ThreadPoolExecutor of
-    # this width, not a cosmetic flag.
-    if ($programs.Count -ge 2) {
-        $extraArgs += "--parallel"
-        $extraArgs += "$($programs.Count)"
-        Write-Host "Running all $($programs.Count) programs concurrently." -ForegroundColor DarkGray
-    }
-
-    # Build a repeatable --program list, one flag per program.
-    $programArgs = @()
-    foreach ($p in $programs) { $programArgs += '--program'; $programArgs += $p }
-    # Preserve FREE-FIRST for local/auto runs, but paid mode is an explicit
-    # vendor choice. Forward the selected PRIMARY. When both paid credentials
-    # are present, keep the CLI's default dual-provider contract: the selected
-    # provider authors and the other independently cross-checks. The old code
-    # printed "both models" above, then appended --single here and silently
-    # disabled the promised cross-check.
-    if ($selectedRuntimeMode -eq "paid") {
-        $extraArgs += "--provider"
-        $extraArgs += $primary
-        if ($paidSingleAccount) {
-            Write-Host "Paid audit: $primary only (you chose '$selectedPaidModels'); no second model cross-checks." -ForegroundColor Yellow
-        } elseif ($haveAnthropic -and $haveOpenai) {
-            $secondary = if ($primary -eq "anthropic") { "openai" } else { "anthropic" }
-            Write-Host "Paid audit: $primary is primary; $secondary will independently cross-check." -ForegroundColor Yellow
-        } else {
-            $extraArgs += "--single"
-            Write-Host "Paid audit: only $primary is credentialed; running single-provider." -ForegroundColor Yellow
-        }
-    }
-
-    Write-Host ""
-    Invoke-FlexFactorJob (@('audit') + $programArgs + $extraArgs)
-    Write-Host ""
-    Read-Host "Done. Press Enter to close"
-    exit $script:FlexFactorJobExit
-}
-
-$provider = Read-Host "Provider [anthropic / openai] (Enter = anthropic)"
-if ([string]::IsNullOrWhiteSpace($provider)) { $provider = "anthropic" }
-
-# Key sanity check (shared by refactor and scout modes).
-if ($provider -eq "openai" -and [string]::IsNullOrEmpty($env:OPENAI_API_KEY)) {
-    Write-Host "OPENAI_API_KEY is not set in this environment." -ForegroundColor Red
-    Read-Host "Press Enter to close"; exit 1
-}
-if ($provider -eq "anthropic" -and [string]::IsNullOrEmpty($env:ANTHROPIC_API_KEY) -and [string]::IsNullOrEmpty($env:ANTHROPIC_AUTH_TOKEN)) {
-    Write-Host "No Anthropic credential set (ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN) and proxy env is missing." -ForegroundColor Red
-    Read-Host "Press Enter to close"; exit 1
-}
-
-if ($mode -eq "2") {
-    # Scout mode: the "program" can be a folder, file, .lnk, URL, or description.
-    if ($dropped) {
-        $program = $dropped
-        Write-Host "Program (dropped): $program" -ForegroundColor Green
-    } else {
-        $program = (Read-Host "Program to help (folder, .lnk, URL, or description)").Trim('"')
-    }
-    Write-Host ""
-    Invoke-FlexFactorJob @('scout', '--program', $program, '--provider', $provider)
-    Write-Host ""
-    Read-Host "Done. Press Enter to close"
-    exit $script:FlexFactorJobExit
-}
-
-# Refactor mode (original behavior).
-if ($dropped -and (Test-Path $dropped)) {
-    $file = $dropped
-    Write-Host "Target file (dropped): $file" -ForegroundColor Green
-} else {
-    $file = (Read-Host "Path to the source file to improve").Trim('"')
-}
-# NO local Test-Path bail-out (owner order 2026-08-20). A repo-relative path
-# like "backend/crawler-os/contract.js" is the spelling a person actually
-# knows, and it is not relative to whatever directory this launcher started
-# in. flexfactor.py resolves it against the local checkouts and then the
-# owner's GitHub repos, so refusing here would kill the lookup before it runs.
-if (-not (Test-Path $file)) {
-    Write-Host "Not in this folder - checking your local projects and GitHub repos..." -ForegroundColor DarkGray
-}
-
-$goal = Read-Host "What's the goal? (plain English)"
-
-$threshold = Read-Host "Accept threshold 0-100 (Enter = 90)"
-# --threshold is `type=int` in argparse, so a non-numeric answer here is exit 2
-# and a dead run before anything starts. Every other numeric prompt in this file
-# already validates; this one did not.
-$thresholdValue = 0
-if ([string]::IsNullOrWhiteSpace($threshold) -or
-    -not [int]::TryParse($threshold, [ref]$thresholdValue) -or
-    $thresholdValue -lt 0 -or $thresholdValue -gt 100) {
-    if (-not [string]::IsNullOrWhiteSpace($threshold)) {
-        Write-Host "  '$threshold' is not a whole number 0-100 - using 90." -ForegroundColor Yellow
-    }
-    $threshold = "90"
+} catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Read-Host "Press Enter to close"
+    exit 2
 }
 
 Write-Host ""
-Invoke-FlexFactorJob @('refactor', '--file', $file, '--goal', $goal, '--provider', $provider, '--threshold', $threshold)
+Write-Host "The orchestrator will run $($targets.Count) target(s) sequentially." -ForegroundColor Cyan
+Write-Host "Writing modes succeed only after independent review, project verification," -ForegroundColor DarkGray
+Write-Host "and proof that the exact commit is present on origin's default branch." -ForegroundColor DarkGray
+Write-Host ""
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $cliArgs)
+$exitCode = $LASTEXITCODE
 Write-Host ""
 Read-Host "Done. Press Enter to close"
-exit $script:FlexFactorJobExit
+exit $exitCode
