@@ -13659,6 +13659,42 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     return (r.returncode == 0, _tail(r.stdout + "\n" + r.stderr, 40))
 
 
+def _validated_generated_test_entries(gen: dict) -> list[dict]:
+    """Validate test-entry properties before the audit consumer uses them.
+
+    The shared structured-output guard proves that array members are objects,
+    but providers without native schema enforcement can still return wrong
+    property types inside those objects.  Keep this consumer boundary strict
+    so malformed ``path`` or ``contents`` values become the surrounding
+    module's ordinary generation failure instead of escaping as AttributeError.
+    """
+    if not isinstance(gen, dict):
+        raise RuntimeError(
+            f"test generation returned {type(gen).__name__}, not an object"
+        )
+    files = gen.get("files")
+    if files is None:
+        return []
+    if not isinstance(files, list):
+        raise RuntimeError(
+            f"test generation 'files' is {type(files).__name__}, not an array"
+        )
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"test generation files[{index}] is "
+                f"{type(item).__name__}, not an object"
+            )
+        for field in ("path", "contents"):
+            value = item.get(field)
+            if not isinstance(value, str):
+                raise RuntimeError(
+                    f"test generation files[{index}].{field} is "
+                    f"{type(value).__name__}, not a string"
+                )
+    return files
+
+
 def _write_and_run_generated_test_batch(
         project_dir: str, candidates: list[dict], stack: dict,
 ) -> tuple[list[dict], bool | None, str, str, list[str]]:
@@ -18213,6 +18249,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             "test generation returned "
                             f"{type(gen).__name__}, not an object")
                     _check_array_item_shape(gen, TEST_GEN_SCHEMA, "")
+                    validated_generated_files = (
+                        _validated_generated_test_entries(gen)
+                    )
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     manual_review.add(rel)
@@ -18225,9 +18264,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "fix": "Generate and run tests that exercise every reachable function.",
                     })
                     continue
-                for f in gen.get("files") or []:
-                    p = str(f.get("path") or "").replace("\\", "/")
-                    if not p or not (f.get("contents") or "").strip():
+                for f in validated_generated_files:
+                    p = f["path"].replace("\\", "/")
+                    if not p or not f["contents"].strip():
                         continue
                     # Do not write here. Every model-generated test from every
                     # changed source is accumulated first, then the shared batch

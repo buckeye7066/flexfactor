@@ -12473,6 +12473,22 @@ class ArrayItemShapeTests(unittest.TestCase):
         out = ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
         self.assertEqual(out, payload)
 
+    def test_generated_test_consumer_rejects_wrong_property_types(self):
+        malformed = (
+            {"files": [{"path": "tests/x.py", "contents": 1}], "notes": "n"},
+            {"files": [{"path": 1, "contents": "assert True\n"}], "notes": "n"},
+            {"files": [{"contents": "assert True\n"}], "notes": "n"},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaises(RuntimeError) as caught:
+                ff._validated_generated_test_entries(payload)
+            self.assertIn("not a string", str(caught.exception))
+
+    def test_generated_test_consumer_returns_validated_entries(self):
+        entries = [{"path": "tests/x.py", "contents": "def test_x(): pass\n"}]
+        payload = {"files": entries, "notes": "n"}
+        self.assertIs(entries, ff._validated_generated_test_entries(payload))
+
     def test_scalar_item_arrays_still_accept_strings(self):
         # fixed_titles declares items.type=string. Validating it as objects
         # would break every schema that legitimately carries a string list -
