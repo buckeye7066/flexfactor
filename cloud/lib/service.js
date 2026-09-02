@@ -276,19 +276,6 @@ export async function configure(token, fetchImpl = fetch) {
   if (typeof user.login !== "string" || !user.login.trim()) {
     throw new ServiceError(502, "account_not_identified", "GitHub did not identify this account.");
   }
-  let hasAdministrableRepository = false;
-  for (let page = 1; page <= MAX_REPOSITORY_PAGES; page += 1) {
-    const batch = await repositories(token, page, fetchImpl);
-    if (batch.repositories.length) {
-      hasAdministrableRepository = true;
-      break;
-    }
-    if (!batch.has_more) break;
-  }
-  if (!hasAdministrableRepository) {
-    throw new ServiceError(403, "no_administrable_repository",
-      "This account has no administrable repository. FlexFactor needs repository contents, workflows, Actions, and secrets access.");
-  }
   return { login: user.login.trim() };
 }
 

@@ -147,27 +147,12 @@ test("repository discovery returns one bounded page of administrable targets", a
     (error) => error instanceof ServiceError && error.code === "invalid_page");
 });
 
-test("configuration validates the account, scopes, and an administrable repository", async () => {
+test("configuration validates the account and scopes without a repository scan", async () => {
   const fetcher = queuedFetch([
     { body: { login: "operator" }, headers: { "x-oauth-scopes": "repo, workflow" } },
-    { body: [{ full_name: "operator/project", default_branch: "main", private: true,
-      permissions: { admin: true } }] },
   ]);
   assert.deepEqual(await configure("gho_configuration_token", fetcher), { login: "operator" });
-});
-
-test("configuration searches bounded pages for an administrable repository", async () => {
-  const full = Array.from({ length: 100 }, (_, index) => ({
-    full_name: `viewer/repo-${index}`, permissions: { admin: false },
-  }));
-  const fetcher = queuedFetch([
-    { body: { login: "operator" }, headers: { "x-oauth-scopes": "repo, workflow" } },
-    { body: full },
-    { body: [{ full_name: "operator/project", default_branch: "trunk", private: true,
-      permissions: { admin: true } }] },
-  ]);
-  assert.deepEqual(await configure("gho_configuration_token", fetcher), { login: "operator" });
-  assert.match(fetcher.calls[2].url, /page=2/);
+  assert.equal(fetcher.calls.length, 1);
 });
 
 test("provider public keys are fetched through the managed service", async () => {

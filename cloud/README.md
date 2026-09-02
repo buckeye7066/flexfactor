@@ -27,8 +27,8 @@ key; FlexFactor Cloud receives only the sealed value and key ID.
 | `POST /api/oauth/device` | Start GitHub device sign-in with rotating-token scope | None |
 | `POST /api/oauth/token` | Poll a device authorization | Device code |
 | `POST /api/oauth/refresh` | Rotate an expiring GitHub session | Refresh token |
-| `POST /api/configure` | Validate account, scopes, and administrable repositories | Bearer |
-| `GET /api/repositories` | List administrable public/private repositories | Bearer |
+| `POST /api/configure` | Validate the signed-in account and required scopes | Bearer |
+| `GET /api/repositories?page=N` | Page through administrable public/private repositories | Bearer |
 | `GET /api/provider-key` | Fetch a repository's Actions sealing key | Bearer |
 | `POST /api/runs/dispatch` | Validate, install the pinned caller, seal secrets, and start a mode | Bearer |
 | `GET /api/runs/status` | Read the correlated run and active step | Bearer |
