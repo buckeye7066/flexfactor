@@ -584,9 +584,14 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             repo = os.path.join(tmp, "repo")
             os.makedirs(repo)
             source = os.path.join(repo, "calculator.py")
-            with open(source, "w", encoding="utf-8") as stream:
-                stream.write(original)
+            with open(source, "wb") as stream:
+                stream.write(original.replace("\n", "\r\n").encode("utf-8"))
             _init_test_origin(repo, remote)
+            # Pin CRLF on every platform.  The security contract is that the
+            # reviewer sees the exact versioned bytes, not this test module's
+            # LF spelling or `_read_contained`'s normalized preview.
+            with open(source, "rb") as stream:
+                exact_original = stream.read().decode("utf-8", errors="strict")
             before = subprocess.run(
                 ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
                 capture_output=True, text=True,
@@ -615,7 +620,8 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertEqual(original, retained)
         self.assertEqual(1, len(Provider.prompts))
         self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
-        self.assertIn(original, Provider.prompts[0])
+        self.assertIn(exact_original, Provider.prompts[0])
+        self.assertEqual(original, exact_original.replace("\r\n", "\n"))
         self.assertNotIn(prose.strip(), Provider.prompts[0])
 
     def test_non_utf8_original_cannot_reach_noop_review(self):
