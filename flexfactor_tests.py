@@ -1456,6 +1456,24 @@ class RotationDefaultProviderTests(unittest.TestCase):
                          "rotation must not leave a stale free pool behind")
         self.assertIn("[rotation] ON:", err.getvalue())
 
+    def test_ai_time_catalog_is_authoritative_over_builtin_guesses(self):
+        self._write_catalog([self._route("groq/llama-x", tier="frontier")])
+        provider = ff._build_rotating_provider(self.Args, None, "best", quiet=True)
+        self.assertIsNotNone(provider)
+        ids = {route.id for route in provider.rotator.catalog.routes}
+        self.assertEqual(ids, {"groq/llama-x"})
+        self.assertNotIn("builtin/openai-gpt-5-6-sol", ids)
+        self.assertNotIn("builtin/anthropic-fable-5-1", ids)
+
+    def test_ai_time_exhausted_route_is_not_selectable(self):
+        import flexfactor_rotation as fr
+        raw = self._route("openai/gpt-5.6-sol", tier="frontier")
+        raw["quota_status"] = "exhausted"
+        raw["resets_at"] = "2026-09-03T00:00:00Z"
+        reason = ff._route_unusable_reason(fr.Route.from_json(raw), "best")
+        self.assertIn("AI Time reports quota exhausted", reason)
+        self.assertIn("2026-09-03T00:00:00Z", reason)
+
     def _providers_with_stubbed_backends(self, args):
         """Run build_audit_providers with key/health/factory stubbed so the
         fall-through (non-rotation) path never touches a real backend."""
