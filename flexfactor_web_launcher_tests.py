@@ -251,6 +251,14 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn("--draft", workflow)
         self.assertIn("--verify-tag", workflow)
         self.assertIn("--draft=false", workflow)
+        complete_guard = workflow.index("if release_is_complete; then")
+        draft_mutation = workflow.index(
+            'gh release edit "$RELEASE_TAG"', complete_guard
+        )
+        self.assertLess(complete_guard, draft_mutation)
+        self.assertIn(
+            "is already complete; no publication mutation required", workflow
+        )
         self.assertIn(
             "group: android-release-${{ needs.release-plan.outputs.release_tag }}",
             workflow,
