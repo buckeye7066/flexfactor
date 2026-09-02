@@ -323,6 +323,27 @@ class CliProviderBehaviourTests(unittest.TestCase):
         self.assertNotIn("--version", seen["argv"])
         self.assertIn("Reply with OK", seen["input"])
 
+    def test_codex_ping_proves_inference_and_runs_ephemeral_read_only(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            seen["input"] = kw.get("input")
+            seen["timeout"] = kw.get("timeout")
+            return subprocess.CompletedProcess(argv, 0, stdout="OK", stderr="")
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            self.assertTrue(cp.CliProvider(
+                "codex-cli", "codex", "codex", timeout=600).ping())
+        finally:
+            subprocess.run = real
+        self.assertNotIn("--version", seen["argv"])
+        self.assertIn("--ephemeral", seen["argv"])
+        self.assertIn("read-only", seen["argv"])
+        self.assertIn("Reply with OK", seen["input"])
+        self.assertLessEqual(seen["timeout"], 60)
+
     def test_billing_label_marks_these_flat_rate(self):
         self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)
 
