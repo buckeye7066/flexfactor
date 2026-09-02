@@ -19,6 +19,10 @@ final class SecureStore {
     static final String GITHUB_TOKEN = "github_token";
     static final String GITHUB_REFRESH_TOKEN = "github_refresh_token";
     static final String GITHUB_TOKEN_EXPIRES_AT = "github_token_expires_at";
+    static final String DEVICE_CODE = "github_device_code";
+    static final String DEVICE_USER_CODE = "github_device_user_code";
+    static final String DEVICE_EXPIRES_AT = "github_device_expires_at";
+    static final String DEVICE_INTERVAL = "github_device_interval";
     static final String OPENAI_KEY = "openai_key";
     static final String ANTHROPIC_KEY = "anthropic_key";
     private static final String KEY_ALIAS = "flexfactor.mobile.credentials.v1";

@@ -70,6 +70,7 @@ public final class MainActivity extends Activity {
     private boolean destroyed;
     private boolean polling;
     private boolean pendingStartupUpdate;
+    private volatile Thread authorizationThread;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -82,7 +83,10 @@ public final class MainActivity extends Activity {
                     LAST_RUN_REPOSITORY, GitHubApi.CONTROL_REPOSITORY).apply();
         }
         renderHome();
-        if (!configured()) main.postDelayed(this::startGitHubSignIn, 350L);
+        GitHubApi.DeviceAuthorization pendingAuthorization = loadPendingAuthorization();
+        if (pendingAuthorization != null) {
+            main.postDelayed(() -> pollDeviceAuthorization(pendingAuthorization), 350L);
+        } else if (!configured()) main.postDelayed(this::startGitHubSignIn, 350L);
         if (directUpdatesEnabled()) {
             main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
         }
@@ -107,6 +111,8 @@ public final class MainActivity extends Activity {
         destroyed = true;
         main.removeCallbacks(pollRun);
         worker.shutdownNow();
+        Thread authorization = authorizationThread;
+        if (authorization != null) authorization.interrupt();
         super.onDestroy();
     }
 
@@ -272,10 +278,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startGitHubSignIn() {
-        if (configured()) {
-            refreshHeader();
-            return;
-        }
+        cancelAuthorization();
         worker.execute(() -> {
             try {
                 GitHubApi.DeviceAuthorization authorization = api.beginDeviceAuthorization();
@@ -292,13 +295,14 @@ public final class MainActivity extends Activity {
                 .setMessage("GitHub will ask for this one-time code:\n\n"
                         + authorization.userCode
                         + "\n\nThe code is copied automatically. Approve FlexFactor, then return here.")
-                .setNegativeButton("Cancel", null)
+                .setNegativeButton("Cancel", (dialog, which) -> cancelAuthorization())
                 .setPositiveButton("Copy code and open GitHub", (dialog, which) -> {
                     ClipboardManager clipboard = (ClipboardManager) getSystemService(
                             Context.CLIPBOARD_SERVICE);
                     clipboard.setPrimaryClip(ClipData.newPlainText(
                             "FlexFactor GitHub code", authorization.userCode));
                     openExternal(authorization.verificationUri);
+                    savePendingAuthorization(authorization);
                     pollDeviceAuthorization(authorization);
                 })
                 .show();
@@ -306,7 +310,9 @@ public final class MainActivity extends Activity {
 
     private void pollDeviceAuthorization(GitHubApi.DeviceAuthorization authorization) {
         accountState.setText("Waiting for GitHub approval…");
-        worker.execute(() -> {
+        Thread previous = authorizationThread;
+        if (previous != null) previous.interrupt();
+        Thread current = new Thread(() -> {
             int interval = authorization.intervalSeconds;
             while (!destroyed && System.currentTimeMillis() < authorization.expiresAt) {
                 try {
@@ -315,6 +321,7 @@ public final class MainActivity extends Activity {
                     GitHubApi.ConfigurationResult configured = api.configure(
                             token.accessToken, "", "");
                     saveGitHubSession(token);
+                    clearPendingAuthorization();
                     preferences.edit().putString(LOGIN, configured.login).apply();
                     post(() -> {
                         refreshHeader();
@@ -328,7 +335,12 @@ public final class MainActivity extends Activity {
                 } catch (InterruptedException stopped) {
                     Thread.currentThread().interrupt();
                     return;
+                } catch (java.io.IOException temporary) {
+                    // Browser handoff often coincides with a network transition. Keep the
+                    // still-valid device code alive and retry instead of abandoning it.
+                    interval = Math.min(interval + 2, 30);
                 } catch (Exception failed) {
+                    clearPendingAuthorization();
                     post(() -> {
                         refreshHeader();
                         showError("GitHub sign-in failed", safeMessage(failed));
@@ -336,18 +348,21 @@ public final class MainActivity extends Activity {
                     return;
                 }
             }
+            clearPendingAuthorization();
             post(() -> {
                 refreshHeader();
                 showError("GitHub sign-in expired", "Tap Sign in with GitHub to try again.");
             });
-        });
+        }, "flexfactor-github-authorization");
+        authorizationThread = current;
+        current.start();
     }
 
     private synchronized void saveGitHubSession(GitHubApi.OAuthToken token) throws Exception {
         secrets.put(SecureStore.GITHUB_TOKEN, token.accessToken);
-        if (!token.refreshToken.isEmpty()) {
-            secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, token.refreshToken);
-        }
+        // This APK is an OAuth public client. Never attempt a refresh grant that would
+        // require embedding the application's client secret.
+        secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, "");
         secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, Long.toString(token.expiresAt));
     }
 
@@ -358,11 +373,61 @@ public final class MainActivity extends Activity {
         try { if (!expiry.isEmpty()) expiresAt = Long.parseLong(expiry); }
         catch (NumberFormatException ignored) { expiresAt = 0L; }
         if (!token.isEmpty() && System.currentTimeMillis() + 300_000L < expiresAt) return token;
-        String refresh = secrets.get(SecureStore.GITHUB_REFRESH_TOKEN);
-        if (refresh.isEmpty()) return token;
-        GitHubApi.OAuthToken renewed = api.refreshDeviceToken(refresh);
-        saveGitHubSession(renewed);
-        return renewed.accessToken;
+        clearGitHubSession();
+        throw new GitHubApi.ApiException("Your GitHub session expired. Reconnect GitHub to continue.");
+    }
+
+    private void savePendingAuthorization(GitHubApi.DeviceAuthorization authorization) {
+        try {
+            secrets.put(SecureStore.DEVICE_CODE, authorization.deviceCode);
+            secrets.put(SecureStore.DEVICE_USER_CODE, authorization.userCode);
+            secrets.put(SecureStore.DEVICE_EXPIRES_AT, Long.toString(authorization.expiresAt));
+            secrets.put(SecureStore.DEVICE_INTERVAL, Integer.toString(authorization.intervalSeconds));
+        } catch (Exception failed) {
+            cancelAuthorization();
+            showError("GitHub sign-in could not continue", safeMessage(failed));
+        }
+    }
+
+    private GitHubApi.DeviceAuthorization loadPendingAuthorization() {
+        try {
+            String code = secrets.get(SecureStore.DEVICE_CODE);
+            String userCode = secrets.get(SecureStore.DEVICE_USER_CODE);
+            long expiresAt = Long.parseLong(secrets.get(SecureStore.DEVICE_EXPIRES_AT));
+            int interval = Integer.parseInt(secrets.get(SecureStore.DEVICE_INTERVAL));
+            if (!code.isEmpty() && !userCode.isEmpty() && expiresAt > System.currentTimeMillis()) {
+                return new GitHubApi.DeviceAuthorization(code, userCode,
+                        "https://github.com/login/device", expiresAt, interval);
+            }
+        } catch (Exception ignored) { }
+        clearPendingAuthorization();
+        return null;
+    }
+
+    private void clearPendingAuthorization() {
+        try {
+            secrets.put(SecureStore.DEVICE_CODE, "");
+            secrets.put(SecureStore.DEVICE_USER_CODE, "");
+            secrets.put(SecureStore.DEVICE_EXPIRES_AT, "");
+            secrets.put(SecureStore.DEVICE_INTERVAL, "");
+        } catch (Exception ignored) { }
+    }
+
+    private void cancelAuthorization() {
+        Thread active = authorizationThread;
+        authorizationThread = null;
+        if (active != null) active.interrupt();
+        clearPendingAuthorization();
+        if (accountState != null) refreshHeader();
+    }
+
+    private void clearGitHubSession() {
+        try {
+            secrets.put(SecureStore.GITHUB_TOKEN, "");
+            secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, "");
+            secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, "");
+        } catch (Exception ignored) { }
+        preferences.edit().remove(LOGIN).remove(REPOSITORY).remove(REF).apply();
     }
 
     private void showCredentialSetup() {
@@ -379,6 +444,8 @@ public final class MainActivity extends Activity {
         form.addView(guidance);
         form.addView(openAi);
         form.addView(anthropic);
+        Button reconnect = button("Reconnect GitHub");
+        form.addView(reconnect);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("Provider settings")
@@ -388,6 +455,12 @@ public final class MainActivity extends Activity {
                 .setPositiveButton("Verify and save", null)
                 .create();
         dialog.setOnShowListener(ignored -> {
+            reconnect.setOnClickListener(view -> {
+                dialog.dismiss();
+                clearGitHubSession();
+                refreshHeader();
+                startGitHubSignIn();
+            });
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view ->
                     showCredentialLinks());
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {

@@ -210,19 +210,6 @@ final class GitHubApi {
         return requireOAuthToken(response);
     }
 
-    OAuthToken refreshDeviceToken(String refreshToken) throws Exception {
-        JSONObject response = oauthForm("https://github.com/login/oauth/access_token",
-                "client_id=" + encode(OAUTH_CLIENT_ID)
-                        + "&grant_type=refresh_token&refresh_token="
-                        + encode(requireSecret(refreshToken, "GitHub refresh token")));
-        String error = response.optString("error", "");
-        if (!error.isEmpty()) {
-            throw new ApiException("GitHub session refresh failed: "
-                    + response.optString("error_description", error));
-        }
-        return requireOAuthToken(response);
-    }
-
     static OAuthToken requireOAuthToken(JSONObject response) throws Exception {
         String access = response.optString("access_token", "").trim();
         String refresh = response.optString("refresh_token", "").trim();
