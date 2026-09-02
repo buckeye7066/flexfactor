@@ -18,6 +18,10 @@ permissions:
   contents: read
   copilot-requests: write
 
+concurrency:
+  group: scout-public-url-proof-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scout:
     name: Acquire and profile public program
@@ -28,7 +32,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       COPILOT_GITHUB_TOKEN: ${{ github.token }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
+      FLEXFACTOR_CLI_TIMEOUT: "180"
       PYTHONUTF8: "1"
 
     steps:
