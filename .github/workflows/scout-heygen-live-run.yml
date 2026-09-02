@@ -12,6 +12,10 @@ permissions:
   contents: read
   copilot-requests: write
 
+concurrency:
+  group: scout-public-url-proof-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scout:
     if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Start isolated HeyGen Scout run'
