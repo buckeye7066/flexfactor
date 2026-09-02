@@ -13,33 +13,40 @@ revision.
 
 1. One request contains at most 30 targets and one orchestrator runs them in
    order, never concurrently.
-2. Repository repair has at most six semantic passes: the whole repository
-   first, then only the immediately preceding verified edit delta.
-3. The top three corroborated competitors are considered after pass 1 and
-   before pass 2. Only purpose-compatible and licence-safe capabilities may be
-   implemented, through normal verification.
-4. Model selection is one strongest-to-weakest ladder: paid/subscription
+2. Repository repair has at most six semantic passes: every Git-visible regular
+   UTF-8 text file first, then only the immediately preceding verified edit
+   delta. An unreviewed scoped file or unattempted fixable finding blocks pass
+   completion.
+3. Every mode establishes an evidence-cited understanding of the target's
+   primary users, core journeys, purpose, and acceptance criteria before it can
+   mutate the program.
+4. The top three corroborated competitors are considered after pass 1 and
+   before pass 2. Scout searches public product/documentation URLs; Repo Rewards
+   separately searches repositories. Ideas require a relevant fetched source
+   and an exact evidence citation. Only purpose-compatible and licence-safe
+   capabilities may be implemented, through normal verification.
+5. Model selection is one strongest-to-weakest ladder: paid/subscription
    capacity first while available, then lower paid tiers, then free/local.
    Workers cannot select paid/free/provider side paths.
-5. No production mutation starts without Git, `origin`, a named branch, a
+6. No production mutation starts without Git, `origin`, a named branch, a
    resolvable authoritative default branch, and mandatory push/merge.
-6. Model output is untrusted. A candidate must pass the target's real build and
+7. Model output is untrusted. A candidate must pass the target's real build and
    strongest suite; an absent gate is not a pass.
-7. The complete candidate patch is reviewed in content-addressed chunks against
+8. The complete candidate patch is reviewed in content-addressed chunks against
    its exact SHA by a model family that authored none of it.
-8. Intermediate commits remain local. Exit 0 after a change requires a fresh
+9. Intermediate commits remain local. Exit 0 after a change requires a fresh
    fetch proving the reviewed SHA is contained in the remote default branch.
-9. Partial output, reviewer loss, quota exhaustion, red tests, missing tools,
+10. Partial output, reviewer loss, quota exhaustion, red tests, missing tools,
    incomplete coverage, an open PR, or a local-only commit yields an incomplete
    or blocked result.
-10. FlexFactor never force-pushes and never silently includes owner WIP.
+11. FlexFactor never force-pushes and never silently includes owner WIP.
 
 ## Modes
 
 | Mode | Purpose |
 |---|---|
 | Refactor | Improve selected source files toward explicit goals, then verify, independently review, and publish. |
-| Scout | Find useful competitive/open-source capabilities; mutation requires explicit Scout authorization and all normal gates. |
+| Scout | Establish the target's purpose, search public competitor URLs, search repositories through Repo Rewards, and find source-backed capabilities; mutation requires explicit Scout authorization and all normal gates. |
 | Audit | Whole-repository purpose, defect, repair, test, journey, evidence, and publication pipeline. |
 | Production Ready | Audit plus the complete readiness rubric and unattended production defaults. |
 

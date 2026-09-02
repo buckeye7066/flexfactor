@@ -47,7 +47,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -58,7 +60,8 @@ import urllib.request
 __all__ = [
     "REUSE_DIRECT", "REUSE_CLEAN_ROOM", "REUSE_REFERENCE",
     "license_reuse_mode", "may_copy_source", "may_bridge",
-    "coverage_note", "web_search", "github_repo_search",
+    "coverage_note", "web_search", "scout_url_search", "github_repo_search",
+    "fetch_evidence_document",
     "research_competitors", "competitor_findings", "report_lines",
     "DEFAULT_TARGET", "DEFAULT_FIX_STREAM_CAP",
 ]
@@ -210,6 +213,100 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _ValidatedEvidenceRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow ordinary public-page redirects, never a redirect to local space."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _public_evidence_url(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _public_evidence_url(value: str) -> bool:
+    """Reject URLs that could turn competitor research into an SSRF probe."""
+    if not _http_url_has_host(value):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = (parsed.hostname or "").strip(".").lower()
+        port = parsed.port
+    except ValueError:
+        return False
+    if not host or parsed.username or parsed.password:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    if port not in (None, 80, 443):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Host names are permitted; the production transport refuses redirects,
+        # which prevents a public search result from bouncing credentials or the
+        # request to a second, unvalidated origin.
+        return "." in host
+    return bool(address.is_global)
+
+
+def _default_evidence_opener(url: str, data: bytes | None = None,
+                             headers: dict | None = None,
+                             timeout: float = _HTTP_TIMEOUT) -> str:
+    """Bounded GET transport for public competitor documents, no redirects."""
+    if data is not None:
+        raise RuntimeError("competitor evidence fetches are GET-only")
+    if not _public_evidence_url(url):
+        raise RuntimeError("competitor evidence URL is not a public http(s) URL")
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": _UA,
+                 "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.8",
+                 **(headers or {})},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(_ValidatedEvidenceRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read(300_000)
+        charset = resp.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, "replace")
+
+
+def _visible_document_text(body: str) -> str:
+    """Reduce HTML/JSON/text to bounded visible prose for idea extraction."""
+    text = str(body or "")
+    text = re.sub(r"(?is)<(script|style|svg|noscript|template)\b.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<!--.*?-->", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[\t\r\f\v ]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()[:20_000]
+
+
+def fetch_evidence_document(url: str, title: str = "", opener=None) -> dict:
+    """Fetch one actual public source and return its citable evidence record.
+
+    Search snippets are discovery hints.  This record is the stronger artifact
+    from which a capability idea may be gleaned: exact URL, content digest,
+    bounded visible text, and a stable ID the model must cite.
+    """
+    if not _public_evidence_url(url):
+        raise RuntimeError("refused non-public competitor evidence URL")
+    transport = opener or _default_evidence_opener
+    body = transport(url, None, {"Accept": "text/html,text/plain,application/json"},
+                     _HTTP_TIMEOUT)
+    visible = _visible_document_text(body)
+    if len(visible) < 80:
+        raise RuntimeError("fetched source contained too little visible content")
+    digest = hashlib.sha256(visible.encode("utf-8")).hexdigest()
+    return {
+        "evidence_id": "web-" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:12],
+        "url": url,
+        "title": str(title or url)[:500],
+        "sha256": digest,
+        "content": visible,
+    }
 
 
 def _default_firecrawl_opener(url: str, data: bytes | None = None,
@@ -409,6 +506,24 @@ def web_search(query: str, limit: int = 6, opener=None, *,
     return [], "", skipped
 
 
+def scout_url_search(query: str, limit: int = 6, opener=None, *,
+                     allow_credentialed_firecrawl: bool = False
+                     ) -> tuple[list[dict], str, dict[str, str]]:
+    """Execute Scout a Program's public-URL search.
+
+    This named boundary keeps URL discovery distinct from the injected
+    ``rr_search`` repository client used below. It invokes only the public-web
+    backends and returns URL/title/snippet discovery rows; it never calls Repo
+    Rewards or returns repository scoring metadata.
+    """
+    return web_search(
+        query,
+        limit=limit,
+        opener=opener,
+        allow_credentialed_firecrawl=allow_credentialed_firecrawl,
+    )
+
+
 def github_repo_search(query: str, limit: int = 5, opener=None) -> list[dict]:
     """Keyless GitHub repository search.
 
@@ -522,6 +637,10 @@ IDEA_SCHEMA = {
                          "description": "Concretely, what adopting it would do for THIS program."},
         "evidence_basis": {"type": "string",
                            "description": "Which supplied evidence establishes the competitor has this."},
+        "evidence_refs": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Exact evidence_id values from fetched source documents that support the idea.",
+        },
         "accept": {"type": "boolean",
                    "description": "true only if adopting this advances the program's OWN stated purpose."},
         "purpose_reason": {"type": "string",
@@ -550,6 +669,7 @@ IDEA_SCHEMA = {
                        "description": "Confidence that the competitor really has this capability."},
     },
     "required": ["idea_title", "what_it_does", "why_valuable", "evidence_basis",
+                 "evidence_refs",
                  "accept", "purpose_reason", "acceptance_ref", "already_present",
                  "risk_level", "risk_reason", "risk_mitigation", "wiring_plan",
                  "verification_plan", "severity", "code_fixable", "file",
@@ -584,12 +704,76 @@ def _norm(name: str) -> str:
 # links came back as "evidence URLs" in the first live run).
 _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo.com")
 
+# Generic product nouns are not an identity check. A page about some unrelated
+# "software platform" must not become evidence for a competitor whose name
+# happens to contain those words.
+_GENERIC_COMPETITOR_TOKENS = {
+    "app", "application", "apps", "cloud", "community", "company", "desktop",
+    "enterprise", "inc", "labs", "ltd", "online", "open", "opensource",
+    "platform", "project", "service", "services", "software", "solution",
+    "solutions", "system", "systems", "technology", "tool", "tools", "web",
+}
+
 
 def _is_evidence_url(url: str | None) -> bool:
     if not url or not _http_url_has_host(url):
         return False
     host = urllib.parse.urlparse(url).hostname or ""
     return host.lower() not in _NON_EVIDENCE_HOSTS
+
+
+def _document_matches_competitor(name: str, document: dict) -> bool:
+    """True only when a fetched page identifies the named competitor.
+
+    Search ranking is discovery metadata, not attribution.  We accept a page
+    when the product/repository identity appears in its URL, title, or visible
+    content.  Generic nouns such as ``software`` and ``platform`` never satisfy
+    the check on their own.  This is deliberately deterministic: the same
+    source bytes cannot become relevant merely because a model is persuasive.
+    """
+    raw_name = str(name or "").strip().lower()
+    if not raw_name:
+        return False
+    tail = raw_name.rsplit("/", 1)[-1]
+    tokens = [token for token in re.findall(r"[a-z0-9]+", tail)
+              if token not in _GENERIC_COMPETITOR_TOKENS and len(token) >= 3]
+    if not tokens:
+        tokens = [token for token in re.findall(r"[a-z0-9]+", tail)
+                  if len(token) >= 2]
+    if not tokens:
+        return False
+
+    url = str(document.get("url") or "").lower()
+    parsed = urllib.parse.urlsplit(url)
+    url_identity = _norm((parsed.hostname or "") + parsed.path)
+    tail_identity = _norm(tail)
+    # Repository slugs and brand domains are the strongest cheap attribution.
+    if len(tail_identity) >= 4 and tail_identity in url_identity:
+        return True
+    if len(tokens[0]) >= 4 and _norm(tokens[0]) in url_identity:
+        return True
+
+    title = str(document.get("title") or "").lower()
+    content = str(document.get("content") or "").lower()
+    title_identity = _norm(title)
+    content_identity = _norm(content)
+    full_identity = _norm(raw_name)
+    for identity in (full_identity, tail_identity):
+        if len(identity) >= 4 and (identity in title_identity
+                                   or identity in content_identity):
+            return True
+
+    # Multiword names must be represented by every distinctive word; a single
+    # generic overlap is not enough. A one-word brand needs an exact word or a
+    # compact title/content match (for spellings such as ``OpenLP``).
+    combined = title + "\n" + content
+    if len(tokens) > 1:
+        return all(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                             combined)
+                   for token in tokens)
+    token = tokens[0]
+    return bool(re.search(
+        rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", combined))
 
 
 def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
@@ -631,10 +815,13 @@ def _name_related(name: str, repo: dict) -> bool:
     return bool(tail) and (want in full or tail in want)
 
 
-_IDEA_REQUIRED_TEXT = ("idea_title", "why_valuable")
+_IDEA_REQUIRED_TEXT = ("idea_title", "what_it_does", "why_valuable",
+                       "evidence_basis", "purpose_reason")
 
 
-def _normalize_idea(idea: dict, competitor_name: str) -> tuple[dict, str | None]:
+def _normalize_idea(idea: dict, competitor_name: str, *,
+                    valid_evidence_refs: set[str] | None = None
+                    ) -> tuple[dict, str | None]:
     """(idea, failure_reason). An idea missing its substance is NOT an idea.
 
     Live 2026-08-16: the cheap judge tier returned objects carrying `accept` and
@@ -646,14 +833,32 @@ def _normalize_idea(idea: dict, competitor_name: str) -> tuple[dict, str | None]
     """
     out = dict(idea or {})
     missing = [k for k in _IDEA_REQUIRED_TEXT if not str(out.get(k) or "").strip()]
+    refs: list[str] = []
+    seen: set[str] = set()
+    for raw in out.get("evidence_refs") or []:
+        ref = str(raw or "").strip()
+        if ref and ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    out["evidence_refs"] = refs
+    invalid_refs: list[str] = []
+    if valid_evidence_refs is not None:
+        invalid_refs = [ref for ref in refs if ref not in valid_evidence_refs]
+        if not refs:
+            missing.append("evidence_refs")
     # `confidence` is an enum in the schema but models return floats; normalize
     # rather than reject - it is descriptive, never load-bearing.
     if out.get("confidence") is not None:
         out["confidence"] = str(out["confidence"])
-    if not missing:
+    if not missing and not invalid_refs:
         return out, None
-    reason = ("model returned an incomplete idea (missing "
-              + ", ".join(missing) + ") - forced to accept=False")
+    defects = []
+    if missing:
+        defects.append("missing " + ", ".join(missing))
+    if invalid_refs:
+        defects.append("unknown evidence_refs " + ", ".join(invalid_refs[:4]))
+    reason = ("model returned an unsupported/incomplete idea ("
+              + "; ".join(defects) + ") - forced to accept=False")
     out["accept"] = False
     out.setdefault("idea_title", "(incomplete - not acted on)")
     out["purpose_reason"] = f"NOT ACTED ON: {reason}. " + str(out.get("purpose_reason") or "")
@@ -668,7 +873,9 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          target: int = DEFAULT_TARGET, opener=None,
                          log=print, max_workers: int = 4,
                          file_list=None, author=None,
-                         allow_credentialed_firecrawl: bool = False) -> dict:
+                         allow_credentialed_firecrawl: bool = False,
+                         scout_profile=None, scout_attempted: bool = False,
+                         scout_error: str = "") -> dict:
     """Find competitors, extract one adoptable idea each, judge against purpose.
 
     `judge(system, prompt, schema) -> dict` is injected (flexfactor routes it to
@@ -683,10 +890,15 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     `rr_search(query) -> [RankedResult]` is the existing
     Repo Rewards client, also injected - this module never speaks to Repo
     Rewards directly, so there is exactly one RR client in the codebase.
+    `scout_profile` keeps the two discovery roles distinct: Scout's
+    `url_search_query` values search public product/documentation URLs, while
+    `repo_search_query` values alone are sent to Repo Rewards.
 
     Never raises: every failure becomes a named entry in `sources_skipped`.
     """
+    injected_opener = opener
     opener = opener or _default_opener
+    evidence_opener = injected_opener or _default_evidence_opener
     stack = stack or []
     research: dict = {
         "researched_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -694,8 +906,79 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         "sources_skipped": {}, "rr_endpoint": rr_endpoint or "(not used)",
         "verified": 0, "unverified": 0, "accepted": 0, "rejected": 0,
         "coverage_note": "", "queries": [],
+        "scout_attempted": bool(scout_attempted),
+        "scout_url_queries": [], "scout_url_hits": [],
+        "repo_rewards_attempted": rr_search is not None,
+        "repo_rewards_queries": [], "repo_rewards_results": 0,
     }
     stack_txt = ", ".join(str(s) for s in stack) if stack else "(unknown)"
+
+    # Scout searches the public web for product/documentation URLs. Repo Rewards
+    # searches repositories. They are deliberately separate evidence streams:
+    # neither a URL hit nor a repository score is allowed to masquerade as the
+    # other, and both carry an execution receipt into the report.
+    scout_opportunities: list[dict] = []
+    seen_url_queries: set[str] = set()
+    seen_repo_queries: set[str] = set()
+    for raw in ((scout_profile or {}).get("opportunities") or [])[:6]:
+        if not isinstance(raw, dict):
+            continue
+        need = " ".join(str(raw.get("need") or "").split())[:600]
+        url_query = " ".join(str(raw.get("url_search_query") or "").split())[:600]
+        repo_query = " ".join(str(raw.get("repo_search_query") or "").split())[:600]
+        if not (need and url_query and repo_query):
+            continue
+        url_key, repo_key = url_query.casefold(), repo_query.casefold()
+        if url_key in seen_url_queries and repo_key in seen_repo_queries:
+            continue
+        seen_url_queries.add(url_key)
+        seen_repo_queries.add(repo_key)
+        scout_opportunities.append({
+            "need": need,
+            "url_search_query": url_query,
+            "repo_search_query": repo_query,
+        })
+    research["scout_opportunities"] = scout_opportunities
+    research["scout_url_queries"] = [
+        row["url_search_query"] for row in scout_opportunities]
+    scout_repo_queries = [row["repo_search_query"] for row in scout_opportunities]
+    if scout_opportunities:
+        research["sources_used"].append("scout-program-analysis")
+    elif scout_attempted:
+        research["sources_skipped"]["scout-program-analysis"] = (
+            str(scout_error or "Scout returned no complete URL/repository query pairs")[:1000]
+        )
+
+    scout_discovery_hits: list[dict] = []
+    scout_web_skips: dict[str, str] = {}
+    for query in research["scout_url_queries"]:
+        hits, backend, skips = scout_url_search(
+            query, limit=6, opener=opener,
+            allow_credentialed_firecrawl=allow_credentialed_firecrawl,
+        )
+        scout_web_skips.update(
+            {key: value for key, value in skips.items()
+             if key not in scout_web_skips}
+        )
+        if backend:
+            source = f"scout-url-search:{backend}"
+            if source not in research["sources_used"]:
+                research["sources_used"].append(source)
+        for hit in hits:
+            if not _is_evidence_url(hit.get("url")):
+                continue
+            row = {
+                "query": query,
+                "title": str(hit.get("title") or "")[:500],
+                "url": str(hit.get("url") or "")[:2000],
+                "snippet": str(hit.get("snippet") or "")[:1000],
+            }
+            if row["url"] not in {item["url"] for item in scout_discovery_hits}:
+                scout_discovery_hits.append(row)
+    research["scout_url_hits"] = scout_discovery_hits
+    if scout_attempted and research["scout_url_queries"] and not scout_discovery_hits:
+        research["sources_skipped"]["scout-url-search"] = (
+            "all Scout URL queries returned 0 usable public URLs")
 
     # -- 4a. Who are the competitors? ---------------------------------------
     # ONE bounded retry, because the observed failure is an ENVELOPE failure,
@@ -704,12 +987,28 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # ("expected a JSON object, got list") after its bare-list salvage scored
     # the element keys below threshold. The competitors were right there; only
     # the wrapper was missing. The retry says so in the prompt.
+    scout_prompt = ""
+    if scout_opportunities:
+        scout_prompt += ("\n\nSCOUT PROGRAM ANALYSIS (repo-grounded discovery leads; "
+                         "the purpose contract remains authoritative):\n"
+                         + _fence("scout-analysis", json.dumps({
+                             "summary": (scout_profile or {}).get("summary") or "",
+                             "goals": (scout_profile or {}).get("goals") or [],
+                             "opportunities": scout_opportunities,
+                         }, ensure_ascii=True)[:10000]))
+    if scout_discovery_hits:
+        scout_prompt += ("\n\nSCOUT URL SEARCH RESULTS (discovery metadata only; "
+                         "fetch a source page before extracting an idea):\n"
+                         + _fence("scout-url-results", json.dumps(
+                             scout_discovery_hits[:24], ensure_ascii=True)[:14000]))
     base_prompt = (
         f"PROGRAM: {program_name}\nSTACK: {stack_txt}\n\n"
         "This is the program's purpose and the job it must do:\n"
         + _fence("purpose", (purpose_blob or "")[:8000]) + "\n\n"
+        + scout_prompt + "\n\n"
         f"Name up to {target + 3} real competitors, best-known first. "
-        "Include both commercial products and open-source projects.")
+        "Include both commercial products and open-source projects. Prefer "
+        "names supported by the Scout URL results when they are relevant.")
     named: list[dict] = []
     last_err: Exception | None = None
     for prompt in (base_prompt,
@@ -745,7 +1044,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
 
     # -- 4b. Corroborate each name from reachable sources --------------------
     merged: dict[str, dict] = {}
-    web_skips: dict[str, str] = {}
+    web_skips: dict[str, str] = dict(scout_web_skips)
     for cand in named[:target + 3]:
         name = (cand.get("name") or "").strip()
         query = (cand.get("search_query") or name or "").strip()
@@ -810,12 +1109,27 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             "reuse_reason": reason,
             "discovery_source": ("web+github" if (hits and repo) else
                                  "github" if repo else "web" if hits else "model"),
-            "evidence_status": "verified" if evidence_urls else "unverified",
+            # A search result URL proves only that search returned a URL.  It
+            # becomes verified below only after source content is fetched.
+            "evidence_status": "unverified",
+            "evidence_documents": [],
         }
 
     # -- 4c. Repo Rewards: open-source competitors with real metadata --------
     if rr_search is not None:
-        rr_queries = [q for q in research["queries"][:3]] or [f"{program_name} alternative"]
+        # Execute EVERY bounded Scout repository query, then the competitor-name
+        # queries. The old [:3] slice silently discarded Scout opportunities.
+        rr_queries: list[str] = []
+        seen_rr: set[str] = set()
+        for raw in scout_repo_queries + list(research["queries"]):
+            query = " ".join(str(raw or "").split())[:600]
+            key = query.casefold()
+            if query and key not in seen_rr:
+                seen_rr.add(key)
+                rr_queries.append(query)
+        if not rr_queries:
+            rr_queries = [f"{program_name} open source alternative"]
+        research["repo_rewards_queries"] = list(rr_queries)
         got_any = False
         for q in rr_queries:
             try:
@@ -824,6 +1138,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 research["sources_skipped"].setdefault(
                     "repo-rewards", f"{type(ex).__name__}: {ex}")
                 break
+            research["repo_rewards_results"] += len(results)
             got_any = got_any or bool(results)
             for r in results[:4]:
                 repo = (r or {}).get("repo") or {}
@@ -851,7 +1166,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                     "license_source": "repo-rewards",
                     "reuse_mode": mode, "reuse_reason": reason,
                     "discovery_source": "repo-rewards",
-                    "evidence_status": "verified" if repo.get("htmlUrl") else "unverified",
+                    "evidence_status": "unverified",
+                    "evidence_documents": [],
                 }
         if got_any and "repo-rewards" not in research["sources_used"]:
             research["sources_used"].append("repo-rewards")
@@ -866,13 +1182,60 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         research["sources_skipped"].setdefault(f"web:{k}", v)
 
     competitors = list(merged.values())
+    competitors.sort(key=lambda c: -(c.get("stars") or 0))
+    competitors = competitors[:target]
+
+    # Search is discovery; GLEANING requires the source itself. Fetch bounded
+    # public documents now and make them first-class evidence with stable IDs
+    # and content hashes. An unreachable URL stays a named skip and cannot
+    # support an accepted idea.
+    def _fetch_competitor(c: dict) -> tuple[list[dict], list[tuple[str, str]]]:
+        documents: list[dict] = []
+        failures: list[tuple[str, str]] = []
+        titles = list(c.get("evidence_titles") or [])
+        for index, url in enumerate(list(c.get("evidence_urls") or [])[:3]):
+            title = titles[index] if index < len(titles) else c.get("name") or url
+            try:
+                doc = fetch_evidence_document(url, title, opener=evidence_opener)
+            except Exception as exc:
+                failures.append((url, f"{type(exc).__name__}: {exc}"))
+                continue
+            if not _document_matches_competitor(str(c.get("name") or ""), doc):
+                failures.append((
+                    url,
+                    "fetched page did not identify the named competitor in its "
+                    "URL, title, or visible content",
+                ))
+                continue
+            doc["competitor_match"] = "deterministic-url-title-content-identity"
+            if doc["evidence_id"] not in {
+                    row.get("evidence_id") for row in documents}:
+                documents.append(doc)
+        return documents, failures
+
+    if competitors:
+        fetch_workers = max(1, min(max_workers, len(competitors)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+            fetched = list(pool.map(_fetch_competitor, competitors))
+        for c, (documents, failures) in zip(competitors, fetched):
+            c["evidence_documents"] = documents
+            c["evidence_status"] = "verified" if documents else "unverified"
+            for index, (url, why) in enumerate(failures, 1):
+                research["sources_skipped"].setdefault(
+                    f"fetch:{c.get('name') or '(unnamed)'}:{index}",
+                    f"{url} - {why}",
+                )
+        if any(c.get("evidence_documents") for c in competitors):
+            research["sources_used"].append("fetched-public-pages")
+
     if probe_only:
-        # The generic probe only earns a place if a real source answered it.
+        # The generic probe only earns a place if actual source content was
+        # fetched; a search result alone is not a competitor determination.
         competitors = [c for c in competitors if c["evidence_status"] == "verified"]
-    # Corroborated competitors first; then best-known (stars) first.
     competitors.sort(key=lambda c: (c["evidence_status"] != "verified",
                                     -(c.get("stars") or 0)))
-    competitors = competitors[:target]
+    research["evidence_documents_fetched"] = sum(
+        len(c.get("evidence_documents") or []) for c in competitors)
 
     if not competitors:
         research["coverage_note"] = coverage_note(0, target, 0)
@@ -886,15 +1249,37 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                       + _fence("files", "\n".join(list(file_list)[:200])))
 
     def _extract(c: dict) -> dict:
+        documents = list(c.get("evidence_documents") or [])
+        valid_refs = {str(row.get("evidence_id") or "") for row in documents
+                      if row.get("evidence_id")}
+        if not documents:
+            return {
+                "error": "no competitor source page could be fetched",
+                "accept": False,
+                "idea_title": "(no source-backed idea)",
+                "what_it_does": "",
+                "why_valuable": "",
+                "evidence_basis": "No fetched source document was available.",
+                "evidence_refs": [],
+                "purpose_reason": "NOT ACTED ON: search results alone do not establish a capability.",
+            }
+        document_text = "\n\n".join(
+            f"EVIDENCE_ID: {row.get('evidence_id')}\n"
+            f"URL: {row.get('url')}\nTITLE: {row.get('title')}\n"
+            f"SHA256: {row.get('sha256')}\nCONTENT:\n{row.get('content')}"
+            for row in documents
+        )
         ev = "\n".join(filter(None, [
             f"URL: {c['url']}" if c.get("url") else "",
             f"LICENCE (from {c['license_source']}): {c['license']}",
             f"REUSE MODE ENFORCED FOR THIS CANDIDATE: {c['reuse_mode']} - {c['reuse_reason']}",
             f"DESCRIPTION: {c['repo_description']}" if c.get("repo_description") else "",
-            "SEARCH EVIDENCE:",
+            "SEARCH DISCOVERY METADATA (not sufficient evidence for an idea):",
             *[f"- {t} :: {u}" for t, u in zip(c.get("evidence_titles") or [],
                                               c.get("evidence_urls") or [])],
             *[s for s in (c.get("evidence_snippets") or []) if s],
+            "FETCHED SOURCE DOCUMENTS (the only capability evidence; cite EVIDENCE_ID):",
+            document_text,
         ]))
         prompt = (
             f"AUDITED PROGRAM: {program_name}\nSTACK: {stack_txt}\n\n"
@@ -904,7 +1289,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             + _fence("competitor-evidence", ev) + files_hint + "\n\n"
             "Extract the single most valuable idea this competitor has that the "
             "audited program lacks, then decide whether adopting it serves the "
-            "audited program's OWN stated purpose."
+            "audited program's OWN stated purpose. `evidence_refs` must contain "
+            "one or more exact EVIDENCE_ID values above."
         )
         # ONE bounded retry when the first answer comes back without its
         # substance. Measured 2026-08-16 on the free judge tier: the model
@@ -917,7 +1303,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                     prompt + "\n\nYour previous answer omitted required fields. "
                              "Answer again and fill EVERY field, especially "
                              "`idea_title`, `what_it_does`, `why_valuable` and "
-                             "`purpose_reason`. Keep each under 40 words.")
+                             "`purpose_reason`. Cite an exact fetched EVIDENCE_ID "
+                             "in `evidence_refs`. Keep each under 40 words.")
         last: dict = {}
         for text in attempts:
             try:
@@ -926,7 +1313,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 return {"error": f"{type(ex).__name__}: {ex}", "accept": False,
                         "idea_title": "(idea extraction failed)",
                         "purpose_reason": f"not judged: {ex}"}
-            if not _normalize_idea(last, c["name"])[1]:
+            if not _normalize_idea(
+                    last, c["name"], valid_evidence_refs=valid_refs)[1]:
                 return last
         return last
 
@@ -937,7 +1325,11 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     for c, raw in zip(competitors, ideas):
         # An idea missing its own substance is not an idea; it is forced to
         # accept=False and named, never rendered as "ACCEPTED - (none)".
-        idea, incomplete = _normalize_idea(raw, c["name"])
+        valid_refs = {str(row.get("evidence_id") or "")
+                      for row in (c.get("evidence_documents") or [])
+                      if row.get("evidence_id")}
+        idea, incomplete = _normalize_idea(
+            raw, c["name"], valid_evidence_refs=valid_refs)
         if idea.get("already_present") is True and idea.get("accept"):
             idea["accept"] = False
             idea["purpose_reason"] = (
@@ -1088,7 +1480,10 @@ def competitor_findings(research: dict, max_findings: int = DEFAULT_FIX_STREAM_C
                       else "You MUST NOT copy or paraphrase the competitor's "
                            "source; implement independently from the described "
                            "behaviour only.")
-                   + f"\n\nEvidence: {', '.join(c.get('evidence_urls') or []) or '(none)'}")
+                   + f"\n\nFetched evidence refs: "
+                     f"{', '.join(idea.get('evidence_refs') or []) or '(none)'}"
+                   + f"\nEvidence URLs: "
+                     f"{', '.join(c.get('evidence_urls') or []) or '(none)'}")
         _mark(c, "bridged", "entered the gated fix stream", bridged=True)
         out.append((rel, {
             "line": 0,
@@ -1121,7 +1516,23 @@ def report_lines(research: dict) -> list[str]:
     L = ["## Competitor research", "",
          f"**Coverage:** {research.get('coverage_note', '')}", "",
          f"- **Sources used:** {', '.join(research.get('sources_used') or []) or 'NONE'}",
-         f"- **Repo Rewards endpoint:** `{research.get('rr_endpoint', '')}`"]
+         f"- **Scout program analysis attempted:** "
+         f"{'yes' if research.get('scout_attempted') else 'no'}",
+         f"- **Scout URL searches executed:** "
+         f"{len(research.get('scout_url_queries') or [])}; public URL hits: "
+         f"{len(research.get('scout_url_hits') or [])}",
+         f"- **Repo Rewards endpoint:** `{research.get('rr_endpoint', '')}`",
+         f"- **Repo Rewards repository searches executed:** "
+         f"{len(research.get('repo_rewards_queries') or [])}; metadata results: "
+         f"{research.get('repo_rewards_results', 0)}"]
+    if research.get("scout_url_queries"):
+        L.append("- **Scout URL query receipt:** "
+                 + "; ".join(f"`{_ascii(q)}`"
+                             for q in research["scout_url_queries"]))
+    if research.get("repo_rewards_queries"):
+        L.append("- **Repo Rewards query receipt:** "
+                 + "; ".join(f"`{_ascii(q)}`"
+                             for q in research["repo_rewards_queries"]))
     skipped = research.get("sources_skipped") or {}
     if skipped:
         L.append("- **Sources SKIPPED (named, not silent):**")
@@ -1173,6 +1584,11 @@ def report_lines(research: dict) -> list[str]:
         L += [f"### {c['name']}", "",
               f"- **Evidence:** " + (", ".join(f"<{u}>" for u in (c.get("evidence_urls") or []))
                                      or "**none - unverified, not acted on**"),
+              f"- **Fetched source documents:** "
+              + (", ".join(
+                    f"`{row.get('evidence_id')}` ({str(row.get('sha256') or '')[:12]})"
+                    for row in (c.get("evidence_documents") or []))
+                 or "**none - search links alone were not treated as evidence**"),
               f"- **Licence:** `{c.get('license')}` (via {c.get('license_source')})",
               f"- **Reuse mode:** `{c.get('reuse_mode')}` - {c.get('reuse_reason')}",
               f"- **Idea:** {idea.get('idea_title', '(none)')} - {idea.get('what_it_does', '')}",
@@ -1196,5 +1612,7 @@ def report_lines(research: dict) -> list[str]:
                  if ("bridge_status" in c or "entered_fix_stream" in c)
                  else "not evaluated for fix-stream entry on this report path"),
               f"- **Evidence basis:** {idea.get('evidence_basis', '')} "
-              f"(confidence {idea.get('confidence', '?')})", ""]
+              f"(confidence {idea.get('confidence', '?')})",
+              f"- **Evidence refs used by idea:** "
+              f"{', '.join(idea.get('evidence_refs') or []) or '(none)'}", ""]
     return L

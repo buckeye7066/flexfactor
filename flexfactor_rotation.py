@@ -1348,13 +1348,15 @@ class RotatingProvider:
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
+        allow_paid_for_call = self._allow_paid
         for attempt in range(attempts):
             # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
             extra: Dict[str, Any] = {}
             if intent is not None:
                 extra["intent"] = intent
-            if self._paid_first:
+            free_only_fallback = self._allow_paid and not allow_paid_for_call
+            if self._paid_first or free_only_fallback:
                 extra["paid_first"] = True
             try:
                 # The ladder remains active on every attempt. Failed and
@@ -1363,7 +1365,7 @@ class RotatingProvider:
                 try:
                     selection = self.rotator.next_route(
                         tier=tier,
-                        allow_paid=self._allow_paid,
+                        allow_paid=allow_paid_for_call,
                         **extra)
                 except TypeError as exc:
                     # Compatibility with injected/test rotators that implement
@@ -1376,7 +1378,7 @@ class RotatingProvider:
                             or (intent is not None and intent.avoid_families)):
                         raise
                     selection = self.rotator.next_route(
-                        tier=tier, allow_paid=self._allow_paid)
+                        tier=tier, allow_paid=allow_paid_for_call)
             except RotationError as exc:
                 if last_error is None:
                     raise
@@ -1395,6 +1397,18 @@ class RotatingProvider:
             try:
                 result = getattr(self._provider_for(route), method)(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
+                # The shared USD meter can refuse a paid route after the call was
+                # selected. That is a policy boundary, not a provider failure.
+                # Continue the SAME call on genuinely free/local capacity when
+                # present; subscription allowance is deliberately not called
+                # "free" here merely because its marginal token price is zero.
+                if (type(exc).__name__ == "BudgetExceededError"
+                        and route.uses_paid_capacity
+                        and allow_paid_for_call
+                        and self.has_genuine_free_capacity(tier)):
+                    last_error = exc
+                    allow_paid_for_call = False
+                    continue
                 # A PAYLOAD refusal is not this route's doing. Reporting it here
                 # would strike an innocent route and, three payloads later, cool
                 # its whole pool -- see _PAYLOAD_FAULT_MARKERS for the measured
@@ -1431,6 +1445,20 @@ class RotatingProvider:
         return [r for r in self.rotator.catalog.routes
                 if r.tier == tier and r.enabled
                 and (self._allow_paid or r.is_free)]
+
+    def has_genuine_free_capacity(self, tier: Optional[str] = None) -> bool:
+        """Whether this provider can demote to non-paid capacity.
+
+        This intentionally uses ``uses_paid_capacity`` rather than ``is_free``:
+        subscription routes have zero marginal price but still consume an
+        allowance the owner pays for.
+        """
+        requested = tier if tier in TIER_CHAIN else self._tier
+        start = TIER_CHAIN.index(requested if requested in TIER_CHAIN else LIGHT)
+        allowed_tiers = set(TIER_CHAIN[start:])
+        return any(route.enabled and route.tier in allowed_tiers
+                   and not route.uses_paid_capacity
+                   for route in self.rotator.catalog.routes)
 
     # -- provider surface --------------------------------------------------
     def complete(self, *args, **kwargs):
