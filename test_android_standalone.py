@@ -196,8 +196,10 @@ class ManagedAndroidInvariants(unittest.TestCase):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
         service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
-        self.assertIn("page <= 100", service)
-        self.assertIn("per_page=100&page=${page}", service)
+        self.assertIn("page <= 100", api)
+        self.assertIn('"/api/repositories?page=" + page', api)
+        self.assertIn("per_page=${REPOSITORY_PAGE_SIZE}&page=${page}", service)
+        self.assertIn("has_more", service)
         self.assertIn('row.optBoolean("private", false)', api)
         self.assertIn("item?.permissions?.admin", service)
         self.assertIn("ensureTargetWorkflow", service)
@@ -227,6 +229,19 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("metadata?.default_branch", service)
         self.assertIn("display_title", service)
         self.assertIn("request.request_id", service)
+        self.assertIn("DISPATCH_READ_TIMEOUT_MS = 330_000", api)
+
+    def test_every_run_operation_has_a_deployed_api_entry_point(self):
+        routes = {
+            "dispatch.js": "dispatch",
+            "status.js": "runStatus",
+            "details.js": "runArtifact",
+            "steer.js": "submitSteering",
+        }
+        for filename, operation in routes.items():
+            source = (CLOUD / "api" / "runs" / filename).read_text(encoding="utf-8")
+            self.assertIn(operation, source)
+            self.assertIn("export default endpoint", source)
 
     def test_completed_runs_expose_the_error_ledger_inside_the_app(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /

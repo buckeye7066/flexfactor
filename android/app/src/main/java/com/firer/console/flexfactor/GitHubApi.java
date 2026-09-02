@@ -30,7 +30,11 @@ import java.util.zip.ZipInputStream;
 final class GitHubApi {
     static final String CONTROL_REPOSITORY = "buckeye7066/flexfactor";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
-    private static final int READ_TIMEOUT_MS = 60_000;
+    private static final int DEFAULT_READ_TIMEOUT_MS = 60_000;
+    // Vercel's dispatch function has a 300-second execution ceiling. Waiting
+    // beyond that contract prevents a successful, accepted run from looking
+    // like a client timeout and being submitted a second time.
+    private static final int DISPATCH_READ_TIMEOUT_MS = 330_000;
     private static final int MAX_JSON_BYTES = 2 * 1024 * 1024;
     private static final int MAX_PHONE_ARTIFACT_BYTES = 2 * 1024 * 1024;
     private static final int MAX_PHONE_ENTRY_BYTES = 256 * 1024;
@@ -210,17 +214,27 @@ final class GitHubApi {
     }
 
     List<Repository> repositories(String token) throws Exception {
-        JSONObject response = cloudJson(token, "GET", "/api/repositories", null, true);
-        JSONArray rows = response.optJSONArray("repositories");
-        if (rows == null) throw new ApiException("FlexFactor Cloud returned an invalid repository list.");
         List<Repository> repositories = new ArrayList<>();
-        for (int i = 0; i < rows.length(); i++) {
-            JSONObject row = rows.getJSONObject(i);
-            String fullName = row.optString("full_name", "");
-            if (!fullName.isEmpty()) repositories.add(new Repository(fullName,
-                    row.optString("default_branch", "main"), row.optBoolean("private", false)));
+        Set<String> found = new HashSet<>();
+        for (int page = 1; page <= 100; page++) {
+            JSONObject response = cloudJson(token, "GET", "/api/repositories?page=" + page,
+                    null, true);
+            JSONArray rows = response.optJSONArray("repositories");
+            if (rows == null || response.optInt("page", 0) != page) {
+                throw new ApiException("FlexFactor Cloud returned an invalid repository page.");
+            }
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                String fullName = row.optString("full_name", "");
+                if (!fullName.isEmpty() && found.add(fullName)) {
+                    repositories.add(new Repository(fullName,
+                            row.optString("default_branch", "main"),
+                            row.optBoolean("private", false)));
+                }
+            }
+            if (!response.optBoolean("has_more", false)) return repositories;
         }
-        return repositories;
+        throw new ApiException("The repository list exceeded FlexFactor's page limit.");
     }
 
     RunState dispatch(String token, String openAiKey, String anthropicKey,
@@ -394,7 +408,9 @@ final class GitHubApi {
         HttpResult latest = null;
         int attempts = retrySafe ? 3 : 1;
         for (int attempt = 0; attempt < attempts; attempt++) {
-            HttpURLConnection connection = connection(url);
+            int readTimeout = "/api/runs/dispatch".equals(path)
+                    ? DISPATCH_READ_TIMEOUT_MS : DEFAULT_READ_TIMEOUT_MS;
+            HttpURLConnection connection = connection(url, readTimeout);
             connection.setRequestMethod(method);
             connection.setRequestProperty("Accept", "application/json, application/zip");
             connection.setRequestProperty("X-FlexFactor-Client-Version", BuildConfig.VERSION_NAME);
@@ -427,13 +443,13 @@ final class GitHubApi {
         return resolved;
     }
 
-    private static HttpURLConnection connection(URL url) throws Exception {
+    private static HttpURLConnection connection(URL url, int readTimeout) throws Exception {
         if (!"https".equals(url.getProtocol())) {
             throw new IllegalArgumentException("Only HTTPS API connections are allowed.");
         }
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
         connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-        connection.setReadTimeout(READ_TIMEOUT_MS);
+        connection.setReadTimeout(readTimeout);
         connection.setInstanceFollowRedirects(false);
         connection.setUseCaches(false);
         connection.setRequestProperty("User-Agent", "FlexFactor-Android/" + BuildConfig.VERSION_NAME);

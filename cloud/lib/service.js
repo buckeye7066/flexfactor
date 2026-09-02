@@ -16,6 +16,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODES = new Set(["refactor", "scout", "audit", "prodready"]);
 const PROVIDERS = new Set(["ollama", "openai", "anthropic", "copilot"]);
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+const REPOSITORY_PAGE_SIZE = 100;
+const MAX_REPOSITORY_PAGES = 100;
 
 export class ServiceError extends Error {
   constructor(status, code, message) {
@@ -274,35 +276,48 @@ export async function configure(token, fetchImpl = fetch) {
   if (typeof user.login !== "string" || !user.login.trim()) {
     throw new ServiceError(502, "account_not_identified", "GitHub did not identify this account.");
   }
-  const repositoriesForUser = await repositories(token, fetchImpl);
-  if (!repositoriesForUser.length) {
+  let hasAdministrableRepository = false;
+  for (let page = 1; page <= MAX_REPOSITORY_PAGES; page += 1) {
+    const batch = await repositories(token, page, fetchImpl);
+    if (batch.repositories.length) {
+      hasAdministrableRepository = true;
+      break;
+    }
+    if (!batch.has_more) break;
+  }
+  if (!hasAdministrableRepository) {
     throw new ServiceError(403, "no_administrable_repository",
       "This account has no administrable repository. FlexFactor needs repository contents, workflows, Actions, and secrets access.");
   }
   return { login: user.login.trim() };
 }
 
-export async function repositories(token, fetchImpl = fetch) {
-  const rows = [];
-  for (let page = 1; page <= 100; page += 1) {
-    const result = await githubJson(token, "GET",
-      `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&per_page=100&page=${page}`,
-      undefined, fetchImpl);
-    if (!Array.isArray(result)) {
-      throw new ServiceError(502, "invalid_repository_response",
-        "GitHub returned an invalid repository list.");
-    }
-    for (const item of result) {
-      if (!item?.permissions?.admin || typeof item.full_name !== "string") continue;
-      rows.push({
-        full_name: item.full_name,
-        default_branch: typeof item.default_branch === "string" ? item.default_branch : "main",
-        private: Boolean(item.private),
-      });
-    }
-    if (result.length < 100) break;
+export async function repositories(token, requestedPage = 1, fetchImpl = fetch) {
+  const page = Number(requestedPage);
+  if (!Number.isInteger(page) || page < 1 || page > MAX_REPOSITORY_PAGES) {
+    throw new ServiceError(400, "invalid_page", "Repository page must be between 1 and 100.");
   }
-  return rows;
+  const rows = [];
+  const result = await githubJson(token, "GET",
+    `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&direction=desc&per_page=${REPOSITORY_PAGE_SIZE}&page=${page}`,
+    undefined, fetchImpl);
+  if (!Array.isArray(result)) {
+    throw new ServiceError(502, "invalid_repository_response",
+      "GitHub returned an invalid repository list.");
+  }
+  for (const item of result) {
+    if (!item?.permissions?.admin || typeof item.full_name !== "string") continue;
+    rows.push({
+      full_name: item.full_name,
+      default_branch: typeof item.default_branch === "string" ? item.default_branch : "main",
+      private: Boolean(item.private),
+    });
+  }
+  return {
+    repositories: rows,
+    page,
+    has_more: result.length === REPOSITORY_PAGE_SIZE && page < MAX_REPOSITORY_PAGES,
+  };
 }
 
 export function validateRunRequest(source) {
