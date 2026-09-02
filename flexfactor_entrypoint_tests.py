@@ -327,7 +327,8 @@ class CleanInstallTests(unittest.TestCase):
         exe = ".exe" if os.name == "nt" else ""
         cls.vpy = os.path.join(cls.venv, bindir, "python" + exe)
         cls.console = os.path.join(cls.venv, bindir, "flexfactor" + exe)
-        cp = subprocess.run([cls.vpy, "-m", "pip", "install", "-q", "--no-deps", cls.wheel],
+        cp = subprocess.run([cls.vpy, "-m", "pip", "install", "-q", "--no-deps",
+                             "--no-index", cls.wheel],
                             capture_output=True, text=True, timeout=600)
         assert cp.returncode == 0, cp.stderr[-3000:]
         cls.outside = os.path.join(cls.tmp, "outside")

@@ -13,3 +13,7 @@ socksio==1.0.0
 # FlexFactor's own publication gate ("python -m pytest -q") is red on a fresh
 # host - found by the 0.5.0 self-dogfood. Verified: 880 passed, 8 skipped.
 pytest==9.1.1
+# The clean-install parity test builds the project with network access disabled
+# and build isolation disabled.  Keep its PEP 517 backend in the reproducible
+# development environment instead of letting pip fetch it implicitly.
+setuptools==84.0.0
