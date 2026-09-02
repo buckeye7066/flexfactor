@@ -2930,7 +2930,9 @@ def _strip_code_fences(code: str) -> str:
     that shape, removing only the first and last lines leaves the closing fence
     inside the candidate and turns otherwise valid source into invalid code.
     Once a response begins with a fence, the first exact closing-fence line is
-    authoritative and any later prose is not part of the requested file.
+    authoritative and any later prose is not part of the requested file.  An
+    opening fence with no exact close is incomplete output and becomes an empty
+    candidate so the acceptance loop rejects it rather than guessing.
     """
     text = str(code or "").strip()
     if not text:
@@ -2938,10 +2940,14 @@ def _strip_code_fences(code: str) -> str:
     lines = text.splitlines()
     if lines[0].lstrip().startswith("```"):
         lines = lines[1:]
+        closed = False
         for index, line in enumerate(lines):
             if re.fullmatch(r"\s*`{3,}\s*", line):
                 lines = lines[:index]
+                closed = True
                 break
+        if not closed:
+            return "\n"
     return "\n".join(lines).strip() + "\n"
 
 

@@ -202,8 +202,8 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "3c164987f69115ed2857635ef1e1e8db7ab562e4c6ab520c8ea86e22741bf61e",
-      "observed_at": "2026-09-02T12:58:20Z",
+      "content_hash": "9e83a6cc34502d779f567b4969dc4d66178eae5a7e135fd99b6b1a6b758a1378",
+      "observed_at": "2026-09-02T13:14:45Z",
       "excerpt": "Four modes, mutation preflight, verification, review, and exact-default-branch publication."
     },
     {

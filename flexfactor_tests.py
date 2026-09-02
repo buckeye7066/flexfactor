@@ -215,6 +215,10 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         source = 'MARKDOWN = """\n```python\npass\n```\n"""\n'
         self.assertEqual(source, ff._strip_code_fences(source))
 
+    def test_unclosed_fenced_response_is_refused_as_incomplete(self):
+        response = "```python\ndef calculate():\n    return 42\n"
+        self.assertEqual("\n", ff._strip_code_fences(response))
+
     def test_verified_unchanged_refactor_succeeds_without_a_fake_commit(self):
         import tempfile
         import types
