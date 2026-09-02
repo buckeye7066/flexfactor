@@ -6,6 +6,7 @@ on:
     tags: ["android-v*"]
     paths:
       - "android/**"
+      - "cloud/**"
       - "scripts/phone/**"
       - "flexfactor_web.py"
       - ".github/workflows/android-client.yml"
@@ -14,6 +15,7 @@ on:
     branches: [main]
     paths:
       - "android/**"
+      - "cloud/**"
       - "scripts/phone/**"
       - "flexfactor_web.py"
       - ".github/workflows/android-client.yml"
@@ -37,6 +39,28 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+      - name: Verify the managed cloud API contract
+        shell: bash
+        run: |
+          npm ci --prefix cloud --no-audit --no-fund
+          npm test --prefix cloud
+      - name: Verify the managed production control plane
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          version_name=$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p' \
+            android/app/build.gradle.kts)
+          test -n "$version_name"
+          health=$(curl --fail --silent --show-error --retry 3 \
+            https://flexfactor-cloud.vercel.app/api/health)
+          jq -e --arg engine "android-v${version_name}" \
+            '.ok == true and .oauth_device_configured == true and .engine_ref == $engine' \
+            <<<"$health"
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
         with:
           gradle-version: "8.13"
@@ -174,7 +198,7 @@ jobs:
 
   release:
     name: android-release
-    needs: release-plan
+    needs: [build, release-plan]
     if: needs.release-plan.outputs.should_publish == 'true'
     permissions:
       contents: write

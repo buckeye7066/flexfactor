@@ -61,6 +61,14 @@ def _runtime_sources() -> list:
             if base.startswith("test_") or base.endswith(TEST_SUFFIXES):
                 continue
             out.append(path)
+    cloud = os.path.join(HERE, "cloud")
+    if os.path.isdir(cloud):
+        for base, _, files in os.walk(cloud):
+            if os.path.basename(base) in {"node_modules", "test"}:
+                continue
+            for name in files:
+                if name.endswith((".js", ".mjs", ".cjs")):
+                    out.append(os.path.join(base, name))
     return sorted(set(out))
 
 
@@ -86,6 +94,9 @@ def read_by_runtime() -> dict:
     line of documentation about a name the project chose to define."""
     literal = re.compile(
         r"""(?:os\.environ\.get\(|os\.getenv\(|os\.environ\[)\s*["']([A-Z][A-Z_0-9]*)["']""")
+    javascript_dot = re.compile(r"""process\.env\.([A-Z][A-Z_0-9]*)""")
+    javascript_index = re.compile(
+        r"""process\.env\[\s*["']([A-Z][A-Z_0-9]*)["']\s*\]""")
     named_constant = re.compile(
         r"""^\s*[A-Z][A-Z_0-9]*\s*(?::\s*str\s*)?=\s*["']((?:FLEXFACTOR|FF|AI)_[A-Z_0-9]*)["']""",
         re.M)
@@ -96,6 +107,9 @@ def read_by_runtime() -> dict:
         for pattern in (literal, named_constant):
             for name in pattern.findall(text):
                 found.setdefault(name, os.path.basename(path))
+        for pattern in (javascript_dot, javascript_index):
+            for name in pattern.findall(text):
+                found.setdefault(name, os.path.relpath(path, HERE))
     return found
 
 

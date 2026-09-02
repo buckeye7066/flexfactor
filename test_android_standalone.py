@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository-level invariants for the independent Android app."""
+"""Repository-level invariants for the managed FlexFactor mobile product."""
 
 from pathlib import Path
 import re
@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 ANDROID = ROOT / "android" / "app" / "src" / "main"
+CLOUD = ROOT / "cloud"
 
 
 def _android_version_name() -> str:
@@ -20,12 +21,12 @@ def _android_version_name() -> str:
 
 
 class EngineRefIsOneVersionEverywhere(unittest.TestCase):
-    """A phone run reaches the engine through THREE version pins.
+    """A phone run reaches the engine through the release and cloud pins.
 
     `android-client.yml` releases the app under the tag
-    `android-v${versionName}`. The app writes a caller workflow into the target
-    repository that calls `mobile-run.yml@<ENGINE_REF>`, and that reusable
-    workflow checks the engine out at its own `ref:`. If any of the three
+    `android-v${versionName}`. FlexFactor Cloud writes a caller workflow into
+    the target repository, and the reusable workflow checks the engine out at
+    its own `ref:`. If any pin
     disagree, every phone run either executes an engine the build was never
     tested against or names a tag that does not exist yet -- and the owner sees
     a run that dies at its first step.
@@ -39,20 +40,18 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
     Live runs 33253519755 and 33255312894 (buckeye7066/FutureU, 2026-08-29)
     both ended `invalid repository` at step 2 of 17.
 
-    `MobileWorkflow.ENGINE_REF` is now derived from `BuildConfig.VERSION_NAME`,
-    so the Java half cannot drift. These tests hold the two pins that live
-    outside the Java compiler's reach.
+    The APK no longer contains a workflow writer. These tests bind the cloud
+    pin and reusable-workflow pin to the Android release version.
     """
 
-    def test_the_engine_ref_is_derived_from_the_build_not_typed_again(self):
-        source = (ANDROID / "java" / "com" / "firer" / "console" / "flexfactor" /
-                  "MobileWorkflow.java").read_text(encoding="utf-8")
+    def test_the_cloud_engine_ref_matches_the_android_release(self):
+        source = (CLOUD / "lib" / "config.js").read_text(encoding="utf-8")
         self.assertIn(
-            'ENGINE_REF = "android-v" + BuildConfig.VERSION_NAME', source)
-        # A hand-typed version literal anywhere in this file is the defect.
-        self.assertIsNone(
-            re.search(r'"android-v\d', source),
-            "MobileWorkflow must not hardcode an engine version",
+            f'ENGINE_REF = "android-v{_android_version_name()}"', source)
+        self.assertFalse(
+            (ANDROID / "java" / "com" / "firer" / "console" / "flexfactor" /
+             "MobileWorkflow.java").exists(),
+            "workflow installation belongs to FlexFactor Cloud, not the APK",
         )
 
     def test_the_reusable_workflow_checks_out_this_versions_engine(self):
@@ -65,7 +64,7 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
         self.assertIn(f"ref: android-v{_android_version_name()}", engine)
 
 
-class StandaloneAndroidInvariants(unittest.TestCase):
+class ManagedAndroidInvariants(unittest.TestCase):
     def test_launcher_declares_no_termux_runtime_permission(self):
         manifest = (ANDROID / "AndroidManifest.xml").read_text(encoding="utf-8")
         self.assertNotIn("com.termux", manifest.lower())
@@ -99,6 +98,33 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         for forbidden in ("127.0.0.1", "localhost:8765", "EngineRecoveryScript",
                           "TERMUX_PACKAGE", "RUN_COMMAND_STDIN"):
             self.assertNotIn(forbidden, source)
+
+    def test_apk_has_one_managed_https_api_and_no_direct_github_api_fallback(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        gradle = (ROOT / "android" / "app" /
+                  "build.gradle.kts").read_text(encoding="utf-8")
+        self.assertIn("https://flexfactor-cloud.vercel.app", gradle)
+        self.assertIn("BuildConfig.FLEXFACTOR_CLOUD_URL", api)
+        self.assertIn("/api/runs/dispatch", api)
+        self.assertNotIn("https://api.github.com", api)
+        self.assertNotIn("/actions/workflows/", api)
+        self.assertNotIn("installWorkflowThroughPullRequest", api)
+
+    def test_managed_device_oauth_rotates_without_any_client_secret(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        self.assertIn("offline_access", service)
+        self.assertIn("client_id: OAUTH_CLIENT_ID", service)
+        self.assertNotIn("GITHUB_OAUTH_CLIENT_SECRET", service)
+        self.assertIn("refreshOAuthToken", api)
+        self.assertIn("token.refreshToken", activity)
+        self.assertIn("api.refreshOAuthToken(refresh)", activity)
+        self.assertNotIn("GITHUB_OAUTH_CLIENT_SECRET", api)
+        self.assertNotIn("OAUTH_CLIENT_ID", api)
 
     def test_mobile_workflow_is_present_and_requires_protected_secrets(self):
         workflow = (ROOT / ".github" / "workflows" /
@@ -169,33 +195,38 @@ class StandaloneAndroidInvariants(unittest.TestCase):
     def test_repository_picker_paginates_and_supports_private_targets(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
-        self.assertIn('per_page=100&page=" + page', api)
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        self.assertIn("page <= 100", service)
+        self.assertIn("per_page=100&page=${page}", service)
         self.assertIn('row.optBoolean("private", false)', api)
-        self.assertNotIn('if (row.optBoolean("private"', api)
-        self.assertIn("ensureTargetWorkflow", api)
-        self.assertIn("MobileWorkflow.FILE_NAME", api)
-        self.assertIn("installWorkflowThroughPullRequest", api)
-        self.assertIn("GitHub's configured approvals", api)
+        self.assertIn("item?.permissions?.admin", service)
+        self.assertIn("ensureTargetWorkflow", service)
+        self.assertIn("installWorkflowThroughPullRequest", service)
+        self.assertIn("GitHub's configured approvals", service)
 
-    def test_credentials_are_validated_and_never_deleted_when_switching_provider(self):
+    def test_provider_credentials_stay_local_until_sealed_dispatch(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
-        configure = api.split("ConfigurationResult configure", 1)[1]
-        configure = configure.split("List<Repository> repositories", 1)[0]
-        self.assertIn("verifyOpenAi(openAi)", configure)
-        self.assertIn("verifyAnthropic(anthropic)", configure)
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        configure = service.split("export async function configure", 1)[1]
+        configure = configure.split("export async function repositories", 1)[0]
+        self.assertNotIn("openai_key", configure.lower())
+        self.assertNotIn("anthropic_key", configure.lower())
+        self.assertNotIn("verifyVendorKey", service)
         self.assertNotIn("putRepositorySecret", configure)
         self.assertNotIn("deleteRepositorySecret", api)
+        self.assertNotIn("deleteRepositorySecret", service)
 
-    def test_dispatch_correlates_the_standard_empty_github_response(self):
+    def test_dispatch_uses_the_authoritative_run_id_with_legacy_correlation_fallback(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
-        dispatch = api.split("RunState dispatch", 1)[1]
-        dispatch = dispatch.split("RunState run", 1)[0]
-        self.assertIn("locateDispatchedRun", dispatch)
-        self.assertNotIn("workflow_run_id", dispatch)
-        self.assertIn("display_title", api)
-        self.assertIn("request.requestId", api)
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        self.assertIn("/api/runs/dispatch", api)
+        self.assertIn("locateDispatchedRun", service)
+        self.assertIn("workflow_run_id", service)
+        self.assertIn("metadata?.default_branch", service)
+        self.assertIn("display_title", service)
+        self.assertIn("request.request_id", service)
 
     def test_completed_runs_expose_the_error_ledger_inside_the_app(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -203,7 +234,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /
                     "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
         self.assertIn("RunDetails runDetails", api)
-        self.assertIn("mobile-phone-", api)
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        self.assertIn("mobile-phone-", service)
         self.assertIn("errors.md", api)
         self.assertIn("View results and error ledger", activity)
 
@@ -216,7 +248,8 @@ class StandaloneAndroidInvariants(unittest.TestCase):
                     "mobile-run.yml").read_text(encoding="utf-8")
         self.assertIn("Steer this build", activity)
         self.assertIn("submitSteering", api)
-        self.assertIn("FLEXFACTOR_STEERING_", api)
+        service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
+        self.assertIn("FLEXFACTOR_STEERING_", service)
         self.assertIn("flexfactor_steering.submit", workflow)
         self.assertIn('source="android"', workflow)
 
@@ -257,16 +290,22 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         self.assertIn("--auto-clean", workflow)
         self.assertNotIn("--no-auto-clean", workflow)
 
-    def test_owner_pat_is_not_persisted_and_cross_model_keys_are_available(self):
+    def test_oauth_session_is_encrypted_and_provider_keys_are_sealed_before_cloud_dispatch(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
         dispatch = api.split("RunState dispatch", 1)[1].split("RunState run", 1)[0]
         self.assertNotIn('"FLEXFACTOR_MOBILE_GITHUB_TOKEN"', dispatch)
-        self.assertIn("request.useBoth", dispatch)
-        provider = api.split("private void prepareProviderSecret", 1)[1]
-        provider = provider.split("private boolean ensureTargetWorkflow", 1)[0]
-        self.assertIn('putRepositorySecret(token, repository, "OPENAI_API_KEY"', provider)
-        self.assertIn('putRepositorySecret(token, repository, "ANTHROPIC_API_KEY"', provider)
+        self.assertIn("encryptedProviderSecrets", dispatch)
+        self.assertNotIn("openai_key", dispatch.lower())
+        provider = api.split("private JSONObject encryptedProviderSecrets", 1)[1]
+        provider = provider.split("private JSONObject seal", 1)[0]
+        self.assertIn("request.useBoth", provider)
+        self.assertIn("OPENAI_API_KEY", provider)
+        self.assertIn("ANTHROPIC_API_KEY", provider)
+        self.assertIn("cryptoBoxSeal", api)
+        store = (ANDROID / "java" / "com" / "firer" / "console" /
+                 "flexfactor" / "SecureStore.java").read_text(encoding="utf-8")
+        self.assertIn("AndroidKeyStore", store)
 
     def test_android_release_gate_proves_the_default_hosted_provider(self):
         workflow = (ROOT / ".github" / "workflows" /
@@ -286,6 +325,12 @@ class StandaloneAndroidInvariants(unittest.TestCase):
         build_gate = build_gate.split("- name: Verify the default phone model provider live", 1)[0]
         self.assertIn("testPlayUnitTest", build_gate)
         self.assertIn("bundlePlay", build_gate)
+
+    def test_release_gate_runs_the_managed_cloud_contract(self):
+        workflow = (ROOT / ".github" / "workflows" /
+                    "android-client.yml").read_text(encoding="utf-8")
+        self.assertIn("npm ci --prefix cloud", workflow)
+        self.assertIn("npm test --prefix cloud", workflow)
 
     def test_play_bundle_omits_the_direct_apk_self_installer(self):
         play_manifest = (ROOT / "android" / "app" / "src" / "play" /

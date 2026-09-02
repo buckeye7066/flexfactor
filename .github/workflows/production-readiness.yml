@@ -31,6 +31,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+      - name: Managed cloud API contract
+        shell: bash
+        run: |
+          npm ci --prefix cloud --no-audit --no-fund
+          npm test --prefix cloud
+      - name: Managed production cloud is ready on main
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          health=$(curl --fail --silent --show-error --retry 3 \
+            https://flexfactor-cloud.vercel.app/api/health)
+          jq -e '.ok == true and .oauth_device_configured == true' <<<"$health"
       - name: Install pinned provider SDKs + the package
         shell: bash
         run: |

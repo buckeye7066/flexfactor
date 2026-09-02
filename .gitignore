@@ -55,3 +55,7 @@ runs/
 # reads that status.
 .venv/
 venv/
+
+# Managed mobile control-plane local dependencies and Vercel project metadata.
+node_modules/
+.vercel/

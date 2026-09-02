@@ -37,7 +37,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Standalone Android control plane for all four FlexFactor modes. */
+/** Managed Android interface for all four FlexFactor modes. */
 public final class MainActivity extends Activity {
     private static final String PREFERENCES = "flexfactor_mobile";
     private static final String LOGIN = "github_login";
@@ -128,7 +128,7 @@ public final class MainActivity extends Activity {
         setContentView(scroll);
 
         content.addView(text("FlexFactor", 30, Color.WHITE));
-        content.addView(text("Standalone phone app · version " + installedVersion(),
+        content.addView(text("Managed phone app · version " + installedVersion(),
                 14, Color.rgb(139, 151, 165)));
 
         LinearLayout top = new LinearLayout(this);
@@ -318,8 +318,7 @@ public final class MainActivity extends Activity {
                 try {
                     Thread.sleep(interval * 1000L);
                     GitHubApi.OAuthToken token = api.pollDeviceAuthorization(authorization);
-                    GitHubApi.ConfigurationResult configured = api.configure(
-                            token.accessToken, "", "");
+                    GitHubApi.ConfigurationResult configured = api.configure(token.accessToken);
                     saveGitHubSession(token);
                     clearPendingAuthorization();
                     preferences.edit().putString(LOGIN, configured.login).apply();
@@ -359,11 +358,11 @@ public final class MainActivity extends Activity {
     }
 
     private synchronized void saveGitHubSession(GitHubApi.OAuthToken token) throws Exception {
-        secrets.put(SecureStore.GITHUB_TOKEN, token.accessToken);
-        // This APK is an OAuth public client. Never attempt a refresh grant that would
-        // require embedding the application's client secret.
-        secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, "");
+        secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, token.refreshToken);
         secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, Long.toString(token.expiresAt));
+        // Store the access token last: configured() must not become true for a
+        // half-written rotating session.
+        secrets.put(SecureStore.GITHUB_TOKEN, token.accessToken);
     }
 
     private synchronized String githubToken() throws Exception {
@@ -373,6 +372,12 @@ public final class MainActivity extends Activity {
         try { if (!expiry.isEmpty()) expiresAt = Long.parseLong(expiry); }
         catch (NumberFormatException ignored) { expiresAt = 0L; }
         if (!token.isEmpty() && System.currentTimeMillis() + 300_000L < expiresAt) return token;
+        String refresh = secrets.get(SecureStore.GITHUB_REFRESH_TOKEN);
+        if (!token.isEmpty() && !refresh.isEmpty()) {
+            GitHubApi.OAuthToken rotated = api.refreshOAuthToken(refresh);
+            saveGitHubSession(rotated);
+            return rotated.accessToken;
+        }
         clearGitHubSession();
         throw new GitHubApi.ApiException("Your GitHub session expired. Reconnect GitHub to continue.");
     }
@@ -452,7 +457,7 @@ public final class MainActivity extends Activity {
                 .setView(form)
                 .setNegativeButton("Cancel", null)
                 .setNeutralButton("Provider key pages", null)
-                .setPositiveButton("Verify and save", null)
+                .setPositiveButton("Save securely", null)
                 .create();
         dialog.setOnShowListener(ignored -> {
             reconnect.setOnClickListener(view -> {
@@ -471,7 +476,7 @@ public final class MainActivity extends Activity {
                     anthropicValue = secrets.get(SecureStore.ANTHROPIC_KEY);
                 }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Saving…");
                 configureCredentials(dialog, openAiValue, anthropicValue);
             });
         });
@@ -481,8 +486,7 @@ public final class MainActivity extends Activity {
     private void configureCredentials(AlertDialog dialog, String openAi, String anthropic) {
         worker.execute(() -> {
             try {
-                GitHubApi.ConfigurationResult result = api.configure(
-                        githubToken(), openAi, anthropic);
+                GitHubApi.ConfigurationResult result = api.configure(githubToken());
                 secrets.put(SecureStore.OPENAI_KEY, openAi);
                 secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
                 preferences.edit().putString(LOGIN, result.login).apply();
@@ -493,9 +497,10 @@ public final class MainActivity extends Activity {
                             Toast.LENGTH_LONG).show();
                 });
             } catch (Exception failed) {
+                invalidateRejectedSession(failed);
                 post(() -> {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verify and save");
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Save securely");
                     showError("Setup was not saved", safeMessage(failed));
                 });
             }
@@ -524,6 +529,7 @@ public final class MainActivity extends Activity {
                         githubToken());
                 post(() -> showRepositoryList(repos));
             } catch (Exception failed) {
+                invalidateRejectedSession(failed);
                 post(() -> {
                     repositoryButton.setEnabled(true);
                     refreshHeader();
@@ -722,6 +728,7 @@ public final class MainActivity extends Activity {
                 post(() -> showBatchRepositoryList(
                         repositories, mode, cost, economy, useBoth));
             } catch (Exception failed) {
+                invalidateRejectedSession(failed);
                 post(() -> {
                     refreshRunLabel();
                     showError("Repositories could not be loaded", safeMessage(failed));
@@ -806,6 +813,7 @@ public final class MainActivity extends Activity {
                             + requests.size() + " repositories…"));
                 } catch (Exception failed) {
                     failures.add(request.repository + ": " + safeMessage(failed));
+                    if (invalidateRejectedSession(failed)) break;
                 }
             }
             int totalStarted = started;
@@ -824,7 +832,7 @@ public final class MainActivity extends Activity {
     }
 
     private void dispatch(MobileRunRequest request) {
-        runState.setText("Submitting " + request.mode.wire + " to GitHub Actions…");
+        runState.setText("Submitting " + request.mode.wire + " to FlexFactor Cloud…");
         worker.execute(() -> {
             try {
                 GitHubApi.RunState state = api.dispatch(
@@ -845,6 +853,7 @@ public final class MainActivity extends Activity {
                     pollLastRun();
                 });
             } catch (Exception failed) {
+                invalidateRejectedSession(failed);
                 post(() -> showError("FlexFactor did not start", safeMessage(failed)));
             }
         });
@@ -893,6 +902,7 @@ public final class MainActivity extends Activity {
                                     && "success".equals(state.conclusion);
                         }
                     } catch (Exception failed) {
+                        invalidateRejectedSession(failed);
                         next = new RunRecord(record.id, record.repository, record.requestId,
                                 record.mode, record.url, "Status check will retry", false);
                     }
@@ -1083,6 +1093,7 @@ public final class MainActivity extends Activity {
                             .show();
                 });
             } catch (Exception failed) {
+                invalidateRejectedSession(failed);
                 post(() -> {
                     refreshRunLabel();
                     showError("Run details are not ready", safeMessage(failed));
@@ -1135,6 +1146,7 @@ public final class MainActivity extends Activity {
                                         Toast.LENGTH_LONG).show();
                             });
                         } catch (Exception failed) {
+                            invalidateRejectedSession(failed);
                             post(() -> {
                                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
                                 showError("Steering was not queued", safeMessage(failed));
@@ -1239,8 +1251,12 @@ public final class MainActivity extends Activity {
 
     private void openExternal(String value) {
         Uri uri = Uri.parse(value);
-        if (!"https".equals(uri.getScheme())) {
-            showError("Link blocked", "FlexFactor opens HTTPS links only.");
+        String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.US);
+        if (!"https".equals(uri.getScheme())
+                || !("github.com".equals(host)
+                || "platform.openai.com".equals(host)
+                || "console.anthropic.com".equals(host))) {
+            showError("Link blocked", "FlexFactor opens only its trusted HTTPS destinations.");
             return;
         }
         startActivity(new Intent(Intent.ACTION_VIEW, uri));
@@ -1265,6 +1281,16 @@ public final class MainActivity extends Activity {
         String value = error.getMessage();
         if (value == null || value.trim().isEmpty()) return error.getClass().getSimpleName();
         return value.length() > 300 ? value.substring(0, 300) : value;
+    }
+
+    private boolean invalidateRejectedSession(Exception error) {
+        if (error instanceof GitHubApi.ApiException
+                && ((GitHubApi.ApiException) error).status == 401) {
+            clearGitHubSession();
+            post(this::refreshHeader);
+            return true;
+        }
+        return false;
     }
 
     private static String capitalize(String value) {

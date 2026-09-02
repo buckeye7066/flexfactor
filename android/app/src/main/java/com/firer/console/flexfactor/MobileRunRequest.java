@@ -5,7 +5,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
-/** Immutable, validated input for the standalone GitHub Actions runner. */
+/** Immutable, validated input for the managed FlexFactor Cloud runner. */
 public final class MobileRunRequest {
     public enum Provider {
         OLLAMA("ollama"),

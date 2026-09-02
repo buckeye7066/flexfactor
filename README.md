@@ -229,21 +229,23 @@ python flexfactor_dashboard_tests.py                    # draws a frame, reads i
 python flexfactor_web.py --print-url                    # same view, phone-reachable
 ```
 
-### Android: standalone phone app
+### Android: managed phone app
 
-The Android app is in [`android/`](android/). Version 3.2 opens the complete
+The Android app is in [`android/`](android/). Version 3.4 opens the complete
 four-option FlexFactor launcher directly from the phone icon: Refactor, Scout,
 Audit, and Production Ready. It requires neither a PC nor Termux/Ollama. The
-signed APK is the native control plane and a disposable GitHub Actions runner
-provides the multi-toolchain execution environment.
+signed APK talks to the deployed [`cloud/`](cloud/) control plane, which owns
+managed sign-in, session rotation, repositories, dispatch, results, and steering.
+GitHub Actions is an implementation detail used for disposable multi-toolchain compute.
 
-The first-launch Credentials screen verifies a GitHub token; OpenAI and Anthropic
-keys are optional. The provider selector also exposes GitHub Copilot and a hosted
-open model. Public and private targets run from a pinned caller installed into the
-selected repository, keeping private run metadata private. Credentials are encrypted with
-Android Keystore and installed as LibSodium-sealed GitHub Actions secrets; they
-are never workflow inputs. The owner's GitHub token stays in Android Keystore and
-is never stored in a target repository; runs use GitHub's short-lived scoped token.
+First launch uses GitHub device sign-in; nobody creates or pastes a personal access
+token. OAuth access and refresh tokens are encrypted with Android Keystore. OpenAI
+and Anthropic keys are optional; the provider selector also exposes GitHub Copilot
+and a hosted open model. For a run, vendor keys are LibSodium-sealed on the phone to
+the selected repository's Actions public key before crossing FlexFactor Cloud; they
+are never workflow inputs or plaintext run payloads. Public and private targets run
+from an exact-release caller installed into the selected repository, keeping private
+run metadata in that repository.
 Choose any writable public or private repository, select one of the four modes,
 monitor the exact correlated Actions run, view its error ledger, and submit live
 operator steering from the same app. See
