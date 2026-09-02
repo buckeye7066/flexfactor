@@ -1392,11 +1392,9 @@ class RotationDefaultProviderTests(unittest.TestCase):
                          "paid routes must reach the rotator; the BOUND is "
                          "--max-cost plus the pool's quota_exhausted cooldown, "
                          "not this filter")
-        # The 2026-08-24 supersession, stated as an assertion so it cannot be
-        # undone by accident: in 'free' the bound IS this filter, because a
-        # promise about what a run can spend cannot be kept by ordering alone -
-        # ordering only decides what is tried FIRST, so a paid route stays
-        # reachable the moment free capacity runs out.
+        # Every retired spelling reaches the same admission boundary. Route
+        # strength, remaining allowance, and cost order belong to the rotator;
+        # a legacy mode name cannot filter paid capacity back out.
         self.assertEqual(ff._route_unusable_reason(paid, "free"), "",
                          "retired free/paid spellings must normalize to the one "
                          "paid-to-free ladder")
@@ -1404,9 +1402,8 @@ class RotationDefaultProviderTests(unittest.TestCase):
         gem["auth_env"] = "FLEXROT_GEMINI_KEY"
         os.environ["FLEXROT_GEMINI_KEY"] = "test-key"
         try:
-            # Gemini is a CLOUD free tier: admitted by 'free' (this is the
-            # capacity the retired 'local' mode threw away), and excluded from
-            # 'paid', which is the owner's own two accounts and nothing else.
+            # Gemini is admitted regardless of the retired spelling. Its free
+            # capacity is ordered by the one ladder, not selected by a mode.
             self.assertEqual(
                 ff._route_unusable_reason(fr.Route.from_json(gem), "free"), "")
             self.assertEqual(
