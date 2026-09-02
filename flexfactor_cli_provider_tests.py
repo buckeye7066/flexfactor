@@ -17,15 +17,22 @@ the rest of the catalog down with it.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+import urllib.error
+from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import flexfactor as ff
 from providers import cli_provider as cp
+from providers import chatgpt_subscription as cs
 
 
 class Route:
@@ -346,6 +353,133 @@ class CliProviderBehaviourTests(unittest.TestCase):
 
     def test_billing_label_marks_these_flat_rate(self):
         self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)
+
+
+class _FakeHttpResponse:
+    def __init__(self, body=b"", *, content_type="application/json", lines=None):
+        self._body = body
+        self._lines = list(lines or [])
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self._body
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+class ChatGPTSubscriptionTransportTests(unittest.TestCase):
+    def test_only_exportable_account_bound_oauth_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth.json"
+            path.write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "real-token", "account_id": "acct-1"},
+            }), encoding="utf-8")
+            auth = cs.load_exportable_oauth(path)
+            self.assertIsNotNone(auth)
+            self.assertEqual(auth.account_id, "acct-1")
+
+            path.write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "managed-placeholder",
+                           "account_id": None},
+            }), encoding="utf-8")
+            self.assertIsNone(cs.load_exportable_oauth(path))
+
+    def test_codex_prefers_subscription_http_without_spawning_nested_cli(self):
+        class FakeClient:
+            model = "gpt-5.6-sol"
+
+            def complete(self, prompt, **kwargs):
+                self.call = (prompt, kwargs)
+                return "OK"
+
+        fake = FakeClient()
+        oauth = cs.CodexOAuth("secret", "acct", "test")
+        with mock.patch.object(cs, "load_exportable_oauth", return_value=oauth), \
+             mock.patch.object(cs, "ChatGPTSubscriptionClient", return_value=fake), \
+             mock.patch.object(subprocess, "run") as run:
+            provider = cp.CliProvider("codex-cli", "codex", "/bin/codex")
+            self.assertEqual(provider.complete("PROMPT", system="SYSTEM"), "OK")
+        run.assert_not_called()
+        self.assertEqual(provider.model, "gpt-5.6-sol")
+        self.assertEqual(fake.call[0], "PROMPT")
+        self.assertEqual(fake.call[1]["system"], "SYSTEM")
+
+    def test_managed_work_mode_without_exportable_oauth_fails_before_spawn(self):
+        with mock.patch.object(cs, "load_exportable_oauth", return_value=None), \
+             mock.patch.object(cp, "_inside_managed_codex_session", return_value=True), \
+             mock.patch.object(subprocess, "run") as run:
+            provider = cp.CliProvider("codex-cli", "codex", "/opt/codex/bin/codex")
+            with self.assertRaisesRegex(cp.CliUnavailable, "brokers.*credential"):
+                provider.ping()
+        run.assert_not_called()
+
+    def test_live_catalog_default_selects_sol_and_streams_text(self):
+        requests = []
+        model_body = json.dumps({"models": [
+            {"slug": "gpt-5.6-sol", "is_default": True},
+            {"slug": "gpt-5.6-terra"},
+        ]}).encode()
+        stream = [
+            b'data: {"type":"response.output_text.delta","delta":"O"}\n',
+            b'\n',
+            b'data: {"type":"response.output_text.delta","delta":"K"}\n',
+            b'\n',
+            b'data: {"type":"response.completed","response":{}}\n',
+            b'\n',
+        ]
+
+        def fake_open(request, timeout):
+            requests.append((request, timeout))
+            if request.get_method() == "GET":
+                return _FakeHttpResponse(model_body)
+            return _FakeHttpResponse(
+                content_type="text/event-stream", lines=stream)
+
+        with mock.patch.object(cs, "_codex_version", return_value="0.149.0"):
+            client = cs.ChatGPTSubscriptionClient(
+                cs.CodexOAuth("TOP-SECRET", "acct-1", "test"),
+                model="codex", binary="codex", timeout=30, urlopen=fake_open)
+        self.assertEqual(client.complete("PROMPT", system="SYSTEM", max_tokens=17), "OK")
+        self.assertEqual(client.model, "gpt-5.6-sol")
+        self.assertEqual(len(requests), 2)
+        post = requests[1][0]
+        payload = json.loads(post.data.decode())
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        self.assertEqual(payload["instructions"], "SYSTEM")
+        self.assertEqual(payload["max_output_tokens"], 17)
+        self.assertIs(payload["store"], False)
+        self.assertEqual(payload["tools"], [])
+        self.assertNotIn("TOP-SECRET", post.full_url)
+        self.assertNotIn("TOP-SECRET", post.data.decode())
+
+    def test_http_failure_never_echoes_bearer_and_becomes_cli_unavailable(self):
+        def rejected(_request, timeout):
+            raise urllib.error.HTTPError(
+                cs.RESPONSES_URL, 429, "limit", {"Retry-After": "12"},
+                io.BytesIO(b'{"error":{"message":"quota exhausted"}}'))
+
+        oauth = cs.CodexOAuth("TOP-SECRET", "acct-1", "test")
+        with mock.patch.object(cs, "load_exportable_oauth", return_value=oauth), \
+             mock.patch.object(cs, "_codex_version", return_value="0.149.0"), \
+             mock.patch.object(cs.urllib.request, "urlopen", side_effect=rejected):
+            provider = cp.CliProvider(
+                "codex-cli", "gpt-5.6-sol", "/bin/codex", timeout=30)
+            with self.assertRaises(cp.CliUnavailable) as raised:
+                provider.complete("PROMPT")
+        message = str(raised.exception)
+        self.assertIn("429", message)
+        self.assertIn("quota exhausted", message)
+        self.assertIn("retry after 12s", message)
+        self.assertNotIn("TOP-SECRET", message)
 
 
 if __name__ == "__main__":
