@@ -234,6 +234,13 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             self.assertFalse(ok, constant)
             self.assertIn("not valid JSON", reason)
 
+    def test_source_syntax_preflight_rejects_lone_unicode_surrogates(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "settings.json", '{"value": "\ud800"}'
+        )
+        self.assertFalse(ok)
+        self.assertIn("not UTF-8 encodable", reason)
+
     def test_source_syntax_preflight_rejects_parser_recursion(self):
         deeply_nested_toml = "value = " + "[" * 2000 + "0" + "]" * 2000
         ok, reason = ff._inproc_source_syntax_ok(
@@ -648,6 +655,45 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertNotIn("<<<UNTRUSTED original END>>>", Provider.prompts[0])
         self.assertEqual(original, exact_original.replace("\r\n", "\n"))
         self.assertNotIn(prose.strip(), Provider.prompts[0])
+
+    def test_redact_mode_refuses_exact_original_noop_review(self):
+        import tempfile
+        import types
+
+        original = 'API_TOKEN = "sk-sensitive-owner-value-123456789"\n'
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return original
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("redacted exact source reached review")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "settings.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the configured token", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(ff, "EGRESS_MODE", "redact"), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()
+                 ), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
 
     def test_non_utf8_original_cannot_reach_noop_review(self):
         import tempfile
@@ -15758,6 +15804,19 @@ class GoverningPurposeCoverageTests(unittest.TestCase):
         selected2, omitted2 = ff._test_generation_scope(files, 2)
         self.assertEqual(selected2, ["src/a.py", "src/b.py"])
         self.assertEqual(omitted2, ["src/c.js"])
+
+    def test_changed_source_scope_includes_new_destinations_not_deleted_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "new.py"), "w", encoding="utf-8") as fh:
+                fh.write("VALUE = 1\n")
+            with open(os.path.join(tmp, "src", "test_new.py"), "w", encoding="utf-8") as fh:
+                fh.write("def test_value(): pass\n")
+            selected = ff._existing_changed_sources(
+                tmp,
+                {"src/deleted.py", "src/new.py", "src/test_new.py"},
+            )
+        self.assertEqual(["src/new.py"], selected)
 
     def test_inventory_accounts_for_source_binary_and_artifact_subtrees(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -3032,6 +3032,10 @@ def _inproc_source_syntax_ok(
     the candidate Python module merely to validate it.
     """
     text = str(source or "")
+    try:
+        encoded = text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        return False, f"source is not UTF-8 encodable: {exc}"
     if not text.strip() and not allow_empty:
         return False, "empty whole-file response"
     ext = os.path.splitext(str(path or ""))[1].lower()
@@ -3043,7 +3047,7 @@ def _inproc_source_syntax_ok(
             # character.  Bytes keep this preflight aligned with the real
             # parser and also validate UTF-8 encoding before any write.
             compile(
-                text.encode("utf-8"),
+                encoded,
                 str(path or "<candidate>"),
                 "exec",
                 dont_inherit=True,
@@ -5244,36 +5248,43 @@ def run(args) -> int:
                 # complete payload.  A file too large for this one-call proof
                 # is refused rather than partially approved.
                 exact_original: str | None = None
-                exact_bytes = _read_bytes_contained(
-                    root, rel, cap=MAX_REVIEW_BYTES + 1,
-                )
-                if exact_bytes is None:
+                if EGRESS_MODE == "redact":
                     original_syntax_ok = False
                     original_syntax_note = (
-                        "exact original bytes could not be safely read"
-                    )
-                elif len(exact_bytes) > MAX_REVIEW_BYTES:
-                    original_syntax_ok = False
-                    original_syntax_note = (
-                        "exact original exceeds the independent no-op review "
-                        f"limit ({MAX_REVIEW_BYTES} bytes)"
+                        "exact original review is unavailable in redact mode "
+                        "because the reviewer would receive altered source"
                     )
                 else:
-                    try:
-                        exact_original = exact_bytes.decode(
-                            "utf-8", errors="strict"
-                        )
-                    except UnicodeDecodeError as exc:
+                    exact_bytes = _read_bytes_contained(
+                        root, rel, cap=MAX_REVIEW_BYTES + 1,
+                    )
+                    if exact_bytes is None:
                         original_syntax_ok = False
                         original_syntax_note = (
-                            f"exact original is not UTF-8: {exc}"
+                            "exact original bytes could not be safely read"
+                        )
+                    elif len(exact_bytes) > MAX_REVIEW_BYTES:
+                        original_syntax_ok = False
+                        original_syntax_note = (
+                            "exact original exceeds the independent no-op review "
+                            f"limit ({MAX_REVIEW_BYTES} bytes)"
                         )
                     else:
-                        original_syntax_ok, original_syntax_note = (
-                            _inproc_source_syntax_ok(
-                                args.file, exact_original, allow_empty=True,
+                        try:
+                            exact_original = exact_bytes.decode(
+                                "utf-8", errors="strict"
                             )
-                        )
+                        except UnicodeDecodeError as exc:
+                            original_syntax_ok = False
+                            original_syntax_note = (
+                                f"exact original is not UTF-8: {exc}"
+                            )
+                        else:
+                            original_syntax_ok, original_syntax_note = (
+                                _inproc_source_syntax_ok(
+                                    args.file, exact_original, allow_empty=True,
+                                )
+                            )
                 if candidate_matches_original:
                     response_description = "unchanged author candidate"
                     print(
@@ -9846,6 +9857,27 @@ def _test_generation_scope(all_files: list[str], max_modules: int
         return candidates, []
     return candidates[:max_modules], candidates[max_modules:]
 
+
+def _existing_changed_sources(project_dir: str, paths) -> list[str]:
+    """Return every changed source path that still exists after mutation.
+
+    Structural fixes may create files or rename them to destinations absent
+    from the pre-mutation source inventory.  Conversely, a rename source is a
+    touched path but no longer exists.  Resolve the live contained paths here
+    so focused regression generation covers new destinations without trying to
+    read deleted sources.
+    """
+    current: set[str] = set()
+    for raw in paths:
+        identity = _portable_rel_identity(str(raw or ""))
+        if identity is None:
+            continue
+        rel = identity[0]
+        if (not _is_test_path(rel)
+                and _contained_existence(project_dir, rel) == "exists"):
+            current.add(rel)
+    return sorted(current)
+
 AUDIT_SYSTEM = (
     "You are a senior code auditor performing an evidence-first, adversarial "
     "line-by-line review. Do not assume code is broken: prove each reported defect "
@@ -12741,6 +12773,31 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     return ""
 
 
+def _read_complete_structural_text(project_dir: str, rel: str) -> tuple[str | None, str]:
+    """Read one complete bounded UTF-8 owner file for structural planning.
+
+    `_read_contained` is intentionally a preview reader and cannot distinguish
+    a complete file from a truncated prefix at its ceiling.  Whole-file
+    structural rewrites may only call a source "shown" after this helper has
+    observed EOF inside the bound.
+    """
+    payload = _read_bytes_contained(
+        project_dir, rel, cap=MAX_REVIEW_BYTES + 1,
+    )
+    if payload is None:
+        return None, "missing or contained read refused"
+    if len(payload) > MAX_REVIEW_BYTES:
+        return (
+            None,
+            f"exceeds the complete structural planning limit "
+            f"({MAX_REVIEW_BYTES} bytes)",
+        )
+    try:
+        return payload.decode("utf-8", errors="strict"), ""
+    except UnicodeDecodeError as exc:
+        return None, f"is not strict UTF-8: {exc}"
+
+
 def _cross_verify_structural(reviewer, rel: str, targets: list, ops_text: str) -> tuple:
     """2nd-model veto of a structural plan's applied operations. FAIL-OPEN on
     reviewer failure, exactly like _cross_verify_fix: a flaky judge must never
@@ -12758,8 +12815,22 @@ def _cross_verify_structural(reviewer, rel: str, targets: list, ops_text: str) -
         data = _judge(reviewer, FIX_VERIFY_SYSTEM, prompt, FIX_VERIFY_SCHEMA)
     except Exception as ex:
         return True, f"cross-verify skipped: {ex}"
-    keep = (str(data.get("verdict")) == "keep") and not data.get("regressions")
-    reason = "; ".join(str(i) for i in (data.get("issues") or [])) or str(data.get("verdict"))
+    issues = data.get("issues")
+    keep = (
+        str(data.get("verdict")) == "keep"
+        and data.get("resolves") is True
+        and data.get("regressions") is False
+        and isinstance(issues, list)
+        and not issues
+    )
+    if issues:
+        reason = "; ".join(str(item) for item in issues)
+    elif data.get("resolves") is not True:
+        reason = "reviewer says the listed defects remain unresolved"
+    elif data.get("regressions") is not False:
+        reason = "reviewer reports a regression"
+    else:
+        reason = str(data.get("verdict"))
     return keep, reason
 
 
@@ -12775,9 +12846,14 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     'failed' (plan refused / apply error / gate broke / veto - EVERY touched
     path restored) with a reason string. Never raises on a model/apply failure;
     the audit must outlive this pass."""
-    primary = _read_contained(project_dir, rel)
+    primary, primary_read_note = _read_complete_structural_text(
+        project_dir, rel
+    )
     if primary is None:
-        return ("failed", "contained read of the primary file was refused")
+        return (
+            "failed",
+            f"complete read of the primary file was refused: {primary_read_note}",
+        )
     bullets = "\n".join(
         f"- [{f.get('severity')}] line {f.get('line')} - {f.get('title')}: "
         f"{f.get('problem')} => FIX: {f.get('fix')}" for f in targets)
@@ -12808,9 +12884,13 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
             extra_parts = []
             for p in need:
                 cp = _canon_rel(p)
-                text = _read_contained(project_dir, cp)
+                text, read_note = _read_complete_structural_text(
+                    project_dir, cp
+                )
                 if text is None:
-                    extra_parts.append(f"REQUESTED FILE {cp}: (missing or refused)")
+                    extra_parts.append(
+                        f"REQUESTED FILE {cp}: (not shown: {read_note})"
+                    )
                 else:
                     shown.add(cp)
                     extra_parts.append(f"REQUESTED FILE {cp}:\n"
@@ -12958,38 +13038,61 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 ok = (_replace_contained(project_dir, p, data) is not None) and ok
         return ok
 
+    def _failed_after_rollback(detail: str) -> tuple[str, str]:
+        try:
+            restored = _rollback()
+        except Exception:
+            restored = False
+        if not restored:
+            raise DirtyTreeError(dict.fromkeys([rel] + touched))
+        return "failed", f"{detail} (rolled back)"
+
     applied_ops = []
-    for src_p, dst_p in renames:
-        data = rename_payloads[(src_p, dst_p)]
-        moved = (data is not None
-                 and _replace_contained(project_dir, dst_p, data) is not None
-                 and _unlink_contained(project_dir, src_p))
-        if not moved:
-            _rollback()
-            return ("failed", f"rename {src_p} -> {dst_p} refused (rolled back)")
-        applied_ops.append(f"rename {src_p} -> {dst_p}")
-    for p, contents in writes:
-        was = snapshots.get(p)
-        if _replace_contained(project_dir, p, contents) is None:
-            _rollback()
-            return ("failed", f"contained write refused for {p} (rolled back)")
-        moved_here = p in rename_destination_paths
-        applied_ops.append(
-            ("rewrite " if was is not None or moved_here else "create ") + p
+    try:
+        for src_p, dst_p in renames:
+            data = rename_payloads[(src_p, dst_p)]
+            moved = (data is not None
+                     and _replace_contained(project_dir, dst_p, data) is not None
+                     and _unlink_contained(project_dir, src_p))
+            if not moved:
+                return _failed_after_rollback(
+                    f"rename {src_p} -> {dst_p} was refused"
+                )
+            applied_ops.append(f"rename {src_p} -> {dst_p}")
+        for p, contents in writes:
+            was = snapshots.get(p)
+            if _replace_contained(project_dir, p, contents) is None:
+                return _failed_after_rollback(
+                    f"contained write was refused for {p}"
+                )
+            moved_here = p in rename_destination_paths
+            applied_ops.append(
+                ("rewrite " if was is not None or moved_here else "create ") + p
+            )
+    except DirtyTreeError:
+        raise
+    except Exception as exc:
+        return _failed_after_rollback(
+            f"structural apply raised {type(exc).__name__}: {exc}"
         )
 
-    unverified = False
+    unverified_paths: list[str] = []
     to_gate = [p for p, _ in writes] + [dst for _, dst in renames]
     for p in dict.fromkeys(to_gate):
         if os.path.splitext(p)[1].lower() not in _CODE_EXTS:
             continue
-        ok, log = _gate_file(project_dir, p, stack, baseline_ok)
+        try:
+            ok, log = _gate_file(project_dir, p, stack, baseline_ok)
+        except Exception as exc:
+            return _failed_after_rollback(
+                f"syntax gate raised for {p}: {type(exc).__name__}: {exc}"
+            )
         if ok is False:
-            if not _rollback():
-                return ("failed", f"gate broke on {p} AND rollback was refused - tree dirty")
-            return ("failed", f"syntax gate failed on {p}: {log[:200]} (rolled back)")
+            return _failed_after_rollback(
+                f"syntax gate failed on {p}: {log[:200]}"
+            )
         if ok is None:
-            unverified = True
+            unverified_paths.append(p)
 
     if cross is not None:
         parts = []
@@ -13009,16 +13112,26 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 parts.append(f"NEW FILE {p}:\n{contents[:8000]}")
         for src_p, dst_p in renames:
             parts.append(f"RENAME {src_p} -> {dst_p}")
-        keep, reason = _cross_verify_structural(cross, rel, targets, "\n\n".join(parts))
+        try:
+            keep, reason = _cross_verify_structural(
+                cross, rel, targets, "\n\n".join(parts)
+            )
+        except Exception as exc:
+            return _failed_after_rollback(
+                f"cross-model verification raised {type(exc).__name__}: {exc}"
+            )
         if not keep:
-            if not _rollback():
-                return ("failed", "cross-model veto AND rollback refused - tree dirty")
-            return ("failed", f"cross-model rejected the structural fix: {reason}")
+            return _failed_after_rollback(
+                f"cross-model rejected the structural fix: {reason}"
+            )
 
+    touched_paths = list(dict.fromkeys([rel] + touched))
     detail = {"fixed_titles": plan.get("fixed_titles") or [],
               "notes": str(plan.get("notes") or ""),
-              "summary": "; ".join(applied_ops)}
-    return ("unverified" if unverified else "fixed", detail)
+              "summary": "; ".join(applied_ops),
+              "touched_paths": touched_paths,
+              "unverified_paths": unverified_paths}
+    return ("unverified" if unverified_paths else "fixed", detail)
 
 
 def _gate_file(project_dir: str, rel_path: str, stack: dict, baseline_ok: bool) -> tuple[bool | None, str]:
@@ -15643,6 +15756,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     s_kind, s_detail = attempt_structural_fix(
                         author, cross, project_dir, rel, targets, stack,
                         baseline_ok, str(outcome[1] or ""))
+                except DirtyTreeError:
+                    raise
                 except Exception as ex:  # noqa: BLE001 - never kill the audit
                     s_kind, s_detail = "failed", f"structural pass crashed: {str(ex)[:200]}"
                 if s_kind in ("fixed", "unverified"):
@@ -15652,11 +15767,22 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     mark = "" if s_kind == "fixed" else "  [unverified]"
                     print(f"  [fixed-structural]{mark} {rel}: {fixed} "
                           f"({s_detail.get('summary', 'cross-file operations')})")
-                    applied.append(rel)
+                    structural_paths = [
+                        _canon_rel(path)
+                        for path in (s_detail.get("touched_paths") or [rel])
+                        if isinstance(path, str) and _rel_components(path) is not None
+                    ]
+                    if rel not in structural_paths:
+                        structural_paths.insert(0, rel)
+                    for changed_path in structural_paths:
+                        if changed_path not in applied:
+                            applied.append(changed_path)
                     if done_set is not None:
-                        done_set.add(rel)
+                        done_set.update(structural_paths)
                     if s_kind == "unverified":
-                        unverified.append(rel)
+                        for changed_path in structural_paths:
+                            if changed_path not in unverified:
+                                unverified.append(changed_path)
                     notes.append(f"{rel}: STRUCTURAL fix applied "
                                  f"({s_detail.get('summary', '')}): "
                                  f"{s_detail.get('notes', '')}")
@@ -18005,9 +18131,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Generating focused regression tests for changed behavior...")
             if checkpoint is not None:
                 checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
-            changed_for_tests = sorted(
-                rel for rel in (set(applied_set) | set(bridged_early) | set(bridged_files))
-                if rel in set(all_files) and not _is_test_path(rel))
+            changed_for_tests = _existing_changed_sources(
+                project_dir,
+                set(applied_set) | set(bridged_early) | set(bridged_files),
+            )
             test_candidates, omitted = _test_generation_scope(
                 changed_for_tests, args.max_test_modules)
             if omitted:

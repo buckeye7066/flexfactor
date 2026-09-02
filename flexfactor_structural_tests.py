@@ -94,7 +94,7 @@ class StructuralApplies(_Base):
             {"path": "pkg/__init__.py", "contents": ""},
         ])])
         applied, unverified, notes = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual({"bad.py", "pkg/__init__.py"}, set(applied))
         self.assertEqual(unverified, [])          # .py files gate via py_compile
         self.assertEqual(self.read("bad.py"), GOOD_FIXED)
         self.assertEqual(self.read("pkg/__init__.py"), "")
@@ -105,7 +105,7 @@ class StructuralApplies(_Base):
             writes=[{"path": "bad.py", "contents": GOOD_FIXED}],
             renames=[{"from": "other.py", "to": "renamed.py"}])])
         applied, _, _ = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual({"bad.py", "other.py", "renamed.py"}, set(applied))
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 2\n")
 
@@ -118,7 +118,7 @@ class StructuralApplies(_Base):
             ),
         ])
         applied, _, notes = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual({"bad.py", "other.py", "renamed.py"}, set(applied))
         self.assertEqual(author.structural_calls, 2)
         self.assertIsNone(self.read("other.py"))
         self.assertEqual(self.read("renamed.py"), "y = 3\n")
@@ -161,7 +161,7 @@ class StructuralApplies(_Base):
             plan(writes=[{"path": "other.py", "contents": "y = 3\n"}]),
         ])
         applied, _, _ = self.run_fix(author)
-        self.assertEqual(applied, ["bad.py"])
+        self.assertEqual({"bad.py", "other.py"}, set(applied))
         self.assertEqual(author.structural_calls, 2)
         self.assertEqual(self.read("other.py"), "y = 3\n")
 
@@ -174,7 +174,6 @@ class StructuralRollsBack(_Base):
             side_effect=AssertionError("malformed plan passed preflight")
         )
         with mock.patch.object(F, "_contained_existence", forbidden), \
-             mock.patch.object(F, "_read_bytes_contained", forbidden), \
              mock.patch.object(F, "_replace_contained", forbidden), \
              mock.patch.object(F, "_unlink_contained", forbidden), \
              mock.patch.object(F, "_gate_file", forbidden), \
@@ -261,6 +260,68 @@ class StructuralRollsBack(_Base):
                 self._assert_malformed_operation_field_is_preflight_refused(
                     malformed, expected="fixed_titles"
                 )
+
+    def test_oversized_primary_is_never_treated_as_fully_shown(self):
+        author = _Author([plan(writes=[
+            {"path": "bad.py", "contents": GOOD_FIXED},
+        ])])
+        with mock.patch.object(F, "MAX_REVIEW_BYTES", len(GOOD_PRIMARY) - 1):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("complete structural planning limit", detail)
+        self.assertEqual(0, author.structural_calls)
+        self.assertEqual(GOOD_PRIMARY, self.read("bad.py"))
+
+    def test_oversized_requested_file_remains_unseen_and_cannot_be_rewritten(self):
+        large = "VALUE = 1\n" * 20
+        with open(os.path.join(self.proj, "large.py"), "w", encoding="utf-8") as stream:
+            stream.write(large)
+        author = _Author([
+            plan(changed=False, need_files=["large.py"]),
+            plan(writes=[{"path": "large.py", "contents": "VALUE = 2\n"}]),
+        ])
+        with mock.patch.object(F, "MAX_REVIEW_BYTES", len(GOOD_PRIMARY) + 2):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("without having seen", detail)
+        self.assertEqual(large, self.read("large.py"))
+
+    def test_lone_surrogate_write_is_refused_before_rename_or_write(self):
+        owner = os.path.join(self.proj, "owner.json")
+        with open(owner, "w", encoding="utf-8") as stream:
+            stream.write('{"value": 1}\n')
+        author = _Author([
+            plan(changed=False, need_files=["owner.json"]),
+            plan(
+                writes=[{"path": "renamed.json",
+                         "contents": '{"value": "\ud800"}\n'}],
+                renames=[{"from": "owner.json", "to": "renamed.json"}],
+            ),
+        ])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("surrogate source reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("surrogate source reached an unlink")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("not UTF-8 encodable", detail)
+        self.assertEqual('{"value": 1}\n', self.read("owner.json"))
+        self.assertIsNone(self.read("renamed.json"))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
 
     def test_rename_destination_rewrite_requires_source_contents(self):
         author = _Author([plan(
@@ -528,6 +589,27 @@ class StructuralRollsBack(_Base):
 
 
 class StructuralGating(_Base):
+    def test_cross_review_requires_resolved_defects_and_no_issues(self):
+        inconsistent_reviews = (
+            {"verdict": "keep", "resolves": False,
+             "regressions": False, "issues": []},
+            {"verdict": "keep", "resolves": True,
+             "regressions": False, "issues": ["defect still reachable"]},
+        )
+        for review in inconsistent_reviews:
+            with self.subTest(review=review):
+                author = _Author([plan(writes=[
+                    {"path": "bad.py", "contents": GOOD_FIXED},
+                ])])
+                with mock.patch.object(F, "_judge", return_value=review):
+                    kind, detail = F.attempt_structural_fix(
+                        author, object(), self.proj, "bad.py", [dict(FINDING)],
+                        {}, True, NOFIX_NOTE,
+                    )
+                self.assertEqual("failed", kind)
+                self.assertIn("cross-model rejected", detail)
+                self.assertEqual(GOOD_PRIMARY, self.read("bad.py"))
+
     def test_declined_plan_keeps_the_honest_noop_accounting(self):
         author = _Author([plan(changed=False, notes="no safe cross-file fix")])
         applied, _, notes = self.run_fix(author)
