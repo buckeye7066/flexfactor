@@ -491,15 +491,12 @@ jobs:
               || { echo "Tag $RELEASE_TAG moved to $tag_commit during publication" >&2; return 1; }
           }
           release_is_complete() {
-            gh release view "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json tagName,isDraft,isPrerelease,assets \
-              | jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
-                  --arg aab "flexfactor-${version_name}.aab" \
-                'select(.tagName == $tag and .isDraft == false and .isPrerelease == false
-                 and ([.assets[].name] | index($apk)) != null
-                 and ([.assets[].name] | index($aab)) != null
-                 and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+            jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
+                --arg aab "flexfactor-${version_name}.aab" \
+              'select(.tagName == $tag and .isDraft == false and .isPrerelease == false
+               and ([.assets[].name] | index($apk)) != null
+               and ([.assets[].name] | index($aab)) != null
+               and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
           }
           tag_exists=false
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
@@ -517,7 +514,18 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             require_live_main
             require_exact_tag
-            if release_is_complete; then
+            # Fetch and validate the state BEFORE any draft mutation. An API or
+            # JSON failure aborts here; it is never conflated with an incomplete
+            # release and can never demote a healthy release.
+            release_state=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,assets)
+            printf '%s' "$release_state" \
+              | jq -e 'type == "object" and (.tagName | type == "string")
+                  and (.isDraft | type == "boolean")
+                  and (.isPrerelease | type == "boolean")
+                  and (.assets | type == "array")' >/dev/null
+            if printf '%s' "$release_state" | release_is_complete; then
               # A tag-triggered rerun can retain should_publish=true from its
               # original plan. Never demote a healthy public release to draft.
               echo "$RELEASE_TAG is already complete; no publication mutation required"
@@ -591,7 +599,10 @@ jobs:
             --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
           require_exact_tag
           require_live_main
-          release_is_complete
+          final_release_state=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets)
+          printf '%s' "$final_release_state" | release_is_complete
       - name: Upload signed exact-commit Android release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
