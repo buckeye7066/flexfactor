@@ -147,5 +147,9 @@ fingerprint check.
 matrix gate on Ubuntu and Windows. `.github/workflows/android-client.yml`
 builds, tests, lints, signs, and publishes an APK only from the exact merged
 `main` commit and verifies that the release tag resolves to that same SHA.
+If a low-level fast-forward does not emit a push workflow, the repository owner
+can comment `/release-android <current-main-sha>` on an issue or pull request.
+The owner-only command dispatches the same workflow, and both the dispatcher
+and signer refuse the run if `main` moved or the SHA is not exact.
 
 For failure diagnosis, see [docs/troubleshooting.md](docs/troubleshooting.md).
