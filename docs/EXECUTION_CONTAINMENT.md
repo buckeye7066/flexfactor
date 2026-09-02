@@ -1,4 +1,4 @@
-# FlexFactor - Execution containment (0.6.0)
+# FlexFactor - Execution containment (0.6.1)
 
 Source: `flexfactor_sandbox.py` (`capability_report`, `_claim_sentence`,
 `prepare`, `run_contained`, `require_containment_or_trust`),

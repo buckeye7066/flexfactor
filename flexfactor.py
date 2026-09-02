@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""FlexFactor 0.6.0 — managed code improvement with four modes.
+r"""FlexFactor 0.6.1 — managed code improvement with four modes.
 
 Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
 one quality-first paid-to-free model ladder. A request may contain up to 30
@@ -643,7 +643,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.6.0"
+TOOL_VERSION = "0.6.1"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -2924,12 +2924,24 @@ def _parse_grade(text: str) -> Grade:
 
 
 def _strip_code_fences(code: str) -> str:
-    """Remove a leading/trailing ``` fence if the model added one despite instructions."""
-    lines = code.splitlines()
-    if lines and lines[0].lstrip().startswith("```"):
+    """Return a whole-file response without a provider's Markdown wrapper.
+
+    Providers sometimes append an explanation *after* the closing fence.  In
+    that shape, removing only the first and last lines leaves the closing fence
+    inside the candidate and turns otherwise valid source into invalid code.
+    Once a response begins with a fence, the first exact closing-fence line is
+    authoritative and any later prose is not part of the requested file.
+    """
+    text = str(code or "").strip()
+    if not text:
+        return "\n"
+    lines = text.splitlines()
+    if lines[0].lstrip().startswith("```"):
         lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
+        for index, line in enumerate(lines):
+            if re.fullmatch(r"\s*`{3,}\s*", line):
+                lines = lines[:index]
+                break
     return "\n".join(lines).strip() + "\n"
 
 
@@ -5100,6 +5112,53 @@ def run(args) -> int:
     else:
         print(f"\nReached max_iterations ({args.max_iterations}) without acceptance.")
         return 1
+
+    # A reviewer may truthfully conclude that the selected file already meets
+    # the goal.  That is a verified no-op, not a failed mutation: run the full
+    # project gate, prove the untouched baseline is already on the authoritative
+    # remote default branch, and close the durable pass without fabricating a
+    # commit.  This path also prevents explanatory model wrappers from being
+    # mistaken for a meaningful edit after normalization above.
+    if current == original:
+        stack = _detect_stack(root)
+        final_ok, gate_log = _publication_gate(root, stack)
+        if final_ok is not True:
+            state = "failed" if final_ok is False else "did not run"
+            print(
+                f"error: unchanged refactor project verification {state}: "
+                + _tail(gate_log, 4), file=sys.stderr,
+            )
+            return 1
+        if not _git_tree_clean(root):
+            print(
+                "error: project verification changed the untouched refactor tree.",
+                file=sys.stderr,
+            )
+            return 1
+        contained, detail = _remote_branch_contains(
+            root, default_branch, baseline_sha
+        )
+        if not contained:
+            print(
+                "error: unchanged refactor baseline is not on the remote "
+                f"default branch: {detail}", file=sys.stderr,
+            )
+            return 1
+        if execution_orchestrator is not None:
+            execution_orchestrator.finish_pass(1, [])
+            execution_orchestrator.record_competitor_gate(
+                attempted=True,
+                implemented_files=[],
+                verified=0,
+                note=("Gate completed without implementation because pass 1 "
+                      "retained no verified edit delta."),
+            )
+        print(
+            f"\nSwole. {args.file} already satisfies the goal; project "
+            f"verification passed and {baseline_sha[:12]} is contained in "
+            f"origin/{default_branch}. No source change was retained.\n"
+        )
+        return 0
 
     # Accepted - back up the original and write the improved code, both through the
     # contained no-follow writer anchored at the file's git root so the FULL ancestor

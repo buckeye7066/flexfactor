@@ -197,6 +197,87 @@ class ReleaseIdentityTests(unittest.TestCase):
         self.assertEqual(package_version, ff.TOOL_VERSION)
 
 
+class RefactorResponseNormalizationTests(unittest.TestCase):
+    def test_fenced_file_discards_trailing_provider_explanation(self):
+        response = (
+            "\n```python\n"
+            "def add(left, right):\n"
+            "    return left + right\n"
+            "```\n"
+            "This keeps the implementation intentionally small.\n"
+        )
+        self.assertEqual(
+            "def add(left, right):\n    return left + right\n",
+            ff._strip_code_fences(response),
+        )
+
+    def test_unfenced_source_keeps_an_internal_fence_literal(self):
+        source = 'MARKDOWN = """\n```python\npass\n```\n"""\n'
+        self.assertEqual(source, ff._strip_code_fences(source))
+
+    def test_verified_unchanged_refactor_succeeds_without_a_fake_commit(self):
+        import tempfile
+        import types
+
+        original = "def add(left: int, right: int) -> int:\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "```python\n" + original + "```\nAlready clear.\n"
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(100, True, "The file already meets the goal.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            before = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            orchestrator = ff._ff_execution.SequentialOrchestrator(
+                "refactor", [source], state_path=os.path.join(tmp, "queue.json"),
+                queue_id="no-op-refactor-test",
+            )
+            orchestrator.start_target(0)
+            args = types.SimpleNamespace(
+                file=source, goal="keep the clear behavior", threshold=90,
+                max_iterations=2, max_cost=1, push=True, merge=True,
+                execution_orchestrator=orchestrator,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", return_value=(True, "ok")):
+                rc = ff.run(args)
+            rc = orchestrator.finish_target(0, rc)
+            receipt = orchestrator.snapshot()
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(before, after)
+        self.assertEqual("", status)
+        self.assertEqual(original, retained)
+        item = receipt["items"][0]
+        self.assertEqual("completed", item["status"])
+        self.assertEqual([], item["passes"][0]["changed_files"])
+        self.assertTrue(item["competitor_gate"]["attempted"])
+
+
 class TestSessionIsolationTests(unittest.TestCase):
     """A guard that can actually fail: if the redirection above is removed or a
     test re-points these at $HOME, this test says so before the next run eats

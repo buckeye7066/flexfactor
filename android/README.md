@@ -1,4 +1,4 @@
-# FlexFactor Mobile 3.5.0
+# FlexFactor Mobile 3.5.1
 
 FlexFactor Mobile is the native managed interface for all four FlexFactor
 modes. It does not require a PC, a personal access token, Termux, or a local
@@ -58,6 +58,10 @@ An open PR, branch-only commit, missing test command, reviewer outage, partial
 output, failed gate, or unproven publication remains incomplete in the app.
 Run details and the bounded in-app artifact remain correlated to the request
 UUID.
+
+Version 3.5.1 also accepts an unchanged Refactor result only after the complete
+project gate and authoritative remote-default containment proof pass. Markdown
+wrappers and trailing provider explanations cannot be written as source.
 
 ## Build
 
