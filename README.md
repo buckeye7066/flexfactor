@@ -105,7 +105,9 @@ See [android/README.md](android/README.md) and
 
 Version 3.5.2 parses supported whole-file responses before any write. Definite
 prose-as-code or invalid source is discarded, never offered to a reviewer as a
-candidate. If the author meant “already good,” the independent reviewer grades
+candidate; a file type without a safe pre-write parser is refused rather than
+implicitly approved. If the author meant “already good,” a different model
+family grades
 the exact original file instead; an unchanged result still needs the complete
 project gate and proof that its baseline is on the authoritative remote default
 branch.

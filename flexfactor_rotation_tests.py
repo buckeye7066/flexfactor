@@ -687,7 +687,7 @@ class RotatingProviderTests(RotationTestCase):
         self.assertEqual(prov.complete("x"), "completed by front/big")
         self.assertEqual(prov.grade()["by"], "light/small")
 
-    def test_grader_avoids_the_author_model_family_when_an_alternative_exists(self):
+    def test_independent_grader_proves_an_alternative_family_was_used(self):
         prov = self._provider(catalog(
             route("front/gpt-5.6-sol", "openai-front", tier=R.FRONTIER,
                   model="gpt-5.6-sol"),
@@ -697,7 +697,9 @@ class RotatingProviderTests(RotationTestCase):
                   model="claude-sonnet-5"),
         ))
         self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
-        self.assertEqual(prov.grade()["by"], "light/claude-sonnet-5")
+        self.assertEqual(
+            prov.grade_independent()["by"], "light/claude-sonnet-5"
+        )
 
     def test_grader_fails_closed_when_only_an_author_family_exists(self):
         prov = self._provider(catalog(
@@ -708,7 +710,15 @@ class RotatingProviderTests(RotationTestCase):
         ), judge_tier=R.LIGHT)
         self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
         with self.assertRaisesRegex(R.RotationError, "independent"):
-            prov.grade()
+            prov.grade_independent()
+
+    def test_independent_grader_requires_a_recorded_author(self):
+        prov = self._provider(catalog(
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+        ), tier=R.LIGHT, judge_tier=R.LIGHT)
+        with self.assertRaisesRegex(R.RotationError, "recorded candidate author"):
+            prov.grade_independent()
 
     def test_separate_ladder_instances_share_author_identity(self):
         coordinator = R.RoleCoordinator()

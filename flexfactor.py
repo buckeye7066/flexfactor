@@ -2959,8 +2959,10 @@ def _inproc_source_syntax_ok(path: str, source: str) -> tuple[bool | None, str]:
 
     ``True`` means a stdlib parser accepted the source, ``False`` means the
     response is definitely invalid for the selected file type, and ``None``
-    means no safe in-process parser is available.  The project publication
-    gate remains authoritative for every type; this earlier gate prevents a
+    means no safe in-process parser is available. Mutation callers must accept
+    only ``True``; ``None`` is a named fail-closed refusal, never an implicit
+    approval. The project publication gate remains authoritative for every
+    type; this earlier gate prevents a
     reviewer from blessing obvious prose-as-code and lets Refactor assess the
     *actual original file* when an author answers "already good" in prose.
 
@@ -4955,7 +4957,7 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
                                " The implementation attempt produced no safe delta.").strip()
             return outcome
         syntax_ok, syntax_note = _inproc_source_syntax_ok(rel, candidate)
-        if syntax_ok is False:
+        if syntax_ok is not True:
             outcome["note"] = (
                 outcome["note"]
                 + " The implementation attempt was rejected before write: "
@@ -5111,6 +5113,7 @@ def run(args) -> int:
     feedback = ""  # previous grader's complaints, fed into the next rewrite (empty on rep 1)
 
     for i in range(1, args.max_iterations + 1):
+        approved_original_fallback = False
         # GOAL is the user's own trusted instruction; the CURRENT FILE and the prior
         # grader FEEDBACK are UNTRUSTED (the file can carry hostile comments, and the
         # feedback echoes source excerpts) and the rewrite is written to disk - fence
@@ -5132,7 +5135,7 @@ def run(args) -> int:
                           ["Return the complete file contents, not an empty response."])
         else:
             syntax_ok, syntax_note = _inproc_source_syntax_ok(args.file, candidate)
-            if syntax_ok is False:
+            if syntax_ok is not True:
                 # Never show the rejected prose/code to the fallback reviewer:
                 # the live Android trial proved that an explanation claiming
                 # "already good" can persuade a judge even though it is not
@@ -5157,22 +5160,42 @@ def run(args) -> int:
                           "satisfies the goal. Set meets_goal true only when no "
                           "source change is required."
                     )
-                    original_grade = provider.grade(grade_prompt)
-                    if (original_grade.meets_goal is True
-                            and original_grade.grade >= int(args.threshold)):
-                        candidate = original
-                        grade = original_grade
-                    else:
+                    independent_grade = getattr(
+                        provider, "grade_independent", None
+                    )
+                    try:
+                        if not callable(independent_grade):
+                            raise RuntimeError(
+                                "the active model ladder cannot prove a "
+                                "non-author reviewer"
+                            )
+                        original_grade = independent_grade(grade_prompt)
+                    except Exception as exc:
                         candidate = ""
                         grade = Grade(
-                            original_grade.grade,
+                            0,
                             False,
-                            "Author response was invalid source and the exact "
-                            "original file was not approved unchanged: "
-                            + original_grade.rationale,
-                            [f"Author must return valid source ({syntax_note})."]
-                            + list(original_grade.issues),
+                            "Author response was invalid source and independent "
+                            f"no-op review was unavailable: {type(exc).__name__}: {exc}",
+                            [f"Author must return valid source ({syntax_note})."],
                         )
+                    else:
+                        if (original_grade.meets_goal is True
+                                and original_grade.grade >= int(args.threshold)):
+                            candidate = original
+                            grade = original_grade
+                            approved_original_fallback = True
+                        else:
+                            candidate = ""
+                            grade = Grade(
+                                original_grade.grade,
+                                False,
+                                "Author response was invalid source and the exact "
+                                "original file was not approved unchanged: "
+                                + original_grade.rationale,
+                                [f"Author must return valid source ({syntax_note})."]
+                                + list(original_grade.issues),
+                            )
                 else:
                     candidate = ""
                     grade = Grade(
@@ -5195,7 +5218,8 @@ def run(args) -> int:
         if grade.issues:
             print("        remaining issues: " + "; ".join(grade.issues))
 
-        if candidate.strip() and grade.grade > best_grade:
+        if (candidate.strip()
+                and (approved_original_fallback or grade.grade > best_grade)):
             best_grade, best_code = grade.grade, candidate
             best_review = grade
 
@@ -14737,7 +14761,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 syntax_ok, syntax_note = _inproc_source_syntax_ok(
                     rel, candidate_contents
                 )
-            if syntax_ok is False:
+            if syntax_ok is not True:
                 # This shared writer serves the ordinary Audit/Production Ready
                 # fix stream and their between-pass competitor gate.  Reject a
                 # definite parser failure before the candidate can touch the

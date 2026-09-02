@@ -1468,6 +1468,33 @@ class RotatingProvider:
         )
         return self._run("grade", self._judge_tier, *args, **kwargs)
 
+    def grade_independent(self, *args, **kwargs):
+        """Grade only when a different model family certifies the result.
+
+        Reviewer routing already carries strict exclusions for every family
+        that authored the candidate.  This method makes that production
+        contract explicit at call sites that use a semantic grade as the final
+        authorization (notably a verified no-op), and checks the postcondition
+        instead of trusting routing metadata alone.
+        """
+        with self._family_lock:
+            author_families = frozenset(self._author_families)
+        if not author_families:
+            raise RotationError(
+                "independent grading requires a recorded candidate author family"
+            )
+        result = self.grade(*args, **kwargs)
+        with self._family_lock:
+            selection = self._last_selection.get(ROLE_REVIEWER)
+        if selection is None:
+            raise RotationError("independent grading did not record a reviewer route")
+        reviewer_family = model_family(selection.route.model)
+        if reviewer_family in author_families:
+            raise RotationError(
+                f"reviewer family '{reviewer_family}' also authored the candidate"
+            )
+        return result
+
     def ping(self, *args, **kwargs):
         return self._run("ping", self._judge_tier, *args, **kwargs)
 
