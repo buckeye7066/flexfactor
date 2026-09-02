@@ -4804,6 +4804,44 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             forbidden_write.assert_not_called()
             passing_existing_suite.assert_not_called()
 
+    def test_jsx_text_never_receives_execution_credit(self):
+        cases = (
+            ("tests/generated_text.test.jsx", "test('not executed');"),
+            ("tests/generated_text.test.tsx", "it('not executed');"),
+        )
+        for path, text in cases:
+            source = (
+                "const view = (\n"
+                "  <div>\n"
+                f"{text}\n"
+                "  </div>\n"
+                ");\n"
+            )
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("JSX text reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(path=path), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "esbuild syntax check"),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": path, "contents": source}],
+                        {"test_cmd": ["npm", "test"], "esbuild": "esbuild"},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
     def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
         for source in (
                 "test('runs', () => {});",
@@ -4813,6 +4851,11 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertTrue(ff._generated_test_source_has_case(
                     "tests/generated.test.js", source,
+                ))
+        for path in ("tests/generated.test.jsx", "tests/generated.test.tsx"):
+            with self.subTest(path=path):
+                self.assertTrue(ff._generated_test_source_has_case(
+                    path, "test('renders', () => {\n  return <Widget />;\n});\n",
                 ))
 
     def test_success_exit_without_collection_evidence_is_a_failure(self):

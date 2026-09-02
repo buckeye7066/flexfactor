@@ -13896,6 +13896,48 @@ def _javascript_code_projection(source: str) -> str:
     return "".join(projected)
 
 
+def _jsx_code_projection(source: str) -> str:
+    """Mask JSX elements in an already literal-free JavaScript projection.
+
+    The projection is intentionally conservative: expressions inside JSX are
+    masked with their surrounding element because a call embedded in rendered
+    markup is not evidence of a module-level test declaration.  Syntax preflight
+    separately rejects malformed JSX/TSX before this helper is consulted.
+    """
+    projected = list(source)
+    index = 0
+    depth = 0
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        opens_tag = following.isalpha() or following in ("_", "$", ">")
+        closes_tag = following == "/"
+        if char != "<" or (depth == 0 and not opens_tag) or (
+                depth > 0 and not (opens_tag or closes_tag)):
+            if depth > 0 and char != "\n":
+                projected[index] = " "
+            index += 1
+            continue
+
+        end = source.find(">", index + 1)
+        if end < 0:
+            for masked in range(index, len(source)):
+                if source[masked] != "\n":
+                    projected[masked] = " "
+            break
+        is_closing = closes_tag
+        is_self_closing = source[index + 1:end].rstrip().endswith("/")
+        for masked in range(index, end + 1):
+            if source[masked] != "\n":
+                projected[masked] = " "
+        if is_closing:
+            depth = max(0, depth - 1)
+        elif not is_self_closing:
+            depth += 1
+        index = end + 1
+    return "".join(projected)
+
+
 def _runner_collectable_generated_test_path(path: str) -> bool:
     """Whether a default native runner can collect this executable test path."""
     canonical = _canon_rel(path)
@@ -13934,12 +13976,15 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
             source,
         ))
     if ext in _GENERATED_JS_TEST_EXTS:
+        projected = _javascript_code_projection(source)
+        if ext in (".jsx", ".tsx"):
+            projected = _jsx_code_projection(projected)
         return bool(re.search(
             # Only declarations that can execute count. ``skip``/``todo`` are
             # deliberately absent: an unrelated existing test can make the
             # suite green while every generated declaration is skipped.
             r"(?m)^[ \t]*(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\(",
-            _javascript_code_projection(source),
+            projected,
         ))
     return False
 
