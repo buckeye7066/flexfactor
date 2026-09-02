@@ -49,10 +49,13 @@ import concurrent.futures
 import datetime
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -215,17 +218,21 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class _ValidatedEvidenceRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow ordinary public-page redirects, never a redirect to local space."""
+class _EvidenceNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Evidence identity is the requested URL; never silently change origins."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _public_evidence_url(newurl):
-            return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return None
 
 
 def _public_evidence_url(value: str) -> bool:
-    """Reject URLs that could turn competitor research into an SSRF probe."""
+    """Apply the non-network portion of the evidence URL safety policy.
+
+    Hostname resolution is deliberately performed by the pinned connection
+    classes below, in the same operation that opens the socket. Resolving here
+    and then letting urllib resolve a second time would introduce a DNS-rebinding
+    gap between validation and use.
+    """
     if not _http_url_has_host(value):
         return False
     try:
@@ -243,17 +250,110 @@ def _public_evidence_url(value: str) -> bool:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        # Host names are permitted; the production transport refuses redirects,
-        # which prevents a public search result from bouncing credentials or the
-        # request to a second, unvalidated origin.
+        # The production transport resolves and validates every A/AAAA result,
+        # then connects directly to one of those numeric endpoints.
         return "." in host
     return bool(address.is_global)
+
+
+def _resolved_public_endpoints(host: str, port: int) -> list[tuple]:
+    """Resolve once and return only an entirely public A/AAAA endpoint set.
+
+    Reject the whole hostname if *any* answer is non-global. Picking only the
+    public answer from a mixed set would still let an attacker steer later
+    retries or address-family preference toward local space.
+    """
+    try:
+        answers = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError) as exc:
+        raise RuntimeError(f"competitor evidence hostname could not be resolved: {exc}") \
+            from None
+    endpoints: list[tuple] = []
+    seen: set[tuple] = set()
+    for family, socktype, proto, _canonname, sockaddr in answers:
+        if family not in (socket.AF_INET, socket.AF_INET6) or not sockaddr:
+            continue
+        literal = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(literal)
+        except ValueError:
+            raise RuntimeError(
+                "competitor evidence DNS returned an invalid IP address") from None
+        if not address.is_global:
+            raise RuntimeError(
+                "competitor evidence hostname resolved to non-public address "
+                f"{address}")
+        key = (family, socktype, proto, sockaddr)
+        if key not in seen:
+            seen.add(key)
+            endpoints.append(key)
+    if not endpoints:
+        raise RuntimeError("competitor evidence hostname resolved to no public address")
+    return endpoints
+
+
+def _connect_public_socket(host: str, port: int, timeout: float,
+                           source_address=None):
+    """Connect to a validated numeric endpoint without a second DNS lookup."""
+    endpoints = _resolved_public_endpoints(host, port)
+    last_error: OSError | None = None
+    for family, socktype, proto, sockaddr in endpoints:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    raise OSError(f"could not connect to validated competitor evidence host: {last_error}")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection whose socket uses the already-validated DNS result."""
+
+    def connect(self) -> None:
+        if self._tunnel_host:
+            raise RuntimeError("proxy tunnels are disabled for competitor evidence")
+        self.sock = _connect_public_socket(
+            self.host, self.port, self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Pinned TCP endpoint with TLS identity still checked against the hostname."""
+
+    def connect(self) -> None:
+        if self._tunnel_host:
+            raise RuntimeError("proxy tunnels are disabled for competitor evidence")
+        raw = _connect_public_socket(
+            self.host, self.port, self.timeout, self.source_address)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _PinnedHTTPSConnection, req, context=self._context)
 
 
 def _default_evidence_opener(url: str, data: bytes | None = None,
                              headers: dict | None = None,
                              timeout: float = _HTTP_TIMEOUT) -> str:
-    """Bounded GET transport for public competitor documents, no redirects."""
+    """Bounded GET transport with pinned public DNS and no redirects/proxies."""
     if data is not None:
         raise RuntimeError("competitor evidence fetches are GET-only")
     if not _public_evidence_url(url):
@@ -265,8 +365,19 @@ def _default_evidence_opener(url: str, data: bytes | None = None,
                  **(headers or {})},
         method="GET",
     )
-    opener = urllib.request.build_opener(_ValidatedEvidenceRedirectHandler())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _PinnedHTTPHandler(),
+        _PinnedHTTPSHandler(context=ssl.create_default_context()),
+        _EvidenceNoRedirectHandler(),
+    )
     with opener.open(req, timeout=timeout) as resp:
+        final_url = str(resp.geturl() or url)
+        if final_url != url:
+            # Defense in depth if a custom/default handler ever changes: fetched
+            # bytes may only be attributed to the URL whose identity was checked.
+            raise RuntimeError(
+                "competitor evidence redirect changed the validated source URL")
         raw = resp.read(300_000)
         charset = resp.headers.get_content_charset() or "utf-8"
     return raw.decode(charset, "replace")
@@ -745,27 +856,27 @@ def _document_matches_competitor(name: str, document: dict) -> bool:
 
     url = str(document.get("url") or "").lower()
     parsed = urllib.parse.urlsplit(url)
-    url_identity = _norm((parsed.hostname or "") + parsed.path)
     tail_identity = _norm(tail)
-    # Repository slugs and brand domains are the strongest cheap attribution.
-    if len(tail_identity) >= 4 and tail_identity in url_identity:
+    # Repository slugs and brand domains are strong attribution only at a URL
+    # boundary. Compact substring matching made `nonlinear.example` evidence for
+    # Linear and `/notional/` evidence for Notion.
+    url_segments = {
+        _norm(urllib.parse.unquote(segment))
+        for segment in (
+            list((parsed.hostname or "").split("."))
+            + [part for part in parsed.path.split("/") if part]
+        )
+        if _norm(urllib.parse.unquote(segment))
+    }
+    if len(tail_identity) >= 4 and tail_identity in url_segments:
         return True
-    if len(tokens[0]) >= 4 and _norm(tokens[0]) in url_identity:
+    if len(tokens[0]) >= 4 and _norm(tokens[0]) in url_segments:
         return True
 
     title = str(document.get("title") or "").lower()
     content = str(document.get("content") or "").lower()
-    title_identity = _norm(title)
-    content_identity = _norm(content)
-    full_identity = _norm(raw_name)
-    for identity in (full_identity, tail_identity):
-        if len(identity) >= 4 and (identity in title_identity
-                                   or identity in content_identity):
-            return True
-
     # Multiword names must be represented by every distinctive word; a single
-    # generic overlap is not enough. A one-word brand needs an exact word or a
-    # compact title/content match (for spellings such as ``OpenLP``).
+    # generic overlap is not enough. A one-word brand needs an exact token.
     combined = title + "\n" + content
     if len(tokens) > 1:
         return all(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
@@ -1183,7 +1294,11 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
 
     competitors = list(merged.values())
     competitors.sort(key=lambda c: -(c.get("stars") or 0))
-    competitors = competitors[:target]
+    # Popularity is only a discovery rank. Fetch a bounded overflow set before
+    # selecting the reported competitors, otherwise three high-star dead URLs
+    # can crowd out a lower-ranked candidate with real, attributable evidence.
+    evidence_candidate_limit = max(target + 3, target * 2, 1)
+    competitors = competitors[:evidence_candidate_limit]
 
     # Search is discovery; GLEANING requires the source itself. Fetch bounded
     # public documents now and make them first-class evidence with stable IDs
@@ -1228,14 +1343,16 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         if any(c.get("evidence_documents") for c in competitors):
             research["sources_used"].append("fetched-public-pages")
 
+    fetched_document_count = sum(
+        len(c.get("evidence_documents") or []) for c in competitors)
     if probe_only:
         # The generic probe only earns a place if actual source content was
         # fetched; a search result alone is not a competitor determination.
         competitors = [c for c in competitors if c["evidence_status"] == "verified"]
     competitors.sort(key=lambda c: (c["evidence_status"] != "verified",
                                     -(c.get("stars") or 0)))
-    research["evidence_documents_fetched"] = sum(
-        len(c.get("evidence_documents") or []) for c in competitors)
+    competitors = competitors[:target]
+    research["evidence_documents_fetched"] = fetched_document_count
 
     if not competitors:
         research["coverage_note"] = coverage_note(0, target, 0)

@@ -2230,6 +2230,18 @@ class GitAwareEnumerationTests(unittest.TestCase):
                    if item["path"] == "late-binary.dat")
         self.assertIn("complete content", row["reason"])
 
+    def test_missing_and_unclassifiable_git_entries_block_a_complete_sweep(self):
+        rows = {
+            "gone.py": {"path": "gone.py", "kind": "missing-git-entry"},
+            "mystery": {"path": "mystery", "kind": "unreadable-entry"},
+            "link": {"path": "link", "kind": "symlink"},
+        }
+        with _patched(ff, "_git_real_files", lambda _root: set(rows)), \
+             _patched(ff, "_manifest_entry", lambda _root, rel: rows[rel]):
+            manifest = ff._repository_review_manifest("/fixture")
+        self.assertEqual(set(manifest["blocking_files"]), {"gone.py", "mystery"})
+        self.assertNotIn("link", manifest["blocking_files"])
+
     def test_audit_source_contains_no_fractional_review_sampling_cutoff(self):
         src = inspect.getsource(ff.audit_one_program)
         self.assertNotIn("REVIEW_BUDGET_FRAC", src)
@@ -10466,8 +10478,14 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         ff._try_start_repo_rewards = lambda *a, **k: False
         ff.repo_rewards_search = lambda url, query, **k: (
             seen.__setitem__("search_url", url) or [])
-        ff._judge = lambda *a, **k: {"name": "x", "summary": "x", "stack": [],
-                                     "goals": [], "opportunities": []}
+        ff._judge = lambda *a, **k: {
+            "name": "x", "summary": "x", "stack": [], "goals": ["do x"],
+            "opportunities": [{
+                "need": "find a useful alternative",
+                "url_search_query": "x product documentation",
+                "repo_search_query": "x open source repository",
+            }],
+        }
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
             model="stub", judge_model="stub")
@@ -13710,6 +13728,27 @@ class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
         self.assertEqual(len(provider.prompts), 2)
         self.assertIn("invented evidence reference", error)
 
+    def test_scalar_or_mapping_array_fields_are_rejected_not_normalized(self):
+        class MalformedProvider(self.Provider):
+            def structured(self, system, prompt, schema, **kwargs):
+                self.prompts.append((system, prompt, schema, kwargs))
+                return {
+                    "purpose": "Issue and receive payment for invoices.",
+                    "primary_users": "billing staff",
+                    "core_journeys": {"journey": "send then pay"},
+                    "acceptance_criteria": ["A sent invoice can be paid"],
+                    "evidence_refs": ["README.md:4"],
+                }
+
+        provider = MalformedProvider([])
+        contract, error = ff._infer_purpose_contract(
+            provider, "Invoicer", self.tmp)
+        self.assertIsNone(contract)
+        self.assertEqual(len(provider.prompts), 2)
+        self.assertIn("arrays of strings", error)
+        self.assertIn("primary_users", error)
+        self.assertIn("core_journeys", error)
+
     def test_incomplete_authored_contract_is_evidence_enriched_not_blindly_accepted(self):
         authored = fp.PurposeContract(
             name="Invoicer",
@@ -15834,6 +15873,51 @@ class CompetitorSearchBackendTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "refused non-public"):
                 fc.fetch_evidence_document(url, opener=lambda *_a: "x" * 100)
 
+    def test_dns_answers_must_all_be_global_before_evidence_connects(self):
+        mixed = [
+            (fc.socket.AF_INET, fc.socket.SOCK_STREAM, fc.socket.IPPROTO_TCP,
+             "", ("8.8.8.8", 443)),
+            (fc.socket.AF_INET, fc.socket.SOCK_STREAM, fc.socket.IPPROTO_TCP,
+             "", ("127.0.0.1", 443)),
+        ]
+        with mock.patch.object(fc.socket, "getaddrinfo", return_value=mixed):
+            with self.assertRaisesRegex(RuntimeError, "non-public address"):
+                fc._resolved_public_endpoints("attacker.example", 443)
+
+    def test_evidence_socket_connects_to_validated_numeric_endpoint(self):
+        class FakeSocket:
+            def __init__(self):
+                self.connected = None
+                self.timeout = None
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def bind(self, _value):
+                raise AssertionError("no source bind expected")
+
+            def connect(self, value):
+                self.connected = value
+
+            def close(self):
+                pass
+
+        fake = FakeSocket()
+        endpoint = (fc.socket.AF_INET, fc.socket.SOCK_STREAM,
+                    fc.socket.IPPROTO_TCP, ("8.8.8.8", 443))
+        with mock.patch.object(fc, "_resolved_public_endpoints",
+                               return_value=[endpoint]), \
+             mock.patch.object(fc.socket, "socket", return_value=fake):
+            result = fc._connect_public_socket("attacker.example", 443, 4.0)
+        self.assertIs(result, fake)
+        self.assertEqual(fake.connected, ("8.8.8.8", 443))
+        self.assertEqual(fake.timeout, 4.0)
+
+    def test_competitor_evidence_redirects_are_refused_even_when_public(self):
+        handler = fc._EvidenceNoRedirectHandler()
+        self.assertIsNone(handler.redirect_request(
+            None, None, 302, "Found", {}, "https://public.example/other"))
+
     def test_fetched_page_must_identify_the_named_competitor(self):
         unrelated = {
             "url": "https://unrelated.example/features",
@@ -15843,6 +15927,18 @@ class CompetitorSearchBackendTests(unittest.TestCase):
         official = dict(unrelated, url="https://openlp.org/features")
         self.assertFalse(fc._document_matches_competitor("OpenLP", unrelated))
         self.assertTrue(fc._document_matches_competitor("OpenLP", official))
+
+    def test_url_identity_requires_a_hostname_label_or_path_segment(self):
+        body = "An unrelated product page with plenty of visible text. " * 8
+        self.assertFalse(fc._document_matches_competitor(
+            "Linear", {"url": "https://nonlinear.example/features",
+                       "title": "Other", "content": body}))
+        self.assertFalse(fc._document_matches_competitor(
+            "Notion", {"url": "https://example.com/notional/features",
+                       "title": "Other", "content": body}))
+        self.assertTrue(fc._document_matches_competitor(
+            "Linear", {"url": "https://linear.example/features",
+                       "title": "Other", "content": body}))
 
     def test_firecrawl_v2_is_first_and_uses_the_configured_key(self):
         calls = []
@@ -16215,6 +16311,53 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
         self.assertTrue(any(key.startswith("fetch:")
                             for key in res["sources_skipped"]))
 
+    def test_evidence_is_fetched_before_popularity_truncates_candidates(self):
+        candidates = [
+            {"name": name, "kind": "market", "search_query": name.lower()}
+            for name in ("Alpha", "Beta", "Gamma", "Delta")
+        ]
+        fetched = []
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": candidates}
+            return {
+                "idea_title": "Verified feature", "what_it_does": "Works",
+                "why_valuable": "Useful", "evidence_basis": "fetched page",
+                "evidence_refs": ["web-deadbeef"], "accept": True,
+                "purpose_reason": "serves the purpose", "severity": "high",
+                "code_fixable": False, "file": "", "confidence": "high",
+            }
+
+        def web(query, **_kwargs):
+            return ([{"title": query, "url": f"https://docs.example/{query}",
+                      "snippet": "candidate"}], "fixture", {})
+
+        def fetch(url, title="", opener=None):
+            fetched.append(url)
+            if not url.endswith("/delta"):
+                raise OSError("unreachable")
+            return {
+                "evidence_id": "web-deadbeef", "url": url, "title": title,
+                "sha256": "a" * 64,
+                "content": "Delta product documentation and features. " * 5,
+            }
+
+        with mock.patch.object(fc, "web_search", side_effect=web), \
+             mock.patch.object(fc, "github_repo_search", return_value=[]), \
+             mock.patch.object(fc, "fetch_evidence_document", side_effect=fetch):
+            result = fc.research_competitors(
+                judge, "Fixture", "purpose", [], target=3,
+                opener=lambda *_a, **_k: "unused")
+
+        self.assertEqual(len(result["competitors"]), 3)
+        self.assertIn("Delta", {row["name"] for row in result["competitors"]})
+        delta = next(row for row in result["competitors"]
+                     if row["name"] == "Delta")
+        self.assertEqual(delta["evidence_status"], "verified")
+        self.assertEqual(len(fetched), 4,
+                         "the fourth buffered candidate must be fetched")
+
     def test_unrelated_fetched_page_cannot_donate_a_competitor_idea(self):
         calls = {"idea": 0}
 
@@ -16439,6 +16582,40 @@ class CompetitorAuditWiringTests(unittest.TestCase):
             "items"]["required"]
         self.assertIn("url_search_query", required)
         self.assertIn("repo_search_query", required)
+
+    def test_scout_profile_failure_is_terminal_before_any_research(self):
+        import types
+
+        args = types.SimpleNamespace(
+            repo_rewards_url="http://localhost:3000",
+            auto_start=False,
+            program="/fixture",
+            allow_remote_program_context=True,
+            max_cost=1.0,
+            execution_orchestrator=None,
+        )
+        provider = types.SimpleNamespace(model="stub", judge_model="stub")
+
+        def research_must_not_start():
+            raise AssertionError("competitor research ran without a Scout profile")
+
+        with _tempfile_ceiling.TemporaryDirectory() as root, \
+             _patched(ff, "resolve_repo_rewards_url",
+                      lambda *_a, **_k: (None, "offline")), \
+             _patched(ff, "resolve_program_input",
+                      lambda _program: ("Fixture", "context")), \
+             _patched(ff, "resolve_project_dir", lambda *_a, **_k: root), \
+             _patched(ff, "_is_git_repo", lambda _root: False), \
+             _patched(ff, "_enumerate_source_files",
+                      lambda *_a, **_k: ["app.py"]), \
+             _patched(ff, "_best_available_provider",
+                      lambda *_a, **_k: provider), \
+             _patched(ff, "_ensure_program_understanding",
+                      lambda *_a, **_k: _unit_purpose_understanding("Fixture")), \
+             _patched(ff, "_scout_program_profile",
+                      lambda *_a, **_k: (None, "two invalid model responses")), \
+             _patched(ff, "_competitors_module", research_must_not_start):
+            self.assertEqual(ff._run_scout_impl(args), 2)
 
     @staticmethod
     def _audit_args(argv):
@@ -18276,7 +18453,7 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         self.assertFalse(fr._is_retryable(_Err("invalid 'messages': empty array")),
                          "a malformed request must not tour all 641 routes")
 
-    def test_auth_failures_still_fail_fast(self):
+    def test_auth_failures_retry_only_after_benching_the_backend_credential(self):
         import flexfactor_rotation as fr
 
         class _E401(Exception):
@@ -18285,8 +18462,10 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         class _E403(Exception):
             status_code = 403
 
-        self.assertFalse(fr._is_retryable(_E401("invalid api key")))
-        self.assertFalse(fr._is_retryable(_E403("forbidden")))
+        self.assertTrue(fr._is_retryable(_E401("invalid api key")))
+        self.assertEqual(fr._classify(_E401("invalid api key")), "auth_failed")
+        self.assertTrue(fr._is_retryable(_E403("forbidden")))
+        self.assertEqual(fr._classify(_E403("forbidden")), "auth_failed")
 
     def test_rotation_actually_reaches_the_second_pool_on_a_capability_400(self):
         """Drive the real RotatingProvider: pool A caps too low, pool B answers."""

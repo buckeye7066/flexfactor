@@ -313,7 +313,8 @@ class CleanInstallTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="ff-install-")
         wheel_dir = os.path.join(cls.tmp, "wheel")
-        cp = subprocess.run([PY, "-m", "pip", "wheel", HERE, "--no-deps", "-q",
+        cp = subprocess.run([PY, "-m", "pip", "wheel", HERE, "--no-deps",
+                             "--no-build-isolation", "--no-index", "-q",
                              "--wheel-dir", wheel_dir], capture_output=True,
                             text=True, timeout=600)
         assert cp.returncode == 0, cp.stderr[-3000:]

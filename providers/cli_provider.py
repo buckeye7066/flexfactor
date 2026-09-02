@@ -242,11 +242,27 @@ class CliProvider:
     def _complete(self, prompt: str, *, system: Optional[str],
                   max_tokens: int, timeout: Optional[float] = None) -> str:
         if self._subscription is not None:
-            from providers.chatgpt_subscription import SubscriptionUnavailable
+            from providers.chatgpt_subscription import (
+                SubscriptionAuthenticationError, SubscriptionUnavailable,
+            )
             try:
                 answer = self._subscription.complete(
                     prompt, system=system, max_tokens=max_tokens,
                     timeout=timeout,
+                )
+            except SubscriptionAuthenticationError as exc:
+                # An access token can expire while the official Codex CLI still
+                # has a refresh token and knows how to renew it. Hand this exact
+                # call to that supported client instead of treating one stale
+                # bearer as proof the paid subscription route is exhausted.
+                if _inside_managed_codex_session():
+                    raise CliUnavailable(
+                        f"{exc}; official Codex CLI refresh is unavailable inside "
+                        "this managed Codex session") from None
+                self._subscription = None
+                return _run_cli(
+                    self.api, self._binary, prompt, system=system,
+                    timeout=float(timeout or self._timeout),
                 )
             except SubscriptionUnavailable as exc:
                 # RotatingProvider recognizes CliUnavailable as a fault of this

@@ -5812,7 +5812,7 @@ def _scout_program_profile(provider, display_name: str, project_dir: str,
     so Scout's repo-grounded opportunity queries were not an input at all. This
     is the shared execution chokepoint.  A usable profile must articulate the
     program, its goals, and at least one concrete need/query pair; otherwise the
-    caller receives a named failure and may continue only with generic research.
+    caller receives a named terminal failure and must not claim Scout completed.
     """
     evidence_block = ""
     fp = _purpose_module()
@@ -6302,7 +6302,16 @@ PROGRAM_UNDERSTANDING_SCHEMA = {
 
 
 def _clean_model_strings(values, *, limit: int, chars: int = 500) -> list[str]:
-    """Bound and de-duplicate model-authored short text fields."""
+    """Bound and de-duplicate a model-authored JSON array of strings.
+
+    Structured-output schemas are a request, not proof of the response shape.
+    In particular, iterating a scalar string here used to turn ``"admins"``
+    into one-character list items, while a mapping donated its keys.  Neither
+    is an array of claims, so fail closed on every non-list or non-string item.
+    """
+    if not isinstance(values, list) or any(
+            not isinstance(raw, str) for raw in values):
+        return []
     out: list[str] = []
     seen: set[str] = set()
     for raw in values or []:
@@ -6385,13 +6394,29 @@ def _infer_purpose_contract(provider, display_name: str, project_dir: str,
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
             continue
-        purpose = " ".join(str((data or {}).get("purpose") or "").split())[:2000]
-        users = _clean_model_strings((data or {}).get("primary_users"), limit=12)
-        journeys = _clean_model_strings((data or {}).get("core_journeys"), limit=20,
+        if not isinstance(data, dict):
+            errors.append(
+                f"understanding response was {type(data).__name__}, not an object")
+            continue
+        array_fields = ("primary_users", "core_journeys",
+                        "acceptance_criteria", "evidence_refs")
+        malformed = [
+            name for name in array_fields
+            if not isinstance(data.get(name), list)
+            or any(not isinstance(item, str) for item in data.get(name, []))
+        ]
+        if malformed:
+            errors.append(
+                "understanding field(s) must be arrays of strings: "
+                + ", ".join(malformed))
+            continue
+        purpose = " ".join(str(data.get("purpose") or "").split())[:2000]
+        users = _clean_model_strings(data.get("primary_users"), limit=12)
+        journeys = _clean_model_strings(data.get("core_journeys"), limit=20,
                                         chars=800)
-        criteria = _clean_model_strings((data or {}).get("acceptance_criteria"),
+        criteria = _clean_model_strings(data.get("acceptance_criteria"),
                                         limit=30, chars=800)
-        cited = _clean_model_strings((data or {}).get("evidence_refs"),
+        cited = _clean_model_strings(data.get("evidence_refs"),
                                      limit=100, chars=1000)
         invalid = [ref for ref in cited if ref not in set(allowed_refs)]
         valid = [ref for ref in cited if ref in set(allowed_refs)]
@@ -8969,12 +8994,13 @@ def _run_scout_impl(args) -> int:
         provider, display_name, apply_dir, purpose_blob, context_blob=context,
     )
     if profile is None:
-        print(f"  Scout program/URL analysis INCOMPLETE: {scout_error}",
+        print(f"error: Scout stopped because its program/URL analysis was "
+              f"INCOMPLETE: {scout_error}",
               file=sys.stderr)
-        profile = {
-            "name": display_name, "summary": "", "stack": [], "goals": [],
-            "opportunities": [], "source": "scout-program-analysis-incomplete",
-        }
+        # Leave the pass active.  The queue orchestrator converts an active pass
+        # on a non-zero target result to ``interrupted``; completing it here would
+        # create the exact false receipt this gate is meant to prevent.
+        return 2
     profile["purpose_contract"] = purpose_contract.to_dict()
     profile["purpose_confidence"] = purpose_confidence
     profile["purpose_mutation_authorized"] = purpose_mutation_authorized
@@ -11257,8 +11283,16 @@ def _repository_review_manifest(project_dir: str) -> dict:
     reviewable.sort(key=lambda rel: (_is_test_path(rel),
                                      not rel.startswith("src/"),
                                      -size_by_path.get(rel, 0), rel))
+    # Every Git-visible entry must receive a definitive safe classification.
+    # Symlinks, other non-regular entries, and proven binary content are explicit
+    # non-reviewable categories.  Missing or unclassifiable entries are not: if
+    # Git named a path and the manifest cannot establish what it is, a whole-repo
+    # audit cannot truthfully pass.
+    blocking_kinds = {
+        "unreadable-entry", "missing-git-entry", "unreadable-regular-file",
+    }
     blocking = [row["path"] for row in entries
-                if row["kind"] == "unreadable-regular-file"]
+                if row["kind"] in blocking_kinds]
     return {
         "source": source,
         "total_entries": len(entries),
