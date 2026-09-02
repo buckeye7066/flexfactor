@@ -16,6 +16,7 @@ default branch. A local commit or open pull request is not success.
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 import concurrent.futures
 import contextlib
@@ -2918,18 +2919,6 @@ class OllamaProvider:
             resp.read(64)
 
 
-def _coerce_issue(item) -> str:
-    """Normalize one issue to a string. Graders without schema enforcement (e.g.
-    OpenAI json mode) sometimes return issues as dicts; flatten them so downstream
-    string joins never crash."""
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        parts = [str(v) for v in item.values() if v]
-        return " - ".join(parts) if parts else json.dumps(item)
-    return str(item)
-
-
 def _parse_grade(text: str) -> Grade:
     data, _ = _extract_json_object(text)
     if data is None:
@@ -2938,20 +2927,33 @@ def _parse_grade(text: str) -> Grade:
         raise ValueError(
             f"grade response was {type(data).__name__}, expected an object"
         )
-    try:
-        grade = max(0, min(100, int(float(data.get("grade") or 0))))  # clamp to 0..100
-    except (TypeError, ValueError):
-        grade = 0
-    raw_issues = data.get("issues") or []
-    if not isinstance(raw_issues, list):
-        raw_issues = [raw_issues]
+    required = {"grade", "meets_goal", "rationale", "issues"}
+    missing = sorted(required - set(data))
+    extra = sorted(set(data) - required)
+    if missing:
+        raise ValueError("grade response omitted required field(s): "
+                         + ", ".join(missing))
+    if extra:
+        raise ValueError("grade response contained unknown field(s): "
+                         + ", ".join(extra))
+    if type(data["grade"]) is not int:
+        raise ValueError("grade response field 'grade' must be an integer")
+    if type(data["meets_goal"]) is not bool:
+        raise ValueError("grade response field 'meets_goal' must be a boolean")
+    if not isinstance(data["rationale"], str):
+        raise ValueError("grade response field 'rationale' must be a string")
+    raw_issues = data["issues"]
+    if (not isinstance(raw_issues, list)
+            or any(not isinstance(issue, str) for issue in raw_issues)):
+        raise ValueError("grade response field 'issues' must be an array of strings")
+    grade = max(0, min(100, data["grade"]))  # schema cannot express this range
+    if grade < 100 and not raw_issues:
+        raise ValueError("a sub-100 grade must include at least one concrete issue")
     return Grade(
         grade=grade,
-        # Only a real JSON boolean can authorize acceptance. Strings such as
-        # "false" are truthy in Python and must therefore fail closed.
-        meets_goal=data.get("meets_goal") is True,
-        rationale=str(data.get("rationale", "")),
-        issues=[_coerce_issue(x) for x in raw_issues],
+        meets_goal=data["meets_goal"],
+        rationale=data["rationale"],
+        issues=list(raw_issues),
     )
 
 
@@ -6691,6 +6693,9 @@ def _run_target_code(cmd: list[str], cwd: str, timeout: int, env: dict | None,
 
 _INTERPRETERS = {"python", "python3", "pythonw", "py", "node"}
 _SYNTAX_ONLY_MODULES = {"py_compile", "compileall", "ast", "tokenize"}
+_NODE_TYPESCRIPT_SYNTAX_FLAGS = {
+    "--experimental-transform-types", "--experimental-strip-types",
+}
 
 
 def _tool_authored_syntax_check(cmd: list[str]) -> bool:
@@ -6709,6 +6714,10 @@ def _tool_authored_syntax_check(cmd: list[str]) -> bool:
     if not args:
         return False
     if args[0] in ("-c", "-e", "--check", "-p", "--eval", "--print"):
+        return True
+    if (exe == "node" and len(args) >= 3
+            and args[0] in _NODE_TYPESCRIPT_SYNTAX_FLAGS
+            and args[1] == "--check"):
         return True
     if args[0] == "-m" and len(args) > 1 and args[1] in _SYNTAX_ONLY_MODULES:
         return True
@@ -10546,6 +10555,131 @@ def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> 
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=True)
 
 
+def _create_contained(project_dir: str, rel: str, content
+                      ) -> tuple[str, os.stat_result] | None:
+    """Atomically create a missing contained file and return its identity.
+
+    Unlike `_write_contained`, this never replaces an existing regular leaf.
+    Generated tests use it after a missing-path preflight so a file raced in by
+    the owner cannot be overwritten.  The returned identity binds any later
+    rollback to the file this call actually created.
+    """
+    comps = _rel_components(rel)
+    if comps is None:
+        return None
+    try:
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    except (TypeError, UnicodeEncodeError):
+        return None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | (
+        os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0
+    )
+
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps, make_dirs=True) as (parent, leaf):
+            if parent is None:
+                return None
+            fd = None
+            identity = None
+            try:
+                fd = os.open(leaf, flags, 0o600, dir_fd=parent)
+                identity = os.fstat(fd)
+                mv = memoryview(data)
+                written = 0
+                while written < len(mv):
+                    count = os.write(fd, mv[written:])
+                    if count <= 0:
+                        raise OSError("short/zero write to created file")
+                    written += count
+                final_identity = os.fstat(fd)
+                os.close(fd)
+                fd = None
+                return (
+                    os.path.join(os.path.realpath(project_dir), *comps),
+                    final_identity,
+                )
+            except OSError:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                # Remove only the inode this call created. If another process
+                # replaced it, leave that owner file untouched and fail closed.
+                if identity is not None:
+                    try:
+                        current = os.lstat(leaf, dir_fd=parent)
+                        if _same_id(current, identity):
+                            os.unlink(leaf, dir_fd=parent)
+                    except OSError:
+                        pass
+                return None
+
+    if not _CONTAINMENT_FALLBACK_OK:
+        return None
+    status, parent_full = _win_walk(project_dir, comps, make_dirs=True)
+    if status != "ok":
+        return None
+    literal = os.path.join(parent_full, comps[-1])
+    fd = None
+    identity = None
+    try:
+        parent_identity = os.stat(parent_full)
+        fd = os.open(literal, flags, 0o600)
+        identity = os.fstat(fd)
+        mv = memoryview(data)
+        written = 0
+        while written < len(mv):
+            count = os.write(fd, mv[written:])
+            if count <= 0:
+                raise OSError("short/zero write to created file")
+            written += count
+        final_identity = os.fstat(fd)
+        os.close(fd)
+        fd = None
+        if not _same_id(os.stat(parent_full), parent_identity):
+            raise OSError("created-file parent identity changed")
+        return literal, final_identity
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if identity is not None:
+            try:
+                current = os.lstat(literal)
+                if _same_id(current, identity):
+                    os.remove(literal)
+            except OSError:
+                pass
+        return None
+
+
+def _created_contained_matches(project_dir: str, rel: str,
+                               identity: os.stat_result) -> bool:
+    """Whether `rel` still names the exact regular file in a create receipt."""
+    with _open_contained_fd(project_dir, rel) as fd:
+        if fd is None:
+            return False
+        try:
+            return _same_id(os.fstat(fd), identity)
+        except OSError:
+            return False
+
+
+def _unlink_created_contained(project_dir: str, rel: str,
+                              identity: os.stat_result) -> bool:
+    """Remove a generated file only while its create-time identity still owns the path."""
+    existence = _contained_existence(project_dir, rel)
+    if existence == "missing":
+        return True
+    if existence != "exists" or not _created_contained_matches(
+            project_dir, rel, identity):
+        return False
+    return _unlink_contained(project_dir, rel)
+
+
 def _replace_contained(project_dir: str, rel: str, content) -> str | None:
     """Like _write_contained but REPLACES a leaf that is a symlink (os.replace no-follow)
     instead of refusing it - for fix-loop candidate writes and rollback RESTORES of an
@@ -10851,11 +10985,11 @@ def _canon_rel(rel: str) -> str:
 
 
 def _is_test_path(rel: str) -> bool:
-    low = _canon_rel(rel).lower()
-    parts = low.split("/")
+    canonical = _canon_rel(rel)
+    parts = canonical.split("/")
     base = parts[-1] if parts else ""
     return (
-        any(part in _TEST_DIR_NAMES for part in parts[:-1])
+        any(part.casefold() in _TEST_DIR_NAMES for part in parts[:-1])
         or base.startswith("test_")
         or base.endswith(("_test.py", "_test.go"))
         or any(marker in base for marker in _TEST_FILE_MARKERS)
@@ -13695,17 +13829,157 @@ def _validated_generated_test_entries(gen: dict) -> list[dict]:
     return files
 
 
+_GENERATED_JS_TEST_EXTS = frozenset(
+    {".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs", ".cts", ".mts"}
+)
+
+
+def _runner_collectable_generated_test_path(path: str) -> bool:
+    """Whether a default native runner can collect this executable test path."""
+    canonical = _canon_rel(path)
+    parts = canonical.split("/")
+    base = parts[-1] if parts else ""
+    ext = os.path.splitext(base)[1]
+    if ext == ".py":
+        return base.startswith("test_") or base.endswith("_test.py")
+    if ext == ".go":
+        return base.endswith("_test.go")
+    if ext in _GENERATED_JS_TEST_EXTS:
+        return (
+            ".test." in base
+            or ".spec." in base
+            or "__tests__" in parts[:-1]
+        )
+    return False
+
+
+def _generated_test_source_has_case(path: str, source: str) -> bool:
+    """Conservative source-level evidence that an executable test declares a case."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".py":
+        try:
+            tree = ast.parse(source, filename=path)
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+        return any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+            for node in ast.walk(tree)
+        )
+    if ext == ".go":
+        return bool(re.search(
+            r"(?m)^\s*func\s+Test[A-Z0-9_]\w*\s*\(\s*\w+\s+\*testing\.T\s*\)",
+            source,
+        ))
+    if ext in _GENERATED_JS_TEST_EXTS:
+        return bool(re.search(
+            r"(?<![\w$])(?:it|test)\s*(?:\.\s*(?:each|only|skip|todo)\s*)?\(",
+            source,
+        ))
+    return False
+
+
+def _generated_test_source_syntax_ok(
+        project_dir: str, path: str, source: str, stack: dict,
+) -> tuple[bool | None, str]:
+    """Parse generated tests without executing them or writing into the repo."""
+    inproc_ok, inproc_note = _inproc_source_syntax_ok(path, source)
+    if inproc_ok is not None:
+        return inproc_ok, inproc_note
+
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        encoded = source.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        return False, f"source is not UTF-8 encodable: {exc}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="flexfactor-test-parse-") as temp_dir:
+            candidate = os.path.join(temp_dir, "candidate" + ext)
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
+                | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0),
+                0o600,
+            )
+            try:
+                view = memoryview(encoded)
+                written = 0
+                while written < len(view):
+                    count = os.write(fd, view[written:])
+                    if count <= 0:
+                        raise OSError("short/zero write to syntax candidate")
+                    written += count
+            finally:
+                os.close(fd)
+
+            if ext in _ESBUILD_EXTS and stack.get("esbuild"):
+                devnull = "NUL" if os.name == "nt" else "/dev/null"
+                result = _run([
+                    stack["esbuild"], candidate, "--bundle=false",
+                    "--log-level=error", f"--outfile={devnull}",
+                ], project_dir, timeout=60)
+                if getattr(result, "flexfactor_launch_error", False):
+                    return None, "esbuild parser did not run"
+                return (
+                    result.returncode == 0,
+                    _tail(result.stderr or result.stdout) or "esbuild syntax check",
+                )
+
+            if ext in (".js", ".cjs", ".mjs"):
+                if not shutil.which("node"):
+                    return None, "node parser is not installed"
+                result = _run(["node", "--check", candidate], project_dir, timeout=60)
+                if getattr(result, "flexfactor_launch_error", False):
+                    return None, "node parser did not run"
+                return (
+                    result.returncode == 0,
+                    _tail(result.stderr or result.stdout) or "node --check",
+                )
+
+            if ext in (".ts", ".cts", ".mts") and shutil.which("node"):
+                unsupported = ("bad option", "unknown option", "not allowed")
+                for flag in ("--experimental-transform-types",
+                             "--experimental-strip-types"):
+                    result = _run(
+                        ["node", flag, "--check", candidate],
+                        project_dir, timeout=60,
+                    )
+                    output = (result.stderr or "") + "\n" + (result.stdout or "")
+                    if getattr(result, "flexfactor_launch_error", False):
+                        return None, "node TypeScript parser did not run"
+                    if result.returncode == 0:
+                        return True, f"node {flag} --check"
+                    if not any(marker in output.lower() for marker in unsupported):
+                        return False, _tail(output) or "TypeScript syntax check failed"
+
+            if ext == ".go":
+                if not shutil.which("gofmt"):
+                    return None, "gofmt parser is not installed"
+                result = _run(
+                    ["gofmt", "-e", "-l", candidate],
+                    project_dir, timeout=60,
+                )
+                if getattr(result, "flexfactor_launch_error", False):
+                    return None, "gofmt parser did not run"
+                return (
+                    result.returncode == 0,
+                    _tail(result.stderr or result.stdout) or "gofmt syntax check",
+                )
+    except OSError as exc:
+        return None, f"temporary syntax preflight failed: {exc}"
+    return None, f"no safe generated-test parser is available for {ext or 'this type'}"
+
+
 def _write_and_run_generated_test_batch(
         project_dir: str, candidates: list[dict], stack: dict,
 ) -> tuple[list[dict], bool | None, str, str, list[str]]:
     """Parse a complete model-generated test batch before its first write.
 
     Returns ``(written_entries, test_status, test_log, refusal, rollback_failed)``.
-    A non-empty refusal means no test command ran. Invalid syntax and source
-    types without a safe in-process parser both fail closed. The all-before-any
-    preflight prevents a valid first entry from reaching the worktree when a
-    later entry is malformed. A contained-write race rolls back every earlier
-    new file before returning.
+    Invalid syntax and source types without a safe non-executing parser fail
+    closed. The all-before-any preflight prevents a valid first entry from
+    reaching the worktree when a later entry is malformed. Create receipts bind
+    rollback and post-run credit to the exact files this transaction created.
     """
     prepared: list[dict] = []
     seen_paths: set[str] = set()
@@ -13751,40 +14025,89 @@ def _write_and_run_generated_test_batch(
                 f"generated test refused overwrite of {path!r} "
                 f"({existence}); existing tests are owner code"
             ), []
-        syntax_ok, syntax_note = _inproc_source_syntax_ok(path, contents)
+        syntax_ok, syntax_note = _generated_test_source_syntax_ok(
+            project_dir, path, contents, stack,
+        )
         if syntax_ok is not True:
             return [], None, "", (
                 f"generated test source rejected before write for {path}: "
                 f"{syntax_note}"
             ), []
         normalized = dict(item)
-        normalized.update(path=path, contents=contents)
+        credit_as_test = _runner_collectable_generated_test_path(path)
+        if credit_as_test and not _generated_test_source_has_case(path, contents):
+            return [], None, "", (
+                f"generated executable test declares no collectable test case: {path}"
+            ), []
+        normalized.update(
+            path=path, contents=contents, _credit_as_test=credit_as_test,
+        )
         prepared.append(normalized)
 
     if not prepared:
         return [], None, "", "no non-empty generated test source was produced", []
+    if not any(item["_credit_as_test"] for item in prepared):
+        return [], None, "", (
+            "generated batch contains support artifacts but no runner-collectable "
+            "executable test"
+        ), []
 
     written_entries: list[dict] = []
+
+    def _rollback_created(entries: list[dict]) -> list[str]:
+        failed = []
+        for entry in entries:
+            receipt = entry.get("_creation_identity")
+            if receipt is None or not _unlink_created_contained(
+                    project_dir, entry["path"], receipt):
+                failed.append(entry["path"])
+        return failed
+
+    def _changed_after_create(entries: list[dict]) -> list[str]:
+        changed = []
+        for entry in entries:
+            receipt = entry.get("_creation_identity")
+            if receipt is None or not _created_contained_matches(
+                    project_dir, entry["path"], receipt):
+                changed.append(entry["path"])
+        return changed
+
     for item in prepared:
-        written = _write_contained(project_dir, item["path"], item["contents"])
-        if written is None:
-            rollback_failed = [
-                entry["path"] for entry in written_entries
-                if not _unlink_contained(project_dir, entry["path"])
-            ]
+        created = _create_contained(project_dir, item["path"], item["contents"])
+        if created is None:
+            rollback_failed = _rollback_created(written_entries)
             return [], None, "", (
-                f"generated test contained write was refused for {item['path']!r}"
+                f"generated test atomic create was refused for {item['path']!r}"
             ), rollback_failed
         normalized = dict(item)
         # Keep the already-validated canonical repository-relative identity. The
-        # contained writer may return an absolute path whose Windows spelling
-        # differs from ``project_dir`` (for example through a temp-directory
-        # alias or junction); deriving identity from that host path can create
-        # a bogus ``../`` path even though the write itself was contained.
+        # contained writer may return a host spelling that differs from the
+        # repository spelling; coverage and rollback use the canonical key.
         normalized["path"] = item["path"]
+        normalized["_creation_identity"] = created[1]
         written_entries.append(normalized)
 
+    changed = _changed_after_create(written_entries)
+    if changed:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            "generated test path identity changed before execution: "
+            + ", ".join(changed)
+        ), rollback_failed
+
     status, log = _run_unit_tests(project_dir, stack)
+    changed = _changed_after_create(written_entries)
+    if changed:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            "generated test path identity changed during execution: "
+            + ", ".join(changed)
+        ), rollback_failed
+    if status is True and not _suite_reported_tests(log):
+        status = False
+        log = (log + "\n" if log else "") + (
+            "test command exited successfully but reported no executed-test evidence"
+        )
     return written_entries, status, log, "", []
 
 
@@ -18188,6 +18511,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "verification_plan": str(_idea.get("verification_plan") or ""),
                 })
         test_files: list[str] = []
+        generated_test_files: list[str] = []
+        test_creation_receipts: dict[str, os.stat_result] = {}
         tests_by_source: dict[str, list[str]] = {}
         tests_by_capability: dict[str, list[str]] = {}
         generated_test_candidates: list[dict] = []
@@ -18300,7 +18625,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "title": "Generated test source failed pre-write validation",
                         "problem": refusal,
                         "fix": ("Generate complete parser-valid test source; unsupported "
-                                "source types require a safe in-process parser."),
+                                "source types require a safe non-executing parser."),
                     })
                     if rollback_failed:
                         dirty_abort = True
@@ -18312,6 +18637,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 else:
                     for item in written_tests:
                         _test_rel = item["path"]
+                        generated_test_files.append(_test_rel)
+                        test_creation_receipts[_test_rel] = item["_creation_identity"]
+                        if not item.get("_credit_as_test"):
+                            continue
                         _source_rel = str(item.get("source") or "")
                         _required_capabilities = list(
                             item.get("required_capabilities") or []
@@ -18349,10 +18678,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     # accepts them.  A red candidate is removed transactionally so
                     # its errors remain in evidence without poisoning every later
                     # gate or leaving an uncommitted tree on timeout.
-                    rejected = list(test_files)
+                    rejected = list(generated_test_files)
                     rollback_failed = []
                     for generated in rejected:
-                        if not _unlink_contained(project_dir, generated):
+                        receipt = test_creation_receipts.get(generated)
+                        if receipt is None or not _unlink_created_contained(
+                                project_dir, generated, receipt):
                             rollback_failed.append(generated)
                     if rollback_failed:
                         dirty_abort = True
@@ -18364,6 +18695,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             f"rejected and removed {len(rejected)} generated test "
                             "file(s) after the native test command failed")
                         test_files = []
+                        generated_test_files = []
+                        test_creation_receipts = {}
                         tests_by_source = {}
                         tests_by_capability = {}
                         # THE VERDICT DIED WITH THE FILES IT DESCRIBED.

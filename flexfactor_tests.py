@@ -4406,6 +4406,66 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         forbidden.assert_not_called()
 
 
+class GradePayloadValidationTests(unittest.TestCase):
+    """Every reviewer route must satisfy the complete no-op authorization schema."""
+
+    def test_complete_grade_payload_is_accepted(self):
+        parsed = ff._parse_grade(json.dumps({
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "The exact candidate meets the goal.",
+            "issues": [],
+        }))
+        self.assertEqual(100, parsed.grade)
+        self.assertIs(parsed.meets_goal, True)
+        self.assertEqual([], parsed.issues)
+
+    def test_missing_required_grade_field_is_rejected(self):
+        complete = {
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "complete",
+            "issues": [],
+        }
+        for missing in tuple(complete):
+            payload = dict(complete)
+            payload.pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                    ValueError, "omitted required"):
+                ff._parse_grade(json.dumps(payload))
+
+    def test_wrong_grade_property_types_and_unknown_fields_are_rejected(self):
+        complete = {
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "complete",
+            "issues": [],
+        }
+        bad_values = {
+            "grade": (100.0, True, "100"),
+            "meets_goal": (1, "true"),
+            "rationale": (None, {"text": "complete"}),
+            "issues": ("none", [1], [{}]),
+        }
+        for field, values in bad_values.items():
+            for value in values:
+                payload = dict(complete)
+                payload[field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    ff._parse_grade(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            ff._parse_grade(json.dumps({**complete, "approval": True}))
+
+    def test_sub_hundred_grade_requires_a_concrete_issue(self):
+        with self.assertRaisesRegex(ValueError, "sub-100"):
+            ff._parse_grade(json.dumps({
+                "grade": 99,
+                "meets_goal": False,
+                "rationale": "One problem remains.",
+                "issues": [],
+            }))
+
+
 class GeneratedTestSourcePreflightTests(unittest.TestCase):
     """Audit/Production Ready parse every generated test before any write."""
 
@@ -4417,11 +4477,12 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("invalid generated test reached runner")
         )
         candidates = [
-            {"path": "tests/good.py", "contents": "VALUE = 1\n"},
-            {"path": "tests/broken.py", "contents": "This is not Python.\n"},
+            {"path": "tests/test_good.py",
+             "contents": "def test_good():\n    assert True\n"},
+            {"path": "tests/test_broken.py", "contents": "This is not Python.\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4431,7 +4492,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertEqual([], written)
         self.assertIsNone(status)
         self.assertEqual("", log)
-        self.assertIn("broken.py", refusal)
+        self.assertIn("test_broken.py", refusal)
         self.assertIn("rejected before write", refusal)
         self.assertEqual([], rollback_failed)
         forbidden_write.assert_not_called()
@@ -4445,11 +4506,11 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("non-test source reached test runner")
         )
         candidates = [
-            {"path": "tests/good.py", "contents": "def test_ok():\n    assert True\n"},
+            {"path": "tests/test_good.py", "contents": "def test_ok():\n    assert True\n"},
             {"path": "src/helper.py", "contents": "VALUE = 1\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4465,10 +4526,10 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         forbidden_runner.assert_not_called()
 
     def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
-        runner = mock.Mock(return_value=(True, "two tests passed"))
+        runner = mock.Mock(return_value=(True, "2 tests passed"))
         candidates = [
-            {"path": "tests/one.py", "contents": "def test_one():\n    assert True\n"},
-            {"path": "tests/two.json", "contents": '{"case": 2}\n'},
+            {"path": "tests/test_one.py", "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/capability.json", "contents": '{"case": 2}\n'},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(ff, "_run_unit_tests", runner):
@@ -4477,12 +4538,14 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                     project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
                 )
             )
-            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "one.py")))
-            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "two.json")))
-        self.assertEqual(["tests/one.py", "tests/two.json"],
+            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "test_one.py")))
+            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "capability.json")))
+        self.assertEqual(["tests/test_one.py", "tests/capability.json"],
                          [item["path"] for item in written])
+        self.assertEqual([True, False],
+                         [item["_credit_as_test"] for item in written])
         self.assertIs(status, True)
-        self.assertEqual("two tests passed", log)
+        self.assertEqual("2 tests passed", log)
         self.assertEqual("", refusal)
         self.assertEqual([], rollback_failed)
         runner.assert_called_once()
@@ -4493,21 +4556,17 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
 
     def test_writer_host_path_cannot_replace_validated_relative_identity(self):
         candidates = [
-            {"path": "./tests//one.py", "contents": "VALUE = 1\n"},
+            {"path": "./tests//test_one.py",
+             "contents": "def test_one():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(
-                 ff,
-                 "_write_contained",
-                 return_value=os.path.join(project, "host-alias", "one.py"),
-             ), \
-             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "ok")):
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "1 test passed")):
             written, status, _log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
                     project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
                 )
             )
-        self.assertEqual(["tests/one.py"], [item["path"] for item in written])
+        self.assertEqual(["tests/test_one.py"], [item["path"] for item in written])
         self.assertIs(status, True)
         self.assertEqual("", refusal)
         self.assertEqual([], rollback_failed)
@@ -4520,11 +4579,13 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("duplicate generated path reached runner")
         )
         candidates = [
-            {"path": "tests/same.py", "contents": "VALUE = 1\n"},
-            {"path": "./tests//same.py", "contents": "VALUE = 2\n"},
+            {"path": "tests/test_same.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "./tests//test_same.py",
+             "contents": "def test_two():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, _log, refusal, _rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4545,11 +4606,13 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("case-only alias reached runner")
         )
         candidates = [
-            {"path": "tests/Same.py", "contents": "VALUE = 1\n"},
-            {"path": "tests/same.py", "contents": "VALUE = 2\n"},
+            {"path": "tests/Test_same.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_same.py",
+             "contents": "def test_two():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, _log, refusal, _rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4570,11 +4633,13 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("Unicode alias reached runner")
         )
         candidates = [
-            {"path": "tests/caf\u00e9.py", "contents": "VALUE = 1\n"},
-            {"path": "tests/cafe\u0301.py", "contents": "VALUE = 2\n"},
+            {"path": "tests/test_caf\u00e9.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_cafe\u0301.py",
+             "contents": "def test_two():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, _log, refusal, _rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4595,11 +4660,13 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             side_effect=AssertionError("Windows trailing-dot alias reached runner")
         )
         candidates = [
-            {"path": "tests/case.py", "contents": "VALUE = 1\n"},
-            {"path": "tests/case.py.", "contents": "VALUE = 2\n"},
+            {"path": "tests/test_case.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_case.py.",
+             "contents": "def test_two():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
              mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
             written, status, _log, refusal, _rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4611,6 +4678,167 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIn("invalid repository path", refusal)
         forbidden_write.assert_not_called()
         forbidden_runner.assert_not_called()
+
+    def test_support_artifacts_alone_are_not_credited_as_tests(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("support-only batch reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("support-only batch reached runner")
+        )
+        candidates = [
+            {"path": "tests/capability.json", "contents": '{"case": 1}\n'},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("no runner-collectable executable test", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_executable_without_a_declared_case_is_refused_before_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("case-free module reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("case-free module reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_empty.py", "contents": "VALUE = 1\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("declares no collectable test case", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_non_native_case_test_suffix_never_receives_execution_credit(self):
+        for rel in ("Widget_Test.py", "widget_TEST.go", "unit.Test.js"):
+            with self.subTest(rel=rel):
+                self.assertFalse(ff._runner_collectable_generated_test_path(rel))
+
+    def test_success_exit_without_collection_evidence_is_a_failure(self):
+        candidates = [
+            {"path": "tests/test_one.py",
+             "contents": "def test_one():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "success")):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual(["tests/test_one.py"], [item["path"] for item in written])
+        self.assertIs(status, False)
+        self.assertIn("reported no executed-test evidence", log)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
+    def test_javascript_typescript_and_go_have_nonexecuting_preflight(self):
+        cases = (
+            ("tests/unit.test.js", "test('x', () => {});\n", {}, "node"),
+            ("tests/unit.test.ts", "test('x', () => {});\n",
+             {"esbuild": "esbuild"}, "esbuild"),
+            ("unit_test.go",
+             "package unit\nimport \"testing\"\nfunc TestX(t *testing.T) {}\n",
+             {}, "gofmt"),
+        )
+        for path, source, stack, expected_tool in cases:
+            with self.subTest(path=path), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+                 mock.patch.object(
+                     ff, "_run",
+                     return_value=ff.subprocess.CompletedProcess([], 0, "", ""),
+                 ) as parser:
+                ok, note = ff._generated_test_source_syntax_ok(
+                    project, path, source, stack,
+                )
+                self.assertIs(ok, True, note)
+                command = parser.call_args.args[0]
+                self.assertEqual(expected_tool, os.path.basename(command[0]))
+                candidate_arg = next(
+                    arg for arg in command[1:]
+                    if arg.endswith(os.path.splitext(path)[1])
+                )
+                self.assertFalse(candidate_arg.startswith(os.path.realpath(project)))
+
+    def test_atomic_create_refuses_raced_in_owner_file_without_overwrite(self):
+        candidates = [
+            {"path": "tests/test_owner.py",
+             "contents": "def test_generated():\n    assert True\n"},
+        ]
+        real_existence = ff._contained_existence
+        raced = False
+
+        def race_owner_file(project, rel):
+            nonlocal raced
+            if rel == "tests/test_owner.py" and not raced:
+                raced = True
+                target = os.path.join(project, "tests", "test_owner.py")
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "w", encoding="utf-8") as handle:
+                    handle.write("OWNER = True\n")
+                return "missing"
+            return real_existence(project, rel)
+
+        runner = mock.Mock(
+            side_effect=AssertionError("raced-in owner file reached runner")
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_contained_existence", side_effect=race_owner_file,
+             ), \
+             mock.patch.object(ff, "_run_unit_tests", runner):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+            with open(os.path.join(project, "tests", "test_owner.py"),
+                      encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("atomic create was refused", refusal)
+        self.assertEqual([], rollback_failed)
+        runner.assert_not_called()
+
+    def test_identity_bound_rollback_preserves_replacement_owner_file(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            created = ff._create_contained(
+                project, "tests/test_one.py",
+                "def test_generated():\n    assert True\n",
+            )
+            self.assertIsNotNone(created)
+            replacement = os.path.join(project, "owner.py")
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("OWNER = True\n")
+            target = os.path.join(project, "tests", "test_one.py")
+            os.replace(replacement, target)
+            self.assertFalse(ff._unlink_created_contained(
+                project, "tests/test_one.py", created[1],
+            ))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
 
 
 class PathContainmentTests(unittest.TestCase):
@@ -7725,6 +7953,11 @@ class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
                     "src/latest_helper.py"):
             self.assertFalse(ff._is_test_path(rel), f"{rel} wrongly called a test")
 
+    def test_native_test_filename_conventions_are_case_sensitive(self):
+        for rel in ("Widget_Test.py", "widget_TEST.go", "Home.Test.jsx",
+                    "Test_widget.py"):
+            self.assertFalse(ff._is_test_path(rel), rel)
+
 
 class ReviewFixBatchSizeTests(unittest.TestCase):
     """A batch's fixes only land after EVERY file in that batch is reviewed, so
@@ -10155,7 +10388,8 @@ class OllamaProviderTests(unittest.TestCase):
 
     def test_grade_parses(self):
         body = {"message": {"content": json.dumps(
-            {"grade": 88, "meets_goal": True, "rationale": "ok", "issues": []})}}
+            {"grade": 88, "meets_goal": False, "rationale": "one issue",
+             "issues": ["finish the remaining behavior"]})}}
         p = ff.OllamaProvider("coder")
         self._fake_opener(p, [], body)
         g = p.grade("grade this")
@@ -19359,8 +19593,17 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
     def test_tool_authored_syntax_checks_are_exempt_but_scripts_are_not(self):
         self.assertTrue(ff._tool_authored_syntax_check([sys.executable, "-c", "print(1)"]))
         self.assertTrue(ff._tool_authored_syntax_check(["node", "--check", "a.js"]))
+        self.assertTrue(ff._tool_authored_syntax_check(
+            ["node", "--experimental-transform-types", "--check", "a.ts"]
+        ))
+        self.assertTrue(ff._tool_authored_syntax_check(
+            ["node", "--experimental-strip-types", "--check", "a.ts"]
+        ))
         self.assertTrue(ff._tool_authored_syntax_check(["python", "-m", "py_compile", "a.py"]))
         self.assertFalse(ff._tool_authored_syntax_check(["python", "-m", "pytest"]))
+        self.assertFalse(ff._tool_authored_syntax_check(
+            ["node", "--experimental-transform-types", "a.ts"]
+        ))
         self.assertFalse(ff._tool_authored_syntax_check(["node", "explore.cjs", "http://x"]))
         self.assertFalse(ff._tool_authored_syntax_check(["python", "script.py"]))
 
