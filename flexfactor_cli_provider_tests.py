@@ -260,6 +260,33 @@ class CliProviderBehaviourTests(unittest.TestCase):
         self.assertIn("SYSTEM RULE", seen["input"])
         self.assertIn("make the fix", seen["input"])
 
+    def test_grade_requests_typed_json_instead_of_free_form_prose(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["input"] = kw.get("input")
+            return subprocess.CompletedProcess(
+                argv, 0,
+                stdout=(
+                    '{"grade": 96, "meets_goal": true, '
+                    '"rationale": "complete", "issues": []}'
+                ),
+                stderr="",
+            )
+
+        real = subprocess.run
+        subprocess.run = fake_run
+        try:
+            result = cp.CliProvider("codex-cli", "gpt-5.6", "codex").grade(
+                "grade this candidate"
+            )
+        finally:
+            subprocess.run = real
+        self.assertEqual(96, result["grade"])
+        self.assertIs(result["meets_goal"], True)
+        self.assertIn('"meets_goal": {"type": "boolean"}', seen["input"])
+        self.assertIn("grade this candidate", seen["input"])
+
     def test_the_work_theme_reaches_the_cli(self):
         """Owner requirement: rotated calls stay ON TASK. The theme must be
         carried, or a rotated provider wanders off the run's purpose."""

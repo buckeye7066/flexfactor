@@ -70,6 +70,24 @@ CLI_BINARIES = {
     "copilot-cli": "copilot",
 }
 
+_GRADE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grade": {"type": "integer"},
+        "meets_goal": {"type": "boolean"},
+        "rationale": {"type": "string"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["grade", "meets_goal", "rationale", "issues"],
+    "additionalProperties": False,
+}
+
+_GRADE_SYSTEM = (
+    "You are a strict independent code reviewer. Grade the candidate against "
+    "the stated goal. Reserve 90 or above for a complete result without "
+    "correctness or completeness defects. Return only the requested JSON."
+)
+
 
 def _extensions_enabled() -> bool:
     """Same switch the Cursor adapter honours, so one flag governs both.
@@ -262,8 +280,21 @@ class CliProvider:
                         timeout=self._timeout, model=self.model)
 
     def grade(self, prompt: str, *, system: Optional[str] = None,
-              max_tokens: int = 4096, **_: Any) -> str:
-        return self.complete(prompt, system=system, max_tokens=max_tokens)
+              max_tokens: int = 4096, **_: Any) -> Dict[str, Any]:
+        """Request the same typed grade contract as the HTTP adapters.
+
+        A plain ``complete`` call leaves the CLI free to answer in prose. The
+        rotating provider preserves that raw string, so downstream attribute
+        access used to fail despite a healthy reviewer. Reuse the JSON-schema
+        transport here; the core still independently normalizes and validates
+        the result before any grade can authorize code.
+        """
+        return self.structured(
+            system or _GRADE_SYSTEM,
+            prompt,
+            _GRADE_SCHEMA,
+            max_tokens=max_tokens,
+        )
 
     def structured(self, system: str, prompt: Optional[str] = None,
                    schema: Optional[Dict[str, Any]] = None,
