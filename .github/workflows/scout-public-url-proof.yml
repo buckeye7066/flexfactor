@@ -32,10 +32,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       COPILOT_GITHUB_TOKEN: ${{ github.token }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
-      FLEXFACTOR_CLI_TIMEOUT: "180"
+      FLEXFACTOR_CLI_TIMEOUT: "420"
+      OLLAMA_BASE_URL: http://127.0.0.1:9
       PYTHONUTF8: "1"
 
     steps:
