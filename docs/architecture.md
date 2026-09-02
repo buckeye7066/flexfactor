@@ -133,3 +133,18 @@ byte-backup rollback, not the WIP transaction); argparse for all modes.
 4. `flexfactor_fix.py`: edit-block generation/apply/shrink + adversarial loop.
 5. Move `--trust-repo`/`--allow-dirty` help and parser fragments into one
    shared `add_common_exec_flags(parser)` so audit/prodready/scout cannot drift.
+
+## 6. Managed mobile control plane
+
+The Android product has three explicit layers:
+
+| Layer | Owns | Must not own |
+|---|---|---|
+| Android APK | Four-mode UI, confirmations, Android-Keystore session storage, repository-key sealed boxes, run history, signed updates | GitHub REST orchestration, workflow installation, arbitrary toolchain execution |
+| FlexFactor Cloud (`cloud/`) | Device OAuth and refresh grants, repository discovery, exact caller installation, dispatch correlation, status, bounded artifact proxy, steering | Persistent bearer/provider-key storage, target-code execution, generic upstream proxying |
+| Selected repository runner | Exact tagged engine, target checkout, Python/Node/browser/build toolchains, verification, publication, result/error artifacts | Owner OAuth token, mobile UI state |
+
+The APK's only product API origin is the fixed production FlexFactor Cloud URL. The cloud service
+uses fixed upstream origins and validates the complete run request again. GitHub Actions is the
+ephemeral compute substrate behind the service, not the interface presented as the finished mobile
+product. `cloud/THREAT_MODEL.md` records the credential, artifact, mutation, and execution boundaries.

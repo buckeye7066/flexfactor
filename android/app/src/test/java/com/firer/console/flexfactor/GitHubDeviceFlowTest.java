@@ -2,15 +2,13 @@ package com.firer.console.flexfactor;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
 
 import org.json.JSONObject;
 import org.junit.Test;
 
 public final class GitHubDeviceFlowTest {
     @Test
-    public void registeredClientAndDeviceResponseArePinned() throws Exception {
-        assertTrue(GitHubApi.OAUTH_CLIENT_ID.matches("[A-Za-z0-9]{20}"));
+    public void managedDeviceResponseIsPinned() throws Exception {
         JSONObject response = new JSONObject()
                 .put("device_code", "device-secret")
                 .put("user_code", "ABCD-1234")
@@ -39,5 +37,20 @@ public final class GitHubDeviceFlowTest {
     public void tokenResponseRequiresAnAccessToken() throws Exception {
         assertThrows(GitHubApi.ApiException.class,
                 () -> GitHubApi.requireOAuthToken(new JSONObject()));
+    }
+
+    @Test
+    public void expiringTokenRequiresServerIssuedRotationMaterial() throws Exception {
+        JSONObject incomplete = new JSONObject()
+                .put("access_token", "gho_access")
+                .put("expires_in", 28_800);
+        assertThrows(GitHubApi.ApiException.class,
+                () -> GitHubApi.requireOAuthToken(incomplete));
+
+        GitHubApi.OAuthToken complete = GitHubApi.requireOAuthToken(new JSONObject()
+                .put("access_token", "gho_access")
+                .put("refresh_token", "ghr_refresh")
+                .put("expires_in", 28_800));
+        assertEquals("ghr_refresh", complete.refreshToken);
     }
 }

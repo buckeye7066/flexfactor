@@ -14,8 +14,13 @@ android {
         applicationId = "com.firer.console.flexfactor"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30300
-        versionName = "3.3.0"
+        versionCode = 30400
+        versionName = "3.4.0"
+        buildConfigField(
+            "String",
+            "FLEXFACTOR_CLOUD_URL",
+            "\"https://flexfactor-cloud.vercel.app\"",
+        )
 
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
     }

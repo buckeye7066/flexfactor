@@ -40,6 +40,7 @@ after impact and remediation are understood.
 
 Reports are in scope when they affect FlexFactor code, packaged artifacts,
 supported launchers, containment controls, credential handling, provider
-routing, or GitHub Actions maintained in this repository. Vulnerabilities in a
+routing, the Android client, the deployed FlexFactor Cloud API, or GitHub Actions
+maintained in this repository. Vulnerabilities in a
 third-party service should be reported to that service unless FlexFactor's use
 of it creates the vulnerability.
