@@ -10583,6 +10583,19 @@ def _run_standalone_scout_impl(args) -> int:
             print("error: --apply requested a persistent behavioral twin, but the "
                   "branch was not verified and published.", file=sys.stderr)
             return 4
+    execution_orchestrator = getattr(args, "execution_orchestrator", None)
+    if execution_orchestrator is not None:
+        execution_orchestrator.record_standalone_scout(
+            evidence_refs=[
+                str(row.get("url") or row.get("id") or "")
+                for row in (source_bundle.get("evidence") or [])
+            ],
+            branch=twin_result.branch,
+            subtree=twin_result.subtree,
+            status=twin_result.status,
+            note=("URL-only Scout completed without a target repository or Repo "
+                  "Rewards stage; the retained twin is handled on its isolated branch."),
+        )
     return 0
 
 

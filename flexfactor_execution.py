@@ -5,10 +5,16 @@ The owner-facing shape is deliberately small and fixed:
 * one queue containing at most thirty targets;
 * exactly one target may execute at a time;
 * a repository receives no more than six semantic passes;
-* pass one covers the complete repository;
+* pass one covers the complete repository when a mode operates on a repository;
 * later passes cover only files changed by the immediately preceding pass; and
 * the three best corroborated competitors are considered between passes one
   and two.
+
+URL-only Scout is the deliberate exception to the repository-pass shape: it
+has no target repository or Repo Rewards stage.  It must instead record the
+public evidence it inspected and the permanent standalone-twin destination.
+That explicit receipt prevents a read-only URL scan from being mistaken for a
+mode that silently skipped a repository pass.
 
 This module is dependency-free so the CLI, workflows, and contract tests can
 all import the same policy without constructing a provider or touching a repo.
@@ -361,6 +367,69 @@ class SequentialOrchestrator:
             }
             self._save()
 
+    def record_standalone_scout(self, *, evidence_refs: Iterable[object],
+                                branch: str, subtree: str, status: str,
+                                note: str = "") -> None:
+        """Record a completed URL-only Scout inspection.
+
+        Standalone Scout intentionally has no target repository, repository
+        pass, or competitor-integration gate.  Requiring this typed receipt
+        keeps that product path explicit without weakening the pass contract
+        for audit, refactor, or target-comparison Scout runs.
+        """
+        with self._lock:
+            if self.mode != "scout":
+                raise OrchestrationOrderError(
+                    "only Scout can record a standalone URL inspection"
+                )
+            index = self._state["active_index"]
+            if index is None:
+                raise OrchestrationOrderError("no target is active")
+            item = self._state["items"][index]
+            target = str(item.get("target") or "").strip().lower()
+            if not target.startswith(("https://", "http://")):
+                raise OrchestrationOrderError(
+                    "standalone Scout completion requires a URL target"
+                )
+            if item.get("passes") or item.get("competitor_gate"):
+                raise OrchestrationOrderError(
+                    "standalone Scout cannot replace a started repository pass"
+                )
+            if "standalone_scout" in item:
+                raise OrchestrationOrderError(
+                    "the standalone Scout inspection was already recorded"
+                )
+            evidence = changed_file_scope(evidence_refs)
+            clean_branch = str(branch or "").strip()
+            clean_subtree = str(subtree or "").strip()
+            clean_status = str(status or "").strip()
+            if not evidence:
+                raise OrchestrationOrderError(
+                    "standalone Scout completion requires public evidence"
+                )
+            if not clean_branch.startswith("scout/twin/"):
+                raise OrchestrationOrderError(
+                    "standalone Scout completion requires its permanent twin branch"
+                )
+            if not clean_subtree.startswith("scout_twins/"):
+                raise OrchestrationOrderError(
+                    "standalone Scout completion requires its isolated twin subtree"
+                )
+            if clean_status not in {"proposal-only", "published", "up-to-date"}:
+                raise OrchestrationOrderError(
+                    "standalone Scout completion has an invalid twin status"
+                )
+            item["standalone_scout"] = {
+                "completed": True,
+                "evidence_refs": evidence,
+                "branch": clean_branch,
+                "subtree": clean_subtree,
+                "status": clean_status,
+                "note": str(note or "")[:1000],
+                "finished_at": time.time(),
+            }
+            self._save()
+
     def finish_target(self, index: int, exit_code: int, *, note: str = "") -> int:
         with self._lock:
             if self._state["active_index"] != index:
@@ -378,41 +447,59 @@ class SequentialOrchestrator:
             if code == 0:
                 failures: list[str] = []
                 passes = list(item.get("passes") or [])
-                if not passes:
-                    failures.append("no repository pass was recorded")
-                elif (passes[0].get("number") != 1
-                      or passes[0].get("scope") != "whole-repository"):
-                    failures.append("pass 1 did not cover the whole repository")
-                if any(row.get("status") != "completed" for row in passes):
-                    failures.append("not every recorded pass completed")
-                gate = item.get("competitor_gate")
-                gate_valid = isinstance(gate, dict) and gate.get("attempted") is True
-                if isinstance(gate, dict) and gate.get("not_applicable") is True:
-                    pass_one_delta = changed_file_scope(
-                        passes[0].get("changed_files") or []
-                    ) if passes else []
-                    gate_valid = bool(
-                        not pass_one_delta
-                        and not changed_file_scope(
-                            gate.get("implemented_files") or []
+                standalone = item.get("standalone_scout")
+                standalone_valid = bool(
+                    self.mode == "scout"
+                    and isinstance(standalone, dict)
+                    and standalone.get("completed") is True
+                    and standalone.get("evidence_refs")
+                    and str(standalone.get("branch") or "").startswith("scout/twin/")
+                    and str(standalone.get("subtree") or "").startswith("scout_twins/")
+                    and standalone.get("status") in {
+                        "proposal-only", "published", "up-to-date"
+                    }
+                    and not passes
+                    and not item.get("competitor_gate")
+                )
+                if not standalone_valid:
+                    if not passes:
+                        failures.append("no repository pass was recorded")
+                    elif (passes[0].get("number") != 1
+                          or passes[0].get("scope") != "whole-repository"):
+                        failures.append("pass 1 did not cover the whole repository")
+                    if any(row.get("status") != "completed" for row in passes):
+                        failures.append("not every recorded pass completed")
+                    gate = item.get("competitor_gate")
+                    gate_valid = isinstance(gate, dict) and gate.get("attempted") is True
+                    if isinstance(gate, dict) and gate.get("not_applicable") is True:
+                        pass_one_delta = changed_file_scope(
+                            passes[0].get("changed_files") or []
+                        ) if passes else []
+                        gate_valid = bool(
+                            not pass_one_delta
+                            and not changed_file_scope(
+                                gate.get("implemented_files") or []
+                            )
+                            and int(gate.get("verified") or 0) == 0
                         )
-                        and int(gate.get("verified") or 0) == 0
-                    )
-                if not gate_valid:
-                    failures.append(
-                        "the top-three competitor gate was neither attempted "
-                        "nor truthfully marked not applicable"
-                    )
-                if passes and len(passes) < MAX_PASSES:
-                    pending = changed_file_scope(passes[-1].get("changed_files") or [])
-                    if len(passes) == 1 and isinstance(gate, dict):
-                        pending = changed_file_scope(
-                            pending + list(gate.get("implemented_files") or [])
-                        )
-                    if pending:
+                    if not gate_valid:
                         failures.append(
-                            "verified edits were not followed by the required exact-delta pass"
+                            "the top-three competitor gate was neither attempted "
+                            "nor truthfully marked not applicable"
                         )
+                    if passes and len(passes) < MAX_PASSES:
+                        pending = changed_file_scope(
+                            passes[-1].get("changed_files") or []
+                        )
+                        if len(passes) == 1 and isinstance(gate, dict):
+                            pending = changed_file_scope(
+                                pending + list(gate.get("implemented_files") or [])
+                            )
+                        if pending:
+                            failures.append(
+                                "verified edits were not followed by the required "
+                                "exact-delta pass"
+                            )
                 if failures:
                     code = 1
                     refusal = "orchestrator refused success: " + "; ".join(failures)

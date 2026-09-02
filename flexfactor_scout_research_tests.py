@@ -690,17 +690,30 @@ class ScoutStandaloneUrlEndToEndTests(unittest.TestCase):
         published = ff.TwinResult(
             "published", "verified", "scout/twin/source-example-123456789abc",
             "scout_twins/source-example-123456789abc")
-        with mock.patch.object(ff, "_research_program_reference",
-                               return_value=bundle), \
-             mock.patch.object(ff, "_best_available_provider",
-                               return_value=object()), \
-             mock.patch.object(ff, "_profile_research_bundle",
-                               return_value=profile), \
-             mock.patch.object(ff, "build_behavioral_twin_branch",
-                               return_value=published) as build, \
-             mock.patch.object(ff, "repo_rewards_search") as repo_rewards:
-            rc = ff._run_scout_impl(args)
+        with tempfile.TemporaryDirectory(prefix="ff-url-only-queue-") as root:
+            coordinator = ff._ff_execution.SequentialOrchestrator(
+                "scout", [args.program],
+                state_path=os.path.join(root, "queue.json"),
+                queue_id="url-only",
+            )
+            coordinator.start_target(0)
+            args.execution_orchestrator = coordinator
+            with mock.patch.object(ff, "_research_program_reference",
+                                   return_value=bundle), \
+                 mock.patch.object(ff, "_best_available_provider",
+                                   return_value=object()), \
+                 mock.patch.object(ff, "_profile_research_bundle",
+                                   return_value=profile), \
+                 mock.patch.object(ff, "build_behavioral_twin_branch",
+                                   return_value=published) as build, \
+                 mock.patch.object(ff, "repo_rewards_search") as repo_rewards:
+                rc = ff._run_scout_impl(args)
+            rc = coordinator.finish_target(0, rc)
+            receipt = coordinator.snapshot()["items"][0]
         self.assertEqual(rc, 0)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["standalone_scout"]["branch"], published.branch)
+        self.assertEqual(receipt["standalone_scout"]["status"], "published")
         self.assertEqual(build.call_count, 1)
         self.assertIsNone(build.call_args.args[1])
         repo_rewards.assert_not_called()

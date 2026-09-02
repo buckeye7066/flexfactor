@@ -134,6 +134,36 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(coordinator.snapshot()["status"], "failed")
 
+    def test_url_only_scout_finishes_with_typed_standalone_receipt(self):
+        coordinator = execution.SequentialOrchestrator(
+            "scout", ["https://www.heygen.com/"],
+            state_path=os.path.join(
+                tempfile.mkdtemp(prefix="ff-standalone-scout-"), "queue.json"
+            ),
+            queue_id="standalone-scout",
+        )
+        self.addCleanup(
+            __import__("shutil").rmtree,
+            os.path.dirname(coordinator.state_path), True,
+        )
+        coordinator.start_target(0)
+        coordinator.record_standalone_scout(
+            evidence_refs=[
+                "https://www.heygen.com/",
+                "https://www.heygen.com/avatars",
+            ],
+            branch="scout/twin/heygen-c0fadff54acb",
+            subtree="scout_twins/heygen-c0fadff54acb",
+            status="published",
+            note="URL-only public-program inspection",
+        )
+        self.assertEqual(coordinator.finish_target(0, 0), 0)
+        item = coordinator.snapshot()["items"][0]
+        self.assertEqual(item["status"], "completed")
+        self.assertTrue(item["standalone_scout"]["completed"])
+        self.assertEqual(item["passes"], [])
+        self.assertNotIn("competitor_gate", item)
+
     def test_success_requires_an_exact_delta_follow_up_after_edits(self):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
