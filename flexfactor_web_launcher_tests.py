@@ -201,6 +201,15 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('if [ "$tag_commit" != "$GITHUB_SHA" ]', workflow)
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
         self.assertIn("ANDROID_KEYSTORE_BASE64", workflow)
+        self.assertIn(".engine_ref == $engine", workflow)
+
+    def test_mobile_refactor_does_not_delete_a_tracked_backup_file(self):
+        path = os.path.join(
+            os.path.dirname(__file__), ".github", "workflows", "mobile-run.yml")
+        with open(path, encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertNotIn('backup_path="target/$TARGET_FILE.bak"', workflow)
+        self.assertNotIn("refactor-existing.bak", workflow)
 
 
 if __name__ == "__main__":

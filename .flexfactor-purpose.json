@@ -188,7 +188,7 @@
     {
       "kind": "source",
       "locator": "flexfactor_execution.py",
-      "content_hash": "b9fc57a95cea44fd092aa0cb16ddc4e7a98ba8b0fa42a6e22734fc2c29e1adfa",
+      "content_hash": "245eab7b1e01f2dcc49fc0743c52ee2f2f721f0f5cce0a86d20c5efae1a50fbd",
       "observed_at": "2026-09-02T08:32:38Z",
       "excerpt": "Durable 30-target, six-pass sequential orchestration contract."
     },
@@ -202,7 +202,7 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "8490c2ef8f56f6e7456852d1d7af2ad99c2565568037525419e3cfd61f14f266",
+      "content_hash": "812707d1f72cdc6b9870bb600a4277ab29c74f0e39565295bc24ef7c00a94d7d",
       "observed_at": "2026-09-02T08:32:38Z",
       "excerpt": "Four modes, mutation preflight, verification, review, and exact-default-branch publication."
     },

@@ -45,7 +45,7 @@ if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
 }
 
 $cliArgs = @("audit", "--model-mode", "best", "--max-cost", "$cost",
-             "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean")
+             "--max-cycles", "6", "--apply", "--yes", "--auto-clean")
 foreach ($program in $programs) { $cliArgs += @("--program", $program) }
 
 Write-Host ""

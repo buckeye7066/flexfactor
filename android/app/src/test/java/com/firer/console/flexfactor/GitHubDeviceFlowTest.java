@@ -1,7 +1,9 @@
 package com.firer.console.flexfactor;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 import org.json.JSONObject;
 import org.junit.Test;
@@ -52,5 +54,17 @@ public final class GitHubDeviceFlowTest {
                 .put("refresh_token", "ghr_refresh")
                 .put("expires_in", 28_800));
         assertEquals("ghr_refresh", complete.refreshToken);
+    }
+
+    @Test
+    public void onlyDefinitiveMissingRunResponsesAreTerminal() {
+        assertTrue(GitHubApi.isAuthoritativelyMissing(
+                new GitHubApi.ApiException(404, "not found")));
+        assertTrue(GitHubApi.isAuthoritativelyMissing(
+                new GitHubApi.ApiException(410, "gone")));
+        assertFalse(GitHubApi.isAuthoritativelyMissing(
+                new GitHubApi.ApiException(503, "retry")));
+        assertFalse(GitHubApi.isAuthoritativelyMissing(
+                new IllegalStateException("retry")));
     }
 }

@@ -87,6 +87,10 @@ try {
         foreach ($target in $targets) { $cliArgs += @("--file", $target) }
     } elseif ($mode -eq "2") {
         $targets = @(Read-FlexFactorTargets "program" @($args))
+        $contextConsent = Read-Host "Scout may send program source context to the selected hosted model. Type YES to allow it"
+        if ($contextConsent -cne "YES") {
+            throw "Scout cancelled; program source context was not sent."
+        }
         $cliArgs = @("scout", "--max-cost", "$cost", "--model-mode", "best",
                      "--allow-remote-program-context")
         foreach ($target in $targets) { $cliArgs += @("--program", $target) }
@@ -95,7 +99,7 @@ try {
         $targets = @(Read-FlexFactorTargets $label @($args))
         $command = if ($mode -eq "3") { "audit" } else { "prodready" }
         $cliArgs = @($command, "--model-mode", "best", "--max-cost", "$cost",
-                     "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean")
+                     "--max-cycles", "6", "--apply", "--yes", "--auto-clean")
         foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     }
 } catch {

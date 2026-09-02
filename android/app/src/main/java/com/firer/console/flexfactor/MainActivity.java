@@ -968,9 +968,19 @@ public final class MainActivity extends Activity {
                                     && "success".equals(state.conclusion);
                         }
                     } catch (Exception failed) {
-                        invalidateRejectedSession(failed);
-                        next = new RunRecord(record.id, record.repository, record.requestId,
-                                record.mode, record.url, "Status check will retry", false);
+                        if (GitHubApi.isAuthoritativelyMissing(failed)) {
+                            String label = "Failed: run no longer exists on GitHub";
+                            next = new RunRecord(record.id, record.repository, record.requestId,
+                                    record.mode, record.url, label, true);
+                            if (record.id == latestId) {
+                                preferences.edit().putString(LAST_RUN_STATUS, label).apply();
+                                latestSucceeded = false;
+                            }
+                        } else {
+                            invalidateRejectedSession(failed);
+                            next = new RunRecord(record.id, record.repository, record.requestId,
+                                    record.mode, record.url, "Status check will retry", false);
+                        }
                     }
                 }
                 if (!next.complete) active = true;

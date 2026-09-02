@@ -590,6 +590,12 @@ final class GitHubApi {
         return clean;
     }
 
+    static boolean isAuthoritativelyMissing(Throwable failure) {
+        if (!(failure instanceof ApiException)) return false;
+        int status = ((ApiException) failure).status;
+        return status == 404 || status == 410;
+    }
+
     private static String encode(String value) throws Exception {
         return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20");
     }

@@ -44,6 +44,13 @@ if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
     exit 2
 }
 
+$contextConsent = Read-Host "Scout may send program source context to the selected hosted model. Type YES to allow it"
+if ($contextConsent -cne "YES") {
+    Write-Host "Scout cancelled; program source context was not sent." -ForegroundColor Yellow
+    Read-Host "Press Enter to close"
+    exit 2
+}
+
 $cliArgs = @("scout", "--model-mode", "best", "--max-cost", "$cost",
              "--allow-remote-program-context")
 foreach ($program in $programs) { $cliArgs += @("--program", $program) }

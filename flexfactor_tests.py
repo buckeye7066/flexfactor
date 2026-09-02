@@ -2925,15 +2925,15 @@ class TopLevelHelpTests(unittest.TestCase):
         # A classic no-subcommand invocation must still route to refactor and
         # accept "--help" as a literal --goal VALUE (not intercepted: the help
         # flag is not standalone; `--goal=--help` is argparse's literal form).
-        real = ff.run
+        real = ff.run_refactor_queue
         cap = {}
-        ff.run = lambda a: cap.__setitem__("args", a) or 0
+        ff.run_refactor_queue = lambda a: cap.__setitem__("args", a) or 0
         try:
             rc = ff.main(["--file", "x.py", "--goal=--help"])
         finally:
-            ff.run = real
+            ff.run_refactor_queue = real
         self.assertEqual(rc, 0)
-        self.assertEqual(cap["args"].file, "x.py")
+        self.assertEqual(cap["args"].file, ["x.py"])
         self.assertEqual(cap["args"].goal, "--help")
 
     def test_empty_argv_still_errors_via_refactor_parser(self):
@@ -10348,7 +10348,7 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         # verified fixes are committed each cycle" (found live 2026-08-10).
         # --yes rides along because the launcher's own prompt IS the confirmation.
         text = self._launcher_text()
-        self.assertIn('"--apply", "--yes", "--no-auto-clean"', text)
+        self.assertIn('"--apply", "--yes", "--auto-clean"', text)
 
     def test_launcher_uses_thirty_sequential_targets_and_six_passes(self):
         text = self._launcher_text()
@@ -11432,7 +11432,7 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
         self.assertFalse(args.push)
         self.assertFalse(args.merge)
 
-    def test_merge_falls_back_to_pr_automerge_on_protected_main(self):
+    def test_merge_falls_back_to_exact_head_pr_polling_on_protected_main(self):
         # Checkpoints are physically incapable of publishing. Protected-branch
         # handling belongs only to the final exact-SHA publication gate, after
         # evidence and independent review have passed.
@@ -12580,6 +12580,44 @@ class VacuousGateTests(unittest.TestCase):
         self.assertIsNone(ok, "no commands must be None (unverified), never True")
         self.assertIn("NOTHING WAS VERIFIED", log)
 
+    def test_default_branch_comes_from_live_remote_not_stale_cache(self):
+        import types
+        calls = []
+
+        def fake_git(argv, _project_dir):
+            calls.append(list(argv))
+            if argv[:2] == ["ls-remote", "--symref"]:
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout="ref: refs/heads/trunk\tHEAD\nabcdef\tHEAD\n",
+                    stderr="",
+                )
+            return types.SimpleNamespace(
+                returncode=0, stdout="origin/old-main\n", stderr="")
+
+        with _patched(ff, "_git", fake_git):
+            branch, basis = ff._remote_default_branch("/proj")
+        self.assertEqual(branch, "trunk")
+        self.assertEqual(basis, "origin HEAD")
+        self.assertEqual(calls[0][:2], ["ls-remote", "--symref"])
+        self.assertFalse(any(call[:1] == ["symbolic-ref"] for call in calls))
+
+    def test_stale_default_branch_cache_cannot_authorize_when_remote_fails(self):
+        import types
+
+        def fake_git(argv, _project_dir):
+            if argv[:2] == ["ls-remote", "--symref"]:
+                return types.SimpleNamespace(
+                    returncode=1, stdout="", stderr="network unavailable")
+            return types.SimpleNamespace(
+                returncode=0, stdout="origin/old-main\n", stderr="")
+
+        with _patched(ff, "_git", fake_git):
+            branch, reason = ff._remote_default_branch("/proj")
+        self.assertIsNone(branch)
+        self.assertIn("old-main", reason)
+        self.assertIn("not publication authority", reason)
+
     def test_merge_and_push_refused_on_an_unverified_gate(self):
         import inspect
         src = inspect.getsource(ff._commit_and_sync)
@@ -12624,7 +12662,8 @@ class VacuousGateTests(unittest.TestCase):
         """A protected main REJECTS a direct push. Before 2026-08-19 that ended
         the story: verified work sat local and unmerged with no PR and nothing
         asking anyone to finish it. The owner's rule is that work reaches
-        production, so the rejection must fall back to a PR with auto-merge."""
+        production, so the rejection must fall back to a polled PR. No deferred
+        auto-merge may survive a timeout."""
         import types
         git_calls = []
         gh_calls = []
@@ -12683,10 +12722,56 @@ class VacuousGateTests(unittest.TestCase):
                          "the fallback must never force-push")
         self.assertTrue(any(c[:3] == ["gh", "pr", "create"] for c in gh_calls))
         self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in gh_calls))
+        self.assertFalse(any("--auto" in c for c in gh_calls), gh_calls)
         self.assertTrue(any("--match-head-commit" in c for c in gh_calls
                             if c[:3] == ["gh", "pr", "merge"]))
         self.assertTrue(result["complete"])
         self.assertEqual(result["default_branch"], "main")
+
+    def test_final_publisher_timeout_leaves_no_deferred_auto_merge(self):
+        import types
+        gh_calls = []
+
+        def fake_git(argv, project_dir, *a, **k):
+            if argv == ["rev-parse", "HEAD"]:
+                return types.SimpleNamespace(
+                    returncode=0, stdout="abcdef1234567890\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_run(argv, cwd, timeout=None):
+            gh_calls.append(list(argv))
+            if argv[:3] == ["gh", "pr", "view"]:
+                return types.SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "state": "OPEN", "mergedAt": None,
+                        "url": "https://github.test/pull/8",
+                        "headRefOid": "abcdef1234567890",
+                    }), stderr="")
+            return types.SimpleNamespace(
+                returncode=(1 if argv[:3] == ["gh", "pr", "merge"] else 0),
+                stdout="", stderr="checks pending")
+
+        args = types.SimpleNamespace(push=True, merge=True)
+        with _patched(ff, "_git", fake_git), \
+             _patched(ff, "_git_has_remote", lambda _pd: True), \
+             _patched(ff, "_git_tree_clean", lambda _pd: True), \
+             _patched(ff, "_wip_publish_guard", lambda _pd: (True, "")), \
+             _patched(ff, "_publication_gate", lambda _pd, _st: (True, "green")), \
+             _patched(ff, "_remote_default_branch", lambda _pd: ("main", "test")), \
+             _patched(ff, "_remote_branch_contains",
+                      lambda _pd, branch, commit: (True, commit)), \
+             _patched(ff, "_git_current_branch", lambda _pd: "feature"), \
+             _patched(ff, "_run", fake_run), \
+             mock.patch.object(ff.shutil, "which", return_value="/bin/gh"), \
+             mock.patch.dict(os.environ, {"FLEXFACTOR_PUBLISH_WAIT_SECONDS": "0"}):
+            result = ff._publish_verified_head(
+                "/proj", "feature", args, {}, "abcdef1234567890")
+
+        self.assertFalse(result["complete"])
+        self.assertIn("not merged", result["reason"])
+        self.assertTrue(any(c[:3] == ["gh", "pr", "merge"] for c in gh_calls))
+        self.assertFalse(any("--auto" in c for c in gh_calls), gh_calls)
 
     def test_final_publisher_refuses_a_commit_added_after_review(self):
         import types

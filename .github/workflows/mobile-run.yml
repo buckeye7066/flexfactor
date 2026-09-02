@@ -320,18 +320,6 @@ jobs:
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?
-            backup_path="target/$TARGET_FILE.bak"
-            saved_backup="$RUNNER_TEMP/refactor-existing.bak"
-            had_backup=false
-            if [ "$rc" -eq 0 ] && { [ -e "$backup_path" ] || [ -L "$backup_path" ]; }; then
-              if [ ! -f "$backup_path" ] && [ ! -L "$backup_path" ]; then
-                echo "Existing refactor backup path is not a file" >&2
-                rc=1
-              else
-                mv -- "$backup_path" "$saved_backup"
-                had_backup=true
-              fi
-            fi
             if [ "$rc" -eq 0 ]; then
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
@@ -339,9 +327,7 @@ jobs:
                 --threshold "$THRESHOLD" \
                 --max-iterations "$MAX_ITERATIONS" \
                 --max-cost "$MAX_COST" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
-              rm -f -- "$backup_path"
             fi
-            if [ "$had_backup" = true ]; then mv -- "$saved_backup" "$backup_path"; fi
           elif [ "$MODE" = scout ]; then
             args=(scout --program "$GITHUB_WORKSPACE/target"
               --allow-remote-program-context --no-auto-start

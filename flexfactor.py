@@ -4804,6 +4804,142 @@ def _load_source_text(file_arg: str) -> tuple[str, str]:
     return resolved, content
 
 
+def _tracked_repository_scope(project_dir: str, selected: str = "") -> list[str]:
+    """Return the stable whole-repository scope used by queue receipts."""
+    listed = _git(["ls-files", "-z"], project_dir)
+    if listed.returncode != 0:
+        return [selected] if selected else []
+    paths = _ff_execution.changed_file_scope((listed.stdout or "").split("\0"))
+    if selected and selected not in paths:
+        paths.append(selected)
+    return paths
+
+
+def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
+                             current: str, stack: dict, branch: str) -> dict:
+    """Research and try the applicable top-three ideas for one-file mode.
+
+    Competitor source is never placed in the rewrite prompt. Only corroborated,
+    licence-gated capability descriptions produced by ``competitor_findings``
+    may influence the clean-room rewrite of the selected target file.
+    """
+    outcome = {
+        "attempted": True, "verified": 0, "implemented_files": [],
+        "note": "", "research": None, "current": current,
+    }
+    module = _competitors_module()
+    if module is None:
+        outcome["note"] = "competitor module unavailable; no idea was implemented"
+        return outcome
+    rr_url, rr_note = resolve_repo_rewards_url(args, auto_start=False)
+    rr_fn = (lambda query: repo_rewards_search(rr_url, query)) if rr_url else None
+    purpose = (
+        f"Refactor goal: {args.goal}\nSelected file: {rel}\n"
+        "Keep the repository's existing behavior while improving this explicit goal."
+    )
+    try:
+        research = module.research_competitors(
+            lambda system, prompt, schema: _judge(provider, system, prompt, schema),
+            os.path.basename(os.path.normpath(project_dir)) or rel,
+            purpose,
+            stack.get("ecosystems") or [],
+            rr_search=rr_fn,
+            rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
+            target=_ff_execution.TOP_COMPETITORS,
+            file_list=_tracked_repository_scope(project_dir, rel),
+            author=lambda system, prompt, schema: provider.structured(
+                system, prompt, schema, max_tokens=8000,
+                salvage_truncated=True,
+            ),
+            allow_credentialed_firecrawl=True,
+            log=lambda message: print(f"[competitor gate] {message}"),
+        )
+        outcome["research"] = research
+        outcome["verified"] = int(research.get("verified") or 0)
+        outcome["note"] = str(research.get("coverage_note") or "")
+        pairs = module.competitor_findings(
+            research,
+            max_findings=_ff_execution.TOP_COMPETITORS,
+            severity_floor_rank=0,
+            severity_rank=SEVERITY_RANK,
+            file_exists=lambda path: path.replace("\\", "/") == rel,
+            acceptance_total=0,
+        )
+    except Exception as exc:
+        outcome["note"] = (
+            f"competitor research failed closed: {type(exc).__name__}: {exc}"
+        )[:1000]
+        return outcome
+
+    relevant = [finding for path, finding in pairs
+                if str(path).replace("\\", "/") == rel]
+    if not relevant:
+        outcome["note"] = (outcome["note"] +
+                           " No corroborated applicable idea targeted the selected file.").strip()
+        return outcome
+
+    idea_summary = [{
+        "title": row.get("title"),
+        "problem": row.get("problem"),
+        "implementation": row.get("fix"),
+    } for row in relevant[:_ff_execution.TOP_COMPETITORS]]
+    instruction = (
+        f"GOAL: {args.goal}\n\n"
+        "CURRENT FILE:\n" + _fence_untrusted("source", current) + "\n\n"
+        "CORROBORATED COMPETITOR CAPABILITIES (descriptions only; implement "
+        "independently and only when applicable):\n"
+        + _fence_untrusted("competitor-capabilities", json.dumps(idea_summary))
+        + "\n\nReturn the complete selected file with the applicable capabilities "
+          "implemented without regressing the explicit goal. Return only file contents."
+    )
+    try:
+        candidate = _strip_code_fences(provider.complete(instruction))
+        if not candidate.strip() or candidate == current:
+            outcome["note"] = (outcome["note"] +
+                               " The implementation attempt produced no safe delta.").strip()
+            return outcome
+        grade = provider.grade(
+            f"GOAL: {args.goal}\n\nCANDIDATE CODE:\n"
+            + _fence_untrusted("candidate", candidate)
+            + "\n\nGrade whether the goal and applicable competitor capabilities are "
+              "implemented without regression."
+        )
+        if grade.meets_goal is not True or grade.grade < int(args.threshold):
+            outcome["note"] = (outcome["note"] +
+                               f" Implementation was rejected at grade {grade.grade}.").strip()
+            return outcome
+        if _replace_contained(project_dir, rel, candidate) is None:
+            outcome["note"] = (outcome["note"] +
+                               " Safe contained write was refused.").strip()
+            return outcome
+        if _git_changed_paths(project_dir) != [rel]:
+            _git(["checkout", "--", rel], project_dir)
+            outcome["note"] = (outcome["note"] +
+                               " Implementation widened beyond the selected file and was restored.").strip()
+            return outcome
+        before = _git(["rev-parse", "HEAD"], project_dir)
+        before_sha = (before.stdout or "").strip() if before.returncode == 0 else ""
+        status = _commit_and_sync(
+            project_dir, branch, branch, args,
+            f"top-three competitor capabilities for {rel}", stack,
+        )
+        after = _git(["rev-parse", "HEAD"], project_dir)
+        after_sha = (after.stdout or "").strip() if after.returncode == 0 else ""
+        if "committed" not in status or not after_sha or after_sha == before_sha:
+            outcome["note"] = (outcome["note"] +
+                               f" Implementation was not retained: {status}").strip()
+            return outcome
+        outcome["implemented_files"] = [rel]
+        outcome["current"] = candidate
+        outcome["note"] = (outcome["note"] +
+                           " Applicable capabilities were project-verified and committed.").strip()
+    except Exception as exc:
+        _git(["reset", "--hard", "HEAD"], project_dir)
+        outcome["note"] = (outcome["note"] +
+                           f" Implementation failed closed: {type(exc).__name__}: {exc}").strip()
+    return outcome
+
+
 def run(args) -> int:
     # A path the owner typed is usually the REPO-RELATIVE one they can see in
     # the editor ("backend/crawler-os/contract.js"), not one relative to
@@ -4861,32 +4997,37 @@ def run(args) -> int:
         return 1
     baseline_sha = None
     branch = None
-    if git:
-        if not _git_tree_clean(root):
-            print(
-                "error: refactor requires a clean Git worktree so only the "
-                "selected file can enter its verified commit.",
-                file=sys.stderr,
-            )
-            return 1
-        head = _git(["rev-parse", "HEAD"], root)
-        if head.returncode != 0:
-            print("error: could not resolve the refactor baseline commit.",
-                  file=sys.stderr)
-            return 1
-        baseline_sha = (head.stdout or "").strip()
-        branch = _git_current_branch(root)
-        if not branch:
-            print("error: refactor requires a named Git branch.", file=sys.stderr)
-            return 1
-        default_branch, default_basis = _remote_default_branch(root)
-        if not default_branch:
-            print(
-                "error: refactor could not resolve origin's authoritative "
-                f"default branch: {default_basis}",
-                file=sys.stderr,
-            )
-            return 1
+    if not _git_tree_clean(root):
+        print(
+            "error: refactor requires a clean Git worktree so only the "
+            "selected file can enter its verified commit.",
+            file=sys.stderr,
+        )
+        return 1
+    head = _git(["rev-parse", "HEAD"], root)
+    if head.returncode != 0:
+        print("error: could not resolve the refactor baseline commit.",
+              file=sys.stderr)
+        return 1
+    baseline_sha = (head.stdout or "").strip()
+    branch = _git_current_branch(root)
+    if not branch:
+        print("error: refactor requires a named Git branch.", file=sys.stderr)
+        return 1
+    default_branch, default_basis = _remote_default_branch(root)
+    if not default_branch:
+        print(
+            "error: refactor could not resolve origin's authoritative "
+            f"default branch: {default_basis}",
+            file=sys.stderr,
+        )
+        return 1
+    execution_orchestrator = getattr(args, "execution_orchestrator", None)
+    if execution_orchestrator is not None:
+        execution_orchestrator.begin_pass(
+            1, _tracked_repository_scope(root, rel.replace("\\", "/")),
+            whole_repository=True,
+        )
 
     # Every mode uses the same orchestrator-owned paid-to-free ladder.
     meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
@@ -4995,6 +5136,51 @@ def run(args) -> int:
             print("error: accepted refactor produced no committed source change.",
                   file=sys.stderr)
             return 1
+        if execution_orchestrator is not None:
+            changed_rel = rel.replace("\\", "/")
+            execution_orchestrator.finish_pass(1, [changed_rel])
+            competitor = _refactor_top_three_gate(
+                args, provider, root, changed_rel, current, stack, branch
+            )
+            execution_orchestrator.record_competitor_gate(
+                attempted=competitor["attempted"],
+                implemented_files=competitor["implemented_files"],
+                verified=competitor["verified"],
+                note=competitor["note"],
+            )
+            delta = _ff_execution.changed_file_scope(
+                [changed_rel] + list(competitor["implemented_files"])
+            )
+            execution_orchestrator.begin_pass(2, delta)
+            current = str(competitor.get("current") or current)
+            follow_up = provider.grade(
+                f"GOAL: {args.goal}\n\nFINAL EXACT-DELTA FILE:\n"
+                + _fence_untrusted("candidate", current)
+                + "\n\nRe-check only this edited file for goal satisfaction and regression."
+            )
+            if (follow_up.meets_goal is not True
+                    or follow_up.grade < int(args.threshold)):
+                print(
+                    "error: exact-delta pass 2 rejected the final refactor "
+                    f"at grade {follow_up.grade}.", file=sys.stderr,
+                )
+                return 1
+            delta_ok, delta_log = _publication_gate(root, stack)
+            if delta_ok is not True:
+                state = "failed" if delta_ok is False else "did not run"
+                print(
+                    f"error: exact-delta pass 2 project verification {state}: "
+                    + _tail(delta_log, 4), file=sys.stderr,
+                )
+                return 1
+            execution_orchestrator.finish_pass(2, [])
+            final_head = _git(["rev-parse", "HEAD"], root)
+            final_sha = ((final_head.stdout or "").strip()
+                         if final_head.returncode == 0 else "")
+            if not final_sha:
+                print("error: exact-delta pass lost the candidate commit.",
+                      file=sys.stderr)
+                return 1
         review_summary = {
             "mode": "refactor",
             "selected_file": rel.replace("\\", "/"),
@@ -5003,6 +5189,8 @@ def run(args) -> int:
             "project_gate": "passed",
             "checkpoint": checkpoint_status,
         }
+        if execution_orchestrator is not None:
+            review_summary["top_three_competitors"] = competitor.get("research")
         try:
             independent = _independent_final_review(
                 provider, root, baseline_sha, final_sha, review_summary
@@ -6151,22 +6339,24 @@ def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
 
 def _remote_default_branch(project_dir: str) -> tuple[str | None, str]:
     """Resolve origin's default branch from authoritative remote metadata."""
-    symbolic = _git(
-        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-        project_dir,
-    )
-    if symbolic.returncode == 0:
-        value = (symbolic.stdout or "").strip()
-        if value.startswith("origin/") and len(value) > len("origin/"):
-            return value[len("origin/"):], "origin/HEAD"
     remote = _git(["ls-remote", "--symref", "origin", "HEAD"], project_dir)
     if remote.returncode == 0:
         match = re.search(r"^ref:\s+refs/heads/([^\s]+)\s+HEAD$",
                           remote.stdout or "", re.MULTILINE)
         if match:
             return match.group(1), "origin HEAD"
-    return None, (_tail(remote.stderr or symbolic.stderr, 3)
-                  or "origin did not identify a default branch")
+    # A local origin/HEAD is only a cache. Keep it in the diagnostic so an
+    # operator can repair the clone, but never let it authorize publication:
+    # the repository owner may have renamed the default branch since fetch.
+    symbolic = _git(
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        project_dir,
+    )
+    cached = (symbolic.stdout or "").strip() if symbolic.returncode == 0 else ""
+    detail = _tail(remote.stderr, 3) or "origin did not identify a default branch"
+    if cached:
+        detail += f" (local cache says {cached}; cache is not publication authority)"
+    return None, detail
 
 
 def _remote_branch_contains(project_dir: str, branch: str,
@@ -6229,8 +6419,9 @@ def _publish_verified_head(project_dir: str, branch: str | None, args,
     """Publish only a fully verified HEAD and prove it landed on default.
 
     Direct default-branch pushes are attempted first. A protected branch falls
-    back to a normal PR with auto-merge; the orchestrator waits for that PR to
-    merge before returning success. It never force-pushes or bypasses checks.
+    back to a normal PR; the orchestrator retries an exact-head immediate merge
+    while checks settle. It never leaves a deferred auto-merge behind, force-
+    pushes, or bypasses checks.
     """
     result = {
         "required": True, "complete": False, "commit": commit,
@@ -6389,38 +6580,32 @@ def _publish_verified_head(project_dir: str, branch: str | None, args,
     if created.returncode != 0 and "already exists" not in create_text.lower():
         result["reason"] = f"landing PR creation failed: {_tail(create_text, 4)}"
         return result
-    enabled = _run(
-        ["gh", "pr", "merge", source_branch, "--auto", "--merge",
-         "--match-head-commit", commit],
-        project_dir, timeout=120
-    )
-    if enabled.returncode != 0:
-        immediate = _run(
-            ["gh", "pr", "merge", source_branch, "--merge",
-             "--match-head-commit", commit],
-            project_dir, timeout=120
-        )
-        if immediate.returncode != 0:
-            result["reason"] = (
-                "landing PR exists but merge could not be enabled: "
-                + _tail((enabled.stdout or "") + (enabled.stderr or "")
-                        + (immediate.stdout or "") + (immediate.stderr or ""), 4)
-            )
-            return result
-
     try:
         wait_seconds = int(os.environ.get("FLEXFACTOR_PUBLISH_WAIT_SECONDS", "900"))
     except ValueError:
         wait_seconds = 900
     deadline = time.time() + max(0, min(wait_seconds, 3600))
     last = ""
+    merge_argv = [
+        "gh", "pr", "merge", source_branch, "--merge",
+        "--match-head-commit", commit,
+    ]
     while True:
+        # This is deliberately NOT --auto. If the process times out or dies,
+        # no deferred GitHub action remains capable of landing an unobserved
+        # revision later. A protected branch simply rejects this immediate
+        # attempt until its checks and review requirements are satisfied.
+        attempted = _run(merge_argv, project_dir, timeout=120)
+        attempt_text = ((attempted.stdout or "")
+                        + (attempted.stderr or "")).strip()
         viewed = _run(
             ["gh", "pr", "view", source_branch,
              "--json", "state,mergedAt,url,mergeCommit,headRefOid"],
             project_dir, timeout=120
         )
         last = ((viewed.stdout or "") + (viewed.stderr or "")).strip()
+        if attempt_text:
+            last = (attempt_text + "\n" + last).strip()
         if viewed.returncode == 0:
             try:
                 status = json.loads(viewed.stdout or "{}")
@@ -7982,6 +8167,20 @@ def run_scout(args) -> int:
               "fallback.", file=sys.stderr)
         return 2
 
+    execution_orchestrator = getattr(args, "execution_orchestrator", None)
+    apply_dir = resolve_project_dir(args.program, display_name)
+    if execution_orchestrator is not None:
+        if not apply_dir or not os.path.isdir(apply_dir):
+            print(
+                "error: the shared execution contract requires a local repository "
+                "for Scout's whole-repository first pass.", file=sys.stderr,
+            )
+            return 2
+        scope = (_tracked_repository_scope(apply_dir)
+                 if _is_git_repo(apply_dir)
+                 else _enumerate_source_files(apply_dir, 0))
+        execution_orchestrator.begin_pass(1, scope, whole_repository=True)
+
     meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
     try:
         provider = _best_available_provider(args, meter)
@@ -8007,6 +8206,9 @@ def run_scout(args) -> int:
     print(f"  {profile_name}: {profile.get('summary', '').strip()}")
     print(f"  stack: {', '.join(profile.get('stack') or []) or '(unknown)'}")
     print(f"  found {len(opportunities)} opportunity area(s) to search.\n")
+    if execution_orchestrator is not None:
+        # Profiling consumes the repository context but does not mutate it.
+        execution_orchestrator.finish_pass(1, [])
 
     # 3. For each opportunity, search Repo Rewards. Dedupe candidates by repo,
     #    keeping the opportunity that surfaced each one.
@@ -8032,7 +8234,9 @@ def run_scout(args) -> int:
 
     # Choose candidates with breadth across needs (not just global finalScore),
     # then judge each for whether it improves the program.
-    ranked = _select_candidates(list(candidates.values()), args.top)
+    ranked = _select_candidates(
+        list(candidates.values()), _ff_execution.TOP_COMPETITORS
+    )
     print(f"\nJudging {len(ranked)} candidate repo(s) across "
           f"{len({c['need'] for c in ranked})} need(s) for improvement to {profile_name}...\n")
 
@@ -8091,7 +8295,6 @@ def run_scout(args) -> int:
     #    target mutation requires separate FlexFactor apply approval (or
     #    --legacy-inline-apply). SAFE DEFAULT remains report-only.
     applied: list[ApplyResult] = []
-    apply_dir = resolve_project_dir(args.program, profile_name)
     proposals = []
     for e in evaluations:
         _scout_contract.pin_fields_from_evidence(e)
@@ -8104,6 +8307,36 @@ def run_scout(args) -> int:
         else:
             print("\nApply cancelled - report + proposals only. "
                   "(Re-run with --apply --yes to skip this prompt.)")
+
+    implemented_files = _ff_execution.changed_file_scope(
+        path
+        for result in applied if result.status.startswith("applied")
+        for path in (result.files or [])
+    )
+    if execution_orchestrator is not None:
+        verified = sum(
+            1 for evaluation in evaluations
+            if (evaluation.get("evidence") or {}).get("clone_inspection_ok") is True
+        )
+        execution_orchestrator.record_competitor_gate(
+            attempted=True,
+            implemented_files=implemented_files,
+            verified=min(verified, _ff_execution.TOP_COMPETITORS),
+            note=(f"evaluated {len(evaluations)} of the top "
+                  f"{_ff_execution.TOP_COMPETITORS} candidate repositories"),
+        )
+        if implemented_files:
+            execution_orchestrator.begin_pass(2, implemented_files)
+            stack = _detect_stack(apply_dir)
+            follow_up_ok, follow_up_log = _publication_gate(apply_dir, stack)
+            if follow_up_ok is not True:
+                state = "failed" if follow_up_ok is False else "did not run"
+                print(
+                    f"error: Scout exact-delta pass 2 project verification {state}: "
+                    + _tail(follow_up_log, 4), file=sys.stderr,
+                )
+                return 4
+            execution_orchestrator.finish_pass(2, [])
 
     report_path = _write_scout_report(args.program, profile_name, profile, evaluations, applied)
     structured = _scout_contract.build_scout_structured_report(
@@ -18236,6 +18469,7 @@ def run_audit(args) -> int:
     saved = orchestrator.snapshot()
     prior_codes = [int(row.get("exit_code") or 0)
                    for row in saved["items"][:orchestrator.next_index]]
+    queue_codes = list(prior_codes)
     if orchestrator.next_index:
         print(f"[orchestrator] resuming at target {orchestrator.next_index + 1}; "
               f"{orchestrator.next_index} prior terminal outcome(s) remain in "
@@ -18250,10 +18484,11 @@ def run_audit(args) -> int:
         result = audit_one_program(program, child_args, index + 1, total, 5180)
         results.append(result)
         target_code = _audit_exit_code([result], apply_requested=True)
-        orchestrator.finish_target(
+        target_code = orchestrator.finish_target(
             index, target_code,
             note=str(result.get("stop_reason") or result.get("error") or "")
         )
+        queue_codes.append(target_code)
 
     # 3. Batch summary + combined report.
     if results:
@@ -18264,7 +18499,7 @@ def run_audit(args) -> int:
 
     # Every run is an apply run now (review-only was removed outright), so the
     # applied-nothing exit-code contract applies unconditionally.
-    return (next((code for code in prior_codes if code != 0), 0)
+    return (next((code for code in queue_codes if code != 0), 0)
             or _audit_exit_code(results, apply_requested=True))
 
 
@@ -18307,7 +18542,7 @@ def _run_simple_target_queue(args, attribute: str, runner, mode: str) -> int:
                 index, 1, note=f"{type(exc).__name__}: {exc}"
             )
             raise
-        orchestrator.finish_target(index, code)
+        code = orchestrator.finish_target(index, code)
         codes.append(code)
     return next((code for code in codes if code != 0), 0)
 

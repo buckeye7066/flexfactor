@@ -255,6 +255,14 @@ class EntryPointParityTests(unittest.TestCase):
             # ASCII-only launcher constraint (WinPS 5.1 without a BOM mangles UTF-8).
             src.encode("ascii")
 
+    def test_scout_launchers_require_explicit_remote_context_consent(self):
+        for name in ("flexfactor_launch.ps1", "flexfactor_scout_launch.ps1"):
+            with open(os.path.join(HERE, name), encoding="ascii") as stream:
+                source = stream.read()
+            self.assertIn("Type YES", source, name)
+            self.assertIn('$contextConsent -cne "YES"', source, name)
+            self.assertIn("--allow-remote-program-context", source, name)
+
     @unittest.skipUnless(shutil.which("powershell") or shutil.which("pwsh"),
                          "no PowerShell on this host: launcher parse UNVERIFIED (blocked, not passed)")
     def test_launchers_parse_under_powershell(self):
@@ -273,7 +281,7 @@ class EntryPointParityTests(unittest.TestCase):
         script = os.path.join(HERE, "flexfactor_run.py")
         target = "portfolio-target"
         cases = (
-            ("flexfactor_launch.ps1", [target], ["2", "", ""],
+            ("flexfactor_launch.ps1", [target], ["2", "", "YES", ""],
              {"ANTHROPIC_API_KEY": "test-placeholder", "OPENAI_API_KEY": ""},
              [script, "scout", "--max-cost", "150", "--model-mode", "best",
               "--allow-remote-program-context", "--program", target]),
@@ -281,9 +289,9 @@ class EntryPointParityTests(unittest.TestCase):
              {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
               "OPENAI_API_KEY": "test-placeholder"},
              [script, "audit", "--model-mode", "best", "--max-cost", "150",
-              "--max-cycles", "6", "--apply", "--yes", "--no-auto-clean",
+              "--max-cycles", "6", "--apply", "--yes", "--auto-clean",
               "--program", target]),
-            ("flexfactor_scout_launch.ps1", [target], ["", ""],
+            ("flexfactor_scout_launch.ps1", [target], ["", "YES", ""],
              {"OPENAI_API_KEY": "test-placeholder",
               "FLEXFACTOR_REPO_REWARDS_URL": "http://127.0.0.1:3000"},
              [script, "scout", "--model-mode", "best", "--max-cost", "150",

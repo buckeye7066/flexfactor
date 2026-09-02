@@ -349,7 +349,7 @@ class SequentialOrchestrator:
             }
             self._save()
 
-    def finish_target(self, index: int, exit_code: int, *, note: str = "") -> None:
+    def finish_target(self, index: int, exit_code: int, *, note: str = "") -> int:
         with self._lock:
             if self._state["active_index"] != index:
                 raise OrchestrationOrderError("only the active target can finish")
@@ -363,6 +363,33 @@ class SequentialOrchestrator:
                     note = (str(note or "") + "; " if note else "") + (
                         "orchestrator refused success while a pass was still active"
                     )
+            if code == 0:
+                failures: list[str] = []
+                passes = list(item.get("passes") or [])
+                if not passes:
+                    failures.append("no repository pass was recorded")
+                elif (passes[0].get("number") != 1
+                      or passes[0].get("scope") != "whole-repository"):
+                    failures.append("pass 1 did not cover the whole repository")
+                if any(row.get("status") != "completed" for row in passes):
+                    failures.append("not every recorded pass completed")
+                gate = item.get("competitor_gate")
+                if not isinstance(gate, dict) or gate.get("attempted") is not True:
+                    failures.append("the top-three competitor gate was not attempted")
+                if passes and len(passes) < MAX_PASSES:
+                    pending = changed_file_scope(passes[-1].get("changed_files") or [])
+                    if len(passes) == 1 and isinstance(gate, dict):
+                        pending = changed_file_scope(
+                            pending + list(gate.get("implemented_files") or [])
+                        )
+                    if pending:
+                        failures.append(
+                            "verified edits were not followed by the required exact-delta pass"
+                        )
+                if failures:
+                    code = 1
+                    refusal = "orchestrator refused success: " + "; ".join(failures)
+                    note = (str(note or "") + "; " if note else "") + refusal
             item["exit_code"] = code
             item["status"] = "completed" if code == 0 else "failed"
             item["note"] = str(note or "")[:1000]
@@ -375,6 +402,7 @@ class SequentialOrchestrator:
             else:
                 self._state["status"] = "queued"
             self._save()
+            return code
 
 
 def run_sequential_queue(mode: str, targets: Iterable[object],
@@ -403,7 +431,7 @@ def run_sequential_queue(mode: str, targets: Iterable[object],
                 index, 1, note=f"{type(exc).__name__}: {exc}"
             )
             raise
-        orchestrator.finish_target(index, code)
+        code = orchestrator.finish_target(index, code)
         results.append(code)
     return (next((code for code in results if code != 0), 0), orchestrator)
 

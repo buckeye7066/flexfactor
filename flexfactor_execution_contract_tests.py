@@ -99,6 +99,38 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(item["status"], "failed")
         self.assertNotEqual(item["exit_code"], 0)
 
+    def test_success_is_refused_when_a_mode_bypasses_the_contract(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.finish_target(0, 0)
+        item = coordinator.snapshot()["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("no repository pass", item["note"])
+        self.assertIn("competitor gate", item["note"])
+
+    def test_queue_exit_code_propagates_contract_refusal(self):
+        root = tempfile.mkdtemp(prefix="ff-queue-refusal-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        code, coordinator = execution.run_sequential_queue(
+            "scout", ["repo"], lambda *_args: 0,
+            state_path=os.path.join(root, "receipt.json"), queue_id="refusal",
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(coordinator.snapshot()["status"], "failed")
+
+    def test_success_requires_an_exact_delta_follow_up_after_edits(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, ["a.py"])
+        coordinator.record_competitor_gate(
+            attempted=True, implemented_files=[], verified=3
+        )
+        coordinator.finish_target(0, 0)
+        item = coordinator.snapshot()["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("exact-delta", item["note"])
+
     def test_interrupted_target_resumes_without_replaying_prior_targets(self):
         root = tempfile.mkdtemp(prefix="ff-queue-resume-")
         self.addCleanup(__import__("shutil").rmtree, root, True)
@@ -130,6 +162,11 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(active, [])
             active.append(target)
             observed.append((target, index, total))
+            coordinator.begin_pass(1, [target], whole_repository=True)
+            coordinator.finish_pass(1, [])
+            coordinator.record_competitor_gate(
+                attempted=True, implemented_files=[], verified=3
+            )
             active.pop()
             return 0
 

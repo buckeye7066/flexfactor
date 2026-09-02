@@ -53,9 +53,28 @@ jobs:
         if: github.event_name != 'pull_request'
         shell: bash
         run: |
-          health=$(curl --fail --silent --show-error --retry 3 \
-            https://flexfactor-cloud.vercel.app/api/health)
-          jq -e '.ok == true and .oauth_device_configured == true' <<<"$health"
+          version_name=$(sed -n \
+            's/.*versionName = "\([^"]*\)".*/\1/p' \
+            android/app/build.gradle.kts)
+          if [ -z "$version_name" ]; then
+            echo "Could not resolve the Android release version" >&2
+            exit 1
+          fi
+          expected_engine="android-v${version_name}"
+          for attempt in {1..60}; do
+            health=$(curl --fail --silent --show-error --retry 3 \
+              https://flexfactor-cloud.vercel.app/api/health) || health='{}'
+            if jq -e --arg engine "$expected_engine" \
+                '.ok == true and .oauth_device_configured == true and .engine_ref == $engine' \
+                <<<"$health"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "Managed control plane is not serving $expected_engine: $health" >&2
+              exit 1
+            fi
+            sleep 10
+          done
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
         with:
           gradle-version: "8.13"
