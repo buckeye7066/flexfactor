@@ -201,6 +201,11 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
         self.assertIn("expected_sha:", workflow)
         self.assertIn('test "$EXPECTED_SHA" = "$GITHUB_SHA"', workflow)
+        self.assertIn(
+            '"$GITHUB_EVENT_NAME" = "workflow_dispatch"', workflow)
+        self.assertIn('"$tag_commit" != "$GITHUB_SHA"', workflow)
+        self.assertIn(
+            "The existing release tag is not the authorized main commit", workflow)
         push_trigger = workflow.split("  push:", 1)[1].split("  pull_request:", 1)[0]
         pull_request_trigger = workflow.split("  pull_request:", 1)[1].split(
             "  workflow_dispatch:", 1)[0]
@@ -216,6 +221,7 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('if [ "$release_status" = 404 ]', workflow)
         self.assertIn('elif [ "$release_status" = 200 ]', workflow)
         self.assertIn('source_sha="$tag_commit"', workflow)
+        self.assertIn('source_sha="$GITHUB_SHA"', workflow)
         self.assertIn("source_sha: ${{ steps.plan.outputs.source_sha }}", workflow)
         self.assertIn("ref: ${{ needs.release-plan.outputs.source_sha }}", workflow)
         self.assertNotIn('"${GITHUB_SHA}^:android/app/build.gradle.kts"', workflow)

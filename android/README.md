@@ -75,11 +75,11 @@ Pull requests receive an exact-commit debug artifact. A version change merged
 to `main` creates the matching release tag and publishes the signed production
 APK and update manifest.
 
-For a low-level fast-forward that does not emit a push workflow, the repository
-owner may comment `/release-android <current-main-sha>` on an issue or pull
-request. `.github/workflows/release-command.yml` verifies the owner and current
-`main` ref before dispatch, while `android-client.yml` independently binds the
-manual run to the same 40-character SHA before it can sign or publish.
+When an automatic release needs an exact rerun or repair, the repository owner
+may comment `/release-android <current-main-sha>` on an issue or pull request.
+`.github/workflows/release-command.yml` verifies the owner and current `main`
+ref before dispatch. `android-client.yml` independently binds the manual run to
+the same 40-character SHA and rejects an older conflicting tag before signing.
 
 ## Release signing and updates
 

@@ -265,6 +265,11 @@ jobs:
               tag_version=$(git show \
                 "${tag_commit}:android/app/build.gradle.kts" | read_version)
               test "$tag_version" = "$version_name"
+              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] \
+                  && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The existing release tag is not the authorized main commit" >&2
+                exit 1
+              fi
               if [ "$version_changed" = true ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
                 echo "The newly declared version already belongs to another commit" >&2
                 exit 1
@@ -286,7 +291,11 @@ jobs:
               fi
               if [ "$release_status" = 404 ]; then
                 should_publish=true
-                source_sha="$tag_commit"
+                if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                  source_sha="$GITHUB_SHA"
+                else
+                  source_sha="$tag_commit"
+                fi
               elif [ "$release_status" = 200 ]; then
                 jq -e 'type == "object"' "$release_json" >/dev/null \
                   || { echo "GitHub returned invalid release metadata" >&2; exit 1; }
@@ -304,7 +313,11 @@ jobs:
                 set -e
                 if [ "$release_complete_rc" -eq 1 ]; then
                   should_publish=true
-                  source_sha="$tag_commit"
+                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                    source_sha="$GITHUB_SHA"
+                  else
+                    source_sha="$tag_commit"
+                  fi
                 elif [ "$release_complete_rc" -ne 0 ]; then
                   echo "GitHub returned invalid release asset metadata" >&2
                   exit 1
