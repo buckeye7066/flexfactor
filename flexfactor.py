@@ -3726,7 +3726,11 @@ def _judge_intent(provider, schema: dict) -> dict:
     the author's family). Everything else is a judge that must emit JSON.
     """
     try:
-        if schema is ADVERSARIAL_VERIFY_SCHEMA or schema is FINAL_REVIEW_SCHEMA:
+        if schema in (
+                FIX_VERIFY_SCHEMA,
+                ADVERSARIAL_VERIFY_SCHEMA,
+                FINAL_REVIEW_SCHEMA,
+        ):
             return _intent_kw(provider, "reviewer", "code_review", "structured_json", "honest")
         if schema is AUDIT_FINDINGS_SCHEMA:
             return _intent_kw(provider, "reviewer", "code_review", "structured_json")

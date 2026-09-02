@@ -745,6 +745,41 @@ class RotatingProviderTests(RotationTestCase):
         with self.assertRaisesRegex(R.RotationError, "opaque author"):
             prov.structured("system", "exact patch", {}, intent=final_review)
 
+    def _cross_verify_provider(self):
+        prov = self._provider(catalog(
+            route("front/gpt", "openai-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/gpt", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+            route("light/auto", "opaque-light", tier=R.LIGHT,
+                  model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("author"), "completed by front/gpt")
+        self.assertEqual(prov.role_coordinator.author_families, {"openai"})
+        return prov
+
+    def test_ordinary_cross_verify_excludes_author_and_opaque_families(self):
+        import flexfactor as F
+
+        prov = self._cross_verify_provider()
+        F._cross_verify_fix(
+            prov, "code.py", "VALUE = 1\n", "VALUE = 2\n", [],
+        )
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("claude-sonnet-4.6", selection.route.model)
+
+    def test_structural_cross_verify_excludes_author_and_opaque_families(self):
+        import flexfactor as F
+
+        prov = self._cross_verify_provider()
+        F._cross_verify_structural(
+            prov, "code.py", [], "rewrite code.py",
+        )
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("claude-sonnet-4.6", selection.route.model)
+
     def test_independent_grader_refuses_an_opaque_auto_reviewer(self):
         prov = self._provider(catalog(
             route("front/qwen", "qwen-front", tier=R.FRONTIER,
