@@ -40,7 +40,7 @@ publication contract on desktop and in the signed Android app.
 | Mode | Selection | Behavior |
 |---|---|---|
 | Refactor | Up to 30 repository-relative files | Rewrite and grade each file toward its stated goal, then verify, independently review, and land the exact commit. |
-| Scout | Up to 30 repositories | Retrieve a public product URL, inventory every evidenced behavior, and design a complete independent twin. `--apply` builds/tests/reviews it on a permanent `scout/twin/...` branch while Repo Rewards separately finds code for target-specific deltas. |
+| Scout | Up to 30 product URLs | Retrieve each public product URL, inventory every evidenced behavior, and supervise a complete independent application. `--apply` builds, repairs, tests, reviews, and retains it on a permanent `scout/twin/...` branch. An optional later `--target` comparison sends only accepted target-specific deltas to Repo Rewards. |
 | Audit | Up to 30 repositories | Whole-repository purpose, defect, test, journey, evidence, competitor, repair, and publication pipeline. |
 | Production Ready | Up to 30 repositories | Audit with the full readiness rubric, medium-severity repair, unattended defaults, and no relaxed completion claim. |
 
@@ -67,10 +67,10 @@ Examples:
 
 ```bash
 python flexfactor.py refactor --file src/app.py --goal "Make failures explicit"
-python flexfactor.py scout --target /path/to/repo --program https://product.example/features \
-  --allow-remote-program-context
-python flexfactor.py scout --target /path/to/repo --program https://product.example/features \
-  --allow-remote-program-context --apply --yes --trust-repo
+python flexfactor.py scout --program https://product.example/features \
+  --apply --yes --trust-repo
+python flexfactor.py scout --program https://product.example/features \
+  --target /path/to/repo --allow-remote-program-context
 python flexfactor.py audit --program /repo/one --program /repo/two --yes
 python flexfactor.py prodready --program /path/to/repo --yes
 python flexfactor.py --runtime-manifest
@@ -116,17 +116,17 @@ and discards later provider prose. It treats an independently verified
 unchanged refactor as a real no-op only after proving its baseline is already
 on the authoritative remote default branch.
 
-Version 3.6.0 makes Scout's source field URL-only. Scout retrieves the entered
-program/product site plus up to twelve prioritized same-site feature/help/API
-pages, records whether that bound left queued pages, profiles cited target and
-source evidence separately, and
-accounts for every observed source capability before it asks Repo Rewards to
-find repositories implementing an accepted target-specific delta. Scout now
-also derives a full public-behavior contract whose scope is independent of
-target fit. With apply enabled, the same canonical URL always maps to the same
+Version 3.6.0 makes Scout's source field URL-only. A URL-only run retrieves the
+entered program/product site plus up to twelve prioritized same-site feature/help/API
+pages, records whether that bound left queued pages, accounts for every observed
+source capability, and derives the complete public-behavior contract before any
+target is involved. When a later run supplies `--target`, Scout profiles target
+and source evidence separately and asks Repo Rewards only for implementations of
+accepted target-specific deltas. With apply enabled, the same canonical URL always maps to the same
 persistent `scout/twin/<host>-<url-hash>` branch and isolated
 `scout_twins/<host>-<url-hash>/` subtree. A sparse temporary worktree authors,
-tests, and independently reviews the twin; only that checkout is removed. The
+tests, repairs, and independently reviews the twin through bounded supervising
+cycles; only that checkout is removed. The
 remote branch, code, tests, evidence contract, feature accounting, and history
 remain and are updated on later scans. Model weights and large generated assets
 are declared as lazy dependencies rather than committed into Git.

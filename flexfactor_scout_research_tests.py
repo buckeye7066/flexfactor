@@ -330,7 +330,7 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
                             "class GreetingTests(unittest.TestCase):\n"
                             "    def test_public_outcome(self):\n"
                             "        pathlib.Path('runtime-only.txt').write_text('side effect')\n"
-                            "        self.assertEqual(render('IPlay'), 'Hello, IPlay!')\n\n"
+                            "        self.assertEqual(render('Scout'), 'Hello, Scout!')\n\n"
                             "if __name__ == '__main__':\n    unittest.main()\n")},
                     ],
                     "delete_files": [],
@@ -346,6 +346,32 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
                         {"name": "Greeting flow", "status": "implemented",
                          "tests": ["tests/test_app.py"], "limitations": [], "blockers": []},
                     ],
+                    "runtime_contract": {
+                        "entrypoints": [{
+                            "name": "Greeting CLI", "kind": "cli",
+                            "command": ["python", "app.py"],
+                            "implementation_files": ["app.py"],
+                            "readiness_check": "Import app and call render with a name",
+                        }],
+                        "capability_routes": [{
+                            "name": "Render greeting",
+                            "execution_files": ["app.py"],
+                            "acceptance_tests": ["tests/test_app.py"],
+                            "success_artifacts": ["rendered greeting string"],
+                            "validation": ["assert exact greeting output"],
+                            "runtime_dependencies": [],
+                        }],
+                        "failure_policy": "Raise an error for invalid input rather than report fake success.",
+                    },
+                    "reuse_contract": {
+                        "modules": [{
+                            "purpose": "Render greetings in another program",
+                            "module": "app", "symbols": ["render"],
+                            "files": ["app.py"],
+                            "consumer_contract": "render(name) returns the completed greeting string",
+                        }],
+                        "integration_example": "from app import render; output = render('Scout')",
+                    },
                     "dependencies": [], "summary": "working greeting twin",
                     "commit_message": "Build source greeting behavioral twin",
                 }
@@ -354,6 +380,22 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
                 return {"verdict": "approve", "commit": commit, "findings": [],
                         "evidence_consistent": True, "reason": "exact commit verified"}
             raise AssertionError("unexpected schema")
+
+    class RepairingProvider(Provider):
+        def __init__(self):
+            self.repair_calls = 0
+
+        def structured(self, system, prompt, schema, max_tokens=8000, **kwargs):
+            payload = super().structured(system, prompt, schema, max_tokens, **kwargs)
+            if schema is ff.BEHAVIORAL_TWIN_PATCH_SCHEMA:
+                if system == ff.BEHAVIORAL_TWIN_REPAIR_SYSTEM:
+                    self.repair_calls += 1
+                elif system == ff.BEHAVIORAL_TWIN_PATCH_SYSTEM:
+                    for row in payload["files"]:
+                        if row["path"] == "tests/test_app.py":
+                            row["contents"] = row["contents"].replace(
+                                "'Hello, Scout!'", "'WRONG OUTPUT'")
+            return payload
 
     @staticmethod
     def _git(root, *args):
@@ -411,7 +453,8 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
         before_head = self._git(root, "rev-parse", "HEAD").stdout.strip()
         before_status = self._git(root, "status", "--porcelain").stdout
         args = argparse.Namespace(verify=True, isolate_verify=True,
-                                  trust_repo=True, push=True)
+                                  trust_repo=True, push=True,
+                                  scout_twin_repo=root)
         result = ff.build_behavioral_twin_branch(
             args, root, spec, bundle, self.Provider())
         self.assertEqual(result.status, "published", result.detail)
@@ -437,6 +480,28 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
         self.assertEqual(second.status, "up-to-date", second.detail)
         self.assertEqual(second.branch, branch)
         self.assertEqual(second.independent_review.get("verdict"), "approve")
+
+    def test_failed_generated_app_is_repaired_and_reverified_before_push(self):
+        root, _remote = self._fixture()
+        bundle, spec = self._spec()
+        provider = self.RepairingProvider()
+        args = argparse.Namespace(verify=True, isolate_verify=True,
+                                  trust_repo=True, push=True,
+                                  scout_twin_repo=root)
+        result = ff.build_behavioral_twin_branch(
+            args, root, spec, bundle, provider)
+        self.assertEqual(result.status, "published", result.detail)
+        self.assertGreaterEqual(provider.repair_calls, 1)
+        branch = spec["identity"]["branch"]
+        subtree = spec["identity"]["subtree"]
+        receipt = self._git(root, "show", f"{branch}:{subtree}/SUPERVISION.json")
+        self.assertEqual(receipt.returncode, 0, receipt.stderr)
+        supervision = json.loads(receipt.stdout)
+        self.assertTrue(supervision["completed"])
+        self.assertEqual(
+            [row["status"] for row in supervision["cycles"]
+             if row["stage"] == "verification"],
+            ["rejected", "passed"])
 
     def test_patch_validator_refuses_path_escape_and_missing_feature(self):
         _bundle, spec = self._spec()
@@ -478,29 +543,15 @@ class ScoutPersistentTwinBranchTests(unittest.TestCase):
         self.assertEqual(inventory.get("file_count"), 2)
 
 
-class HeyGenToIPlayReplayTests(unittest.TestCase):
-    """Named replay of the owner's required URL/target acceptance case.
+class HeyGenStandaloneReplayTests(unittest.TestCase):
+    """Named replay of the owner's required standalone URL acceptance case.
 
     The evidence rows are short factual paraphrases of the official public
-    HeyGen pages and the cited IPlay repository files inspected on 2026-09-02.
-    No vendor source or private behavior is present in the fixture.
+    HeyGen pages inspected on 2026-09-02. No target-program evidence, vendor
+    source, or private behavior is present in the fixture.
     """
 
-    def test_full_heygen_twin_scope_is_not_reduced_to_iplay_optimizations(self):
-        target_bundle = {
-            "evidence": [
-                {"id": "T1", "path": "iplay/README.md",
-                 "title": "IPlay product boundary",
-                 "text": "Playing motion and instrument contact must remain exact; "
-                         "generative video is limited to non-performance material."},
-                {"id": "T2", "path": "iplay/iplay_app.py",
-                 "title": "IPlay render path",
-                 "text": "The note plan currently proceeds directly into exact avatar render."},
-                {"id": "T3", "path": "iplay/performance_qa.py",
-                 "title": "IPlay performance QA",
-                 "text": "Checks pose fidelity and replacement leakage."},
-            ],
-        }
+    def test_full_heygen_twin_is_created_without_any_target_program(self):
         source_bundle = {
             "canonical_url": "https://www.heygen.com/", "name_hint": "HeyGen",
             "evidence": [
@@ -586,71 +637,73 @@ class HeyGenToIPlayReplayTests(unittest.TestCase):
             "stack_signals": [], "limitations": ["Private model internals are not public"],
             "coverage_gaps": ["Public evidence does not establish model architecture"],
         }
-        decisions = {
-            "Prompt-to-video planning and approval": "adapt",
-            "Photo-to-talking-avatar video": "reject",
-            "Script lip sync and voiceover": "reject",
-            "Directed gesture, expression, gaze, and motion": "reject",
-            "Full-body and multiple output formats": "reject",
-            "Programmatic avatar video API": "adapt",
-            "Captions, visuals, and animation composition": "adapt",
-            "Long-form avatar identity consistency": "adapt",
-        }
-
-        def comparison_row(capability):
-            decision = decisions[capability["name"]]
-            accepted = decision == "adapt"
-            return {
-                "capability": capability["name"], "decision": decision,
-                "source_behavior": capability["behavior"],
-                "target_state": "IPlay has exact performance rendering with bounded generative use",
-                "target_gap": ("the evidenced workflow/QA layer is absent" if accepted
-                               else "no purpose-compatible gap"),
-                "purpose_alignment": ("preserves exact playing while improving orchestration"
-                                      if accepted else "would risk or duplicate exact performance"),
-                "how_it_optimizes": ("adds a bounded IPlay-native capability" if accepted
-                                     else "does not improve IPlay's exact-performance purpose"),
-                "adaptation_plan": ("implement only around IPlay's exact renderer" if accepted
-                                    else "retain in the standalone twin, not IPlay"),
-                "target_touchpoints": ["iplay/iplay_app.py"],
-                "verification_plan": "prove note, timing, hand, and instrument-contact invariants remain exact",
-                "implementation_search_query": "independent public behavior implementation",
-                "value_score": 85 if accepted else 20,
-                "confidence": capability["confidence"],
-                "target_evidence_refs": ["T1", "T2", "T3"],
-                "source_evidence_refs": capability["evidence_refs"],
-            }
-
-        comparison = research.validate_comparison(
-            {"target_name": "IPlay", "scouted_name": "HeyGen",
-             "summary": "Use bounded orchestration/QA while protecting exact performance",
-             "coverage_gaps": [],
-             "recommendations": [comparison_row(row)
-                                 for row in source_profile["capabilities"]]},
-            target_bundle, source_bundle, source_profile)
-        self.assertTrue(comparison["validation"]["complete"], comparison)
-        twin = research.build_behavioral_twin_spec(
-            source_bundle, source_profile,
-            target_profile={"name": "IPlay", "summary": "Exact avatar instrument performance"},
-            comparison=comparison)
+        twin = research.build_behavioral_twin_spec(source_bundle, source_profile)
         twin_names = [row["name"] for row in
                       twin["public_behavior_contract"]["capabilities"]]
         author_evidence = json.loads(ff._twin_public_evidence_context(
             source_bundle, twin))
-        accepted = ff._accepted_program_optimizations(comparison)
-        selective = research.build_clean_room_contracts(
-            comparison, target_bundle, source_bundle, source_profile)
         self.assertEqual(len(twin_names), 8)
-        self.assertEqual(set(twin_names), set(decisions))
+        self.assertEqual(
+            set(twin_names),
+            {row["name"] for row in source_profile["capabilities"]})
         self.assertEqual({row["id"] for row in author_evidence},
                          {"S1", "S2", "S3", "S4", "S5", "S6"})
-        self.assertEqual(len(accepted), 4)
-        self.assertEqual(len(selective["contracts"]), 4)
         self.assertEqual(twin["identity"]["branch"],
                          "scout/twin/heygen-c0fadff54acb")
-        rejected_in_iplay = {name for name, decision in decisions.items()
-                             if decision == "reject"}
-        self.assertTrue(rejected_in_iplay.issubset(set(twin_names)))
+        self.assertNotIn("target_profile", twin)
+        self.assertNotIn("target_fit", twin)
+
+
+class ScoutStandaloneUrlEndToEndTests(unittest.TestCase):
+    def test_url_only_run_builds_scout_branch_without_target_or_repo_rewards(self):
+        bundle = {
+            "reference": "https://source.example",
+            "kind": "website-url", "name_hint": "SourceSuite",
+            "canonical_url": "https://source.example/",
+            "retrieved_at": "2026-09-02T00:00:00+00:00",
+            "evidence": [{
+                "id": "S1", "url": "https://source.example/features",
+                "title": "Source features", "text": "Creates a finished video.",
+            }],
+            "coverage": {"complete": True, "pages_retrieved": 1},
+        }
+        profile = {
+            "name": "SourceSuite", "summary": "Creates videos.",
+            "program_type": "service", "canonical_url": "https://source.example/",
+            "workflows": [{"name": "Create video", "behavior": "Create then export",
+                           "evidence_refs": ["S1"]}],
+            "capabilities": [{
+                "name": "Video export", "behavior": "Produces a finished video",
+                "user_value": "Delivers the requested media",
+                "implementation_pattern": "validated render pipeline",
+                "evidence_refs": ["S1"], "confidence": "high",
+            }],
+            "stack_signals": [], "limitations": [], "coverage_gaps": [],
+            "evidence_validation": {"complete": True},
+        }
+        args = argparse.Namespace(
+            target=None, program="https://source.example", apply=True,
+            assume_yes=True, apply_tier="adopt", max_cost=25.0,
+            model_mode="best", provider="auto", model=None, economy=False,
+            judge_model=None, trust_repo=True,
+        )
+        published = ff.TwinResult(
+            "published", "verified", "scout/twin/source-example-123456789abc",
+            "scout_twins/source-example-123456789abc")
+        with mock.patch.object(ff, "_research_program_reference",
+                               return_value=bundle), \
+             mock.patch.object(ff, "_best_available_provider",
+                               return_value=object()), \
+             mock.patch.object(ff, "_profile_research_bundle",
+                               return_value=profile), \
+             mock.patch.object(ff, "build_behavioral_twin_branch",
+                               return_value=published) as build, \
+             mock.patch.object(ff, "repo_rewards_search") as repo_rewards:
+            rc = ff._run_scout_impl(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(build.call_count, 1)
+        self.assertIsNone(build.call_args.args[1])
+        repo_rewards.assert_not_called()
 
 
 class ScoutProgramComparisonEndToEndTests(unittest.TestCase):
