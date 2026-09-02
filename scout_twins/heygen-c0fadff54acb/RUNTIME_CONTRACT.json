@@ -1,0 +1,94 @@
+{
+  "schema_version": "1.0",
+  "entrypoints": [
+    {
+      "name": "Avatar Studio web/API",
+      "kind": "web",
+      "command": ["avatar-twin-server", "--runtime-config", "runtime.local.json", "--asset-root", "."],
+      "implementation_files": ["src/avatar_twin/server.py", "src/avatar_twin/studio.py", "src/avatar_twin/live.py", "src/avatar_twin/pipeline.py"],
+      "readiness_check": "GET /health and require runtime.ready=true for at least one selected production provider"
+    },
+    {
+      "name": "Avatar Studio CLI",
+      "kind": "cli",
+      "command": ["avatar-twin", "render", "approved-project.json", "--runtime-config", "runtime.local.json", "--output-dir", "output"],
+      "implementation_files": ["src/avatar_twin/cli.py", "src/avatar_twin/renderer.py"],
+      "readiness_check": "selected provider readiness succeeds and FFmpeg/FFprobe resolve before completion"
+    }
+  ],
+  "capability_routes": [
+    {
+      "name": "Prompt-to-video planning",
+      "execution_files": ["src/avatar_twin/planning.py"],
+      "acceptance_tests": ["tests/test_planning.py", "tests/test_library_and_agent.py"],
+      "success_artifacts": ["validated editable VideoProject scenes"],
+      "validation": ["contiguous scene timeline", "strict layouts", "AI asset paths discarded", "review state required"],
+      "runtime_dependencies": ["optional AVATAR_TWIN_AGENT_URL"]
+    },
+    {
+      "name": "Saved studio projects, scene editing, and brand kits",
+      "execution_files": ["src/avatar_twin/server.py", "src/avatar_twin/studio.py", "src/avatar_twin/models.py", "src/avatar_twin/composition.py"],
+      "acceptance_tests": ["tests/test_studio.py", "tests/test_renderer_jobs.py", "tests/test_server.py"],
+      "success_artifacts": ["versioned project JSON", "editable scene model", "rendered title/media composition", "durable brand kit"],
+      "validation": ["optimistic revision conflict", "safe stable identifiers", "scene timing and overlay bounds", "FFmpeg artifact probing"],
+      "runtime_dependencies": ["FFmpeg for final scene composition"]
+    },
+    {
+      "name": "Voice, accent, and cloning",
+      "execution_files": ["src/avatar_twin/audio.py", "src/avatar_twin/library.py"],
+      "acceptance_tests": ["tests/test_library_and_agent.py", "tests/test_renderer_jobs.py"],
+      "success_artifacts": ["decoded authoritative WAV", "filterable voice catalog"],
+      "validation": ["voice profile bounds", "voice_clone consent", "RIFF artifact", "TTS command receipt"],
+      "runtime_dependencies": ["HTTP TTS or Piper or Coqui XTTS-v2"]
+    },
+    {
+      "name": "Avatar generation and performance transfer",
+      "execution_files": ["src/avatar_twin/pipeline.py", "src/avatar_twin/backends/wan.py", "src/avatar_twin/backends/sadtalker.py", "src/avatar_twin/backends/musetalk.py", "src/avatar_twin/backends/liveportrait.py"],
+      "acceptance_tests": ["tests/test_renderer_jobs.py"],
+      "success_artifacts": ["new model-generated moving video"],
+      "validation": ["FFprobe streams", "duration tolerance", "sampled-frame motion", "driving-video hash inequality"],
+      "runtime_dependencies": ["one configured local model or HTTPS worker", "FFmpeg", "FFprobe"]
+    },
+    {
+      "name": "Background and brand composition",
+      "execution_files": ["src/avatar_twin/composition.py", "src/avatar_twin/backgrounds.py", "src/avatar_twin/media.py"],
+      "acceptance_tests": ["tests/test_renderer_jobs.py"],
+      "success_artifacts": ["composed video at requested aspect/resolution", "composition receipts"],
+      "validation": ["background/logo source hashes", "layout intervals", "output dimensions", "motion after composition"],
+      "runtime_dependencies": ["FFmpeg", "optional generated-background endpoint"]
+    },
+    {
+      "name": "Templates and reusable avatars",
+      "execution_files": ["src/avatar_twin/library.py"],
+      "acceptance_tests": ["tests/test_library_and_agent.py"],
+      "success_artifacts": ["durable template JSON", "durable consented avatar-look record"],
+      "validation": ["safe stable identifiers", "source image hash lock", "project validation after template application"],
+      "runtime_dependencies": []
+    },
+    {
+      "name": "Translation and dubbing",
+      "execution_files": ["src/avatar_twin/localization.py", "src/avatar_twin/collection.py", "src/avatar_twin/pipeline.py"],
+      "acceptance_tests": ["tests/test_animation_localization.py"],
+      "success_artifacts": ["reviewable target-language project", "rerendered target-language video", "multilingual player"],
+      "validation": ["target voice language", "source narration cleared", "glossary preservation", "explicit review"],
+      "runtime_dependencies": ["translation endpoint", "target-language TTS"]
+    },
+    {
+      "name": "Asynchronous API and artifact delivery",
+      "execution_files": ["src/avatar_twin/server.py", "src/avatar_twin/jobs.py"],
+      "acceptance_tests": ["tests/test_server.py", "tests/test_renderer_jobs.py"],
+      "success_artifacts": ["persistent job record", "streamed validated final video", "artifact.json"],
+      "validation": ["bounded uploads", "safe output paths", "completed only after pipeline verification"],
+      "runtime_dependencies": ["configured avatar runtime"]
+    },
+    {
+      "name": "Live conversational avatar",
+      "execution_files": ["src/avatar_twin/live.py", "src/avatar_twin/server.py"],
+      "acceptance_tests": ["tests/test_live.py"],
+      "success_artifacts": ["secure bidirectional WebRTC join URL", "non-sensitive session lifecycle record"],
+      "validation": ["HTTPS-only configured engine", "valid provider session ID", "HTTPS/WSS join URL", "join token not persisted"],
+      "runtime_dependencies": ["configured AVATAR_TWIN_LIVE_URL live-avatar engine"]
+    }
+  ],
+  "failure_policy": "Reject or error when consent, assets, production providers, model output, motion, audio, hashes, or runtime dependencies are unavailable; never report a fixture, static clip, tone, metadata record, or procedural preview as production success."
+}

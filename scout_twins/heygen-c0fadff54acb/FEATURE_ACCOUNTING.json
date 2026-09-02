@@ -1,0 +1,135 @@
+{
+  "schema": "scout-twin-feature-accounting-v1",
+  "contract_sha256": "c29797893caa8e8c19cf8d64d2d43769f48d635d95209214f2b584a03ed13705",
+  "capabilities": [
+    {
+      "name": "Prompt-to-video planning",
+      "status": "implemented",
+      "files": ["src/avatar_twin/planning.py", "src/avatar_twin/models.py"],
+      "tests": ["tests/test_planning.py", "tests/test_library_and_agent.py"],
+      "limitations": ["Creative planning quality depends on the configured planning agent; the bundled deterministic planner is an explicitly identified baseline."],
+      "blockers": []
+    },
+    {
+      "name": "Saved studio projects, scene editing, and brand kits",
+      "status": "implemented",
+      "files": ["src/avatar_twin/server.py", "src/avatar_twin/studio.py", "src/avatar_twin/models.py", "src/avatar_twin/composition.py"],
+      "tests": ["tests/test_studio.py", "tests/test_server.py", "tests/test_renderer_jobs.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Voice, accent, and cloning",
+      "status": "implemented",
+      "files": ["src/avatar_twin/audio.py", "src/avatar_twin/library.py", "src/avatar_twin/models.py"],
+      "tests": ["tests/test_library_and_agent.py", "tests/test_renderer_jobs.py"],
+      "limitations": ["Available voice identities and premium synthesis quality depend on configured speech engines; no vendor catalog or voice assets are copied."],
+      "blockers": []
+    },
+    {
+      "name": "Avatar generation and performance transfer",
+      "status": "implemented",
+      "files": ["src/avatar_twin/pipeline.py", "src/avatar_twin/animation.py", "src/avatar_twin/backends/wan.py", "src/avatar_twin/backends/sadtalker.py", "src/avatar_twin/backends/musetalk.py", "src/avatar_twin/backends/liveportrait.py"],
+      "tests": ["tests/test_renderer_jobs.py", "tests/test_animation_localization.py"],
+      "limitations": ["Production generation requires separately installed compatible checkpoints or a configured HTTPS GPU worker; model weights are intentionally not committed."],
+      "blockers": []
+    },
+    {
+      "name": "Background and brand composition",
+      "status": "implemented",
+      "files": ["src/avatar_twin/composition.py", "src/avatar_twin/backgrounds.py", "src/avatar_twin/media.py", "src/avatar_twin/models.py"],
+      "tests": ["tests/test_renderer_jobs.py", "tests/test_studio.py"],
+      "limitations": ["Generated background imagery requires an operator-configured image service; uploaded/color/video/transparent backgrounds are local."],
+      "blockers": []
+    },
+    {
+      "name": "Templates and reusable avatars",
+      "status": "implemented",
+      "files": ["src/avatar_twin/library.py", "src/avatar_twin/models.py"],
+      "tests": ["tests/test_library_and_agent.py", "tests/test_planning.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Translation and dubbing",
+      "status": "implemented",
+      "files": ["src/avatar_twin/localization.py", "src/avatar_twin/collection.py", "src/avatar_twin/pipeline.py"],
+      "tests": ["tests/test_animation_localization.py"],
+      "limitations": ["Translation quality and supported languages depend on the configured translation and target-language speech providers."],
+      "blockers": []
+    },
+    {
+      "name": "Asynchronous API and artifact delivery",
+      "status": "implemented",
+      "files": ["src/avatar_twin/server.py", "src/avatar_twin/jobs.py", "src/avatar_twin/cli.py", "src/avatar_twin/renderer.py"],
+      "tests": ["tests/test_server.py", "tests/test_renderer_jobs.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Live conversational avatar",
+      "status": "implemented",
+      "files": ["src/avatar_twin/live.py", "src/avatar_twin/server.py"],
+      "tests": ["tests/test_live.py"],
+      "limitations": ["A low-latency media/LLM provider implementing the documented HTTPS session contract must be configured; this repository does not pretend a local metadata stub is a live call."],
+      "blockers": []
+    }
+  ],
+  "workflows": [
+    {
+      "name": "Create and approve a video from a prompt",
+      "status": "implemented",
+      "files": ["src/avatar_twin/planning.py", "src/avatar_twin/server.py", "src/avatar_twin/jobs.py"],
+      "tests": ["tests/test_planning.py", "tests/test_server.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Enroll and reuse a custom avatar",
+      "status": "implemented",
+      "files": ["src/avatar_twin/library.py", "src/avatar_twin/models.py"],
+      "tests": ["tests/test_library_and_agent.py", "tests/test_planning.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Configure narration voice and delivery",
+      "status": "implemented",
+      "files": ["src/avatar_twin/audio.py", "src/avatar_twin/library.py", "src/avatar_twin/server.py"],
+      "tests": ["tests/test_library_and_agent.py", "tests/test_renderer_jobs.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Compose and brand scene media",
+      "status": "implemented",
+      "files": ["src/avatar_twin/composition.py", "src/avatar_twin/studio.py", "src/avatar_twin/server.py"],
+      "tests": ["tests/test_renderer_jobs.py", "tests/test_studio.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Translate and rerender a project",
+      "status": "implemented",
+      "files": ["src/avatar_twin/localization.py", "src/avatar_twin/collection.py", "src/avatar_twin/pipeline.py"],
+      "tests": ["tests/test_animation_localization.py"],
+      "limitations": [],
+      "blockers": []
+    },
+    {
+      "name": "Start and end a live avatar session",
+      "status": "implemented",
+      "files": ["src/avatar_twin/live.py", "src/avatar_twin/server.py"],
+      "tests": ["tests/test_live.py"],
+      "limitations": [],
+      "blockers": []
+    }
+  ],
+  "capability_counts": {"total": 9, "implemented": 9, "partial": 0, "blocked": 0},
+  "workflow_counts": {"total": 6, "implemented": 6, "partial": 0, "blocked": 0},
+  "weighted_capability_coverage_pct": 100.0,
+  "all_contract_rows_accounted": true,
+  "placeholders_counted_as_implemented": false,
+  "runtime_dependencies_external": true,
+  "runtime_dependency_note": "Implemented means the branch contains the executable adapter, validation, failure behavior, and acceptance tests. It does not claim bundled model weights or an unconfigured external service."
+}

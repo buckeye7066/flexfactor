@@ -1,0 +1,60 @@
+{
+  "ffmpeg": "ffmpeg",
+  "ffprobe": "ffprobe",
+  "max_download_bytes": 4294967296,
+  "default_talking_provider": "wan_s2v",
+  "default_performance_provider": "wan_animate",
+  "providers": {
+    "wan_s2v": {
+      "type": "wan_s2v",
+      "repo": "/opt/models/Wan2.2",
+      "python": "/opt/venvs/wan/bin/python",
+      "checkpoint": "/opt/checkpoints/Wan2.2-S2V-14B",
+      "timeout_s": 7200,
+      "options": {"size": [1024, 704], "offload_model": true}
+    },
+    "wan_animate": {
+      "type": "wan_animate",
+      "repo": "/opt/models/Wan2.2",
+      "python": "/opt/venvs/wan/bin/python",
+      "checkpoint": "/opt/checkpoints/Wan2.2-Animate-14B",
+      "timeout_s": 7200,
+      "options": {"resolution_area": [1280, 720], "reference_frames": 1, "offload_model": true}
+    },
+    "sadtalker": {
+      "type": "sadtalker",
+      "repo": "/opt/models/SadTalker",
+      "python": "/opt/venvs/sadtalker/bin/python",
+      "checkpoint": "/opt/models/SadTalker/checkpoints",
+      "timeout_s": 3600,
+      "options": {"preprocess": "full", "enhancer": "gfpgan"}
+    },
+    "musetalk": {
+      "type": "musetalk",
+      "repo": "/opt/models/MuseTalk",
+      "python": "/opt/venvs/musetalk/bin/python",
+      "checkpoint": "/opt/models/MuseTalk/models",
+      "timeout_s": 3600,
+      "options": {"bbox_shift": 0, "use_float16": false}
+    },
+    "liveportrait": {
+      "type": "liveportrait",
+      "repo": "/opt/models/LivePortrait",
+      "python": "/opt/venvs/liveportrait/bin/python",
+      "checkpoint": "/opt/models/LivePortrait/pretrained_weights",
+      "timeout_s": 3600,
+      "options": {"crop_driving_video": true}
+    },
+    "gpu_worker": {
+      "type": "remote_worker",
+      "timeout_s": 7200,
+      "options": {
+        "endpoint": "https://avatar-worker.example.com/v1/",
+        "token_env": "AVATAR_TWIN_WORKER_TOKEN",
+        "worker_provider": "wan_animate",
+        "allowed_hosts": ["artifacts.example.com"],
+        "poll_interval_s": 3
+      }
+    }
+  }
+}

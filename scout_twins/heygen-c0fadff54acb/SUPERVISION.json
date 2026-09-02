@@ -1,0 +1,41 @@
+{
+  "schema": "scout-twin-supervision-v1",
+  "contract_sha256": "c29797893caa8e8c19cf8d64d2d43769f48d635d95209214f2b584a03ed13705",
+  "completed": true,
+  "cycles_used": 3,
+  "max_cycles": 6,
+  "cycles": [
+    {
+      "cycle": 1,
+      "stage": "isolated-verification",
+      "status": "rejected",
+      "reason": "The clean checkout could compile, but standard unittest discovery could not import the src-layout avatar_twin package without caller-supplied PYTHONPATH.",
+      "correction": "Added an explicit test-discovery bootstrap shared by every acceptance-test module so a fresh checkout is self-contained.",
+      "checks": [
+        {"command": ["python", "-m", "compileall", "-q", "."], "exit_code": 0},
+        {"command": ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"], "exit_code": 1, "tests_run": 7, "output_sha256": "ed57276a6c771f426e3e43ce976517e647780d981d1fdf6dc0b90e783753e7f1"}
+      ]
+    },
+    {
+      "cycle": 2,
+      "stage": "isolated-verification",
+      "status": "rejected",
+      "reason": "All 24 tests were discovered, but FFmpeg's unbounded thread selection exceeded the verifier's process/address-space limits and the loopback API test inherited the deliberately dead outbound proxy.",
+      "correction": "Bounded FFmpeg filter and encoder threads, reduced fixture output to 480p without changing production output options, and made the loopback-only HTTP test bypass ambient proxies explicitly.",
+      "checks": [
+        {"command": ["python", "-m", "compileall", "-q", "."], "exit_code": 0},
+        {"command": ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"], "exit_code": 1, "tests_run": 24, "output_sha256": "d823a638df5ddd4f71747b162163b5d6ac23014a7c12d208eb7bb82355d25364"}
+      ]
+    },
+    {
+      "cycle": 3,
+      "stage": "isolated-verification",
+      "status": "passed",
+      "reason": "An exact Git-free copy compiled and all acceptance tests passed under the Scout verifier's bounded process, memory, credential, and best-effort network controls.",
+      "checks": [
+        {"command": ["python", "-m", "compileall", "-q", "."], "exit_code": 0, "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"command": ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"], "exit_code": 0, "tests_run": 24, "output_sha256": "a92e1f01a3dab7446c9d9e38cc01f16eafdfaf84dca43d358d5c93519c231bf1"}
+      ]
+    }
+  ]
+}

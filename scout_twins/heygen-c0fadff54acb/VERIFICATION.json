@@ -1,0 +1,29 @@
+{
+  "schema": "scout-twin-verification-v1",
+  "contract_sha256": "c29797893caa8e8c19cf8d64d2d43769f48d635d95209214f2b584a03ed13705",
+  "passed": true,
+  "verified_tree_sha256": "2d8038165dc69ef0b288f51162da63e3858018a76f94fd91515078fb912c3346",
+  "verified_file_count": 52,
+  "verified_total_bytes": 327183,
+  "receipts": [
+    {
+      "command": ["/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python", "-m", "compileall", "-q", "."],
+      "containment_mechanism": "direct",
+      "exit_code": 0,
+      "network_controls": "deny-requested",
+      "os_network_isolation": "not-reported",
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "verified_tree_sha256": "2d8038165dc69ef0b288f51162da63e3858018a76f94fd91515078fb912c3346"
+    },
+    {
+      "command": ["/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"],
+      "containment_mechanism": "rlimit",
+      "exit_code": 0,
+      "network_controls": "deny-requested",
+      "os_network_isolation": "best-effort-env",
+      "output_sha256": "a92e1f01a3dab7446c9d9e38cc01f16eafdfaf84dca43d358d5c93519c231bf1",
+      "tests_run": 24,
+      "verified_tree_sha256": "2d8038165dc69ef0b288f51162da63e3858018a76f94fd91515078fb912c3346"
+    }
+  ]
+}

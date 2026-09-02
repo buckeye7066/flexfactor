@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "modules": [
+    {
+      "purpose": "Create, validate, and serialize projects with voices, accents, avatars, backgrounds, brands, and scenes",
+      "module": "avatar_twin.models",
+      "symbols": ["VideoProject", "AvatarProfile", "VoiceProfile", "Background", "BrandKit", "Scene", "ConsentRecord", "ValidationError"],
+      "files": ["src/avatar_twin/models.py"],
+      "consumer_contract": "VideoProject.from_dict(data) returns a typed project; validate() rejects invalid or unconsented input; to_dict() is JSON-serializable."
+    },
+    {
+      "purpose": "Plan, revise, and approve an editable one-prompt video",
+      "module": "avatar_twin.planning",
+      "symbols": ["ProjectWorkflow", "VideoPlanner", "HttpVideoAgentPlanner"],
+      "files": ["src/avatar_twin/planning.py"],
+      "consumer_contract": "ProjectWorkflow.from_env() selects the configured agent or honest deterministic planner and returns projects that require explicit approval before render."
+    },
+    {
+      "purpose": "Render a complete validated avatar-video artifact",
+      "module": "avatar_twin.renderer",
+      "symbols": ["RenderEngine"],
+      "files": ["src/avatar_twin/renderer.py", "src/avatar_twin/pipeline.py", "src/avatar_twin/composition.py", "src/avatar_twin/media.py"],
+      "consumer_contract": "RenderEngine(...).render(approved_project, output_dir) returns completed_verified only after model, composition, audio, duration, and motion validation."
+    },
+    {
+      "purpose": "Store/filter voices and reuse consented avatars and templates",
+      "module": "avatar_twin.library",
+      "symbols": ["VoiceCatalog", "AvatarLibrary", "TemplateStore"],
+      "files": ["src/avatar_twin/library.py"],
+      "consumer_contract": "Catalog searches return typed voice profiles; avatar records detect asset mutation; templates revalidate the resulting project."
+    },
+    {
+      "purpose": "Persist editable studio projects, revisions, and reusable brand kits",
+      "module": "avatar_twin.studio",
+      "symbols": ["StudioProjectStore", "BrandKitStore"],
+      "files": ["src/avatar_twin/studio.py"],
+      "consumer_contract": "StudioProjectStore.save(project, expected_revision=...) performs validated optimistic versioning; BrandKitStore saves and returns typed brand/glossary records."
+    },
+    {
+      "purpose": "Create a real bidirectional conversational avatar session",
+      "module": "avatar_twin.live",
+      "symbols": ["HttpLiveAvatarProvider", "LiveSession", "LiveSessionStore"],
+      "files": ["src/avatar_twin/live.py"],
+      "consumer_contract": "HttpLiveAvatarProvider.create(...) returns a validated HTTPS/WSS session for a configured engine, while LiveSessionStore persists lifecycle metadata without room URLs or tokens."
+    }
+  ],
+  "integration_example": "from avatar_twin import ProjectWorkflow, RenderEngine, VideoProject; workflow = ProjectWorkflow.from_env(); project = workflow.plan(VideoProject.from_dict(data)); project = workflow.approve(project); artifact = RenderEngine(asset_root, runtime_config='runtime.local.json').render(project, output_dir)"
+}

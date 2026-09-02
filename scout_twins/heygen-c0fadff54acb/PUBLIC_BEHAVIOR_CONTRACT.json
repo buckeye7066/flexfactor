@@ -1,0 +1,219 @@
+{
+  "schema": "scout-behavioral-twin-v1",
+  "implementation_kind": "independent-public-behavior-twin",
+  "identity": {
+    "canonical_url": "https://www.heygen.com/",
+    "url_sha256": "c0fadff54acb974981c2160509946bb429736ff7bee1b8892218f022386d33b8",
+    "slug": "heygen-c0fadff54acb",
+    "branch": "scout/twin/heygen-c0fadff54acb",
+    "subtree": "scout_twins/heygen-c0fadff54acb",
+    "persistence": "permanent-url-branch"
+  },
+  "source_program": {
+    "name": "HeyGen",
+    "canonical_url": "https://www.heygen.com/",
+    "program_type": "commercial-service",
+    "summary": "A public-facing avatar-video platform with an editable video studio, reusable avatars and voices, localization, brand controls, asynchronous generation, and live conversational avatars."
+  },
+  "target_context": {
+    "name": null,
+    "purpose": null,
+    "note": "This is a standalone URL-owned twin. No target program limits or receives this implementation."
+  },
+  "public_behavior_contract": {
+    "capabilities": [
+      {
+        "name": "Prompt-to-video planning",
+        "observable_behavior": "A user can enter a brief and receive an editable multi-scene plan containing script, visuals, voice direction, pacing, and captions before generation.",
+        "user_outcome": "A reviewable video project is created from one prompt instead of requiring every scene to be authored from scratch.",
+        "public_implementation_pattern": "Structured planning agent plus a validated scene model, explicit revision state, and approval gate.",
+        "confidence": "high",
+        "evidence_refs": ["S1"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Saved studio projects, scene editing, and brand kits",
+        "observable_behavior": "A studio exposes editable scenes, scripts, timing, media, text, layouts, music, captions, templates, brand colors, logos, fonts, and glossary rules across saved projects.",
+        "user_outcome": "The user can create, save, reopen, revise, brand, approve, and render a complete video project.",
+        "public_implementation_pattern": "Durable versioned project store, scene editor, media composition pipeline, reusable brand kit, and review/approval workflow.",
+        "confidence": "high",
+        "evidence_refs": ["S2", "S8", "S9"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Voice, accent, and cloning",
+        "observable_behavior": "A user selects a voice by language, locale, accent, style, emotion, and delivery controls, or uses an authorized cloned voice, with consistent settings across project scenes.",
+        "user_outcome": "Avatar narration can match the required language, accent, tone, rate, pitch, and identity.",
+        "public_implementation_pattern": "Filterable voice catalog, provider-neutral TTS adapter, local speech engines, consent-gated voice cloning, and post-synthesis rate/pitch processing.",
+        "confidence": "high",
+        "evidence_refs": ["S3"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Avatar generation and performance transfer",
+        "observable_behavior": "A user can create video from a public or custom avatar, enroll a consented digital twin, create reusable looks, and drive the avatar with speech or a performance video.",
+        "user_outcome": "A reusable presenter identity produces new moving, speaking video rather than a static image or metadata record.",
+        "public_implementation_pattern": "Consented avatar library plus adapters for speech-to-video, audio-driven lip sync, portrait animation, and driving-video performance transfer, followed by artifact and motion validation.",
+        "confidence": "high",
+        "evidence_refs": ["S4", "S5", "S6"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Background and brand composition",
+        "observable_behavior": "A project can use color, image, video, generated, blurred, or transparent backgrounds; presenter layouts; text and media overlays; captions; music; logos; and multiple aspect, resolution, and output formats.",
+        "user_outcome": "The rendered artifact has the desired visual setting and brand presentation instead of only an uncomposed talking head.",
+        "public_implementation_pattern": "FFmpeg-based timed composition, chroma key, overlay, drawtext, caption, audio-mix, dimension, format, and transparency pipelines with source/output receipts.",
+        "confidence": "high",
+        "evidence_refs": ["S2", "S7", "S8"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Templates and reusable avatars",
+        "observable_behavior": "Users can persist templates, avatar identities, and avatar looks, then reuse those assets and presentation choices in later projects.",
+        "user_outcome": "Repeated videos preserve identity and production settings without recreating them each time.",
+        "public_implementation_pattern": "Durable template and avatar stores with stable identifiers, consent records, source-asset hashes, and project revalidation on apply.",
+        "confidence": "high",
+        "evidence_refs": ["S2", "S5"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Translation and dubbing",
+        "observable_behavior": "An existing project can be translated into another language, reviewed with glossary preservation, assigned a target-language voice, rerendered, captioned, and collected with other language variants.",
+        "user_outcome": "The same video can be delivered to multilingual audiences with localized speech and text.",
+        "public_implementation_pattern": "Translation-provider adapter, glossary-aware review state, voice-language validation, new speech/avatar render, and multilingual artifact collection.",
+        "confidence": "high",
+        "evidence_refs": ["S9", "S10"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Asynchronous API and artifact delivery",
+        "observable_behavior": "Programmatic clients submit video-generation jobs, inspect status, receive completion state, and retrieve generated artifacts without holding one synchronous request open.",
+        "user_outcome": "Applications can reliably automate longer-running video creation and retrieve validated results.",
+        "public_implementation_pattern": "Persistent job records, bounded worker queue, HTTP API and CLI, status/result routes, streamed artifacts, and completion only after validation.",
+        "confidence": "high",
+        "evidence_refs": ["S1", "S11"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      },
+      {
+        "name": "Live conversational avatar",
+        "observable_behavior": "A configured avatar and voice can join a low-latency bidirectional session and respond using supplied knowledge and behavior context.",
+        "user_outcome": "The user can speak with a real-time avatar rather than only render prerecorded video.",
+        "public_implementation_pattern": "Provider-neutral HTTPS session adapter returning a secure WebRTC room, with lifecycle persistence that excludes room tokens and join URLs.",
+        "confidence": "high",
+        "evidence_refs": ["S12"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": [],
+        "target_fit": {"decision": "unassessed", "value_score": null, "how_it_optimizes_target": ""}
+      }
+    ],
+    "workflows": [
+      {
+        "name": "Create and approve a video from a prompt",
+        "observable_behavior": "Enter a brief, inspect and revise the generated scenes, save the project, approve it, submit an asynchronous render, and download the verified artifact.",
+        "evidence_refs": ["S1", "S2", "S11"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      },
+      {
+        "name": "Enroll and reuse a custom avatar",
+        "observable_behavior": "Record consent, enroll a source photo or training video, preserve the source identity, create reusable looks, and select that avatar in later projects.",
+        "evidence_refs": ["S4", "S5", "S6"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      },
+      {
+        "name": "Configure narration voice and delivery",
+        "observable_behavior": "Filter voices by language and accent, select an engine and style, adjust emotion, speed, and pitch, or authorize a cloned voice, then apply the choice project-wide.",
+        "evidence_refs": ["S3"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      },
+      {
+        "name": "Compose and brand scene media",
+        "observable_behavior": "For each scene choose presenter layout, background, headline, media overlay, captions, and timing, then apply music, logo, brand colors, glossary, aspect, resolution, and export format.",
+        "evidence_refs": ["S2", "S7", "S8", "S9"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      },
+      {
+        "name": "Translate and rerender a project",
+        "observable_behavior": "Choose a target language, apply glossary rules, review the localized project, assign a compatible voice, rerender it, and add it to a multilingual collection.",
+        "evidence_refs": ["S9", "S10"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      },
+      {
+        "name": "Start and end a live avatar session",
+        "observable_behavior": "Choose an avatar, voice, language, knowledge, and behavior context; obtain a secure real-time room; converse bidirectionally; and end the session without persisting the room secret.",
+        "evidence_refs": ["S12"],
+        "authoring_status": "ready-for-independent-implementation",
+        "authoring_blockers": []
+      }
+    ],
+    "limitations": [
+      "The vendor's private source, model weights, training data, infrastructure, media catalog, and private endpoints are not public and are not copied or claimed.",
+      "Pixel-identical output and parity with undisclosed internal algorithms cannot be asserted; the independent implementation targets the same documented classes of user-visible outcome.",
+      "GPU-heavy generation, premium speech, translation, generated imagery, and live WebRTC require separately installed documented open models or operator-configured services."
+    ],
+    "coverage_gaps": [
+      "Vendor-only asset inventory, billing, team administration, enterprise SSO, analytics, and other account-service behavior were not included in this media-creation branch."
+    ]
+  },
+  "evidence": {
+    "refs": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12"],
+    "manifest": [
+      {"id": "S1", "kind": "official-documentation", "title": "Video Agent", "url": "https://developers.heygen.com/docs/video-agent", "retrieved_on": "2026-09-02"},
+      {"id": "S2", "kind": "official-help", "title": "Overview: Our New AI Studio", "url": "https://help.heygen.com/en/articles/11049655-overview-our-new-ai-studio", "retrieved_on": "2026-09-02"},
+      {"id": "S3", "kind": "official-help", "title": "Advanced Voice Settings", "url": "https://help.heygen.com/en/articles/16139180-advance-voice-settings", "retrieved_on": "2026-09-02"},
+      {"id": "S4", "kind": "official-help", "title": "Digital Twin FAQ", "url": "https://help.heygen.com/en/articles/9380615-digital-twin-faq", "retrieved_on": "2026-09-02"},
+      {"id": "S5", "kind": "official-documentation", "title": "Avatars", "url": "https://developers.heygen.com/docs/avatars", "retrieved_on": "2026-09-02"},
+      {"id": "S6", "kind": "official-help", "title": "Create Your First Digital Twin Video Avatar with Avatar IV", "url": "https://help.heygen.com/en/articles/12089286-create-your-first-digital-twin-video-avatar-with-avatar-iv", "retrieved_on": "2026-09-02"},
+      {"id": "S7", "kind": "official-documentation", "title": "Transparent Background Videos", "url": "https://developers.heygen.com/transparent-background-videos", "retrieved_on": "2026-09-02"},
+      {"id": "S8", "kind": "official-documentation", "title": "On Brand", "url": "https://developers.heygen.com/docs/on-brand", "retrieved_on": "2026-09-02"},
+      {"id": "S9", "kind": "official-documentation", "title": "Brand Glossary", "url": "https://developers.heygen.com/docs/brand-glossary", "retrieved_on": "2026-09-02"},
+      {"id": "S10", "kind": "official-documentation", "title": "Developer Product Index", "url": "https://developers.heygen.com/", "retrieved_on": "2026-09-02"},
+      {"id": "S11", "kind": "official-documentation", "title": "Webhooks", "url": "https://developers.heygen.com/docs/webhooks", "retrieved_on": "2026-09-02"},
+      {"id": "S12", "kind": "official-help", "title": "How to Get Started with LiveAvatar", "url": "https://help.heygen.com/en/articles/10035615-how-to-get-started-with-liveavatar", "retrieved_on": "2026-09-02"}
+    ],
+    "raw_page_text_stored": false,
+    "acquisition_note": "The Scout process attempted the canonical URL first. This runtime could not resolve heygen.com, so no successful direct-crawl claim is made. The evidence manifest was then assembled only from first-party public pages retrieved through the available public-web research channel."
+  },
+  "clean_room_boundary": {
+    "source_code_used": false,
+    "private_internals_known": false,
+    "private_or_undocumented_endpoints_allowed": false,
+    "publicly_evidenced_outcomes_may_be_reimplemented": true,
+    "vendor_brand_impersonation_allowed": false
+  },
+  "completeness_contract": {
+    "capability_total": 9,
+    "workflow_total": 6,
+    "every_capability_must_be_accounted_in_code_or_named_blocked": true,
+    "every_workflow_must_be_accounted_in_code_or_named_blocked": true,
+    "no_placeholders_may_count_as_implemented": true,
+    "low_confidence_behavior_may_not_be_invented": true
+  },
+  "validation": {
+    "complete": true,
+    "errors": [],
+    "ready_capabilities": 9,
+    "blocked_capabilities": 0
+  },
+  "contract_sha256": "c29797893caa8e8c19cf8d64d2d43769f48d635d95209214f2b584a03ed13705"
+}

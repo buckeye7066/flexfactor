@@ -1,0 +1,42 @@
+{
+  "schema": "scout-twin-manifest-v1",
+  "branch": "scout/twin/heygen-c0fadff54acb",
+  "subtree": "scout_twins/heygen-c0fadff54acb",
+  "persistent": true,
+  "updated_in_place_for_same_url": true,
+  "contract_sha256": "c29797893caa8e8c19cf8d64d2d43769f48d635d95209214f2b584a03ed13705",
+  "source_program": {
+    "name": "HeyGen",
+    "canonical_url": "https://www.heygen.com/"
+  },
+  "architecture": "Python standard-library HTTP studio/API and CLI; durable JSON project, asset, avatar, template, brand, live-session, and job stores; provider-neutral planning, TTS, translation, image, live-session, local-model, command, and HTTPS GPU-worker adapters; FFmpeg/FFprobe media composition and artifact verification.",
+  "runtime": "Python 3.11+, FFmpeg/FFprobe, and at least one configured production avatar engine. Optional configured engines provide higher-quality TTS, voice cloning, translation, generated backgrounds, planning, and live WebRTC sessions.",
+  "launch": [
+    "python -m pip install -e .",
+    "cp runtime.example.json runtime.local.json",
+    "avatar-twin-server --host 127.0.0.1 --port 8765 --workspace .avatar-twin --asset-root . --runtime-config runtime.local.json --voice-catalog voices.example.json"
+  ],
+  "dependencies": [
+    {"name": "FFmpeg and FFprobe", "required": true, "committed": false, "acquisition": "Install from the operating-system or official FFmpeg distribution."},
+    {"name": "Wan2.2 Animate or S2V", "required": false, "committed": false, "acquisition": "Install a compatible documented open implementation and checkpoints, then configure runtime.local.json."},
+    {"name": "SadTalker", "required": false, "committed": false, "acquisition": "Install its public implementation and checkpoints, then configure runtime.local.json."},
+    {"name": "MuseTalk", "required": false, "committed": false, "acquisition": "Install its public implementation and checkpoints, then configure runtime.local.json."},
+    {"name": "LivePortrait", "required": false, "committed": false, "acquisition": "Install its public implementation and checkpoints, then configure runtime.local.json."},
+    {"name": "Piper or Coqui XTTS-v2", "required": false, "committed": false, "acquisition": "Install the selected documented speech engine and authorized voice assets locally."},
+    {"name": "Operator-configured HTTPS services", "required": false, "committed": false, "acquisition": "Configure documented service URLs/credentials for GPU generation, planning, TTS, translation, backgrounds, or live avatar sessions."}
+  ],
+  "large_assets_committed": false,
+  "supervised_authoring": true,
+  "max_supervision_cycles": 6,
+  "direct_scout_url_attempt": {
+    "attempted": true,
+    "completed": false,
+    "failure_class": "runtime-dns-resolution-blocked",
+    "note": "The canonical URL was passed through Scout first; this runtime could not resolve heygen.com. The branch contract therefore names the failure and uses only separately retrieved first-party public evidence rather than claiming a successful crawl."
+  },
+  "prohibited_claims": [
+    "No HeyGen private source, private API, credentials, model weights, training data, voice/media assets, or hidden algorithms are present.",
+    "No pixel-identical or undisclosed-internal parity claim is made.",
+    "A production render cannot succeed with the test-only fixture backends."
+  ]
+}

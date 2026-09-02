@@ -1,0 +1,33 @@
+{
+  "schema_version": "2.0",
+  "source": {
+    "canonical_url": "https://www.heygen.com/",
+    "host": "heygen.com",
+    "public_evidence_only": true,
+    "scouted_at": "2026-09-02T00:00:00Z"
+  },
+  "target": {
+    "repository": "buckeye7066/flexfactor",
+    "base_branch": "codex/scout-url-research",
+    "branch": "scout/twin/heygen-c0fadff54acb",
+    "subtree": "scout_twins/heygen-c0fadff54acb",
+    "retention": "permanent",
+    "update_policy": "future runs for the same canonical URL update this branch"
+  },
+  "implementation": {
+    "name": "Scout Avatar Video Studio",
+    "package": "scout-public-avatar-studio",
+    "version": "0.4.0",
+    "kind": "independent_public_behavior_twin",
+    "private_source_used": false,
+    "third_party_assets_copied": false,
+    "large_model_weights_committed": false,
+    "consumer_examples": [],
+    "capability_contract": "PUBLIC_BEHAVIOR_CONTRACT.json",
+    "capability_contract_human_readable": "PUBLIC_BEHAVIOR_CONTRACT.md",
+    "feature_accounting": "FEATURE_ACCOUNTING.json",
+    "scout_twin_manifest": "SCOUT_TWIN_MANIFEST.json",
+    "runtime_contract": "RUNTIME_CONTRACT.json",
+    "reuse_contract": "REUSE_CONTRACT.json"
+  }
+}

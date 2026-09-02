@@ -1,0 +1,44 @@
+{
+  "schema_version": "1.0",
+  "voices": [
+    {
+      "id": "configured_en_us_warm",
+      "name": "Configured US Warm",
+      "provider": "http",
+      "language": "en",
+      "locale": "en-US",
+      "accent": "US",
+      "style": "warm",
+      "gender": "unspecified",
+      "emotion": "friendly",
+      "rate": 1.0,
+      "pitch_semitones": 0.0
+    },
+    {
+      "id": "configured_en_gb_news",
+      "name": "Configured British News",
+      "provider": "http",
+      "language": "en",
+      "locale": "en-GB",
+      "accent": "British",
+      "style": "news",
+      "gender": "unspecified",
+      "emotion": "confident",
+      "rate": 1.0,
+      "pitch_semitones": 0.0
+    },
+    {
+      "id": "consented_xtts_clone",
+      "name": "Consented XTTS Clone",
+      "provider": "xtts_v2",
+      "language": "en",
+      "locale": "en-US",
+      "accent": "reference sample",
+      "style": "reference sample",
+      "gender": "unspecified",
+      "emotion": "neutral",
+      "rate": 1.0,
+      "pitch_semitones": 0.0
+    }
+  ]
+}
