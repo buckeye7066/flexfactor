@@ -232,6 +232,9 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("DISPATCH_READ_TIMEOUT_MS = 330_000", api)
 
     def test_every_run_operation_has_a_deployed_api_entry_point(self):
+        ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn("/runs/", ignore)
+        self.assertNotIn("runs/", ignore)
         routes = {
             "dispatch.js": "dispatch",
             "status.js": "runStatus",
