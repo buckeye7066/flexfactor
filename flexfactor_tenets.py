@@ -2,7 +2,7 @@
 """Safe Tenets code-context integration for FlexFactor.
 
 Tenets is a local-first external tool that ranks the files most relevant to a
-coding objective.  FlexFactor uses the ranking only to PRIORITIZE its existing
+coding objective. FlexFactor uses the ranking only to PRIORITIZE its existing
 complete source sweep; it never lets Tenets remove a file, mark a file clean, or
 bypass a release gate.
 
@@ -16,7 +16,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import hashlib
+import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, BinaryIO, Iterable, Mapping, MutableMapping, Sequence
 
 TENETS_VERSION = "0.13.3"
 DEFAULT_TOP = 50
@@ -34,9 +36,21 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_TOP = 200
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
+MAX_ENUMERATION_FILES = 100_000
 
 _DISABLE_VALUES = {"0", "false", "no", "off"}
+_CAP_PARAMETER_NAMES = (
+    "max_files",
+    "max_files_per_run",
+    "file_limit",
+    "limit",
+)
+_CAP_GLOBAL_NAMES = (
+    "MAX_FILES_PER_RUN",
+    "_MAX_FILES_PER_RUN",
+)
 _INSTALL_LOCK = threading.Lock()
+_ENUMERATION_LOCK = threading.RLock()
 _RESULT_CACHE_LOCK = threading.Lock()
 _RESULT_CACHE: dict[tuple[str, str, int, float], "TenetsContextResult"] = {}
 
@@ -69,6 +83,16 @@ class TenetsContextResult:
         return data
 
 
+@dataclass(frozen=True)
+class _BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    overflow_stream: str | None = None
+    read_error: str | None = None
+
+
 def enabled() -> bool:
     """Whether automatic Tenets prioritization is enabled for launcher runs."""
     return os.environ.get("FLEXFACTOR_TENETS", "1").strip().lower() not in _DISABLE_VALUES
@@ -88,7 +112,7 @@ def _coerce_score(value: Any) -> float | None:
         score = float(value)
     except (TypeError, ValueError):
         return None
-    if score != score or score in (float("inf"), float("-inf")):
+    if not math.isfinite(score):
         return None
     return score
 
@@ -114,8 +138,6 @@ def _safe_relative_path(project_root: Path, candidate: Any) -> str | None:
         relative = resolved.relative_to(project_root)
     except (OSError, ValueError):
         return None
-    # resolve(strict=False) already follows every existing symlink component.
-    # A broken leaf is permitted only if its resolved location remains in-root.
     normalized = relative.as_posix()
     if normalized in ("", "."):
         return None
@@ -178,6 +200,193 @@ def _resolve_output_path(project_root: Path, output: str | os.PathLike[str] | No
     return candidate.resolve(strict=False)
 
 
+def _find_tenets_executable(
+    *,
+    interpreter: str | os.PathLike[str] | None = None,
+    platform_name: str | None = None,
+    path_value: str | None = None,
+) -> str | None:
+    """Resolve Tenets beside the selected Python before consulting ambient PATH."""
+    interpreter_path = Path(interpreter or sys.executable).expanduser().resolve(strict=False)
+    windows = (platform_name or os.name) == "nt"
+    executable_names = ("tenets.exe", "tenets") if windows else ("tenets",)
+    candidate_dirs = [interpreter_path.parent]
+    prefix_dir = Path(sys.prefix).expanduser().resolve(strict=False)
+    prefix_scripts = prefix_dir / ("Scripts" if windows else "bin")
+    if prefix_scripts not in candidate_dirs:
+        candidate_dirs.append(prefix_scripts)
+
+    for directory in candidate_dirs:
+        for name in executable_names:
+            candidate = directory / name
+            if candidate.is_file() and (windows or os.access(candidate, os.X_OK)):
+                return str(candidate)
+
+    search_path = os.environ.get("PATH") if path_value is None else path_value
+    for name in executable_names:
+        found = shutil.which(name, path=search_path)
+        if found:
+            return found
+    return None
+
+
+def _read_bounded_pipe(
+    pipe: BinaryIO,
+    *,
+    limit: int,
+    stream_name: str,
+    chunks: list[bytes],
+    overflow_event: threading.Event,
+    state: MutableMapping[str, str],
+    state_lock: threading.Lock,
+) -> None:
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(64 * 1024)
+            if not chunk:
+                return
+            remaining = max(0, limit - total)
+            if remaining:
+                retained = chunk[:remaining]
+                chunks.append(retained)
+                total += len(retained)
+            if len(chunk) > remaining:
+                with state_lock:
+                    state.setdefault("overflow_stream", stream_name)
+                overflow_event.set()
+                return
+    except Exception as exc:
+        with state_lock:
+            state.setdefault("read_error", f"{stream_name}: {exc}")
+        overflow_event.set()
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _run_bounded_process(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    stdout_limit: int = MAX_STDOUT_BYTES,
+    stderr_limit: int = MAX_STDERR_BYTES,
+) -> _BoundedProcessResult:
+    """Run a child while bounding both output streams during production."""
+    if stdout_limit < 1 or stderr_limit < 1:
+        raise ValueError("output limits must be positive")
+    process = subprocess.Popen(
+        tuple(command),
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    overflow_event = threading.Event()
+    state: dict[str, str] = {}
+    state_lock = threading.Lock()
+    readers = (
+        threading.Thread(
+            target=_read_bounded_pipe,
+            kwargs={
+                "pipe": process.stdout,
+                "limit": stdout_limit,
+                "stream_name": "stdout",
+                "chunks": stdout_chunks,
+                "overflow_event": overflow_event,
+                "state": state,
+                "state_lock": state_lock,
+            },
+            name="tenets-stdout-reader",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_read_bounded_pipe,
+            kwargs={
+                "pipe": process.stderr,
+                "limit": stderr_limit,
+                "stream_name": "stderr",
+                "chunks": stderr_chunks,
+                "overflow_event": overflow_event,
+                "state": state,
+                "state_lock": state_lock,
+            },
+            name="tenets-stderr-reader",
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    while process.poll() is None:
+        if overflow_event.wait(timeout=0.02):
+            _terminate_process(process)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            _terminate_process(process)
+            break
+        try:
+            process.wait(timeout=min(0.05, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+
+    if process.poll() is None:
+        _terminate_process(process)
+    for reader in readers:
+        reader.join(timeout=3)
+    if any(reader.is_alive() for reader in readers):
+        with state_lock:
+            state.setdefault("read_error", "output reader did not terminate")
+
+    return _BoundedProcessResult(
+        returncode=int(process.returncode if process.returncode is not None else -1),
+        stdout=b"".join(stdout_chunks),
+        stderr=b"".join(stderr_chunks),
+        timed_out=timed_out,
+        overflow_stream=state.get("overflow_stream"),
+        read_error=state.get("read_error"),
+    )
+
+
+def _validated_timeout(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be a positive finite number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_seconds must be a positive finite number")
+    return timeout
+
+
 def generate_tenets_context(
     project: str | os.PathLike[str],
     task: str,
@@ -200,12 +409,11 @@ def generate_tenets_context(
         raise ValueError("task must not be empty")
     if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= MAX_TOP:
         raise ValueError(f"top must be an integer between 1 and {MAX_TOP}")
-    if isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be a positive number")
+    timeout = _validated_timeout(timeout_seconds)
 
     output_path = _resolve_output_path(root, output)
     started = time.monotonic()
-    resolved_executable = executable or shutil.which("tenets")
+    resolved_executable = executable or _find_tenets_executable()
     command: tuple[str, ...] = ()
     status = "unavailable"
     message = (
@@ -226,39 +434,49 @@ def generate_tenets_context(
             "json",
         )
         try:
-            completed = subprocess.run(
+            completed = _run_bounded_process(
                 command,
                 cwd=root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
-                timeout=float(timeout_seconds),
-                check=False,
+                timeout_seconds=timeout,
             )
-            stdout_bytes = completed.stdout or b""
-            stderr_bytes = completed.stderr or b""
-            if len(stdout_bytes) > MAX_STDOUT_BYTES:
-                raise ValueError(f"Tenets output exceeded {MAX_STDOUT_BYTES} bytes")
-            stdout = stdout_bytes.decode("utf-8", errors="strict")
-            stderr = stderr_bytes[:MAX_STDERR_BYTES].decode("utf-8", errors="replace")
-            if completed.returncode != 0:
+            stdout_bytes = completed.stdout
+            stderr_bytes = completed.stderr
+            if completed.timed_out:
+                status = "degraded"
+                message = f"Tenets exceeded the {timeout:g}-second timeout."
+            elif completed.overflow_stream:
+                limit = (
+                    MAX_STDOUT_BYTES
+                    if completed.overflow_stream == "stdout"
+                    else MAX_STDERR_BYTES
+                )
+                status = "degraded"
+                message = (
+                    f"Tenets {completed.overflow_stream} exceeded the "
+                    f"{limit}-byte safety limit."
+                )
+            elif completed.read_error:
                 status = "degraded"
                 message = _bounded_text(
-                    f"Tenets exited with status {completed.returncode}: {stderr or stdout}"
+                    f"Tenets output could not be read safely: {completed.read_error}"
                 )
             else:
-                payload = json.loads(stdout)
-                files = _parse_ranked_files(payload, root, top)
-                if files:
-                    status = "ok"
-                    message = f"Tenets ranked {len(files)} safe in-repository file(s)."
-                else:
+                stdout = stdout_bytes.decode("utf-8", errors="strict")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+                if completed.returncode != 0:
                     status = "degraded"
-                    message = "Tenets returned no safe in-repository file paths."
-        except subprocess.TimeoutExpired:
-            status = "degraded"
-            message = f"Tenets exceeded the {float(timeout_seconds):g}-second timeout."
+                    message = _bounded_text(
+                        f"Tenets exited with status {completed.returncode}: {stderr or stdout}"
+                    )
+                else:
+                    payload = json.loads(stdout)
+                    files = _parse_ranked_files(payload, root, top)
+                    if files:
+                        status = "ok"
+                        message = f"Tenets ranked {len(files)} safe in-repository file(s)."
+                    else:
+                        status = "degraded"
+                        message = "Tenets returned no safe in-repository file paths."
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             status = "degraded"
             message = _bounded_text(f"Tenets returned unusable output: {exc}")
@@ -271,7 +489,7 @@ def generate_tenets_context(
         schema_version=1,
         tool="tenets",
         expected_version=TENETS_VERSION,
-        adapter_version=1,
+        adapter_version=2,
         status=status,
         project_root=str(root),
         task=task_text,
@@ -293,12 +511,13 @@ def cached_tenets_context(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> TenetsContextResult:
     root = Path(project).expanduser().resolve(strict=False)
-    key = (str(root), str(task).strip(), top, float(timeout_seconds))
+    timeout = _validated_timeout(timeout_seconds)
+    key = (str(root), str(task).strip(), top, timeout)
     with _RESULT_CACHE_LOCK:
         hit = _RESULT_CACHE.get(key)
     if hit is not None:
         return hit
-    result = generate_tenets_context(root, task, top=top, timeout_seconds=timeout_seconds)
+    result = generate_tenets_context(root, task, top=top, timeout_seconds=timeout)
     with _RESULT_CACHE_LOCK:
         return _RESULT_CACHE.setdefault(key, result)
 
@@ -365,11 +584,71 @@ def _prioritize_paths(
     return tuple(ordered) if isinstance(source_files, tuple) else ordered
 
 
+def _positive_cap(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _limit_paths(source_files: Any, cap: int | None) -> Any:
+    if cap is None or not isinstance(source_files, (list, tuple)):
+        return source_files
+    limited = source_files[:cap]
+    return tuple(limited) if isinstance(source_files, tuple) else list(limited)
+
+
+def _call_with_lifted_cap(
+    prior: Any,
+    module_globals: MutableMapping[str, Any],
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+) -> tuple[Any, int | None]:
+    """Call the canonical enumerator before its cap, then report that cap."""
+    try:
+        signature = inspect.signature(prior)
+        bound = signature.bind_partial(*args, **kwargs)
+    except (TypeError, ValueError):
+        signature = None
+        bound = None
+
+    if bound is not None and signature is not None:
+        for name in _CAP_PARAMETER_NAMES:
+            parameter = signature.parameters.get(name)
+            if parameter is None:
+                continue
+            supplied = bound.arguments.get(name, parameter.default)
+            cap = _positive_cap(supplied)
+            if cap is None:
+                continue
+            if cap >= MAX_ENUMERATION_FILES:
+                return prior(*args, **kwargs), cap
+            bound.arguments[name] = MAX_ENUMERATION_FILES
+            return prior(*bound.args, **bound.kwargs), cap
+
+    for name in _CAP_GLOBAL_NAMES:
+        cap = _positive_cap(module_globals.get(name))
+        if cap is None:
+            continue
+        if cap >= MAX_ENUMERATION_FILES:
+            return prior(*args, **kwargs), cap
+        with _ENUMERATION_LOCK:
+            original = module_globals[name]
+            module_globals[name] = MAX_ENUMERATION_FILES
+            try:
+                return prior(*args, **kwargs), cap
+            finally:
+                module_globals[name] = original
+
+    return prior(*args, **kwargs), None
+
+
 def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | None = None) -> None:
     """Idempotently prioritize FlexFactor's complete source sweep with Tenets.
 
-    This hook only changes order. The original enumerator still determines the
-    complete file set, skip rules, clean-file memory, containment, and errors.
+    Tenets runs before a bounded review cap is applied. The canonical enumerator
+    still owns containment, skip rules, clean-file memory, and candidate
+    discovery. The wrapper only lifts a detected cap for that one enumeration,
+    reorders those canonical candidates, and reapplies exactly the same cap.
     """
     with _INSTALL_LOCK:
         if module_globals.get("_FLEXFACTOR_TENETS_INSTALLED"):
@@ -382,21 +661,28 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
         canonicalize = module_globals.get("_canon_rel")
 
         def enumerate_source_files(*args: Any, **kwargs: Any) -> Any:
-            source_files = prior(*args, **kwargs)
             if not enabled():
-                return source_files
+                return prior(*args, **kwargs)
             root = _infer_project_root(args, kwargs)
             if root is None:
-                return source_files
+                return prior(*args, **kwargs)
             try:
                 result = cached_tenets_context(root, task)
-            except Exception as exc:  # the optional ranker must never break the audit
+            except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
-                return source_files
+                return prior(*args, **kwargs)
             module_globals["_TENETS_CONTEXT_LAST"] = result.to_dict()
             if result.status != "ok":
-                return source_files
-            return _prioritize_paths(source_files, result.files, canonicalize)
+                return prior(*args, **kwargs)
+
+            source_files, cap = _call_with_lifted_cap(
+                prior,
+                module_globals,
+                args,
+                kwargs,
+            )
+            prioritized = _prioritize_paths(source_files, result.files, canonicalize)
+            return _limit_paths(prioritized, cap)
 
         enumerate_source_files._tenets_wrapped = True  # type: ignore[attr-defined]
         module_globals["_enumerate_source_files"] = enumerate_source_files

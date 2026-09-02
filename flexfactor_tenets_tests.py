@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -21,7 +21,11 @@ class TenetsContextTests(unittest.TestCase):
         (self.root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
         (self.root / "README.md").write_text("demo\n", encoding="utf-8")
         self.state = Path(self.temp.name) / "state"
-        self.state_patch = mock.patch.dict(os.environ, {"FLEXFACTOR_STATE_DIR": str(self.state)}, clear=False)
+        self.state_patch = mock.patch.dict(
+            os.environ,
+            {"FLEXFACTOR_STATE_DIR": str(self.state)},
+            clear=False,
+        )
         self.state_patch.start()
         with ft._RESULT_CACHE_LOCK:
             ft._RESULT_CACHE.clear()
@@ -30,8 +34,27 @@ class TenetsContextTests(unittest.TestCase):
         self.state_patch.stop()
         self.temp.cleanup()
 
+    @staticmethod
+    def _process(
+        *,
+        returncode: int = 0,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        timed_out: bool = False,
+        overflow_stream: str | None = None,
+        read_error: str | None = None,
+    ) -> ft._BoundedProcessResult:
+        return ft._BoundedProcessResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+            overflow_stream=overflow_stream,
+            read_error=read_error,
+        )
+
     def test_missing_tenets_is_fail_open_and_writes_external_evidence(self) -> None:
-        with mock.patch.object(ft.shutil, "which", return_value=None):
+        with mock.patch.object(ft, "_find_tenets_executable", return_value=None):
             result = ft.generate_tenets_context(self.root, "review launch path")
         self.assertEqual(result.status, "unavailable")
         self.assertEqual(result.files, ())
@@ -42,6 +65,23 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(payload["status"], "unavailable")
         self.assertEqual(payload["tool"], "tenets")
         self.assertEqual(payload["expected_version"], "0.13.3")
+        self.assertEqual(payload["adapter_version"], 2)
+
+    def test_virtualenv_sibling_executable_precedes_ambient_path(self) -> None:
+        scripts = Path(self.temp.name) / "venv" / "Scripts"
+        scripts.mkdir(parents=True)
+        interpreter = scripts / "python.exe"
+        interpreter.write_bytes(b"")
+        tenets = scripts / "tenets.exe"
+        tenets.write_bytes(b"")
+        with mock.patch.object(ft.shutil, "which", return_value="C:/global/tenets.exe") as which:
+            found = ft._find_tenets_executable(
+                interpreter=interpreter,
+                platform_name="nt",
+                path_value="",
+            )
+        self.assertEqual(Path(found or ""), tenets.resolve())
+        which.assert_not_called()
 
     def test_success_keeps_only_safe_unique_repository_paths(self) -> None:
         outside = self.root.parent / "secret.txt"
@@ -54,78 +94,103 @@ class TenetsContextTests(unittest.TestCase):
                 {"path": str(outside), "score": 1.0},
             ]
         }
-        completed = subprocess.CompletedProcess(
-            args=["tenets"], returncode=0, stdout=json.dumps(payload).encode(), stderr=b""
-        )
-        with mock.patch.object(ft.shutil, "which", return_value="/usr/bin/tenets"), mock.patch.object(
-            ft.subprocess, "run", return_value=completed
-        ) as runner:
+        completed = self._process(stdout=json.dumps(payload).encode())
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
+        ), mock.patch.object(ft, "_run_bounded_process", return_value=completed) as runner:
             result = ft.generate_tenets_context(self.root, "fix auth", top=10)
         self.assertEqual(result.status, "ok")
         self.assertEqual([item.path for item in result.files], ["src/app.py", "README.md"])
         self.assertEqual(result.files[0].score, 0.91)
         command = runner.call_args.args[0]
         self.assertEqual(command[:3], ("/usr/bin/tenets", "rank", "fix auth"))
-        self.assertNotIn("shell", runner.call_args.kwargs)
-        self.assertIs(runner.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(runner.call_args.kwargs["cwd"], self.root.resolve())
+        self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 120.0)
 
     def test_empty_valid_result_is_degraded_not_success(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["tenets"], returncode=0, stdout=b'{"files": []}', stderr=b""
-        )
-        with mock.patch.object(ft.shutil, "which", return_value="tenets"), mock.patch.object(
-            ft.subprocess, "run", return_value=completed
+        completed = self._process(stdout=b'{"files": []}')
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
+            ft, "_run_bounded_process", return_value=completed
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
 
-    def test_nonzero_exit_is_fail_open_and_stderr_is_bounded(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["tenets"], returncode=3, stdout=b"", stderr=(b"failure " * 100_000)
-        )
-        with mock.patch.object(ft.shutil, "which", return_value="tenets"), mock.patch.object(
-            ft.subprocess, "run", return_value=completed
+    def test_nonzero_exit_is_fail_open_and_message_is_bounded(self) -> None:
+        completed = self._process(returncode=3, stderr=b"failure " * 50_000)
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
+            ft, "_run_bounded_process", return_value=completed
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
         self.assertLessEqual(len(result.message), 2000)
 
     def test_timeout_is_fail_open(self) -> None:
-        with mock.patch.object(ft.shutil, "which", return_value="tenets"), mock.patch.object(
-            ft.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired(cmd=["tenets"], timeout=1),
+        completed = self._process(returncode=-9, timed_out=True)
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
+            ft, "_run_bounded_process", return_value=completed
         ):
             result = ft.generate_tenets_context(self.root, "audit", timeout_seconds=1)
         self.assertEqual(result.status, "degraded")
         self.assertIn("timeout", result.message)
 
-    def test_malformed_json_is_fail_open(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["tenets"], returncode=0, stdout=b"not-json", stderr=b""
+    def test_oversized_output_is_terminated_and_bounded_for_both_streams(self) -> None:
+        scripts = {
+            "stdout": "import sys; sys.stdout.buffer.write(b'x' * 4096); sys.stdout.flush()",
+            "stderr": "import sys; sys.stderr.buffer.write(b'x' * 4096); sys.stderr.flush()",
+        }
+        for stream, script in scripts.items():
+            with self.subTest(stream=stream):
+                result = ft._run_bounded_process(
+                    (sys.executable, "-S", "-c", script),
+                    cwd=self.root,
+                    timeout_seconds=10,
+                    stdout_limit=128,
+                    stderr_limit=128,
+                )
+                self.assertEqual(result.overflow_stream, stream)
+                self.assertFalse(result.timed_out)
+                self.assertLessEqual(len(result.stdout), 128)
+                self.assertLessEqual(len(result.stderr), 128)
+
+    def test_generator_reports_stream_limit_without_parsing_partial_json(self) -> None:
+        completed = self._process(
+            returncode=-15,
+            stdout=b"{" * 10,
+            overflow_stream="stdout",
         )
-        with mock.patch.object(ft.shutil, "which", return_value="tenets"), mock.patch.object(
-            ft.subprocess, "run", return_value=completed
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
+            ft, "_run_bounded_process", return_value=completed
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("safety limit", result.message)
+
+    def test_malformed_json_is_fail_open(self) -> None:
+        completed = self._process(stdout=b"not-json")
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
+            ft, "_run_bounded_process", return_value=completed
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
 
-    def test_invalid_inputs_fail_closed(self) -> None:
+    def test_invalid_inputs_fail_closed_with_value_error(self) -> None:
         with self.assertRaises(ValueError):
             ft.generate_tenets_context(self.root / "missing", "audit")
         with self.assertRaises(ValueError):
             ft.generate_tenets_context(self.root, "  ")
-        with self.assertRaises(ValueError):
-            ft.generate_tenets_context(self.root, "audit", top=0)
-        with self.assertRaises(ValueError):
-            ft.generate_tenets_context(self.root, "audit", top=1.5)  # type: ignore[arg-type]
-        with self.assertRaises(ValueError):
-            ft.generate_tenets_context(self.root, "audit", timeout_seconds=0)
-        with self.assertRaises(ValueError):
-            ft.generate_tenets_context(self.root, "audit", timeout_seconds=True)
+        for top in (0, 201, True, 1.5):
+            with self.subTest(top=top), self.assertRaises(ValueError):
+                ft.generate_tenets_context(self.root, "audit", top=top)  # type: ignore[arg-type]
+        for timeout in (0, -1, True, None, "1", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                ft.generate_tenets_context(
+                    self.root,
+                    "audit",
+                    timeout_seconds=timeout,  # type: ignore[arg-type]
+                )
 
     def test_strict_cli_returns_nonzero_when_tool_is_missing(self) -> None:
-        with mock.patch.object(ft.shutil, "which", return_value=None), mock.patch(
+        with mock.patch.object(ft, "_find_tenets_executable", return_value=None), mock.patch(
             "builtins.print"
         ):
             code = ft.run_cli([str(self.root), "audit", "--strict"])
@@ -136,7 +201,7 @@ class TenetsContextTests(unittest.TestCase):
             schema_version=1,
             tool="tenets",
             expected_version=ft.TENETS_VERSION,
-            adapter_version=1,
+            adapter_version=2,
             status="unavailable",
             project_root=str(self.root),
             task="audit",
@@ -163,20 +228,17 @@ class TenetsInstallTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _ok_result(self) -> ft.TenetsContextResult:
+    def _result(self, *paths: str, status: str = "ok") -> ft.TenetsContextResult:
         return ft.TenetsContextResult(
             schema_version=1,
             tool="tenets",
             expected_version=ft.TENETS_VERSION,
-            adapter_version=1,
-            status="ok",
+            adapter_version=2,
+            status=status,
             project_root=str(self.root),
             task="audit",
-            files=(
-                ft.RankedFile("tests/test_app.py", 0.9),
-                ft.RankedFile("src/app.py", 0.8),
-            ),
-            message="ok",
+            files=tuple(ft.RankedFile(path, 1.0 - index / 10) for index, path in enumerate(paths)),
+            message=status,
             duration_seconds=0.0,
             output_path=str(self.root / "context.json"),
             command=("tenets",),
@@ -192,23 +254,89 @@ class TenetsInstallTests(unittest.TestCase):
             "_enumerate_source_files": enumerate_source_files,
             "_canon_rel": lambda value: value.replace("\\", "/").removeprefix("./"),
         }
-        with mock.patch.object(ft, "cached_tenets_context", return_value=self._ok_result()):
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("tests/test_app.py", "src/app.py"),
+        ):
             ft.install(runtime, argv=["audit", "--program", str(self.root)])
             result = runtime["_enumerate_source_files"](str(self.root))
         self.assertEqual(result[:2], ["tests/test_app.py", "src/app.py"])
         self.assertCountEqual(result, original)
         self.assertEqual(len(result), len(original))
 
-    def test_degraded_context_preserves_original_order(self) -> None:
-        original = ["b.py", "a.py"]
-        runtime = {"_enumerate_source_files": lambda project_dir: list(original)}
-        degraded = self._ok_result().__class__(
-            **{**self._ok_result().__dict__, "status": "degraded", "files": ()}
+    def test_ranked_file_beyond_parameter_cap_enters_same_sized_budget(self) -> None:
+        original = ["src/first.py", "src/second.py", "src/target.py", "src/fourth.py"]
+        observed_caps: list[int] = []
+
+        def enumerate_source_files(project_dir: str, max_files: int = 2):
+            observed_caps.append(max_files)
+            return list(original[:max_files])
+
+        runtime = {"_enumerate_source_files": enumerate_source_files}
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("src/target.py"),
+        ):
+            ft.install(runtime)
+            result = runtime["_enumerate_source_files"](str(self.root), max_files=2)
+        self.assertEqual(observed_caps, [ft.MAX_ENUMERATION_FILES])
+        self.assertEqual(result, ["src/target.py", "src/first.py"])
+        self.assertEqual(len(result), 2)
+
+    def test_ranked_file_beyond_positional_cap_enters_budget(self) -> None:
+        original = ["src/first.py", "src/second.py", "src/target.py"]
+
+        def enumerate_source_files(project_dir: str, max_files: int):
+            return list(original[:max_files])
+
+        runtime = {"_enumerate_source_files": enumerate_source_files}
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("src/target.py"),
+        ):
+            ft.install(runtime)
+            result = runtime["_enumerate_source_files"](str(self.root), 2)
+        self.assertEqual(result, ["src/target.py", "src/first.py"])
+
+    def test_ranked_file_beyond_global_cap_enters_budget_and_cap_is_restored(self) -> None:
+        runtime: dict[str, object] = {"MAX_FILES_PER_RUN": 2}
+        exec(
+            "def _enumerate_source_files(project_dir):\n"
+            "    files = ['src/first.py', 'src/second.py', 'src/target.py']\n"
+            "    return files[:MAX_FILES_PER_RUN]\n",
+            runtime,
         )
-        with mock.patch.object(ft, "cached_tenets_context", return_value=degraded):
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("src/target.py"),
+        ):
+            ft.install(runtime)
+            result = runtime["_enumerate_source_files"](str(self.root))  # type: ignore[operator]
+        self.assertEqual(result, ["src/target.py", "src/first.py"])
+        self.assertEqual(runtime["MAX_FILES_PER_RUN"], 2)
+
+    def test_degraded_context_preserves_original_cap_and_order(self) -> None:
+        original = ["b.py", "a.py", "target.py"]
+        observed_caps: list[int] = []
+
+        def enumerate_source_files(project_dir: str, max_files: int = 2):
+            observed_caps.append(max_files)
+            return list(original[:max_files])
+
+        runtime = {"_enumerate_source_files": enumerate_source_files}
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result(status="degraded"),
+        ):
             ft.install(runtime)
             result = runtime["_enumerate_source_files"](str(self.root))
-        self.assertEqual(result, original)
+        self.assertEqual(result, ["b.py", "a.py"])
+        self.assertEqual(observed_caps, [2])
 
     def test_install_is_idempotent(self) -> None:
         calls = 0
@@ -219,7 +347,11 @@ class TenetsInstallTests(unittest.TestCase):
             return ["a.py"]
 
         runtime = {"_enumerate_source_files": enumerate_source_files}
-        with mock.patch.object(ft, "cached_tenets_context", return_value=self._ok_result()):
+        with mock.patch.object(
+            ft,
+            "cached_tenets_context",
+            return_value=self._result("a.py"),
+        ):
             ft.install(runtime)
             wrapped = runtime["_enumerate_source_files"]
             ft.install(runtime)
