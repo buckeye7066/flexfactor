@@ -122,6 +122,24 @@ class StructuralApplies(_Base):
         with open(os.path.join(self.proj, "moved.toml"), "rb") as stream:
             self.assertEqual(payload, stream.read())
 
+    def test_same_extension_document_rename_needs_no_source_parser(self):
+        os.makedirs(os.path.join(self.proj, "docs"))
+        source = os.path.join(self.proj, "docs", "old.md")
+        with open(source, "w", encoding="utf-8") as stream:
+            stream.write("# Existing owner documentation\n")
+        author = _Author([plan(
+            renames=[{"from": "docs/old.md", "to": "docs/new.md"}],
+        )])
+        kind, detail = F.attempt_structural_fix(
+            author, None, self.proj, "bad.py", [dict(FINDING)],
+            {}, True, NOFIX_NOTE,
+        )
+        self.assertEqual("fixed", kind, detail)
+        self.assertFalse(os.path.exists(source))
+        self.assertEqual(
+            "# Existing owner documentation\n", self.read("docs/new.md")
+        )
+
     def test_need_files_round_grants_rewrite_of_requested_file(self):
         author = _Author([
             plan(changed=False, need_files=["other.py"]),
@@ -134,6 +152,33 @@ class StructuralApplies(_Base):
 
 
 class StructuralRollsBack(_Base):
+    def test_oversized_rename_is_refused_before_every_mutation(self):
+        source = os.path.join(self.proj, "large.toml")
+        with open(source, "wb") as stream:
+            stream.write(b"value = 1\n" * 8)
+        author = _Author([plan(
+            renames=[{"from": "large.toml", "to": "moved.toml"}],
+        )])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("oversized rename reached a write")
+        )
+        forbidden_unlink = mock.Mock(
+            side_effect=AssertionError("oversized rename reached an unlink")
+        )
+        with mock.patch.object(F, "STRUCTURAL_RENAME_MAX_BYTES", 32), \
+             mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_unlink_contained", forbidden_unlink):
+            kind, detail = F.attempt_structural_fix(
+                author, None, self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("exceeds 32 bytes", detail)
+        self.assertTrue(os.path.exists(source))
+        self.assertFalse(os.path.exists(os.path.join(self.proj, "moved.toml")))
+        forbidden_write.assert_not_called()
+        forbidden_unlink.assert_not_called()
+
     def test_unparsed_structural_source_is_rejected_before_every_write(self):
         author = _Author([plan(writes=[
             {"path": "bad.py", "contents": GOOD_FIXED},

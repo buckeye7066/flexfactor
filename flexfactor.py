@@ -3006,6 +3006,11 @@ def _strip_code_fences(code: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _reject_nonfinite_json_constant(value: str):
+    """Make the permissive stdlib JSON decoder enforce RFC JSON numbers."""
+    raise ValueError(f"non-finite constant {value!r} is not valid JSON")
+
+
 def _inproc_source_syntax_ok(
         path: str, source: str, *, allow_empty: bool = False,
 ) -> tuple[bool | None, str]:
@@ -3045,7 +3050,7 @@ def _inproc_source_syntax_ok(
             )
             return True, "python parse"
         if ext == ".json":
-            json.loads(text)
+            json.loads(text, parse_constant=_reject_nonfinite_json_constant)
             return True, "json parse"
         if ext == ".toml":
             import tomllib
@@ -5228,11 +5233,45 @@ def run(args) -> int:
                 # a no-op candidate only on an explicit threshold pass; the
                 # unchanged path below still runs the full project gate and
                 # proves this exact baseline is on remote default.
-                original_syntax_ok, original_syntax_note = (
-                    _inproc_source_syntax_ok(
-                        args.file, original, allow_empty=True,
-                    )
+                # `_load_source_text` intentionally returns a bounded,
+                # newline-normalized preview for ordinary prompts.  That
+                # preview is not the exact versioned file and therefore can
+                # never authorize an unchanged result.  Re-read through the
+                # contained raw-byte chokepoint, detect truncation, require
+                # strict UTF-8, and show the independent reviewer only that
+                # complete payload.  A file too large for this one-call proof
+                # is refused rather than partially approved.
+                exact_original: str | None = None
+                exact_bytes = _read_bytes_contained(
+                    root, rel, cap=MAX_REVIEW_BYTES + 1,
                 )
+                if exact_bytes is None:
+                    original_syntax_ok = False
+                    original_syntax_note = (
+                        "exact original bytes could not be safely read"
+                    )
+                elif len(exact_bytes) > MAX_REVIEW_BYTES:
+                    original_syntax_ok = False
+                    original_syntax_note = (
+                        "exact original exceeds the independent no-op review "
+                        f"limit ({MAX_REVIEW_BYTES} bytes)"
+                    )
+                else:
+                    try:
+                        exact_original = exact_bytes.decode(
+                            "utf-8", errors="strict"
+                        )
+                    except UnicodeDecodeError as exc:
+                        original_syntax_ok = False
+                        original_syntax_note = (
+                            f"exact original is not UTF-8: {exc}"
+                        )
+                    else:
+                        original_syntax_ok, original_syntax_note = (
+                            _inproc_source_syntax_ok(
+                                args.file, exact_original, allow_empty=True,
+                            )
+                        )
                 print(
                     f"[rep {i}] author response rejected before write: "
                     f"{syntax_note}"
@@ -5242,7 +5281,7 @@ def run(args) -> int:
                         f"GOAL: {args.goal}\n\n"
                         "EXACT ORIGINAL FILE (the author's invalid response was "
                         "discarded and is not evidence):\n"
-                        + _fence_untrusted("original", original)
+                        + _fence_untrusted("original", exact_original)
                         + "\n\nGrade whether retaining this exact original file fully "
                           "satisfies the goal. Set meets_goal true only when no "
                           "source change is required."
@@ -5271,6 +5310,9 @@ def run(args) -> int:
                     else:
                         if (original_grade.meets_goal is True
                                 and original_grade.grade >= int(args.threshold)):
+                            # Keep the normalized working copy as the no-op
+                            # sentinel; no write occurs.  Authorization above
+                            # was based on the complete exact bytes.
                             candidate = original
                             grade = original_grade
                             approved_original_fallback = True
@@ -6463,6 +6505,10 @@ INTEGRATION_PATCH_SYSTEM = (
 
 class ApplyError(Exception):
     """A change was generated but failed to apply/verify cleanly (-> rollback)."""
+
+
+SCOUT_MAX_PATCH_FILES = 30
+SCOUT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
 
 
 class BranchStateError(Exception):
@@ -7662,6 +7708,12 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             repo_name, "refused-invalid-source",
             f"generated 'files' is not a list ({type(raw_files).__name__})",
         )
+    if len(raw_files) > SCOUT_MAX_PATCH_FILES:
+        return ApplyResult(
+            repo_name, "refused-invalid-source",
+            f"generated Scout batch names {len(raw_files)} files "
+            f"(max {SCOUT_MAX_PATCH_FILES})",
+        )
     files: list[dict[str, str]] = []
     seen_file_paths: set[str] = set()
     for index, item in enumerate(raw_files):
@@ -7825,8 +7877,15 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     def _snapshot(rel: str) -> None:
         if rel in backups or rel in created:
             return
-        data = _read_bytes_contained(project_dir, rel, cap=None)
+        data = _read_bytes_contained(
+            project_dir, rel, cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
+        )
         if data is not None:
+            if len(data) > SCOUT_SNAPSHOT_MAX_BYTES:
+                raise ApplyError(
+                    f"cannot safely snapshot {rel!r}: file exceeds the "
+                    f"{SCOUT_SNAPSHOT_MAX_BYTES}-byte rollback limit"
+                )
             backups[rel] = data  # readable existing file -> restore on rollback
             return
         # A None read is NOT automatically "created". Use tri-state existence: only a
@@ -7943,9 +8002,15 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             except (ValueError, UnicodeDecodeError):
                 return {}
         deps_before = _deps_of(backups.get("package.json"))
-        deps_after = _deps_of(
-            _read_bytes_contained(project_dir, "package.json", cap=None)
+        deps_after_raw = _read_bytes_contained(
+            project_dir, "package.json", cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
         )
+        if (deps_after_raw is not None
+                and len(deps_after_raw) > SCOUT_SNAPSHOT_MAX_BYTES):
+            raise ApplyError(
+                "post-install package.json exceeds the bounded rollback limit"
+            )
+        deps_after = _deps_of(deps_after_raw)
         changed_files = sorted(file_list)
         if git:
             st = _git(["status", "--porcelain"], project_dir)
@@ -10139,7 +10204,8 @@ def _rel_components(rel: str) -> list[str] | None:
                 or any(ord(ch) < 32 or ch in '<>:"|?*' for ch in part)):
             return None
         device_stem = part.split(".", 1)[0].casefold()
-        if (device_stem in {"con", "prn", "aux", "nul"}
+        if (device_stem in {
+                "con", "prn", "aux", "nul", "conin$", "conout$"}
                 # Win32 also recognizes the Latin-1 superscript digits as
                 # device numbers. COM¹.py and LPT³.txt are reserved aliases,
                 # not ordinary repository files.
@@ -12441,6 +12507,7 @@ STRUCTURAL_MAX_RENAMES = 3      # renames one plan may perform
 STRUCTURAL_MAX_NEED_FILES = 8   # companion files the model may ask to read
 STRUCTURAL_MAX_PER_RUN = 10     # escalation attempts per _fix_files pass
 STRUCTURAL_WRITE_MAX_CHARS = 400_000   # per-file contents ceiling
+STRUCTURAL_RENAME_MAX_BYTES = 8 * 1024 * 1024  # bounded owner-byte move/snapshot
 
 STRUCTURAL_FIX_SCHEMA = {
     "type": "object",
@@ -12683,17 +12750,27 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 f"structural source rejected before write for {p}: {syntax_note}",
             )
 
-    # A rename changes the source identity just as surely as a generated write:
-    # bytes that were harmless as notes.txt can become executable as new.py.
-    # Parse every source against its DESTINATION type before any rename or
-    # unrelated write occurs. Existing empty owner files may remain valid when
-    # that destination parser accepts an empty module.
+    # A rename can change the source identity: bytes harmless as notes.txt can
+    # become executable as new.py.  Read each owner payload with a hard bound
+    # and parse it against the destination whenever a safe parser exists.
+    # Same-extension moves with no in-process parser preserve both bytes and
+    # type, so they remain eligible for the normal file/project gates.  An
+    # unsupported extension-changing move fails closed.
+    rename_payloads: dict[tuple[str, str], bytes] = {}
     for src_p, dst_p in renames:
-        source_bytes = _read_bytes_contained(project_dir, src_p, cap=None)
+        source_bytes = _read_bytes_contained(
+            project_dir, src_p, cap=STRUCTURAL_RENAME_MAX_BYTES + 1,
+        )
         if source_bytes is None:
             return (
                 "failed",
                 f"structural rename source read was refused for {src_p}",
+            )
+        if len(source_bytes) > STRUCTURAL_RENAME_MAX_BYTES:
+            return (
+                "failed",
+                f"structural rename source exceeds "
+                f"{STRUCTURAL_RENAME_MAX_BYTES} bytes: {src_p}",
             )
         try:
             # The rename below copies these exact bytes. A replacement-decoded
@@ -12708,21 +12785,48 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
         syntax_ok, syntax_note = _inproc_source_syntax_ok(
             dst_p, source, allow_empty=True,
         )
-        if syntax_ok is not True:
+        same_type = (
+            os.path.splitext(src_p)[1].casefold()
+            == os.path.splitext(dst_p)[1].casefold()
+        )
+        if syntax_ok is False or (syntax_ok is None and not same_type):
             return (
                 "failed",
                 f"structural rename source rejected before write for "
                 f"{src_p} -> {dst_p}: {syntax_note}",
             )
+        rename_payloads[(src_p, dst_p)] = source_bytes
 
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
     snapshots = {}
+    rename_destinations = {dst for _, dst in renames}
     for p in dict.fromkeys(touched):
         ex = _contained_existence(project_dir, p)
         if ex == "refused":
             return ("failed", f"existence check refused for {p}")
-        snapshots[p] = (_read_bytes_contained(project_dir, p, cap=None)
-                        if ex == "exists" else None)
+        if p in rename_destinations and ex != "missing":
+            return ("failed", f"rename target changed before apply: {p}")
+        if ex == "exists":
+            snapshot = _read_bytes_contained(
+                project_dir, p, cap=STRUCTURAL_RENAME_MAX_BYTES + 1,
+            )
+            if snapshot is None:
+                return ("failed", f"snapshot read was refused for {p}")
+            if len(snapshot) > STRUCTURAL_RENAME_MAX_BYTES:
+                return (
+                    "failed",
+                    f"structural snapshot exceeds "
+                    f"{STRUCTURAL_RENAME_MAX_BYTES} bytes: {p}",
+                )
+            snapshots[p] = snapshot
+        else:
+            snapshots[p] = None
+    for pair, payload in rename_payloads.items():
+        if snapshots.get(pair[0]) != payload:
+            return (
+                "failed",
+                f"rename source changed during preflight: {pair[0]}",
+            )
 
     def _rollback() -> bool:
         ok = True
@@ -12736,7 +12840,7 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
 
     applied_ops = []
     for src_p, dst_p in renames:
-        data = _read_bytes_contained(project_dir, src_p, cap=None)
+        data = rename_payloads[(src_p, dst_p)]
         moved = (data is not None
                  and _replace_contained(project_dir, dst_p, data) is not None
                  and _unlink_contained(project_dir, src_p))

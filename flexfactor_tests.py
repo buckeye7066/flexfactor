@@ -226,6 +226,14 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             ff._inproc_source_syntax_ok("README.md", "ordinary prose")[0]
         )
 
+    def test_source_syntax_preflight_rejects_nonfinite_json_constants(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            ok, reason = ff._inproc_source_syntax_ok(
+                "settings.json", '{"value": ' + constant + "}"
+            )
+            self.assertFalse(ok, constant)
+            self.assertIn("not valid JSON", reason)
+
     def test_source_syntax_preflight_rejects_parser_recursion(self):
         deeply_nested_toml = "value = " + "[" * 2000 + "0" + "]" * 2000
         ok, reason = ff._inproc_source_syntax_ok(
@@ -609,6 +617,79 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
         self.assertIn(original, Provider.prompts[0])
         self.assertNotIn(prose.strip(), Provider.prompts[0])
+
+    def test_non_utf8_original_cannot_reach_noop_review(self):
+        import tempfile
+        import types
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "The current file already satisfies the goal.\n"
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("altered non-UTF-8 source reached review")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "wb") as stream:
+                stream.write(b"# invalid UTF-8 follows: \xff\nVALUE = 1\n")
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the exact file", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, "rb") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(b"# invalid UTF-8 follows: \xff\nVALUE = 1\n", retained)
+        gate.assert_not_called()
+
+    def test_oversized_original_cannot_be_partially_approved_as_noop(self):
+        import tempfile
+        import types
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "The current file already satisfies the goal.\n"
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("truncated original reached no-op review")
+
+        original = "# " + ("x" * 128) + "\nVALUE = 1\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the exact file", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with mock.patch.object(ff, "MAX_REVIEW_BYTES", 64), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()
+                 ), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
 
     def test_valid_empty_original_can_be_independently_approved_as_noop(self):
         import tempfile
@@ -4216,6 +4297,33 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         self.assertIn("duplicate path", result.detail)
         forbidden.assert_not_called()
 
+    def test_scout_batch_above_thirty_files_is_refused_before_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("oversized Scout batch reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": f"generated/file_{index}.py", "contents": "VALUE = 1\n"}
+                for index in range(31)
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+             mock.patch.object(ff, "_write_contained", forbidden), \
+             mock.patch.object(ff, "_detect_verify", forbidden):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("max 30", result.detail)
+        forbidden.assert_not_called()
+
 
 class GeneratedTestSourcePreflightTests(unittest.TestCase):
     """Audit/Production Ready parse every generated test before any write."""
@@ -4414,6 +4522,7 @@ class PathContainmentTests(unittest.TestCase):
         aliases = (
             "tests/case.py.", "tests/trailing /case.py", "tests/file.py:stream",
             "tests/NUL.txt", "tests/con.py", "tests/COM1", "tests/lpt9.js",
+            "tests/CONIN$.txt", "tests/conout$.py",
             "tests/COM¹.py", "tests/com²", "tests/LPT³.txt",
             "tests/bad?.py", "tests/control\x01.py",
         )
@@ -4421,7 +4530,8 @@ class PathContainmentTests(unittest.TestCase):
             for bad in aliases:
                 self.assertIsNone(ff._rel_components(bad), bad)
                 self.assertIsNone(ff._contained_path(tmp, bad), bad)
-            for device_alias in ("COM¹.py", "com²", "LPT³.txt"):
+            for device_alias in (
+                    "COM¹.py", "com²", "LPT³.txt", "CONIN$.txt", "conout$.py"):
                 self.assertIsNone(
                     ff._write_contained(tmp, device_alias, "blocked"), device_alias
                 )
@@ -6745,6 +6855,34 @@ class SnapshotTriStateTests(unittest.TestCase):
             finally:
                 ff._run = real_run
             self.assertIn(result.status, ("verify-failed", "error"))
+            with open(target, "rb") as fh:
+                self.assertEqual(original, fh.read())
+
+    def test_oversized_scout_snapshot_is_refused_before_generated_write(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            original = ("# " + ("x" * 300) + "\nVALUE = 1\n").encode()
+            target = os.path.join(proj, "large.py")
+            with open(target, "wb") as fh:
+                fh.write(original)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("oversized snapshot reached generated write")
+            )
+            patch = {
+                "files": [{"path": "large.py", "contents": "VALUE = 2\n"}],
+                "packages": [],
+            }
+            with mock.patch.object(ff, "SCOUT_SNAPSHOT_MAX_BYTES", 256), \
+                 mock.patch.object(ff, "_write_contained", forbidden_write):
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            self.assertEqual("verify-failed", result.status)
+            self.assertIn("rollback limit", result.detail)
+            forbidden_write.assert_not_called()
             with open(target, "rb") as fh:
                 self.assertEqual(original, fh.read())
 
