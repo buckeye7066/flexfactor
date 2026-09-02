@@ -1858,6 +1858,7 @@ class RotationDefaultProviderTests(unittest.TestCase):
         best-available ladder that reaches free capacity after paid exhaustion.
         """
         import flexfactor_rotation as fr
+        from unittest import mock
         remote = dict(self._route("groq/llama-x"))
         remote["base_url"] = "https://api.groq.com/openai/v1"
         self.assertEqual(ff._route_unusable_reason(
@@ -1866,8 +1867,10 @@ class RotationDefaultProviderTests(unittest.TestCase):
             "wrongly excluded; under 'free' it must be admitted")
         local = self._route("ollama/qwen", api="ollama", auth_env="",
                             cost="local-unlimited")
-        self.assertEqual(ff._route_unusable_reason(
-            fr.Route.from_json(local), "local"), "")
+        with mock.patch.object(ff, "_ollama_route_health",
+                               return_value=(True, "ok")):
+            self.assertEqual(ff._route_unusable_reason(
+                fr.Route.from_json(local), "local"), "")
         # The old spelling no longer creates a second cost path: it maps to the
         # same strongest-paid-to-free ladder as every other spelling.
         paid = dict(self._route("openai_api/gpt-4o", cost="paid-metered"))
@@ -9147,6 +9150,21 @@ class OllamaProviderTests(unittest.TestCase):
             redirectors[0].redirect_request(
                 req, None, 302, "Found", {}, "https://evil.example/collect")
 
+    def test_ping_requires_the_configured_model_not_just_a_live_server(self):
+        p = ff.OllamaProvider("qwen2.5-coder:32b",
+                              judge_model="deepseek-coder:6.7b")
+        self._fake_opener(
+            p, [], {"models": [
+                {"name": "qwen2.5-coder:32b"},
+                {"name": "deepseek-coder:6.7b"},
+            ]})
+        p.ping()
+
+        missing = ff.OllamaProvider("qwen2.5-coder:32b")
+        self._fake_opener(missing, [], {"models": []})
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            missing.ping()
+
 
 class OllamaThrottleTests(unittest.TestCase):
     """2026-08-11 live failure: ~40 concurrent review calls (5 parallel programs
@@ -9280,6 +9298,7 @@ class PaidRescueStampedeTests(unittest.TestCase):
                                   secondary_model=None, judge_model=None,
                                   economy=False, no_preflight=False)
         with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+             mock.patch.dict(ff._OLLAMA_ROUTE_HEALTH, clear=True), \
              mock.patch.object(ff.OllamaProvider, "ping", lambda self: None):
             provs = ff.build_audit_providers(args, meter=None)
         self.assertEqual([n for n, _ in provs],
@@ -9292,10 +9311,12 @@ class PaidRescueStampedeTests(unittest.TestCase):
         def dead(self):
             raise OSError("connection refused")
         with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+             mock.patch.dict(ff._OLLAMA_ROUTE_HEALTH, clear=True), \
              mock.patch.object(ff.OllamaProvider, "ping", dead):
             provs = ff.build_audit_providers(args, meter=None)
-        self.assertEqual([n for n, _ in provs],
-                         ["best-available", "best-available-verifier"])
+        self.assertEqual(provs, [],
+                         "an unreachable Ollama must not enter the ladder")
+        self.assertIn("no usable", ff._PROVIDER_DIAGNOSIS)
 
     def test_make_provider_wires_meter_and_judge_tier(self):
         m = ff.CostMeter(limit_usd=1.0)
