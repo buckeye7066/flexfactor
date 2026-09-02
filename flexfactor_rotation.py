@@ -86,6 +86,10 @@ class RotationError(RuntimeError):
         self.reasons = reasons or {}
 
 
+class ReviewerSeparationError(RotationError):
+    """Independent review is impossible under the current route identities."""
+
+
 class PinUnavailable(RotationError):
     """The operator pinned a target and it cannot serve.
 
@@ -524,14 +528,18 @@ def model_family(model_id: str) -> str:
     """Coarse family of a model id, for author/reviewer independence.
 
     Looks at the LAST path segment so 'openrouter/qwen/qwen3.6-27b' and
-    'ollama/qwen3-coder:30b' both say 'qwen'. Unknown families return the
-    segment itself, which still distinguishes them from each other.
+    'ollama/qwen3-coder:30b' both say 'qwen'. Unknown deployment aliases are
+    opaque: distinct labels do not prove distinct underlying model families.
     """
     seg = str(model_id or "").lower().split("/")[-1]
     for needle, fam in _FAMILY_PATTERNS:
         if needle in seg:
             return fam
-    return seg.split(":")[0].split("-")[0] or "unknown"
+    # An arbitrary deployment alias is not model-family evidence. Treat every
+    # unrecognized wire identity as opaque so `author-prod` and `review-prod`
+    # cannot falsely certify two aliases of the same underlying model as
+    # independent families.
+    return "unknown"
 
 
 def route_model_family(route: Route) -> str:
@@ -713,6 +721,24 @@ class Rotator:
         """
         now = time.time() if now is None else now
         requested = tier if tier in TIER_CHAIN else LIGHT
+        if intent is not None and intent.avoid_families:
+            permitted_tiers = set(TIER_CHAIN[TIER_CHAIN.index(requested):])
+            excluded = set(intent.avoid_families) | set(_OPAQUE_MODEL_FAMILIES)
+            permanent_alternatives = [
+                route for route in self.catalog.routes
+                if route.enabled
+                and route.tier in permitted_tiers
+                and (allow_paid or route.is_free)
+                and route_model_family(route) not in excluded
+                and not (intent.needs and route.capabilities
+                         and any(need not in route.capabilities
+                                 for need in intent.needs))
+            ]
+            if not permanent_alternatives:
+                raise ReviewerSeparationError(
+                    "independent reviewer family unavailable: no enabled route "
+                    "has a recognized non-author model family"
+                )
         reasons: Dict[str, str] = {}
         outcome: Dict[str, Any] = {}
 
@@ -891,8 +917,11 @@ class Rotator:
         soft_families = ({intent.avoid_family}
                          if intent is not None and intent.avoid_family else set())
         if strict_families:
-            strict_others = [r for r in candidates
-                             if route_model_family(r) not in strict_families]
+            strict_others = [
+                r for r in candidates
+                if route_model_family(r) not in strict_families
+                and route_model_family(r) not in _OPAQUE_MODEL_FAMILIES
+            ]
             if strict_others:
                 candidates = strict_others
             else:
@@ -1319,7 +1348,7 @@ class RotatingProvider:
                 _OPAQUE_MODEL_FAMILIES
             )
             if opaque_authors:
-                raise RotationError(
+                raise ReviewerSeparationError(
                     "independent review cannot prove separation from opaque "
                     "author model identity: "
                     + ", ".join(sorted(opaque_authors))
@@ -1518,12 +1547,12 @@ class RotatingProvider:
         with self._family_lock:
             author_families = frozenset(self._author_families)
         if not author_families:
-            raise RotationError(
+            raise ReviewerSeparationError(
                 "independent grading requires a recorded candidate author family"
             )
         opaque_authors = author_families.intersection(_OPAQUE_MODEL_FAMILIES)
         if opaque_authors:
-            raise RotationError(
+            raise ReviewerSeparationError(
                 "independent grading cannot prove separation from opaque author "
                 "model identity: " + ", ".join(sorted(opaque_authors))
             )
@@ -1531,15 +1560,17 @@ class RotatingProvider:
         with self._family_lock:
             selection = self._last_selection.get(ROLE_REVIEWER)
         if selection is None:
-            raise RotationError("independent grading did not record a reviewer route")
+            raise ReviewerSeparationError(
+                "independent grading did not record a reviewer route"
+            )
         reviewer_family = route_model_family(selection.route)
         if reviewer_family in _OPAQUE_MODEL_FAMILIES:
-            raise RotationError(
+            raise ReviewerSeparationError(
                 "independent grading cannot prove the reviewer family from "
                 f"opaque model identity '{reviewer_family}'"
             )
         if reviewer_family in author_families:
-            raise RotationError(
+            raise ReviewerSeparationError(
                 f"reviewer family '{reviewer_family}' also authored the candidate"
             )
         return result

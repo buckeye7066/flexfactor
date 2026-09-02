@@ -36,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 import unicodedata
 import urllib.error
 import urllib.request
@@ -3048,6 +3049,17 @@ def _inproc_source_syntax_ok(
             # decoded str rejects its leading U+FEFF as a non-printable
             # character.  Bytes keep this preflight aligned with the real
             # parser and also validate UTF-8 encoding before any write.
+            detected_encoding, _ = tokenize.detect_encoding(
+                io.BytesIO(encoded).readline,
+            )
+            normalized_encoding = detected_encoding.lower().replace(
+                "_", "",
+            ).replace("-", "")
+            if normalized_encoding not in {"utf8", "utf8sig"}:
+                return False, (
+                    "python source encoding must be UTF-8; "
+                    f"declared {detected_encoding!r}"
+                )
             compile(
                 encoded,
                 str(path or "<candidate>"),
@@ -8039,7 +8051,8 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             except (ValueError, UnicodeDecodeError):
                 return {}
         dependency_manifest_changed = (
-            bool(packages and is_node) or "package.json" in file_list
+            bool(packages and is_node)
+            or _portable_rel_member("package.json", file_list)
         )
         if dependency_manifest_changed:
             deps_before = _deps_of(backups.get("package.json"))
@@ -9722,6 +9735,7 @@ TEST_GEN_SCHEMA = {
 _SUITE_EXECUTION_EVIDENCE = re.compile(
     r"(?im)(?:collected\s+[1-9]\d*"           # pytest
     r"|[1-9]\d*\s+(?:tests?|passed|examples?)"  # vitest/jest/cargo/rspec
+    r"|(?:tests?|pass)\s+[1-9]\d*"            # node --test spec summary
     r"|test files\s+[1-9]\d*"                 # vitest summary
     r"|^ok\s+\S+"                             # go: one line per package that ran
     r"|passed:\s*[1-9]\d*"                    # dotnet
@@ -10321,6 +10335,18 @@ def _portable_rel_identity(rel: str) -> tuple[str, str] | None:
     return canonical, unicodedata.normalize("NFC", canonical).casefold()
 
 
+def _portable_rel_member(path: str, candidates) -> bool:
+    """Whether candidates name ``path`` under portable worktree semantics."""
+    wanted = _portable_rel_identity(path)
+    if wanted is None:
+        return False
+    return any(
+        identity is not None and identity[1] == wanted[1]
+        for identity in (_portable_rel_identity(candidate)
+                         for candidate in candidates)
+    )
+
+
 @contextlib.contextmanager
 def _walked_parent_fd(root: str, comps: list[str], *, make_dirs: bool = False):
     """POSIX openat component-walk. Yields (parent_fd, leaf_name): parent_fd is an
@@ -10558,8 +10584,23 @@ def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> 
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=True)
 
 
+@dataclass(frozen=True)
+class _ContainedCreateResult:
+    """Outcome of create-only generated-file persistence.
+
+    ``complete=False`` means this call created a live pathname but failed while
+    filling or validating it. The pathname is intentionally retained because
+    no portable identity-conditional unlink exists; callers must treat it as a
+    dirty rollback and block publication.
+    """
+
+    path: str
+    receipt: tuple[os.stat_result, bytes] | None
+    complete: bool
+
+
 def _create_contained(project_dir: str, rel: str, content
-                      ) -> tuple[str, tuple[os.stat_result, bytes]] | None:
+                      ) -> _ContainedCreateResult | None:
     """Atomically create a missing file and return identity plus content digest.
 
     Unlike `_write_contained`, this never replaces an existing regular leaf.
@@ -10584,10 +10625,10 @@ def _create_contained(project_dir: str, rel: str, content
             if parent is None:
                 return None
             fd = None
-            identity = None
+            leaf_created = False
             try:
                 fd = os.open(leaf, flags, 0o600, dir_fd=parent)
-                identity = os.fstat(fd)
+                leaf_created = True
                 mv = memoryview(data)
                 written = 0
                 while written < len(mv):
@@ -10598,9 +10639,9 @@ def _create_contained(project_dir: str, rel: str, content
                 final_identity = os.fstat(fd)
                 os.close(fd)
                 fd = None
-                return (
+                return _ContainedCreateResult(
                     os.path.join(os.path.realpath(project_dir), *comps),
-                    (final_identity, hashlib.sha256(data).digest()),
+                    (final_identity, hashlib.sha256(data).digest()), True,
                 )
             except OSError:
                 if fd is not None:
@@ -10608,15 +10649,11 @@ def _create_contained(project_dir: str, rel: str, content
                         os.close(fd)
                     except OSError:
                         pass
-                # Remove only the inode this call created. If another process
-                # replaced it, leave that owner file untouched and fail closed.
-                if identity is not None:
-                    try:
-                        current = os.lstat(leaf, dir_fd=parent)
-                        if _same_id(current, identity):
-                            os.unlink(leaf, dir_fd=parent)
-                    except OSError:
-                        pass
+                if leaf_created:
+                    return _ContainedCreateResult(
+                        os.path.join(os.path.realpath(project_dir), *comps),
+                        None, False,
+                    )
                 return None
 
     if not _CONTAINMENT_FALLBACK_OK:
@@ -10626,11 +10663,11 @@ def _create_contained(project_dir: str, rel: str, content
         return None
     literal = os.path.join(parent_full, comps[-1])
     fd = None
-    identity = None
+    leaf_created = False
     try:
         parent_identity = os.stat(parent_full)
         fd = os.open(literal, flags, 0o600)
-        identity = os.fstat(fd)
+        leaf_created = True
         mv = memoryview(data)
         written = 0
         while written < len(mv):
@@ -10643,20 +10680,17 @@ def _create_contained(project_dir: str, rel: str, content
         fd = None
         if not _same_id(os.stat(parent_full), parent_identity):
             raise OSError("created-file parent identity changed")
-        return literal, (final_identity, hashlib.sha256(data).digest())
+        return _ContainedCreateResult(
+            literal, (final_identity, hashlib.sha256(data).digest()), True,
+        )
     except OSError:
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        if identity is not None:
-            try:
-                current = os.lstat(literal)
-                if _same_id(current, identity):
-                    os.remove(literal)
-            except OSError:
-                pass
+        if leaf_created:
+            return _ContainedCreateResult(literal, None, False)
         return None
 
 
@@ -11816,7 +11850,8 @@ def _merge_unresolved_file_findings(current: dict[str, list[dict]],
             list(current.get(rel) or []) + [dict(row) for row in rows])
 
 
-def _next_cycle_review_paths(changed_files, incomplete_files=()) -> list[str]:
+def _next_cycle_review_paths(changed_files, incomplete_files=(), *,
+                             project_dir: str | None = None) -> list[str]:
     """Build the only legitimate scope for a follow-up semantic pass.
 
     Cycle 1 is the complete line-by-line sweep. A later cycle may re-read only
@@ -11827,7 +11862,15 @@ def _next_cycle_review_paths(changed_files, incomplete_files=()) -> list[str]:
     they do not violate the owner's changed-files-only follow-up contract.
     """
     del incomplete_files  # compatibility with old callers; deliberately excluded
-    return _unique_review_paths(_ff_execution.changed_file_scope(changed_files))
+    paths = _unique_review_paths(_ff_execution.changed_file_scope(changed_files))
+    if project_dir is not None:
+        # Structural mutation accounting names both sides of a rename. The
+        # deleted source remains in that ledger, but it cannot be a later
+        # semantic-review target. A refused path remains in scope so a
+        # containment problem becomes an explicit incomplete-review blocker.
+        paths = [path for path in paths
+                 if _contained_existence(project_dir, path) != "missing"]
+    return paths
 
 
 def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
@@ -14172,6 +14215,40 @@ def _python_source_has_collectable_test(tree: ast.Module) -> bool:
     return False
 
 
+def _go_runnable_test_names(source: str) -> list[str]:
+    """Return generated Go tests that cannot unconditionally self-skip.
+
+    The lexical projection removes comments and strings first, so braces and
+    ``t.Skip`` text in examples cannot affect the scan. Any Skip/SkipNow call
+    on the test parameter is conservatively disqualifying; runtime-dependent
+    skips cannot establish that generated behavior executed.
+    """
+    projected = _go_code_projection(source)
+    declaration = re.compile(
+        r"(?m)^\s*func\s+(Test[A-Z0-9_]\w*)\s*\(\s*"
+        r"([A-Za-z_]\w*)\s+\*testing\.T\s*\)\s*\{"
+    )
+    runnable: list[str] = []
+    for match in declaration.finditer(projected):
+        depth = 1
+        cursor = match.end()
+        while cursor < len(projected) and depth:
+            if projected[cursor] == "{":
+                depth += 1
+            elif projected[cursor] == "}":
+                depth -= 1
+            cursor += 1
+        if depth:
+            continue
+        parameter = re.escape(match.group(2))
+        body = projected[match.end():cursor - 1]
+        if re.search(
+                rf"\b{parameter}\s*\.\s*Skip(?:Now)?\s*\(", body):
+            continue
+        runnable.append(match.group(1))
+    return runnable
+
+
 def _generated_test_source_has_case(path: str, source: str) -> bool:
     """Conservative source-level evidence that an executable test declares a case."""
     ext = os.path.splitext(path)[1].lower()
@@ -14182,10 +14259,7 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
             return False
         return _python_source_has_collectable_test(tree)
     if ext == ".go":
-        return bool(re.search(
-            r"(?m)^\s*func\s+Test[A-Z0-9_]\w*\s*\(\s*\w+\s+\*testing\.T\s*\)",
-            _go_code_projection(source),
-        ))
+        return bool(_go_runnable_test_names(source))
     if ext in _GENERATED_JS_TEST_EXTS:
         # Raw JSX/TSX needs parser-backed transformation before declaration
         # matching.  The batch preflight supplies the transformed JavaScript
@@ -14314,6 +14388,107 @@ def _generated_test_source_syntax_ok(
     ), None
 
 
+def _selected_test_command(command: list[str], path: str) -> list[str]:
+    """Add one exact test-file selector using the configured runner protocol."""
+    selected = [str(part) for part in command]
+    if not selected:
+        return []
+    executable = os.path.basename(selected[0]).lower()
+    if executable in {"npm", "npm.cmd", "pnpm", "pnpm.cmd"}:
+        return selected + ([] if "--" in selected else ["--"]) + [path]
+    return selected + [path]
+
+
+def _run_generated_test_file(project_dir: str, entry: dict,
+                             stack: dict) -> tuple[bool, str]:
+    """Execute one generated file and require file-specific runner evidence.
+
+    A broad green suite cannot prove that its configured discovery included a
+    particular generated path. Python/JavaScript runners therefore receive an
+    exact path selector after a missing-path probe proves they honor it. Go is
+    scoped to the generated file's package and every declared test must emit a
+    JSON ``pass`` action. Unsupported selectors fail closed and receive no
+    coverage or competitor-capability credit.
+    """
+    path = str(entry.get("path") or "")
+    source = str(entry.get("contents") or "")
+    extension = os.path.splitext(path)[1].lower()
+    configured = [str(part) for part in (stack.get("test_cmd") or [])]
+    if not configured:
+        return False, "no configured test command"
+
+    if extension == ".go":
+        executable = os.path.basename(configured[0]).lower()
+        if executable not in {"go", "go.exe"} or len(configured) < 2 \
+                or configured[1] != "test":
+            return False, "configured command is not the Go test runner"
+        names = _go_runnable_test_names(source)
+        if not names:
+            return False, "generated Go file has no runnable test names"
+        directory = os.path.dirname(path).replace("\\", "/") or "."
+        package = "." if directory == "." else "./" + directory
+        expression = "^(?:" + "|".join(re.escape(name) for name in names) + ")$"
+        command = [configured[0], "test", "-json", "-count=1",
+                   "-run", expression, package]
+        result = _run(command, project_dir, timeout=600)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        passed: set[str] = set()
+        skipped: set[str] = set()
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            name = event.get("Test") if isinstance(event, dict) else None
+            action = event.get("Action") if isinstance(event, dict) else None
+            if name in names and action == "pass":
+                passed.add(name)
+            elif name in names and action == "skip":
+                skipped.add(name)
+        missing = sorted(set(names) - passed)
+        if result.returncode != 0 or missing or skipped:
+            detail = _tail(output, 20)
+            return False, (
+                "Go runner did not pass every generated test "
+                f"(missing={missing}, skipped={sorted(skipped)}): {detail}"
+            )
+        return True, f"Go runner passed {len(passed)} generated test(s) in {path}"
+
+    if extension == ".py":
+        command_text = " ".join(configured).lower()
+        base = (configured if "pytest" in command_text else
+                [sys.executable, "-m", "pytest", "-q"])
+    elif extension in _GENERATED_JS_TEST_EXTS:
+        base = configured
+    else:
+        return False, f"no exact-file execution protocol for {extension or 'this type'}"
+
+    token = hashlib.sha256((path + "\0" + source).encode(
+        "utf-8", "strict")).hexdigest()[:16]
+    directory = os.path.dirname(path).replace("\\", "/")
+    missing_name = f".flexfactor-missing-{token}{extension}"
+    missing_path = f"{directory}/{missing_name}" if directory else missing_name
+    if _contained_existence(project_dir, missing_path) != "missing":
+        return False, "could not establish an absent selector-control path"
+    control = _run(
+        _selected_test_command(base, missing_path), project_dir, timeout=600,
+    )
+    if control.returncode == 0:
+        return False, "configured test runner ignored an absent exact-file selector"
+    result = _run(
+        _selected_test_command(base, path), project_dir, timeout=600,
+    )
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.returncode != 0:
+        return False, "exact generated test file failed: " + _tail(output, 20)
+    if not _suite_reported_tests(output):
+        return False, (
+            "exact generated test file reported no executed-test evidence: "
+            + _tail(output, 20)
+        )
+    return True, f"configured runner executed exact generated file {path}"
+
+
 def _write_and_run_generated_test_batch(
         project_dir: str, candidates: list[dict], stack: dict,
 ) -> tuple[list[dict], bool | None, str, str, list[str]]:
@@ -14389,13 +14564,14 @@ def _write_and_run_generated_test_batch(
                 f"generated executable test declares no collectable test case: {path}"
             ), []
         normalized.update(
-            path=path, contents=contents, _credit_as_test=credit_as_test,
+            path=path, contents=contents,
+            _candidate_test=credit_as_test, _credit_as_test=False,
         )
         prepared.append(normalized)
 
     if not prepared:
         return [], None, "", "no non-empty generated test source was produced", []
-    if not any(item["_credit_as_test"] for item in prepared):
+    if not any(item["_candidate_test"] for item in prepared):
         return [], None, "", (
             "generated batch contains support artifacts but no runner-collectable "
             "executable test"
@@ -14428,12 +14604,20 @@ def _write_and_run_generated_test_batch(
             return [], None, "", (
                 f"generated test atomic create was refused for {item['path']!r}"
             ), rollback_failed
+        if not created.complete or created.receipt is None:
+            rollback_failed = _rollback_created(written_entries)
+            if item["path"] not in rollback_failed:
+                rollback_failed.append(item["path"])
+            return [], None, "", (
+                "generated test atomic create failed after creating and "
+                f"retaining {item['path']!r}; manual recovery is required"
+            ), rollback_failed
         normalized = dict(item)
         # Keep the already-validated canonical repository-relative identity. The
         # contained writer may return a host spelling that differs from the
         # repository spelling; coverage and rollback use the canonical key.
         normalized["path"] = item["path"]
-        normalized["_creation_identity"] = created[1]
+        normalized["_creation_identity"] = created.receipt
         written_entries.append(normalized)
 
     changed = _changed_after_create(written_entries)
@@ -14457,6 +14641,28 @@ def _write_and_run_generated_test_batch(
         log = (log + "\n" if log else "") + (
             "test command exited successfully but reported no executed-test evidence"
         )
+    if status is True:
+        for entry in written_entries:
+            if not entry.get("_candidate_test"):
+                continue
+            executed, execution_note = _run_generated_test_file(
+                project_dir, entry, stack,
+            )
+            if not executed:
+                rollback_failed = _rollback_created(written_entries)
+                return [], None, log, (
+                    f"generated test file was not individually executed: "
+                    f"{entry['path']}: {execution_note}"
+                ), rollback_failed
+            entry["_credit_as_test"] = True
+            entry["_execution_evidence"] = execution_note
+        changed = _changed_after_create(written_entries)
+        if changed:
+            rollback_failed = _rollback_created(written_entries)
+            return [], None, log, (
+                "generated test content or identity changed during exact-file "
+                "execution: " + ", ".join(changed)
+            ), rollback_failed
     return written_entries, status, log, "", []
 
 
@@ -18554,7 +18760,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # Pass 1 covered the entire codebase. Every follow-up is an exact
             # delta pass: only verified files whose bytes changed THIS pass,
             # including verified competitor-gate edits before pass 2.
-            files = _next_cycle_review_paths(cycle_applied_files)
+            files = _next_cycle_review_paths(
+                cycle_applied_files, project_dir=project_dir,
+            )
 
         # Reattach findings that were outside a later changed-files-only pass.
         # This happens before purpose/readiness/evidence phases so every consumer
@@ -19006,7 +19214,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         for _capability_id, _paths in _capability_test_evidence.items():
                             tests_by_capability.setdefault(
                                 _capability_id, []).extend(_paths)
-            if test_files:
+            if generated_test_files:
                 ok, log = generated_test_status, generated_test_log
                 test_status = ok
                 # `ok` is TRI-STATE (_run_unit_tests -> bool | None). Read it
@@ -19016,17 +19224,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # printing PASS.
                 print(f"{pfx}unit tests: "
                       f"{'PASS' if ok is True else 'FAIL' if ok is False else 'n/a'}")
-                if ok is False:
+                if ok is not True:
                     all_findings.append({
                         "file": "(unit tests)", "line": 0, "severity": "high", "category": "bug",
                         "title": "Generated unit tests fail against current code",
-                        "problem": "Tests exercising real functions failed:\n" + log,
+                        "problem": ("Tests exercising real functions failed or "
+                                    "lacked executable evidence:\n" + log),
                         "fix": "Repair the implicated functions until the suite passes.",
                     })
                     # Generated tests are candidates until the project's own runner
-                    # accepts them.  A red candidate is removed transactionally so
-                    # its errors remain in evidence without poisoning every later
-                    # gate or leaving an uncommitted tree on timeout.
+                    # accepts them. A red candidate may not be deleted by pathname:
+                    # there is no portable identity-conditional unlink, so another
+                    # process could replace it between an identity check and unlink.
+                    # Retain it, mark the rollback dirty, and block publication.
                     rejected = list(generated_test_files)
                     rollback_failed = []
                     for generated in rejected:

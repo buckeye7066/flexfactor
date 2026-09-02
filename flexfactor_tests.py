@@ -212,6 +212,18 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         )
         self.assertIs(ok, True, reason)
 
+    def test_source_syntax_preflight_rejects_non_utf8_python_cookie(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "encoded.py", "# coding: latin-1\nVALUE = 'é'\n",
+        )
+        self.assertIs(ok, False)
+        self.assertIn("encoding must be UTF-8", reason)
+        for cookie in ("utf-8", "UTF_8", "utf8"):
+            accepted, note = ff._inproc_source_syntax_ok(
+                "encoded.py", f"# coding: {cookie}\nVALUE = 'é'\n",
+            )
+            self.assertIs(accepted, True, note)
+
     def test_source_syntax_preflight_parses_data_without_writing(self):
         self.assertEqual(
             True, ff._inproc_source_syntax_ok("settings.json", '{"safe": true}')[0]
@@ -4527,12 +4539,14 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
 
     def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
         runner = mock.Mock(return_value=(True, "2 tests passed"))
+        focused = mock.Mock(return_value=(True, "exact file passed"))
         candidates = [
             {"path": "tests/test_one.py", "contents": "def test_one():\n    assert True\n"},
             {"path": "tests/capability.json", "contents": '{"case": 2}\n'},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_run_unit_tests", runner):
+             mock.patch.object(ff, "_run_unit_tests", runner), \
+             mock.patch.object(ff, "_run_generated_test_file", focused):
             written, status, log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
                     project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
@@ -4549,6 +4563,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertEqual("", refusal)
         self.assertEqual([], rollback_failed)
         runner.assert_called_once()
+        focused.assert_called_once()
         self.assertIn(
             "_write_and_run_generated_test_batch(",
             inspect.getsource(ff.audit_one_program),
@@ -4560,7 +4575,11 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
              "contents": "def test_one():\n    assert True\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
-             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "1 test passed")):
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "1 test passed")), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(True, "exact file passed"),
+             ):
             written, status, _log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
                     project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
@@ -4805,6 +4824,17 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             "func TestReal(t *testing.T) {}\n",
         ))
 
+    def test_go_skip_and_skipnow_tests_never_receive_execution_credit(self):
+        for call in ("Skip", "SkipNow"):
+            source = (
+                "package x\nimport \"testing\"\n"
+                f"func TestGenerated(t *testing.T) {{ t.{call}() }}\n"
+            )
+            with self.subTest(call=call):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+
     def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
         cases = (
             "test.skip('skipped', () => {});\n",
@@ -4985,6 +5015,10 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
              ), \
              mock.patch.object(
                  ff, "_run_unit_tests", return_value=(True, "1 passed"),
+             ), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(True, "exact file passed"),
              ):
             written, status, _log, refusal, rollback_failed = (
                 ff._write_and_run_generated_test_batch(
@@ -4997,6 +5031,54 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIs(status, True)
         self.assertEqual("", refusal)
         self.assertEqual([], rollback_failed)
+
+    def test_generated_file_gets_no_credit_without_exact_file_execution(self):
+        path = "test_generated.py"
+        candidate = {
+            "path": path,
+            "contents": "def test_generated():\n    assert True\n",
+        }
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run_unit_tests", return_value=(True, "1 passed"),
+             ), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(False, "configured discovery omitted this path"),
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, [candidate],
+                    {"test_cmd": ["python", "-m", "pytest", "-q"]},
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("not individually executed", refusal)
+        self.assertEqual([path], rollback_failed)
+
+    def test_python_exact_file_selector_is_probed_then_executed(self):
+        path = "test_generated.py"
+        calls = []
+
+        def runner(command, _project, timeout=900, env=None):
+            del timeout, env
+            calls.append(command)
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(command, 4, "", "missing")
+            return ff.subprocess.CompletedProcess(command, 0, "1 passed", "")
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run", side_effect=runner):
+            ok, note = ff._run_generated_test_file(
+                project,
+                {"path": path,
+                 "contents": "def test_generated():\n    assert True\n"},
+                {"test_cmd": ["python", "-m", "pytest", "-q"]},
+            )
+        self.assertIs(ok, True, note)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(path, calls[1][-1])
 
     def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
         for source in (
@@ -5145,7 +5227,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             target = os.path.join(project, "tests", "test_one.py")
             os.replace(replacement, target)
             self.assertFalse(ff._unlink_created_contained(
-                project, "tests/test_one.py", created[1],
+                project, "tests/test_one.py", created.receipt,
             ))
             with open(target, encoding="utf-8") as handle:
                 self.assertEqual("OWNER = True\n", handle.read())
@@ -5177,11 +5259,46 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                     side_effect=observe_then_replace), \
                  mock.patch.object(ff, "_unlink_contained") as unlink:
                 self.assertFalse(ff._unlink_created_contained(
-                    project, rel, created[1],
+                    project, rel, created.receipt,
                 ))
             unlink.assert_not_called()
             with open(target, encoding="utf-8") as handle:
                 self.assertEqual("OWNER = True\n", handle.read())
+
+    def test_failed_create_retains_raced_owner_file_and_reports_dirty(self):
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("the replacement schedule is POSIX-specific")
+        rel = "tests/test_short_write.py"
+        source = "def test_generated():\n    assert True\n"
+        runner = mock.Mock(
+            side_effect=AssertionError("partial generated file reached tests")
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            target = os.path.join(project, *rel.split("/"))
+
+            def replace_then_short_write(_fd, _data):
+                replacement = os.path.join(project, "owner.py")
+                with open(replacement, "w", encoding="utf-8") as handle:
+                    handle.write("OWNER = True\n")
+                os.replace(replacement, target)
+                return 0
+
+            with mock.patch.object(ff.os, "write",
+                                   side_effect=replace_then_short_write), \
+                 mock.patch.object(ff, "_run_unit_tests", runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("retaining", refusal)
+        self.assertEqual([rel], rollback_failed)
+        runner.assert_not_called()
 
     def test_in_place_test_rewrite_revokes_execution_credit(self):
         rel = "tests/test_self_rewrite.py"
@@ -5226,6 +5343,21 @@ class PathContainmentTests(unittest.TestCase):
                         "../outside.js", "C:evil", r"\\host\share\x", "~/secrets",
                         "sub/../../escape.js"):
                 self.assertIsNone(ff._contained_path(tmp, bad), f"should reject {bad!r}")
+
+    def test_portable_membership_matches_manifest_case_and_normalization(self):
+        self.assertTrue(ff._portable_rel_member(
+            "package.json", ["Package.json"],
+        ))
+        self.assertTrue(ff._portable_rel_member(
+            "docs/café.json", ["docs/cafe\u0301.json"],
+        ))
+        self.assertFalse(ff._portable_rel_member(
+            "package.json", ["packages/example.json"],
+        ))
+        source = inspect.getsource(ff._apply_integration_impl)
+        self.assertIn(
+            '_portable_rel_member("package.json", file_list)', source,
+        )
 
     def test_windows_alias_components_are_rejected_on_every_host(self):
         import tempfile
@@ -5499,7 +5631,7 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
         )
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn(
-            "_next_cycle_review_paths(cycle_applied_files)", source)
+            "cycle_applied_files, project_dir=project_dir", source)
         self.assertNotIn(
             "_next_cycle_review_paths(cycle_applied_files, all_review_incomplete)",
             source,
@@ -5507,6 +5639,21 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
         self.assertNotIn("list(fixable_files) + sorted(all_review_incomplete)", source)
         self.assertIn(
             '"review_incomplete": len(all_review_incomplete)', source)
+
+    def test_followup_scope_excludes_deleted_rename_source_only(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            destination = os.path.join(project, "src", "new.py")
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with open(destination, "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            self.assertEqual(
+                ["src/new.py"],
+                ff._next_cycle_review_paths(
+                    ["src/old.py", "src/new.py"], project_dir=project,
+                ),
+            )
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn("project_dir=project_dir", source)
 
     @staticmethod
     def _finding(rel, severity="high", title="still broken"):
@@ -12539,6 +12686,10 @@ class SuiteExecutionEvidenceTests(unittest.TestCase):
             "Passed!  - Failed:     0, Passed:    12, Skipped:     0"))
         self.assertTrue(ff._suite_reported_tests(
             "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0"))
+
+    def test_node_spec_reporter_nonzero_summary_counts(self):
+        self.assertTrue(ff._suite_reported_tests("ℹ tests 1\nℹ pass 1"))
+        self.assertFalse(ff._suite_reported_tests("ℹ tests 0\nℹ pass 0"))
 
     def test_the_original_shapes_still_count(self):
         for log in (" Test Files  19 passed (20)\n      Tests  108 passed",

@@ -683,8 +683,10 @@ class RotatingProviderTests(RotationTestCase):
 
     def test_grading_uses_the_cheap_tier_not_the_author_tier(self):
         prov = self._provider(catalog(
-            route("front/big", "pool-front", tier=R.FRONTIER),
-            route("light/small", "pool-light", tier=R.LIGHT)))
+            route("front/big", "pool-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/small", "pool-light", tier=R.LIGHT,
+                  model="claude-sonnet-5")))
         self.assertEqual(prov.complete("x"), "completed by front/big")
         self.assertEqual(prov.grade()["by"], "light/small")
 
@@ -740,7 +742,8 @@ class RotatingProviderTests(RotationTestCase):
         ))
         self.assertEqual(prov.complete("x"), "completed by front/codex")
         self.assertEqual(prov.role_coordinator.author_families, {"openai"})
-        with self.assertRaisesRegex(R.RotationError, "no .* route available"):
+        with self.assertRaisesRegex(
+                R.ReviewerSeparationError, "independent reviewer"):
             prov.grade_independent()
 
     def test_independence_uses_wire_model_not_catalog_label(self):
@@ -757,6 +760,18 @@ class RotatingProviderTests(RotationTestCase):
         prov.grade_independent()
         selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
         self.assertEqual("qwen3-coder", selection.route.wire_model)
+
+    def test_unknown_wire_aliases_are_opaque_not_independent_families(self):
+        prov = self._provider(catalog(
+            route("front/author", "external-author", tier=R.FRONTIER,
+                  model="author-prod", wire_model="author-prod"),
+            route("light/reviewer", "external-review", tier=R.LIGHT,
+                  model="review-prod", wire_model="review-prod"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/author")
+        self.assertEqual({"unknown"}, prov.role_coordinator.author_families)
+        with self.assertRaises(R.ReviewerSeparationError):
+            prov.grade_independent()
 
     def test_exact_review_intent_refuses_an_opaque_auto_author(self):
         prov = self._provider(catalog(
