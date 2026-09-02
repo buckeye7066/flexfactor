@@ -251,7 +251,9 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn("--draft", workflow)
         self.assertIn("--verify-tag", workflow)
         self.assertIn("--draft=false", workflow)
-        complete_guard = workflow.index("| release_is_complete; then")
+        complete_guard = workflow.index(
+            'if [ "$release_complete_rc" -eq 0 ]; then'
+        )
         draft_mutation = workflow.index(
             'gh release edit "$RELEASE_TAG"', complete_guard
         )
@@ -261,6 +263,12 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         )
         self.assertIn(
             "JSON failure aborts here; it is never conflated", workflow
+        )
+        self.assertIn(
+            'elif [ "$release_complete_rc" -ne 1 ]; then', workflow
+        )
+        self.assertIn(
+            'all(.assets[]; type == "object"', workflow
         )
         self.assertIn(
             "group: android-release-${{ needs.release-plan.outputs.release_tag }}",

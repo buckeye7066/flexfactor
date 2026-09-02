@@ -495,10 +495,10 @@ jobs:
           release_is_complete() {
             jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
                 --arg aab "flexfactor-${version_name}.aab" \
-              'select(.tagName == $tag and .isDraft == false and .isPrerelease == false
-               and ([.assets[].name] | index($apk)) != null
-               and ([.assets[].name] | index($aab)) != null
-               and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+              '(.tagName == $tag and .isDraft == false and .isPrerelease == false
+                and ([.assets[].name] | index($apk)) != null
+                and ([.assets[].name] | index($aab)) != null
+                and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
           }
           tag_exists=false
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
@@ -526,12 +526,21 @@ jobs:
               | jq -e 'type == "object" and (.tagName | type == "string")
                   and (.isDraft | type == "boolean")
                   and (.isPrerelease | type == "boolean")
-                  and (.assets | type == "array")' >/dev/null
-            if printf '%s' "$release_state" | release_is_complete; then
+                  and (.assets | type == "array")
+                  and all(.assets[]; type == "object"
+                    and (.name | type == "string"))' >/dev/null
+            set +e
+            printf '%s' "$release_state" | release_is_complete
+            release_complete_rc=$?
+            set -e
+            if [ "$release_complete_rc" -eq 0 ]; then
               # A tag-triggered rerun can retain should_publish=true from its
               # original plan. Never demote a healthy public release to draft.
               echo "$RELEASE_TAG is already complete; no publication mutation required"
               exit 0
+            elif [ "$release_complete_rc" -ne 1 ]; then
+              echo "Release completeness classifier failed" >&2
+              exit "$release_complete_rc"
             fi
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
