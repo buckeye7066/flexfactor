@@ -22,12 +22,13 @@ import flexfactor_rotation as R
 
 def route(rid: str, pool: str, tier: str = R.FRONTIER,
           cost: str = R.SUBSCRIPTION, enabled: bool = True,
-          backend: str = "", model: str = "", **kw) -> R.Route:
+          backend: str = "", model: str = "", wire_model: str = "",
+          **kw) -> R.Route:
     return R.Route(
         id=rid, backend=backend or rid.split("/")[0],
         backend_label=backend or rid.split("/")[0],
         model=model or rid.split("/", 1)[-1],
-        wire_model=model or rid.split("/", 1)[-1],
+        wire_model=wire_model or model or rid.split("/", 1)[-1],
         api="openai", base_url="https://example.invalid/v1",
         pool=pool, cost_class=cost, tier=tier, enabled=enabled, **kw)
 
@@ -741,6 +742,21 @@ class RotatingProviderTests(RotationTestCase):
         self.assertEqual(prov.role_coordinator.author_families, {"openai"})
         with self.assertRaisesRegex(R.RotationError, "no .* route available"):
             prov.grade_independent()
+
+    def test_independence_uses_wire_model_not_catalog_label(self):
+        prov = self._provider(catalog(
+            route("front/mislabeled", "author", tier=R.FRONTIER,
+                  model="gpt-5.6-sol", wire_model="claude-sonnet-4.6"),
+            route("light/claude", "review-claude", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+            route("light/qwen", "review-qwen", tier=R.LIGHT,
+                  model="qwen3-coder"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/mislabeled")
+        self.assertEqual(prov.role_coordinator.author_families, {"anthropic"})
+        prov.grade_independent()
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("qwen3-coder", selection.route.wire_model)
 
     def test_exact_review_intent_refuses_an_opaque_auto_author(self):
         prov = self._provider(catalog(

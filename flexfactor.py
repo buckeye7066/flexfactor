@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -3006,7 +3007,17 @@ def _inproc_source_syntax_ok(
     ext = os.path.splitext(str(path or ""))[1].lower()
     try:
         if ext in (".py", ".pyi"):
-            compile(text, str(path or "<candidate>"), "exec", dont_inherit=True)
+            # Compile the exact UTF-8 bytes the contained text writer would
+            # persist.  Python accepts an on-disk UTF-8 BOM, but compiling the
+            # decoded str rejects its leading U+FEFF as a non-printable
+            # character.  Bytes keep this preflight aligned with the real
+            # parser and also validate UTF-8 encoding before any write.
+            compile(
+                text.encode("utf-8"),
+                str(path or "<candidate>"),
+                "exec",
+                dont_inherit=True,
+            )
             return True, "python parse"
         if ext == ".json":
             json.loads(text)
@@ -3015,7 +3026,7 @@ def _inproc_source_syntax_ok(
             import tomllib
             tomllib.loads(text)
             return True, "toml parse"
-    except (SyntaxError, ValueError, TypeError, RecursionError,
+    except (SyntaxError, UnicodeError, ValueError, TypeError, RecursionError,
             MemoryError, OverflowError) as exc:
         return False, f"{ext.lstrip('.') or 'source'} parse error: {exc}"
     return None, "no safe in-process parser for this file type"
@@ -13210,7 +13221,7 @@ def _write_and_run_generated_test_batch(
         # `same.py` preflight as two files before both writes hit one leaf.
         # The universal rejection is intentionally stricter on case-sensitive
         # hosts: generated tests never need two case-only-distinct identities.
-        key = path.casefold()
+        key = unicodedata.normalize("NFC", path).casefold()
         if key in seen_paths:
             return [], None, "", (
                 f"generated test batch names duplicate path {path!r}"

@@ -534,6 +534,17 @@ def model_family(model_id: str) -> str:
     return seg.split(":")[0].split("-")[0] or "unknown"
 
 
+def route_model_family(route: Route) -> str:
+    """Family of the concrete model identity actually sent to a provider.
+
+    ``model`` may be a display/catalog label while ``wire_model`` is what the
+    provider factory executes.  Independence decisions must follow the latter
+    whenever it is present; otherwise a mislabeled route can evade both author
+    recording and reviewer exclusion.
+    """
+    return model_family(route.wire_model or route.model)
+
+
 # These labels describe a routing decision, not the concrete model that served
 # the call.  They cannot establish cross-family independence.  Ordinary work
 # may still use such routes, but a semantic authorization that explicitly
@@ -881,7 +892,7 @@ class Rotator:
                          if intent is not None and intent.avoid_family else set())
         if strict_families:
             strict_others = [r for r in candidates
-                             if model_family(r.model) not in strict_families]
+                             if route_model_family(r) not in strict_families]
             if strict_others:
                 candidates = strict_others
             else:
@@ -893,7 +904,7 @@ class Rotator:
                 return None
         if soft_families:
             soft_others = [r for r in candidates
-                           if model_family(r.model) not in soft_families]
+                           if route_model_family(r) not in soft_families]
             if soft_others:
                 candidates = soft_others
             else:
@@ -1443,7 +1454,7 @@ class RotatingProvider:
                 continue
             self.rotator.report(route, "ok")
             if intent is not None and intent.role:
-                family = model_family(route.model)
+                family = route_model_family(route)
                 with self._family_lock:
                     self._last_family[intent.role] = family
                     self._last_selection[intent.role] = selection
@@ -1521,7 +1532,7 @@ class RotatingProvider:
             selection = self._last_selection.get(ROLE_REVIEWER)
         if selection is None:
             raise RotationError("independent grading did not record a reviewer route")
-        reviewer_family = model_family(selection.route.model)
+        reviewer_family = route_model_family(selection.route)
         if reviewer_family in _OPAQUE_MODEL_FAMILIES:
             raise RotationError(
                 "independent grading cannot prove the reviewer family from "

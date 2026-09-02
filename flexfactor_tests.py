@@ -206,6 +206,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("parse error", reason)
 
+    def test_source_syntax_preflight_accepts_utf8_bom_python_bytes(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "bom.py", "\ufeffVALUE = 1\n"
+        )
+        self.assertIs(ok, True, reason)
+
     def test_source_syntax_preflight_parses_data_without_writing(self):
         self.assertEqual(
             True, ff._inproc_source_syntax_ok("settings.json", '{"safe": true}')[0]
@@ -4281,6 +4287,31 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         candidates = [
             {"path": "tests/Same.py", "contents": "VALUE = 1\n"},
             {"path": "tests/same.py", "contents": "VALUE = 2\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_unicode_normalization_alias_is_refused_on_every_host(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("Unicode alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("Unicode alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/caf\u00e9.py", "contents": "VALUE = 1\n"},
+            {"path": "tests/cafe\u0301.py", "contents": "VALUE = 2\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(ff, "_write_contained", forbidden_write), \
