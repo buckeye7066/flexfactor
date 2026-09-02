@@ -2954,7 +2954,9 @@ def _strip_code_fences(code: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def _inproc_source_syntax_ok(path: str, source: str) -> tuple[bool | None, str]:
+def _inproc_source_syntax_ok(
+        path: str, source: str, *, allow_empty: bool = False,
+) -> tuple[bool | None, str]:
     """Parse a whole-file model response without writing or executing it.
 
     ``True`` means a stdlib parser accepted the source, ``False`` means the
@@ -2962,15 +2964,18 @@ def _inproc_source_syntax_ok(path: str, source: str) -> tuple[bool | None, str]:
     means no safe in-process parser is available. Mutation callers must accept
     only ``True``; ``None`` is a named fail-closed refusal, never an implicit
     approval. The project publication gate remains authoritative for every
-    type; this earlier gate prevents a
-    reviewer from blessing obvious prose-as-code and lets Refactor assess the
-    *actual original file* when an author answers "already good" in prose.
+    type; this earlier gate prevents a reviewer from blessing obvious
+    prose-as-code and lets Refactor assess the *actual original file* when an
+    author answers "already good" in prose. Generated responses must never be
+    empty. ``allow_empty`` exists only for validating an already-versioned
+    original: empty Python and TOML files are syntactically valid, while the
+    relevant parser still rejects formats such as empty JSON.
 
     Keep this helper side-effect free.  In particular, never import or execute
     the candidate Python module merely to validate it.
     """
     text = str(source or "")
-    if not text.strip():
+    if not text.strip() and not allow_empty:
         return False, "empty whole-file response"
     ext = os.path.splitext(str(path or ""))[1].lower()
     try:
@@ -2984,7 +2989,8 @@ def _inproc_source_syntax_ok(path: str, source: str) -> tuple[bool | None, str]:
             import tomllib
             tomllib.loads(text)
             return True, "toml parse"
-    except (SyntaxError, ValueError, TypeError) as exc:
+    except (SyntaxError, ValueError, TypeError, RecursionError,
+            MemoryError, OverflowError) as exc:
         return False, f"{ext.lstrip('.') or 'source'} parse error: {exc}"
     return None, "no safe in-process parser for this file type"
 
@@ -5144,7 +5150,9 @@ def run(args) -> int:
                 # unchanged path below still runs the full project gate and
                 # proves this exact baseline is on remote default.
                 original_syntax_ok, original_syntax_note = (
-                    _inproc_source_syntax_ok(args.file, original)
+                    _inproc_source_syntax_ok(
+                        args.file, original, allow_empty=True,
+                    )
                 )
                 print(
                     f"[rep {i}] author response rejected before write: "
@@ -5218,8 +5226,8 @@ def run(args) -> int:
         if grade.issues:
             print("        remaining issues: " + "; ".join(grade.issues))
 
-        if (candidate.strip()
-                and (approved_original_fallback or grade.grade > best_grade)):
+        if (approved_original_fallback
+                or (candidate.strip() and grade.grade > best_grade)):
             best_grade, best_code = grade.grade, candidate
             best_review = grade
 

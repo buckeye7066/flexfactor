@@ -220,6 +220,37 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
             ff._inproc_source_syntax_ok("README.md", "ordinary prose")[0]
         )
 
+    def test_source_syntax_preflight_rejects_parser_recursion(self):
+        deeply_nested_toml = "value = " + "[" * 2000 + "0" + "]" * 2000
+        ok, reason = ff._inproc_source_syntax_ok(
+            "adversarial.toml", deeply_nested_toml
+        )
+        self.assertFalse(ok)
+        self.assertIn("parse error", reason)
+
+    def test_original_validation_allows_only_parser_valid_empty_source(self):
+        self.assertEqual(
+            True,
+            ff._inproc_source_syntax_ok(
+                "empty.py", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            True,
+            ff._inproc_source_syntax_ok(
+                "empty.toml", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            False,
+            ff._inproc_source_syntax_ok(
+                "empty.json", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            False, ff._inproc_source_syntax_ok("generated.py", "")[0]
+        )
+
     def test_missing_source_parser_fails_closed_before_review_or_publication(self):
         import tempfile
         import types
@@ -567,6 +598,64 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
         self.assertIn(original, Provider.prompts[0])
         self.assertNotIn(prose.strip(), Provider.prompts[0])
+
+    def test_valid_empty_original_can_be_independently_approved_as_noop(self):
+        import tempfile
+        import types
+
+        class Provider:
+            prompts = []
+
+            @staticmethod
+            def complete(_instruction):
+                return "The empty module already meets the requested goal.\n"
+
+            @classmethod
+            def grade_independent(cls, prompt):
+                cls.prompts.append(prompt)
+                return ff.Grade(
+                    100, True, "The exact empty original meets the goal.", []
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "empty.py")
+            with open(source, "w", encoding="utf-8"):
+                pass
+            _init_test_origin(repo, remote)
+            before = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            args = types.SimpleNamespace(
+                file=source, goal="keep this namespace-only package marker",
+                threshold=90, max_iterations=1, max_cost=1,
+                push=True, merge=True,
+            )
+            with mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(
+                    ff, "_publication_gate", return_value=(True, "ok")
+                 ) as gate:
+                rc = ff.run(args)
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(before, after)
+        self.assertEqual("", status)
+        self.assertEqual("", retained)
+        self.assertEqual(1, len(Provider.prompts))
+        gate.assert_called_once()
 
     def test_invalid_author_prose_cannot_claim_noop_without_original_approval(self):
         import tempfile
@@ -7243,15 +7332,25 @@ class CanonicalFileKeyTests(unittest.TestCase):
             done_set = set()
             real_edits = ff.generate_file_fix_edits
             real_gate = ff._gate_file
+            real_syntax = ff._inproc_source_syntax_ok
             try:
                 ff.generate_file_fix_edits = fake_edits
                 ff._gate_file = lambda *a, **k: (True, "")
+                # This regression is about canonical path identity, not parser
+                # availability.  Supply the parse success that a supported
+                # production source type must provide; the dedicated
+                # normalization tests prove parser-unavailable types fail
+                # closed before any write.
+                ff._inproc_source_syntax_ok = lambda *a, **k: (
+                    True, "fixture parser"
+                )
                 applied, _unver, _notes = ff._fix_files(
                     object(), None, tmp, findings, self.STACK, True, args,
                     done_set=done_set, adversarial=False)
             finally:
                 ff.generate_file_fix_edits = real_edits
                 ff._gate_file = real_gate
+                ff._inproc_source_syntax_ok = real_syntax
 
         self.assertEqual(len(gen_calls), 1,
                          f"the file was fixed more than once: {gen_calls}")
