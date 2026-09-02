@@ -30,7 +30,12 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       COPILOT_GITHUB_TOKEN: ${{ github.token }}
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
-      FLEXFACTOR_CLI_TIMEOUT: "420"
+      # A proof run has one authenticated remote model route.  Do not spend the
+      # remainder of the job retrying deliberately unreachable local Ollama
+      # fallbacks, and never let provider-capacity retry outlive this job.
+      FLEXFACTOR_ROTATION_EXCLUDE: "ollama"
+      FLEXFACTOR_CLI_TIMEOUT: "240"
+      FLEXFACTOR_PROVIDER_WAIT_MAX_S: "60"
       OLLAMA_BASE_URL: http://127.0.0.1:9
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"

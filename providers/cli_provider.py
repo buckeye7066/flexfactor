@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 from typing import Any, Dict, Optional
@@ -125,6 +126,83 @@ def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
     raise CliUnavailable(f"no CLI argv defined for api '{api}'")
 
 
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the CLI and descendants that inherited its captured pipes.
+
+    ``subprocess.run(..., timeout=...)`` kills only the direct child.  Agent
+    CLIs can spawn a worker which keeps stdout/stderr open; in that case
+    ``run`` waits forever while draining those pipes even though its advertised
+    timeout expired.  Each CLI is therefore placed in its own process group and
+    the complete group is terminated on expiry.
+    """
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                subprocess.run(
+                    [taskkill, "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=10, check=False, shell=False,
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _run_process_tree(argv: list, **kwargs: Any) -> subprocess.CompletedProcess:
+    """A ``subprocess.run`` equivalent with bounded process-tree cleanup."""
+    input_data = kwargs.pop("input", None)
+    timeout = float(kwargs.pop("timeout"))
+    capture_output = bool(kwargs.pop("capture_output", False))
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout/stderr may not accompany capture_output")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if input_data is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin may not accompany input")
+        kwargs["stdin"] = subprocess.PIPE
+    if os.name == "nt":
+        kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | int(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Never turn cleanup into a second unbounded wait. Closing our
+            # copies of the pipes is safe after the entire process group has
+            # received SIGKILL/taskkill.
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
              timeout: float) -> str:
     if os.environ.get(_RECURSION_MARKER):
@@ -138,7 +216,7 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
     body = prompt if (api not in ("codex-cli", "copilot-cli") or not system) \
         else f"{system}\n\n{prompt}"
     try:
-        proc = subprocess.run(
+        proc = _run_process_tree(
             argv,
             input=body,
             capture_output=True,

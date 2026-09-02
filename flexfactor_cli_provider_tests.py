@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -146,49 +147,49 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             p = cp.CliProvider("claude-code", "m", "claude")
             p.complete("SECRET_PROMPT_TEXT {\"a\": 1}")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("SECRET_PROMPT_TEXT", seen["input"])
         self.assertNotIn("SECRET_PROMPT_TEXT", " ".join(seen["argv"]))
 
     def test_a_nonzero_exit_raises_rather_than_returning_empty(self):
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 2, stdout="", stderr="boom")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_an_EMPTY_answer_is_a_failure_not_a_clean_review(self):
         """An empty result recorded as success is the silent-no-op class."""
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 0, stdout="   ", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_a_timeout_is_bounded_and_reported(self):
         def fake_run(argv, **kw):
             raise subprocess.TimeoutExpired(argv, kw.get("timeout", 1))
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude", timeout=1).complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_every_call_passes_a_timeout(self):
         """An unbounded wait is what froze a live run for 25+ minutes."""
@@ -197,12 +198,12 @@ class CliProviderBehaviourTests(unittest.TestCase):
         def fake_run(argv, **kw):
             seen["timeout"] = kw.get("timeout")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIsNotNone(seen["timeout"])
         self.assertGreater(seen["timeout"], 0)
 
@@ -222,24 +223,24 @@ class CliProviderBehaviourTests(unittest.TestCase):
                         'Here you go: {"ok": 1} — done'):
             def fake_run(argv, **kw):
                 return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
-            real = subprocess.run
-            subprocess.run = fake_run
+            real = cp._run_process_tree
+            cp._run_process_tree = fake_run
             try:
                 out = cp.CliProvider("claude-code", "m", "claude").structured("x", {})
             finally:
-                subprocess.run = real
+                cp._run_process_tree = real
             self.assertEqual(out, {"ok": 1})
 
     def test_unparseable_json_raises_instead_of_returning_junk(self):
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 0, stdout="no json here", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").structured("x", {})
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_structured_accepts_the_core_provider_call_shape(self):
         """Fix generation passes system, prompt, schema as three positionals."""
@@ -248,14 +249,14 @@ class CliProviderBehaviourTests(unittest.TestCase):
         def fake_run(argv, **kw):
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}', stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             out = cp.CliProvider("codex-cli", "m", "codex").structured(
                 "SYSTEM RULE", "make the fix", {"type": "object"},
                 max_tokens=123, model="ignored", salvage_truncated=True)
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertEqual(out, {"ok": True})
         self.assertIn("SYSTEM RULE", seen["input"])
         self.assertIn("make the fix", seen["input"])
@@ -269,20 +270,20 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
+        real = cp._run_process_tree
 
-        subprocess.run = fake_run
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("claude-code", "m", "claude").complete("p", system="THEME_MARKER")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("THEME_MARKER", " ".join(seen["argv"]) + (seen["input"] or ""))
 
-        subprocess.run = fake_run
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("codex-cli", "m", "codex").complete("p", system="THEME_MARKER")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         # codex exec takes no --append-system-prompt, so it must ride the prompt.
         self.assertIn("THEME_MARKER", seen["input"])
 
@@ -293,13 +294,13 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("copilot-cli", "auto", "copilot").complete(
                 "PROMPT", system="SYSTEM")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("-s", seen["argv"])
         self.assertIn("--no-ask-user", seen["argv"])
         self.assertNotIn("--allow-all-tools", seen["argv"])
@@ -313,18 +314,35 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="OK", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             self.assertTrue(cp.CliProvider(
                 "copilot-cli", "auto", "copilot").ping())
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertNotIn("--version", seen["argv"])
         self.assertIn("Reply with OK", seen["input"])
 
     def test_billing_label_marks_these_flat_rate(self):
         self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)
+
+    def test_timeout_kills_descendants_that_hold_captured_pipes(self):
+        child = "import time; time.sleep(60)"
+        parent = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+            "time.sleep(60)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            cp._run_process_tree(
+                [sys.executable, "-c", parent],
+                input="", capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=0.2,
+                env=dict(os.environ), shell=False,
+            )
+        self.assertLess(time.monotonic() - started, 5.0)
 
 
 if __name__ == "__main__":
