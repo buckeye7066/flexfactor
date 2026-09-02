@@ -7663,6 +7663,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             f"generated 'files' is not a list ({type(raw_files).__name__})",
         )
     files: list[dict[str, str]] = []
+    seen_file_paths: set[str] = set()
     for index, item in enumerate(raw_files):
         if not isinstance(item, dict):
             return ApplyResult(
@@ -7683,7 +7684,20 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 f"generated file {path!r} has non-text contents "
                 f"({type(contents).__name__})",
             )
-        files.append({"path": path, "contents": contents})
+        identity = _portable_rel_identity(path)
+        if identity is None:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} has an invalid repository path",
+            )
+        canonical_path, path_key = identity
+        if path_key in seen_file_paths:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated Scout batch names duplicate path {canonical_path!r}",
+            )
+        seen_file_paths.add(path_key)
+        files.append({"path": canonical_path, "contents": contents})
     # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
     # mutation, so a malformed or option-like entry can never write a file,
     # raise past the rollback, or reach npm.
@@ -7811,7 +7825,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     def _snapshot(rel: str) -> None:
         if rel in backups or rel in created:
             return
-        data = _read_bytes_contained(project_dir, rel)
+        data = _read_bytes_contained(project_dir, rel, cap=None)
         if data is not None:
             backups[rel] = data  # readable existing file -> restore on rollback
             return
@@ -7929,7 +7943,9 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             except (ValueError, UnicodeDecodeError):
                 return {}
         deps_before = _deps_of(backups.get("package.json"))
-        deps_after = _deps_of(_read_bytes_contained(project_dir, "package.json"))
+        deps_after = _deps_of(
+            _read_bytes_contained(project_dir, "package.json", cap=None)
+        )
         changed_files = sorted(file_list)
         if git:
             st = _git(["status", "--porcelain"], project_dir)
@@ -10131,6 +10147,20 @@ def _rel_components(rel: str) -> list[str] | None:
             return None
         comps.append(part)
     return comps or None
+
+
+def _portable_rel_identity(rel: str) -> tuple[str, str] | None:
+    """Canonical repository spelling plus a portable duplicate identity.
+
+    The spelling is used for every later worktree operation. The identity is
+    NFC-normalized and case-folded so a model-generated batch cannot name one
+    macOS/Windows leaf more than once while appearing distinct on Linux.
+    """
+    components = _rel_components(rel)
+    if components is None:
+        return None
+    canonical = "/".join(components)
+    return canonical, unicodedata.normalize("NFC", canonical).casefold()
 
 
 @contextlib.contextmanager
@@ -12486,6 +12516,8 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     if len(renames) > STRUCTURAL_MAX_RENAMES:
         return f"plan renames {len(renames)} files (max {STRUCTURAL_MAX_RENAMES})"
 
+    seen_paths: dict[str, str] = {}
+
     def bad_path(p) -> str:
         if not isinstance(p, str) or not p.strip():
             return "empty path in plan"
@@ -12494,6 +12526,15 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
             return f"path touches .git: {p}"
         if _rel_components(cp) is None:
             return f"path refused by containment: {p}"
+        identity = _portable_rel_identity(cp)
+        if identity is None:
+            return f"path refused by containment: {p}"
+        canonical, key = identity
+        previous = seen_paths.get(key)
+        if previous is not None:
+            return (f"plan aliases one repository path more than once: "
+                    f"{previous!r} and {canonical!r}")
+        seen_paths[key] = canonical
         return ""
 
     for w in writes:
@@ -12617,8 +12658,10 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     if why:
         return ("failed", f"plan refused: {why}")
 
-    writes = [(_canon_rel(w["path"]), w["contents"]) for w in plan.get("writes") or []]
-    renames = [(_canon_rel(r["from"]), _canon_rel(r["to"]))
+    writes = [(_portable_rel_identity(w["path"])[0], w["contents"])
+              for w in plan.get("writes") or []]
+    renames = [(_portable_rel_identity(r["from"])[0],
+                _portable_rel_identity(r["to"])[0])
                for r in plan.get("renames") or []]
 
     # Structural escalation is still model-authored source.  Validate EVERY
@@ -13270,22 +13313,21 @@ def _write_and_run_generated_test_batch(
             return [], None, "", (
                 f"generated test entry {index} has no non-empty text source"
             ), []
-        components = _rel_components(path)
-        if components is None:
+        identity = _portable_rel_identity(path)
+        if identity is None:
             return [], None, "", (
                 f"generated test entry {index} has an invalid repository path"
             ), []
         # One canonical spelling is both the worktree identity and the
         # duplicate key.  Without this, `tests/x.py` and `./tests//x.py`
         # preflight as two missing files but write the same leaf twice.
-        path = "/".join(components)
+        path, key = identity
         # Reject case-only aliases on every host.  macOS normally uses a
         # case-insensitive filesystem even though os.path.normcase() retains
         # POSIX case, so relying on the host path module lets `Same.py` and
         # `same.py` preflight as two files before both writes hit one leaf.
         # The universal rejection is intentionally stricter on case-sensitive
         # hosts: generated tests never need two case-only-distinct identities.
-        key = unicodedata.normalize("NFC", path).casefold()
         if key in seen_paths:
             return [], None, "", (
                 f"generated test batch names duplicate path {path!r}"

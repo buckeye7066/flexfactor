@@ -241,6 +241,34 @@ class StructuralRollsBack(_Base):
         forbidden_gate.assert_not_called()
         forbidden_review.assert_not_called()
 
+    def test_portable_aliases_are_rejected_before_every_structural_write(self):
+        author = _Author([plan(writes=[
+            {"path": "pkg/caf\u00e9.py", "contents": "VALUE = 1\n"},
+            {"path": "pkg/cafe\u0301.py", "contents": "VALUE = 2\n"},
+        ])])
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("structural alias reached a write")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("structural alias reached a gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("structural alias reached review")
+        )
+        with mock.patch.object(F, "_replace_contained", forbidden_write), \
+             mock.patch.object(F, "_gate_file", forbidden_gate), \
+             mock.patch.object(F, "_cross_verify_structural", forbidden_review):
+            kind, detail = F.attempt_structural_fix(
+                author, object(), self.proj, "bad.py", [dict(FINDING)],
+                {}, True, NOFIX_NOTE,
+            )
+        self.assertEqual("failed", kind)
+        self.assertIn("aliases one repository path", detail)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, "pkg")))
+        forbidden_write.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
     def test_broken_python_rolls_back_every_operation(self):
         author = _Author([plan(writes=[
             {"path": "bad.py", "contents": BAD_PYTHON},

@@ -4183,6 +4183,39 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         forbidden_review.assert_not_called()
         forbidden_publish.assert_not_called()
 
+    def test_portable_alias_batch_is_refused_before_scout_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("Scout path alias reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": "pkg/caf\u00e9.py", "contents": "VALUE = 1\n"},
+                {"path": "pkg/cafe\u0301.py", "contents": "VALUE = 2\n"},
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+             mock.patch.object(ff, "_write_contained", forbidden), \
+             mock.patch.object(ff, "_detect_verify", forbidden), \
+             mock.patch.object(ff, "_run", forbidden), \
+             mock.patch.object(ff, "_git", forbidden), \
+             mock.patch.object(ff, "_independent_final_review", forbidden), \
+             mock.patch.object(ff, "_publish_verified_head", forbidden):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("duplicate path", result.detail)
+        forbidden.assert_not_called()
+
 
 class GeneratedTestSourcePreflightTests(unittest.TestCase):
     """Audit/Production Ready parse every generated test before any write."""
@@ -6679,6 +6712,41 @@ class SnapshotTriStateTests(unittest.TestCase):
             self.assertIn(res.status, ("verify-failed", "error"))    # npm mock failed -> rollback
             # The genuinely-created new.py was snapshotted 'created' and unlinked on rollback.
             self.assertFalse(os.path.exists(os.path.join(proj, "new.py")))
+
+    def test_large_rewritten_file_is_restored_without_snapshot_truncation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            original = ("# " + ("x" * (ff.MAX_REVIEW_BYTES + 32))
+                        + "\nVALUE = 1\n").encode()
+            target = os.path.join(proj, "large.py")
+            with open(target, "wb") as fh:
+                fh.write(original)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            real_run = ff._run
+
+            def fail_install(cmd, cwd, timeout=900, **kwargs):
+                if list(cmd[:2]) == ["npm", "install"]:
+                    return ff.subprocess.CompletedProcess(
+                        cmd, 1, "", "forced install failure"
+                    )
+                return real_run(cmd, cwd, timeout=timeout, **kwargs)
+
+            ff._run = fail_install
+            patch = {
+                "files": [{"path": "large.py", "contents": "VALUE = 2\n"}],
+                "packages": ["lodash"],
+            }
+            try:
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            finally:
+                ff._run = real_run
+            self.assertIn(result.status, ("verify-failed", "error"))
+            with open(target, "rb") as fh:
+                self.assertEqual(original, fh.read())
 
 
 def _try_dir_symlink(link, target_dir):
