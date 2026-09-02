@@ -245,7 +245,25 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
             workflow.count('test "$live_main" = "$AUTHORIZED_MAIN_SHA"'), 2)
         self.assertIn('source_sha="$tag_commit"', workflow)
         self.assertIn('authorized_main_sha="$GITHUB_SHA"', workflow)
-        self.assertIn('git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha"', workflow)
+        tag_plan = workflow.index('if [ "$GITHUB_REF_TYPE" = "tag" ]; then')
+        fetch_main = workflow.index("git fetch --no-tags origin", tag_plan)
+        resolve_fetched_main = workflow.index(
+            "authorized_main_sha=$(git rev-parse", fetch_main
+        )
+        prove_tag_containment = workflow.index(
+            'git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha"',
+            resolve_fetched_main,
+        )
+        self.assertIn(
+            "+refs/heads/main:refs/remotes/origin/release-authorized-main",
+            workflow[fetch_main:resolve_fetched_main],
+        )
+        self.assertIn(
+            "refs/remotes/origin/release-authorized-main",
+            workflow[resolve_fetched_main:prove_tag_containment],
+        )
+        self.assertLess(fetch_main, resolve_fetched_main)
+        self.assertLess(resolve_fetched_main, prove_tag_containment)
         self.assertIn("require_exact_tag()", workflow)
         self.assertGreaterEqual(workflow.count("require_exact_tag"), 8)
         self.assertIn("--draft", workflow)
