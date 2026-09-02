@@ -31,7 +31,12 @@ target, waits for its terminal GitHub run, then dispatches the next.
 
 Scout additionally requires one public program/product website URL. That URL
 is retrieved and compared with each selected target repository; source
-repository discovery remains the responsibility of Repo Rewards.
+repository discovery remains the responsibility of Repo Rewards. Report mode
+writes the full public-behavior twin specification. Enabling Scout apply builds,
+tests, independently reviews, and pushes a permanent URL-specific
+`scout/twin/...` branch without switching or merging the target branch. Later
+scans of the same URL update that branch; selective ports into the target stay
+separately approval-gated.
 
 Every request carries a stable UUID. If the app process stops after dispatch but
 before recording the returned run ID, retrying with that UUID recovers the
@@ -58,8 +63,10 @@ suite, deterministic evidence gates, and independent exact-commit review by a
 model family that authored none of the candidate. It then must prove that exact
 SHA is reachable from the repository's authoritative default branch.
 
-An open PR, branch-only commit, missing test command, reviewer outage, partial
-output, failed gate, or unproven publication remains incomplete in the app.
+An open PR, an unproven branch commit, missing test command, reviewer outage,
+partial output, failed gate, or unproven publication remains incomplete in the app.
+For a Scout behavioral twin, exact remote twin-branch-tip proof is the intended
+publication result; target mutations still require default-branch containment.
 Run details and the bounded in-app artifact remain correlated to the request
 UUID.
 

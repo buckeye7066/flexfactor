@@ -21,6 +21,7 @@ addresses, unsafe redirects, non-text responses, and oversized bodies.
 from __future__ import annotations
 
 import datetime as _datetime
+import hashlib
 import html as _html
 import http.client
 import ipaddress
@@ -43,6 +44,10 @@ __all__ = [
     "format_evidence_context",
     "validate_profile_references",
     "validate_comparison",
+    "build_clean_room_contracts",
+    "canonical_program_url",
+    "behavioral_twin_identity",
+    "build_behavioral_twin_spec",
     "is_public_http_url",
 ]
 
@@ -50,11 +55,12 @@ __all__ = [
 _UA = "Mozilla/5.0 (compatible; FlexFactor-Scout/2.0; program research)"
 _HTTP_TIMEOUT = 25.0
 _MAX_RESPONSE_BYTES = 1_000_000
-_MAX_PAGE_TEXT = 18_000
-_MAX_TOTAL_TEXT = 72_000
+_MAX_PAGE_TEXT = 12_000
+_MAX_TOTAL_TEXT = 144_000
 _FEATURE_TERMS = re.compile(
     r"(?:feature|capabilit|product|solution|workflow|integration|document|"
-    r"developer|platform|how[- ]it[- ]works|use[- ]case|about|overview)", re.I
+    r"developer|platform|how[- ]it[- ]works|use[- ]case|about|overview|api|"
+    r"academy|help|guide|editor|template|security|pricing|export|import|avatar)", re.I
 )
 _SKIP_SUFFIXES = (
     ".7z", ".avi", ".bin", ".dmg", ".doc", ".docx", ".exe", ".gif",
@@ -62,6 +68,11 @@ _SKIP_SUFFIXES = (
     ".pdf", ".png", ".ppt", ".pptx", ".rar", ".svg", ".tar", ".webp",
     ".xls", ".xlsx", ".zip",
 )
+
+
+CLEAN_ROOM_CONTRACT_SCHEMA_VERSION = "scout-clean-room-contract-v1"
+CLEAN_ROOM_REUSE_MODE = "clean-room-from-documented-behavior"
+BEHAVIORAL_TWIN_SCHEMA_VERSION = "scout-behavioral-twin-v1"
 
 
 TARGET_PROFILE_SCHEMA = {
@@ -267,9 +278,14 @@ TARGET_PROFILE_SYSTEM = (
 )
 
 SCOUTED_PROGRAM_PROFILE_SYSTEM = (
-    "You are examining one specifically named SCOUTED program for capabilities "
-    "that might be useful elsewhere. Use only the retrieved website pages supplied. "
-    "Describe observable behavior and implementation patterns; "
+    "You are building the exhaustive public-behavior inventory for one specifically "
+    "named SCOUTED program. Use only the retrieved website pages supplied. Inventory "
+    "distinct end-to-end workflows; screens and interaction states; inputs and outputs; "
+    "editing, project, collaboration, import/export, API/webhook, and automation surfaces; "
+    "and evidenced limits, errors, retries, or quality controls. Express each distinct "
+    "user-visible or programmatic function as its own capability rather than compressing "
+    "unrelated functions into a vague row. Describe observable behavior and public "
+    "implementation patterns; "
     "do not invent features from the product name. Every workflow/capability must "
     "cite exact [S#] evidence identifiers. When evidence is marketing-only, lower "
     "confidence and say so. Respond with JSON only."
@@ -631,6 +647,11 @@ def crawl_public_program(
             "retrieved": len(pages),
             "text_chars": total,
             "errors": errors,
+            "page_limit": max_pages,
+            "page_limit_reached": bool(queue) and len(pages) >= max_pages,
+            "text_limit_reached": bool(queue) and total >= _MAX_TOTAL_TEXT,
+            "queued_remaining": len(queue),
+            "exhaustive": not queue and not errors,
             "complete": bool(pages),
         },
     }
@@ -846,3 +867,398 @@ def validate_comparison(comparison: dict, target_bundle: dict,
         "complete": not rejected and not missing,
     }
     return root
+
+
+def _clean_room_evidence_manifest(bundle: dict, refs: set[str]) -> list[dict]:
+    """Return provenance for public-behavior authoring without copied page text."""
+    rows: list[dict] = []
+    for item in bundle.get("evidence") or []:
+        evidence_id = str(item.get("id") or "")
+        if evidence_id not in refs:
+            continue
+        body = str(item.get("text") or "")
+        rows.append({
+            "id": evidence_id,
+            "kind": item.get("kind"),
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "path": item.get("path"),
+            "text_chars": len(body),
+            "text_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        })
+    return rows
+
+
+def build_clean_room_contracts(comparison: dict, target_bundle: dict,
+                               source_bundle: dict,
+                               source_profile: dict | None = None) -> dict:
+    """Turn accepted public-product behavior into independent code contracts.
+
+    This deliberately does *not* reconstruct a proprietary implementation.  It
+    records the observable behavior, the target-native outcome, and the test
+    that an independently authored implementation must pass.  Raw website text
+    stays in the in-memory evidence bundle; artifacts receive references and
+    hashes only.
+
+    Every adopt/adapt row at the normal value threshold is accounted.  Low
+    confidence or invalid evidence produces a named, non-authorable contract
+    instead of either invented internals or a silent omission.
+    """
+    target_ids = _known_ids(target_bundle, "T")
+    source_ids = _known_ids(source_bundle, "S")
+    source_profile = source_profile or {}
+    source_name = str(source_profile.get("name") or comparison.get("scouted_name")
+                      or source_bundle.get("name_hint") or "scouted program").strip()
+    source_url = str(source_profile.get("canonical_url")
+                     or source_bundle.get("canonical_url") or "").strip()
+    contracts: list[dict] = []
+    rejected: list[dict] = []
+    eligible = 0
+
+    for raw in comparison.get("recommendations") or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        decision = str(row.get("decision") or "").lower()
+        try:
+            value_score = int(row.get("value_score") or 0)
+        except (TypeError, ValueError):
+            value_score = 0
+        if decision not in {"adopt", "adapt"} or value_score < 50:
+            continue
+        eligible += 1
+        capability = str(row.get("capability") or "").strip()
+        t_refs = {str(ref) for ref in (row.get("target_evidence_refs") or [])}
+        s_refs = {str(ref) for ref in (row.get("source_evidence_refs") or [])}
+        errors: list[str] = []
+        if not capability:
+            errors.append("capability is empty")
+        if not t_refs or not t_refs.issubset(target_ids):
+            errors.append("target evidence reference is missing or unknown")
+        if not s_refs or not s_refs.issubset(source_ids):
+            errors.append("source evidence reference is missing or unknown")
+        for field in ("source_behavior", "target_state", "target_gap",
+                      "purpose_alignment", "how_it_optimizes",
+                      "adaptation_plan", "verification_plan"):
+            if not str(row.get(field) or "").strip():
+                errors.append(f"{field} is empty")
+        touchpoints = [str(item).strip() for item in
+                       (row.get("target_touchpoints") or []) if str(item).strip()]
+        if not touchpoints:
+            errors.append("target touchpoint is missing")
+        confidence = str(row.get("confidence") or "low").lower()
+        evidence_ready = confidence in {"high", "medium"} and not errors
+        reason = ""
+        if errors:
+            reason = "; ".join(errors)
+        elif not evidence_ready:
+            reason = ("public evidence confidence is low; gather a stronger official "
+                      "behavioral specification before authoring code")
+
+        contract = {
+            "schema": CLEAN_ROOM_CONTRACT_SCHEMA_VERSION,
+            "implementation_kind": CLEAN_ROOM_REUSE_MODE,
+            "source_program": {"name": source_name, "canonical_url": source_url},
+            "capability": capability,
+            "decision": decision,
+            "value_score": value_score,
+            "confidence": confidence if confidence in {"high", "medium", "low"} else "low",
+            "can_implement": evidence_ready,
+            "status": "ready-for-authoring" if evidence_ready else "insufficient-public-evidence",
+            "reason": reason,
+            "public_behavior_contract": {
+                "observable_behavior": str(row.get("source_behavior") or "").strip(),
+                "target_before": str(row.get("target_state") or "").strip(),
+                "target_gap": str(row.get("target_gap") or "").strip(),
+                "required_outcome": str(row.get("how_it_optimizes") or "").strip(),
+                "purpose_alignment": str(row.get("purpose_alignment") or "").strip(),
+                "target_native_design": str(row.get("adaptation_plan") or "").strip(),
+                "target_touchpoints": touchpoints,
+                "acceptance_tests": [str(row.get("verification_plan") or "").strip()],
+                "interface_goal": (
+                    "Implement the evidenced user-facing capability through the target's "
+                    "own architecture; do not impersonate or depend on a private vendor endpoint."
+                ),
+            },
+            "evidence": {
+                "target_refs": sorted(t_refs),
+                "source_refs": sorted(s_refs),
+                "target_manifest": _clean_room_evidence_manifest(target_bundle, t_refs),
+                "source_manifest": _clean_room_evidence_manifest(source_bundle, s_refs),
+            },
+            "clean_room_boundary": {
+                "reuse_mode": CLEAN_ROOM_REUSE_MODE,
+                "source_code_used": False,
+                "may_copy_source": False,
+                "may_infer_private_internals": False,
+                "may_use_publicly_evidenced_behavior": True,
+                "prohibited": [
+                    "proprietary or leaked source code",
+                    "decompilation or reconstruction claims",
+                    "undocumented/private endpoint access",
+                    "authentication, paywall, or terms bypass",
+                    "vendor branding or endpoint impersonation",
+                ],
+            },
+        }
+        digest_input = json.dumps(
+            contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        contract_sha256 = hashlib.sha256(digest_input).hexdigest()
+        contract["contract_sha256"] = contract_sha256
+        contract["proposal_id"] = "clean-room-" + contract_sha256[:24]
+        contracts.append(contract)
+        if errors:
+            rejected.append({
+                "capability": capability or "(unnamed)",
+                "validation_errors": errors,
+            })
+
+    ready = sum(1 for row in contracts if row.get("can_implement") is True)
+    return {
+        "schema": "scout-clean-room-contracts-v1",
+        "implementation_kind": CLEAN_ROOM_REUSE_MODE,
+        "contracts": contracts,
+        "rejected_rows": rejected,
+        "summary": (
+            f"{ready}/{eligible} accepted public behavior(s) have an evidence-bound "
+            "independent implementation contract."
+        ),
+        "validation": {
+            "eligible": eligible,
+            "ready": ready,
+            "not_ready": eligible - ready,
+            "complete": not rejected and ready == eligible,
+        },
+    }
+
+
+def canonical_program_url(value: str) -> str:
+    """Canonical, credential-free URL used for stable twin branch identity.
+
+    The identity deliberately ignores fragments and common campaign parameters,
+    but preserves meaningful query parameters.  A later evidence refresh can
+    therefore update the same branch instead of allocating another checkout.
+    """
+    raw = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid program URL: {exc}") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("behavioral twin identity requires an http(s) program URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credentials are not allowed in a program URL")
+    try:
+        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError(f"invalid program hostname: {exc}") from exc
+    if port and port != (443 if scheme == "https" else 80):
+        host = f"{host}:{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    query_rows = []
+    for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        low = key.lower()
+        if low.startswith("utm_") or low in {"gclid", "fbclid", "mc_cid", "mc_eid"}:
+            continue
+        query_rows.append((key, item))
+    query = urllib.parse.urlencode(sorted(query_rows), doseq=True)
+    return urllib.parse.urlunsplit((scheme, host, path, query, ""))
+
+
+def behavioral_twin_identity(canonical_url: str, program_name: str = "") -> dict:
+    """Return the permanent branch/subtree identity for one canonical URL."""
+    normalized = canonical_program_url(canonical_url)
+    parsed = urllib.parse.urlsplit(normalized)
+    # The model-derived/display name is deliberately NOT identity material. A
+    # later profile may call the same site "HeyGen", "HeyGen AI", or "HeyGen
+    # Video"; that wording drift must still update one URL-owned branch.
+    stable_host = str(parsed.hostname or "program").lower().removeprefix("www.")
+    label = stable_host.split(".", 1)[0] or "program"
+    slug = re.sub(r"[^a-z0-9]+", "-", label).strip("-")[:42] or "program"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    leaf = f"{slug}-{digest[:12]}"
+    return {
+        "canonical_url": normalized,
+        "url_sha256": digest,
+        "slug": leaf,
+        "branch": f"scout/twin/{leaf}",
+        "subtree": f"scout_twins/{leaf}",
+        "persistence": "permanent-url-branch",
+    }
+
+
+def build_behavioral_twin_spec(source_bundle: dict, source_profile: dict,
+                               *, target_profile: dict | None = None,
+                               comparison: dict | None = None) -> dict:
+    """Describe the most complete independently authored public-behavior twin.
+
+    Unlike target optimization recommendations, this inventory accounts for
+    *every* evidenced source capability and workflow.  Target fit is annotations
+    only: a capability rejected for the target still belongs in the twin.
+    """
+    source_profile = source_profile or {}
+    canonical = str(source_profile.get("canonical_url")
+                    or source_bundle.get("canonical_url") or "").strip()
+    name = str(source_profile.get("name") or source_bundle.get("name_hint")
+               or "scouted program").strip()
+    identity = behavioral_twin_identity(canonical, name)
+    known_ids = _known_ids(source_bundle, "S")
+    comparison_by_name = {
+        str(row.get("capability") or ""): row
+        for row in ((comparison or {}).get("recommendations") or [])
+        if isinstance(row, dict) and str(row.get("capability") or "")
+    }
+    features: list[dict] = []
+    seen: set[str] = set()
+    validation_errors: list[dict] = []
+    all_refs: set[str] = set()
+    for raw in source_profile.get("capabilities") or []:
+        if not isinstance(raw, dict):
+            validation_errors.append({"capability": "(invalid)",
+                                      "errors": ["capability is not an object"]})
+            continue
+        row = dict(raw)
+        capability = str(row.get("name") or "").strip()
+        key = capability.casefold()
+        refs = {str(ref) for ref in (row.get("evidence_refs") or [])}
+        errors = []
+        if not capability:
+            errors.append("name is empty")
+        if key in seen:
+            errors.append("capability name is duplicated")
+        if not refs or not refs.issubset(known_ids):
+            errors.append("source evidence reference is missing or unknown")
+        for field in ("behavior", "user_value", "implementation_pattern"):
+            if not str(row.get(field) or "").strip():
+                errors.append(f"{field} is empty")
+        confidence = str(row.get("confidence") or "low").lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+            errors.append("confidence is invalid")
+        if key:
+            seen.add(key)
+        all_refs.update(refs & known_ids)
+        target_row = comparison_by_name.get(capability) or {}
+        evidence_ready = confidence in {"high", "medium"} and not errors
+        feature = {
+            "name": capability,
+            "observable_behavior": str(row.get("behavior") or "").strip(),
+            "user_outcome": str(row.get("user_value") or "").strip(),
+            "public_implementation_pattern": str(
+                row.get("implementation_pattern") or "").strip(),
+            "confidence": confidence,
+            "evidence_refs": sorted(refs),
+            "authoring_status": (
+                "ready-for-independent-implementation" if evidence_ready
+                else "evidence-blocked"
+            ),
+            "authoring_blockers": list(errors) + (
+                ["public evidence confidence is low; do not invent missing behavior"]
+                if confidence == "low" else []
+            ),
+            "target_fit": {
+                "decision": target_row.get("decision") or "unassessed",
+                "value_score": target_row.get("value_score"),
+                "how_it_optimizes_target": target_row.get("how_it_optimizes") or "",
+            },
+        }
+        features.append(feature)
+        if errors:
+            validation_errors.append({"capability": capability or "(unnamed)",
+                                      "errors": errors})
+
+    workflows: list[dict] = []
+    workflow_seen: set[str] = set()
+    for raw in source_profile.get("workflows") or []:
+        if not isinstance(raw, dict):
+            validation_errors.append({"workflow": "(invalid)",
+                                      "errors": ["workflow is not an object"]})
+            continue
+        name_value = str(raw.get("name") or "").strip()
+        behavior = str(raw.get("behavior") or "").strip()
+        refs = {str(ref) for ref in (raw.get("evidence_refs") or [])}
+        errors = []
+        if not name_value:
+            errors.append("name is empty")
+        if name_value.casefold() in workflow_seen:
+            errors.append("workflow name is duplicated")
+        if not behavior:
+            errors.append("behavior is empty")
+        if not refs or not refs.issubset(known_ids):
+            errors.append("source evidence reference is missing or unknown")
+        if name_value:
+            workflow_seen.add(name_value.casefold())
+        all_refs.update(refs & known_ids)
+        workflows.append({
+            "name": name_value,
+            "observable_behavior": behavior,
+            "evidence_refs": sorted(refs),
+            "authoring_status": "ready-for-independent-implementation" if not errors
+                                else "evidence-blocked",
+            "authoring_blockers": errors,
+        })
+        if errors:
+            validation_errors.append({"workflow": name_value or "(unnamed)",
+                                      "errors": errors})
+
+    spec = {
+        "schema": BEHAVIORAL_TWIN_SCHEMA_VERSION,
+        "implementation_kind": "independent-public-behavior-twin",
+        "identity": identity,
+        "source_program": {
+            "name": name,
+            "canonical_url": identity["canonical_url"],
+            "program_type": source_profile.get("program_type") or "unknown",
+            "summary": source_profile.get("summary") or "",
+        },
+        "target_context": {
+            "name": (target_profile or {}).get("name"),
+            "purpose": (target_profile or {}).get("summary"),
+            "note": ("Target fit does not limit twin scope; every source capability "
+                     "remains accounted even when it is not useful to the target."),
+        },
+        "public_behavior_contract": {
+            "capabilities": features,
+            "workflows": workflows,
+            "limitations": list(source_profile.get("limitations") or []),
+            "coverage_gaps": list(source_profile.get("coverage_gaps") or []),
+        },
+        "evidence": {
+            "refs": sorted(all_refs),
+            "manifest": _clean_room_evidence_manifest(source_bundle, all_refs),
+            "raw_page_text_stored": False,
+        },
+        "clean_room_boundary": {
+            "source_code_used": False,
+            "private_internals_known": False,
+            "private_or_undocumented_endpoints_allowed": False,
+            "publicly_evidenced_outcomes_may_be_reimplemented": True,
+            "vendor_brand_impersonation_allowed": False,
+        },
+        "completeness_contract": {
+            "capability_total": len(features),
+            "workflow_total": len(workflows),
+            "every_capability_must_be_accounted_in_code_or_named_blocked": True,
+            "every_workflow_must_be_accounted_in_code_or_named_blocked": True,
+            "no_placeholders_may_count_as_implemented": True,
+            "low_confidence_behavior_may_not_be_invented": True,
+        },
+        "validation": {
+            "complete": bool(features) and not validation_errors,
+            "errors": validation_errors,
+            "ready_capabilities": sum(
+                1 for row in features
+                if row["authoring_status"] == "ready-for-independent-implementation"),
+            "blocked_capabilities": sum(
+                1 for row in features if row["authoring_status"] == "evidence-blocked"),
+        },
+    }
+    unsigned = json.dumps(spec, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+    spec["contract_sha256"] = hashlib.sha256(unsigned).hexdigest()
+    return spec

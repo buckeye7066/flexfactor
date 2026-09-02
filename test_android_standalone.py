@@ -158,7 +158,7 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertNotIn("${{ inputs.openai", workflow.lower())
         self.assertNotIn("inputs.target_repository }} ·", workflow)
         self.assertNotIn("find target -type f -name '*.bak'", workflow)
-        self.assertIn("args+=(--apply --yes)", workflow)
+        self.assertIn("args+=(--apply --yes --trust-repo)", workflow)
         self.assertIn("target/*_repo_rewards_report.md", workflow)
         self.assertIn("target/*_audit_report.md", workflow)
         self.assertIn("target/*_readiness.md", workflow)

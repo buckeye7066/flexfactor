@@ -20,14 +20,18 @@ publication contract on desktop and in the signed Android app.
 - There are no paid and free routes. Every call starts at the strongest
   available paid or subscription model, descends through lower paid capacity
   only when credit/quota is unavailable, and reaches free/local capacity last.
-- A writing mode refuses to begin model work without Git, an `origin`, a named
-  branch, and mandatory push-and-merge publication.
+- A writing mode refuses to begin model work without Git, an `origin`, and a
+  named branch. Target mutations require push-and-merge publication. Scout's
+  standalone behavioral twin is the explicit exception: its intended product
+  output is a retained, URL-specific remote branch that is never auto-merged.
 - Generated code is never trusted because it was generated. It must pass the
   target's real build and strongest project suite, complete changed-file
   rescanning and evidence gates, and an exact-commit review by a model family
   that authored none of the candidate.
-- Exit 0 requires proof that the exact reviewed commit is reachable from the
-  authoritative remote default branch. A local commit, an open PR, a red or
+- Exit 0 requires proof that the exact reviewed target commit is reachable from
+  the authoritative remote default branch, or—for a Scout twin—that the exact
+  reviewed commit is the authoritative tip of its permanent remote twin branch.
+  A local commit, an open PR, a red or
   missing test gate, reviewer loss, partial model output, or exhausted budget is
   incomplete—not success.
 
@@ -36,7 +40,7 @@ publication contract on desktop and in the signed Android app.
 | Mode | Selection | Behavior |
 |---|---|---|
 | Refactor | Up to 30 repository-relative files | Rewrite and grade each file toward its stated goal, then verify, independently review, and land the exact commit. |
-| Scout | Up to 30 repositories | Profile the product and research improvements. Mutation requires explicit Scout apply authorization and then uses the same verification/publication contract. |
+| Scout | Up to 30 repositories | Retrieve a public product URL, inventory every evidenced behavior, and design a complete independent twin. `--apply` builds/tests/reviews it on a permanent `scout/twin/...` branch while Repo Rewards separately finds code for target-specific deltas. |
 | Audit | Up to 30 repositories | Whole-repository purpose, defect, test, journey, evidence, competitor, repair, and publication pipeline. |
 | Production Ready | Up to 30 repositories | Audit with the full readiness rubric, medium-severity repair, unattended defaults, and no relaxed completion claim. |
 
@@ -65,6 +69,8 @@ Examples:
 python flexfactor.py refactor --file src/app.py --goal "Make failures explicit"
 python flexfactor.py scout --target /path/to/repo --program https://product.example/features \
   --allow-remote-program-context
+python flexfactor.py scout --target /path/to/repo --program https://product.example/features \
+  --allow-remote-program-context --apply --yes --trust-repo
 python flexfactor.py audit --program /repo/one --program /repo/two --yes
 python flexfactor.py prodready --program /path/to/repo --yes
 python flexfactor.py --runtime-manifest
@@ -111,9 +117,19 @@ unchanged refactor as a real no-op only after proving its baseline is already
 on the authoritative remote default branch.
 
 Version 3.6.0 makes Scout's source field URL-only. Scout retrieves the entered
-program/product site, profiles cited target and source evidence separately, and
+program/product site plus up to twelve prioritized same-site feature/help/API
+pages, records whether that bound left queued pages, profiles cited target and
+source evidence separately, and
 accounts for every observed source capability before it asks Repo Rewards to
-find repositories implementing an accepted target-specific delta.
+find repositories implementing an accepted target-specific delta. Scout now
+also derives a full public-behavior contract whose scope is independent of
+target fit. With apply enabled, the same canonical URL always maps to the same
+persistent `scout/twin/<host>-<url-hash>` branch and isolated
+`scout_twins/<host>-<url-hash>/` subtree. A sparse temporary worktree authors,
+tests, and independently reviews the twin; only that checkout is removed. The
+remote branch, code, tests, evidence contract, feature accounting, and history
+remain and are updated on later scans. Model weights and large generated assets
+are declared as lazy dependencies rather than committed into Git.
 
 ## Evidence and recovery
 

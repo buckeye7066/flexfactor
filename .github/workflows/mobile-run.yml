@@ -42,7 +42,7 @@ on:
         required: false
         type: string
       scout_apply:
-        description: Emit Scout integration proposals
+        description: Build and retain the URL-specific behavioral-twin branch
         required: true
         default: false
         type: boolean
@@ -366,7 +366,7 @@ jobs:
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards --max-cost "$MAX_COST")
-            if [ "$SCOUT_APPLY" = true ]; then args+=(--apply --yes); fi
+            if [ "$SCOUT_APPLY" = true ]; then args+=(--apply --yes --trust-repo); fi
             python engine/flexfactor.py "${args[@]}" 2>&1 | tee mobile-run.log \
               || rc=${PIPESTATUS[0]}
           else
@@ -514,6 +514,7 @@ jobs:
             mobile-phone-summary/orchestrator-receipt.json
             target/*_repo_rewards_report.md
             target/_scout_report*.json
+            target/_scout_twin_spec*.json
             target/.flexfactor-scout-proposals*.json
             target/*_audit_report.md
             target/*_readiness.md

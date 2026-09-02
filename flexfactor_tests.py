@@ -8117,7 +8117,7 @@ class ScoutEndToEndTests(unittest.TestCase):
                  ("_server_is_up", "repo_rewards_search", "_judge",
                   "_best_available_provider", "generate_integration", "_detect_verify",
                   "_research_program_reference",
-                  "_independent_final_review", "_run")}
+                  "_independent_final_review", "build_behavioral_twin_branch", "_run")}
         self.npm_calls: list[list[str]] = []
         self.verify_envs: list[dict | None] = []
         real_run = ff._run
@@ -8167,6 +8167,16 @@ class ScoutEndToEndTests(unittest.TestCase):
                 "evidence_consistent": True, "findings": [],
                 "reason": "fixture independently approved exact commit",
             })
+        # This legacy scenario isolates Repo Rewards target integration and its
+        # rollback contract. Persistent twin authoring has a real Git/worktree
+        # end-to-end fixture in flexfactor_scout_research_tests.py.
+        ff.build_behavioral_twin_branch = (
+            lambda args, project_dir, spec, source_bundle, provider: ff.TwinResult(
+                "published", "fixture twin published",
+                spec["identity"]["branch"], spec["identity"]["subtree"],
+                commit="a" * 40, remote_commit="a" * 40,
+                feature_accounting={"capability_counts": {
+                    "total": 1, "implemented": 1, "partial": 0, "blocked": 0}}))
         # is_node=True so the (spied) npm install path is actually exercised.
         ff._detect_verify = lambda project_dir: (
             True, [[sys.executable, "-c", f"import sys; sys.exit({verify_rc})"]])
@@ -8255,6 +8265,7 @@ class ScoutEndToEndTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "widget_integration.js")))
             # Tree pristine apart from scout report/proposal artifacts.
             _artifact_names = ("repo_rewards_report", "_scout_report",
+                               "_scout_twin_spec",
                                ".flexfactor-scout-proposals",
                                ".flexfactor-apply-approval.json")
             status = [ln for ln in self._git_out(tmp, "status", "--porcelain")
@@ -10194,8 +10205,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             self.assertEqual(results[0].status, "proposal-only")
             self.assertEqual(gen_calls["n"], 0)
 
-    def test_e2e_apply_without_approval_does_not_mutate(self):
-        """Scout --apply --yes without approval file must not create branches."""
+    def test_e2e_apply_without_approval_does_not_mutate_target(self):
+        """Twin publication is separate; no approval means no target mutation."""
         import subprocess
         import types
         with tempfile.TemporaryDirectory() as tmp:
@@ -10220,7 +10231,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             saved = {n: getattr(ff, n) for n in
                      ("_server_is_up", "repo_rewards_search", "_judge",
                       "_best_available_provider", "_research_program_reference",
-                      "generate_integration")}
+                      "generate_integration", "build_behavioral_twin_branch")}
             ff._server_is_up = lambda url, timeout=1.5: True
             ff.repo_rewards_search = lambda *a, **k: [good]
             target_bundle = {
@@ -10284,6 +10295,11 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                             "contents": "export const widget = 1;\n"}],
                  "packages": [], "commit_message": "Integrate good/widget",
                  "post_steps": []}, "plan")
+            ff.build_behavioral_twin_branch = (
+                lambda args, project_dir, spec, source_bundle, provider: ff.TwinResult(
+                    "published", "fixture twin published",
+                    spec["identity"]["branch"], spec["identity"]["subtree"],
+                    commit="b" * 40, remote_commit="b" * 40))
             try:
                 rc = ff.main(["scout", "--target", tmp,
                               "--allow-remote-program-context", "--program",
@@ -10292,8 +10308,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             finally:
                 for n, fn in saved.items():
                     setattr(ff, n, fn)
-            self.assertEqual(rc, 4,
-                             "--apply with zero landed changes must fail visibly")
+            self.assertEqual(rc, 0,
+                             "the independent twin may publish while target ports stay gated")
             branches = subprocess.run(
                 ["git", "-C", tmp, "branch", "--list"],
                 capture_output=True, text=True).stdout

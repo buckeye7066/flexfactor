@@ -5,6 +5,9 @@ import argparse
 import email.message
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import types
 import unittest
@@ -233,6 +236,421 @@ class ScoutResearchTransportTests(unittest.TestCase):
             result = ff._research_program_reference(
                 "https://source.example", "S", "source")
         self.assertEqual(result["kind"], "website-url")
+
+    def test_behavioral_twin_identity_is_stable_per_canonical_url(self):
+        first = research.behavioral_twin_identity(
+            "HTTPS://Example.COM:443/product/?utm_source=x#demo", "Example Product")
+        second = research.behavioral_twin_identity(
+            "https://example.com/product", "Example Product")
+        renamed = research.behavioral_twin_identity(
+            "https://example.com/product", "Completely Different Display Name")
+        other = research.behavioral_twin_identity(
+            "https://example.com/another", "Example Product")
+        self.assertEqual(first, second)
+        self.assertEqual(second, renamed)
+        self.assertNotEqual(first["branch"], other["branch"])
+        self.assertTrue(first["branch"].startswith("scout/twin/"))
+        self.assertTrue(first["subtree"].startswith("scout_twins/"))
+        self.assertEqual(len(first["url_sha256"]), 64)
+
+    def test_twin_spec_keeps_every_source_capability_even_when_target_rejects_it(self):
+        bundle = {
+            "canonical_url": "https://source.example", "name_hint": "Source",
+            "evidence": [
+                {"id": "S1", "kind": "web-page", "url": "https://source.example/a",
+                 "title": "A", "text": "observable A"},
+                {"id": "S2", "kind": "web-page", "url": "https://source.example/b",
+                 "title": "B", "text": "marketing-only B"},
+            ],
+        }
+        profile = {
+            "name": "Source", "canonical_url": "https://source.example",
+            "program_type": "service", "summary": "two features",
+            "capabilities": [
+                {"name": "Useful A", "behavior": "does A", "user_value": "A value",
+                 "implementation_pattern": "pipeline", "evidence_refs": ["S1"],
+                 "confidence": "high"},
+                {"name": "Rejected B", "behavior": "claims B", "user_value": "B value",
+                 "implementation_pattern": "unknown", "evidence_refs": ["S2"],
+                 "confidence": "low"},
+            ],
+            "workflows": [{"name": "A flow", "behavior": "run A",
+                           "evidence_refs": ["S1"]}],
+            "limitations": [], "coverage_gaps": [],
+        }
+        comparison = {"recommendations": [
+            {"capability": "Useful A", "decision": "adapt", "value_score": 90,
+             "how_it_optimizes": "helps"},
+            {"capability": "Rejected B", "decision": "reject", "value_score": 5,
+             "how_it_optimizes": "does not help"},
+        ]}
+        spec = research.build_behavioral_twin_spec(
+            bundle, profile, target_profile={"name": "Target"}, comparison=comparison)
+        rows = spec["public_behavior_contract"]["capabilities"]
+        self.assertEqual([row["name"] for row in rows], ["Useful A", "Rejected B"])
+        self.assertEqual(rows[1]["target_fit"]["decision"], "reject")
+        self.assertEqual(rows[1]["authoring_status"], "evidence-blocked")
+        self.assertTrue(spec["validation"]["complete"])
+        self.assertEqual(spec["completeness_contract"]["capability_total"], 2)
+        self.assertNotIn("observable A", json.dumps(spec["evidence"]))
+
+
+class ScoutPersistentTwinBranchTests(unittest.TestCase):
+    class Provider:
+        judge_model = "reviewer"
+        model = "author"
+
+        def structured(self, _system, prompt, schema, max_tokens=8000, **_kwargs):
+            if schema is ff.BEHAVIORAL_TWIN_PLAN_SCHEMA:
+                return {
+                    "can_build": True, "reason": "", "architecture": "stdlib service",
+                    "runtime": "Python 3.12", "files": ["app.py", "tests/test_app.py"],
+                    "capability_plan": [
+                        {"name": "Render greeting", "status": "full",
+                         "implementation": "pure function", "files": ["app.py"],
+                         "acceptance_tests": ["tests/test_app.py"], "blockers": []},
+                        {"name": "Unproven magic", "status": "blocked",
+                         "implementation": "not invented", "files": [],
+                         "acceptance_tests": [], "blockers": ["low-confidence evidence"]},
+                    ],
+                    "workflow_plan": [
+                        {"name": "Greeting flow", "status": "full",
+                         "implementation": "call render", "acceptance_tests": ["tests/test_app.py"],
+                         "blockers": []},
+                    ],
+                    "dependencies": [],
+                }
+            if schema is ff.BEHAVIORAL_TWIN_PATCH_SCHEMA:
+                return {
+                    "files": [
+                        {"path": "app.py",
+                         "contents": "def render(name: str) -> str:\n    return f'Hello, {name}!'\n"},
+                        {"path": "tests/test_app.py", "contents": (
+                            "import pathlib\nimport unittest\nfrom app import render\n\n"
+                            "class GreetingTests(unittest.TestCase):\n"
+                            "    def test_public_outcome(self):\n"
+                            "        pathlib.Path('runtime-only.txt').write_text('side effect')\n"
+                            "        self.assertEqual(render('IPlay'), 'Hello, IPlay!')\n\n"
+                            "if __name__ == '__main__':\n    unittest.main()\n")},
+                    ],
+                    "delete_files": [],
+                    "capability_accounting": [
+                        {"name": "Render greeting", "status": "implemented",
+                         "files": ["app.py"], "tests": ["tests/test_app.py"],
+                         "limitations": [], "blockers": []},
+                        {"name": "Unproven magic", "status": "blocked",
+                         "files": [], "tests": [], "limitations": [],
+                         "blockers": ["low-confidence evidence"]},
+                    ],
+                    "workflow_accounting": [
+                        {"name": "Greeting flow", "status": "implemented",
+                         "tests": ["tests/test_app.py"], "limitations": [], "blockers": []},
+                    ],
+                    "dependencies": [], "summary": "working greeting twin",
+                    "commit_message": "Build source greeting behavioral twin",
+                }
+            if schema is ff.FINAL_REVIEW_SCHEMA:
+                commit = re.search(r"EXPECTED FINAL COMMIT: ([0-9a-f]{40})", prompt).group(1)
+                return {"verdict": "approve", "commit": commit, "findings": [],
+                        "evidence_consistent": True, "reason": "exact commit verified"}
+            raise AssertionError("unexpected schema")
+
+    @staticmethod
+    def _git(root, *args):
+        return subprocess.run(["git", "-C", root, *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+
+    def _fixture(self):
+        root = tempfile.mkdtemp(prefix="ff-twin-target-")
+        remote = tempfile.mkdtemp(prefix="ff-twin-origin-")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, remote, True)
+        self.assertEqual(self._git(root, "init", "-q", "-b", "main").returncode, 0)
+        self._git(root, "config", "user.name", "Test")
+        self._git(root, "config", "user.email", "test@example.com")
+        with open(os.path.join(root, "target.txt"), "w", encoding="utf-8") as fh:
+            fh.write("target stays untouched\n")
+        self._git(root, "add", "-A")
+        self.assertEqual(self._git(root, "commit", "-qm", "base").returncode, 0)
+        self.assertEqual(subprocess.run(
+            ["git", "init", "--bare", "-q", "-b", "main", remote],
+            capture_output=True).returncode, 0)
+        self._git(root, "remote", "add", "origin", remote)
+        self.assertEqual(self._git(root, "push", "-q", "origin", "main").returncode, 0)
+        return root, remote
+
+    @staticmethod
+    def _spec():
+        bundle = {
+            "canonical_url": "https://source.example", "name_hint": "Source",
+            "evidence": [{"id": "S1", "kind": "web-page",
+                          "url": "https://source.example/features", "title": "Features",
+                          "text": "Greeting behavior and an unproven marketing claim."}],
+        }
+        profile = {
+            "name": "Source", "canonical_url": "https://source.example",
+            "program_type": "service", "summary": "greets users",
+            "capabilities": [
+                {"name": "Render greeting", "behavior": "renders a greeting",
+                 "user_value": "friendly output", "implementation_pattern": "function",
+                 "evidence_refs": ["S1"], "confidence": "high"},
+                {"name": "Unproven magic", "behavior": "claims magic",
+                 "user_value": "unknown", "implementation_pattern": "unknown",
+                 "evidence_refs": ["S1"], "confidence": "low"},
+            ],
+            "workflows": [{"name": "Greeting flow", "behavior": "enter name, get greeting",
+                           "evidence_refs": ["S1"]}],
+            "limitations": [], "coverage_gaps": [],
+        }
+        return bundle, research.build_behavioral_twin_spec(bundle, profile)
+
+    def test_branch_is_persistent_remote_and_target_worktree_never_switches(self):
+        root, _remote = self._fixture()
+        bundle, spec = self._spec()
+        before_branch = self._git(root, "branch", "--show-current").stdout.strip()
+        before_head = self._git(root, "rev-parse", "HEAD").stdout.strip()
+        before_status = self._git(root, "status", "--porcelain").stdout
+        args = argparse.Namespace(verify=True, isolate_verify=True,
+                                  trust_repo=True, push=True)
+        result = ff.build_behavioral_twin_branch(
+            args, root, spec, bundle, self.Provider())
+        self.assertEqual(result.status, "published", result.detail)
+        self.assertEqual(result.commit, result.remote_commit)
+        self.assertEqual(result.verification[-1]["network_controls"], "deny-requested")
+        self.assertEqual(self._git(root, "branch", "--show-current").stdout.strip(),
+                         before_branch)
+        self.assertEqual(self._git(root, "rev-parse", "HEAD").stdout.strip(), before_head)
+        self.assertEqual(self._git(root, "status", "--porcelain").stdout, before_status)
+        branch = spec["identity"]["branch"]
+        subtree = spec["identity"]["subtree"]
+        self.assertEqual(self._git(root, "show", f"{branch}:{subtree}/app.py").returncode, 0)
+        self.assertNotEqual(
+            self._git(root, "show", f"{branch}:{subtree}/runtime-only.txt").returncode, 0,
+            "test side effects from the Git-free verification copy must not be committed")
+        self.assertNotEqual(self._git(root, "show", f"main:{subtree}/app.py").returncode, 0)
+        remote = self._git(root, "ls-remote", "--heads", "origin",
+                           f"refs/heads/{branch}")
+        self.assertIn(result.commit, remote.stdout)
+        self.assertIn(branch, self._git(root, "branch", "--list").stdout)
+        second = ff.build_behavioral_twin_branch(
+            args, root, spec, bundle, self.Provider())
+        self.assertEqual(second.status, "up-to-date", second.detail)
+        self.assertEqual(second.branch, branch)
+        self.assertEqual(second.independent_review.get("verdict"), "approve")
+
+    def test_patch_validator_refuses_path_escape_and_missing_feature(self):
+        _bundle, spec = self._spec()
+        patch = {
+            "files": [{"path": "../../outside.py", "contents": "print('x')\n"}],
+            "delete_files": [], "capability_accounting": [],
+            "workflow_accounting": [], "dependencies": [],
+            "summary": "bad", "commit_message": "bad",
+        }
+        ok, reason, _accounting = ff._validate_behavioral_twin_patch(spec, patch)
+        self.assertFalse(ok)
+        self.assertIn("unsafe", reason)
+        self.assertIn("missing capability accounting", reason)
+
+        blocked_ready = self.Provider().structured(
+            "", "", ff.BEHAVIORAL_TWIN_PATCH_SCHEMA)
+        blocked_ready["capability_accounting"][0] = {
+            "name": "Render greeting", "status": "blocked", "files": [], "tests": [],
+            "limitations": [], "blockers": ["would take engineering effort"],
+        }
+        ok, reason, _accounting = ff._validate_behavioral_twin_patch(
+            spec, blocked_ready)
+        self.assertFalse(ok)
+        self.assertIn("sufficient public evidence", reason)
+
+    def test_verification_refuses_a_suite_that_discovers_zero_tests(self):
+        with tempfile.TemporaryDirectory(prefix="ff-empty-twin-") as root:
+            os.makedirs(os.path.join(root, "tests"))
+            with open(os.path.join(root, "app.py"), "w", encoding="utf-8") as fh:
+                fh.write("VALUE = 1\n")
+            with open(os.path.join(root, "tests", "test_empty.py"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("VALUE = 1\n")
+            args = argparse.Namespace(verify=True, isolate_verify=True, trust_repo=True)
+            ok, receipts, reason, inventory = ff._verify_behavioral_twin(root, args)
+        self.assertFalse(ok)
+        self.assertIn("zero executable acceptance tests", reason)
+        self.assertEqual(receipts[-1].get("tests_run"), 0)
+        self.assertEqual(inventory.get("file_count"), 2)
+
+
+class HeyGenToIPlayReplayTests(unittest.TestCase):
+    """Named replay of the owner's required URL/target acceptance case.
+
+    The evidence rows are short factual paraphrases of the official public
+    HeyGen pages and the cited IPlay repository files inspected on 2026-09-02.
+    No vendor source or private behavior is present in the fixture.
+    """
+
+    def test_full_heygen_twin_scope_is_not_reduced_to_iplay_optimizations(self):
+        target_bundle = {
+            "evidence": [
+                {"id": "T1", "path": "iplay/README.md",
+                 "title": "IPlay product boundary",
+                 "text": "Playing motion and instrument contact must remain exact; "
+                         "generative video is limited to non-performance material."},
+                {"id": "T2", "path": "iplay/iplay_app.py",
+                 "title": "IPlay render path",
+                 "text": "The note plan currently proceeds directly into exact avatar render."},
+                {"id": "T3", "path": "iplay/performance_qa.py",
+                 "title": "IPlay performance QA",
+                 "text": "Checks pose fidelity and replacement leakage."},
+            ],
+        }
+        source_bundle = {
+            "canonical_url": "https://www.heygen.com/", "name_hint": "HeyGen",
+            "evidence": [
+                {"id": "S1", "kind": "web-page", "title": "HeyGen homepage",
+                 "url": "https://www.heygen.com/",
+                 "text": "Publicly describes text, image, and audio inputs producing videos "
+                         "with avatars, voiceovers, captions, visuals, and animations."},
+                {"id": "S2", "kind": "web-page", "title": "Avatar IV",
+                 "url": "https://www.heygen.com/avatars/avatar-iv",
+                 "text": "Publicly describes photo-to-talking-video, lip sync, gestures, "
+                         "and full-body formats."},
+                {"id": "S3", "kind": "web-page", "title": "Avatar IV API",
+                 "url": "https://www.heygen.com/blog/announcing-the-avatar-iv-api",
+                 "text": "Publicly describes programmatic photo plus script video creation."},
+                {"id": "S4", "kind": "web-page", "title": "Video Agent",
+                 "url": "https://www.heygen.com/academy/video-agent",
+                 "text": "Publicly describes prompt-to-plan, user review and feedback, then "
+                         "full generation and editing."},
+                {"id": "S5", "kind": "web-page", "title": "Motion prompts",
+                 "url": ("https://help.heygen.com/en/articles/12805098-fine-tune-avatar-"
+                         "gestures-and-movements-with-custom-motion-prompts-avatar-iv-v"),
+                 "text": "Publicly describes free-text and preset control of expression, "
+                         "gesture, gaze, and per-scene motion."},
+                {"id": "S6", "kind": "web-page", "title": "Avatar V",
+                 "url": "https://www.heygen.com/avatars/avatar-v",
+                 "text": "Publicly claims long-form identity and motion consistency learned "
+                         "from an input video."},
+            ],
+        }
+        source_profile = {
+            "name": "HeyGen", "summary": "AI avatar video creation platform",
+            "program_type": "service", "canonical_url": "https://www.heygen.com/",
+            "workflows": [
+                {"name": "Prompt, review, then generate",
+                 "behavior": "Turns a prompt into a reviewable plan before generation",
+                 "evidence_refs": ["S4"]},
+                {"name": "Photo and script to avatar video",
+                 "behavior": "Accepts a photo and script and produces a talking avatar video",
+                 "evidence_refs": ["S2", "S3"]},
+            ],
+            "capabilities": [
+                {"name": "Prompt-to-video planning and approval",
+                 "behavior": "Creates a plan, accepts feedback, then proceeds to generation",
+                 "user_value": "Users can correct intent before expensive generation",
+                 "implementation_pattern": "plan/review/generate state machine",
+                 "evidence_refs": ["S4"], "confidence": "high"},
+                {"name": "Photo-to-talking-avatar video",
+                 "behavior": "Animates a supplied photo into a talking avatar video",
+                 "user_value": "Creates presenter video without recording footage",
+                 "implementation_pattern": "image-conditioned avatar renderer",
+                 "evidence_refs": ["S2"], "confidence": "high"},
+                {"name": "Script lip sync and voiceover",
+                 "behavior": "Synchronizes avatar speech motion with scripted audio",
+                 "user_value": "Produces understandable presenter speech",
+                 "implementation_pattern": "speech and viseme timeline",
+                 "evidence_refs": ["S1", "S2"], "confidence": "high"},
+                {"name": "Directed gesture, expression, gaze, and motion",
+                 "behavior": "Applies prompts or presets to avatar motion per scene",
+                 "user_value": "Gives creators control over delivery",
+                 "implementation_pattern": "scene-scoped motion controls",
+                 "evidence_refs": ["S5"], "confidence": "high"},
+                {"name": "Full-body and multiple output formats",
+                 "behavior": "Supports full-body avatars and multiple presentation formats",
+                 "user_value": "Fits varied publishing layouts",
+                 "implementation_pattern": "layout-aware composition pipeline",
+                 "evidence_refs": ["S2"], "confidence": "medium"},
+                {"name": "Programmatic avatar video API",
+                 "behavior": "Accepts photo and script inputs programmatically",
+                 "user_value": "Automates repeated video generation",
+                 "implementation_pattern": "asynchronous job API",
+                 "evidence_refs": ["S3"], "confidence": "high"},
+                {"name": "Captions, visuals, and animation composition",
+                 "behavior": "Composes captions and supporting visuals into generated video",
+                 "user_value": "Produces a more complete edited result",
+                 "implementation_pattern": "timeline composition",
+                 "evidence_refs": ["S1"], "confidence": "medium"},
+                {"name": "Long-form avatar identity consistency",
+                 "behavior": "Keeps avatar identity stable across longer and varied scenes",
+                 "user_value": "Avoids distracting identity drift",
+                 "implementation_pattern": "identity-conditioned rendering and QA",
+                 "evidence_refs": ["S6"], "confidence": "medium"},
+            ],
+            "stack_signals": [], "limitations": ["Private model internals are not public"],
+            "coverage_gaps": ["Public evidence does not establish model architecture"],
+        }
+        decisions = {
+            "Prompt-to-video planning and approval": "adapt",
+            "Photo-to-talking-avatar video": "reject",
+            "Script lip sync and voiceover": "reject",
+            "Directed gesture, expression, gaze, and motion": "reject",
+            "Full-body and multiple output formats": "reject",
+            "Programmatic avatar video API": "adapt",
+            "Captions, visuals, and animation composition": "adapt",
+            "Long-form avatar identity consistency": "adapt",
+        }
+
+        def comparison_row(capability):
+            decision = decisions[capability["name"]]
+            accepted = decision == "adapt"
+            return {
+                "capability": capability["name"], "decision": decision,
+                "source_behavior": capability["behavior"],
+                "target_state": "IPlay has exact performance rendering with bounded generative use",
+                "target_gap": ("the evidenced workflow/QA layer is absent" if accepted
+                               else "no purpose-compatible gap"),
+                "purpose_alignment": ("preserves exact playing while improving orchestration"
+                                      if accepted else "would risk or duplicate exact performance"),
+                "how_it_optimizes": ("adds a bounded IPlay-native capability" if accepted
+                                     else "does not improve IPlay's exact-performance purpose"),
+                "adaptation_plan": ("implement only around IPlay's exact renderer" if accepted
+                                    else "retain in the standalone twin, not IPlay"),
+                "target_touchpoints": ["iplay/iplay_app.py"],
+                "verification_plan": "prove note, timing, hand, and instrument-contact invariants remain exact",
+                "implementation_search_query": "independent public behavior implementation",
+                "value_score": 85 if accepted else 20,
+                "confidence": capability["confidence"],
+                "target_evidence_refs": ["T1", "T2", "T3"],
+                "source_evidence_refs": capability["evidence_refs"],
+            }
+
+        comparison = research.validate_comparison(
+            {"target_name": "IPlay", "scouted_name": "HeyGen",
+             "summary": "Use bounded orchestration/QA while protecting exact performance",
+             "coverage_gaps": [],
+             "recommendations": [comparison_row(row)
+                                 for row in source_profile["capabilities"]]},
+            target_bundle, source_bundle, source_profile)
+        self.assertTrue(comparison["validation"]["complete"], comparison)
+        twin = research.build_behavioral_twin_spec(
+            source_bundle, source_profile,
+            target_profile={"name": "IPlay", "summary": "Exact avatar instrument performance"},
+            comparison=comparison)
+        twin_names = [row["name"] for row in
+                      twin["public_behavior_contract"]["capabilities"]]
+        author_evidence = json.loads(ff._twin_public_evidence_context(
+            source_bundle, twin))
+        accepted = ff._accepted_program_optimizations(comparison)
+        selective = research.build_clean_room_contracts(
+            comparison, target_bundle, source_bundle, source_profile)
+        self.assertEqual(len(twin_names), 8)
+        self.assertEqual(set(twin_names), set(decisions))
+        self.assertEqual({row["id"] for row in author_evidence},
+                         {"S1", "S2", "S3", "S4", "S5", "S6"})
+        self.assertEqual(len(accepted), 4)
+        self.assertEqual(len(selective["contracts"]), 4)
+        self.assertEqual(twin["identity"]["branch"],
+                         "scout/twin/heygen-c0fadff54acb")
+        rejected_in_iplay = {name for name, decision in decisions.items()
+                             if decision == "reject"}
+        self.assertTrue(rejected_in_iplay.issubset(set(twin_names)))
 
 
 class ScoutProgramComparisonEndToEndTests(unittest.TestCase):

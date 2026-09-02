@@ -13,6 +13,7 @@ Callers inject helpers (run, hermetic env, no-network env, rmtree) when needed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ SCOUT_POLICY_FILE = ".flexfactor-scout-policy.json"
 SCOUT_PROPOSAL_FILE = ".flexfactor-scout-proposals.json"
 SCOUT_REPORT_JSON = "_scout_report.json"
 FLEXFACTOR_APPLY_APPROVAL_FILE = ".flexfactor-apply-approval.json"
+CLEAN_ROOM_IMPLEMENTATION_KIND = "clean-room-from-documented-behavior"
 
 # Risk model: three independent verdicts. README/metadata never grants execute.
 SCOUT_RISK_MODEL = {
@@ -40,6 +42,8 @@ SCOUT_RISK_MODEL = {
         "Never label a candidate safe-to-install or safe-to-run from metadata.",
         "safe_to_execute is never granted automatically.",
         "Unknown license / missing safety / injection indicators fail closed.",
+        "Closed-source product behavior may inform only an independent clean-room design.",
+        "Clean-room authoring may not infer private internals or use undocumented endpoints.",
         "Target mutation requires a separate FlexFactor apply approval.",
     ),
     "false_substitutes": (
@@ -90,6 +94,8 @@ SCOUT_REPORT_SCHEMA = {
             },
         },
         "proposals": {"type": "array"},
+        "clean_room_implementations": {"type": "array"},
+        "behavioral_twin": {"type": "object"},
         "sandbox": {"type": "object"},
     },
 }
@@ -415,6 +421,130 @@ def run_sandboxed_candidate_eval(
 # Bridge 97 — integration proposal (delta / conflict / rollback) + apply gate
 # --------------------------------------------------------------------------- #
 
+def is_clean_room_evaluation(evaluation: dict | None) -> bool:
+    return bool(
+        isinstance(evaluation, dict)
+        and evaluation.get("implementation_kind") == CLEAN_ROOM_IMPLEMENTATION_KIND
+    )
+
+
+def _clean_room_contract_integrity(contract: dict) -> tuple[bool, str]:
+    if not isinstance(contract, dict):
+        return False, "clean-room contract is missing"
+    if contract.get("implementation_kind") != CLEAN_ROOM_IMPLEMENTATION_KIND:
+        return False, "clean-room implementation kind is invalid"
+    boundary = contract.get("clean_room_boundary") or {}
+    required_false = ("source_code_used", "may_copy_source", "may_infer_private_internals")
+    if any(boundary.get(key) is not False for key in required_false):
+        return False, "clean-room boundary permits proprietary-source reconstruction"
+    if boundary.get("may_use_publicly_evidenced_behavior") is not True:
+        return False, "clean-room boundary does not bind authoring to public behavior"
+    expected = str(contract.get("contract_sha256") or "")
+    unsigned = {key: value for key, value in contract.items()
+                if key not in {"contract_sha256", "proposal_id"}}
+    actual = hashlib.sha256(json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+    if not expected or expected != actual:
+        return False, "clean-room contract digest does not match its contents"
+    if str(contract.get("proposal_id") or "") != "clean-room-" + actual[:24]:
+        return False, "clean-room proposal id does not match its contract digest"
+    return True, ""
+
+
+def build_clean_room_proposal(
+    evaluation: dict,
+    *,
+    project_dir: str | None = None,
+    packages: list | None = None,
+    files_planned: list | None = None,
+) -> dict:
+    """Proposal for original target code derived only from public behavior."""
+    contract = evaluation.get("clean_room_contract") or {}
+    integrity_ok, integrity_error = _clean_room_contract_integrity(contract)
+    packages = list(packages or [])
+    files_planned = list(files_planned or [])
+    deps_before, deps_after_estimate = _dependency_delta_estimate(project_dir, packages)
+    conflicts = analyze_conflicts(project_dir, files_planned, packages)
+    can_implement = contract.get("can_implement") is True and integrity_ok
+    rejection = ""
+    if packages:
+        rejection = ("clean-room authoring requested external packages; use the separately "
+                     "screened Repo Rewards path for third-party code")
+    elif not can_implement:
+        rejection = integrity_error or str(contract.get("reason") or
+                                            "public evidence is insufficient for authoring")
+    behavior = contract.get("public_behavior_contract") or {}
+    source = contract.get("source_program") or {}
+    benefit = evaluation.get("benefit") or {}
+    proposal = {
+        "schema": "scout-clean-room-proposal-v1",
+        "implementation_kind": CLEAN_ROOM_IMPLEMENTATION_KIND,
+        "proposal_id": contract.get("proposal_id"),
+        "contract_sha256": contract.get("contract_sha256"),
+        # Compatibility field for report consumers that require the key. This
+        # is intentionally null: no third-party commit exists in a clean room.
+        "commit_sha": None,
+        "commit_pin_source": "not-applicable-clean-room",
+        "repo": evaluation.get("implementation_id") or contract.get("proposal_id"),
+        "url": source.get("canonical_url"),
+        "need": evaluation.get("need") or contract.get("capability"),
+        "recommendation": evaluation.get("recommendation"),
+        "source_program": source,
+        "reuse_mode": CLEAN_ROOM_IMPLEMENTATION_KIND,
+        "source_code_used": False,
+        "may_copy_source": False,
+        "may_infer_private_internals": False,
+        "public_behavior_contract": behavior,
+        "public_evidence": contract.get("evidence") or {},
+        "metadata_screened_only": False,
+        "safe_to_install": False,
+        "license": "not-applicable (independently authored target code)",
+        "license_compatible": True,
+        "security": {
+            "external_candidate_code": "none",
+            "private_endpoint_access": "forbidden",
+            "source_reconstruction": "forbidden",
+            "generated_code_requires_target_verification": True,
+            "verdicts": evaluation.get("verdicts") or {},
+        },
+        "maintenance": {
+            "ownership": "target repository",
+            "upstream_dependency": "none",
+            "public_behavior_evidence": source.get("canonical_url"),
+        },
+        "compatibility": (
+            "target-native design; exact compatibility is established only by the "
+            "target repository's verification and independent final review"
+        ),
+        "transitive_risk": "no external code selected; generated target code remains unverified",
+        "benefit": {
+            "score": benefit.get("benefit_score"),
+            "how_it_helps": benefit.get("how_it_helps") or behavior.get("required_outcome"),
+            "integration_note": benefit.get("integration_note") or behavior.get("target_native_design"),
+            "risks": benefit.get("risks") or [],
+        },
+        "integration_cost": _integration_cost(packages, files_planned, conflicts, {}),
+        "dependency_delta": {
+            "packages_requested": packages,
+            "deps_before_count": len(deps_before),
+            "deps_added_estimate": [p for p in packages if _npm_name(str(p)) not in deps_before],
+            "deps_already_present": [p for p in packages if _npm_name(str(p)) in deps_before],
+            "deps_after_estimate_count": len(deps_after_estimate),
+        },
+        "conflict_analysis": conflicts,
+        "rollback_plan": (
+            "generate original target code only after exact proposal approval; verify the "
+            "whole target; independently review the exact commit; restore the pre-change "
+            "tree on any failure"
+        ),
+        "rejection_reason": rejection or None,
+        "requires_flexfactor_apply_approval": True,
+        "target_mutation_allowed": False,
+    }
+    evaluation["proposal"] = proposal
+    return proposal
+
 def build_integration_proposal(
     evaluation: dict,
     *,
@@ -423,6 +553,10 @@ def build_integration_proposal(
     files_planned: list | None = None,
 ) -> dict:
     """Structured proposal — never mutates the target by itself."""
+    if is_clean_room_evaluation(evaluation):
+        return build_clean_room_proposal(
+            evaluation, project_dir=project_dir, packages=packages,
+            files_planned=files_planned)
     pin_fields_from_evidence(evaluation)
     ev = evaluation.get("evidence") or {}
     v = evaluation.get("verdicts") or {}
@@ -611,6 +745,19 @@ def flexfactor_apply_approved(project_dir: str | None,
     if str(data.get("approver") or "") not in ("flexfactor-apply", "owner", "flexfactor"):
         return False
     if proposal:
+        if proposal.get("implementation_kind") == CLEAN_ROOM_IMPLEMENTATION_KIND:
+            # A clean-room proposal has no upstream commit to pin. Its complete
+            # public-behavior contract is content-addressed instead, and generic
+            # approval files are deliberately insufficient.
+            want_id = str(proposal.get("proposal_id") or "")
+            got_id = str(data.get("proposal_id") or "")
+            if not want_id or got_id != want_id:
+                return False
+            want_contract = str(proposal.get("contract_sha256") or "")
+            got_contract = str(data.get("contract_sha256") or "")
+            if got_contract and got_contract != want_contract:
+                return False
+            return True
         want = str(proposal.get("commit_sha") or "")
         got = str(data.get("commit_sha") or "")
         if want and want != "unpinned" and got:
@@ -653,6 +800,9 @@ def recommendation_record(evaluation: dict) -> dict:
     ev = evaluation.get("evidence") or {}
     b = proposal.get("benefit") or {}
     return {
+        "implementation_kind": proposal.get("implementation_kind") or "repo-rewards",
+        "proposal_id": proposal.get("proposal_id"),
+        "contract_sha256": proposal.get("contract_sha256"),
         "repo": proposal.get("repo"),
         "url": proposal.get("url"),
         "need": proposal.get("need"),
@@ -686,11 +836,16 @@ def build_scout_structured_report(
     """Assemble a schema-versioned Scout report (never claims safe-to-install)."""
     recs = []
     props = list(proposals or [])
+    clean_room = []
     for e in evaluations:
-        pin_fields_from_evidence(e)
+        if not is_clean_room_evaluation(e):
+            pin_fields_from_evidence(e)
         if "proposal" not in e:
             build_integration_proposal(e)
-        recs.append(recommendation_record(e))
+        record = recommendation_record(e)
+        recs.append(record)
+        if is_clean_room_evaluation(e):
+            clean_room.append(record)
         if e.get("proposal"):
             props.append(e["proposal"])
     report = {
@@ -711,6 +866,7 @@ def build_scout_structured_report(
             "coverage_gaps": (profile or {}).get("coverage_gaps") or [],
         },
         "recommendations": recs,
+        "clean_room_implementations": clean_room,
         "proposals": props,
         # THE DEFAULT DESCRIBES WHAT ACTUALLY HAPPENED. The single production
         # call site does not pass `sandbox_summary`, and the live enrichment
@@ -728,12 +884,16 @@ def build_scout_structured_report(
         },
         "apply_contract": {
             "scout_mutates_target": False,
+            "persistent_twin_branch_is_separate": True,
+            "twin_branch_is_not_merged": True,
             "requires_flexfactor_apply_approval": True,
             "approval_file": FLEXFACTOR_APPLY_APPROVAL_FILE,
         },
     }
     if scout_analysis is not None:
         report["program_comparison"] = scout_analysis
+        report["behavioral_twin"] = (
+            scout_analysis.get("behavioral_twin") or {})
     # Self-check: recommendation narratives must not claim safe-to-install.
     # Policy rules may mention the forbidden phrases (to forbid them); those
     # are excluded from the narrative scan. Boolean denial fields are also OK.
@@ -748,7 +908,8 @@ def build_scout_structured_report(
 
 def write_scout_artifacts(base_dir: str, structured: dict,
                           proposals: list[dict] | None = None,
-                          *, artifact_slug: str | None = None) -> dict:
+                          *, artifact_slug: str | None = None,
+                          twin_spec: dict | None = None) -> dict:
     """Write JSON report + proposals next to the program (reversible artifacts)."""
     os.makedirs(base_dir, exist_ok=True)
     clean_slug = re.sub(r"[^a-z0-9._-]+", "-", str(artifact_slug or "").lower()).strip("-.")
@@ -756,24 +917,39 @@ def write_scout_artifacts(base_dir: str, structured: dict,
     if clean_slug:
         report_name = f"_scout_report.{clean_slug}.json"
         proposal_name = f".flexfactor-scout-proposals.{clean_slug}.json"
+        twin_name = f"_scout_twin_spec.{clean_slug}.json"
     else:
         report_name = SCOUT_REPORT_JSON
         proposal_name = SCOUT_PROPOSAL_FILE
+        twin_name = "_scout_twin_spec.json"
     report_path = os.path.join(base_dir, report_name)
     proposal_path = os.path.join(base_dir, proposal_name)
+    twin_path = os.path.join(base_dir, twin_name)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(structured, f, indent=2, default=str)
         f.write("\n")
     payload = {
         "schema": "scout-proposals-v1",
         "metadata_screened_only": True,
+        "implementation_kinds": sorted({
+            str(row.get("implementation_kind") or "repo-rewards")
+            for row in (proposals if proposals is not None
+                        else structured.get("proposals") or [])
+            if isinstance(row, dict)
+        }),
+        "clean_room_source_code_used": False,
         "requires_flexfactor_apply_approval": True,
         "proposals": proposals if proposals is not None else structured.get("proposals") or [],
     }
     with open(proposal_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, default=str)
         f.write("\n")
-    return {"report_json": report_path, "proposals_json": proposal_path}
+    with open(twin_path, "w", encoding="utf-8") as f:
+        json.dump(twin_spec or structured.get("behavioral_twin") or {}, f,
+                  indent=2, default=str, sort_keys=True)
+        f.write("\n")
+    return {"report_json": report_path, "proposals_json": proposal_path,
+            "twin_spec_json": twin_path}
 
 
 def malicious_fixture_escape_probe(run: Callable,

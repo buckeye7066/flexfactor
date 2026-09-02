@@ -641,10 +641,10 @@ public final class MainActivity extends Activity {
         source.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         form.addView(source);
         CheckBox apply = new CheckBox(this);
-        apply.setText("Prepare and apply approved integration proposals");
+        apply.setText("Build and keep the URL-specific behavioral-twin branch");
         apply.setTextColor(Color.WHITE);
         apply.setChecked(false);
-        form.addView(text("Report mode researches improvements without changing the target. Enable apply to process proposals through FlexFactor's approval and verification gates.",
+        form.addView(text("Report mode writes the comparison and full twin specification. Enable apply to build, test, review, and push a permanent scout/twin branch without merging or switching the target branch. Selective target ports remain separately approval-gated.",
                 14, Color.rgb(170, 181, 194)));
         form.addView(apply);
         CheckBox batch = new CheckBox(this);
