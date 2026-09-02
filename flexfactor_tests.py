@@ -4148,6 +4148,27 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             inspect.getsource(ff.audit_one_program),
         )
 
+    def test_writer_host_path_cannot_replace_validated_relative_identity(self):
+        candidates = [
+            {"path": "tests/one.py", "contents": "VALUE = 1\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff,
+                 "_write_contained",
+                 return_value=os.path.join(project, "host-alias", "one.py"),
+             ), \
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "ok")):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual(["tests/one.py"], [item["path"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
     def test_duplicate_generated_path_is_refused_before_overwrite(self):
         forbidden_write = mock.Mock(
             side_effect=AssertionError("duplicate generated path reached write")

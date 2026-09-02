@@ -13168,9 +13168,12 @@ def _write_and_run_generated_test_batch(
                 f"generated test contained write was refused for {item['path']!r}"
             ), rollback_failed
         normalized = dict(item)
-        normalized["path"] = os.path.relpath(
-            written, project_dir
-        ).replace("\\", "/")
+        # Keep the already-validated repository-relative identity.  The
+        # contained writer may return an absolute path whose Windows spelling
+        # differs from ``project_dir`` (for example through a temp-directory
+        # alias or junction); deriving identity from that host path can create
+        # a bogus ``../`` path even though the write itself was contained.
+        normalized["path"] = item["path"]
         written_entries.append(normalized)
 
     status, log = _run_unit_tests(project_dir, stack)
