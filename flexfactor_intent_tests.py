@@ -93,6 +93,18 @@ class FamilyIndependence(_Base):
         sel = rot.next_route(tier=R.STRONG, intent=R.CallIntent(R.ROLE_REVIEWER, avoid_family="qwen"))
         self.assertIn("independence NOT achieved", sel.family_note)
 
+    def test_strict_independence_wins_over_a_conflicting_soft_preference(self):
+        rot = self.rotator([
+            route("a/gpt-5", "pool-a", model="gpt-5"),
+            route("b/qwen3-coder", "pool-b", model="qwen3-coder"),
+        ])
+        intent = R.CallIntent(
+            R.ROLE_REVIEWER, avoid_family="qwen", avoid_families=("openai",)
+        )
+        sel = rot.next_route(tier=R.STRONG, intent=intent)
+        self.assertEqual(R.model_family(sel.route.model), "qwen")
+        self.assertIn("independence NOT achieved", sel.family_note)
+
     def test_model_family_sees_through_route_prefixes(self):
         self.assertEqual(R.model_family("openrouter/qwen/qwen3.6-27b"), "qwen")
         self.assertEqual(R.model_family("ollama/gemma4:26b"), "gemma")

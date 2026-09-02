@@ -40,6 +40,22 @@ class PassContractTests(unittest.TestCase):
             ["src/a.py", "src/b.py", "src/c.py"],
         )
 
+    def test_whole_repository_scope_is_also_normalized(self):
+        root = tempfile.mkdtemp(prefix="ff-scope-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        coordinator = execution.SequentialOrchestrator(
+            "audit", ["repo"], state_path=os.path.join(root, "queue.json"),
+            queue_id="normalized-scope",
+        )
+        coordinator.start_target(0)
+        self.assertEqual(
+            coordinator.begin_pass(
+                1, [" src\\a.py ", "src/a.py", "", "src/b.py"],
+                whole_repository=True,
+            ),
+            ["src/a.py", "src/b.py"],
+        )
+
 
 class ProductDefaultsTests(unittest.TestCase):
     def test_fixed_product_constants(self):
@@ -178,6 +194,34 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(observed, [("one", 1, 3), ("two", 2, 3), ("three", 3, 3)])
         self.assertEqual(coordinator.snapshot()["status"], "completed")
         self.assertTrue(os.path.isfile(path))
+
+    def test_ordinary_runner_exception_fails_one_target_and_continues(self):
+        root = tempfile.mkdtemp(prefix="ff-queue-exception-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        observed = []
+
+        def runner(target, _index, _total, coordinator):
+            observed.append(target)
+            if target == "one":
+                raise RuntimeError("first target broke")
+            coordinator.begin_pass(1, ["two.py"], whole_repository=True)
+            coordinator.finish_pass(1, [])
+            coordinator.record_competitor_gate(
+                attempted=True, implemented_files=[], verified=3
+            )
+            return 0
+
+        code, coordinator = execution.run_sequential_queue(
+            "audit", ["one", "two"], runner,
+            state_path=os.path.join(root, "queue.json"), queue_id="continue",
+        )
+        snapshot = coordinator.snapshot()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(observed, ["one", "two"])
+        self.assertEqual([item["status"] for item in snapshot["items"]],
+                         ["failed", "completed"])
+        self.assertIn("RuntimeError: first target broke",
+                      snapshot["items"][0]["note"])
 
 
 if __name__ == "__main__":

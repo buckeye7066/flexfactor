@@ -30,7 +30,7 @@ New in this tree:
 | `purpose_confidence` | `purpose_confidence()` | owner-authored / strongly-inferred / weakly-inferred / unresolved |
 | `purpose_mutation_authorized` | `mutation_authorized_by_purpose()` | bool; false => gap cap forced to 0 |
 | `purpose_evidence_summary` | cache of `gather_purpose_evidence` | counts of sources / contradictions / unknowns / integrations |
-| `trust_repo_override` | `--trust-repo` (scout only) | bool |
+| `trust_repo_override` | `--trust-repo` (audit, production ready, and scout) | bool |
 
 ## 2. Evidence bundle artifacts
 
@@ -92,8 +92,10 @@ rc 0 AND completeness. Roles/viewports/page cap/isolation come from
 | function-coverage | `direct_gate.complete` (or zero functions) | - |
 | behavior | e2e ok and executed routes/controls >= discovered (or not applicable) | e2e did not run while applicable |
 | independent-final-review | verdict approve AND evidence_consistent AND commit == final sha AND HEAD unchanged | reviewer unavailable -> `ran: false`, fail |
+| remote-default-publication | required and the exact reviewed SHA is proven on the remote default branch | required but incomplete; `not-run` when publication is not applicable |
 
-`passed` is all-pass. A `blocked` gate is never a pass.
+`passed` is all-pass across applicable gates. A `blocked` gate is never a pass,
+and a `not-run` gate is never counted as a pass.
 
 ## 7. What can and cannot be claimed
 

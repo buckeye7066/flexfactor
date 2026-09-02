@@ -322,6 +322,12 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn(".commit()", saved)
         self.assertNotIn(".apply()", saved)
         self.assertIn("could not be saved durably", saved)
+        polling = activity.split("private void pollLastRun", 1)[1]
+        polling = polling.split("private void refreshRunLabel", 1)[0]
+        self.assertIn("catch (RuntimeException failed)", polling)
+        self.assertIn("queueAdvanceFailure", polling)
+        self.assertIn("polling = false", polling)
+        self.assertIn("kept the next target stopped", polling)
 
     def test_pre_32_run_ids_migrate_to_the_legacy_control_repository(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /

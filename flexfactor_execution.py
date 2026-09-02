@@ -281,8 +281,7 @@ class SequentialOrchestrator:
                 raise OrchestrationOrderError(
                     "pass 2 cannot start before the top-three competitor gate"
                 )
-            paths = ([str(value).strip().replace("\\", "/") for value in scope]
-                     if whole_repository else changed_file_scope(scope))
+            paths = changed_file_scope(scope)
             if count > 1:
                 expected_paths = list(item["passes"][-1].get("changed_files") or [])
                 if count == 2:
@@ -426,11 +425,12 @@ def run_sequential_queue(mode: str, targets: Iterable[object],
         except (KeyboardInterrupt, SystemExit):
             orchestrator.finish_target(index, 130, note="operator interruption")
             raise
-        except BaseException as exc:
-            orchestrator.finish_target(
+        except Exception as exc:
+            code = orchestrator.finish_target(
                 index, 1, note=f"{type(exc).__name__}: {exc}"
             )
-            raise
+            results.append(code)
+            continue
         code = orchestrator.finish_target(index, code)
         results.append(code)
     return (next((code for code in results if code != 0), 0), orchestrator)

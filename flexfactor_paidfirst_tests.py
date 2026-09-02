@@ -90,6 +90,16 @@ class LadderOrdering(_Base):
         )
         self.assertEqual(selected.route.id, FREE_STRONG.id)
 
+    def test_best_available_policy_ignores_legacy_pins(self):
+        os.environ["AI_ROTATE_PIN"] = FREE_STRONG.id
+        self.addCleanup(os.environ.pop, "AI_ROTATE_PIN", None)
+        selected = self.rot().next_route(
+            tier=R.FRONTIER, allow_paid=True, paid_first=True,
+            pin=FREE_STRONG.id, now=100,
+        )
+        self.assertEqual(selected.route.id, PAID_FRONTIER.id)
+        self.assertFalse(selected.pinned)
+
 
 class _Provider:
     def __init__(self, selected):

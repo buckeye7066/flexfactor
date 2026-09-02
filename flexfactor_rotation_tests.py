@@ -646,6 +646,40 @@ class RotatingProviderTests(RotationTestCase):
         results = {prov.complete("x") for _ in range(2)}
         self.assertEqual(results, {"completed by a/one", "completed by b/one"})
 
+    def test_legacy_signature_fallback_cannot_drop_strict_family_policy(self):
+        class LegacyRotator:
+            def __init__(self):
+                self.catalog = catalog(route("a/gpt", "pool-a", model="gpt-5"))
+
+            def next_route(self, tier, allow_paid):
+                return self.unexpected_call(tier, allow_paid)
+
+            def unexpected_call(self, *_args):
+                raise AssertionError("strict metadata was silently discarded")
+
+        provider = R.RotatingProvider(
+            LegacyRotator(), lambda selected: FakeProvider(selected),
+            allow_paid=True,
+        )
+        intent = R.CallIntent(R.ROLE_REVIEWER, avoid_families=("gpt",))
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+            provider.complete("x", intent=intent)
+
+    def test_legacy_signature_fallback_cannot_drop_paid_first_policy(self):
+        class LegacyRotator:
+            def __init__(self):
+                self.catalog = catalog(route("a/gpt", "pool-a"))
+
+            def next_route(self, tier, allow_paid):
+                raise AssertionError("paid-first policy was silently discarded")
+
+        provider = R.RotatingProvider(
+            LegacyRotator(), lambda selected: FakeProvider(selected),
+            allow_paid=True, paid_first=True,
+        )
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+            provider.complete("x")
+
     def test_grading_uses_the_cheap_tier_not_the_author_tier(self):
         prov = self._provider(catalog(
             route("front/big", "pool-front", tier=R.FRONTIER),

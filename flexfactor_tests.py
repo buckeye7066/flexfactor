@@ -52,6 +52,10 @@ ff = importlib.util.module_from_spec(_SPEC)
 sys.modules["flexfactor"] = ff
 _SPEC.loader.exec_module(ff)
 
+_RETIRED_LADDER_REASON = (
+    "retired characterization: superseded by the one best-available paid-to-free ladder"
+)
+
 
 def _init_test_origin(project: str, remote: str) -> None:
     """Give a fixture the production prerequisites without using a real host repo."""
@@ -303,7 +307,8 @@ class FixDiffTests(unittest.TestCase):
         self.assertEqual(ff._fix_diff("same\n", "same\n", "f"), "")
 
 
-class RetiredPaidFreeProviderCharacterization:
+@unittest.skip(_RETIRED_LADDER_REASON)
+class RetiredPaidFreeProviderCharacterization(unittest.TestCase):
     def tearDown(self):
         # build_audit_providers publishes the chosen free backends in a MODULE
         # GLOBAL, and audit_one_program wraps whatever is in it into the
@@ -1378,17 +1383,8 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertEqual(good, "")
 
     def test_paid_and_gemini_routes_are_ROTATED_not_filtered(self):
-        """Owner order 2026-08-21: "Paid can be rotated in until exhausted.
-        Leave no routes blocked." STILL TRUE - now scoped to 'paid' mode by the
-        2026-08-24 order ("paid uses both anthropic and openai exclusively until
-        credits expire and free uses free exclusively").
-
-        Both routes were once dropped BY NAME, and that free-only rule was
-        load-bearing enough that removing it silently would be indistinguishable
-        from a bug. The same hazard applies to superseding it, so both halves of
-        the new boundary are pinned here rather than one assertion being quietly
-        deleted: inside the mode the owner asked for it, nothing blocks paid;
-        outside it, the mode is the block.
+        """Historical paid/free characterization retained only as migration
+        context. Active tests now require the single paid-to-free ladder.
         """
         import flexfactor_rotation as fr
         paid = fr.Route.from_json(self._route("openai_api/gpt-4o", cost="paid-metered"))
@@ -1558,16 +1554,8 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertFalse(os.path.exists(ff._FCC_ENV_FILE))
 
     def test_the_retired_local_spelling_now_admits_cloud_FREE_routes(self):
-        """Owner order 2026-08-24 retired 'local'; this pins what changed.
-
-        'local' used to mean LOOPBACK ONLY, and the assertion that used to live
-        here - a remote groq route is excluded - was the very rule that shut all
-        126 credentialed cloud free-tier routes out of the mode the launcher
-        offered as its DEFAULT, pinning runs to CPU-only Ollama (measured 20+
-        minutes for one large-file review). The spelling still has to be
-        ACCEPTED, because a shortcut or scheduled task nobody found must degrade
-        rather than die on argparse exit 2 - but it now resolves to 'free', and
-        free means every free route, not just the loopback ones.
+        """Historical local/free migration behavior; active policy has one
+        best-available ladder that reaches free capacity after paid exhaustion.
         """
         import flexfactor_rotation as fr
         remote = dict(self._route("groq/llama-x"))
@@ -1587,7 +1575,8 @@ class RotationDefaultProviderTests(unittest.TestCase):
             fr.Route.from_json(paid), "local"), "")
 
 
-class RetiredConcurrentFreePoolCharacterization:
+@unittest.skip(_RETIRED_LADDER_REASON)
+class RetiredConcurrentFreePoolCharacterization(unittest.TestCase):
     """2026-08-12 owner correction: the FCC proxy and local Ollama are both
     genuinely free but not equally fast on this machine (Ollama is CPU-only -
     a large-file review measured 20+ minutes locally vs under a minute
@@ -3913,9 +3902,8 @@ class WriteGeneratingPromptFencingTests(unittest.TestCase):
                 return (ff.Grade(50, False, "meh", ["fix the thing"]) if len(grades) == 1
                         else ff.Grade(100, True, "great", []))
 
-        real_best = ff._best_available_provider
-        ff._best_available_provider = lambda *a, **k: FakeProv()
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+             _patched(ff, "_best_available_provider", lambda *a, **k: FakeProv()):
             remote = os.path.join(tmp, "origin.git")
             repo = os.path.join(tmp, "repo")
             subprocess.run(["git", "init", "--bare", remote], check=True,
@@ -3944,10 +3932,7 @@ class WriteGeneratingPromptFencingTests(unittest.TestCase):
             args = types.SimpleNamespace(file=src, goal="do X", provider="anthropic",
                                          model=None, judge_model=None, threshold=90,
                                          max_iterations=4, push=True, merge=True)
-            try:
-                ff.run(args)
-            finally:
-                ff._best_available_provider = real_best
+            ff.run(args)
         self.assertIn("<<<UNTRUSTED source START>>>", rewrites[0])
         self.assertTrue(any("<<<UNTRUSTED feedback START>>>" in r for r in rewrites),
                         "retry feedback must be fenced")
@@ -7819,6 +7804,7 @@ class ScoutEndToEndTests(unittest.TestCase):
                        check=True)
         subprocess.run(["git", "-C", tmp, "push", "-q", "origin", branch],
                        check=True)
+        return branch
 
     def _stub_judge(self, provider, system, prompt, schema, max_tokens=8000):
         if schema is ff.PROGRAM_PROFILE_SCHEMA:
@@ -7905,13 +7891,13 @@ class ScoutEndToEndTests(unittest.TestCase):
     def test_full_scenario_applies_good_rejects_hostile(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            self._make_target(tmp)
+            branch = self._make_target(tmp)
             rc = self._run_scenario(tmp, verify_rc=0)
             self.assertEqual(rc, 0)
             branches = self._git_out(tmp, "branch", "--list")
             # No sandbox branch: adopt applies onto whatever branch the repo is on.
             self.assertNotIn("flexfactor/adopt-", branches)
-            self.assertIn("master", branches)
+            self.assertIn(branch, branches)
             # The hostile candidate (higher finalScore, LLM said ADOPT) must
             # have NO branch and NO applied change.
             self.assertNotIn("injector", branches)
@@ -12889,6 +12875,23 @@ class VacuousGateTests(unittest.TestCase):
         self.assertEqual(row["status"], "blocked")
         self.assertFalse(row["passed"])
 
+    def test_optional_publication_gate_is_not_counted_as_a_pass(self):
+        import flexfactor_evidence as ev
+        gates = {
+            "schema": ev.GATES_SCHEMA,
+            "gates": [{"id": "tests", "status": "pass", "passed": True}],
+            "totals": {"pass": 1, "fail": 0, "blocked": 0},
+            "passed": True,
+        }
+        row = ev.record_publication_gate(
+            gates, None, {"required": False, "complete": False}
+        )
+        self.assertEqual(row["status"], "not-run")
+        self.assertFalse(row["ran"])
+        self.assertIsNone(row["passed"])
+        self.assertEqual(gates["totals"], {"pass": 1, "fail": 0, "blocked": 0})
+        self.assertTrue(gates["passed"])
+
     def test_the_suite_is_not_run_when_the_build_already_failed(self):
         # Publication is already impossible on a red/unverified build, and the
         # project suite can take 20+ minutes - _publication_gate must return
@@ -14044,7 +14047,8 @@ class ResumeCheckpointTests(unittest.TestCase):
                          "not be left dangling mid-run")
 
 
-class RetiredEconomyFlagCharacterization:
+@unittest.skip(_RETIRED_LADDER_REASON)
+class RetiredEconomyFlagCharacterization(unittest.TestCase):
     """Owner feedback 2026-08-11: a cost switch that works in audit but errors
     in refactor is a trap, not a design - one flag, one meaning, every mode."""
 
@@ -14160,7 +14164,8 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
                     ff.run_scout(args)
         self.assertTrue(reached["judge"])
 
-    def retired_ollama_primary_never_retains_cloud_secondary(self):
+    @unittest.skip(_RETIRED_LADDER_REASON)
+    def test_retired_ollama_primary_never_retains_cloud_secondary(self):
         class Args:
             provider = "ollama"
             explicit_provider = True
@@ -14630,7 +14635,8 @@ class EvidenceRuntimeTests(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz1234", raw)
         self.assertIn("REDACTED", raw)
 
-    def retired_paid_mode_is_explicit_and_never_silently_uses_missing_credentials(self):
+    @unittest.skip(_RETIRED_LADDER_REASON)
+    def test_retired_paid_mode_is_explicit_and_never_silently_uses_missing_credentials(self):
         ev = self._ev()
         with self.assertRaisesRegex(RuntimeError, "credentials are absent"):
             ev.resolve_runtime_mode("paid", "anthropic", None, False, True)
@@ -14640,7 +14646,8 @@ class EvidenceRuntimeTests(unittest.TestCase):
         self.assertEqual(free.mode, "free")
         self.assertTrue(free.local_only, "loopback was the only free capacity")
 
-    def retired_free_mode_records_egress_truthfully_when_cloud_free_is_reachable(self):
+    @unittest.skip(_RETIRED_LADDER_REASON)
+    def test_retired_free_mode_records_egress_truthfully_when_cloud_free_is_reachable(self):
         """`local_only` is what the evidence record claims about EGRESS, so it
         has to track the resolved run and not the mode name. A free run that
         reached a cloud free tier did send bytes off this machine; recording it
@@ -14690,7 +14697,8 @@ class EvidenceRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no reachable model route"):
             ev.resolve_runtime_mode("best", "auto", None, False, False, False)
 
-    def retired_paid_runtime_never_falls_back_to_free_proxy_or_ollama(self):
+    @unittest.skip(_RETIRED_LADDER_REASON)
+    def test_retired_paid_runtime_never_falls_back_to_free_proxy_or_ollama(self):
         class Args:
             provider = "anthropic"
             explicit_provider = False

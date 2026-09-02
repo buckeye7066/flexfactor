@@ -12,10 +12,14 @@ import sys
 
 _SKIP = re.compile(r"\.\.\. skipped (?P<quote>['\"])(?P<reason>.*)(?P=quote)\s*$")
 
-# These are capability or opposite-platform tests.  Counts are upper bounds:
+# These are capability, opposite-platform, or explicitly retired tests.
+# Counts are upper bounds:
 # gaining a capability may remove a skip, but a new or duplicated skip fails.
 _ALLOW: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {
     "Windows": (
+        (re.compile(
+            r"^retired characterization: superseded by the one best-available paid-to-free ladder$"
+        ), 33),
         (re.compile(r"^POSIX openat component-walk unavailable on this platform$"), 6),
         (re.compile(r"^review_files entry not present - covered by review_file test$"), 1),
         (re.compile(r"^POSIX openat write path unavailable on this platform$"), 1),
@@ -24,6 +28,9 @@ _ALLOW: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {
         (re.compile(r"^BLOCKED: no sufficient OS sandbox "), 1),
     ),
     "Linux": (
+        (re.compile(
+            r"^retired characterization: superseded by the one best-available paid-to-free ladder$"
+        ), 33),
         (re.compile(r"^Windows junction test$"), 1),
         (re.compile(r"^review_files entry not present - covered by review_file test$"), 1),
         (re.compile(r"^POSIX openat\+O_NOFOLLOW leaf open does not use the Windows "), 1),

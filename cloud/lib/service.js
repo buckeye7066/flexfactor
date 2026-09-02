@@ -649,6 +649,12 @@ async function existingDispatchedRun(token, request, fetchImpl) {
 export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl = fetch,
     sleepImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))) {
   const run = validateRunRequest(source);
+  // request_id is the idempotency key shared with the durable phone queue.
+  // Recover an already accepted run before revalidating mutable repository
+  // state: its saved target ref or caller workflow may have been deleted after
+  // GitHub accepted the original dispatch but before the phone stored the ID.
+  const existingRun = await existingDispatchedRun(token, run, fetchImpl);
+  if (existingRun) return existingRun;
   const metadata = await githubJson(token, "GET", `/repos/${run.repository}`, undefined, fetchImpl);
   const workflowRef = typeof metadata?.default_branch === "string"
     ? metadata.default_branch.trim() : "";
@@ -665,11 +671,6 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // continues through its subscription and free/local routes.
   const providerSecretWrites = await prepareProviderSecrets(
     token, run, encryptedSecrets, fetchImpl);
-  // request_id is the idempotency key shared with the durable phone queue. If
-  // the app dies after GitHub accepts a dispatch but before it stores the run
-  // ID, retrying must recover the existing run instead of starting a duplicate.
-  const existingRun = await existingDispatchedRun(token, run, fetchImpl);
-  if (existingRun) return existingRun;
   const workflowChanged = await ensureTargetWorkflow(
     token, run.repository, workflowRef, fetchImpl);
   await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);

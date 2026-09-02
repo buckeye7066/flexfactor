@@ -10,7 +10,7 @@ push/merge. Configure the correct remote and retry. Local-only or
 ## The strongest model is unavailable
 
 Do not choose another route. The single best-available ladder records quota,
-credit, rate, or transport failure and continues through lower paid capacity
+credit, rate, or transport failure and continues through lower-paid capacity
 before free/local capacity. If every route is unavailable, the run checkpoints
 and reports blocked. Add or restore optional credentials, then rerun the same
 request.

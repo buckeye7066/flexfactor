@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -70,6 +72,26 @@ class OneAdmissionBoundary(unittest.TestCase):
             provider = ff._build_rotating_provider(Args(), None, "best", quiet=True)
         self.assertIsInstance(provider, rot.RotatingProvider)
         self.assertTrue(provider._paid_first)
+
+    def test_best_available_banner_does_not_advertise_an_ignored_pin(self):
+        class Args:
+            economy = False
+            max_cost = 150.0
+
+        ollama = _route(
+            id="builtin/ollama", backend="ollama", api="ollama",
+            model="qwen2.5-coder:7b", wire_model="qwen2.5-coder:7b",
+            pool="ollama:local", cost_class=rot.LOCAL_UNLIMITED,
+        )
+        output = io.StringIO()
+        with mock.patch.object(rot, "load_catalog", return_value=None), \
+             mock.patch.object(ff, "_builtin_route_catalog", return_value=[ollama]), \
+             mock.patch.object(rot.StateStore, "get_pin", return_value="legacy/free"), \
+             mock.patch.dict(os.environ, {"AI_ROTATE_PIN": "legacy/free"}), \
+             contextlib.redirect_stderr(output):
+            provider = ff._build_rotating_provider(Args(), None, "best", quiet=False)
+        self.assertIsInstance(provider, rot.RotatingProvider)
+        self.assertNotIn("pinned to", output.getvalue())
 
 
 if __name__ == "__main__":

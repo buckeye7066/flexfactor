@@ -979,14 +979,15 @@ def record_publication_gate(gates: dict, paths: dict | None,
     """
     required = publication.get("required") is True
     complete = publication.get("complete") is True
-    passed = complete if required else True
+    passed = complete if required else None
+    status = ("pass" if complete else "blocked") if required else "not-run"
     gate = {
         "id": "remote-default-publication",
         "name": "Verified commit on remote default branch",
         "category": "publication",
         "ran": required,
         "passed": passed,
-        "status": "pass" if passed else "blocked",
+        "status": status,
         "evidence": dict(publication),
     }
     rows = [row for row in (gates.get("gates") or [])
@@ -998,7 +999,8 @@ def record_publication_gate(gates: dict, paths: dict | None,
         "fail": sum(row.get("status") == "fail" for row in rows),
         "blocked": sum(row.get("status") == "blocked" for row in rows),
     }
-    gates["passed"] = all(row.get("status") == "pass" for row in rows)
+    counted = [row for row in rows if row.get("status") != "not-run"]
+    gates["passed"] = all(row.get("status") == "pass" for row in counted)
 
     if paths:
         quality_path = paths.get("quality_gates")

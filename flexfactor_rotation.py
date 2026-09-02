@@ -868,19 +868,23 @@ class Rotator:
         strict_families = set(intent.avoid_families) if intent is not None else set()
         soft_families = ({intent.avoid_family}
                          if intent is not None and intent.avoid_family else set())
-        excluded_families = strict_families | soft_families
-        if excluded_families:
-            others = [r for r in candidates
-                      if model_family(r.model) not in excluded_families]
-            if others:
-                candidates = others
-            elif strict_families:
+        if strict_families:
+            strict_others = [r for r in candidates
+                             if model_family(r.model) not in strict_families]
+            if strict_others:
+                candidates = strict_others
+            else:
                 label = ",".join(sorted(strict_families))
                 reasons.setdefault(
                     f"reviewer-family:{label}",
                     "no model family independent from every candidate author",
                 )
                 return None
+        if soft_families:
+            soft_others = [r for r in candidates
+                           if model_family(r.model) not in soft_families]
+            if soft_others:
+                candidates = soft_others
             else:
                 family_note = (f"no alternative to family '{intent.avoid_family}' "
                                f"for {intent.role}; independence NOT achieved")
@@ -917,12 +921,13 @@ class Rotator:
                        for route in pools[pool_name])
 
         if paid_first:
-            pool_key = lambda p: (0 if _paid_pool(p) else 1,
-                                  _pool_catalog_order(p),
-                                  -_best_pool_yield(p), p)
+            def pool_key(p: str) -> tuple:
+                return (0 if _paid_pool(p) else 1,
+                        _pool_catalog_order(p), -_best_pool_yield(p), p)
         else:
-            pool_key = lambda p: (self._pool_last_used(state, p),
-                                  self._pool_calls(state, p), p)
+            def pool_key(p: str) -> tuple:
+                return (self._pool_last_used(state, p),
+                        self._pool_calls(state, p), p)
         ordered = sorted(pools.keys(), key=pool_key)
         pool = ordered[0]
 
@@ -936,14 +941,14 @@ class Rotator:
             return 0 if r.capabilities_source == "measured" else 1
 
         if paid_first:
-            route_key = lambda r: (
-                _fit_rank(r), catalog_order.get(r.id, len(catalog_order)),
-                -_route_yield(state, r, purpose), r.id)
+            def route_key(r: Route) -> tuple:
+                return (_fit_rank(r), catalog_order.get(r.id, len(catalog_order)),
+                        -_route_yield(state, r, purpose), r.id)
         else:
-            route_key = lambda r: (
-                _fit_rank(r), -_route_yield(state, r, purpose),
-                self._route_last_used(state, r),
-                COST_ORDER.get(r.cost_class, 9), r.id)
+            def route_key(r: Route) -> tuple:
+                return (_fit_rank(r), -_route_yield(state, r, purpose),
+                        self._route_last_used(state, r),
+                        COST_ORDER.get(r.cost_class, 9), r.id)
         routes = sorted(pools[pool], key=route_key)
         chosen = routes[0]
         fit = ("" if intent is None or not intent.needs else
@@ -1362,7 +1367,9 @@ class RotatingProvider:
                     # raised by a current implementation: retry only for the
                     # precise signature-drift message and only when optional
                     # policy metadata was supplied.
-                    if not extra or "unexpected keyword argument" not in str(exc):
+                    if (not extra or "unexpected keyword argument" not in str(exc)
+                            or self._paid_first
+                            or (intent is not None and intent.avoid_families)):
                         raise
                     selection = self.rotator.next_route(
                         tier=tier, allow_paid=self._allow_paid)

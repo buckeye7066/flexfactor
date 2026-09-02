@@ -988,26 +988,40 @@ public final class MainActivity extends Activity {
             }
             saveRunHistory(updated);
             boolean advanced = false;
-            MobileRunQueue queue = loadRunQueue();
-            if (queue != null && queue.hasActiveRun()) {
-                long queuedRun = queue.activeRunId();
-                for (RunRecord record : updated) {
-                    if (record.id == queuedRun && record.complete) {
-                        queue.markActiveComplete(queuedRun);
-                        saveRunQueue(queue);
-                        advanced = true;
-                        break;
+            String queueAdvanceFailure = "";
+            try {
+                MobileRunQueue queue = loadRunQueue();
+                if (queue != null && queue.hasActiveRun()) {
+                    long queuedRun = queue.activeRunId();
+                    for (RunRecord record : updated) {
+                        if (record.id == queuedRun && record.complete) {
+                            queue.markActiveComplete(queuedRun);
+                            saveRunQueue(queue);
+                            advanced = true;
+                            break;
+                        }
                     }
                 }
+            } catch (RuntimeException failed) {
+                // A failed durable queue write must not strand `polling=true`.
+                // Leave the saved queue on its prior active item and retry the
+                // same transition; never dispatch the next target from memory.
+                queueAdvanceFailure = safeMessage(failed);
             }
-            boolean pollAgain = active;
+            boolean pollAgain = active || !queueAdvanceFailure.isEmpty();
             boolean toast = latestSucceeded;
             boolean startNext = advanced;
+            String queueError = queueAdvanceFailure;
             post(() -> {
                 polling = false;
                 refreshRunLabel();
                 if (startNext) dispatchNextQueued();
                 else if (pollAgain) main.postDelayed(pollRun, POLL_MS);
+                if (!queueError.isEmpty()) {
+                    showError("The queue could not advance",
+                            queueError + "\n\nFlexFactor kept the next target stopped "
+                                    + "and will retry the durable queue update.");
+                }
                 if (toast) Toast.makeText(this, "FlexFactor completed successfully",
                         Toast.LENGTH_LONG).show();
             });

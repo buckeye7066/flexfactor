@@ -4324,6 +4324,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
         if not any(r.tier == author_tier for r in usable):
             author_tier = fr.LIGHT
     announced: set[str] = set()
+    paid_first = normalize_model_mode(model_mode) == "best"
 
     def _announce(selection) -> None:
         # One line per distinct route per run — shows which backends actually
@@ -4333,8 +4334,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
             print(f"  [rotation] {selection.describe()}", file=sys.stderr)
 
     pools = len({r.pool for r in usable})
-    pin = fr.StateStore().get_pin("flexfactor") or fr.StateStore().get_pin() \
-        or os.environ.get("AI_ROTATE_PIN") or ""
+    pin = "" if paid_first else (fr.StateStore().get_pin("flexfactor")
+                                  or fr.StateStore().get_pin()
+                                  or os.environ.get("AI_ROTATE_PIN") or "")
     drop_note = ("; excluded " + ", ".join(
         f"{n}x {w}" for w, n in sorted(dropped.items()))) if dropped else ""
     # Catalog staleness is a fact about ONE FILE, so it is said ONCE per process
@@ -4374,7 +4376,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
                                # non-exhausted paid capacity, descend through
                                # paid tiers, then use independent free families.
                                # --max-cost still bounds the total spend.
-                               paid_first=(normalize_model_mode(model_mode) == "best"),
+                               paid_first=paid_first,
                                role_coordinator=role_coordinator)
 
 
