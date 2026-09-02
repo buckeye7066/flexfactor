@@ -1,4 +1,4 @@
-# FlexFactor - Evidence model (0.6.1)
+# FlexFactor - Evidence model (0.7.0)
 
 Two artifacts per run: the **run manifest** (`<slug>_run_manifest_<stamp>.json`
 written into the target dir by `_write_run_manifest`, never overwritten) and the

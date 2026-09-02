@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""FlexFactor 0.6.1 — managed code improvement with four modes.
+r"""FlexFactor 0.7.0 — managed code improvement with four modes.
 
 Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
 one quality-first paid-to-free model ladder. A request may contain up to 30
@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -134,6 +135,15 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import flexfactor_scout_contract as _scout_contract
+
+# Evidence-backed target-vs-scouted-program research.  This is a hard Scout
+# dependency: silently falling back to the old "URL as a label" behavior would
+# restore the placeholder path this module exists to remove.
+try:
+    import flexfactor_scout_research as _scout_research
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import flexfactor_scout_research as _scout_research
 
 # Model defaults per provider. These are the first metered routes in the
 # orchestrator-owned best-available ladder. They are intentionally not exposed
@@ -643,7 +653,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.6.1"
+TOOL_VERSION = "0.7.0"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -5547,36 +5557,6 @@ def allow_remote_program_context(args=None) -> bool:
         return True
     return _env_truthy("FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT")
 
-# The LLM's characterization of the entered program. `opportunities` is the
-# bridge to Repo Rewards: each one carries a ready-to-run natural-language query.
-PROGRAM_PROFILE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string", "description": "Short name of the program."},
-        "summary": {"type": "string", "description": "1-3 sentences: what it is and does."},
-        "stack": {"type": "array", "items": {"type": "string"},
-                  "description": "Languages, frameworks, and notable libraries it uses."},
-        "goals": {"type": "array", "items": {"type": "string"},
-                  "description": "What the program is trying to achieve for its users."},
-        "opportunities": {
-            "type": "array",
-            "description": "Distinct areas where an external open-source repo could help.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "need": {"type": "string", "description": "The capability/area, e.g. 'math expression rendering'."},
-                    "search_query": {"type": "string",
-                                     "description": "A natural-language search to find repos for this need."},
-                },
-                "required": ["need", "search_query"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["name", "summary", "stack", "goals", "opportunities"],
-    "additionalProperties": False,
-}
-
 # The LLM's verdict on whether ONE repo benefits the program.
 BENEFIT_SCHEMA = {
     "type": "object",
@@ -5593,14 +5573,6 @@ BENEFIT_SCHEMA = {
     "required": ["benefit_score", "verdict", "how_it_helps", "integration_note", "risks"],
     "additionalProperties": False,
 }
-
-PROFILE_SYSTEM = (
-    "You are a senior software architect profiling a program so we can find "
-    "open-source projects that would help it. Be concrete and grounded in the "
-    "evidence provided. For `opportunities`, identify genuine gaps or areas the "
-    "program could improve by adopting an existing library/tool - 3 to 6 of them - "
-    "and give each a focused, natural-language search query. Respond with JSON only."
-)
 
 BENEFIT_SYSTEM = (
     "You are a pragmatic staff engineer with one question only: would adopting "
@@ -6121,6 +6093,393 @@ def resolve_program_input(program_arg: str) -> tuple[str, str]:
 
     # 5. Fall back to treating the input as a plain-English description.
     return arg[:60], f"PROGRAM DESCRIPTION (entered by the user):\n{arg}"
+
+
+# --------------------------------------------------------------------------- #
+# Scout's corrected TWO-PROGRAM evidence path.
+#
+# ``resolve_program_input`` remains the compatibility resolver used throughout
+# Audit/Production Ready.  It intentionally does not fetch URLs.  Scout cannot
+# use that shortcut for a specifically named source program: a URL string is
+# not evidence of the program behind it.  The helpers below acquire bounded
+# evidence for both sides, index every local target source file structurally,
+# inspect selected high-signal files, crawl public product/documentation pages,
+# and, only when the target itself is remote, shallow-clone its public code-host
+# URL without executing its code. Repo Rewards owns implementation-repository
+# discovery after the comparison.
+# --------------------------------------------------------------------------- #
+_SCOUT_TEXT_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html",
+    ".java", ".js", ".jsx", ".json", ".kt", ".kts", ".md", ".mjs",
+    ".php", ".ps1", ".py", ".rb", ".rs", ".sh", ".sql", ".svelte",
+    ".swift", ".toml", ".ts", ".tsx", ".vue", ".xml", ".yaml", ".yml",
+}
+_SCOUT_METADATA_NAMES = {
+    "readme", "readme.md", "package.json", "pyproject.toml", "cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "settings.gradle", "dockerfile",
+    "compose.yml", "docker-compose.yml", "requirements.txt", "gemfile",
+}
+
+
+def _scout_file_score(rel: str) -> int:
+    low = rel.replace("\\", "/").lower()
+    base = low.rsplit("/", 1)[-1]
+    ext = os.path.splitext(base)[1]
+    if ext not in _SCOUT_TEXT_EXTENSIONS and base not in _SCOUT_METADATA_NAMES:
+        return -1000
+    if any(token in low for token in (
+            "/node_modules/", "/vendor/", "/dist/", "/build/", "/coverage/",
+            ".min.js", ".map", "package-lock.json", "pnpm-lock.yaml",
+            "yarn.lock")):
+        return -1000
+    score = 10
+    if base in _SCOUT_METADATA_NAMES or base.startswith("readme"):
+        score += 100
+    if any(token in low for token in (
+            "/route", "/api/", "/controller", "/service", "/workflow",
+            "/feature", "/page", "/screen", "/component", "/agent",
+            "/pipeline", "/integration", "/crawler", "/search")):
+        score += 55
+    if any(token in low for token in ("test", "spec", "e2e", "acceptance")):
+        score += 35
+    if any(token in base for token in (
+            "main", "index", "app", "server", "router", "schema", "config")):
+        score += 25
+    score -= min(20, low.count("/") * 2)
+    return score
+
+
+def _scout_index_summary(index: dict) -> str:
+    """Compact, factual rendering of a complete repository-wide code index."""
+    from collections import Counter
+
+    totals = index.get("totals") or {}
+    files = [str(row.get("path") or "") for row in index.get("files") or []
+             if row.get("path")]
+    routes = index.get("routes") or []
+    symbols = index.get("symbols") or []
+    controls = index.get("controls") or []
+    imports = Counter(str(row.get("module") or "")
+                      for row in index.get("imports") or [] if row.get("module"))
+    control_files = Counter(str(row.get("file") or "") for row in controls
+                            if row.get("file"))
+    rows = [
+        "REPOSITORY-WIDE STRUCTURAL INDEX (every discovered file accounted):",
+        json.dumps(totals, sort_keys=True),
+        f"complete_source_inventory={index.get('complete_source_inventory')}",
+        f"discovery={json.dumps(index.get('discovery') or {}, default=str)}",
+        "Routes/endpoints:",
+    ]
+    rows.extend(
+        f"  {r.get('method')} {r.get('path')} -> {r.get('file')}:{r.get('line')}"
+        for r in routes[:120]
+    )
+    rows.append("User-control density by file:")
+    rows.extend(f"  {path}: {count}" for path, count in control_files.most_common(60))
+    rows.append("Top imported modules:")
+    rows.extend(f"  {name}: {count}" for name, count in imports.most_common(80))
+    rows.append("Symbols (bounded rendering; totals above remain authoritative):")
+    rows.extend(
+        f"  {s.get('kind')} {s.get('name')} @ {s.get('file')}:{s.get('line')}"
+        for s in symbols[:260]
+    )
+    rows.append(f"Tracked/relevant paths ({len(files)} total):")
+    rows.extend(f"  {p}" for p in files[:600])
+    if len(files) > 600:
+        rows.append(f"  ... {len(files) - 600} additional path(s) counted but not rendered")
+    return "\n".join(rows)
+
+
+def _scout_local_repository_bundle(reference: str, prefix: str) -> dict:
+    root = os.path.abspath(reference)
+    name, purpose_context = _gather_from_folder(root)
+    evidence_rows: list[dict] = []
+    errors: list[dict] = []
+    index = None
+    evidence_mod = _evidence_module()
+    if evidence_mod is not None:
+        try:
+            run_id = "scout-" + hashlib.sha256(
+                f"{root}:{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:16]
+            index = evidence_mod.build_repository_index(root, run_id)
+        except Exception as exc:  # a named coverage gap, never a clean result
+            errors.append({"ref": root, "error": f"repository index failed: {exc}"})
+    overview = purpose_context
+    if index is not None:
+        overview += "\n\n" + _scout_index_summary(index)
+    evidence_rows.append({
+        "id": f"{prefix}1", "kind": "repository-overview", "path": root,
+        "title": f"{name} repository purpose, history, and complete structural index",
+        "text": overview[:90_000],
+    })
+
+    if index is not None:
+        paths = [str(row.get("path") or "") for row in index.get("files") or []]
+    else:
+        paths = _tracked_repository_scope(root) if _is_git_repo(root) else _file_tree(root, 500)
+    ranked = sorted(
+        ((-_scout_file_score(path), path) for path in paths
+         if path and _scout_file_score(path) > -1000),
+        key=lambda row: (row[0], row[1]),
+    )
+    total_chars = len(evidence_rows[0]["text"])
+    selected = 0
+    for _neg_score, rel in ranked:
+        if selected >= 32 or total_chars >= 180_000:
+            break
+        body = _read_contained(root, rel, 7_000)
+        if body is None or not body.strip():
+            continue
+        selected += 1
+        body = body[: min(7_000, 180_000 - total_chars)]
+        evidence_rows.append({
+            "id": f"{prefix}{len(evidence_rows) + 1}",
+            "kind": "source-file", "path": rel,
+            "title": f"Source evidence: {rel}", "text": body,
+        })
+        total_chars += len(body)
+    source_total = int((index or {}).get("totals", {}).get(
+        "tracked_or_relevant_source_files", 0) or 0)
+    return {
+        "reference": reference,
+        "kind": "local-repository",
+        "name_hint": name,
+        "canonical_url": "",
+        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "evidence": evidence_rows,
+        "coverage": {
+            "repository_files": int((index or {}).get("totals", {}).get("files", len(paths))),
+            "source_files": source_total,
+            "source_files_structurally_analyzed": int((index or {}).get("totals", {}).get(
+                "analyzed_source_files", 0) or 0),
+            "source_files_rendered": selected,
+            "complete_source_inventory": bool(index and index.get("complete_source_inventory")),
+            "errors": errors,
+            "complete": bool(evidence_rows and index and index.get("complete_source_inventory")),
+        },
+    }
+
+
+def _scout_local_file_bundle(reference: str, prefix: str) -> dict:
+    full = os.path.abspath(reference)
+    body = _read_contained(os.path.dirname(full), os.path.basename(full), 180_000)
+    errors = [] if body is not None else [{"ref": full, "error": "contained read refused"}]
+    return {
+        "reference": reference, "kind": "local-file",
+        "name_hint": os.path.basename(full), "canonical_url": "",
+        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "evidence": ([{"id": f"{prefix}1", "kind": "source-file", "path": full,
+                       "title": os.path.basename(full), "text": body}]
+                     if body is not None else []),
+        "coverage": {"files": 1, "retrieved": int(body is not None),
+                     "errors": errors, "complete": body is not None},
+    }
+
+
+def _normalized_code_repository_url(reference: str) -> str | None:
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parsed = urlsplit(reference.strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if parsed.scheme not in ("http", "https") or host not in {
+            "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+            "gitea.com"}:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) < 2:
+        return None
+    # Product and documentation pages on a code-host domain are still valid
+    # Scout website inputs. Only owner/repository-shaped paths are routed away
+    # from Scout and left to Repo Rewards.
+    non_repository_roots = {
+        "about", "collections", "customer-stories", "enterprise", "events",
+        "explore", "features", "help", "marketplace", "pricing", "readme",
+        "resources", "security", "site", "solutions", "sponsors", "topics",
+    }
+    if parts[0].lower() in non_repository_roots:
+        return None
+    # GitHub/Bitbucket/Codeberg use owner/repo.  GitLab permits nested groups;
+    # a .git suffix is the unambiguous boundary, otherwise owner/repo remains
+    # the conservative public URL accepted by all listed hosts.
+    if host == "gitlab.com" and any(p.endswith(".git") for p in parts):
+        end = next(i for i, p in enumerate(parts) if p.endswith(".git")) + 1
+        repo_parts = parts[:end]
+    else:
+        repo_parts = parts[:2]
+    repo_parts[-1] = repo_parts[-1][:-4] if repo_parts[-1].endswith(".git") else repo_parts[-1]
+    if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in repo_parts):
+        return None
+    return urlunsplit(("https", host, "/" + "/".join(repo_parts), "", ""))
+
+
+def _scout_git_object_bundle(reference: str, prefix: str) -> dict:
+    canonical = _normalized_code_repository_url(reference)
+    if not canonical:
+        raise ValueError(f"not a supported public repository URL: {reference}")
+    temp_root = tempfile.mkdtemp(prefix="ffscout-program-")
+    checkout = os.path.join(temp_root, "repo")
+    errors: list[dict] = []
+    try:
+        env = _scout_contract.strip_credential_env(_hermetic_git_env())
+        command = [
+            "git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+            "clone", "--depth", "1", "--no-tags", "--single-branch",
+            "--filter=blob:none", "--no-checkout", "--", canonical, checkout,
+        ]
+        cp = _run(command, cwd=temp_root, timeout=240, env=env)
+        if cp.returncode != 0:
+            _rmtree_force(checkout)
+            fallback = command.copy()
+            fallback.remove("--filter=blob:none")
+            cp = _run(fallback, cwd=temp_root, timeout=240, env=env)
+        if cp.returncode != 0:
+            raise RuntimeError("public repository clone failed: " + _tail(cp.stderr, 4))
+        sha_cp = _run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                      cwd=checkout, timeout=60, env=env)
+        sha = sha_cp.stdout.strip() if sha_cp.returncode == 0 else "unknown"
+        tree_cp = _run(["git", "-C", checkout, "ls-tree", "-r", "--name-only", "HEAD"],
+                       cwd=checkout, timeout=120, env=env)
+        if tree_cp.returncode != 0:
+            raise RuntimeError("repository tree could not be read: " + _tail(tree_cp.stderr, 3))
+        paths = [line.strip() for line in tree_cp.stdout.splitlines() if line.strip()]
+        source_paths = [p for p in paths if _scout_file_score(p) > -1000]
+        history = _run([
+            "git", "-C", checkout, "log", "-20", "--date=short",
+            "--pretty=format:%h %ad %s",
+        ], cwd=checkout, timeout=60, env=env)
+        overview = [
+            f"PUBLIC REPOSITORY: {canonical}", f"IMMUTABLE HEAD: {sha}",
+            f"TREE: {len(paths)} tracked path(s); {len(source_paths)} relevant text/source path(s)",
+            "RECENT COMMITS:", history.stdout if history.returncode == 0 else "[unavailable]",
+            "TRACKED PATHS:", *paths[:800],
+        ]
+        if len(paths) > 800:
+            overview.append(f"... {len(paths) - 800} additional tracked path(s)")
+        evidence_rows = [{
+            "id": f"{prefix}1", "kind": "repository-overview", "url": canonical,
+            "title": f"Repository tree and history at {sha}",
+            "text": "\n".join(overview)[:90_000],
+        }]
+        ranked = sorted(source_paths, key=lambda p: (-_scout_file_score(p), p))
+        selected = 0
+        total_chars = len(evidence_rows[0]["text"])
+        for rel in ranked:
+            if selected >= 40 or total_chars >= 190_000:
+                break
+            size_cp = _run(["git", "-C", checkout, "cat-file", "-s", f"HEAD:{rel}"],
+                           cwd=checkout, timeout=30, env=env)
+            try:
+                size = int(size_cp.stdout.strip()) if size_cp.returncode == 0 else 1_000_001
+            except ValueError:
+                size = 1_000_001
+            if size > 160_000:
+                continue
+            blob = _run(["git", "-C", checkout, "show", f"HEAD:{rel}"],
+                        cwd=checkout, timeout=60, env=env)
+            if blob.returncode != 0 or not blob.stdout.strip():
+                errors.append({"ref": rel, "error": "git object read failed"})
+                continue
+            text = blob.stdout[: min(7_000, 190_000 - total_chars)]
+            evidence_rows.append({
+                "id": f"{prefix}{len(evidence_rows) + 1}", "kind": "source-file",
+                "url": f"{canonical}/blob/{sha}/{rel}", "title": f"Source evidence: {rel}",
+                "text": text,
+            })
+            total_chars += len(text)
+            selected += 1
+        return {
+            "reference": reference, "kind": "repository-url",
+            "name_hint": canonical.rstrip("/").split("/")[-1],
+            "canonical_url": canonical, "commit_sha": sha,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "evidence": evidence_rows,
+            "coverage": {
+                "tracked_files": len(paths), "relevant_source_files": len(source_paths),
+                "source_files_rendered": selected, "errors": errors,
+                "complete": bool(evidence_rows and selected),
+                "note": ("all paths and repository history inspected; bounded high-signal "
+                         "source contents rendered for capability analysis"),
+            },
+        }
+    finally:
+        _rmtree_force(temp_root)
+
+
+def _scout_description_bundle(reference: str, prefix: str, role: str) -> dict:
+    return {
+        "reference": reference, "kind": "user-description", "name_hint": reference[:80],
+        "canonical_url": "",
+        "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "evidence": [{
+            "id": f"{prefix}1", "kind": "user-description", "ref": "user input",
+            "title": f"User-supplied {role} description", "text": reference,
+        }],
+        "coverage": {
+            "user_supplied": True, "errors": [], "complete": bool(reference.strip()),
+            "note": "no external behavior is inferred beyond the supplied description",
+        },
+    }
+
+
+def _scout_source_shape_error(reference: str) -> str | None:
+    raw = str(reference or "").strip().strip('"')
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        _ = parsed.port  # Force malformed-port validation here, before retrieval.
+    except ValueError:
+        return "Scout's scouted-program input is not a valid URL"
+    if (not raw or len(raw) > 2_000 or any(char.isspace() for char in raw)
+            or parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None):
+        return ("Scout's scouted-program input must be a public product/program URL; "
+                "Repo Rewards is responsible for repository discovery")
+    if _normalized_code_repository_url(raw):
+        return ("Scout accepts a product/program website URL, not a source repository URL; "
+                "Repo Rewards is responsible for repositories")
+    return None
+
+
+def _research_program_reference(reference: str, prefix: str, role: str, args=None) -> dict:
+    """Resolve one target/source reference into evidence or fail visibly."""
+    raw = str(reference or "").strip().strip('"')
+    if not raw:
+        raise ValueError(f"{role} program reference is blank")
+    if role == "source":
+        source_error = _scout_source_shape_error(raw)
+        if source_error:
+            raise ValueError(source_error)
+        bundle = _scout_research.crawl_public_program(raw, prefix=prefix, max_pages=7)
+        bundle["name_hint"] = (
+            urllib.parse.urlsplit(bundle.get("canonical_url") or raw).hostname or raw
+        ).removeprefix("www.")
+    elif os.path.isdir(raw):
+        bundle = _scout_local_repository_bundle(raw, prefix)
+    elif os.path.isfile(raw):
+        bundle = _scout_local_file_bundle(raw, prefix)
+    else:
+        code_url = _normalized_code_repository_url(raw)
+        if code_url:
+            bundle = _scout_git_object_bundle(raw, prefix)
+        elif raw.lower().startswith(("http://", "https://")):
+            bundle = _scout_research.crawl_public_program(raw, prefix=prefix, max_pages=7)
+            bundle["name_hint"] = raw.rstrip("/").split("/")[-1] or raw
+        else:
+            bundle = _scout_description_bundle(raw, prefix, role)
+    coverage = bundle.get("coverage") or {}
+    if not bundle.get("evidence") or coverage.get("complete") is not True:
+        detail = "; ".join(str(e.get("error") or e) for e in coverage.get("errors") or [])
+        raise RuntimeError(
+            f"could not acquire usable evidence for {role} program {raw!r}"
+            + (f": {detail}" if detail else "")
+        )
+    return bundle
 
 
 def _extract_url(target: str, sc_args: str) -> str | None:
@@ -7019,8 +7378,9 @@ def _is_flexfactor_artifact(rel: str) -> bool:
             or r.endswith("_readiness.md")
             or r.endswith("_repo_rewards_report.md")
             or "_run_manifest_" in base  # immutable run evidence (Master Prompt 86/90)
-            or base == "_scout_report.json"  # Scout structured report (94/99)
-            or base == ".flexfactor-scout-proposals.json"  # Scout proposals (97)
+            or (base.startswith("_scout_report") and base.endswith(".json"))
+            or (base.startswith(".flexfactor-scout-proposals")
+                and base.endswith(".json"))
             or base == "playwright.flexfactor.config.cjs"
             or r.startswith("__flexfactor_e2e__/")
             or "/__flexfactor_e2e__/" in r)
@@ -8346,48 +8706,213 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
-def _run_scout_impl(args) -> int:
-    requested_url = args.repo_rewards_url.rstrip("/")
+def _bundle_evidence_index(bundle: dict) -> str:
+    rows = []
+    for item in bundle.get("evidence") or []:
+        ref = item.get("url") or item.get("path") or item.get("ref") or "unknown"
+        rows.append(f"[{item.get('id')}] {item.get('title') or item.get('kind')} | {ref}")
+    return "\n".join(rows)
 
-    # 1. Pick the Repo Rewards endpoint (the search backend). Local wins when it
-    #    is up; the production deployment is the DEFAULT fallback since
-    #    2026-08-16 so scout works out of the box. Which endpoint was chosen is
-    #    always printed - a search that silently changed hosts is not acceptable.
-    base_url, rr_note = resolve_repo_rewards_url(
-        args, requested=requested_url,
-        auto_start=bool(getattr(args, "auto_start", False)))
-    if base_url is None:
-        print(f"error: Repo Rewards isn't usable - {rr_note}.", file=sys.stderr)
-        print("Start it first (double-click the 'Repo Rewards' desktop icon), "
-              "set FLEXFACTOR_REPO_REWARDS_URL, or pass --repo-rewards-url.",
-              file=sys.stderr)
+
+def _evidence_manifest(bundle: dict) -> dict:
+    """Artifact-safe provenance: references and hashes, never copied source."""
+    out = {key: value for key, value in bundle.items() if key != "evidence"}
+    rows = []
+    for item in bundle.get("evidence") or []:
+        row = {key: value for key, value in item.items() if key != "text"}
+        text = str(item.get("text") or "")
+        row["text_chars"] = len(text)
+        row["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        rows.append(row)
+    out["evidence"] = rows
+    return out
+
+
+def _profile_research_bundle(provider, bundle: dict, *, role: str) -> dict:
+    if role == "target":
+        system = _scout_research.TARGET_PROFILE_SYSTEM
+        schema = _scout_research.TARGET_PROFILE_SCHEMA
+        prefix = "T"
+        instruction = (
+            "Profile the target program from the acquired evidence. The target's "
+            "own purpose and current implementation control every later decision."
+        )
+    else:
+        system = _scout_research.SCOUTED_PROGRAM_PROFILE_SYSTEM
+        schema = _scout_research.SCOUTED_PROGRAM_PROFILE_SCHEMA
+        prefix = "S"
+        instruction = (
+            "Profile the specifically requested scouted program from the acquired "
+            "evidence. Inventory concrete, observable capabilities."
+        )
+    context = _scout_research.format_evidence_context(bundle)
+    profile = _judge(
+        provider, system,
+        instruction + "\n\n" + _fence_untrusted(f"{role}-program-evidence", context),
+        schema,
+    )
+    profile = _scout_research.validate_profile_references(
+        profile, bundle, prefix)
+    if not str(profile.get("name") or "").strip():
+        profile["name"] = bundle.get("name_hint") or bundle.get("reference") or role
+    if role == "source":
+        # Retrieval owns provenance. A model cannot replace the canonical URL
+        # with a guessed, injected, or unrelated address.
+        profile["canonical_url"] = bundle.get("canonical_url") or ""
+    return profile
+
+
+def _compare_scout_programs(provider, target_profile: dict, source_profile: dict,
+                            target_bundle: dict, source_bundle: dict) -> dict:
+    prompt = (
+        "TARGET PROFILE (model-derived only from cited target evidence):\n"
+        + _fence_untrusted("target-profile", json.dumps(
+            target_profile, indent=2, ensure_ascii=False, default=str))
+        + "\n\nSCOUTED PROGRAM PROFILE (model-derived only from cited source evidence):\n"
+        + _fence_untrusted("source-profile", json.dumps(
+            source_profile, indent=2, ensure_ascii=False, default=str))
+        + "\n\nAUTHORITATIVE TARGET EVIDENCE INDEX:\n"
+        + _fence_untrusted("target-evidence-index", _bundle_evidence_index(target_bundle))
+        + "\n\nAUTHORITATIVE SOURCE EVIDENCE INDEX:\n"
+        + _fence_untrusted("source-evidence-index", _bundle_evidence_index(source_bundle))
+        + "\n\nCompare the programs now. Include rejected/duplicate/purpose-drifting "
+          "capabilities as decision='reject' rather than silently omitting them."
+    )
+    comparison = _judge(
+        provider, _scout_research.PROGRAM_COMPARISON_SYSTEM, prompt,
+        _scout_research.PROGRAM_COMPARISON_SCHEMA,
+    )
+    return _scout_research.validate_comparison(
+        comparison, target_bundle, source_bundle, source_profile)
+
+
+def _accepted_program_optimizations(comparison: dict) -> list[dict]:
+    accepted = []
+    for row in comparison.get("recommendations") or []:
+        if str(row.get("decision") or "").lower() not in ("adopt", "adapt"):
+            continue
+        try:
+            value = int(row.get("value_score") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value < 50:
+            continue
+        accepted.append(row)
+    return accepted
+
+
+def _print_program_comparison(target_profile: dict, source_profile: dict,
+                              comparison: dict) -> None:
+    print("\n" + "=" * 70)
+    print(f"  Program comparison: {source_profile.get('name')} -> "
+          f"{target_profile.get('name')}")
+    print("=" * 70)
+    print(f"Target:  {target_profile.get('summary', '').strip()}")
+    print(f"Scouted: {source_profile.get('summary', '').strip()}")
+    rows = comparison.get("recommendations") or []
+    if not rows:
+        print("No evidence-grounded comparison rows were returned.")
+    for row in rows:
+        decision = str(row.get("decision") or "investigate").upper()
+        print(f"\n[{decision}] {row.get('capability')} "
+              f"({row.get('value_score')}/100, {row.get('confidence')} confidence)")
+        print(f"  target now: {row.get('target_state')}")
+        print(f"  source does: {row.get('source_behavior')}")
+        print(f"  optimization: {row.get('how_it_optimizes')}")
+        print("  evidence: target=" + ", ".join(row.get("target_evidence_refs") or [])
+              + " source=" + ", ".join(row.get("source_evidence_refs") or []))
+    rejected = comparison.get("rejected_rows") or []
+    if rejected:
+        print(f"\n{len(rejected)} uncited/incomplete model row(s) were rejected "
+              "instead of being treated as findings.")
+
+
+def _named_scout_candidate_evaluation(provider, profile: dict, source_profile: dict,
+                                      candidate: dict) -> dict:
+    result = candidate["result"]
+    repo = result.get("repo") or {}
+    optimization = candidate.get("optimization") or {}
+    safety_verdict = (result.get("safety") or {}).get("verdict", "")
+    judge_prompt = (
+        "TARGET PROGRAM PROFILE:\n"
+        + _fence_untrusted("target-profile", json.dumps(
+            profile, indent=2, ensure_ascii=False, default=str))
+        + "\n\nSCOUTED PROGRAM PROFILE:\n"
+        + _fence_untrusted("scouted-profile", json.dumps(
+            source_profile, indent=2, ensure_ascii=False, default=str))
+        + "\n\nEVIDENCE-GROUNDED OPTIMIZATION TO IMPLEMENT:\n"
+        + _fence_untrusted("optimization", json.dumps(
+            optimization, indent=2, ensure_ascii=False, default=str))
+        + "\n\nCANDIDATE OPEN-SOURCE IMPLEMENTATION:\n"
+        + _fence_untrusted("repo", _summarize_repo_for_judge(result))
+        + "\n\nWould this repository implement the exact behavior without duplicating "
+          "the target or drifting from its purpose? Judge the concrete delta, not keywords."
+    )
+    try:
+        benefit = _judge(provider, BENEFIT_SYSTEM, judge_prompt, BENEFIT_SCHEMA)
+        recommendation = classify_benefit(
+            benefit, result.get("finalScore") or 0, safety_verdict)
+    except Exception as exc:
+        print(f"  [skip] {(repo.get('fullName') or '?')}: benefit judging failed ({exc})")
+        benefit = {"benefit_score": 0, "verdict": "skip",
+                   "how_it_helps": "", "integration_note": "",
+                   "risks": [f"judging failed: {exc}"]}
+        recommendation = "SKIP"
+    evaluation = {
+        "need": str(optimization.get("capability") or candidate.get("need") or ""),
+        "repo": repo, "result": result, "benefit": benefit,
+        "recommendation": recommendation, "optimization": optimization,
+        "scouted_program": source_profile.get("name"),
+    }
+    evaluation["evidence"] = build_evidence_matrix(evaluation)
+    evaluation["verdicts"] = candidate_verdicts(evaluation["evidence"])
+    _scout_contract.pin_fields_from_evidence(evaluation)
+    _scout_contract.build_integration_proposal(evaluation)
+    return evaluation
+
+
+def _run_named_scout_impl(args) -> int:
+    """Scout one explicit program/URL against one explicit target program."""
+    target_ref = str(getattr(args, "target", "") or "").strip()
+    source_ref = str(args.program or "").strip()
+    if not target_ref:
+        raise ValueError("named Scout requires --target")
+    source_error = _scout_source_shape_error(source_ref)
+    if source_error:
+        print(f"error: {source_error}", file=sys.stderr)
         return 2
-    print(f"Repo Rewards: {rr_note}")
-
-    # 2. Characterize the entered program locally, then enforce the separate
-    # cloud-context boundary before constructing or calling a remote provider.
-    display_name, context = resolve_program_input(args.program)
     if not allow_remote_program_context(args):
-        print("error: Scout profiling would send this program's source/README/file tree "
-              "to a cloud LLM, but remote program-context sharing is not enabled.",
+        print("error: Scout comparison would send target and scouted-program evidence "
+              "to a hosted model, but remote program-context sharing is not enabled.",
               file=sys.stderr)
-        print("Re-run with --allow-remote-program-context or set "
-              "FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1. "
-              "The best-available ladder may use a hosted model before its free "
-              "fallback.", file=sys.stderr)
+        print("Re-run with --allow-remote-program-context.", file=sys.stderr)
         return 2
+
+    print(f"Acquiring target evidence: {target_ref}")
+    try:
+        target_bundle = _research_program_reference(target_ref, "T", "target", args)
+    except Exception as exc:
+        print(f"error: target evidence acquisition failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"  target evidence: {len(target_bundle.get('evidence') or [])} source(s); "
+          f"coverage={json.dumps(target_bundle.get('coverage') or {}, default=str)}")
+    print(f"Acquiring scouted-program evidence: {source_ref}")
+    try:
+        source_bundle = _research_program_reference(source_ref, "S", "source", args)
+    except Exception as exc:
+        print(f"error: scouted-program evidence acquisition failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"  source evidence: {len(source_bundle.get('evidence') or [])} source(s); "
+          f"coverage={json.dumps(source_bundle.get('coverage') or {}, default=str)}")
 
     execution_orchestrator = getattr(args, "execution_orchestrator", None)
-    apply_dir = resolve_project_dir(args.program, display_name)
+    apply_dir = resolve_project_dir(target_ref, target_bundle.get("name_hint") or target_ref)
     if execution_orchestrator is not None:
         if not apply_dir or not os.path.isdir(apply_dir):
-            print(
-                "error: the shared execution contract requires a local repository "
-                "for Scout's whole-repository first pass.", file=sys.stderr,
-            )
+            print("error: the shared execution contract requires a local target repository "
+                  "for Scout's whole-repository first pass.", file=sys.stderr)
             return 2
-        scope = (_tracked_repository_scope(apply_dir)
-                 if _is_git_repo(apply_dir)
+        scope = (_tracked_repository_scope(apply_dir) if _is_git_repo(apply_dir)
                  else _enumerate_source_files(apply_dir, 0))
         execution_orchestrator.begin_pass(1, scope, whole_repository=True)
 
@@ -8398,142 +8923,131 @@ def _run_scout_impl(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(_scout_contract.scout_config_banner())
-    print(f"FlexFactor scout | program='{display_name}' "
-          "model_policy=best-available")
-    print("Repo Rewards results are METADATA-SCREENED CANDIDATES ONLY "
-          "(never safe-to-install).\n")
-    print("Profiling the program...")
-    # Profiling/summarizing is a judging task -> cheap tier.
-    profile = _judge(
-        provider,
-        PROFILE_SYSTEM,
-        "Profile this program and identify where open-source repos could help.\n\n"
-        + _fence_untrusted("program", context),
-        PROGRAM_PROFILE_SCHEMA,
-    )
-    profile_name = profile.get("name") or display_name
-    opportunities = profile.get("opportunities") or []
-    print(f"  {profile_name}: {profile.get('summary', '').strip()}")
-    print(f"  stack: {', '.join(profile.get('stack') or []) or '(unknown)'}")
-    print(f"  found {len(opportunities)} opportunity area(s) to search.\n")
+    print(f"FlexFactor Scout | target='{target_ref}' | scouted='{source_ref}' "
+          "| model_policy=best-available")
+
+    print("\nUnderstanding the target program from code and cited evidence...")
+    target_profile = _profile_research_bundle(provider, target_bundle, role="target")
+    print("Understanding the entered program from retrieved behavior/source evidence...")
+    source_profile = _profile_research_bundle(provider, source_bundle, role="source")
+    for label, profiled in (("target", target_profile), ("scouted-program", source_profile)):
+        if (profiled.get("evidence_validation") or {}).get("complete") is not True:
+            print(f"error: {label} profiling contained uncited, duplicate, or incomplete "
+                  "behavior rows.", file=sys.stderr)
+            return 1
+    if not (target_profile.get("capabilities") or target_profile.get("workflows")):
+        print("error: target profiling produced no evidence-grounded capabilities or workflows.",
+              file=sys.stderr)
+        return 1
+    if not source_profile.get("capabilities"):
+        print("error: scouted-program profiling produced no evidence-grounded capability "
+              "inventory.", file=sys.stderr)
+        return 1
+    comparison = _compare_scout_programs(
+        provider, target_profile, source_profile, target_bundle, source_bundle)
+    _print_program_comparison(target_profile, source_profile, comparison)
     if execution_orchestrator is not None:
-        # Profiling consumes the repository context but does not mutate it.
         execution_orchestrator.finish_pass(1, [])
 
-    # 3. For each opportunity, search Repo Rewards. Dedupe candidates by repo,
-    #    keeping the opportunity that surfaced each one.
+    profile = dict(target_profile)
+    profile["opportunities"] = [
+        {"need": row.get("capability"),
+         "search_query": row.get("implementation_search_query")}
+        for row in _accepted_program_optimizations(comparison)
+    ]
+    profile["scouted_program"] = source_profile
+    profile["optimization_comparison"] = comparison
+    profile_name = target_profile.get("name") or target_bundle.get("name_hint") or target_ref
+    optimizations = _accepted_program_optimizations(comparison)
+
+    # The program-to-program answer exists independently of Repo Rewards.  RR
+    # is now the SECOND stage: find actual open-source implementations for the
+    # exact accepted behaviors, never broad keywords invented before comparison.
+    requested_url = args.repo_rewards_url.rstrip("/")
+    base_url, rr_note = resolve_repo_rewards_url(
+        args, requested=requested_url,
+        auto_start=bool(getattr(args, "auto_start", False)))
+    search_ledger = {"repo_rewards": rr_note, "queries": [], "results": 0}
     candidates: dict[str, dict] = {}
-    for opp in opportunities:
-        need = opp.get("need", "")
-        query = opp.get("search_query") or need
-        if not query:
-            continue
-        print(f"Searching Repo Rewards for: {query}")
-        results = repo_rewards_search(base_url, query)
-        print(f"  {len(results)} result(s).")
-        for r in results:
-            key = _candidate_key(r)
-            existing = candidates.get(key)
-            if not existing or (r.get("finalScore") or 0) > (existing["result"].get("finalScore") or 0):
-                candidates[key] = {"result": r, "need": need}
+    if optimizations and base_url is not None:
+        print(f"\nRepo Rewards: {rr_note}")
+        for optimization in optimizations:
+            query = str(optimization.get("implementation_search_query") or "").strip()
+            if not query:
+                continue
+            search_ledger["queries"].append({
+                "capability": optimization.get("capability"), "query": query})
+            print(f"Searching implementation evidence for '{optimization.get('capability')}': "
+                  f"{query}")
+            results = repo_rewards_search(base_url, query)
+            print(f"  {len(results)} result(s).")
+            search_ledger["results"] += len(results)
+            for result in results:
+                # A repo can be relevant to more than one accepted behavior; the
+                # behavior is part of the key so neither mapping gets erased.
+                key = _candidate_key(result) + "::" + str(optimization.get("capability"))
+                current = candidates.get(key)
+                if (current is None or (result.get("finalScore") or 0)
+                        > (current["result"].get("finalScore") or 0)):
+                    candidates[key] = {
+                        "result": result, "need": optimization.get("capability") or "",
+                        "optimization": optimization,
+                    }
+    elif optimizations:
+        print(f"\nwarning: implementation repository search is unavailable: {rr_note}",
+              file=sys.stderr)
+    else:
+        print("\nNo scouted capability cleared the purpose/value bar; repository "
+              "implementation search was correctly skipped.")
 
-    if not candidates:
-        print("\nNo repositories came back from Repo Rewards. Nothing to evaluate.")
-        print("(If this seems wrong, check that Repo Rewards has a DATABASE_URL configured.)")
-        return 1
-
-    # Choose candidates with breadth across needs (not just global finalScore),
-    # then judge each for whether it improves the program.
     ranked = _select_candidates(
-        list(candidates.values()), _ff_execution.TOP_COMPETITORS
-    )
-    print(f"\nJudging {len(ranked)} candidate repo(s) across "
-          f"{len({c['need'] for c in ranked})} need(s) for improvement to {profile_name}...\n")
+        list(candidates.values()), max(1, min(int(getattr(args, "top", 8) or 8), 30)))
+    evaluations: list[dict] = []
+    if ranked:
+        print(f"\nJudging {len(ranked)} concrete implementation candidate(s)...")
+        workers = max(1, min(8, len(ranked)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            evaluations = list(executor.map(
+                lambda candidate: _named_scout_candidate_evaluation(
+                    provider, profile, source_profile, candidate), ranked))
+        if getattr(args, "clone_inspect", True):
+            for evaluation in evaluations:
+                enrich_evidence_from_clone(evaluation)
+                if ((evaluation.get("evidence") or {}).get("clone_inspection_ok") is not True
+                        or (evaluation.get("verdicts") or {}).get("safe_to_integrate") is not True):
+                    evaluation["recommendation"] = "SKIP"
+                    risks = evaluation.setdefault("benefit", {}).setdefault("risks", [])
+                    risks.append("real-clone/license inspection did not clear integration")
+        tier = {"ADOPT": 0, "CONSIDER": 1, "SKIP": 2}
+        evaluations.sort(key=lambda row: (
+            tier.get(row.get("recommendation"), 3),
+            -(row.get("benefit") or {}).get("benefit_score", 0)))
+        _print_scout_report(profile_name, profile, evaluations)
 
-    profile_blob = (
-        f"PROGRAM: {profile_name}\nSUMMARY: {profile.get('summary')}\n"
-        f"STACK: {', '.join(profile.get('stack') or [])}\n"
-        f"GOALS: {', '.join(profile.get('goals') or [])}"
-    )
-    # Each candidate's judging call is independent, so run them in parallel
-    # (same pattern as _review_all). Order is preserved via executor.map; a
-    # single failed judge call degrades that candidate to SKIP instead of
-    # aborting the whole scout run.
-    def _judge_candidate(c: dict) -> dict:
-        result = c["result"]
-        repo = result.get("repo") or {}
-        safety_verdict = (result.get("safety") or {}).get("verdict", "")
-        judge_prompt = (
-            f"{profile_blob}\n\n"
-            f"This repo surfaced for the need: \"{c['need']}\".\n\n"
-            f"CANDIDATE REPOSITORY:\n{_fence_untrusted('repo', _summarize_repo_for_judge(result))}\n\n"
-            "Would adopting this repository benefit the program? Judge fit specifically."
-        )
-        try:
-            benefit = _judge(provider, BENEFIT_SYSTEM, judge_prompt, BENEFIT_SCHEMA)
-            recommendation = classify_benefit(
-                benefit, result.get("finalScore") or 0, safety_verdict)
-        except Exception as ex:  # one bad LLM call must not abort the sweep
-            print(f"  [skip] {(repo.get('fullName') or '?')}: benefit judging failed ({ex})")
-            benefit = {"benefit_score": 0, "rationale": f"judging failed: {ex}"}
-            recommendation = "SKIP"
-        evaluation = {
-            "need": c["need"], "repo": repo, "result": result,
-            "benefit": benefit, "recommendation": recommendation,
-        }
-        # Deterministic safety layer: evidence matrix + three verdicts. Computed
-        # AFTER (and independently of) the LLM judgment - repo text cannot
-        # influence it, and _qualifies_for_apply hard-gates on it.
-        evaluation["evidence"] = build_evidence_matrix(evaluation)
-        evaluation["verdicts"] = candidate_verdicts(evaluation["evidence"])
-        # Bridge 95/97: stamp pin fields + integration proposal (no mutation).
-        _scout_contract.pin_fields_from_evidence(evaluation)
-        _scout_contract.build_integration_proposal(evaluation)
-        return evaluation
-
-    n_workers = max(1, min(8, len(ranked)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
-        evaluations = list(ex.map(_judge_candidate, ranked))
-
-    # 4. Rank by recommendation tier, then benefit score, and report.
-    tier = {"ADOPT": 0, "CONSIDER": 1, "SKIP": 2}
-    evaluations.sort(key=lambda e: (tier[e["recommendation"]],
-                                    -(e["benefit"].get("benefit_score") or 0)))
-    _print_scout_report(profile_name, profile, evaluations)
-
-    # 5. APPLY: production contract (bridge 97/100) always emits proposals;
-    #    target mutation requires separate FlexFactor apply approval (or
-    #    --legacy-inline-apply). SAFE DEFAULT remains report-only.
     applied: list[ApplyResult] = []
     proposals = []
-    for e in evaluations:
-        _scout_contract.pin_fields_from_evidence(e)
-        proposals.append(
-            _scout_contract.build_integration_proposal(e, project_dir=apply_dir))
-
+    for evaluation in evaluations:
+        _scout_contract.pin_fields_from_evidence(evaluation)
+        proposals.append(_scout_contract.build_integration_proposal(
+            evaluation, project_dir=apply_dir))
     if getattr(args, "apply", False):
         if _confirm_scout_apply(args, evaluations, apply_dir):
-            applied = _apply_phase(args, profile_name, profile, evaluations, provider)
+            applied = _apply_phase(
+                args, profile_name, profile, evaluations, provider)
         else:
-            print("\nApply cancelled - report + proposals only. "
-                  "(Re-run with --apply --yes to skip this prompt.)")
+            print("\nApply cancelled - comparison, report, and proposals were preserved.")
 
     implemented_files = _ff_execution.changed_file_scope(
-        path
-        for result in applied if result.status.startswith("applied")
-        for path in (result.files or [])
-    )
+        path for result in applied if result.status.startswith("applied")
+        for path in (result.files or []))
     if execution_orchestrator is not None:
-        verified = sum(
-            1 for evaluation in evaluations
-            if (evaluation.get("evidence") or {}).get("clone_inspection_ok") is True
-        )
+        verified = sum(1 for row in evaluations
+                       if (row.get("evidence") or {}).get("clone_inspection_ok") is True)
         execution_orchestrator.record_competitor_gate(
-            attempted=True,
-            implemented_files=implemented_files,
+            attempted=True, implemented_files=implemented_files,
             verified=min(verified, _ff_execution.TOP_COMPETITORS),
-            note=(f"evaluated {len(evaluations)} of the top "
-                  f"{_ff_execution.TOP_COMPETITORS} candidate repositories"),
+            note=(f"compared explicit program {source_profile.get('name')} and evaluated "
+                  f"{len(evaluations)} implementation candidate(s)"),
         )
         if implemented_files:
             execution_orchestrator.begin_pass(2, implemented_files)
@@ -8541,34 +9055,65 @@ def _run_scout_impl(args) -> int:
             follow_up_ok, follow_up_log = _publication_gate(apply_dir, stack)
             if follow_up_ok is not True:
                 state = "failed" if follow_up_ok is False else "did not run"
-                print(
-                    f"error: Scout exact-delta pass 2 project verification {state}: "
-                    + _tail(follow_up_log, 4), file=sys.stderr,
-                )
+                print(f"error: Scout exact-delta pass 2 project verification {state}: "
+                      + _tail(follow_up_log, 4), file=sys.stderr)
                 return 4
             execution_orchestrator.finish_pass(2, [])
 
-    report_path = _write_scout_report(args.program, profile_name, profile, evaluations, applied)
+    analysis = {
+        "target_reference": target_ref, "scouted_reference": source_ref,
+        "target_evidence": _evidence_manifest(target_bundle),
+        "scouted_evidence": _evidence_manifest(source_bundle),
+        "target_profile": target_profile, "scouted_profile": source_profile,
+        "comparison": comparison, "implementation_search": search_ledger,
+    }
+    report_path = _write_scout_report(
+        target_ref, profile_name, profile, evaluations, applied,
+        scout_analysis=analysis)
     structured = _scout_contract.build_scout_structured_report(
-        profile_name, profile, evaluations, proposals=proposals)
-    base_dir = args.program if os.path.isdir(args.program) else (
+        profile_name, profile, evaluations, proposals=proposals,
+        scout_analysis=analysis)
+    base_dir = target_ref if os.path.isdir(target_ref) else (
         _find_local_project(profile_name) or os.getcwd())
-    artifacts = _scout_contract.write_scout_artifacts(base_dir, structured, proposals)
-    print(f"\nFull report written to {report_path}")
+    artifact_slug = f"{_slugify(profile_name)}-from-{_slugify(source_profile.get('name') or source_ref)}"
+    artifacts = _scout_contract.write_scout_artifacts(
+        base_dir, structured, proposals, artifact_slug=artifact_slug)
+    print(f"\nComparison report:       {report_path}")
     print(f"Structured scout report: {artifacts['report_json']}")
     print(f"Integration proposals:   {artifacts['proposals_json']}")
-    print("Target mutation requires separate FlexFactor apply approval "
-          f"({_scout_contract.FLEXFACTOR_APPLY_APPROVAL_FILE}).")
-    qualifying = [e for e in evaluations
-                  if _qualifies_for_apply(e, args.apply_tier)]
-    if (getattr(args, "apply", False)
-            and qualifying
-            and not any(r.status.startswith("applied") for r in applied)):
-        print("error: --apply requested mutations, but every qualifying result "
-              "was skipped, refused, proposal-only, or failed; zero changes landed.",
+    qualifying = [row for row in evaluations
+                  if _qualifies_for_apply(row, args.apply_tier)]
+    if (getattr(args, "apply", False) and qualifying
+            and not any(result.status.startswith("applied") for result in applied)):
+        print("error: --apply requested mutations, but zero qualifying changes landed.",
               file=sys.stderr)
         return 4
+    # An empty comparison after both profiles found capabilities is a model/
+    # evidence failure, not proof that no optimization exists. Explicit reject
+    # rows, by contrast, are a valid evidence-backed answer.
+    if not (comparison.get("recommendations") or comparison.get("rejected_rows")):
+        print("error: comparison returned no accounted capability decisions.", file=sys.stderr)
+        return 1
+    if (comparison.get("validation") or {}).get("unaccounted_source_capabilities"):
+        print("error: comparison did not account for every scouted capability.",
+              file=sys.stderr)
+        return 1
+    if (comparison.get("validation") or {}).get("complete") is not True:
+        print("error: comparison contained uncited, duplicate, or incomplete decisions.",
+              file=sys.stderr)
+        return 1
     return 0
+
+
+def _run_scout_impl(args) -> int:
+    """Run the URL-to-target Scout contract; the old label-only path is retired."""
+    if not str(getattr(args, "target", "") or "").strip():
+        print("error: Scout needs --target plus a public program/product URL in "
+              "--program. Repo Rewards handles repository discovery.",
+              file=sys.stderr)
+        return 2
+    return _run_named_scout_impl(args)
+
 
 
 def run_scout(args) -> int:
@@ -8577,8 +9122,9 @@ def run_scout(args) -> int:
     if getattr(args, "trust_repo", False):
         # Resolve through the same aliases/shortcuts Scout accepts so
         # --trust-repo authorizes precisely the local repository it will use.
-        display_name, _context = resolve_program_input(args.program)
-        project_dir = resolve_project_dir(args.program, display_name)
+        target_ref = getattr(args, "target", None) or args.program
+        display_name, _context = resolve_program_input(target_ref)
+        project_dir = resolve_project_dir(target_ref, display_name)
         if project_dir and os.path.isdir(project_dir):
             trust_key = _grant_run_trust(project_dir)
     try:
@@ -8606,11 +9152,22 @@ def _qualifies_for_apply(evaluation: dict, apply_tier: str) -> bool:
 
 
 def _profile_blob(profile_name: str, profile: dict) -> str:
-    return (
+    base = (
         f"PROGRAM: {profile_name}\nSUMMARY: {profile.get('summary')}\n"
         f"STACK: {', '.join(profile.get('stack') or [])}\n"
         f"GOALS: {', '.join(profile.get('goals') or [])}"
     )
+    if profile.get("capabilities"):
+        base += "\nCAPABILITIES:\n" + json.dumps(
+            profile.get("capabilities"), indent=2, ensure_ascii=False, default=str)
+    if profile.get("optimization_needs"):
+        base += "\nOPTIMIZATION NEEDS:\n" + json.dumps(
+            profile.get("optimization_needs"), indent=2, ensure_ascii=False, default=str)
+    if profile.get("optimization_comparison"):
+        base += "\nSCOUTED-PROGRAM COMPARISON:\n" + json.dumps(
+            profile.get("optimization_comparison"), indent=2,
+            ensure_ascii=False, default=str)
+    return base
 
 
 def _confirm_scout_apply(args, evaluations: list[dict],
@@ -8797,7 +9354,8 @@ def _apply_phase(args, profile_name: str, profile: dict,
               "Nothing to change.")
         return []
 
-    project_dir = resolve_project_dir(args.program, profile_name)
+    target_ref = getattr(args, "target", None) or args.program
+    project_dir = resolve_project_dir(target_ref, profile_name)
     if not project_dir or not os.path.isdir(project_dir):
         print("\nCannot apply changes: no local source folder resolved for this program "
               "(looks like a URL/description with no local checkout). Report written only.")
@@ -8898,7 +9456,12 @@ def _apply_phase(args, profile_name: str, profile: dict,
                 name, "skipped-publication-required", detail))
             continue
         try:
-            patch, plan = generate_integration(provider, project_dir, blob, e["need"], e["result"])
+            need = e["need"]
+            if e.get("optimization"):
+                need += "\n\nEvidence-grounded adaptation contract:\n" + json.dumps(
+                    e["optimization"], indent=2, ensure_ascii=False, default=str)
+            patch, plan = generate_integration(
+                provider, project_dir, blob, need, e["result"])
         except Exception as ex:  # one bad LLM call must not abort the whole apply phase
             print(f"   generation failed: {ex}")
             results.append(ApplyResult(name, "error", f"generation failed: {ex}"))
@@ -8962,18 +9525,110 @@ def _print_scout_report(name: str, profile: dict, evaluations: list[dict]) -> No
 
 def _write_scout_report(program_arg: str, name: str, profile: dict,
                         evaluations: list[dict],
-                        applied: list[ApplyResult] | None = None) -> str:
+                        applied: list[ApplyResult] | None = None,
+                        scout_analysis: dict | None = None) -> str:
     """Write a markdown report next to the program. Prefer the program's own
     folder (given directly, or recovered from its name for a URL/.lnk input);
     fall back to the current directory."""
     base_dir = program_arg if os.path.isdir(program_arg) else (
         _find_local_project(name) or os.getcwd())
-    report_name = f"{_slugify(name) or 'program'}_repo_rewards_report.md"
+    source_name = str(((scout_analysis or {}).get("scouted_profile") or {}).get(
+        "name") or (scout_analysis or {}).get("scouted_reference") or "")
+    source_suffix = f"_from_{_slugify(source_name)}" if source_name else ""
+    report_name = (f"{_slugify(name) or 'program'}{source_suffix}"
+                   "_repo_rewards_report.md")
     surfaced = [e for e in evaluations if e["recommendation"] != "SKIP"]
     skipped = [e for e in evaluations if e["recommendation"] == "SKIP"]
-    lines = [f"# Repo Rewards benefit report — {name}", "",
+    title = (f"Scout program comparison — {source_name} → {name}"
+             if source_name else f"Repo Rewards benefit report — {name}")
+    lines = [f"# {title}", "",
              f"**Summary:** {profile.get('summary', '')}", "",
              f"**Stack:** {', '.join(profile.get('stack') or [])}", ""]
+
+    if scout_analysis:
+        target_profile = scout_analysis.get("target_profile") or {}
+        source_profile = scout_analysis.get("scouted_profile") or {}
+        comparison = scout_analysis.get("comparison") or {}
+        target_bundle = scout_analysis.get("target_evidence") or {}
+        source_bundle = scout_analysis.get("scouted_evidence") or {}
+        lines += [
+            "## Research identity and coverage", "",
+            f"- **Target to optimize:** `{scout_analysis.get('target_reference')}`",
+            f"- **Program explicitly scouted:** `{scout_analysis.get('scouted_reference')}`",
+            "- **Target evidence coverage:** `" + json.dumps(
+                target_bundle.get("coverage") or {}, default=str) + "`",
+            "- **Scouted evidence coverage:** `" + json.dumps(
+                source_bundle.get("coverage") or {}, default=str) + "`",
+            "",
+            "### Target evidence sources", "",
+        ]
+        for row in target_bundle.get("evidence") or []:
+            ref = row.get("url") or row.get("path") or row.get("ref") or "unknown"
+            lines.append(f"- **[{row.get('id')}]** {row.get('title')} — `{ref}`")
+        lines += ["", "### Scouted-program evidence sources", ""]
+        for row in source_bundle.get("evidence") or []:
+            ref = row.get("url") or row.get("path") or row.get("ref") or "unknown"
+            if str(ref).startswith(("http://", "https://")):
+                lines.append(f"- **[{row.get('id')}]** [{row.get('title')}]({ref})")
+            else:
+                lines.append(f"- **[{row.get('id')}]** {row.get('title')} — `{ref}`")
+
+        lines += ["", "## Target program understanding", "",
+                  str(target_profile.get("summary") or ""), "",
+                  "### Target workflows and capabilities", ""]
+        for row in (target_profile.get("workflows") or []) + (
+                target_profile.get("capabilities") or []):
+            lines.append(
+                f"- **{row.get('name')}** — `{row.get('status')}`: "
+                f"{row.get('current_behavior')} "
+                f"(evidence: {', '.join(row.get('evidence_refs') or [])})")
+        if target_profile.get("optimization_needs"):
+            lines += ["", "### Target optimization needs established before comparison", ""]
+            for row in target_profile["optimization_needs"]:
+                lines.append(
+                    f"- **{row.get('need')}** — `{row.get('priority')}`: {row.get('why')} "
+                    f"(evidence: {', '.join(row.get('evidence_refs') or [])})")
+
+        lines += ["", "## Scouted program understanding", "",
+                  str(source_profile.get("summary") or ""), "",
+                  "### Proven scouted capabilities", ""]
+        for row in source_profile.get("capabilities") or []:
+            lines.append(
+                f"- **{row.get('name')}** — {row.get('behavior')} "
+                f"Value: {row.get('user_value')} Pattern: {row.get('implementation_pattern')} "
+                f"(confidence: {row.get('confidence')}; evidence: "
+                f"{', '.join(row.get('evidence_refs') or [])})")
+
+        lines += ["", "## Target-versus-scouted capability decisions", ""]
+        for row in comparison.get("recommendations") or []:
+            lines += [
+                f"### {str(row.get('decision') or '').upper()} — {row.get('capability')} "
+                f"({row.get('value_score')}/100)", "",
+                f"- **Source behavior:** {row.get('source_behavior')}",
+                f"- **Target state/gap:** {row.get('target_state')} — {row.get('target_gap')}",
+                f"- **Purpose alignment:** {row.get('purpose_alignment')}",
+                f"- **Optimization:** {row.get('how_it_optimizes')}",
+                f"- **Adaptation plan:** {row.get('adaptation_plan')}",
+                f"- **Target touchpoints:** {', '.join(row.get('target_touchpoints') or [])}",
+                f"- **Verification:** {row.get('verification_plan')}",
+                f"- **Implementation search:** `{row.get('implementation_search_query')}`",
+                f"- **Evidence:** target {', '.join(row.get('target_evidence_refs') or [])}; "
+                f"source {', '.join(row.get('source_evidence_refs') or [])}", "",
+            ]
+        if comparison.get("rejected_rows"):
+            lines += ["### Rejected model rows (not treated as findings)", ""]
+            for row in comparison["rejected_rows"]:
+                lines.append(
+                    f"- {row.get('capability') or '(unnamed)'} — "
+                    f"{'; '.join(row.get('validation_errors') or [])}")
+            lines.append("")
+        search = scout_analysis.get("implementation_search") or {}
+        lines += ["## Implementation search ledger", "",
+                  f"- **Repo Rewards:** {search.get('repo_rewards')}",
+                  f"- **Results returned:** {search.get('results', 0)}"]
+        for row in search.get("queries") or []:
+            lines.append(f"- **{row.get('capability')}:** `{row.get('query')}`")
+        lines.append("")
 
     # Lead with what scout actually CHANGED, so the report documents the work,
     # not just the advice.
@@ -19919,11 +20574,16 @@ def main(argv=None) -> int:
     if mode == "scout":
         parser = argparse.ArgumentParser(
             prog="flexfactor scout",
-            description="Scout Repo Rewards for repos that would benefit a program you enter.",
+            description=("Compare a specific public program/product URL against a target "
+                         "program, then find concrete implementations of the useful deltas."),
         )
+        parser.add_argument("--target", required=True,
+                            help="Program to optimize: local folder/file, repository or "
+                                 "product URL, shortcut, or description.")
         parser.add_argument("--program", required=True, action="append",
-                            help="Program to help: folder, file, shortcut, URL, or description. "
-                                 "Repeat up to 30 times; the orchestrator runs them in order.")
+                            help="Public product/program website URL to scout when --target "
+                                 "is supplied. Source repository discovery belongs to Repo "
+                                 "Rewards. Repeat up to 30 URLs; each is researched in order.")
         parser.add_argument("--provider",
                             choices=["auto", "anthropic", "openai", "ollama", "copilot"],
                             default="auto", help=argparse.SUPPRESS)
@@ -20437,7 +21097,8 @@ def runtime_manifest() -> dict:
                  "flexfactor_competitors", "flexfactor_rotation", "flexfactor_discovery",
                  "flexfactor_prodevidence",
                  "flexfactor_prodready", "flexfactor_prodready_persist",
-                 "flexfactor_product_invariants", "flexfactor_scout_contract", "flexfactor_locate", "flexfactor_flags",
+                 "flexfactor_product_invariants", "flexfactor_scout_contract",
+                 "flexfactor_scout_research", "flexfactor_locate", "flexfactor_flags",
                  "flexfactor_autoclean", "flexfactor_sandbox", "flexfactor_ledger",
                  "flexfactor_errors",
                  "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",

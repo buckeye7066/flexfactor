@@ -1,4 +1,4 @@
-# FlexFactor Mobile 3.5.1
+# FlexFactor Mobile 3.6.0
 
 FlexFactor Mobile is the native managed interface for all four FlexFactor
 modes. It does not require a PC, a personal access token, Termux, or a local
@@ -28,6 +28,10 @@ The home screen exposes:
 Refactor accepts up to 30 repository-relative files. The other modes accept up
 to 30 repositories. The durable mobile orchestrator dispatches exactly one
 target, waits for its terminal GitHub run, then dispatches the next.
+
+Scout additionally requires one public program/product website URL. That URL
+is retrieved and compared with each selected target repository; source
+repository discovery remains the responsibility of Repo Rewards.
 
 Every request carries a stable UUID. If the app process stops after dispatch but
 before recording the returned run ID, retrying with that UUID recovers the

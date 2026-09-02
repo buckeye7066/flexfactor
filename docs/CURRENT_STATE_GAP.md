@@ -1,7 +1,7 @@
 # FlexFactor current gap register
 
-This register describes product limits that remain after the 0.6.1 / Android
-3.5.1 / cloud 1.1.1 architecture change. Historical measurements belong in
+This register describes product limits that remain after the 0.7.0 / Android
+3.6.0 / cloud 1.2.0 architecture change. Historical measurements belong in
 release reports and are not current-state claims.
 
 ## Closed by this release
@@ -20,6 +20,9 @@ release reports and are not current-state claims.
 - Refactor, Scout apply, Audit, and Production Ready preflight publication
   prerequisites before model-backed mutation.
 - Android has a durable sequential queue and idempotent crash recovery.
+- Scout retrieves only entered program/product URLs, separates target and
+  source evidence, accounts for every source capability, and delegates all
+  repository discovery to Repo Rewards.
 - The local Termux browser launch/provider endpoints are retired; managed mobile
   is the only phone launch product.
 

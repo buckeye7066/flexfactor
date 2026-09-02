@@ -636,6 +636,10 @@ public final class MainActivity extends Activity {
     private void showScoutDialog() {
         if (!requireReadyTarget()) return;
         LinearLayout form = form();
+        EditText source = input("Public program/product website URL to scout");
+        source.setSingleLine(true);
+        source.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        form.addView(source);
         CheckBox apply = new CheckBox(this);
         apply.setText("Prepare and apply approved integration proposals");
         apply.setTextColor(Color.WHITE);
@@ -655,10 +659,12 @@ public final class MainActivity extends Activity {
                     try {
                         if (batch.isChecked()) {
                             chooseBatchRepositories(
-                                    MobileRunRequest.Mode.SCOUT, 25, apply.isChecked());
+                                    MobileRunRequest.Mode.SCOUT, 25, apply.isChecked(),
+                                    source.getText().toString());
                         } else {
                             confirmAndDispatch(request(MobileRunRequest.Mode.SCOUT,
-                                    "", "", apply.isChecked(), 25));
+                                    "", "", source.getText().toString(),
+                                    apply.isChecked(), 25));
                         }
                     } catch (IllegalArgumentException rejected) {
                         showError("Check the run details", rejected.getMessage());
@@ -690,9 +696,9 @@ public final class MainActivity extends Activity {
                     try {
                         double cap = Double.parseDouble(cost.getText().toString().trim());
                         if (batch.isChecked()) {
-                            chooseBatchRepositories(mode, cap, false);
+                            chooseBatchRepositories(mode, cap, false, "");
                         } else {
-                            confirmAndDispatch(request(mode, "", "", false, cap));
+                            confirmAndDispatch(request(mode, "", "", "", false, cap));
                         }
                     } catch (NumberFormatException rejected) {
                         showError("Check the cost cap", "Enter a number from 1 through 150.");
@@ -704,16 +710,19 @@ public final class MainActivity extends Activity {
     }
 
     private MobileRunRequest request(MobileRunRequest.Mode mode, String file, String goal,
-            boolean scoutApply, double cost) {
+            String scoutSource, boolean scoutApply, double cost) {
         return new MobileRunRequest(mode,
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
-                file, goal, scoutApply, cost, 90, 6);
+                file, goal, scoutSource, scoutApply, cost, 90, 6);
     }
 
     private void confirmAndDispatch(MobileRunRequest request) {
         String detail = request.repository + " · " + request.ref;
         detail += "\nModel policy: best available, paid to free";
+        if (request.mode == MobileRunRequest.Mode.SCOUT) {
+            detail += "\nScouting: " + request.scoutSource;
+        }
         if (request.mode == MobileRunRequest.Mode.AUDIT
                 || request.mode == MobileRunRequest.Mode.PRODREADY) {
             detail += "\nMaximum provider cost: $"
@@ -729,7 +738,7 @@ public final class MainActivity extends Activity {
     }
 
     private void chooseBatchRepositories(MobileRunRequest.Mode mode, double cost,
-            boolean scoutApply) {
+            boolean scoutApply, String scoutSource) {
         if (!requireConfiguration()) return;
         runState.setText("Loading repositories for the sequential queue…");
         worker.execute(() -> {
@@ -737,7 +746,7 @@ public final class MainActivity extends Activity {
                 List<GitHubApi.Repository> repositories = api.repositories(
                         githubToken());
                 post(() -> showBatchRepositoryList(
-                        repositories, mode, cost, scoutApply));
+                        repositories, mode, cost, scoutApply, scoutSource));
             } catch (Exception failed) {
                 invalidateRejectedSession(failed);
                 post(() -> {
@@ -749,7 +758,8 @@ public final class MainActivity extends Activity {
     }
 
     private void showBatchRepositoryList(List<GitHubApi.Repository> repositories,
-            MobileRunRequest.Mode mode, double cost, boolean scoutApply) {
+            MobileRunRequest.Mode mode, double cost, boolean scoutApply,
+            String scoutSource) {
         refreshRunLabel();
         if (repositories.isEmpty()) {
             showError("No writable repositories",
@@ -776,7 +786,7 @@ public final class MainActivity extends Activity {
                         GitHubApi.Repository repository = repositories.get(i);
                         requests.add(new MobileRunRequest(mode,
                                 repository.fullName, repository.defaultBranch,
-                                "", "", scoutApply, cost, 90, 6));
+                                "", "", scoutSource, scoutApply, cost, 90, 6));
                     }
                     if (requests.isEmpty() || requests.size() > MobileRunQueue.MAX_TARGETS) {
                         showError("Check the queue",

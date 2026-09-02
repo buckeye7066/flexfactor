@@ -86,16 +86,16 @@ recorded in every run manifest rather than described as containment
 
 ## Use Cases
 
-1. **Audit a codebase** — `python flexfactor.py audit --program <path>`  
+1. **Audit a codebase** — `python flexfactor.py audit --program <path>`
    Finds and fixes defects; publishes verified result to the branch.
 
-2. **Production-readiness check** — `python flexfactor.py prodready --program <path>`  
+2. **Production-readiness check** — `python flexfactor.py prodready --program <path>`
    Installs deps, runs 13 rubric gates, fixes medium-and-above findings.
 
-3. **Scout an integration** — `python flexfactor.py scout --program <path>`  
-   Proposes third-party integrations; requires explicit `--apply` approval.
+3. **Scout a program URL** — `python flexfactor.py scout --target <path> --program <public-url>`
+   Retrieves the URL, compares its evidenced capabilities with the target, then asks Repo Rewards for implementations of accepted deltas. Requires explicit `--apply` approval.
 
-4. **Single-file refactor** — `python flexfactor.py --file <f> --goal "..."`  
+4. **Single-file refactor** — `python flexfactor.py --file <f> --goal "..."`
    Targeted rewrite of one file toward a stated goal.
 
 ## Optimization Approach

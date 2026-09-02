@@ -44,6 +44,7 @@ function validRun(overrides = {}) {
     ref: "main",
     file: "",
     goal: "",
+    scout_source: "",
     scout_apply: false,
     max_cost: 50,
     threshold: 90,
@@ -107,8 +108,8 @@ function storedClaim(request, overrides = {}) {
 }
 
 test("the reusable workflow is pinned to the release that carries this client", () => {
-  assert.equal(ENGINE_REF, "android-v3.5.1");
-  assert.match(mobileWorkflow(), /mobile-run\.yml@android-v3\.5\.1/);
+  assert.equal(ENGINE_REF, "android-v3.6.0");
+  assert.match(mobileWorkflow(), /mobile-run\.yml@android-v3\.6\.0/);
   for (const mode of ["refactor", "scout", "audit", "prodready"]) {
     assert.match(mobileWorkflow(), new RegExp(mode));
   }
@@ -169,10 +170,23 @@ test("all four domain requests are accepted and mode-specific invariants fail cl
   assert.equal(validateRunRequest(validRun({
     mode: "refactor", file: "src/app.js", goal: "Make failures explicit",
   })).mode, "refactor");
-  assert.equal(validateRunRequest(validRun({ mode: "scout", scout_apply: true })).mode, "scout");
+  const scout = validateRunRequest(validRun({
+    mode: "scout", scout_source: "https://source.example/features", scout_apply: true,
+  }));
+  assert.equal(scout.mode, "scout");
+  assert.equal(scout.scout_source, "https://source.example/features");
   assert.equal(validateRunRequest(validRun({ mode: "audit" })).mode, "audit");
   assert.equal(validateRunRequest(validRun({ mode: "prodready" })).mode, "prodready");
   assert.throws(() => validateRunRequest(validRun({ mode: "audit", scout_apply: true })), ServiceError);
+  assert.throws(() => validateRunRequest(validRun({ mode: "scout" })), ServiceError);
+  assert.throws(() => validateRunRequest(validRun({ mode: "scout", scout_source: "SourceSuite" })), ServiceError);
+  assert.throws(() => validateRunRequest(validRun({
+    mode: "scout", scout_source: "https://github.com/example/source-suite",
+  })), ServiceError);
+  assert.equal(validateRunRequest(validRun({
+    mode: "scout", scout_source: "https://github.com/features/actions",
+  })).scout_source, "https://github.com/features/actions");
+  assert.throws(() => validateRunRequest(validRun({ mode: "audit", scout_source: "SourceSuite" })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ ref: "../main" })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ max_cost: 151 })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ provider: "openai" })), ServiceError);
@@ -457,7 +471,7 @@ test("every configured paid credential is accepted for the one ladder", async ()
     markedRequestClaim(),
   ]);
   const result = await dispatch("gho_ladder_token",
-    validRun({ mode: "scout" }),
+    validRun({ mode: "scout", scout_source: "https://source.example/features" }),
     { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {});
   assert.equal(result.id, 45);
   const secretNames = new Set(fetcher.calls
@@ -469,6 +483,7 @@ test("every configured paid credential is accepted for the one ladder", async ()
   assert.ok(dispatchCall);
   const dispatched = JSON.parse(dispatchCall.options.body);
   assert.equal(dispatched.inputs.provider, "auto");
+  assert.equal(dispatched.inputs.scout_source, "https://source.example/features");
   assert.equal(Object.hasOwn(dispatched.inputs, "economy"), false);
   assert.equal(Object.hasOwn(dispatched.inputs, "use_both"), false);
 });

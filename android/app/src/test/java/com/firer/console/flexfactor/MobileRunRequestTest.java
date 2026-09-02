@@ -26,6 +26,8 @@ public final class MobileRunRequestTest {
                 "src/app.py", "Make startup deterministic", false).workflowInputs().get("mode"));
         assertEquals("scout", request(MobileRunRequest.Mode.SCOUT,
                 "", "", false).workflowInputs().get("mode"));
+        assertEquals("https://source.example/features", request(MobileRunRequest.Mode.SCOUT,
+                "", "", false).workflowInputs().get("scout_source"));
         assertEquals("audit", request(MobileRunRequest.Mode.AUDIT,
                 "", "", false).workflowInputs().get("mode"));
         assertEquals("prodready", request(MobileRunRequest.Mode.PRODREADY,
@@ -63,6 +65,27 @@ public final class MobileRunRequestTest {
     }
 
     @Test
+    public void scoutRequiresAnExplicitSourceAndOtherModesRejectIt() {
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                ID, MobileRunRequest.Mode.SCOUT,
+                "buckeye7066/flexfactor", "main", "", "", "", false, 25));
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                ID, MobileRunRequest.Mode.AUDIT,
+                "buckeye7066/flexfactor", "main", "", "", "SourceSuite", false, 25));
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                ID, MobileRunRequest.Mode.SCOUT,
+                "buckeye7066/flexfactor", "main", "", "", "SourceSuite", false, 25));
+        assertThrows(IllegalArgumentException.class, () -> new MobileRunRequest(
+                ID, MobileRunRequest.Mode.SCOUT,
+                "buckeye7066/flexfactor", "main", "", "",
+                "https://github.com/example/source-suite", false, 25));
+        assertEquals("https://source.example/features", new MobileRunRequest(
+                ID, MobileRunRequest.Mode.SCOUT,
+                "buckeye7066/flexfactor", "main", "", "",
+                "https://source.example/features", false, 25).scoutSource);
+    }
+
+    @Test
     public void refactorRequiresContainedFileAndGoal() {
         assertThrows(IllegalArgumentException.class, () -> request(
                 MobileRunRequest.Mode.REFACTOR, "../secret", "change it", false));
@@ -90,6 +113,9 @@ public final class MobileRunRequestTest {
             String goal, boolean scoutApply) {
         return new MobileRunRequest(ID, mode,
                 "buckeye7066/flexfactor", "main",
-                file, goal, scoutApply, 25);
+                file, goal,
+                mode == MobileRunRequest.Mode.SCOUT
+                        ? "https://source.example/features" : "",
+                scoutApply, 25);
     }
 }

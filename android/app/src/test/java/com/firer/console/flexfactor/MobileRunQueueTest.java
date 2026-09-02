@@ -56,6 +56,17 @@ public final class MobileRunQueueTest {
     }
 
     @Test
+    public void persistenceRetainsTheScoutedProgram() {
+        MobileRunRequest scout = new MobileRunRequest(
+                MobileRunRequest.Mode.SCOUT, "owner/repo", "main", "", "",
+                "https://source.example/features", false, 25);
+        MobileRunQueue restored = MobileRunQueue.fromJson(
+                new MobileRunQueue(List.of(scout)).toJson());
+        assertEquals("https://source.example/features",
+                restored.nextRequest().scoutSource);
+    }
+
+    @Test
     public void rejectsDuplicateRequestIdsAndImpossibleActivePointers() {
         String requestId = "4d32c8e5-6f2b-4a98-a7f5-99594c49b2f8";
         MobileRunRequest first = new MobileRunRequest(requestId,

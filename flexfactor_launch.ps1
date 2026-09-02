@@ -86,12 +86,14 @@ try {
                      "--model-mode", "best")
         foreach ($target in $targets) { $cliArgs += @("--file", $target) }
     } elseif ($mode -eq "2") {
-        $targets = @(Read-FlexFactorTargets "program" @($args))
-        $contextConsent = Read-Host "Scout may send program source context to the selected hosted model. Type YES to allow it"
+        $target = (Read-Host "Target program to optimize (folder, file, shortcut, URL, or description)").Trim('"')
+        if ([string]::IsNullOrWhiteSpace($target)) { throw "A target program is required." }
+        $targets = @(Read-FlexFactorTargets "public program/product URL to scout (repositories belong in Repo Rewards)" @($args))
+        $contextConsent = Read-Host "Scout may send target and scouted-program evidence to the selected hosted model. Type YES to allow it"
         if ($contextConsent -cne "YES") {
-            throw "Scout cancelled; program source context was not sent."
+            throw "Scout cancelled; program evidence was not sent."
         }
-        $cliArgs = @("scout", "--max-cost", "$cost", "--model-mode", "best",
+        $cliArgs = @("scout", "--target", $target, "--max-cost", "$cost", "--model-mode", "best",
                      "--allow-remote-program-context")
         foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     } else {

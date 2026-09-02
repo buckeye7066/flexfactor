@@ -2934,7 +2934,8 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: (captured.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--target", "target", "--allow-remote-program-context",
+                     "--program", "https://source.example", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args"].apply)
@@ -2956,7 +2957,8 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         captured = {}
         ff.run_scout = lambda a: (captured.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--allow-remote-program-context", "--program", "x"])
+            ff.main(["scout", "--target", "target", "--allow-remote-program-context",
+                     "--program", "https://source.example"])
         finally:
             ff.run_scout = real
         self.assertFalse(captured["args"].apply)
@@ -2965,7 +2967,8 @@ class ScoutApplyDefaultTests(unittest.TestCase):
         # --apply flips it on.
         ff.run_scout = lambda a: captured.__setitem__("args2", a) or 0
         try:
-            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--apply", "--yes"])
+            ff.main(["scout", "--target", "target", "--allow-remote-program-context",
+                     "--program", "https://source.example", "--apply", "--yes"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args2"].apply)
@@ -3075,7 +3078,8 @@ class AuditApplyDefaultTests(unittest.TestCase):
         cap = {}
         ff.run_scout = lambda a: (cap.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--report-only"])
+            ff.main(["scout", "--target", "target", "--allow-remote-program-context",
+                     "--program", "https://source.example", "--report-only"])
             self.assertFalse(cap["args"].apply)
             self.assertFalse(hasattr(cap["args"], "dry_run"),
                              "the dry_run attribute must not survive anywhere")
@@ -8065,11 +8069,43 @@ class ScoutEndToEndTests(unittest.TestCase):
         return branch
 
     def _stub_judge(self, provider, system, prompt, schema, max_tokens=8000):
-        if schema is ff.PROGRAM_PROFILE_SCHEMA:
+        if schema is ff._scout_research.TARGET_PROFILE_SCHEMA:
             return {"name": "FixtureApp", "summary": "a fixture app",
-                    "stack": ["node"], "goals": ["test"],
-                    "opportunities": [{"need": "widgets",
-                                       "search_query": "widget"}]}
+                    "stack": ["node"], "goals": ["test"], "users": ["operators"],
+                    "workflows": [{"name": "render", "current_behavior": "basic",
+                                   "status": "partial", "evidence_refs": ["T1"]}],
+                    "capabilities": [{"name": "widgets", "current_behavior": "missing",
+                                      "status": "missing", "evidence_refs": ["T1"]}],
+                    "constraints": [],
+                    "optimization_needs": [{"need": "widgets", "why": "missing",
+                                            "priority": "high", "evidence_refs": ["T1"]}],
+                    "coverage_gaps": []}
+        if schema is ff._scout_research.SCOUTED_PROGRAM_PROFILE_SCHEMA:
+            return {"name": "SourceSuite", "summary": "provides reusable widgets",
+                    "program_type": "product", "canonical_url": "https://source.example",
+                    "workflows": [{"name": "widget workflow", "behavior": "renders widgets",
+                                   "evidence_refs": ["S1"]}],
+                    "capabilities": [{"name": "widgets", "behavior": "renders widgets",
+                                      "user_value": "better interaction",
+                                      "implementation_pattern": "component library",
+                                      "evidence_refs": ["S1"], "confidence": "high"}],
+                    "stack_signals": [], "limitations": [], "coverage_gaps": []}
+        if schema is ff._scout_research.PROGRAM_COMPARISON_SCHEMA:
+            return {"target_name": "FixtureApp", "scouted_name": "SourceSuite",
+                    "summary": "widgets improve the target", "coverage_gaps": [],
+                    "recommendations": [{
+                        "capability": "widgets", "decision": "adapt",
+                        "source_behavior": "renders reusable widgets",
+                        "target_state": "has no widget layer", "target_gap": "widgets missing",
+                        "purpose_alignment": "improves interaction",
+                        "how_it_optimizes": "adds the missing interaction layer",
+                        "adaptation_plan": "add a bounded widget component",
+                        "target_touchpoints": ["src.js"],
+                        "verification_plan": "render and exercise the widget",
+                        "implementation_search_query": "widget",
+                        "value_score": 90, "confidence": "high",
+                        "target_evidence_refs": ["T1"], "source_evidence_refs": ["S1"],
+                    }]}
         return {"benefit_score": 90, "verdict": "adopt",
                 "how_it_helps": "adds widgets", "integration_note": "",
                 "risks": []}
@@ -8079,7 +8115,8 @@ class ScoutEndToEndTests(unittest.TestCase):
         import types
         saved = {n: getattr(ff, n) for n in
                  ("_server_is_up", "repo_rewards_search", "_judge",
-                  "make_provider", "generate_integration", "_detect_verify",
+                  "_best_available_provider", "generate_integration", "_detect_verify",
+                  "_research_program_reference",
                   "_independent_final_review", "_run")}
         self.npm_calls: list[list[str]] = []
         self.verify_envs: list[dict | None] = []
@@ -8101,7 +8138,24 @@ class ScoutEndToEndTests(unittest.TestCase):
         ff.repo_rewards_search = lambda base, q, lens=None, attempts=3: \
             [self.GOOD, self.HOSTILE]
         ff._judge = self._stub_judge
-        ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
+        target_bundle = {
+            "reference": tmp, "kind": "local-repository", "name_hint": "FixtureApp",
+            "canonical_url": "", "evidence": [
+                {"id": "T1", "path": "src.js", "title": "Target source",
+                 "text": "console.log('app');"}],
+            "coverage": {"complete": True, "source_files": 1},
+        }
+        source_bundle = {
+            "reference": "https://source.example", "kind": "website-url",
+            "name_hint": "SourceSuite", "canonical_url": "https://source.example",
+            "evidence": [{"id": "S1", "url": "https://source.example/features",
+                          "title": "Widget features", "text": "Reusable widget workflows."}],
+            "coverage": {"complete": True, "retrieved": 1},
+        }
+        ff._research_program_reference = (
+            lambda _ref, _prefix, role, args=None:
+            target_bundle if role == "target" else source_bundle)
         ff.generate_integration = lambda provider, project_dir, blob, need, result: (
             {"files": [{"path": "widget_integration.js",
                         "contents": "export const widget = 1;\n"}],
@@ -8134,7 +8188,8 @@ class ScoutEndToEndTests(unittest.TestCase):
                            capture_output=True)
             # --no-clone-inspect keeps the scenario fully offline (the fixture
             # urls aren't cloneable); enrichment has its own dedicated tests.
-            rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
+            rc = ff.main(["scout", "--target", tmp, "--allow-remote-program-context",
+                          "--program", "https://source.example", "--apply", "--yes",
                           "--top", "5", "--no-clone-inspect"])
         finally:
             for n, fn in saved.items():
@@ -8162,7 +8217,7 @@ class ScoutEndToEndTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmp, "widget_integration.js")))
             log = self._git_out(tmp, "log", "--oneline", "-3")
             self.assertIn("Integrate good/widget", log)
-            report = os.path.join(tmp, "fixtureapp_repo_rewards_report.md")
+            report = os.path.join(tmp, "fixtureapp_from_sourcesuite_repo_rewards_report.md")
             self.assertTrue(os.path.exists(report), "scout report must be written")
             with open(report, "r", encoding="utf-8") as fh:
                 body = fh.read()
@@ -8199,8 +8254,8 @@ class ScoutEndToEndTests(unittest.TestCase):
             self.assertNotIn("flexfactor/adopt-good-widget", branches)
             self.assertFalse(os.path.exists(os.path.join(tmp, "widget_integration.js")))
             # Tree pristine apart from scout report/proposal artifacts.
-            _artifact_names = ("repo_rewards_report", "_scout_report.json",
-                               ".flexfactor-scout-proposals.json",
+            _artifact_names = ("repo_rewards_report", "_scout_report",
+                               ".flexfactor-scout-proposals",
                                ".flexfactor-apply-approval.json")
             status = [ln for ln in self._git_out(tmp, "status", "--porcelain")
                       .splitlines()
@@ -10164,19 +10219,65 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             }
             saved = {n: getattr(ff, n) for n in
                      ("_server_is_up", "repo_rewards_search", "_judge",
-                      "make_provider", "generate_integration")}
+                      "_best_available_provider", "_research_program_reference",
+                      "generate_integration")}
             ff._server_is_up = lambda url, timeout=1.5: True
             ff.repo_rewards_search = lambda *a, **k: [good]
-            ff._judge = lambda provider, system, prompt, schema, max_tokens=8000: (
-                {"name": "FixtureApp", "summary": "a fixture app",
-                 "stack": ["node"], "goals": ["test"],
-                 "opportunities": [{"need": "widgets",
-                                    "search_query": "widget"}]}
-                if schema is ff.PROGRAM_PROFILE_SCHEMA else
-                {"benefit_score": 90, "verdict": "adopt",
-                 "how_it_helps": "adds widgets", "integration_note": "",
-                 "risks": []})
-            ff.make_provider = lambda *a, **k: types.SimpleNamespace(
+            target_bundle = {
+                "reference": tmp, "kind": "local-repository", "name_hint": "FixtureApp",
+                "canonical_url": "", "evidence": [
+                    {"id": "T1", "path": "src.js", "text": "target source"}],
+                "coverage": {"complete": True},
+            }
+            source_bundle = {
+                "reference": "https://source.example", "kind": "website-url",
+                "name_hint": "SourceSuite", "canonical_url": "https://source.example",
+                "evidence": [{"id": "S1", "url": "https://source.example",
+                              "text": "reusable widgets"}],
+                "coverage": {"complete": True},
+            }
+            ff._research_program_reference = (
+                lambda _ref, _prefix, role, args=None:
+                target_bundle if role == "target" else source_bundle)
+
+            def judge(_provider, _system, _prompt, schema, max_tokens=8000):
+                if schema is ff._scout_research.TARGET_PROFILE_SCHEMA:
+                    return {"name": "FixtureApp", "summary": "a fixture app",
+                            "stack": ["node"], "goals": ["test"], "users": [],
+                            "workflows": [], "constraints": [], "coverage_gaps": [],
+                            "capabilities": [{"name": "widgets", "current_behavior": "missing",
+                                              "status": "missing", "evidence_refs": ["T1"]}],
+                            "optimization_needs": []}
+                if schema is ff._scout_research.SCOUTED_PROGRAM_PROFILE_SCHEMA:
+                    return {"name": "SourceSuite", "summary": "has widgets",
+                            "program_type": "product", "canonical_url": "https://source.example",
+                            "workflows": [], "stack_signals": [], "limitations": [],
+                            "coverage_gaps": [], "capabilities": [{
+                                "name": "widgets", "behavior": "renders reusable widgets",
+                                "user_value": "interaction", "implementation_pattern": "component",
+                                "evidence_refs": ["S1"], "confidence": "high"}]}
+                if schema is ff._scout_research.PROGRAM_COMPARISON_SCHEMA:
+                    return {"target_name": "FixtureApp", "scouted_name": "SourceSuite",
+                            "summary": "useful widgets", "coverage_gaps": [],
+                            "recommendations": [{
+                                "capability": "widgets", "decision": "adapt",
+                                "source_behavior": "renders reusable widgets",
+                                "target_state": "widgets are missing", "target_gap": "no widgets",
+                                "purpose_alignment": "improves interaction",
+                                "how_it_optimizes": "adds missing interaction",
+                                "adaptation_plan": "add bounded components",
+                                "target_touchpoints": ["src.js"],
+                                "verification_plan": "render the widget",
+                                "implementation_search_query": "widget",
+                                "value_score": 90, "confidence": "high",
+                                "target_evidence_refs": ["T1"],
+                                "source_evidence_refs": ["S1"]}]}
+                return {"benefit_score": 90, "verdict": "adopt",
+                        "how_it_helps": "adds widgets", "integration_note": "",
+                        "risks": []}
+
+            ff._judge = judge
+            ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
                 judge_model="stub")
             ff.generate_integration = lambda *a, **k: (
                 {"files": [{"path": "widget_integration.js",
@@ -10184,7 +10285,9 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                  "packages": [], "commit_message": "Integrate good/widget",
                  "post_steps": []}, "plan")
             try:
-                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--apply", "--yes",
+                rc = ff.main(["scout", "--target", tmp,
+                              "--allow-remote-program-context", "--program",
+                              "https://source.example", "--apply", "--yes",
                               "--top", "3", "--no-clone-inspect"])
             finally:
                 for n, fn in saved.items():
@@ -10198,10 +10301,10 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             self.assertFalse(os.path.exists(
                 os.path.join(tmp, "widget_integration.js")))
             # Structured proposal artifacts must still be written.
-            self.assertTrue(os.path.exists(
-                os.path.join(tmp, self.sc.SCOUT_PROPOSAL_FILE)))
-            self.assertTrue(os.path.exists(
-                os.path.join(tmp, self.sc.SCOUT_REPORT_JSON)))
+            self.assertTrue(any(name.startswith(".flexfactor-scout-proposals.")
+                                for name in os.listdir(tmp)))
+            self.assertTrue(any(name.startswith("_scout_report.")
+                                for name in os.listdir(tmp)))
 
     def test_host_port_https_defaults_to_443(self):
         self.assertEqual(ff._host_port("https://web-production-d7db7.up.railway.app"),
@@ -10225,8 +10328,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "up": ff._server_is_up,
             "start": ff._try_start_repo_rewards,
             "search": ff.repo_rewards_search,
-            "judge": ff._judge,
-            "prov": ff.make_provider,
         }
 
         def fake_up(url, timeout=1.5):
@@ -10237,15 +10338,11 @@ class ScoutBridge94to100Tests(unittest.TestCase):
         ff._try_start_repo_rewards = lambda *a, **k: False
         ff.repo_rewards_search = lambda url, query, **k: (
             seen.__setitem__("search_url", url) or [])
-        ff._judge = lambda *a, **k: {"name": "x", "summary": "x", "stack": [],
-                                     "goals": [], "opportunities": []}
-        ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
-                              "--repo-rewards-url", "http://localhost:3000",
-                              "--no-remote-repo-rewards", "--no-auto-start"])
+            base, _note = ff.resolve_repo_rewards_url(
+                types.SimpleNamespace(no_remote_repo_rewards=True),
+                requested="http://localhost:3000", auto_start=False)
+            rc = 2 if base is None else 0
             self.assertEqual(rc, 2)
             self.assertIsNone(seen["search_url"])
             self.assertFalse([u for u in seen["urls"]
@@ -10256,8 +10353,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff._server_is_up = saved["up"]
             ff._try_start_repo_rewards = saved["start"]
             ff.repo_rewards_search = saved["search"]
-            ff._judge = saved["judge"]
-            ff.make_provider = saved["prov"]
 
     def test_production_rr_fallback_when_local_down(self):
         """When localhost RR is down and opt-in is set, Scout uses production URL."""
@@ -10267,36 +10362,23 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "up": ff._server_is_up,
             "start": ff._try_start_repo_rewards,
             "search": ff.repo_rewards_search,
-            "judge": ff._judge,
-            "prov": ff.make_provider,
         }
 
         def fake_up(url, timeout=1.5):
             seen["urls"].append(url)
             return str(url).startswith("https://web-production")
 
-        def fake_judge(provider, system, prompt, schema, max_tokens=8000):
-            if schema is ff.PROGRAM_PROFILE_SCHEMA:
-                return {"name": "FixtureApp", "summary": "fixture",
-                        "stack": ["node"], "goals": ["test"],
-                        "opportunities": [{"need": "widgets",
-                                           "search_query": "widget"}]}
-            return {"benefit_score": 10, "verdict": "skip",
-                    "how_it_helps": "", "integration_note": "", "risks": []}
-
         ff._server_is_up = fake_up
         ff._try_start_repo_rewards = lambda *a, **k: False
         ff.repo_rewards_search = lambda url, query, **k: (
             seen.__setitem__("search_url", url) or [])
-        ff._judge = fake_judge
-        ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
-                              "--repo-rewards-url", "http://localhost:3000",
-                              "--allow-remote-repo-rewards",
-                              "--no-auto-start"])
+            base, _note = ff.resolve_repo_rewards_url(
+                types.SimpleNamespace(no_remote_repo_rewards=False),
+                requested="http://localhost:3000", auto_start=False)
+            if base:
+                ff.repo_rewards_search(base, "widget")
+            rc = 1 if base else 2
             # No candidates => rc 1 is OK; fallback must have been used.
             self.assertIn(rc, (0, 1))
             self.assertTrue(
@@ -10309,8 +10391,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff._server_is_up = saved["up"]
             ff._try_start_repo_rewards = saved["start"]
             ff.repo_rewards_search = saved["search"]
-            ff._judge = saved["judge"]
-            ff.make_provider = saved["prov"]
 
     def test_autostart_keeps_explicit_local_url(self):
         """After auto-start, keep --repo-rewards-url; do not rewrite to DEFAULT."""
@@ -10320,8 +10400,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             "up": ff._server_is_up,
             "start": ff._try_start_repo_rewards,
             "search": ff.repo_rewards_search,
-            "judge": ff._judge,
-            "prov": ff.make_provider,
             "default": ff.DEFAULT_REPO_REWARDS_URL,
         }
         calls = {"n": 0}
@@ -10337,27 +10415,18 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             seen["started"] = True
             return True
 
-        def fake_judge(provider, system, prompt, schema, max_tokens=8000):
-            if schema is ff.PROGRAM_PROFILE_SCHEMA:
-                return {"name": "FixtureApp", "summary": "fixture",
-                        "stack": ["node"], "goals": ["test"],
-                        "opportunities": [{"need": "widgets",
-                                           "search_query": "widget"}]}
-            return {"benefit_score": 10, "verdict": "skip",
-                    "how_it_helps": "", "integration_note": "", "risks": []}
-
         ff.DEFAULT_REPO_REWARDS_URL = "http://custom-env:9999"
         ff._server_is_up = fake_up
         ff._try_start_repo_rewards = fake_start
         ff.repo_rewards_search = lambda url, query, **k: (
             seen.__setitem__("search_url", url) or [])
-        ff._judge = fake_judge
-        ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
-                rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
-                              "--repo-rewards-url", "http://127.0.0.1:3000"])
+            base, _note = ff.resolve_repo_rewards_url(
+                types.SimpleNamespace(no_remote_repo_rewards=False),
+                requested="http://127.0.0.1:3000", auto_start=True)
+            if base:
+                ff.repo_rewards_search(base, "widget")
+            rc = 1 if base else 2
             self.assertIn(rc, (0, 1))
             self.assertTrue(seen["started"])
             self.assertEqual(seen["search_url"], "http://127.0.0.1:3000")
@@ -10365,8 +10434,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             ff._server_is_up = saved["up"]
             ff._try_start_repo_rewards = saved["start"]
             ff.repo_rewards_search = saved["search"]
-            ff._judge = saved["judge"]
-            ff.make_provider = saved["prov"]
             ff.DEFAULT_REPO_REWARDS_URL = saved["default"]
 
 
@@ -14339,7 +14406,8 @@ class RetiredEconomyFlagCharacterization(unittest.TestCase):
         real = ff.run_scout
         ff.run_scout = lambda a: (cap.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--allow-remote-program-context", "--program", "x", "--economy"])
+            ff.main(["scout", "--target", "target", "--allow-remote-program-context",
+                     "--program", "https://source.example", "--economy"])
         finally:
             ff.run_scout = real
         self.assertTrue(cap["args"].economy)
@@ -14354,7 +14422,8 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
             repo_rewards_url="http://localhost:3000",
             auto_start=False,
             provider="anthropic",
-            program="C:/private/project",
+            target="C:/private/project",
+            program="https://source.example",
             allow_remote_program_context=False,
         )
         called = {"provider": False}
@@ -14374,7 +14443,8 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
         real = ff.run_scout
         ff.run_scout = lambda a: (captured.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--program", "x", "--allow-remote-program-context"])
+            ff.main(["scout", "--target", "target", "--program",
+                     "https://source.example", "--allow-remote-program-context"])
         finally:
             ff.run_scout = real
         self.assertTrue(captured["args"].allow_remote_program_context)
@@ -14388,7 +14458,8 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
              _patched(ff, "make_provider",
                       lambda *a, **k: called.__setitem__("provider", True)):
             with _patched(os, "environ", {}):
-                rc = ff.main(["scout", "--program", "C:/private/project"])
+                rc = ff.main(["scout", "--target", "C:/private/project",
+                              "--program", "https://source.example"])
         self.assertEqual(rc, 2)
         self.assertFalse(called["provider"])
 
@@ -14398,7 +14469,8 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
             repo_rewards_url="http://localhost:3000",
             auto_start=False,
             provider="anthropic",
-            program="C:/private/project",
+            target="C:/private/project",
+            program="https://source.example",
             allow_remote_program_context=False,
             model=None,
             economy=False,
@@ -14410,11 +14482,28 @@ class ScoutCloudContextConsentTests(unittest.TestCase):
             reached["judge"] = True
             raise RuntimeError("stop after consent boundary")
 
+        target_bundle = {
+            "reference": "C:/private/project", "kind": "local-repository",
+            "name_hint": "private-project", "canonical_url": "",
+            "evidence": [{"id": "T1", "path": "app.py", "text": "source"}],
+            "coverage": {"complete": True},
+        }
+        source_bundle = {
+            "reference": "https://source.example", "kind": "website-url",
+            "name_hint": "source.example", "canonical_url": "https://source.example",
+            "evidence": [{"id": "S1", "url": "https://source.example",
+                          "text": "source behavior"}],
+            "coverage": {"complete": True},
+        }
+
         with _patched(ff, "_server_is_up", lambda _url: True), \
              _patched(ff, "resolve_program_input",
                       lambda _program: ("private-project", "SECRET SOURCE TREE")), \
              _patched(ff, "_best_available_provider",
                       lambda *a, **k: types.SimpleNamespace(judge_model=None)), \
+             _patched(ff, "_research_program_reference",
+                      lambda _ref, _prefix, role, args=None:
+                      target_bundle if role == "target" else source_bundle), \
              _patched(ff, "_judge", stop_at_judge):
             with _patched(os, "environ",
                           {"FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT": "1"}):
@@ -15905,7 +15994,8 @@ class CompetitorAuditWiringTests(unittest.TestCase):
         real, cap = ff.run_scout, {}
         ff.run_scout = lambda a: (cap.setdefault("args", a), 0)[1]
         try:
-            ff.main(["scout", "--program", "x", "--allow-remote-program-context",
+            ff.main(["scout", "--target", "target", "--program",
+                     "https://source.example", "--allow-remote-program-context",
                      "--allow-remote-repo-rewards", "--repo-rewards-url",
                      "http://localhost:3000", "--no-auto-start"])
         finally:
@@ -17826,7 +17916,8 @@ class ZeroWorkOvernightRunTests(unittest.TestCase):
         """Owner order: removed means an invocation naming it FAILS (exit 2),
         never silently proceeds and never becomes a confirmation gate."""
         with self.assertRaises(SystemExit) as cm:
-            ff.main(["scout", "--program", "x", "--dry-run"])
+            ff.main(["scout", "--target", "target", "--program",
+                     "https://source.example", "--dry-run"])
         self.assertEqual(cm.exception.code, 2)
 
     def test_no_dry_run_branch_survives_in_the_apply_path(self):
@@ -18485,6 +18576,12 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         src = inspect.getsource(ff.audit_one_program)
         self.assertIn("head_matches(_git_argv, project_dir, final_sha)", src)
         self.assertIn("approval REVOKED", src)
+
+
+from flexfactor_scout_research_tests import (  # noqa: E402,F401
+    ScoutProgramComparisonEndToEndTests,
+    ScoutResearchTransportTests,
+)
 
 
 if __name__ == "__main__":

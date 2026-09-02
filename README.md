@@ -1,7 +1,7 @@
 # FlexFactor
 
 FlexFactor is a managed, purpose-driven code improvement system with four
-interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.6.1 uses one
+interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.7.0 uses one
 quality-first model ladder, one durable orchestrator, and one fail-closed
 publication contract on desktop and in the signed Android app.
 
@@ -63,7 +63,8 @@ Examples:
 
 ```bash
 python flexfactor.py refactor --file src/app.py --goal "Make failures explicit"
-python flexfactor.py scout --program /path/to/repo
+python flexfactor.py scout --target /path/to/repo --program https://product.example/features \
+  --allow-remote-program-context
 python flexfactor.py audit --program /repo/one --program /repo/two --yes
 python flexfactor.py prodready --program /path/to/repo --yes
 python flexfactor.py --runtime-manifest
@@ -76,7 +77,7 @@ code-model families so the free fallback can still separate author and reviewer.
 
 ## Managed Android product
 
-Android 3.5.1 is a native phone interface, not a Termux or desktop remote-control
+Android 3.6.0 is a native phone interface, not a Termux or desktop remote-control
 screen. The user taps the icon, signs in with GitHub device authorization, picks
 one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so
@@ -108,6 +109,11 @@ closing fence, preserves nested examples, rejects unclosed wrappers as partial,
 and discards later provider prose. It treats an independently verified
 unchanged refactor as a real no-op only after proving its baseline is already
 on the authoritative remote default branch.
+
+Version 3.6.0 makes Scout's source field URL-only. Scout retrieves the entered
+program/product site, profiles cited target and source evidence separately, and
+accounts for every observed source capability before it asks Repo Rewards to
+find repositories implementing an accepted target-specific delta.
 
 ## Evidence and recovery
 

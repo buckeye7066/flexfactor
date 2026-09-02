@@ -1,6 +1,6 @@
 # FlexFactor architecture
 
-This document describes the 0.6.1 engine, Android 3.5.1 client, and 1.1.1
+This document describes the 0.7.0 engine, Android 3.6.0 client, and 1.2.0
 managed control plane.
 
 ## Execution topology
@@ -17,6 +17,16 @@ managed control plane.
 Every process entry ends in `flexfactor.run_cli(argv)`. The installed
 `flexfactor` command, `python -m flexfactor`, `flexfactor_run.py`, and the
 PowerShell launchers all use that same dispatcher.
+
+## Scout boundary
+
+Scout accepts an explicit target plus one or more public program/product
+website URLs. It retrieves bounded same-site evidence, builds separate cited
+profiles for target and source, and requires one adopt/adapt/reject/investigate
+decision for every observed source capability. Only an accepted, target-specific
+implementation query crosses into Repo Rewards. Repository discovery, scoring,
+and candidate metadata belong to Repo Rewards; Scout does not accept a source
+repository URL as a substitute for program research.
 
 ## Orchestrator contract
 

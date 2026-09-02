@@ -14,9 +14,15 @@ const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const FILE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[^\r\n]{1,500}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODES = new Set(["refactor", "scout", "audit", "prodready"]);
+const CODE_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "gitea.com"]);
+const NON_REPOSITORY_ROOTS = new Set([
+  "about", "collections", "customer-stories", "enterprise", "events", "explore",
+  "features", "help", "marketplace", "pricing", "readme", "resources", "security",
+  "site", "solutions", "sponsors", "topics",
+]);
 const RUN_FIELDS = new Set([
   "request_id", "mode", "provider", "repository", "ref", "file", "goal",
-  "scout_apply", "max_cost", "threshold", "max_iterations",
+  "scout_source", "scout_apply", "max_cost", "threshold", "max_iterations",
 ]);
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 const REPOSITORY_PAGE_SIZE = 100;
@@ -56,6 +62,22 @@ function encode(value) {
 
 function validRef(value) {
   return REF.test(value) && !value.includes("..") && !value.endsWith("/");
+}
+
+function validScoutUrl(value) {
+  if (!value || value.length > 2_000 || /\s/.test(value)) return false;
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    const codeRepository = CODE_HOSTS.has(host) && parts.length >= 2
+      && !NON_REPOSITORY_ROOTS.has(parts[0].toLowerCase());
+    return (parsed.protocol === "https:" || parsed.protocol === "http:")
+      && Boolean(parsed.hostname) && !parsed.username && !parsed.password
+      && !codeRepository;
+  } catch {
+    return false;
+  }
 }
 
 function parseJson(buffer, label = "upstream") {
@@ -333,6 +355,7 @@ export function validateRunRequest(source) {
     ref: typeof source.ref === "string" ? source.ref.trim() : "",
     file: typeof source.file === "string" ? source.file.trim() : "",
     goal: typeof source.goal === "string" ? source.goal.trim() : "",
+    scout_source: typeof source.scout_source === "string" ? source.scout_source.trim() : "",
     scout_apply: source.scout_apply === true,
     max_cost: Number(source.max_cost),
     threshold: Number(source.threshold),
@@ -369,6 +392,15 @@ export function validateRunRequest(source) {
     }
   } else if (request.file || request.goal) {
     throw new ServiceError(400, "invalid_run", "File and goal are only valid for Option 1.");
+  }
+  if (request.mode === "scout") {
+    if (!validScoutUrl(request.scout_source)) {
+      throw new ServiceError(400, "invalid_run",
+        "Option 2 needs a public program or product website URL. Repo Rewards handles repositories.");
+    }
+  } else if (request.scout_source) {
+    throw new ServiceError(400, "invalid_run",
+      "A scouted program is only valid for Option 2.");
   }
   if (request.mode !== "scout" && request.scout_apply) {
     throw new ServiceError(400, "invalid_run", "Scout apply is only valid for Option 2.");
@@ -590,6 +622,7 @@ function workflowInputs(request) {
     target_ref: request.ref,
     file: request.file,
     goal: request.goal,
+    scout_source: request.scout_source,
     scout_apply: String(request.scout_apply),
     max_cost: cost,
     threshold: String(request.threshold),

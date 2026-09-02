@@ -37,6 +37,10 @@ on:
         description: Goal for refactor mode
         required: false
         type: string
+      scout_source:
+        description: Public program/product website URL to scout
+        required: false
+        type: string
       scout_apply:
         description: Emit Scout integration proposals
         required: true
@@ -66,6 +70,7 @@ on:
       target_ref: {required: true, type: string}
       file: {required: false, type: string, default: ""}
       goal: {required: false, type: string, default: ""}
+      scout_source: {required: false, type: string, default: ""}
       scout_apply: {required: true, type: boolean}
       max_cost: {required: true, type: string}
       threshold: {required: true, type: string}
@@ -117,11 +122,12 @@ jobs:
           INPUT_TARGET_REF: ${{ inputs.target_ref }}
           INPUT_FILE: ${{ inputs.file }}
           INPUT_GOAL: ${{ inputs.goal }}
+          INPUT_SCOUT_SOURCE: ${{ inputs.scout_source }}
           INPUT_MAX_COST: ${{ inputs.max_cost }}
           INPUT_THRESHOLD: ${{ inputs.threshold }}
           INPUT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
         run: |
-          import json, math, os, pathlib, re, urllib.error, urllib.request, uuid
+          import json, math, os, pathlib, re, urllib.error, urllib.parse, urllib.request, uuid
 
           # A called workflow keeps the caller's original event payload. Values
           # computed by the caller (notably github.repository) exist only in the
@@ -134,6 +140,7 @@ jobs:
           ref = os.environ["INPUT_TARGET_REF"]
           file = os.environ["INPUT_FILE"]
           goal = os.environ["INPUT_GOAL"].strip()
+          scout_source = os.environ["INPUT_SCOUT_SOURCE"].strip()
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
@@ -163,6 +170,31 @@ jobs:
                   raise SystemExit("refactor goal is missing or too long")
           elif file or goal:
               raise SystemExit("file and goal are only valid in refactor mode")
+          if mode == "scout":
+              try:
+                  scout_url = urllib.parse.urlsplit(scout_source)
+                  _ = scout_url.port
+              except ValueError:
+                  raise SystemExit("invalid scouted-program URL") from None
+              if (not scout_source or len(scout_source) > 2000
+                      or scout_url.scheme not in {"http", "https"}
+                      or not scout_url.hostname or scout_url.username is not None
+                      or scout_url.password is not None
+                      or any(char.isspace() for char in scout_source)):
+                  raise SystemExit("Scout needs a public program/product website URL")
+              code_hosts = {"github.com", "gitlab.com", "bitbucket.org",
+                            "codeberg.org", "gitea.com"}
+              non_repo_roots = {"about", "collections", "customer-stories",
+                                "enterprise", "events", "explore", "features", "help",
+                                "marketplace", "pricing", "readme", "resources", "security",
+                                "site", "solutions", "sponsors", "topics"}
+              host = scout_url.hostname.lower().removeprefix("www.")
+              parts = [part for part in scout_url.path.split("/") if part]
+              if (host in code_hosts and len(parts) >= 2
+                      and parts[0].lower() not in non_repo_roots):
+                  raise SystemExit("source repositories belong in Repo Rewards, not Scout")
+          elif scout_source:
+              raise SystemExit("scouted program is only valid in scout mode")
 
           request = urllib.request.Request(
               "https://api.github.com/repos/" + repository,
@@ -190,7 +222,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.5.1
+          ref: android-v3.6.0
           path: engine
           persist-credentials: false
 
@@ -265,6 +297,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
+          SCOUT_SOURCE: ${{ inputs.scout_source }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
           SCOUT_APPLY: ${{ inputs.scout_apply }}
           MAX_COST: ${{ inputs.max_cost }}
@@ -329,7 +362,7 @@ jobs:
                 --max-cost "$MAX_COST" 2>&1 | tee mobile-run.log || rc=${PIPESTATUS[0]}
             fi
           elif [ "$MODE" = scout ]; then
-            args=(scout --program "$GITHUB_WORKSPACE/target"
+            args=(scout --target "$GITHUB_WORKSPACE/target" --program "$SCOUT_SOURCE"
               --allow-remote-program-context --no-auto-start
               --repo-rewards-url "https://web-production-d7db7.up.railway.app"
               --allow-remote-repo-rewards --max-cost "$MAX_COST")
@@ -480,8 +513,8 @@ jobs:
             mobile-after.txt
             mobile-phone-summary/orchestrator-receipt.json
             target/*_repo_rewards_report.md
-            target/_scout_report.json
-            target/.flexfactor-scout-proposals.json
+            target/_scout_report*.json
+            target/.flexfactor-scout-proposals*.json
             target/*_audit_report.md
             target/*_readiness.md
           if-no-files-found: warn

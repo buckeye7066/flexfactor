@@ -681,6 +681,7 @@ def build_scout_structured_report(
     *,
     proposals: list[dict] | None = None,
     sandbox_summary: dict | None = None,
+    scout_analysis: dict | None = None,
 ) -> dict:
     """Assemble a schema-versioned Scout report (never claims safe-to-install)."""
     recs = []
@@ -703,6 +704,11 @@ def build_scout_structured_report(
             "summary": (profile or {}).get("summary"),
             "stack": (profile or {}).get("stack") or [],
             "goals": (profile or {}).get("goals") or [],
+            "users": (profile or {}).get("users") or [],
+            "workflows": (profile or {}).get("workflows") or [],
+            "capabilities": (profile or {}).get("capabilities") or [],
+            "optimization_needs": (profile or {}).get("optimization_needs") or [],
+            "coverage_gaps": (profile or {}).get("coverage_gaps") or [],
         },
         "recommendations": recs,
         "proposals": props,
@@ -726,6 +732,8 @@ def build_scout_structured_report(
             "approval_file": FLEXFACTOR_APPLY_APPROVAL_FILE,
         },
     }
+    if scout_analysis is not None:
+        report["program_comparison"] = scout_analysis
     # Self-check: recommendation narratives must not claim safe-to-install.
     # Policy rules may mention the forbidden phrases (to forbid them); those
     # are excluded from the narrative scan. Boolean denial fields are also OK.
@@ -739,11 +747,20 @@ def build_scout_structured_report(
 
 
 def write_scout_artifacts(base_dir: str, structured: dict,
-                          proposals: list[dict] | None = None) -> dict:
+                          proposals: list[dict] | None = None,
+                          *, artifact_slug: str | None = None) -> dict:
     """Write JSON report + proposals next to the program (reversible artifacts)."""
     os.makedirs(base_dir, exist_ok=True)
-    report_path = os.path.join(base_dir, SCOUT_REPORT_JSON)
-    proposal_path = os.path.join(base_dir, SCOUT_PROPOSAL_FILE)
+    clean_slug = re.sub(r"[^a-z0-9._-]+", "-", str(artifact_slug or "").lower()).strip("-.")
+    clean_slug = clean_slug[:120]
+    if clean_slug:
+        report_name = f"_scout_report.{clean_slug}.json"
+        proposal_name = f".flexfactor-scout-proposals.{clean_slug}.json"
+    else:
+        report_name = SCOUT_REPORT_JSON
+        proposal_name = SCOUT_PROPOSAL_FILE
+    report_path = os.path.join(base_dir, report_name)
+    proposal_path = os.path.join(base_dir, proposal_name)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(structured, f, indent=2, default=str)
         f.write("\n")

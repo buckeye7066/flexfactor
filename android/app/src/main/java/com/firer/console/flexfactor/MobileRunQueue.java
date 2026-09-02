@@ -94,6 +94,7 @@ public final class MobileRunQueue {
                 row.put("ref", request.ref);
                 row.put("file", request.file);
                 row.put("goal", request.goal);
+                row.put("scout_source", request.scoutSource);
                 row.put("scout_apply", request.scoutApply);
                 row.put("max_cost", request.maxCost);
                 row.put("threshold", request.threshold);
@@ -122,6 +123,7 @@ public final class MobileRunQueue {
                         MobileRunRequest.Mode.valueOf(row.getString("mode")),
                         row.getString("repository"), row.getString("ref"),
                         row.optString("file", ""), row.optString("goal", ""),
+                        row.optString("scout_source", ""),
                         row.optBoolean("scout_apply", false), row.getDouble("max_cost"),
                         row.optInt("threshold", 90), row.optInt("max_iterations", 6)));
             }
