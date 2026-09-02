@@ -14,6 +14,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}"
+  cancel-in-progress: true
+
 jobs:
   unit-tests:
     name: unit-tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
