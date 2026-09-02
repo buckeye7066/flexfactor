@@ -615,9 +615,11 @@ _PROCESS_LAUNCH_SITES = {
         "FlexFactor-authored, the prompt travels on STDIN and never in argv, "
         "and a recursion guard refuses a nested agent."
     ),
-    "providers/cli_provider.py::ping": (
-        "`<binary> --version` liveness probe for the same provider layer. "
-        "Fixed argv, no repository input."
+    "providers/chatgpt_subscription.py::_codex_version": (
+        "Reads only the installed Codex client's version before an HTTPS "
+        "subscription request. The argv is fixed (`<codex> --version`), has "
+        "a five-second timeout, receives no repository input, and cannot "
+        "execute target-controlled code."
     ),
 }
 

@@ -10,13 +10,22 @@ publication contract on desktop and in the signed Android app.
 - A queue contains from 1 through 30 files or repositories.
 - The orchestrator starts exactly one queued target at a time. A crash resumes
   the durable queue; it never admits the next target while one is active.
+- Before review or research, every mode establishes a purpose contract naming
+  the program's users, core journeys, acceptance criteria, and exact repository
+  evidence. If that understanding cannot be established, mutation does not
+  begin.
 - Audit and Production Ready perform at most six semantic passes. Pass 1 covers
-  the complete repository. Every later pass covers exactly the files whose
-  verified bytes changed in the preceding pass.
+  every Git-visible regular UTF-8 text file—tracked plus untracked and
+  non-ignored, with no extension or hidden-directory filter. Binary,
+  non-regular, and unreadable entries remain explicitly accounted. Every later
+  pass covers exactly the files whose verified bytes changed in the preceding
+  pass.
 - Between passes 1 and 2, FlexFactor researches the top three corroborated
-  competitors and attempts their strongest purpose-compatible, licence-safe
-  capabilities. Those edits pass the same build and independent-review gates as
-  every other edit.
+  competitors. Scout executes public product/documentation URL searches; Repo
+  Rewards separately executes repository searches. FlexFactor fetches the
+  resulting competitor pages before gleaning ideas and attempts the strongest
+  purpose-compatible, licence-safe capabilities. Those edits pass the same
+  build and independent-review gates as every other edit.
 - There are no paid and free routes. Every call starts at the strongest
   available paid or subscription model, descends through lower paid capacity
   only when credit/quota is unavailable, and reaches free/local capacity last.
@@ -36,7 +45,7 @@ publication contract on desktop and in the signed Android app.
 | Mode | Selection | Behavior |
 |---|---|---|
 | Refactor | Up to 30 repository-relative files | Rewrite and grade each file toward its stated goal, then verify, independently review, and land the exact commit. |
-| Scout | Up to 30 repositories | Profile the product and research improvements. Mutation requires explicit Scout apply authorization and then uses the same verification/publication contract. |
+| Scout | Up to 30 repositories | Establish the product purpose, search public competitor URLs with Scout, search repositories with Repo Rewards, and research source-backed improvements. Mutation requires explicit Scout apply authorization and then uses the same verification/publication contract. |
 | Audit | Up to 30 repositories | Whole-repository purpose, defect, test, journey, evidence, competitor, repair, and publication pipeline. |
 | Production Ready | Up to 30 repositories | Audit with the full readiness rubric, medium-severity repair, unattended defaults, and no relaxed completion claim. |
 

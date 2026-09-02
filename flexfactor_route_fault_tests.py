@@ -55,6 +55,7 @@ import unittest
 import urllib.error
 
 import flexfactor_rotation as R
+import flexfactor_capacity as C
 
 # TEST HYGIENE (house rule, see CLAUDE.md): never touch the real
 # ~/.flexfactor. Redirected at IMPORT, before flexfactor is used for anything,
@@ -137,17 +138,37 @@ class RouteFaultTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.store = R.StateStore(os.path.join(self._tmp.name, "rotation-state.json"))
+        # Route-fault tests deliberately create account-wide quota cooldowns.
+        # When the capacity runtime was installed by an earlier test module,
+        # those cooldowns also landed in its process-global persistent store and
+        # the next test waited for the six-hour reset.  Give every test both of
+        # its real ledgers, rotation and capacity, in the same isolated tempdir.
+        self._prior_capacity_manager = C._MANAGER
+        C._MANAGER = C.CapacityManager(C.CapacityState(
+            os.path.join(self._tmp.name, "provider-capacity.json")))
         self._prior_ext = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
         os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "0"
-        for var in ("AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
-                    "AI_ROTATE_STATE", "AITIME_STATE_DIR"):
+        self._isolated_env_names = (
+            "AI_ROTATE", "AI_ROTATE_PIN", "AI_ROTATE_CATALOG",
+            "AI_ROTATE_STATE", "AITIME_STATE_DIR",
+        )
+        self._prior_isolated_env = {
+            var: os.environ.get(var) for var in self._isolated_env_names
+        }
+        for var in self._isolated_env_names:
             os.environ.pop(var, None)
 
     def tearDown(self):
+        C._MANAGER = self._prior_capacity_manager
         if self._prior_ext is None:
             os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
         else:
             os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prior_ext
+        for var, value in self._prior_isolated_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
         self._tmp.cleanup()
 
     def provider(self, cat, failures=None, **kw):

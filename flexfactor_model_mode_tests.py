@@ -68,7 +68,8 @@ class OneAdmissionBoundary(unittest.TestCase):
             pool="ollama:local", cost_class=rot.LOCAL_UNLIMITED,
         )
         with mock.patch.object(rot, "load_catalog", return_value=None), \
-             mock.patch.object(ff, "_builtin_route_catalog", return_value=[ollama]):
+             mock.patch.object(ff, "_builtin_route_catalog", return_value=[ollama]), \
+             mock.patch.object(ff, "_ollama_route_health", return_value=(True, "ok")):
             provider = ff._build_rotating_provider(Args(), None, "best", quiet=True)
         self.assertIsInstance(provider, rot.RotatingProvider)
         self.assertTrue(provider._paid_first)
@@ -86,6 +87,7 @@ class OneAdmissionBoundary(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(rot, "load_catalog", return_value=None), \
              mock.patch.object(ff, "_builtin_route_catalog", return_value=[ollama]), \
+             mock.patch.object(ff, "_ollama_route_health", return_value=(True, "ok")), \
              mock.patch.object(rot.StateStore, "get_pin", return_value="legacy/free"), \
              mock.patch.dict(os.environ, {"AI_ROTATE_PIN": "legacy/free"}), \
              contextlib.redirect_stderr(output):

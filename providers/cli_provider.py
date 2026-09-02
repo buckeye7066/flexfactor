@@ -1,11 +1,12 @@
 """CLI-backed provider adapter for flexfactor_rotation.
 
 Implements the same surface as AnthropicProvider / OpenAIProvider / the Cursor
-adapter so RotatingProvider can call it transparently, but the transport is a
-LOCAL CLI subprocess rather than an HTTP endpoint:
+adapter so RotatingProvider can call it transparently. Claude and Copilot use
+bounded local CLI subprocesses. Codex prefers the owner's exportable ChatGPT
+OAuth subscription over HTTPS and retains the official CLI as a fallback:
 
     api="claude-code"  -> the `claude` CLI   (flat-rate subscription)
-    api="codex-cli"    -> the `codex` CLI    (flat-rate subscription)
+    api="codex-cli"    -> ChatGPT OAuth, then `codex` CLI (flat-rate subscription)
     api="copilot-cli"  -> the `copilot` CLI  (GitHub Copilot entitlement)
 
 WHY THIS EXISTS
@@ -133,8 +134,12 @@ def _argv_for(api: str, binary: str, system: Optional[str],
             argv += ["--append-system-prompt", system]
         return argv
     if api == "codex-cli":
-        # `exec` is codex's non-interactive one-shot mode.
-        return [binary, "exec", "--skip-git-repo-check", "-"]
+        # `exec` is codex's non-interactive one-shot mode. Keep provider calls
+        # ephemeral and read-only: FlexFactor owns every filesystem mutation;
+        # this nested process supplies inference only.
+        return [binary, "exec", "--ephemeral", "--ignore-user-config",
+                "--sandbox", "read-only", "--color", "never",
+                "--skip-git-repo-check", "-"]
     if api == "copilot-cli":
         # Silent programmatic mode reads the prompt from stdin. No tools are
         # allowlisted: FlexFactor needs model inference here, not a second agent
@@ -191,6 +196,20 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
     return out
 
 
+def _inside_managed_codex_session() -> bool:
+    """Whether credentials are brokered to this process instead of exported.
+
+    Work Mode deliberately places short sentinels in ``auth.json`` and keeps
+    the real credential in its parent service. Starting another Codex process
+    there stalls at thread creation and can disconnect the workspace executor.
+    Refuse that known-dead recursion immediately; a normal local Codex session
+    with a real OAuth file takes the direct subscription path before this guard.
+    """
+    return any(os.environ.get(name) for name in (
+        "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_ENVIRONMENT_ID",
+    ))
+
+
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
@@ -233,6 +252,62 @@ class CliProvider:
         self.judge_model = judge_model or model
         self._binary = binary
         self._timeout = float(timeout or DEFAULT_TIMEOUT_S)
+        self._subscription = None
+        if str(api or "").lower() == "codex-cli":
+            # Lazy import keeps the other CLI adapters dependency-free and
+            # preserves their original startup behavior.
+            from providers.chatgpt_subscription import (
+                ChatGPTSubscriptionClient, load_exportable_oauth,
+            )
+            oauth = load_exportable_oauth()
+            if oauth is not None:
+                self._subscription = ChatGPTSubscriptionClient(
+                    oauth, model=model, binary=binary, timeout=self._timeout)
+
+    def _complete(self, prompt: str, *, system: Optional[str],
+                  max_tokens: int, timeout: Optional[float] = None) -> str:
+        if self._subscription is not None:
+            from providers.chatgpt_subscription import (
+                SubscriptionAuthenticationError, SubscriptionUnavailable,
+            )
+            try:
+                answer = self._subscription.complete(
+                    prompt, system=system, max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+            except SubscriptionAuthenticationError as exc:
+                # An access token can expire while the official Codex CLI still
+                # has a refresh token and knows how to renew it. Hand this exact
+                # call to that supported client instead of treating one stale
+                # bearer as proof the paid subscription route is exhausted.
+                if _inside_managed_codex_session():
+                    raise CliUnavailable(
+                        f"{exc}; official Codex CLI refresh is unavailable inside "
+                        "this managed Codex session") from None
+                self._subscription = None
+                return _run_cli(
+                    self.api, self._binary, prompt, system=system,
+                    timeout=float(timeout or self._timeout),
+                    model=self.model,
+                )
+            except SubscriptionUnavailable as exc:
+                # RotatingProvider recognizes CliUnavailable as a fault of this
+                # route and continues down the AI Time ladder.
+                raise CliUnavailable(str(exc)) from None
+            self.model = self._subscription.model or self.model
+            return answer
+        if (self.api == "codex-cli" and os.path.isabs(self._binary)
+                and _inside_managed_codex_session()):
+            raise CliUnavailable(
+                "codex: this managed Codex session brokers its ChatGPT "
+                "credential to the parent service; nested inference is not "
+                "available. Run FlexFactor outside the active Work Mode "
+                "session or provide another AI Time route")
+        return _run_cli(
+            self.api, self._binary, prompt, system=system,
+            timeout=float(timeout or self._timeout),
+            model=self.model,
+        )
 
     #: Cost label. Both CLIs are flat-rate, so rotated calls bill $0.
     #:
@@ -258,26 +333,19 @@ class CliProvider:
     meter: Any = None
 
     def ping(self, **_: Any) -> bool:
-        """Is the CLI actually runnable? A PATH hit is not proof."""
-        if self.api == "copilot-cli":
-            # Unlike a version check, this proves the supplied GitHub token has
-            # a usable Copilot entitlement before a long audit begins.
-            return bool(_run_cli(self.api, self._binary, "Reply with OK only.",
-                                 system=None, timeout=min(self._timeout, 90),
-                                 model=self.model))
-        try:
-            proc = subprocess.run(
-                [self._binary, "--version"], capture_output=True, text=True,
-                timeout=30, env=_recursion_guard_env(), shell=False,
-            )
-            return proc.returncode == 0
-        except Exception:
-            return False
+        """Prove authenticated inference, not merely executable presence."""
+        answer = self._complete(
+            # Reasoning tokens count against the Responses output ceiling. A
+            # 16-token ceiling can consume itself before emitting the two
+            # visible characters and falsely label a healthy route dead.
+            "Reply with OK only.", system=None, max_tokens=256,
+            timeout=min(self._timeout, 60),
+        )
+        return bool(answer.strip())
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
                  max_tokens: int = 4096, **_: Any) -> str:
-        return _run_cli(self.api, self._binary, prompt, system=system,
-                        timeout=self._timeout, model=self.model)
+        return self._complete(prompt, system=system, max_tokens=max_tokens)
 
     def grade(self, prompt: str, *, system: Optional[str] = None,
               max_tokens: int = 4096, **_: Any) -> Dict[str, Any]:
@@ -315,8 +383,8 @@ class CliProvider:
             f"SCHEMA: {json.dumps(schema)}\n\n{prompt}"
         )
         return _extract_json(
-            _run_cli(self.api, self._binary, instruction, system=system or None,
-                     timeout=self._timeout, model=self.model))
+            self._complete(instruction, system=system or None,
+                           max_tokens=max_tokens))
 
 
 def make_cli_provider(route: Any) -> CliProvider:

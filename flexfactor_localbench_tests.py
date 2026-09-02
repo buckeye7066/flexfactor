@@ -29,13 +29,21 @@ def _write_bench(dirpath: str, models: list, floor: float = 5.0) -> None:
 class MeasuredLocalGate(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="ff-bench-")
+        self._prior_state_dir = os.environ.get("AITIME_STATE_DIR")
+        self._prior_exclude = os.environ.get("FLEXFACTOR_ROTATION_EXCLUDE")
         os.environ["AITIME_STATE_DIR"] = self.dir
         os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
         F._LOCAL_BENCH_CACHE = None
 
     def tearDown(self):
-        os.environ.pop("AITIME_STATE_DIR", None)
-        os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
+        if self._prior_state_dir is None:
+            os.environ.pop("AITIME_STATE_DIR", None)
+        else:
+            os.environ["AITIME_STATE_DIR"] = self._prior_state_dir
+        if self._prior_exclude is None:
+            os.environ.pop("FLEXFACTOR_ROTATION_EXCLUDE", None)
+        else:
+            os.environ["FLEXFACTOR_ROTATION_EXCLUDE"] = self._prior_exclude
         F._LOCAL_BENCH_CACHE = None
 
     def test_slow_measurement_excludes(self):

@@ -60,6 +60,10 @@ DEFAULT_QUOTA_COOLDOWN = 3600.0
 ROUTE_ERROR_COOLDOWN = 30.0
 POOL_STRIKE_COOLDOWN = 300.0
 STRIKES_BEFORE_POOL_COOLDOWN = 3
+# Authentication failures normally persist until a credential is refreshed.
+# Bench the credential ledger long enough to avoid re-testing every model that
+# shares it, while still allowing the same call to continue on another backend.
+AUTH_FAILURE_COOLDOWN = 3600.0
 # A route whose own TRANSPORT is dead here (a CLI binary that this account
 # cannot drive, one that has to be killed at its deadline) is not having a bad
 # minute -- it cannot serve this machine at all. MEASURED 2026-08-24 in
@@ -623,6 +627,12 @@ def allowance_key(route: "Route") -> str:
     return f"{route.backend}:{route.cost_class}"
 
 
+def credential_key(route: "Route") -> str:
+    """The backend-scoped credential shared by one or more model routes."""
+    identity = route.auth_env or route.auth_kind or route.cost_class
+    return f"{route.backend}:{identity}"
+
+
 # A 429/quota refusal whose SCOPE is the whole account, not this model. Only
 # shapes measured in this toolchain's own ledgers; a guess here would bench a
 # healthy backend.
@@ -795,6 +805,33 @@ class Rotator:
                 self._no_route_message(requested, allow_paid, reasons), reasons)
         return selection
 
+    def has_usable_route(self, tier: str = FRONTIER, *,
+                         allow_paid: bool = False,
+                         intent: Optional[CallIntent] = None,
+                         paid_first: bool = False,
+                         paid_capacity: Optional[bool] = None,
+                         now: Optional[float] = None) -> bool:
+        """Non-mutating availability probe using the real selection gates.
+
+        This deliberately delegates to ``_pick_in_tier`` rather than maintaining
+        a second, inevitably drifting definition of "available".  It therefore
+        observes pool, allowance, credential, route and purpose cooldowns as
+        well as capability and reviewer-family constraints, without stamping a
+        selection or consuming a rotation turn.
+        """
+        moment = time.time() if now is None else now
+        requested = tier if tier in TIER_CHAIN else LIGHT
+        state = self.store.read()
+        reasons: Dict[str, str] = {}
+        start = TIER_CHAIN.index(requested)
+        return any(
+            self._pick_in_tier(
+                candidate_tier, allow_paid, state, moment, reasons, intent,
+                paid_first=paid_first, paid_capacity=paid_capacity,
+            ) is not None
+            for candidate_tier in TIER_CHAIN[start:]
+        )
+
     # -- pin ---------------------------------------------------------------
     def _resolve_pin(self, pin: str, state: Dict[str, Any], now: float,
                      strict: bool, tier: str, allow_paid: bool,
@@ -819,6 +856,7 @@ class Rotator:
                   and (allow_paid or r.is_free)
                   and not _cooling(state, r.pool, now)
                   and not _cooling(state, f"route:{r.id}", now)
+                  and not _cooling(state, f"credential:{credential_key(r)}", now)
                   and not _cooling(state, f"allowance:{allowance_key(r)}", now)]
         if not usable:
             if strict:
@@ -830,6 +868,8 @@ class Rotator:
                     if _cooling(state, f"allowance:{allowance_key(r)}", now):
                         return (f"{allowance_key(r)} allowance exhausted "
                                 "(account-wide)")
+                    if _cooling(state, f"credential:{credential_key(r)}", now):
+                        return f"{credential_key(r)} credential rejected"
                     return "cooling down"
                 why = "; ".join(f"{r.id}: {_why(r)}" for r in matches[:4])
                 raise PinUnavailable(
@@ -880,6 +920,10 @@ class Rotator:
             if _cooling(state, f"allowance:{allowance_key(route)}", now):
                 reasons[route.pool] = (f"{allowance_key(route)} allowance "
                                        "exhausted (account-wide)")
+                continue
+            if _cooling(state, f"credential:{credential_key(route)}", now):
+                reasons[route.pool] = (f"{credential_key(route)} credential "
+                                       "rejected")
                 continue
             if _cooling(state, f"route:{route.id}", now):
                 continue
@@ -1107,7 +1151,8 @@ class Rotator:
                reset_at: Optional[float] = None) -> None:
         """Record what a call did so the next pick is better informed.
 
-        outcome: ok | rate_limited | quota_exhausted | transport_dead | error
+        outcome: ok | rate_limited | quota_exhausted | auth_failed |
+                 transport_dead | error
         """
         now = time.time() if now is None else now
 
@@ -1162,6 +1207,17 @@ class Rotator:
                 # route, not evidence that its provider is sick.
                 cooldowns[f"route:{route.id}"] = now + float(
                     retry_after_seconds or TRANSPORT_DEAD_COOLDOWN)
+                strikes.pop(route.id, None)
+                return
+
+            if outcome == "auth_failed":
+                # Credentials are backend-scoped, not global. A rejected OpenAI
+                # key says nothing about an authenticated Anthropic, ChatGPT,
+                # local, or free-tier route. Cool the shared credential so every
+                # model behind it is skipped, then let this call try another
+                # backend instead of declaring the entire ladder unavailable.
+                cooldowns[f"credential:{credential_key(route)}"] = (
+                    now + float(retry_after_seconds or AUTH_FAILURE_COOLDOWN))
                 strikes.pop(route.id, None)
                 return
 
@@ -1415,13 +1471,15 @@ class RotatingProvider:
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
+        allow_paid_for_call = self._allow_paid
         for attempt in range(attempts):
             # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
             extra: Dict[str, Any] = {}
             if intent is not None:
                 extra["intent"] = intent
-            if self._paid_first:
+            free_only_fallback = self._allow_paid and not allow_paid_for_call
+            if self._paid_first or free_only_fallback:
                 extra["paid_first"] = True
             try:
                 # The ladder remains active on every attempt. Failed and
@@ -1430,7 +1488,7 @@ class RotatingProvider:
                 try:
                     selection = self.rotator.next_route(
                         tier=tier,
-                        allow_paid=self._allow_paid,
+                        allow_paid=allow_paid_for_call,
                         **extra)
                 except TypeError as exc:
                     # Compatibility with injected/test rotators that implement
@@ -1443,7 +1501,7 @@ class RotatingProvider:
                             or (intent is not None and intent.avoid_families)):
                         raise
                     selection = self.rotator.next_route(
-                        tier=tier, allow_paid=self._allow_paid)
+                        tier=tier, allow_paid=allow_paid_for_call)
             except RotationError as exc:
                 if last_error is None:
                     raise
@@ -1462,6 +1520,18 @@ class RotatingProvider:
             try:
                 result = getattr(self._provider_for(route), method)(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
+                # The shared USD meter can refuse a paid route after the call was
+                # selected. That is a policy boundary, not a provider failure.
+                # Continue the SAME call on genuinely free/local capacity when
+                # present; subscription allowance is deliberately not called
+                # "free" here merely because its marginal token price is zero.
+                if (type(exc).__name__ == "BudgetExceededError"
+                        and route.uses_paid_capacity
+                        and allow_paid_for_call
+                        and self.has_genuine_free_capacity(tier, intent=intent)):
+                    last_error = exc
+                    allow_paid_for_call = False
+                    continue
                 # A PAYLOAD refusal is not this route's doing. Reporting it here
                 # would strike an innocent route and, three payloads later, cool
                 # its whole pool -- see _PAYLOAD_FAULT_MARKERS for the measured
@@ -1498,6 +1568,33 @@ class RotatingProvider:
         return [r for r in self.rotator.catalog.routes
                 if r.tier == tier and r.enabled
                 and (self._allow_paid or r.is_free)]
+
+    def has_genuine_free_capacity(self, tier: Optional[str] = None,
+                                  intent: Optional[CallIntent] = None) -> bool:
+        """Whether this provider can demote to non-paid capacity.
+
+        This intentionally uses ``uses_paid_capacity`` rather than ``is_free``:
+        subscription routes have zero marginal price but still consume an
+        allowance the owner pays for.
+        """
+        requested = tier if tier in TIER_CHAIN else self._tier
+        completed_intent = self._complete_intent(intent)
+        probe = getattr(self.rotator, "has_usable_route", None)
+        if callable(probe):
+            return bool(probe(
+                requested,
+                allow_paid=False,
+                intent=completed_intent,
+                paid_first=True,
+                paid_capacity=False,
+            ))
+        # Compatibility for injected legacy rotators. Production Rotator always
+        # takes the path above, where every selection constraint is enforced.
+        start = TIER_CHAIN.index(requested if requested in TIER_CHAIN else LIGHT)
+        allowed_tiers = set(TIER_CHAIN[start:])
+        return any(route.enabled and route.tier in allowed_tiers
+                   and not route.uses_paid_capacity
+                   for route in self.rotator.catalog.routes)
 
     # -- provider surface --------------------------------------------------
     def complete(self, *args, **kwargs):
@@ -1666,7 +1763,8 @@ def is_route_capability_error(exc: BaseException) -> bool:
     """True when a 4xx names a limit/capability of THIS route specifically.
 
     Such a call is worth retrying on a different route; a genuinely malformed
-    request (and an auth failure) is not.
+    request is not. Authentication is classified separately because it is
+    backend-credential scoped rather than a route capability.
     """
     blob = f"{type(exc).__name__} {exc}".lower()
     if type(exc).__name__ == "RouteCapabilityError":
@@ -1682,6 +1780,8 @@ def _classify(exc: BaseException) -> str:
     blob = f"{type(exc).__name__} {exc}".lower()
     if status == 429 or "rate limit" in blob or "rate_limit" in blob:
         return "rate_limited"
+    if status in (401, 403) and not is_route_capability_error(exc):
+        return "auth_failed"
     if any(m in blob for m in ("quota", "insufficient", "credit", "billing")):
         return "quota_exhausted"
     # Checked AFTER the two allowance outcomes on purpose: a CLI that reports a
@@ -1733,9 +1833,11 @@ def _is_retryable(exc: BaseException) -> bool:
         # malformed request and stays malformed everywhere.
         return is_route_capability_error(exc)
     if isinstance(status, int) and status in (401, 403):
-        # A credential failure is not worth a 641-route tour - unless the body
-        # names a per-route capability refusal (see the 403 marker above).
-        return is_route_capability_error(exc)
+        # Authentication is scoped to the selected backend/credential, not the
+        # whole ladder. ``report(auth_failed)`` benches every model sharing that
+        # credential, so retrying proceeds to a genuinely different route rather
+        # than touring hundreds of models with the same rejected key.
+        return True
     blob = f"{type(exc).__name__} {exc}".lower()
     if is_route_capability_error(exc):
         return True
