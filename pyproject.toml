@@ -19,12 +19,16 @@ dependencies = []
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=2,<3"]
-# Everything needed to run BOTH providers plus the test/dev workflow.
-all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2"]
+# Local, privacy-preserving code-context ranking selected from FutureTools.
+context = ["tenets==0.13.3"]
+# Everything needed to run both providers, local context ranking, and the
+# complete desktop/test workflow.
+all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2", "tenets==0.13.3"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
 flexfactor = "flexfactor:run_cli"
+flexfactor-context = "flexfactor_tenets:run_cli"
 
 [tool.setuptools]
 py-modules = [
@@ -61,6 +65,7 @@ py-modules = [
   "flexfactor_sandbox",
   "flexfactor_scout_contract",
   "flexfactor_self_audit_report",
+  "flexfactor_tenets",
   "flexfactor_trust",
   "flexfactor_web",
   "flexfactor_wip",
@@ -73,9 +78,10 @@ flexfactor_assets = ["*.js"]
 where = ["."]
 include = ["providers*", "competitors*", "tests*", "flexfactor_assets*"]
 
-# Test runner: the suite is stdlib unittest and needs no API keys or network.
+# Test runner: the main suite is stdlib unittest and needs no API keys or network.
 #   python flexfactor_tests.py
+#   python flexfactor_tenets_tests.py
 # or, if pytest is installed:
-#   pytest flexfactor_tests.py
+#   pytest flexfactor_tests.py flexfactor_tenets_tests.py
 [tool.pytest.ini_options]
-python_files = ["flexfactor_tests.py"]
+python_files = ["flexfactor_tests.py", "flexfactor_tenets_tests.py"]
