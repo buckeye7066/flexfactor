@@ -28,6 +28,7 @@ import java.util.zip.ZipInputStream;
 /** Minimal GitHub/OpenAI client for the standalone Android control plane. */
 final class GitHubApi {
     static final String CONTROL_REPOSITORY = "buckeye7066/flexfactor";
+    static final String OAUTH_CLIENT_ID = "Ov23li0JXVXULhuCRr1g";
     static final String API_VERSION = "2026-03-10";
     private static final String GITHUB = "https://api.github.com";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
@@ -38,6 +39,44 @@ final class GitHubApi {
     static final class ConfigurationResult {
         final String login;
         ConfigurationResult(String login) { this.login = login; }
+    }
+
+    static final class DeviceAuthorization {
+        final String deviceCode;
+        final String userCode;
+        final String verificationUri;
+        final long expiresAt;
+        final int intervalSeconds;
+
+        DeviceAuthorization(String deviceCode, String userCode, String verificationUri,
+                long expiresAt, int intervalSeconds) {
+            this.deviceCode = deviceCode;
+            this.userCode = userCode;
+            this.verificationUri = verificationUri;
+            this.expiresAt = expiresAt;
+            this.intervalSeconds = intervalSeconds;
+        }
+    }
+
+    static final class OAuthToken {
+        final String accessToken;
+        final String refreshToken;
+        final long expiresAt;
+
+        OAuthToken(String accessToken, String refreshToken, long expiresAt) {
+            this.accessToken = accessToken;
+            this.refreshToken = refreshToken;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    static final class AuthorizationPendingException extends Exception {
+        final boolean slowDown;
+        AuthorizationPendingException(boolean slowDown) {
+            super(slowDown ? "Authorization is still pending; poll more slowly."
+                    : "Authorization is still pending.");
+            this.slowDown = slowDown;
+        }
     }
 
     static final class Repository {
@@ -129,6 +168,95 @@ final class GitHubApi {
         if (!openAi.isEmpty()) verifyOpenAi(openAi);
         if (!anthropic.isEmpty()) verifyAnthropic(anthropic);
         return new ConfigurationResult(login);
+    }
+
+    DeviceAuthorization beginDeviceAuthorization() throws Exception {
+        JSONObject response = oauthForm("https://github.com/login/device/code",
+                "client_id=" + encode(OAUTH_CLIENT_ID) + "&scope=" + encode("repo workflow"));
+        return requireDeviceAuthorization(response, System.currentTimeMillis());
+    }
+
+    static DeviceAuthorization requireDeviceAuthorization(JSONObject response, long now)
+            throws Exception {
+        String deviceCode = response.optString("device_code", "").trim();
+        String userCode = response.optString("user_code", "").trim();
+        String verificationUri = response.optString("verification_uri", "").trim();
+        int expiresIn = response.optInt("expires_in", 0);
+        int interval = Math.max(5, response.optInt("interval", 5));
+        if (deviceCode.isEmpty() || userCode.isEmpty()
+                || !"https://github.com/login/device".equals(verificationUri)
+                || expiresIn <= 0) {
+            throw new ApiException("GitHub returned an incomplete device sign-in response.");
+        }
+        return new DeviceAuthorization(deviceCode, userCode, verificationUri,
+                now + expiresIn * 1000L, interval);
+    }
+
+    OAuthToken pollDeviceAuthorization(DeviceAuthorization authorization) throws Exception {
+        JSONObject response = oauthForm("https://github.com/login/oauth/access_token",
+                "client_id=" + encode(OAUTH_CLIENT_ID)
+                        + "&device_code=" + encode(authorization.deviceCode)
+                        + "&grant_type=" + encode(
+                                "urn:ietf:params:oauth:grant-type:device_code"));
+        String error = response.optString("error", "");
+        if ("authorization_pending".equals(error)) {
+            throw new AuthorizationPendingException(false);
+        }
+        if ("slow_down".equals(error)) throw new AuthorizationPendingException(true);
+        if (!error.isEmpty()) {
+            throw new ApiException("GitHub sign-in failed: "
+                    + response.optString("error_description", error));
+        }
+        return requireOAuthToken(response);
+    }
+
+    OAuthToken refreshDeviceToken(String refreshToken) throws Exception {
+        JSONObject response = oauthForm("https://github.com/login/oauth/access_token",
+                "client_id=" + encode(OAUTH_CLIENT_ID)
+                        + "&grant_type=refresh_token&refresh_token="
+                        + encode(requireSecret(refreshToken, "GitHub refresh token")));
+        String error = response.optString("error", "");
+        if (!error.isEmpty()) {
+            throw new ApiException("GitHub session refresh failed: "
+                    + response.optString("error_description", error));
+        }
+        return requireOAuthToken(response);
+    }
+
+    static OAuthToken requireOAuthToken(JSONObject response) throws Exception {
+        String access = response.optString("access_token", "").trim();
+        String refresh = response.optString("refresh_token", "").trim();
+        long expiresIn = response.optLong("expires_in", 0L);
+        if (access.isEmpty()) throw new ApiException("GitHub did not return an access token.");
+        long expiresAt = expiresIn <= 0 ? Long.MAX_VALUE
+                : System.currentTimeMillis() + expiresIn * 1000L;
+        return new OAuthToken(access, refresh, expiresAt);
+    }
+
+    private static JSONObject oauthForm(String address, String form) throws Exception {
+        URL url = new URL(address);
+        if (!"github.com".equals(url.getHost()) || !"https".equals(url.getProtocol())) {
+            throw new IllegalArgumentException("OAuth requests must use GitHub HTTPS.");
+        }
+        HttpURLConnection request = connection(url);
+        request.setRequestMethod("POST");
+        request.setRequestProperty("Accept", "application/json");
+        request.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        byte[] body = form.getBytes(StandardCharsets.UTF_8);
+        request.setDoOutput(true);
+        request.setFixedLengthStreamingMode(body.length);
+        try {
+            try (OutputStream output = request.getOutputStream()) { output.write(body); }
+            int status = request.getResponseCode();
+            InputStream input = status >= 400 ? request.getErrorStream() : request.getInputStream();
+            byte[] raw = readLimited(input, 128 * 1024);
+            if (status < 200 || status >= 300) {
+                throw new ApiException("GitHub sign-in request failed (HTTP " + status + ").");
+            }
+            return new JSONObject(new String(raw, StandardCharsets.UTF_8));
+        } finally {
+            request.disconnect();
+        }
     }
 
     List<Repository> repositories(String token) throws Exception {

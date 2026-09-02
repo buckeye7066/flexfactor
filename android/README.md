@@ -1,6 +1,6 @@
 # FlexFactor Android app
 
-Version 3.2 is a standalone Android control plane. Tapping the FlexFactor icon
+Version 3.3 is a standalone Android control plane. Tapping the FlexFactor icon
 opens the complete four-mode launcher; a PC, Termux, a loopback web server, and
 an on-phone model server are not part of its runtime.
 
@@ -12,10 +12,14 @@ sandbox.
 
 ## First launch
 
-Open **Credentials** and enter:
+Tap **Sign in with GitHub**. FlexFactor displays a one-time GitHub device code,
+opens GitHub's authorization page, and stores the resulting short-lived session
+encrypted by Android Keystore. The app refreshes that session automatically;
+the user never creates or pastes a personal access token.
 
-1. A GitHub token for the owner account with repository/workflow access.
-2. Optionally, an OpenAI and/or Anthropic API key. GitHub Copilot and the hosted
+After sign-in, **Provider settings** optionally accepts:
+
+1. An OpenAI and/or Anthropic API key. GitHub Copilot and the hosted
    open-source model use no separate vendor key.
 
 FlexFactor validates the GitHub account before saving anything. A pinned Ollama

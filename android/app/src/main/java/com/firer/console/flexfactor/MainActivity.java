@@ -3,6 +3,9 @@ package com.firer.console.flexfactor;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -60,6 +63,7 @@ public final class MainActivity extends Activity {
     private LinearLayout content;
     private Button repositoryButton;
     private Button providerButton;
+    private Button settingsButton;
     private Button updateButton;
     private TextView accountState;
     private TextView runState;
@@ -78,7 +82,7 @@ public final class MainActivity extends Activity {
                     LAST_RUN_REPOSITORY, GitHubApi.CONTROL_REPOSITORY).apply();
         }
         renderHome();
-        if (!configured()) main.postDelayed(this::showCredentialSetup, 350L);
+        if (!configured()) main.postDelayed(this::startGitHubSignIn, 350L);
         if (directUpdatesEnabled()) {
             main.postDelayed(this::checkForUpdateOnLaunch, 1_500L);
         }
@@ -124,8 +128,10 @@ public final class MainActivity extends Activity {
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        Button settingsButton = button("Credentials");
-        settingsButton.setOnClickListener(view -> showCredentialSetup());
+        settingsButton = button(configured() ? "Provider settings" : "Sign in with GitHub");
+        settingsButton.setOnClickListener(view -> {
+            if (configured()) showCredentialSetup(); else startGitHubSignIn();
+        });
         updateButton = button("Update");
         updateButton.setOnClickListener(view -> startUpdate());
         top.addView(settingsButton, weighted());
@@ -200,12 +206,12 @@ public final class MainActivity extends Activity {
         if (accountState == null) return;
         String login = preferences.getString(LOGIN, "");
         if (configured()) {
-            accountState.setText("GitHub: " + (login.isEmpty() ? "configured" : login)
+            accountState.setText("Signed in as " + (login.isEmpty() ? "GitHub user" : login)
                     + " · Provider: " + providerLabel(selectedProvider())
                     + " · No PC or Termux required");
             accountState.setTextColor(Color.rgb(63, 185, 80));
         } else {
-            accountState.setText("One-time setup needed: GitHub token · OpenAI/Anthropic optional");
+            accountState.setText("Sign in once with GitHub · no token to create or paste");
             accountState.setTextColor(Color.rgb(248, 81, 73));
         }
         if (repositoryButton != null) {
@@ -214,6 +220,9 @@ public final class MainActivity extends Activity {
             repositoryButton.setText(repo.isEmpty() ? "Choose repository" : repo + " · " + ref);
         }
         if (providerButton != null) providerButton.setText(providerLabel(selectedProvider()));
+        if (settingsButton != null) {
+            settingsButton.setText(configured() ? "Provider settings" : "Sign in with GitHub");
+        }
     }
 
     private MobileRunRequest.Provider selectedProvider() {
@@ -262,61 +271,145 @@ public final class MainActivity extends Activity {
         return secrets.contains(SecureStore.GITHUB_TOKEN);
     }
 
+    private void startGitHubSignIn() {
+        if (configured()) {
+            refreshHeader();
+            return;
+        }
+        worker.execute(() -> {
+            try {
+                GitHubApi.DeviceAuthorization authorization = api.beginDeviceAuthorization();
+                post(() -> showDeviceAuthorization(authorization));
+            } catch (Exception failed) {
+                post(() -> showError("GitHub sign-in could not start", safeMessage(failed)));
+            }
+        });
+    }
+
+    private void showDeviceAuthorization(GitHubApi.DeviceAuthorization authorization) {
+        new AlertDialog.Builder(this)
+                .setTitle("Sign in with GitHub")
+                .setMessage("GitHub will ask for this one-time code:\n\n"
+                        + authorization.userCode
+                        + "\n\nThe code is copied automatically. Approve FlexFactor, then return here.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Copy code and open GitHub", (dialog, which) -> {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(
+                            Context.CLIPBOARD_SERVICE);
+                    clipboard.setPrimaryClip(ClipData.newPlainText(
+                            "FlexFactor GitHub code", authorization.userCode));
+                    openExternal(authorization.verificationUri);
+                    pollDeviceAuthorization(authorization);
+                })
+                .show();
+    }
+
+    private void pollDeviceAuthorization(GitHubApi.DeviceAuthorization authorization) {
+        accountState.setText("Waiting for GitHub approval…");
+        worker.execute(() -> {
+            int interval = authorization.intervalSeconds;
+            while (!destroyed && System.currentTimeMillis() < authorization.expiresAt) {
+                try {
+                    Thread.sleep(interval * 1000L);
+                    GitHubApi.OAuthToken token = api.pollDeviceAuthorization(authorization);
+                    GitHubApi.ConfigurationResult configured = api.configure(
+                            token.accessToken, "", "");
+                    saveGitHubSession(token);
+                    preferences.edit().putString(LOGIN, configured.login).apply();
+                    post(() -> {
+                        refreshHeader();
+                        Toast.makeText(this, "FlexFactor is signed in",
+                                Toast.LENGTH_LONG).show();
+                        chooseRepository();
+                    });
+                    return;
+                } catch (GitHubApi.AuthorizationPendingException pending) {
+                    if (pending.slowDown) interval += 5;
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Exception failed) {
+                    post(() -> {
+                        refreshHeader();
+                        showError("GitHub sign-in failed", safeMessage(failed));
+                    });
+                    return;
+                }
+            }
+            post(() -> {
+                refreshHeader();
+                showError("GitHub sign-in expired", "Tap Sign in with GitHub to try again.");
+            });
+        });
+    }
+
+    private synchronized void saveGitHubSession(GitHubApi.OAuthToken token) throws Exception {
+        secrets.put(SecureStore.GITHUB_TOKEN, token.accessToken);
+        if (!token.refreshToken.isEmpty()) {
+            secrets.put(SecureStore.GITHUB_REFRESH_TOKEN, token.refreshToken);
+        }
+        secrets.put(SecureStore.GITHUB_TOKEN_EXPIRES_AT, Long.toString(token.expiresAt));
+    }
+
+    private synchronized String githubToken() throws Exception {
+        String token = secrets.get(SecureStore.GITHUB_TOKEN);
+        String expiry = secrets.get(SecureStore.GITHUB_TOKEN_EXPIRES_AT);
+        long expiresAt = Long.MAX_VALUE;
+        try { if (!expiry.isEmpty()) expiresAt = Long.parseLong(expiry); }
+        catch (NumberFormatException ignored) { expiresAt = 0L; }
+        if (!token.isEmpty() && System.currentTimeMillis() + 300_000L < expiresAt) return token;
+        String refresh = secrets.get(SecureStore.GITHUB_REFRESH_TOKEN);
+        if (refresh.isEmpty()) return token;
+        GitHubApi.OAuthToken renewed = api.refreshDeviceToken(refresh);
+        saveGitHubSession(renewed);
+        return renewed.accessToken;
+    }
+
     private void showCredentialSetup() {
         LinearLayout form = form();
         TextView guidance = text(
-                "Enter your GitHub token once. OpenAI and Anthropic keys are optional; GitHub Copilot and the hosted open model need no vendor key.",
+                "GitHub sign-in is already managed. OpenAI and Anthropic keys are optional; GitHub Copilot and the hosted open model need no vendor key.",
                 14, Color.rgb(170, 181, 194));
-        EditText github = secretInput("GitHub token (repo and workflow access)");
         EditText openAi = secretInput("OpenAI API key (optional)");
         EditText anthropic = secretInput("Anthropic API key (optional)");
-        if (secrets.contains(SecureStore.GITHUB_TOKEN)) github.setHint("GitHub token already saved");
         if (secrets.contains(SecureStore.OPENAI_KEY)) openAi.setHint("OpenAI key already saved");
         if (secrets.contains(SecureStore.ANTHROPIC_KEY)) {
             anthropic.setHint("Anthropic key already saved");
         }
         form.addView(guidance);
-        form.addView(github);
         form.addView(openAi);
         form.addView(anthropic);
 
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("FlexFactor setup")
+                .setTitle("Provider settings")
                 .setView(form)
                 .setNegativeButton("Cancel", null)
-                .setNeutralButton("Credential pages", null)
+                .setNeutralButton("Provider key pages", null)
                 .setPositiveButton("Verify and save", null)
                 .create();
         dialog.setOnShowListener(ignored -> {
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view ->
                     showCredentialLinks());
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-                String githubValue = github.getText().toString().trim();
                 String openAiValue = openAi.getText().toString().trim();
                 String anthropicValue = anthropic.getText().toString().trim();
-                if (githubValue.isEmpty()) githubValue = secrets.get(SecureStore.GITHUB_TOKEN);
                 if (openAiValue.isEmpty()) openAiValue = secrets.get(SecureStore.OPENAI_KEY);
                 if (anthropicValue.isEmpty()) {
                     anthropicValue = secrets.get(SecureStore.ANTHROPIC_KEY);
                 }
-                if (githubValue.isEmpty()) {
-                    github.setError("GitHub token is required.");
-                    return;
-                }
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("Verifying…");
-                configureCredentials(dialog, githubValue, openAiValue, anthropicValue);
+                configureCredentials(dialog, openAiValue, anthropicValue);
             });
         });
         dialog.show();
     }
 
-    private void configureCredentials(AlertDialog dialog, String github, String openAi,
-            String anthropic) {
+    private void configureCredentials(AlertDialog dialog, String openAi, String anthropic) {
         worker.execute(() -> {
             try {
-                GitHubApi.ConfigurationResult result = api.configure(github, openAi, anthropic);
-                secrets.put(SecureStore.GITHUB_TOKEN, github);
+                GitHubApi.ConfigurationResult result = api.configure(
+                        githubToken(), openAi, anthropic);
                 secrets.put(SecureStore.OPENAI_KEY, openAi);
                 secrets.put(SecureStore.ANTHROPIC_KEY, anthropic);
                 preferences.edit().putString(LOGIN, result.login).apply();
@@ -338,12 +431,11 @@ public final class MainActivity extends Activity {
 
     private void showCredentialLinks() {
         new AlertDialog.Builder(this)
-                .setTitle("Create credentials")
-                .setItems(new String[]{"Open GitHub token page", "Open OpenAI API key page",
+                .setTitle("Provider keys")
+                .setItems(new String[]{"Open OpenAI API key page",
                                 "Open Anthropic API key page"},
                         (dialog, which) -> openExternal(which == 0
-                                ? "https://github.com/settings/tokens/new?scopes=repo,workflow&description=FlexFactor%20Android"
-                                : which == 1 ? "https://platform.openai.com/api-keys"
+                                ? "https://platform.openai.com/api-keys"
                                 : "https://console.anthropic.com/settings/keys"))
                 .setNegativeButton("Cancel", null)
                 .show();
@@ -356,7 +448,7 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 List<GitHubApi.Repository> repos = api.repositories(
-                        secrets.get(SecureStore.GITHUB_TOKEN));
+                        githubToken());
                 post(() -> showRepositoryList(repos));
             } catch (Exception failed) {
                 post(() -> {
@@ -553,7 +645,7 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 List<GitHubApi.Repository> repositories = api.repositories(
-                        secrets.get(SecureStore.GITHUB_TOKEN));
+                        githubToken());
                 post(() -> showBatchRepositoryList(
                         repositories, mode, cost, economy, useBoth));
             } catch (Exception failed) {
@@ -623,7 +715,7 @@ public final class MainActivity extends Activity {
             for (MobileRunRequest request : requests) {
                 try {
                     GitHubApi.RunState state = api.dispatch(
-                            secrets.get(SecureStore.GITHUB_TOKEN),
+                            githubToken(),
                             secrets.get(SecureStore.OPENAI_KEY),
                             secrets.get(SecureStore.ANTHROPIC_KEY), request);
                     recordRun(state, request);
@@ -663,7 +755,7 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 GitHubApi.RunState state = api.dispatch(
-                        secrets.get(SecureStore.GITHUB_TOKEN),
+                        githubToken(),
                         secrets.get(SecureStore.OPENAI_KEY),
                         secrets.get(SecureStore.ANTHROPIC_KEY), request);
                 preferences.edit()
@@ -712,7 +804,7 @@ public final class MainActivity extends Activity {
                 if (!record.complete) {
                     try {
                         GitHubApi.RunState state = api.run(
-                                secrets.get(SecureStore.GITHUB_TOKEN), record.repository,
+                                githubToken(), record.repository,
                                 record.id);
                         String label = state.complete()
                                 ? ("success".equals(state.conclusion)
@@ -760,7 +852,7 @@ public final class MainActivity extends Activity {
 
     private boolean requireConfiguration() {
         if (configured()) return true;
-        showCredentialSetup();
+        startGitHubSignIn();
         return false;
     }
 
@@ -902,7 +994,7 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 GitHubApi.RunDetails details = api.runDetails(
-                        secrets.get(SecureStore.GITHUB_TOKEN), repository, id);
+                        githubToken(), repository, id);
                 post(() -> {
                     refreshRunLabel();
                     TextView body = text(details.displayText(), 14, Color.WHITE);
@@ -961,7 +1053,7 @@ public final class MainActivity extends Activity {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
                     worker.execute(() -> {
                         try {
-                            api.submitSteering(secrets.get(SecureStore.GITHUB_TOKEN),
+                            api.submitSteering(githubToken(),
                                     repository, requestId, value);
                             post(() -> {
                                 dialog.dismiss();
