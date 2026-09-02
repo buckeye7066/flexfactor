@@ -198,6 +198,11 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         with open(path, encoding="utf-8") as stream:
             workflow = stream.read()
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        push_trigger = workflow.split("  push:", 1)[1].split("  pull_request:", 1)[0]
+        pull_request_trigger = workflow.split("  pull_request:", 1)[1].split(
+            "  workflow_dispatch:", 1)[0]
+        self.assertNotIn("paths:", push_trigger)
+        self.assertIn("paths:", pull_request_trigger)
         self.assertIn("PREVIOUS_MAIN_SHA: ${{ github.event.before }}", workflow)
         self.assertIn('"${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts"', workflow)
         self.assertIn("git ls-remote --exit-code --tags origin", workflow)
