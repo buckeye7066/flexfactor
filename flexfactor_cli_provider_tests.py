@@ -461,6 +461,37 @@ class ChatGPTSubscriptionTransportTests(unittest.TestCase):
         self.assertNotIn("TOP-SECRET", post.full_url)
         self.assertNotIn("TOP-SECRET", post.data.decode())
 
+    def test_sse_heartbeats_cannot_extend_the_wall_clock_deadline(self):
+        now = [0.0]
+
+        def clock():
+            now[0] += 0.4
+            return now[0]
+
+        heartbeats = [b": keep-alive\n"] * 20
+        with self.assertRaisesRegex(cs.SubscriptionUnavailable, "exceeded 1s"):
+            list(cs._sse_events(
+                heartbeats, deadline=1.0, timeout=1.0, clock=clock))
+
+    def test_expired_oauth_falls_back_to_official_codex_cli_refresh_path(self):
+        def rejected(_request, timeout):
+            raise urllib.error.HTTPError(
+                cs.RESPONSES_URL, 401, "unauthorized", {},
+                io.BytesIO(b'{"error":{"message":"access token expired"}}'))
+
+        oauth = cs.CodexOAuth("OLD-SECRET", "acct-1", "test")
+        with mock.patch.object(cs, "load_exportable_oauth", return_value=oauth), \
+             mock.patch.object(cs, "_codex_version", return_value="0.149.0"), \
+             mock.patch.object(cs.urllib.request, "urlopen", side_effect=rejected), \
+             mock.patch.object(cp, "_inside_managed_codex_session", return_value=False), \
+             mock.patch.object(cp, "_run_cli", return_value="CLI-REFRESHED") as run_cli:
+            provider = cp.CliProvider(
+                "codex-cli", "gpt-5.6-sol", "/bin/codex", timeout=30)
+            self.assertEqual(provider.complete("PROMPT", system="SYSTEM"),
+                             "CLI-REFRESHED")
+        run_cli.assert_called_once()
+        self.assertIsNone(provider._subscription)
+
     def test_http_failure_never_echoes_bearer_and_becomes_cli_unavailable(self):
         def rejected(_request, timeout):
             raise urllib.error.HTTPError(

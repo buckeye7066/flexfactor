@@ -39,6 +39,14 @@ class SubscriptionUnavailable(RuntimeError):
     """The ChatGPT subscription transport could not serve this call."""
 
 
+class SubscriptionAuthenticationError(SubscriptionUnavailable):
+    """The stored OAuth credential was rejected and may need CLI refresh."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
 @dataclass(frozen=True)
 class CodexOAuth:
     access_token: str
@@ -132,11 +140,28 @@ def _output_text(response: Any) -> str:
     return "".join(chunks)
 
 
-def _sse_events(lines: Iterable[bytes]) -> Iterator[Dict[str, Any]]:
-    """Yield JSON data objects from a standards-shaped SSE response."""
+def _sse_events(lines: Iterable[bytes], *, deadline: Optional[float] = None,
+                timeout: Optional[float] = None,
+                clock: Callable[[], float] = time.monotonic
+                ) -> Iterator[Dict[str, Any]]:
+    """Yield JSON data objects from SSE while enforcing a wall-clock deadline.
+
+    Heartbeat/comment lines intentionally yield no event.  Checking time only in
+    the consumer's event loop therefore allowed a server to keep a socket alive
+    forever with heartbeats.  Check around *every raw line* instead.
+    """
+    def check_deadline() -> None:
+        if deadline is not None and clock() >= deadline:
+            label = f"{float(timeout):.0f}s" if timeout is not None else "its deadline"
+            raise SubscriptionUnavailable(
+                f"ChatGPT subscription exceeded {label}")
+
     data: list[str] = []
+    check_deadline()
     for raw_line in lines:
+        check_deadline()
         line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+        check_deadline()
         if not line:
             if data:
                 payload = "\n".join(data)
@@ -152,6 +177,7 @@ def _sse_events(lines: Iterable[bytes]) -> Iterator[Dict[str, Any]]:
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
     if data:
+        check_deadline()
         try:
             value = json.loads("\n".join(data))
         except json.JSONDecodeError:
@@ -209,9 +235,12 @@ class ChatGPTSubscriptionClient:
                 detail = "request was rejected"
             reset = exc.headers.get("Retry-After") if exc.headers else None
             suffix = f"; retry after {reset}s" if reset else ""
-            raise SubscriptionUnavailable(
-                f"ChatGPT subscription HTTP {exc.code}: {detail}{suffix}"
-            ) from None
+            message = f"ChatGPT subscription HTTP {exc.code}: {detail}{suffix}"
+            if exc.code in (401, 403):
+                raise SubscriptionAuthenticationError(message, exc.code) from None
+            error = SubscriptionUnavailable(message)
+            error.status_code = int(exc.code)
+            raise error from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise SubscriptionUnavailable(
@@ -298,10 +327,9 @@ class ChatGPTSubscriptionClient:
 
             deltas = []
             completed: Optional[Dict[str, Any]] = None
-            for event in _sse_events(response):
-                if time.monotonic() - started > call_timeout:
-                    raise SubscriptionUnavailable(
-                        f"ChatGPT subscription exceeded {call_timeout:.0f}s")
+            for event in _sse_events(
+                    response, deadline=started + call_timeout,
+                    timeout=call_timeout):
                 kind = str(event.get("type") or "")
                 if kind == "response.output_text.delta" and isinstance(event.get("delta"), str):
                     deltas.append(event["delta"])

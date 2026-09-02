@@ -798,6 +798,28 @@ class RotatingProviderTests(RotationTestCase):
         state = self.store.read()
         self.assertNotIn("route:paid/frontier", state.get("cooldowns", {}))
 
+    def test_free_capacity_probe_excludes_routes_that_are_cooling(self):
+        free = route("local/qwen", "local:pool", cost=R.LOCAL_UNLIMITED)
+        prov = self._provider(catalog(free))
+        self.assertTrue(prov.has_genuine_free_capacity())
+        prov.rotator.report(free, "transport_dead")
+        self.assertFalse(prov.has_genuine_free_capacity())
+
+    def test_free_capacity_probe_applies_role_capability_and_family_constraints(self):
+        free = route(
+            "local/qwen", "local:pool", cost=R.LOCAL_UNLIMITED,
+            model="qwen3", capabilities=(R.CAP_STRUCTURED_JSON,),
+            capabilities_source="measured",
+        )
+        prov = self._provider(catalog(free))
+        author = R.CallIntent(R.ROLE_AUTHOR, (R.CAP_CODE_AUTHOR,))
+        reviewer = R.CallIntent(
+            R.ROLE_REVIEWER, (R.CAP_STRUCTURED_JSON,),
+            avoid_families=("qwen",),
+        )
+        self.assertFalse(prov.has_genuine_free_capacity(intent=author))
+        self.assertFalse(prov.has_genuine_free_capacity(intent=reviewer))
+
     def test_rotation_exhaustion_reports_the_real_provider_error(self):
         """When every pool has genuinely failed, the raise must carry the last
         provider error as its cause - a bare 'no route available' after a real
@@ -1083,40 +1105,33 @@ class VerificationFailClosedTests(RotationTestCase):
     # -- Credential mismatch -----------------------------------------------
 
     def test_credential_mismatch_blocks_assignment(self):
-        """A 401 on the provider propagates as-is — it is never swallowed."""
+        """A 401 still blocks when every independent credential is exhausted."""
         prov = self._all_fail(Boom("invalid API key", status_code=401), n_pools=1)
-        with self.assertRaises(Boom) as ctx:
+        with self.assertRaises(R.RotationError) as ctx:
             prov.complete("assign provider coverage")
         self.assertIn("invalid API key", str(ctx.exception))
 
-    def test_credential_mismatch_is_not_retried_across_pools(self):
-        """A 401 must raise immediately — rotating through all pools is wrong.
+    def test_preflight_continues_after_one_backend_rejects_its_credential(self):
+        """A stale key on backend A must not hide healthy backend B."""
+        bad = route("a/bad", "pool-a", tier=R.LIGHT)
+        good = route("b/good", "pool-b", tier=R.LIGHT)
+        prov = self._provider(
+            catalog(bad, good),
+            failures={bad.id: Boom("unauthorized", status_code=401)},
+        )
+        self.assertTrue(prov.ping())
+        self.assertEqual(prov.model, "good")
+        cooldowns = prov.rotator.store.read().get("cooldowns", {})
+        self.assertIn(f"credential:{R.credential_key(bad)}", cooldowns)
 
-        A bad API key is bad on every backend.  If _is_retryable ever returned
-        True for a 401, both pools would be attempted and call_log would contain
-        two entries; this assertion catches that regression.
-        """
-        call_log: list = []
-        cat = catalog(route("a/m", "pool-a"), route("b/m", "pool-b"))
-        prov = self._tracked_provider(
-            cat, Boom("unauthorized", status_code=401), call_log)
-        with self.assertRaises(Boom):
-            prov.complete("x")
-        self.assertEqual(len(call_log), 1,
-                         f"a 401 must not rotate to a second pool; "
-                         f"attempted: {call_log}")
-
-    def test_forbidden_response_also_blocks_without_rotation(self):
-        """A 403 (Forbidden) is treated identically to 401 — not retried."""
+    def test_forbidden_responses_try_each_independent_backend_then_block(self):
         call_log: list = []
         cat = catalog(route("a/m", "pool-a"), route("b/m", "pool-b"))
         prov = self._tracked_provider(
             cat, Boom("forbidden", status_code=403), call_log)
-        with self.assertRaises(Boom):
+        with self.assertRaises(R.RotationError):
             prov.complete("x")
-        self.assertEqual(len(call_log), 1,
-                         f"a 403 must not rotate to a second pool; "
-                         f"attempted: {call_log}")
+        self.assertEqual(call_log, ["a/m", "b/m"])
 
     # -- General fail-closed invariant -------------------------------------
 
@@ -1145,8 +1160,7 @@ class VerificationFailClosedTests(RotationTestCase):
 
 
 class RouteRefusal403Tests(unittest.TestCase):
-    """A 403 that names a per-route capability refusal must rotate; a plain
-    403 (wrong key) must still fail fast."""
+    """Both route-capability and backend-credential 403s can try another route."""
 
     class _Exc(Exception):
         def __init__(self, msg, status):
@@ -1159,10 +1173,12 @@ class RouteRefusal403Tests(unittest.TestCase):
                         "agent', 'code': 403}}", 403)
         self.assertTrue(R.is_route_capability_error(exc))
         self.assertTrue(R._is_retryable(exc))
+        self.assertEqual(R._classify(exc), "error")
 
-    def test_plain_403_still_fails_fast(self):
+    def test_plain_403_rotates_to_an_independent_backend(self):
         exc = self._Exc("Error code: 403 - {'error': {'message': 'Forbidden'}}", 403)
-        self.assertFalse(R._is_retryable(exc))
+        self.assertTrue(R._is_retryable(exc))
+        self.assertEqual(R._classify(exc), "auth_failed")
 
 
 if __name__ == "__main__":
