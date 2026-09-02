@@ -13106,6 +13106,77 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     return (r.returncode == 0, _tail(r.stdout + "\n" + r.stderr, 40))
 
 
+def _write_and_run_generated_test_batch(
+        project_dir: str, candidates: list[dict], stack: dict,
+) -> tuple[list[dict], bool | None, str, str, list[str]]:
+    """Parse a complete model-generated test batch before its first write.
+
+    Returns ``(written_entries, test_status, test_log, refusal, rollback_failed)``.
+    A non-empty refusal means no test command ran. Invalid syntax and source
+    types without a safe in-process parser both fail closed. The all-before-any
+    preflight prevents a valid first entry from reaching the worktree when a
+    later entry is malformed. A contained-write race rolls back every earlier
+    new file before returning.
+    """
+    prepared: list[dict] = []
+    seen_paths: set[str] = set()
+    for index, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            return [], None, "", (
+                f"generated test entry {index} is not an object"
+            ), []
+        path = str(item.get("path") or "").replace("\\", "/")
+        contents = item.get("contents")
+        if not path or not isinstance(contents, str) or not contents.strip():
+            return [], None, "", (
+                f"generated test entry {index} has no non-empty text source"
+            ), []
+        key = os.path.normcase(path)
+        if key in seen_paths:
+            return [], None, "", (
+                f"generated test batch names duplicate path {path!r}"
+            ), []
+        seen_paths.add(key)
+        existence = _contained_existence(project_dir, path)
+        if existence != "missing":
+            return [], None, "", (
+                f"generated test refused overwrite of {path!r} "
+                f"({existence}); existing tests are owner code"
+            ), []
+        syntax_ok, syntax_note = _inproc_source_syntax_ok(path, contents)
+        if syntax_ok is not True:
+            return [], None, "", (
+                f"generated test source rejected before write for {path}: "
+                f"{syntax_note}"
+            ), []
+        normalized = dict(item)
+        normalized.update(path=path, contents=contents)
+        prepared.append(normalized)
+
+    if not prepared:
+        return [], None, "", "no non-empty generated test source was produced", []
+
+    written_entries: list[dict] = []
+    for item in prepared:
+        written = _write_contained(project_dir, item["path"], item["contents"])
+        if written is None:
+            rollback_failed = [
+                entry["path"] for entry in written_entries
+                if not _unlink_contained(project_dir, entry["path"])
+            ]
+            return [], None, "", (
+                f"generated test contained write was refused for {item['path']!r}"
+            ), rollback_failed
+        normalized = dict(item)
+        normalized["path"] = os.path.relpath(
+            written, project_dir
+        ).replace("\\", "/")
+        written_entries.append(normalized)
+
+    status, log = _run_unit_tests(project_dir, stack)
+    return written_entries, status, log, "", []
+
+
 def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
                          allow_scripts: bool = False) -> list:
     """Install every detected component's dependencies through the gated `_run`.
@@ -17495,6 +17566,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         test_files: list[str] = []
         tests_by_source: dict[str, list[str]] = {}
         tests_by_capability: dict[str, list[str]] = {}
+        generated_test_candidates: list[dict] = []
+        generated_test_batch_refused = False
         test_status = None
         if (args.tests and stack.get("test_cmd") and not dirty_abort
                 and not infrastructure_abort):
@@ -17567,32 +17640,68 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     p = str(f.get("path") or "").replace("\\", "/")
                     if not p or not (f.get("contents") or "").strip():
                         continue
-                    existence = _contained_existence(project_dir, p)
-                    if existence != "missing":
-                        print(f"{pfx}[skip] generated test refused overwrite of "
-                              f"{p!r} ({existence}); existing tests are owner code")
-                        manual_review.add(rel)
-                        continue
-                    written = _write_contained(project_dir, p, f["contents"])
-                    if written is None:  # escapes repo / symlinked leaf -> refuse
-                        print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
-                        manual_review.add(rel)
-                        continue
-                    _test_rel = os.path.relpath(written, project_dir).replace("\\", "/")
-                    test_files.append(_test_rel)
-                    tests_by_source.setdefault(rel.replace("\\", "/"), []).append(_test_rel)
-                    _capability_test_evidence = (
-                        _ff_product_invariants.collect_capability_test_evidence(
-                            test_path=_test_rel,
-                            contents=str(f.get("contents") or ""),
-                            required_capabilities=_required_capabilities,
+                    # Do not write here. Every model-generated test from every
+                    # changed source is accumulated first, then the shared batch
+                    # chokepoint parses ALL of them before writing ANY of them.
+                    generated_test_candidates.append({
+                        "path": p,
+                        "contents": f["contents"],
+                        "source": rel.replace("\\", "/"),
+                        "required_capabilities": _required_capabilities,
+                    })
+
+            generated_test_status = None
+            generated_test_log = ""
+            if generated_test_candidates:
+                (written_tests, generated_test_status, generated_test_log,
+                 refusal, rollback_failed) = _write_and_run_generated_test_batch(
+                    project_dir, generated_test_candidates, stack,
+                )
+                if refusal:
+                    generated_test_batch_refused = True
+                    affected_sources = {
+                        str(item.get("source") or "")
+                        for item in generated_test_candidates
+                        if item.get("source")
+                    }
+                    manual_review.update(affected_sources)
+                    print(f"{pfx}[skip] generated test batch refused: {refusal}")
+                    all_findings.append({
+                        "file": "(unit tests)", "line": 0, "severity": "high",
+                        "category": "test-coverage",
+                        "title": "Generated test source failed pre-write validation",
+                        "problem": refusal,
+                        "fix": ("Generate complete parser-valid test source; unsupported "
+                                "source types require a safe in-process parser."),
+                    })
+                    if rollback_failed:
+                        dirty_abort = True
+                        manual_review.update(rollback_failed)
+                        fix_notes.append(
+                            "generated-test pre-run rollback refused for: "
+                            + ", ".join(rollback_failed)
                         )
-                    )
-                    for _capability_id, _paths in _capability_test_evidence.items():
-                        tests_by_capability.setdefault(
-                            _capability_id, []).extend(_paths)
+                else:
+                    for item in written_tests:
+                        _test_rel = item["path"]
+                        _source_rel = str(item.get("source") or "")
+                        _required_capabilities = list(
+                            item.get("required_capabilities") or []
+                        )
+                        test_files.append(_test_rel)
+                        tests_by_source.setdefault(_source_rel, []).append(_test_rel)
+                        _capability_test_evidence = (
+                            _ff_product_invariants.collect_capability_test_evidence(
+                                test_path=_test_rel,
+                                contents=item["contents"],
+                                required_capabilities=_required_capabilities,
+                            )
+                        )
+                        for _capability_id, _paths in _capability_test_evidence.items():
+                            tests_by_capability.setdefault(
+                                _capability_id, []).extend(_paths)
             if test_files:
-                ok, log = _run_unit_tests(project_dir, stack)
+                ok, log = generated_test_status, generated_test_log
                 test_status = ok
                 # `ok` is TRI-STATE (_run_unit_tests -> bool | None). Read it
                 # with `is True`, never truthiness: the two happen to agree for
@@ -17662,7 +17771,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
-            elif test_candidates:
+            elif test_candidates and not generated_test_batch_refused:
                 manual_review.update(test_candidates)
                 all_findings.append({
                     "file": "(unit tests)", "line": 0, "severity": "high",

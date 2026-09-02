@@ -4090,6 +4090,90 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         forbidden_publish.assert_not_called()
 
 
+class GeneratedTestSourcePreflightTests(unittest.TestCase):
+    """Audit/Production Ready parse every generated test before any write."""
+
+    def test_invalid_later_test_reaches_neither_writer_nor_runner(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid generated test reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("invalid generated test reached runner")
+        )
+        candidates = [
+            {"path": "tests/good.py", "contents": "VALUE = 1\n"},
+            {"path": "tests/broken.py", "contents": "This is not Python.\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("broken.py", refusal)
+        self.assertIn("rejected before write", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
+        runner = mock.Mock(return_value=(True, "two tests passed"))
+        candidates = [
+            {"path": "tests/one.py", "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/two.json", "contents": '{"case": 2}\n'},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run_unit_tests", runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "one.py")))
+            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "two.json")))
+        self.assertEqual(["tests/one.py", "tests/two.json"],
+                         [item["path"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("two tests passed", log)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+        runner.assert_called_once()
+        self.assertIn(
+            "_write_and_run_generated_test_batch(",
+            inspect.getsource(ff.audit_one_program),
+        )
+
+    def test_duplicate_generated_path_is_refused_before_overwrite(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("duplicate generated path reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("duplicate generated path reached runner")
+        )
+        candidates = [
+            {"path": "tests/same.py", "contents": "VALUE = 1\n"},
+            {"path": "tests/same.py", "contents": "VALUE = 2\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+
 class PathContainmentTests(unittest.TestCase):
     """Round-3 defect 2: model-generated paths must be contained to the repo; a
     write outside project_dir is a sandbox escape."""
