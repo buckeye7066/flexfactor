@@ -25,7 +25,7 @@ public final class GitHubDeviceFlowTest {
     }
 
     @Test
-    public void deviceResponseRejectsAnUntrustedVerificationHost() {
+    public void deviceResponseRejectsAnUntrustedVerificationHost() throws Exception {
         JSONObject response = new JSONObject()
                 .put("device_code", "device-secret")
                 .put("user_code", "ABCD-1234")
@@ -36,7 +36,7 @@ public final class GitHubDeviceFlowTest {
     }
 
     @Test
-    public void tokenResponseRequiresAnAccessToken() {
+    public void tokenResponseRequiresAnAccessToken() throws Exception {
         assertThrows(GitHubApi.ApiException.class,
                 () -> GitHubApi.requireOAuthToken(new JSONObject()));
     }
