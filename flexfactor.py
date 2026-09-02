@@ -13131,6 +13131,15 @@ def _write_and_run_generated_test_batch(
             return [], None, "", (
                 f"generated test entry {index} has no non-empty text source"
             ), []
+        components = _rel_components(path)
+        if components is None:
+            return [], None, "", (
+                f"generated test entry {index} has an invalid repository path"
+            ), []
+        # One canonical spelling is both the worktree identity and the
+        # duplicate key.  Without this, `tests/x.py` and `./tests//x.py`
+        # preflight as two missing files but write the same leaf twice.
+        path = "/".join(components)
         key = os.path.normcase(path)
         if key in seen_paths:
             return [], None, "", (
@@ -13168,7 +13177,7 @@ def _write_and_run_generated_test_batch(
                 f"generated test contained write was refused for {item['path']!r}"
             ), rollback_failed
         normalized = dict(item)
-        # Keep the already-validated repository-relative identity.  The
+        # Keep the already-validated canonical repository-relative identity. The
         # contained writer may return an absolute path whose Windows spelling
         # differs from ``project_dir`` (for example through a temp-directory
         # alias or junction); deriving identity from that host path can create

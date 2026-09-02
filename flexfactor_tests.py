@@ -4150,7 +4150,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
 
     def test_writer_host_path_cannot_replace_validated_relative_identity(self):
         candidates = [
-            {"path": "tests/one.py", "contents": "VALUE = 1\n"},
+            {"path": "./tests//one.py", "contents": "VALUE = 1\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(
@@ -4178,7 +4178,7 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         )
         candidates = [
             {"path": "tests/same.py", "contents": "VALUE = 1\n"},
-            {"path": "tests/same.py", "contents": "VALUE = 2\n"},
+            {"path": "./tests//same.py", "contents": "VALUE = 2\n"},
         ]
         with _tempfile_ceiling.TemporaryDirectory() as project, \
              mock.patch.object(ff, "_write_contained", forbidden_write), \
