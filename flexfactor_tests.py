@@ -4734,6 +4734,53 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertFalse(ff._runner_collectable_generated_test_path(rel))
 
+    def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
+        cases = (
+            "test.skip('skipped', () => {});\n",
+            "it.skip('skipped', () => {});\n",
+            "test.todo('later');\n",
+            "it.todo('later');\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("non-running test reached writer")
+            )
+            forbidden_runner = mock.Mock(
+                side_effect=AssertionError("non-running test reached runner")
+            )
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "javascript parse"),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/generated_{index}.test.js",
+                          "contents": source}],
+                        {"test_cmd": ["npm", "test"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            forbidden_runner.assert_not_called()
+
+    def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
+        for source in (
+                "test('runs', () => {});",
+                "it.only('runs', () => {});",
+                "test.each([[1]])('runs %s', () => {});",
+                "test.only.each([[1]])('runs %s', () => {});"):
+            with self.subTest(source=source):
+                self.assertTrue(ff._generated_test_source_has_case(
+                    "tests/generated.test.js", source,
+                ))
+
     def test_success_exit_without_collection_evidence_is_a_failure(self):
         candidates = [
             {"path": "tests/test_one.py",

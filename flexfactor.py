@@ -13873,7 +13873,10 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
         ))
     if ext in _GENERATED_JS_TEST_EXTS:
         return bool(re.search(
-            r"(?<![\w$])(?:it|test)\s*(?:\.\s*(?:each|only|skip|todo)\s*)?\(",
+            # Only declarations that can execute count. ``skip``/``todo`` are
+            # deliberately absent: an unrelated existing test can make the
+            # suite green while every generated declaration is skipped.
+            r"(?<![\w$])(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\(",
             source,
         ))
     return False
