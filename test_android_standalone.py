@@ -44,10 +44,28 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
     pin and reusable-workflow pin to the Android release version.
     """
 
-    def test_the_cloud_engine_ref_matches_the_android_release(self):
+    def test_cloud_engine_ref_is_current_or_explicitly_staged_one_patch(self):
         source = (CLOUD / "lib" / "config.js").read_text(encoding="utf-8")
-        self.assertIn(
-            f'ENGINE_REF = "android-v{_android_version_name()}"', source)
+        match = re.search(r'ENGINE_REF = "(android-v[^"]+)"', source)
+        self.assertIsNotNone(match, "cloud config has no engine release pin")
+        cloud_ref = match.group(1)
+        android_ref = f"android-v{_android_version_name()}"
+        marker = CLOUD / "ENGINE_ROLLOUT_PENDING"
+        if cloud_ref == android_ref:
+            self.assertFalse(
+                marker.exists(),
+                "remove the completed engine rollout marker",
+            )
+        else:
+            self.assertTrue(
+                marker.is_file(),
+                "a cloud/Android version split requires an explicit rollout marker",
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), android_ref)
+            cloud_version = tuple(map(int, cloud_ref.removeprefix("android-v").split(".")))
+            android_version = tuple(map(int, _android_version_name().split(".")))
+            self.assertEqual(cloud_version[:2], android_version[:2])
+            self.assertEqual(cloud_version[2] + 1, android_version[2])
         self.assertFalse(
             (ANDROID / "java" / "com" / "firer" / "console" / "flexfactor" /
              "MobileWorkflow.java").exists(),
