@@ -1,9 +1,30 @@
 # Safely refresh a desktop checkout before its launcher asks any questions.
 #
-# Desktop shortcuts point at files inside a checkout. Without this preflight, a
-# shortcut can keep running an obsolete launcher forever even after GitHub main
-# has removed an old execution path. Only a clean, non-diverged main checkout
-# is fast-forwarded; local work is never overwritten or merged automatically.
+# Desktop shortcuts point at files inside a checkout. The runtime must never
+# silently continue with a stale or locally modified FlexFactor tree. On the
+# owner's canonical checkout we preserve local work first, bind the working
+# tree to origin/main, reconcile dependency changes, and restart the launcher.
+
+function Stop-FlexFactorSourceRefresh {
+    param([Parameter(Mandatory = $true)][string]$Message, [int]$Code = 5)
+    Write-Host "[source] $Message" -ForegroundColor Red
+    Write-Host "[source] FlexFactor will not run from an unverified/stale checkout." -ForegroundColor Yellow
+    exit $Code
+}
+
+function Restart-FlexFactorLauncher {
+    param(
+        [Parameter(Mandatory = $true)][string]$LauncherPath,
+        [object[]]$ForwardedArgs = @()
+    )
+    $powershell = Join-Path $PSHOME "powershell.exe"
+    if (-not (Test-Path -LiteralPath $powershell)) {
+        $powershell = (Get-Process -Id $PID).Path
+    }
+    & $powershell -NoProfile -ExecutionPolicy Bypass -File $LauncherPath @ForwardedArgs
+    $childExit = $LASTEXITCODE
+    exit $childExit
+}
 
 function Invoke-FlexFactorSourceRefresh {
     param(
@@ -13,16 +34,19 @@ function Invoke-FlexFactorSourceRefresh {
     )
 
     if ($env:FLEXFACTOR_SKIP_SOURCE_REFRESH -eq "1") { return }
-    if (-not (Test-Path (Join-Path $Repository ".git"))) { return }
+    if (-not (Test-Path (Join-Path $Repository ".git"))) {
+        Stop-FlexFactorSourceRefresh "The desktop launcher is not inside a Git checkout: $Repository"
+    }
 
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (-not $git) {
-        Write-Host "[source] Git is unavailable; using the installed checkout." -ForegroundColor Yellow
-        return
+        Stop-FlexFactorSourceRefresh "Git is unavailable, so current origin/main cannot be verified."
     }
 
     $origin = (& $git.Source -C $Repository remote get-url origin 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) { return }
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) {
+        Stop-FlexFactorSourceRefresh "The checkout has no readable origin remote."
+    }
     $normalizedOrigin = "$origin".Trim().TrimEnd("/").ToLowerInvariant()
     if ($normalizedOrigin -notin @(
         "https://github.com/buckeye7066/flexfactor.git",
@@ -32,38 +56,29 @@ function Invoke-FlexFactorSourceRefresh {
         "ssh://git@github.com/buckeye7066/flexfactor.git",
         "ssh://git@github.com/buckeye7066/flexfactor"
     )) {
-        Write-Host "[source] This is a fork; automatic upstream refresh was not attempted." -ForegroundColor DarkGray
-        return
+        Stop-FlexFactorSourceRefresh "This desktop checkout is not bound to buckeye7066/flexfactor origin."
     }
 
     $branch = (& $git.Source -C $Repository branch --show-current 2>$null | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0 -or "$branch".Trim() -ne "main") {
-        Write-Host "[source] Not on main; automatic refresh was not attempted." -ForegroundColor DarkGray
-        return
+        Stop-FlexFactorSourceRefresh "The desktop checkout must be on main before it can run. Current branch: $branch"
     }
 
     $dependencyMarker = Join-Path $Repository ".git\flexfactor-refresh-needs-install"
     if (Test-Path $dependencyMarker) {
         $venvPython = Join-Path $Repository ".venv\Scripts\python.exe"
         if (-not (Test-Path $venvPython)) {
-            Write-Host "[source] The updated source requires dependency reconciliation." -ForegroundColor Yellow
-            Write-Host "[source] Run: py -3.12 -m venv .venv" -ForegroundColor Yellow
-            Write-Host '[source] Then: .venv\Scripts\python.exe -m pip install -e ".[all]"' -ForegroundColor Yellow
-            exit 4
+            Stop-FlexFactorSourceRefresh "The updated source requires dependency reconciliation, but .venv is missing." 4
         }
         $quotedRepo = '"' + $Repository.Replace('"', '\"') + '[all]"'
         $install = Start-Process -FilePath $venvPython -NoNewWindow -PassThru `
             -ArgumentList @("-m", "pip", "install", "--disable-pip-version-check", "-e", $quotedRepo)
         if (-not $install.WaitForExit(600000)) {
             Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "[source] Dependency reconciliation timed out after 10 minutes." -ForegroundColor Red
-            Write-Host '[source] Run: .venv\Scripts\python.exe -m pip install -e ".[all]"' -ForegroundColor Yellow
-            exit 4
+            Stop-FlexFactorSourceRefresh "Dependency reconciliation timed out after 10 minutes." 4
         }
         if ($install.ExitCode -ne 0) {
-            Write-Host "[source] Dependency reconciliation failed with exit $($install.ExitCode)." -ForegroundColor Red
-            Write-Host '[source] Run: .venv\Scripts\python.exe -m pip install -e ".[all]"' -ForegroundColor Yellow
-            exit 4
+            Stop-FlexFactorSourceRefresh "Dependency reconciliation failed with exit $($install.ExitCode)." 4
         }
         Remove-Item -LiteralPath $dependencyMarker -Force
     }
@@ -73,45 +88,77 @@ function Invoke-FlexFactorSourceRefresh {
         -ArgumentList @("-C", $quotedRepository, "fetch", "--quiet", "--no-tags", "origin", "main")
     if (-not $fetch.WaitForExit(30000)) {
         Stop-Process -Id $fetch.Id -Force -ErrorAction SilentlyContinue
-        Write-Host "[source] GitHub update check timed out after 30 seconds; using the installed checkout." -ForegroundColor Yellow
-        return
+        Stop-FlexFactorSourceRefresh "GitHub update check timed out after 30 seconds."
     }
     if ($fetch.ExitCode -ne 0) {
-        Write-Host "[source] Could not check GitHub for an update; using the installed checkout." -ForegroundColor Yellow
-        return
+        Stop-FlexFactorSourceRefresh "Could not verify GitHub origin/main."
     }
 
     $head = (& $git.Source -C $Repository rev-parse HEAD 2>$null | Select-Object -First 1)
     $upstream = (& $git.Source -C $Repository rev-parse origin/main 2>$null | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($head) -or
-        [string]::IsNullOrWhiteSpace($upstream) -or "$head".Trim() -eq "$upstream".Trim()) {
-        return
+        [string]::IsNullOrWhiteSpace($upstream)) {
+        Stop-FlexFactorSourceRefresh "Could not resolve local HEAD and origin/main."
     }
+    $head = "$head".Trim()
+    $upstream = "$upstream".Trim()
 
-    & $git.Source -C $Repository merge-base --is-ancestor HEAD origin/main 2>$null
+    # IMPORTANT: inspect the working tree BEFORE the HEAD==origin/main shortcut.
+    # A checkout can point at the exact current commit while flexfactor.py or a
+    # launcher is locally modified. The previous ordering silently ran those
+    # modified/stale bytes and is how a repaired defect could appear to return.
+    $changes = @(& $git.Source -C $Repository status --porcelain --untracked-files=all 2>$null)
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[source] Local main has commits not on GitHub; it was not overwritten." -ForegroundColor Yellow
-        Write-Host "[source] Update that checkout manually before relying on this launcher." -ForegroundColor Yellow
-        return
+        Stop-FlexFactorSourceRefresh "Could not inspect the working tree."
     }
 
-    $changes = @(& $git.Source -C $Repository status --porcelain 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $changes.Count -gt 0) {
-        Write-Host "[source] Local files are modified; they were not overwritten." -ForegroundColor Yellow
-        Write-Host "[source] Update that checkout manually before relying on this launcher." -ForegroundColor Yellow
-        return
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $preserved = $false
+    if ($changes.Count -gt 0) {
+        $stashMessage = "FlexFactor auto-preserved before verified source refresh $stamp"
+        & $git.Source -C $Repository stash push --include-untracked -m $stashMessage *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Stop-FlexFactorSourceRefresh "Local work exists and could not be preserved with git stash."
+        }
+        $remaining = @(& $git.Source -C $Repository status --porcelain --untracked-files=all 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $remaining.Count -gt 0) {
+            Stop-FlexFactorSourceRefresh "Local work was preserved incompletely; refusing to overwrite it."
+        }
+        $preserved = $true
+        Write-Host "[source] Preserved local edits in git stash: $stashMessage" -ForegroundColor Yellow
     }
 
-    # `git status` intentionally hides ignored files. Git merge may replace an
-    # ignored file when the incoming commit starts tracking that exact path, so
-    # refuse such a collision before the fast-forward. `--no-renames` makes a
-    # rename destination appear as an addition and therefore receive the same
-    # protection. Case-insensitive Test-Path also covers Windows case drift.
+    $incomingChanges = @(& $git.Source -C $Repository diff --name-only HEAD origin/main 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Stop-FlexFactorSourceRefresh "Could not inspect incoming source changes."
+    }
+    $dependencyFiles = @(
+        "pyproject.toml", "requirements.txt", "requirements-dev.txt",
+        "setup.cfg", "setup.py"
+    )
+    $dependenciesChanged = @($incomingChanges | Where-Object { $_ -in $dependencyFiles }).Count -gt 0
+
+    # Protect local commits too. If main diverged/ahead, anchor the old HEAD on
+    # a rescue branch before resetting the executable checkout to authoritative
+    # origin/main. Nothing is discarded; it simply stops being executable main.
+    & $git.Source -C $Repository merge-base --is-ancestor HEAD origin/main 2>$null
+    $fastForwardable = ($LASTEXITCODE -eq 0)
+    if (-not $fastForwardable -and $head -ne $upstream) {
+        $rescue = "flexfactor/local-preserved-$stamp-$PID"
+        & $git.Source -C $Repository branch $rescue HEAD 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Stop-FlexFactorSourceRefresh "Local commits differ from origin/main and could not be preserved on a rescue branch."
+        }
+        Write-Host "[source] Preserved local commits on branch: $rescue" -ForegroundColor Yellow
+    }
+
+    # `git status` intentionally hides ignored files. Git may replace an
+    # ignored path if origin/main begins tracking that exact name, so detect
+    # that collision before updating. Untracked files were already stashed.
     $incomingAdditions = @(& $git.Source -C $Repository diff --name-only `
         --no-renames --diff-filter=A HEAD origin/main 2>$null)
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[source] Could not inspect incoming paths; the checkout was not updated." -ForegroundColor Yellow
-        return
+        Stop-FlexFactorSourceRefresh "Could not inspect incoming paths."
     }
     foreach ($relativePath in $incomingAdditions) {
         if ([string]::IsNullOrWhiteSpace("$relativePath")) { continue }
@@ -119,42 +166,39 @@ function Invoke-FlexFactorSourceRefresh {
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
         & $git.Source -C $Repository ls-files --error-unmatch -- "$relativePath" *> $null
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "[source] Incoming tracked path would replace local ignored/untracked content: $relativePath" -ForegroundColor Red
-            Write-Host "[source] The checkout was not updated." -ForegroundColor Yellow
-            return
+            Stop-FlexFactorSourceRefresh "Incoming tracked path would replace ignored local content: $relativePath"
         }
     }
 
-    $dependencyFiles = @(
-        "pyproject.toml", "requirements.txt", "requirements-dev.txt",
-        "setup.cfg", "setup.py"
-    )
-    $incomingChanges = @(& $git.Source -C $Repository diff --name-only HEAD origin/main 2>$null)
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[source] Could not inspect dependency changes; the checkout was not updated." -ForegroundColor Yellow
-        return
+    $sourceChanged = $preserved -or ($head -ne $upstream)
+    if ($head -ne $upstream) {
+        if ($fastForwardable) {
+            & $git.Source -C $Repository merge --ff-only --quiet origin/main
+            if ($LASTEXITCODE -ne 0) {
+                Stop-FlexFactorSourceRefresh "The verified fast-forward to origin/main failed."
+            }
+        } else {
+            & $git.Source -C $Repository reset --hard origin/main *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Stop-FlexFactorSourceRefresh "Could not reset the executable checkout to preserved origin/main."
+            }
+        }
     }
-    $dependenciesChanged = @($incomingChanges | Where-Object { $_ -in $dependencyFiles }).Count -gt 0
 
-    & $git.Source -C $Repository merge --ff-only --quiet origin/main
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[source] The safe fast-forward failed; using the installed checkout." -ForegroundColor Yellow
-        return
+    $finalHead = (& $git.Source -C $Repository rev-parse HEAD 2>$null | Select-Object -First 1)
+    $finalStatus = @(& $git.Source -C $Repository status --porcelain --untracked-files=all 2>$null)
+    if ($LASTEXITCODE -ne 0 -or "$finalHead".Trim() -ne $upstream -or $finalStatus.Count -gt 0) {
+        Stop-FlexFactorSourceRefresh "Post-refresh verification failed; executable source is not an exact clean origin/main tree."
     }
+
     if ($dependenciesChanged) {
         Set-Content -LiteralPath $dependencyMarker -Value "dependency metadata changed" -Encoding Ascii
-        # Re-enter the refreshed helper so the new dependency graph is
-        # reconciled before the updated source imports anything.
         Invoke-FlexFactorSourceRefresh -Repository $Repository `
             -LauncherPath $LauncherPath -ForwardedArgs $ForwardedArgs
     }
 
-    Write-Host "[source] Updated FlexFactor to GitHub main; restarting the refreshed launcher." -ForegroundColor Green
-    $powershell = Join-Path $PSHOME "powershell.exe"
-    if (-not (Test-Path $powershell)) {
-        $powershell = (Get-Process -Id $PID).Path
+    if ($sourceChanged) {
+        Write-Host "[source] Bound FlexFactor runtime to verified GitHub main $upstream; restarting." -ForegroundColor Green
+        Restart-FlexFactorLauncher -LauncherPath $LauncherPath -ForwardedArgs $ForwardedArgs
     }
-    & $powershell -NoProfile -ExecutionPolicy Bypass -File $LauncherPath @ForwardedArgs
-    $childExit = $LASTEXITCODE
-    exit $childExit
 }
