@@ -127,8 +127,10 @@ class InterruptedGitRecoveryTests(unittest.TestCase):
         # report rather than destructively pick ours/theirs.
         blob = _git(["hash-object", "-w", "seed.txt"], d).stdout.strip()
         stream = f"100644 {blob} 1\tseed.txt\n100644 {blob} 2\tseed.txt\n100644 {blob} 3\tseed.txt\n"
+        # Feed bytes so Windows does not translate LF to CRLF inside the
+        # index-info protocol and silently turn the staged path into seed.txt\r.
         proc = subprocess.run(["git", "update-index", "--index-info"], cwd=d,
-                              input=stream, text=True, capture_output=True)
+                              input=stream.encode("utf-8"), capture_output=True)
         self.assertEqual(0, proc.returncode)
         self.assertTrue(
             _git(["ls-files", "--unmerged"], d).stdout.strip(),
