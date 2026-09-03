@@ -40,6 +40,8 @@ if ($programs.Count -eq 0) {
     }
 }
 
+$sessionPrompt = Read-Host "Session prompt for the selected repositories (Enter = none)"
+
 $costRaw = Read-Host "Maximum paid-model cost in USD (1-150, Enter = 150)"
 $cost = 150
 if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
@@ -52,6 +54,9 @@ if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
 $cliArgs = @("audit", "--model-mode", "best", "--max-cost", "$cost",
              "--max-cycles", "6", "--apply", "--yes", "--auto-clean")
 foreach ($program in $programs) { $cliArgs += @("--program", $program) }
+if (-not [string]::IsNullOrWhiteSpace($sessionPrompt)) {
+    $cliArgs += @("--session-prompt", $sessionPrompt)
+}
 
 Write-Host ""
 Write-Host "FlexFactor Audit" -ForegroundColor Cyan

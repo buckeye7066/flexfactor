@@ -17,6 +17,8 @@ import uuid
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".flexfactor", "steering")
 MAX_COMMENT_CHARS = 4000
 MAX_GUIDANCE_CHARS = 4000
+MAX_SESSION_PROMPT_CHARS = 20000
+MAX_SESSION_TARGETS = 30
 MAX_RECORD_BYTES = 16384
 _BEGIN = "<<< FLEXFACTOR OPERATOR STEERING >>>"
 _END = "<<< END FLEXFACTOR OPERATOR STEERING >>>"
@@ -137,15 +139,199 @@ def _records(path: str) -> list[dict]:
     return out
 
 def submit(program: str, project_dir: str, comment: str, *,
-           source: str = "dashboard", root: str | None = None) -> dict:
+           source: str = "dashboard", root: str | None = None,
+           session_id: str = "", scope: str = "program") -> dict:
     program_s = str(program or "").strip()
     if not program_s:
         raise ValueError("program is required")
     row = {"kind": "submission", "id": uuid.uuid4().hex, "program": program_s,
            "project_dir": _canonical(project_dir), "comment": _clean_comment(comment),
            "source": str(source or "dashboard")[:40], "created_at": _now()}
+    if session_id:
+        row["session_id"] = str(session_id)[:64]
+    if scope != "program":
+        row["scope"] = str(scope or "program")[:40]
     _append(journal_path(program_s, project_dir, root), row)
     return dict(row, status="pending")
+
+
+def _clean_session_prompt(prompt: str) -> str:
+    value = str(prompt or "").strip()
+    if not value:
+        raise ValueError("session prompt is required")
+    if len(value) > MAX_SESSION_PROMPT_CHARS:
+        raise ValueError(
+            f"session prompt exceeds {MAX_SESSION_PROMPT_CHARS} characters")
+    if _CONTROL.search(value):
+        raise ValueError("session prompt contains unsupported control characters")
+    return value
+
+
+def _alias_forms(program: str, project_dir: str) -> set[str]:
+    """Names that can unambiguously identify one selected target in prose."""
+    raw = {
+        str(program or "").strip(),
+        os.path.basename(_canonical(project_dir)).strip(),
+    }
+    forms: set[str] = set()
+    for item in raw:
+        item = re.sub(r"\.git$", "", item, flags=re.IGNORECASE)
+        item = item.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        words = " ".join(re.findall(r"[a-z0-9]+", item.casefold()))
+        if len(words.replace(" ", "")) >= 3:
+            forms.add(words)
+            forms.add(words.replace(" ", ""))
+    return {form for form in forms if form}
+
+
+def _mentions(segment: str, aliases: list[set[str]]) -> list[int]:
+    tokens = re.findall(r"[a-z0-9]+", segment.casefold())
+    words = " ".join(tokens)
+    padded = f" {words} "
+    found: list[int] = []
+    for index, forms in enumerate(aliases):
+        if any((" " in form and f" {form} " in padded) or
+               (" " not in form and form in tokens) for form in forms):
+            found.append(index)
+    return found
+
+
+def _prompt_segments(prompt: str, aliases: list[set[str]]) -> list[str]:
+    """Split owner prose without losing list items or cross-target sentences."""
+    pieces: list[str] = []
+    for line in prompt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # A common compact form is "GrantFlow: ...; SermonSmith: ...". Split
+        # only where the text after the semicolon actually names a selected
+        # target, so ordinary semicolons inside one requirement stay intact.
+        candidates = [line]
+        for _ in range(MAX_SESSION_TARGETS):
+            changed = False
+            next_candidates: list[str] = []
+            for candidate in candidates:
+                parts = re.split(r";\s+(?=[A-Za-z0-9_.\-/ ]{2,80}:)", candidate,
+                                 maxsplit=1)
+                if len(parts) == 2 and _mentions(parts[1], aliases):
+                    next_candidates.extend(parts)
+                    changed = True
+                else:
+                    next_candidates.append(candidate)
+            candidates = next_candidates
+            if not changed:
+                break
+        for candidate in candidates:
+            sentences = re.split(r"(?<=[.!?])\s+(?=(?:[-*]\s*)?[A-Za-z0-9\[])",
+                                 candidate)
+            pieces.extend(part.strip() for part in sentences if part.strip())
+    return pieces or [prompt]
+
+
+def route_session_prompt(prompt: str, targets: list[tuple[str, str]]) -> dict:
+    """Route one owner prompt into exact selected programs before work starts.
+
+    Explicit program/repository names win. Continuation sentences stay with the
+    last explicitly named target. Unscoped requirements are deliberately shared
+    with every selected target instead of being guessed away or silently lost.
+    """
+    clean = _clean_session_prompt(prompt)
+    if not 1 <= len(targets) <= MAX_SESSION_TARGETS:
+        raise ValueError(f"choose between 1 and {MAX_SESSION_TARGETS} targets")
+    canonical: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for program, project_dir in targets:
+        name = str(program or "").strip()
+        if not name:
+            raise ValueError("every session target needs a program name")
+        directory = _canonical(project_dir)
+        key = (name.casefold(), directory)
+        if key in seen:
+            raise ValueError(f"duplicate session target: {name}")
+        seen.add(key)
+        canonical.append((name, directory))
+    aliases = [_alias_forms(name, directory) for name, directory in canonical]
+    for left in range(len(aliases)):
+        for right in range(left + 1, len(aliases)):
+            overlap = aliases[left] & aliases[right]
+            if overlap:
+                raise ValueError(
+                    "ambiguous session target names: "
+                    f"{canonical[left][0]} and {canonical[right][0]} share "
+                    f"{sorted(overlap)[0]!r}")
+    routed: list[list[str]] = [[] for _ in canonical]
+    evidence: list[dict] = []
+    last_explicit: list[int] = []
+    global_rx = re.compile(
+        r"\b(all|both|each|every)\s+(selected\s+)?(programs?|apps?|repos(?:itories)?)\b",
+        re.IGNORECASE,
+    )
+    continuation_rx = re.compile(
+        r"^(and|also|then|next|it|its|this|that|these|those|they|their|plus)\b",
+        re.IGNORECASE,
+    )
+    for segment in _prompt_segments(clean, aliases):
+        named = _mentions(segment, aliases)
+        reason = "explicit-target"
+        if global_rx.search(segment):
+            chosen = list(range(len(canonical)))
+            reason = "explicit-shared"
+            last_explicit = []
+        elif named:
+            chosen = named
+            last_explicit = named
+        elif len(canonical) == 1:
+            chosen = [0]
+            reason = "single-target"
+        elif last_explicit and continuation_rx.search(segment):
+            chosen = last_explicit
+            reason = "target-continuation"
+        else:
+            chosen = list(range(len(canonical)))
+            reason = "unscoped-shared"
+            last_explicit = []
+        for index in chosen:
+            routed[index].append(segment)
+        evidence.append({
+            "text": segment,
+            "reason": reason,
+            "targets": [canonical[index][0] for index in chosen],
+        })
+    return {
+        "schema": 1,
+        "prompt": clean,
+        "routes": [
+            {
+                "program": name,
+                "project_dir": directory,
+                "instruction": "\n".join(routed[index]).strip(),
+            }
+            for index, (name, directory) in enumerate(canonical)
+        ],
+        "evidence": evidence,
+    }
+
+
+def submit_session_prompt(prompt: str, targets: list[tuple[str, str]], *,
+                          source: str = "session", root: str | None = None) -> dict:
+    """Durably queue every routed portion for its target's next checkpoint."""
+    routed = route_session_prompt(prompt, targets)
+    session_id = uuid.uuid4().hex
+    submissions = []
+    for route in routed["routes"]:
+        submissions.append(submit(
+            route["program"], route["project_dir"], route["instruction"],
+            source=source, root=root, session_id=session_id,
+            scope="multi-program-session",
+        ))
+    return {
+        "schema": 1,
+        "session_id": session_id,
+        "created_at": _now(),
+        "routes": routed["routes"],
+        "evidence": routed["evidence"],
+        "submission_ids": [item["id"] for item in submissions],
+    }
 
 
 def set_guidance(program: str, project_dir: str, prompt: str, *,
