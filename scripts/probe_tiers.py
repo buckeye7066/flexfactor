@@ -48,7 +48,7 @@ def fullness(findings):
 out = {}
 for i, (label, jm) in enumerate(TIERS):
     if i:
-        print(f"[probe] sleeping 7s for throttle...", flush=True)
+        print("[probe] sleeping 7s for throttle...", flush=True)
         time.sleep(7)
     # meter=None -> _budget_guard is a no-op; make_provider is the production path.
     prov = ff.make_provider('anthropic', 'claude-sonnet-5', None, judge_model=jm)

@@ -67,7 +67,6 @@ py-modules = [
   "flexfactor_steering",
   "flexfactor_sandbox",
   "flexfactor_scout_contract",
-  "flexfactor_self_audit_report",
   "flexfactor_trust",
   "flexfactor_web",
   "flexfactor_wip",

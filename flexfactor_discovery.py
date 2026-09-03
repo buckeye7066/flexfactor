@@ -403,7 +403,7 @@ def discover_from_cursor() -> List[Dict[str, Any]]:
         import shutil
         if shutil.which("cursor") or shutil.which("cursor-agent"):
             all_models = ["claude-3-5-sonnet", "gpt-4o", "cursor-small"]
-            _info(f"cursor: using default model set (Cursor binary found, no config parsed)")
+            _info("cursor: using default model set (Cursor binary found, no config parsed)")
 
     routes: List[Dict[str, Any]] = []
     for model in all_models:

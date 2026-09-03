@@ -159,7 +159,7 @@ class RouteFailuresAreTheProviders(unittest.TestCase):
     def test_unknown_route_failure_defaults_to_provider_even_with_our_frame(self):
         try:
             _boom()
-        except ValueError as exc:
+        except ValueError:
             e = self.led.record("rotation", "Weird: never seen", route="r/x")
         self.assertEqual(e["kind"], E.KIND_PROVIDER)
 
