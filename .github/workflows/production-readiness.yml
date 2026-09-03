@@ -96,6 +96,7 @@ jobs:
                    flexfactor_steering_tests.py \
                    flexfactor_web_launcher_tests.py \
                    test_android_standalone.py \
+                   test_target_publication.py \
                    flexfactor_invariant_sweep_tests.py \
                    flexfactor_prodevidence_tests.py \
                    flexfactor_entrypoint_tests.py \
