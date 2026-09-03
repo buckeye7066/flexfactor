@@ -130,6 +130,10 @@ class InterruptedGitRecoveryTests(unittest.TestCase):
         proc = subprocess.run(["git", "update-index", "--index-info"], cwd=d,
                               input=stream, text=True, capture_output=True)
         self.assertEqual(0, proc.returncode)
+        self.assertTrue(
+            _git(["ls-files", "--unmerged"], d).stdout.strip(),
+            "the test must create index stages 1/2/3 before exercising recovery",
+        )
         recovered = ac.recover_interrupted_git_operation(d, run=_test_runner)
         self.assertEqual([], recovered["acted_on"])
         self.assertEqual(1, len(recovered["failed"]))
