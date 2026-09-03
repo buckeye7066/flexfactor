@@ -31,6 +31,9 @@ publication contract on desktop and in the signed Android app.
   only when credit/quota is unavailable, and reaches free/local capacity last.
 - A writing mode refuses to begin model work without Git, an `origin`, a named
   branch, and mandatory push-and-merge publication.
+- A safely verified incremental repair is pushed and merged even when unrelated
+  whole-product readiness gates remain open. Those open gates keep the run
+  incomplete and nonzero; they no longer strand the verified commit locally.
 - Generated code is never trusted because it was generated. It must pass the
   target's real build and strongest project suite, complete changed-file
   rescanning and evidence gates, and an exact-commit review by a model family
