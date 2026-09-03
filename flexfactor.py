@@ -9094,6 +9094,12 @@ _COMPETITOR_SOURCE_EXTENSIONS = frozenset({
     ".sh", ".sql", ".svelte", ".swift", ".toml", ".ts", ".tsx",
     ".vue", ".xml", ".yaml", ".yml",
 })
+_COMPETITOR_IMPLEMENTATION_EXTENSIONS = frozenset({
+    ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".go", ".graphql",
+    ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".kt", ".kts",
+    ".lua", ".m", ".php", ".py", ".rb", ".rs", ".scala", ".sh",
+    ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue",
+})
 _COMPETITOR_SOURCE_NAMES = frozenset({
     "dockerfile", "gemfile", "makefile", "package.json", "pyproject.toml",
     "requirements.txt", "cargo.toml", "go.mod",
@@ -9254,16 +9260,19 @@ def _competitor_source_documents(checkout_dir: str, repository_url: str,
         excerpt = content[:min(16_000, remaining)]
         total_chars += len(excerpt)
         digest = hashlib.sha256(excerpt.encode("utf-8", "replace")).hexdigest()
+        implementation = os.path.splitext(rel.lower())[1] in (
+            _COMPETITOR_IMPLEMENTATION_EXTENSIONS)
+        prefix = "code-" if implementation else "repo-"
         documents.append({
-            "evidence_id": "code-" + hashlib.sha256(
+            "evidence_id": prefix + hashlib.sha256(
                 f"{commit}:{rel}".encode("utf-8")).hexdigest()[:12],
-            "url": (repository_url.rstrip("/") + "/blob/" + commit + "/"
-                    + urllib.parse.quote(rel, safe="/")),
+            "url": _competitor_source_url(repository_url, commit, rel),
             "title": rel,
             "path": rel,
             "sha256": digest,
             "content": excerpt,
-            "evidence_kind": "inspected-source-code",
+            "evidence_kind": ("inspected-source-code" if implementation
+                              else "inspected-repository-support"),
             "truncated": len(content) >= 16_000,
         })
     receipt = {
@@ -9274,6 +9283,15 @@ def _competitor_source_documents(checkout_dir: str, repository_url: str,
         "source_excerpt_characters": total_chars,
     }
     return documents, receipt
+
+
+def _competitor_source_url(repository_url: str, commit: str, rel: str) -> str:
+    """Return the host's canonical immutable source-file URL."""
+    host = (urllib.parse.urlsplit(repository_url).hostname or "").lower()
+    marker = "/src/" if host == "bitbucket.org" else (
+        "/-/blob/" if host == "gitlab.com" else "/blob/")
+    return (repository_url.rstrip("/") + marker + commit + "/"
+            + urllib.parse.quote(rel, safe="/"))
 
 
 def inspect_public_competitor_source(competitor: dict, run=None) -> dict:
@@ -9324,10 +9342,11 @@ def inspect_public_competitor_source(competitor: dict, run=None) -> dict:
                 "source_documents": [],
             }
         documents, receipt = _competitor_source_documents(dest, url, commit)
-        if not documents:
+        if not any(row.get("evidence_kind") == "inspected-source-code"
+                   for row in documents):
             return {
                 "source_inspection_ok": False,
-                "reason": "repository contained no readable source evidence",
+                "reason": "repository contained no readable implementation code",
                 "source_documents": [],
                 "commit": commit,
                 **receipt,

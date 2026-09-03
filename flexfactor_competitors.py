@@ -107,6 +107,13 @@ _COPYLEFT = {
     "gpl-2.0", "gpl-3.0", "agpl-3.0", "lgpl-2.1", "lgpl-3.0",
     "sspl-1.0", "busl-1.1", "cc-by-nc-4.0", "proprietary",
 }
+_INSPECTED_LICENSE_FAMILY = {
+    "mit": "mit", "apache-2.0": "apache", "bsd-2-clause": "bsd",
+    "bsd-3-clause": "bsd", "0bsd": "bsd", "isc": "isc",
+    "mpl-2.0": "mpl", "unlicense": "unlicense", "gpl-2.0": "gpl",
+    "gpl-3.0": "gpl", "agpl-3.0": "agpl", "lgpl-2.1": "lgpl",
+    "lgpl-3.0": "lgpl",
+}
 
 
 def _default_compatible(spdx: str | None) -> bool | None:
@@ -1377,11 +1384,43 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 key: value for key, value in inspection.items()
                 if key != "source_documents"
             }
-            if inspection.get("source_inspection_ok") is True and source_documents:
+            expected_family = _INSPECTED_LICENSE_FAMILY.get(
+                str(c.get("license") or "").strip().lower())
+            actual_families = {
+                str(value).strip().lower()
+                for value in (inspection.get("license_families") or []) if value
+            }
+            license_ok = bool(
+                inspection.get("license_file_found") is True
+                and expected_family
+                and actual_families == {expected_family}
+            )
+            c["source_inspection"]["license_verified"] = license_ok
+            if not license_ok:
+                license_failure = (
+                    "source inspection license check failed: metadata="
+                    f"{c.get('license') or 'UNKNOWN'}, checkout="
+                    f"{','.join(sorted(actual_families)) or 'missing/unrecognized'}"
+                )
+                inspection["source_inspection_ok"] = False
+                c["source_inspection"]["source_inspection_ok"] = False
+                c["source_inspection"]["reason"] = license_failure
+                failures.append((
+                    str(c.get("url") or "(repository)"),
+                    license_failure,
+                ))
+            if (inspection.get("source_inspection_ok") is True and source_documents
+                    and c.get("reuse_mode") == REUSE_DIRECT):
                 for doc in source_documents:
                     if doc["evidence_id"] not in {
                             row.get("evidence_id") for row in documents}:
                         documents.append(doc)
+            elif (inspection.get("source_inspection_ok") is True
+                  and c.get("reuse_mode") != REUSE_DIRECT):
+                # The checkout was inspected only to verify identity/licence.
+                # Copyleft/restricted source must not be placed in the model's
+                # adoption context; clean-room ideas may use public pages only.
+                c["source_inspection"]["code_evidence_withheld"] = True
             else:
                 failures.append((
                     str(c.get("url") or "(repository)"),

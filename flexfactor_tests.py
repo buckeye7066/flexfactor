@@ -10346,6 +10346,29 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertIs(result["source_inspection_ok"], False)
         self.assertIn("supported public HTTPS", result["reason"])
 
+    def test_documentation_is_supporting_evidence_not_code_evidence(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as checkout:
+            self._write(checkout, "README.md", "A feature described only in prose.\n")
+            documents, _receipt = ff._competitor_source_documents(
+                checkout, "https://github.com/example/docs-only", "a" * 40)
+        self.assertTrue(documents)
+        self.assertFalse(any(row["evidence_id"].startswith("code-")
+                             for row in documents))
+        self.assertTrue(all(row["evidence_kind"] != "inspected-source-code"
+                            for row in documents))
+
+    def test_competitor_source_links_use_each_hosts_commit_path(self):
+        rel = "src/feature.py"
+        commit = "a" * 40
+        self.assertIn("/blob/", ff._competitor_source_url(
+            "https://github.com/o/r", commit, rel))
+        self.assertIn("/-/blob/", ff._competitor_source_url(
+            "https://gitlab.com/o/r", commit, rel))
+        self.assertIn("/src/", ff._competitor_source_url(
+            "https://bitbucket.org/o/r", commit, rel))
+
     def test_lifecycle_scripts_recorded_and_reasoned(self):
         e = self._evaluation("MIT")
 
@@ -17606,6 +17629,8 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
                 "commit": "a" * 40,
                 "source_files_indexed": 17,
                 "source_files_inspected": 1,
+                "license_file_found": True,
+                "license_families": ["mit"],
                 "source_documents": [{
                     "evidence_id": "code-abc123def456",
                     "url": "https://github.com/openlp/openlp/blob/" + "a" * 40
@@ -17637,6 +17662,11 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
 
         result = fc.research_competitors(
             judge, "SermonSmith", "purpose", [], opener=self._opener(), target=1,
+            rr_search=lambda _query: [{"repo": {
+                "fullName": "openlp/openlp",
+                "htmlUrl": "https://github.com/openlp/openlp",
+                "licenseSpdx": "MIT", "stars": 100,
+            }}],
             source_inspector=source_inspector,
         )
         competitor = result["competitors"][0]
@@ -17653,6 +17683,11 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
         }])
         result = fc.research_competitors(
             judge, "SermonSmith", "purpose", [], opener=self._opener(), target=1,
+            rr_search=lambda _query: [{"repo": {
+                "fullName": "openlp/openlp",
+                "htmlUrl": "https://github.com/openlp/openlp",
+                "licenseSpdx": "MIT", "stars": 100,
+            }}],
             source_inspector=lambda _competitor: {
                 "source_inspection_ok": False,
                 "reason": "clone unavailable", "source_documents": [],
@@ -17663,6 +17698,36 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
         self.assertFalse(competitor["idea"]["accept"])
         self.assertTrue(any("source inspection failed" in reason
                             for reason in result["sources_skipped"].values()))
+
+    def test_cloned_license_mismatch_blocks_code_evidence_and_adoption(self):
+        judge = self._judge([{
+            "name": "openlp", "kind": "oss", "search_query": "openlp",
+        }])
+        result = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], opener=self._opener(), target=1,
+            rr_search=lambda _query: [{"repo": {
+                "fullName": "openlp/openlp",
+                "htmlUrl": "https://github.com/openlp/openlp",
+                "licenseSpdx": "MIT", "stars": 100,
+            }}],
+            source_inspector=lambda _competitor: {
+                "source_inspection_ok": True,
+                "license_file_found": True,
+                "license_families": ["gpl"],
+                "source_documents": [{
+                    "evidence_id": "code-mismatch", "url": "https://example/code",
+                    "title": "src/app.py", "path": "src/app.py",
+                    "sha256": "a" * 64, "content": "def feature(): pass",
+                    "evidence_kind": "inspected-source-code",
+                }],
+            },
+        )
+        competitor = result["competitors"][0]
+        self.assertEqual(competitor["evidence_status"], "unverified")
+        self.assertFalse(competitor["source_inspection"]["license_verified"])
+        self.assertFalse(competitor["idea"]["accept"])
+        self.assertFalse(any(row.get("evidence_id") == "code-mismatch"
+                             for row in competitor["evidence_documents"]))
 
     def test_a_competitor_no_source_corroborates_is_marked_unverified_and_not_acted_on(self):
         judge = self._judge([{"name": "GhostProduct", "kind": "market", "why": "w",
