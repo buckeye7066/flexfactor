@@ -22,6 +22,17 @@ def recall(query: str="continuity decisions blockers", limit: int=8):
         return {"ok":False,"code":"aibus_spawn_failed","detail":str(exc)}
     return {"ok":True,"results":done.stdout.strip()} if done.returncode==0 else {"ok":False,"code":"aibus_failed","detail":(done.stderr or done.stdout or f"exit {done.returncode}").strip()[:500]}
 
+def remember(title: str, content: str, tag: str = "project"):
+    heading, body = str(title or "").strip(), str(content or "").strip()
+    combined = heading + "\n" + body
+    blocked = ("api_key", "secret", "token", "password", "authorization", "private key")
+    if not heading or not body:
+        return {"ok": False, "code": "empty_memory", "detail": "A title and non-empty project lesson are required."}
+    if len(combined) > 4000 or any(item in combined.lower() for item in blocked):
+        return {"ok": False, "code": "unsafe_memory", "detail": "Shared memory rejects sensitive or oversized content."}
+    result = run_aibus(["note", "--from", os.environ.get("OBSIDIAN_MEMORY_AGENT", APP), "--title", f"[{APP}] {heading}", "--tag", tag or "project", body])
+    return {"ok": True, "title": heading, "detail": result.get("output")} if result.get("ok") else result
+
 def startup():
     result=recall(limit=1)
     print("[obsidian-memory] recall available" if result.get("ok") else f"[obsidian-memory] unavailable: {result.get('detail',result.get('code'))}",file=sys.stderr)
