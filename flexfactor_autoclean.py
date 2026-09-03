@@ -222,6 +222,9 @@ def recover_interrupted_git_operation(project_dir, *, run):
     side of the conflict.  A bare unmerged index with no operation marker is
     *reported* rather than guessed at; selecting conflict content is an owner
     decision, not a cleanup action.
+    ``git ls-files --unmerged`` is used as the cross-platform plumbing view;
+    porcelain ``git diff --diff-filter=U`` can omit a synthetic staged conflict
+    on Git for Windows even though the index still contains stages 1/2/3.
     """
     res = _result("interrupted-git-operation")
     markers = (
@@ -257,7 +260,7 @@ def recover_interrupted_git_operation(project_dir, *, run):
     # sequence of aborts against it and call that recovery.
     res["candidates"] = len(active)
     if not active:
-        code, unmerged = run(["git", "diff", "--name-only", "--diff-filter=U"], project_dir)
+        code, unmerged = run(["git", "ls-files", "--unmerged"], project_dir)
         if code != 0:
             res["candidates"] = 1
             res["failed"].append({"item": "unmerged check", "reason": str(unmerged)[:160]})
@@ -278,7 +281,7 @@ def recover_interrupted_git_operation(project_dir, *, run):
     if code != 0:
         res["failed"].append({"item": label, "reason": str(out)[:240]})
         return res
-    check, unmerged = run(["git", "diff", "--name-only", "--diff-filter=U"], project_dir)
+    check, unmerged = run(["git", "ls-files", "--unmerged"], project_dir)
     if check != 0 or str(unmerged or "").strip():
         res["failed"].append({"item": label,
                               "reason": "abort ran but the index still has unmerged paths"})

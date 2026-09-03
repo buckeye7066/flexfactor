@@ -424,8 +424,10 @@ class ManagedAndroidInvariants(unittest.TestCase):
     def test_android_release_gate_proves_both_independent_hosted_families(self):
         workflow = (ROOT / ".github" / "workflows" /
                     "android-client.yml").read_text(encoding="utf-8")
-        self.assertIn("qwen2.5-coder:7b", workflow)
-        self.assertIn("deepseek-coder:6.7b", workflow)
+        self.assertIn("qwen2.5-coder:1.5b", workflow)
+        self.assertIn("deepseek-coder:1.3b", workflow)
+        self.assertNotIn("qwen2.5-coder:7b", workflow)
+        self.assertNotIn("deepseek-coder:6.7b", workflow)
         self.assertIn("division_by_zero", workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("sha256sum --check --strict", workflow)
@@ -443,10 +445,16 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn('rm -f "$archive"', model_install)
         self.assertLess(model_install.index('sudo tar --zstd -xf "$archive"'),
                         model_install.index('rm -f "$archive"'))
-        self.assertLess(model_install.index('rm -f "$archive"'),
-                        model_install.index("ollama pull qwen2.5-coder:7b"))
-        self.assertLess(model_install.index('rm -f "$archive"'),
-                        model_install.index("ollama pull deepseek-coder:6.7b"))
+        model_loop = model_install.index(
+            'for model in ("qwen2.5-coder:1.5b", "deepseek-coder:1.3b")')
+        self.assertLess(model_install.index('rm -f "$archive"'), model_loop)
+        self.assertIn(
+            'subprocess.run(["ollama", "pull", model], check=True)', model_install)
+        self.assertIn(
+            'subprocess.run(["ollama", "stop", model], check=False)', model_install)
+        self.assertIn(
+            'subprocess.run(["ollama", "rm", model], check=True)', model_install)
+        self.assertIn('"num_ctx": 2048', model_install)
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
         build_gate = build_gate.split(
             "- name: Verify both independent free model families live", 1)[0]

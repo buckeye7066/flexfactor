@@ -178,34 +178,40 @@ jobs:
             if [ "$attempt" -eq 60 ]; then cat "$RUNNER_TEMP/ollama.log"; exit 1; fi
             sleep 1
           done
-          ollama pull qwen2.5-coder:7b
-          ollama pull deepseek-coder:6.7b
           python - <<'PY'
-          import json, urllib.request
-          for model in ("qwen2.5-coder:7b", "deepseek-coder:6.7b"):
-              request = urllib.request.Request(
-                  "http://127.0.0.1:11434/api/chat",
-                  data=json.dumps({
-                  "model": model,
-                  "stream": False,
-                  "messages": [{"role": "user", "content": "Review this Python function: def ratio(total, count): return total / count. Return the requested JSON naming the runtime defect."}],
-                  "format": {
-                      "type": "object",
-                      "properties": {"defect": {"type": "string", "enum": ["division_by_zero"]}},
-                      "required": ["defect"],
-                      "additionalProperties": False,
-                  },
-                  "options": {"temperature": 0, "num_predict": 64},
-                  }).encode(),
-                  headers={"Content-Type": "application/json"},
-              )
-              with urllib.request.urlopen(request, timeout=600) as response:
-                  content = json.load(response)["message"]["content"]
-              answer = json.loads(content)
-              if answer != {"defect": "division_by_zero"}:
-                  raise SystemExit(
-                      f"hosted model {model} returned an unexpected answer: {answer!r}")
-              print(model, "FLEXFACTOR_READY", answer["defect"])
+          import json, subprocess, urllib.request
+
+          # Prove both independent families without retaining two large model
+          # images or two loaded runtimes on the constrained hosted runner.
+          for model in ("qwen2.5-coder:1.5b", "deepseek-coder:1.3b"):
+              subprocess.run(["ollama", "pull", model], check=True)
+              try:
+                  request = urllib.request.Request(
+                      "http://127.0.0.1:11434/api/chat",
+                      data=json.dumps({
+                      "model": model,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Review this Python function: def ratio(total, count): return total / count. Return the requested JSON naming the runtime defect."}],
+                      "format": {
+                          "type": "object",
+                          "properties": {"defect": {"type": "string", "enum": ["division_by_zero"]}},
+                          "required": ["defect"],
+                          "additionalProperties": False,
+                      },
+                      "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 64},
+                      }).encode(),
+                      headers={"Content-Type": "application/json"},
+                  )
+                  with urllib.request.urlopen(request, timeout=600) as response:
+                      content = json.load(response)["message"]["content"]
+                  answer = json.loads(content)
+                  if answer != {"defect": "division_by_zero"}:
+                      raise SystemExit(
+                          f"hosted model {model} returned an unexpected answer: {answer!r}")
+                  print(model, "FLEXFACTOR_READY", answer["defect"])
+              finally:
+                  subprocess.run(["ollama", "stop", model], check=False)
+                  subprocess.run(["ollama", "rm", model], check=True)
           PY
       - name: Record exact APK checksum
         shell: bash
@@ -256,6 +262,27 @@ jobs:
           read_version() {
             sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p'
           }
+          resolve_tag_target() {
+            local object_type="$1" object_sha="$2" object_json
+            while [ "$object_type" = "tag" ]; do
+              object_json=$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")
+              object_type=$(printf '%s\n' "$object_json" | jq -r '.object.type')
+              object_sha=$(printf '%s\n' "$object_json" | jq -r '.object.sha')
+            done
+            test "$object_type" = "commit"
+            printf '%s\n' "$object_sha"
+          }
+          require_ancestor() {
+            local base_sha="$1" head_sha="$2" comparison
+            comparison=$(gh api \
+              "repos/$GITHUB_REPOSITORY/compare/${base_sha}...${head_sha}" \
+              --jq '.status')
+            case "$comparison" in
+              ahead|identical) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
           version_name=$(read_version < android/app/build.gradle.kts)
           test -n "$version_name"
           release_tag="android-v${version_name}"
@@ -264,14 +291,20 @@ jobs:
           authorized_main_sha="$GITHUB_SHA"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             test "$GITHUB_REF_NAME" = "$release_tag"
-            git fetch --no-tags origin \
-              '+refs/heads/main:refs/remotes/origin/release-authorized-main'
-            authorized_main_sha=$(git rev-parse \
-              refs/remotes/origin/release-authorized-main)
+            pushed_tag=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag")
+            source_sha=$(resolve_tag_target \
+              "$(printf '%s\n' "$pushed_tag" | jq -r '.object.type')" \
+              "$(printf '%s\n' "$pushed_tag" | jq -r '.object.sha')")
+            printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}$' \
+              || { echo "Could not resolve the pushed release tag" >&2; exit 1; }
+            authorized_main_sha=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+              --jq '.object.sha')
             printf '%s' "$authorized_main_sha" | grep -Eq '^[0-9a-f]{40}$' \
               || { echo "Could not bind the tag run to live main" >&2; exit 1; }
-            git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha" \
-              || { echo "$GITHUB_SHA is not contained in live main" >&2; exit 1; }
+            require_ancestor "$source_sha" "$authorized_main_sha" \
+              || { echo "$source_sha is not contained in live main" >&2; exit 1; }
             should_publish=true
           else
             version_changed=false
@@ -295,26 +328,30 @@ jobs:
               if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
             fi
 
+            tag_error="$RUNNER_TEMP/android-tag-lookup.err"
             set +e
-            tag_rows=$(git ls-remote --exit-code --tags origin \
-              "refs/tags/$release_tag" "refs/tags/$release_tag^{}")
+            tag_object=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" \
+              2>"$tag_error")
             tag_lookup_rc=$?
             set -e
-            if [ "$tag_lookup_rc" -eq 2 ]; then
-              # No matching ref is the only lookup failure that means missing.
-              should_publish=true
-            elif [ "$tag_lookup_rc" -ne 0 ]; then
-              echo "Could not determine whether $release_tag exists" >&2
-              exit "$tag_lookup_rc"
+            if [ "$tag_lookup_rc" -ne 0 ]; then
+              if grep -Eq '\(HTTP 404\)|Reference does not exist' "$tag_error"; then
+                # Only a proven 404 means the tag is absent. Authentication,
+                # network, and API failures remain hard errors.
+                should_publish=true
+              else
+                cat "$tag_error" >&2
+                echo "Could not determine whether $release_tag exists" >&2
+                exit "$tag_lookup_rc"
+              fi
             else
-              tag_commit=$(printf '%s\n' "$tag_rows" \
-                | awk -v peeled="refs/tags/$release_tag^{}" \
-                    '$2 == peeled {print $1; found=1} END {if (!found) exit 1}') \
-                || tag_commit=$(printf '%s\n' "$tag_rows" \
-                  | awk -v exact="refs/tags/$release_tag" '$2 == exact {print $1}')
+              tag_commit=$(resolve_tag_target \
+                "$(printf '%s\n' "$tag_object" | jq -r '.object.type')" \
+                "$(printf '%s\n' "$tag_object" | jq -r '.object.sha')")
               printf '%s' "$tag_commit" | grep -Eq '^[0-9a-f]{40}$' \
                 || { echo "Could not resolve $release_tag to a commit" >&2; exit 1; }
-              git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA" \
+              require_ancestor "$tag_commit" "$GITHUB_SHA" \
                 || { echo "$release_tag is not an ancestor of main" >&2; exit 1; }
               tag_version=$(git show \
                 "${tag_commit}:android/app/build.gradle.kts" | read_version)
