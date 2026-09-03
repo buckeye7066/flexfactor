@@ -523,6 +523,12 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "obsidian_memory.py::run_aibus": (
+        "Optional owner-memory bridge, independent of the audited target: "
+        "it launches only the owner-configured Python interpreter and AI Bus "
+        "script with shell=False. Recall/note text is passed as argv data, "
+        "never as an executable or shell program, and cannot run repository code."
+    ),
     "flexfactor_release_policy.py::repository_entries": (
         "Runs only fixed, read-only Git metadata commands (rev-parse and "
         "ls-files) so the release-language scanner can enumerate the exact "
