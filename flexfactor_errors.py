@@ -166,7 +166,14 @@ SIGNATURES: List[Tuple[str, str, str]] = [
     (r"ModuleNotFoundError: No module named '([^']+)'", KIND_ENV,
      "A Python dependency is missing in the interpreter that ran. Install it in that interpreter "
      "(`python -m pip install <module>`), or point the run at the project's venv."),
-    (r"pytest|FAILED |AssertionError|Error: .* test", KIND_PROGRAM,
+    (r"StructuredOutputShapeError|understanding field\(s\) must be arrays of strings|"
+     r"program-understanding output omitted required non-empty field", KIND_PROVIDER,
+     "A model returned JSON that did not match the requested program-understanding schema. "
+     "FlexFactor safely normalizes lossless one-item/string envelopes and rotates to the next "
+     "model for ambiguous output. If this is the terminal entry, every usable route failed the "
+     "same bounded call; inspect the per-route entries rather than changing the target program."),
+    (r"pytest|(?:^|\n)\s*FAILED(?:\s+[^\r\n]+::|\s*\()|AssertionError|Error: .* test",
+     KIND_PROGRAM,
      "The program's own test suite is red. Open the named test, read its assertion, and fix the "
      "implementation it exercises (not the test) -- the build gate will not publish until it passes."),
     (r"npm ERR|ERR_PNPM|tsc .*error TS|error TS\d+", KIND_PROGRAM,

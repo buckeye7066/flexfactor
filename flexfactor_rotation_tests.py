@@ -658,6 +658,56 @@ class RotatingProviderTests(RotationTestCase):
         results = {prov.complete("x") for _ in range(2)}
         self.assertEqual(results, {"completed by a/one", "completed by b/one"})
 
+    def test_validated_shape_failure_moves_the_same_call_to_the_next_model(self):
+        class StructuredOutputShapeError(RuntimeError):
+            pass
+
+        errors = []
+        prov = R.RotatingProvider(
+            self.rotator(catalog(route("a/top", "pool-a"),
+                                 route("b/next", "pool-b"))),
+            lambda selected: FakeProvider(selected),
+            allow_paid=True,
+            paid_first=True,
+            on_error=lambda selected, exc: errors.append(
+                (selected.id, type(exc).__name__)),
+        )
+
+        def validate(data):
+            if data["by"] == "a/top":
+                raise StructuredOutputShapeError("array field was an object")
+            return data
+
+        result = prov.structured_validated(
+            "system", "prompt", {"type": "object"}, validator=validate)
+        self.assertEqual(result["by"], "b/next")
+        self.assertEqual(errors,
+                         [("a/top", "StructuredOutputShapeError")])
+        self.assertIn("route:a/top", self.store.read().get("cooldowns", {}))
+
+    def test_all_validated_shape_failures_are_bounded_and_fail_closed(self):
+        class StructuredOutputShapeError(RuntimeError):
+            pass
+
+        attempted = []
+        prov = R.RotatingProvider(
+            self.rotator(catalog(route("a/top", "pool-a"),
+                                 route("b/next", "pool-b"))),
+            lambda selected: FakeProvider(selected),
+            allow_paid=True,
+            paid_first=True,
+        )
+
+        def reject(data):
+            attempted.append(data["by"])
+            raise StructuredOutputShapeError("required array was an object")
+
+        with self.assertRaises(R.RotationError) as caught:
+            prov.structured_validated(
+                "system", "prompt", {"type": "object"}, validator=reject)
+        self.assertEqual(attempted, ["a/top", "b/next"])
+        self.assertIn("required array was an object", str(caught.exception))
+
     def test_legacy_signature_fallback_cannot_drop_strict_family_policy(self):
         class LegacyRotator:
             def __init__(self):
@@ -1047,6 +1097,13 @@ class ClassificationTests(unittest.TestCase):
     def test_interrupts_are_never_retried(self):
         self.assertFalse(R._is_retryable(KeyboardInterrupt()))
         self.assertFalse(R._is_retryable(SystemExit()))
+
+    def test_named_structured_output_shape_error_is_route_retryable(self):
+        class StructuredOutputShapeError(RuntimeError):
+            pass
+
+        self.assertTrue(R._is_retryable(
+            StructuredOutputShapeError("model ignored array schema")))
 
     def test_retry_after_is_read_from_headers_too(self):
         exc = Boom("slow down", status_code=429)

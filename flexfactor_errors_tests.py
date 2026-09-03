@@ -30,6 +30,21 @@ class Classification(unittest.TestCase):
         self.assertEqual(kind, E.KIND_PROGRAM)
         self.assertIn("test", sugg.lower())
 
+    def test_purpose_shape_failure_is_not_blamed_on_the_target_program(self):
+        text = (
+            "purpose understanding failed before repository review: "
+            "understanding field(s) must be arrays of strings: "
+            "primary_users, core_journeys")
+        kind, sugg = E.classify(text)
+        self.assertEqual(kind, E.KIND_PROVIDER)
+        self.assertIn("rotates to the next model", sugg)
+        self.assertNotIn("test suite is red", sugg)
+
+    def test_lowercase_failed_prose_does_not_match_pytest_signature(self):
+        kind, _sugg = E.classify(
+            "purpose understanding failed before repository review")
+        self.assertNotEqual(kind, E.KIND_PROGRAM)
+
     def test_unknown_is_honest(self):
         kind, sugg = E.classify("SomethingNobodyHasSeen: zzz")
         self.assertEqual(kind, E.KIND_UNKNOWN)
