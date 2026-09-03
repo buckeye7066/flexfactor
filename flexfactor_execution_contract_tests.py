@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import tempfile
 import os
@@ -225,6 +226,26 @@ class OrchestratorTests(unittest.TestCase):
                          ["requirements.txt"])
         self.assertEqual(coordinator.finish_target(0, 0), 0)
 
+    def test_incomplete_pass_records_failed_finalization_without_raising(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.record_finalization(
+            changed_files=[], final_commit=None,
+            quality_gates_passed=False,
+            publication_required=False,
+            publication_complete=True,
+            note="semantic review incomplete",
+        )
+        finalization = coordinator.snapshot()["items"][0]["finalization"]
+        self.assertEqual(finalization["status"], "failed")
+        self.assertFalse(finalization["passes_complete"])
+        self.assertEqual(coordinator.finish_target(0, 1), 1)
+        self.assertEqual(
+            coordinator.snapshot()["items"][0]["passes"][0]["status"],
+            "interrupted",
+        )
+
     def test_audit_success_requires_final_tree_reconciliation(self):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
@@ -335,6 +356,40 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(item["attempts"][0]["status"], "interrupted")
         resumed.start_target(0)
         resumed.begin_pass(1, ["a.py"], whole_repository=True)
+
+    def test_recovery_archives_and_clears_a_stale_finalization(self):
+        root = tempfile.mkdtemp(prefix="ff-finalization-resume-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        path = os.path.join(root, "receipt.json")
+        first = execution.SequentialOrchestrator(
+            "audit", ["repo"], state_path=path, queue_id="finalization-resume")
+        first.start_target(0)
+        first.begin_pass(1, ["a.py"], whole_repository=True)
+        first.finish_pass(1, [], reviewed_files=["a.py"])
+        first.record_competitor_gate(
+            attempted=False, implemented_files=[], verified=0,
+            not_applicable=True)
+        self._finalize(first)
+
+        resumed = execution.SequentialOrchestrator(
+            "audit", ["repo"], state_path=path, queue_id="finalization-resume")
+        item = resumed.snapshot()["items"][0]
+        self.assertNotIn("finalization", item)
+        self.assertEqual(item["attempts"][0]["finalization"]["status"],
+                         "completed")
+        resumed.start_target(0)
+        resumed.begin_pass(1, ["a.py"], whole_repository=True)
+
+    def test_schema_one_receipt_is_rejected_instead_of_bypassing_finalization(self):
+        root = tempfile.mkdtemp(prefix="ff-schema-one-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        path = os.path.join(root, "receipt.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump({"schema": 1}, stream)
+        with self.assertRaisesRegex(
+                execution.ExecutionContractError, "unsupported schema"):
+            execution.SequentialOrchestrator(
+                "audit", ["repo"], state_path=path, queue_id="legacy")
 
     def test_queue_runner_never_overlaps_targets_and_persists_receipt(self):
         root = tempfile.mkdtemp(prefix="ff-queue-run-")

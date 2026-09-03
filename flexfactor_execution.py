@@ -120,7 +120,10 @@ class SequentialOrchestrator:
     is atomically persisted as an owner-readable execution receipt.
     """
 
-    SCHEMA = 1
+    # Schema 2 makes exact final-tree reconciliation part of the durable
+    # contract.  Schema-1 success receipts cannot be resumed as though they had
+    # satisfied an invariant that did not exist when they were written.
+    SCHEMA = 2
 
     def __init__(self, mode: str, targets: Iterable[object], *,
                  state_path: str | None = None, queue_id: str | None = None):
@@ -215,9 +218,11 @@ class SequentialOrchestrator:
         }
         if item.get("competitor_gate") is not None:
             prior["competitor_gate"] = item.get("competitor_gate")
+        if item.get("finalization") is not None:
+            prior["finalization"] = item.get("finalization")
         item.setdefault("attempts", []).append(prior)
         for field in ("started_at", "finished_at", "exit_code", "note",
-                      "competitor_gate"):
+                      "competitor_gate", "finalization"):
             item.pop(field, None)
         item["passes"] = []
         item["status"] = "queued"
@@ -466,9 +471,9 @@ class SequentialOrchestrator:
                 raise OrchestrationOrderError("no target is active")
             item = self._state["items"][index]
             passes = list(item.get("passes") or [])
-            if not passes or any(row.get("status") != "completed" for row in passes):
+            if not passes:
                 raise OrchestrationOrderError(
-                    "finalization requires completed repository passes"
+                    "finalization requires a recorded repository pass"
                 )
             if "finalization" in item:
                 raise OrchestrationOrderError("target finalization already recorded")
@@ -485,6 +490,8 @@ class SequentialOrchestrator:
             post_pass = [path for path in final_files if path not in governed]
             gates_ok = bool(quality_gates_passed)
             publication_ok = bool(publication_complete)
+            passes_complete = all(
+                row.get("status") == "completed" for row in passes)
             item["finalization"] = {
                 "changed_files": final_files,
                 "pass_changed_files": pass_files,
@@ -492,9 +499,11 @@ class SequentialOrchestrator:
                 "post_pass_changed_files": post_pass,
                 "final_commit": str(final_commit or ""),
                 "quality_gates_passed": gates_ok,
+                "passes_complete": passes_complete,
                 "publication_required": bool(publication_required),
                 "publication_complete": publication_ok,
-                "status": "completed" if gates_ok and publication_ok else "failed",
+                "status": ("completed" if passes_complete and gates_ok
+                           and publication_ok else "failed"),
                 "note": str(note or "")[:1000],
                 "finished_at": time.time(),
             }
