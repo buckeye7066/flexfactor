@@ -158,6 +158,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
                         model_install.index('rm -f "$archive"'))
         self.assertLess(model_install.index('rm -f "$archive"'),
                         model_install.index("ollama pull qwen2.5-coder:7b"))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull deepseek-coder:6.7b"))
         self.assertIn("options: [auto]", workflow)
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
