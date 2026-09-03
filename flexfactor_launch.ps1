@@ -7,6 +7,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
+$launcherArguments = @($args)
+. (Join-Path $PSScriptRoot 'scripts\flexfactor_source_refresh.ps1')
+Invoke-FlexFactorSourceRefresh -Repository $PSScriptRoot `
+    -LauncherPath $PSCommandPath -ForwardedArgs $launcherArguments
+
 $script = Join-Path $PSScriptRoot "flexfactor_run.py"
 . (Join-Path $PSScriptRoot 'scripts\flexfactor_python.ps1')
 
