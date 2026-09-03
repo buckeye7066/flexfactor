@@ -1702,21 +1702,22 @@ class RotationDefaultProviderTests(unittest.TestCase):
         for rid in ("groq/llama-x", "cerebras/qwen-y", "openrouter/z"):
             self.assertIn(rid, out)
 
-    def test_the_stale_warning_is_actionable_and_never_auto_refreshes(self):
+    def test_ai_time_refreshes_before_catalog_selection(self):
         import io, contextlib
         self._write_stale_catalog([self._route("groq/llama-x")], age_hours=9.0)
         ff._ROTATION_STALE_PRINTED.clear()
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with mock.patch.object(
+                ff, "_refresh_ai_time_catalog",
+                return_value=(True, "AI Time refreshed live availability")) as refresh, \
+                contextlib.redirect_stderr(err):
             ff.build_audit_providers(self.Args)
         out = err.getvalue()
+        refresh.assert_called_once_with()
+        self.assertIn("AI Time refreshed live availability", out)
         self.assertIn(self._cat_path, out, "name the file that is stale")
         self.assertIn("9.0h", out, "say how old it is")
         self.assertIn("python -m aitime.catalog", out, "give the exact command")
-        # FlexFactor must never run it: AI Time owns that catalog, and silently
-        # regenerating another program's state is not this tool's call.
-        self.assertNotIn("aitime.catalog", inspect.getsource(ff._build_rotating_provider)
-                         .replace("`python -m aitime.catalog`", ""))
 
     def test_a_batch_run_warns_once_not_once_per_program(self):
         """`_build_rotating_provider` runs per PROGRAM. A 5-program batch that
@@ -2855,6 +2856,50 @@ class BudgetReservationTests(unittest.TestCase):
         m = ff.CostMeter(limit_usd=None)
         self.assertTrue(m.reserve(10_000.0))
         self.assertFalse(m.over_limit())
+
+    def test_spent_paid_budget_keeps_the_run_available_when_free_capacity_exists(self):
+        class Provider:
+            @staticmethod
+            def has_genuine_free_capacity():
+                return True
+
+        meter = ff.CostMeter(limit_usd=1.0)
+        meter.record("claude-opus-4-8", input_tokens=100_000,
+                     output_tokens=100_000)
+        self.assertTrue(meter.over_limit())
+        self.assertTrue(ff._model_work_available(meter, [Provider()]))
+        self.assertNotIn("meter.over_limit()", inspect.getsource(ff.audit_one_program))
+
+    def test_ai_time_refresh_executes_before_catalog_read(self):
+        import subprocess
+        completed = subprocess.CompletedProcess([], 0, "refreshed", "")
+        with mock.patch("importlib.util.find_spec", return_value=object()), \
+                mock.patch.object(ff, "_run", return_value=completed) as run:
+            okay, note = ff._refresh_ai_time_catalog()
+        self.assertTrue(okay)
+        self.assertIn("refreshed live", note)
+        self.assertEqual(run.call_args.args[0],
+                         [sys.executable, "-m", "aitime.catalog"])
+
+    def test_ai_time_refresh_finds_configured_source_checkout(self):
+        import subprocess
+        import tempfile
+
+        completed = subprocess.CompletedProcess([], 0, "refreshed", "")
+        with tempfile.TemporaryDirectory() as checkout:
+            os.makedirs(os.path.join(checkout, "aitime"))
+            with open(os.path.join(checkout, "aitime", "catalog.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("# fixture\n")
+            config = os.path.join(checkout, "config.json")
+            with mock.patch("importlib.util.find_spec", return_value=None), \
+                    mock.patch.dict(os.environ, {
+                        "FLEXFACTOR_AITIME_CONFIG": config,
+                        "AITIME_STATE_DIR": "",
+                    }), mock.patch.object(ff, "_run", return_value=completed) as run:
+                okay, _note = ff._refresh_ai_time_catalog()
+        self.assertTrue(okay)
+        self.assertEqual(run.call_args.args[1], checkout)
 
     def test_parallel_reservations_never_exceed_cap(self):
         import threading
@@ -5447,7 +5492,7 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
             ff._flatten_unresolved_fix_ledger(pending)[0]["title"],
             "still broken")
 
-    def test_completed_below_floor_verdict_clears_an_old_serious_finding(self):
+    def test_low_finding_remains_a_repair_obligation_regardless_of_legacy_floor(self):
         pending = {"src/a.py": [self._finding("src/a.py")]}
         ff._update_unresolved_fix_ledger(
             pending,
@@ -5455,7 +5500,16 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
                 "src/a.py", severity="low", title="minor only")]},
             clean={},
             min_severity="high")
-        self.assertEqual(pending, {})
+        self.assertEqual(pending["src/a.py"][0]["title"], "minor only")
+
+    def test_every_code_finding_is_fixable_independent_of_severity(self):
+        for severity in ("info", "low", "medium", "high", "critical"):
+            finding = self._finding("src/a.py", severity=severity)
+            self.assertTrue(ff.should_fix_finding(finding, "critical"))
+        self.assertFalse(ff.should_fix_finding({
+            "severity": "critical", "category": "runtime-data",
+            "evidence_source": "runtime-data",
+        }, "info"))
 
     def test_reattachment_preserves_current_low_and_open_serious_findings(self):
         low = self._finding("src/a.py", severity="low", title="minor issue")
@@ -10247,6 +10301,51 @@ class RealCloneEnrichmentTests(unittest.TestCase):
         self.assertEqual(info["dependency_burden"], "1 runtime + 0 dev deps")
         self.assertEqual(info["license_families"], {"mit"})
 
+    def test_competitor_source_inspector_returns_commit_bound_code_evidence(self):
+        import subprocess
+
+        def runner(cmd, cwd, timeout=900, env=None):
+            if "clone" in cmd:
+                dest = cmd[-1]
+                subprocess.run(["git", "init", "-q", dest], check=True)
+                subprocess.run(
+                    ["git", "-C", dest, "config", "user.email", "t@t"], check=True)
+                subprocess.run(
+                    ["git", "-C", dest, "config", "user.name", "t"], check=True)
+                os.makedirs(os.path.join(dest, "src"), exist_ok=True)
+                self._write(dest, "src/feature.py",
+                            "def export_project():\n    return {'portable': True}\n")
+                self._write(dest, "README.md", "Public project export support.\n")
+                self._write(dest, "LICENSE", self.MIT_TEXT)
+                subprocess.run(["git", "-C", dest, "add", "-A"], check=True)
+                subprocess.run(
+                    ["git", "-C", dest, "commit", "-q", "-m", "fixture"], check=True)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.run(
+                cmd, cwd=cwd, timeout=timeout, env=env,
+                capture_output=True, text=True,
+            )
+
+        result = ff.inspect_public_competitor_source({
+            "name": "PublicTool", "url": "https://github.com/example/public-tool",
+        }, run=runner)
+        self.assertIs(result["source_inspection_ok"], True)
+        self.assertEqual(len(result["commit"]), 40)
+        self.assertGreaterEqual(result["source_files_indexed"], 2)
+        code = [row for row in result["source_documents"]
+                if row.get("path") == "src/feature.py"]
+        self.assertEqual(len(code), 1)
+        self.assertTrue(code[0]["evidence_id"].startswith("code-"))
+        self.assertIn(result["commit"], code[0]["url"])
+        self.assertIn("export_project", code[0]["content"])
+
+    def test_competitor_source_inspector_rejects_embedded_credentials(self):
+        result = ff.inspect_public_competitor_source({
+            "name": "Unsafe", "url": "https://token@github.com/example/project",
+        })
+        self.assertIs(result["source_inspection_ok"], False)
+        self.assertIn("supported public HTTPS", result["reason"])
+
     def test_lifecycle_scripts_recorded_and_reasoned(self):
         e = self._evaluation("MIT")
 
@@ -11299,7 +11398,7 @@ class ProdreadyModeTests(unittest.TestCase):
                 ff.main(["prodready", "--program", "."])
                 self.assertTrue(captured["readiness"])
                 self.assertTrue(captured["apply"])
-                self.assertEqual(captured["severity"], "medium")
+                self.assertEqual(captured["severity"], "info")
                 self.assertIn("prodready", captured["prefix"])
 
     def test_explicit_flags_still_win_in_prodready(self):
@@ -11314,6 +11413,17 @@ class ProdreadyModeTests(unittest.TestCase):
         self.assertFalse(captured["readiness"])
         self.assertTrue(captured["apply"],
                         "apply cannot be turned off any more - every run is real")
+
+    def test_legacy_severity_flag_cannot_narrow_a_whole_repo_repair(self):
+        captured = {}
+
+        def fake_run_audit(args):
+            captured["severity"] = args.fix_severity
+            return 0
+
+        with _patched(ff, "run_audit", fake_run_audit):
+            ff.main(["audit", "--program", ".", "--fix-severity", "critical"])
+        self.assertEqual(captured["severity"], "info")
 
     def test_bootstrap_flags_exist_with_safe_defaults(self):
         captured = {}
@@ -12608,12 +12718,13 @@ class ReadinessRemediationIsWiredTests(unittest.TestCase):
         _src, block = self._block()
         self.assertIn("_fix_files(", block,
                       "readiness blockers still never reach the fix loop")
-        self.assertIn("MAX_READINESS_FIXES", block, "the pass is unbounded")
+        self.assertNotIn("MAX_READINESS_FIXES", block,
+                         "an arbitrary count cap leaves fixable blockers unattempted")
 
     def test_the_remediation_pass_respects_the_existing_gates(self):
         _src, block = self._block()
         for guard in ("not dirty_abort", "not infrastructure_abort",
-                      "meter.over_limit()", "adversarial="):
+                      "_model_work_available", "adversarial="):
             self.assertIn(guard, block, f"readiness fixes bypass {guard}")
 
     def test_only_a_real_file_is_handed_to_the_fix_loop(self):
@@ -16012,11 +16123,9 @@ class ResumeCheckpointTests(unittest.TestCase):
             # further defects, so the total is intentionally not exact.
             self.assertGreaterEqual(res2.get("defects", 0), 1,
                                     "the recovered finding must reach the results")
-            # This second run converges (nothing left to fix at fix-severity
-            # 'medium' since the finding is 'low'... but readiness/purpose are
-            # off and the only finding is sub-floor, so nothing gets fixed and
-            # the run should still finish and leave its OWN checkpoint marked
-            # "finished" - not stuck "running"/"interrupted" forever.
+            # The second run must reach a terminal checkpoint even when its
+            # recovered low-severity finding enters the same repair workflow as
+            # every other code finding.
             run2 = ffrs.load(ff.RUNS_PATH, cp.run_id)
             self.assertIn(run2.data.get("status"), ("finished", "interrupted"),
                          "the resumed checkpoint must reach a terminal status, "
@@ -16891,11 +17000,13 @@ class CompetitorBridgeGateTests(unittest.TestCase):
         self.assertEqual(fc.competitor_findings(self._research(idea={"accept": False}),
                                                 file_exists=lambda x: True), [])
 
-    def test_severity_floor_and_cap_and_missing_file_all_drop_the_finding(self):
+    def test_legacy_severity_floor_cannot_drop_a_fixable_finding(self):
         r = self._research(idea={"severity": "low"})
-        self.assertEqual(fc.competitor_findings(r, severity_floor_rank=3,
-                                                severity_rank=ff.SEVERITY_RANK,
-                                                file_exists=lambda x: True), [])
+        self.assertEqual(len(fc.competitor_findings(
+            r, severity_floor_rank=3, severity_rank=ff.SEVERITY_RANK,
+            file_exists=lambda x: True)), 1)
+
+    def test_cap_and_missing_file_drop_the_finding(self):
         self.assertEqual(fc.competitor_findings(self._research(), max_findings=0,
                                                 file_exists=lambda x: True), [])
         self.assertEqual(fc.competitor_findings(self._research(),
@@ -16934,10 +17045,10 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
                                      severity_rank=ff.SEVERITY_RANK,
                                      file_exists=lambda r: r == "src/app.js")
         ledger = research["bridge_ledger"]
-        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out), 2)
         self.assertEqual(ledger["candidates"], 7)
-        self.assertEqual(ledger["bridged"], 1)
-        self.assertEqual(ledger["dropped_total"], 6)
+        self.assertEqual(ledger["bridged"], 2)
+        self.assertEqual(ledger["dropped_total"], 5)
         self.assertTrue(ledger["accounted"],
                         "candidates != bridged + dropped: a candidate vanished")
         reasons = "\n".join(ledger["dropped"].keys())
@@ -16945,7 +17056,6 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
                           ("not bridgeable", "refonly"),
                           ("not code_fixable", "nofix"),
                           ("no target file", "nofile"),
-                          ("below the --fix-severity floor", "lowsev"),
                           ("does not exist in the repo", "ghostfile")):
             self.assertIn(frag, reasons)
             self.assertTrue(any(who in names for r, names
@@ -17009,16 +17119,16 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
 
     def test_phase1_purpose_gap_bridging_keeps_the_same_ledger(self):
         # The purpose-gap loop had the IDENTICAL silent-drop shape (three bare
-        # continues plus an unrecorded [:cap] truncation) - and its drops are
-        # the owner's own unmet acceptance criteria, which makes silence there
-        # strictly worse. Pin that the loop records every drop, records the
-        # cap tail, and seals the same accounted invariant.
+        # continues plus an unrecorded count truncation) - and its drops are the
+        # owner's own unmet acceptance criteria, which makes silence there
+        # strictly worse. Pin that the loop records every safety rejection,
+        # has no arbitrary item cap, and seals the same accounted invariant.
         src = inspect.getsource(ff.audit_one_program)
-        start = src.index("authored_b = bool(")
+        start = src.index("bridgeable_b: list[")
         seg = src[start:start + 4000]
         self.assertIn("_gdrop(", seg)
-        self.assertIn("bridgeable_b[cap_b:]", seg,
-                      "the cap tail must be recorded, not silently truncated")
+        self.assertNotIn("bridgeable_b[cap_b:]", seg,
+                         "a count cap leaves fixable purpose gaps unattempted")
         self.assertIn('purpose_before["bridge_ledger"]', seg)
         self.assertIn('"accounted"', seg)
         # Every filter branch must record before it continues: count the bare
@@ -17109,6 +17219,7 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
                       "author= must route to the provider's STRONG tier, "
                       "not through _judge")
         self.assertIn("allow_credentialed_firecrawl=", call)
+        self.assertIn("source_inspector=inspect_public_competitor_source", call)
         self.assertIn("TOP_COMPETITORS", call,
                       "the inter-pass gate must remain fixed at the top three")
 
@@ -17484,6 +17595,74 @@ class CompetitorResearchPipelineTests(unittest.TestCase):
         self.assertEqual(c["evidence_status"], "verified")
         self.assertTrue(fc.may_bridge(c))
         self.assertFalse(fc.may_copy_source(c["reuse_mode"]))
+
+    def test_open_source_idea_must_be_grounded_in_inspected_code(self):
+        inspected = []
+
+        def source_inspector(competitor):
+            inspected.append(competitor["name"])
+            return {
+                "source_inspection_ok": True,
+                "commit": "a" * 40,
+                "source_files_indexed": 17,
+                "source_files_inspected": 1,
+                "source_documents": [{
+                    "evidence_id": "code-abc123def456",
+                    "url": "https://github.com/openlp/openlp/blob/" + "a" * 40
+                           + "/src/export.py",
+                    "title": "src/export.py", "path": "src/export.py",
+                    "sha256": "b" * 64,
+                    "content": "def export_service_plan(): return portable_bundle()",
+                    "evidence_kind": "inspected-source-code",
+                }],
+            }
+
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {"competitors": [{
+                    "name": "openlp", "kind": "oss", "search_query": "openlp",
+                }]}
+            return {
+                "idea_title": "Portable service plans", "what_it_does": "Exports plans",
+                "why_valuable": "Users can move complete plans", "evidence_basis": "code",
+                "evidence_refs": ["code-abc123def456"], "accept": True,
+                "purpose_reason": "serves criterion 1", "acceptance_ref": "1",
+                "already_present": False, "risk_level": "low",
+                "risk_reason": "bounded export format", "risk_mitigation": "",
+                "wiring_plan": "add export route and UI action",
+                "verification_plan": "round-trip an exported fixture",
+                "severity": "low", "code_fixable": True,
+                "file": "src/app.js", "confidence": "high",
+            }
+
+        result = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], opener=self._opener(), target=1,
+            source_inspector=source_inspector,
+        )
+        competitor = result["competitors"][0]
+        self.assertEqual(inspected, ["openlp"])
+        self.assertEqual(result["source_repositories_inspected"], 1)
+        self.assertIn("inspected-public-source-code", result["sources_used"])
+        self.assertEqual(competitor["evidence_status"], "verified")
+        self.assertTrue(competitor["idea"]["accept"])
+        self.assertIn("code-abc123def456", competitor["idea"]["evidence_refs"])
+
+    def test_open_source_page_evidence_cannot_bypass_failed_code_inspection(self):
+        judge = self._judge([{
+            "name": "openlp", "kind": "oss", "search_query": "openlp",
+        }])
+        result = fc.research_competitors(
+            judge, "SermonSmith", "purpose", [], opener=self._opener(), target=1,
+            source_inspector=lambda _competitor: {
+                "source_inspection_ok": False,
+                "reason": "clone unavailable", "source_documents": [],
+            },
+        )
+        competitor = result["competitors"][0]
+        self.assertEqual(competitor["evidence_status"], "unverified")
+        self.assertFalse(competitor["idea"]["accept"])
+        self.assertTrue(any("source inspection failed" in reason
+                            for reason in result["sources_skipped"].values()))
 
     def test_a_competitor_no_source_corroborates_is_marked_unverified_and_not_acted_on(self):
         judge = self._judge([{"name": "GhostProduct", "kind": "market", "why": "w",

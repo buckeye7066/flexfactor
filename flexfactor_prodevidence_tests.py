@@ -597,7 +597,9 @@ class NonCodeFindingsAreNeverPatchedTests(unittest.TestCase):
         self.assertIn("FB_IAB: 41 sessions, 0 refresh rotations", text)
         self.assertIn("Next step (owner):", text)
         # It must NOT be listed as a code defect awaiting a patch.
-        head = text.split("## Remaining defects NOT auto-fixed")[1].split("##")[0]
+        head = text.split(
+            "## Remaining defects that could not be safely repaired"
+        )[1].split("##")[0]
         self.assertNotIn("Facebook in-app browser", head)
 
     def test_an_UNAVAILABLE_capability_says_so_in_the_report(self):

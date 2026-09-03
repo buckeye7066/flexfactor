@@ -40,6 +40,7 @@ import time
 import tokenize
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -391,11 +392,12 @@ def _price_for(model: str) -> tuple[float, float]:
 
 
 class CostMeter:
-    """Accumulates token spend across provider calls and enforces a hard cap.
+    """Accumulates token spend and enforces a hard cap on paid routes.
 
     Thread-safe because audit can run several programs (and their provider calls)
-    concurrently. `over_limit()` is checked before each expensive LLM call so a
-    run stops cleanly at the budget instead of blowing past it."""
+    concurrently. `over_limit()` is checked before each expensive LLM call;
+    reaching it demotes work to genuine zero-cost routes rather than ending a
+    run while AI Time still reports usable capacity."""
 
     def __init__(self, limit_usd: float | None = None, carried_usd: float = 0.0):
         # `carried_usd` is spend from an EARLIER, interrupted run of the same
@@ -487,6 +489,62 @@ def _model_work_available(meter, providers) -> bool:
         return True
     return any(_provider_has_zero_cost_capacity(provider)
                for provider in (providers or []) if provider is not None)
+
+
+def _refresh_ai_time_catalog() -> tuple[bool, str]:
+    """Ask AI Time to refresh availability before this program selects a model.
+
+    AI Time owns the route/allowance catalog, while FlexFactor owns selection
+    from it. Refreshing here prevents a stale paid allowance from being retried
+    for an entire repository run. A missing AI Time installation is not fatal
+    because the built-in catalog remains the documented fallback; a present but
+    failing installation is reported so no receipt implies live availability
+    was measured when it was not.
+    """
+    import importlib.util
+    checkout_candidates: list[str] = []
+    try:
+        spec = importlib.util.find_spec("aitime.catalog")
+    except (ImportError, ModuleNotFoundError, ValueError):
+        spec = None
+    origin = str(getattr(spec, "origin", "") or "")
+    if origin:
+        checkout_candidates.append(os.path.dirname(os.path.dirname(origin)))
+    configured = str(os.environ.get("FLEXFACTOR_AITIME_CONFIG") or "").strip()
+    if configured:
+        checkout_candidates.append(os.path.dirname(os.path.abspath(configured)))
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("AITime", "ai-time", "aitime"):
+        checkout_candidates.extend((
+            os.path.normpath(os.path.join(here, "..", name)),
+            os.path.normpath(os.path.join(here, "..", "..", name)),
+        ))
+    state_dir = str(os.environ.get("AITIME_STATE_DIR") or "").strip()
+    if state_dir:
+        checkout_candidates.append(os.path.abspath(state_dir))
+    checkout = next((path for path in dict.fromkeys(checkout_candidates)
+                     if os.path.isfile(os.path.join(path, "aitime", "catalog.py"))), None)
+    if checkout is None and spec is not None:
+        # Installed packages already resolve independently of cwd. This also
+        # keeps test doubles simple while the real source-checkout path above
+        # handles AI Time's documented bare-module constraint.
+        checkout = os.getcwd()
+    if checkout is None:
+        return False, "AI Time source/catalog module could not be located"
+    try:
+        refreshed = _run(
+            [sys.executable, "-m", "aitime.catalog"],
+            checkout, timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001 - availability probing is fail-visible
+        return False, f"AI Time catalog refresh failed: {type(exc).__name__}: {exc}"
+    if refreshed.returncode != 0:
+        return False, (
+            "AI Time catalog refresh failed: "
+            + (_tail((refreshed.stderr or "") + (refreshed.stdout or ""), 3)
+               or f"exit {refreshed.returncode}")
+        )
+    return True, "AI Time refreshed live model and allowance availability"
 
 
 def _estimate_call_cost(model: str, source_chars: int, max_out_tokens: int) -> float:
@@ -4520,6 +4578,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     except ImportError as ex:
         _say(f"flexfactor_rotation unavailable ({ex})")
         return None
+    if not quiet:
+        _refreshed, refresh_note = _refresh_ai_time_catalog()
+        print(f"  [rotation] {refresh_note}", file=sys.stderr)
     # The sequential orchestrator is the product control plane. A legacy
     # AI_ROTATE=off value may no longer bypass its one best-available policy.
     catalog = fr.load_catalog()
@@ -4578,8 +4639,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     # (keyed by path), not once per rotated route. `Selection.describe()` used to
     # append it, and the caller prints one line per distinct route: a live
     # 5-program run on 2026-08-19 emitted ~30 `... stale catalog` lines. The note
-    # is actionable now -- file, age, and the exact refresh command -- and
-    # FlexFactor never runs that command itself (AI Time owns the catalog).
+    # is actionable now -- file, age, and the exact refresh command. FlexFactor
+    # requests that refresh before loading the catalog; this warning remains
+    # truthful when AI Time is missing or its refresh failed.
     # It is printed HERE, below the "no usable route" bail-out above, so it is
     # only ever said about a catalog this run is actually going to rotate on.
     stale_note = fr.catalog_staleness_note(catalog)
@@ -5018,6 +5080,7 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
                 system, prompt, schema, max_tokens=8000,
                 salvage_truncated=True,
             ),
+            source_inspector=inspect_public_competitor_source,
             allow_credentialed_firecrawl=True,
             log=lambda message: print(f"[competitor gate] {message}"),
             scout_profile=scout_profile,
@@ -5036,8 +5099,6 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
         pairs = module.competitor_findings(
             research,
             max_findings=_ff_execution.TOP_COMPETITORS,
-            severity_floor_rank=0,
-            severity_rank=SEVERITY_RANK,
             file_exists=lambda path: path.replace("\\", "/") == rel,
             acceptance_total=len(
                 getattr(purpose_contract, "acceptance_criteria", []) or []
@@ -9026,6 +9087,22 @@ _LICENSE_FILE_RX = re.compile(r"^(license|licence|copying|unlicense)([._\-].*)?$
 _NPM_LIFECYCLE_HOOKS = ("preinstall", "install", "postinstall", "prepare")
 _NATIVE_BUILD_FILES = ("binding.gyp", "CMakeLists.txt", "Cargo.toml")
 
+_COMPETITOR_SOURCE_EXTENSIONS = frozenset({
+    ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".go", ".graphql",
+    ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".kt", ".kts",
+    ".lua", ".m", ".md", ".php", ".py", ".rb", ".rs", ".scala",
+    ".sh", ".sql", ".svelte", ".swift", ".toml", ".ts", ".tsx",
+    ".vue", ".xml", ".yaml", ".yml",
+})
+_COMPETITOR_SOURCE_NAMES = frozenset({
+    "dockerfile", "gemfile", "makefile", "package.json", "pyproject.toml",
+    "requirements.txt", "cargo.toml", "go.mod",
+})
+_COMPETITOR_SOURCE_SKIP_PARTS = frozenset({
+    ".git", ".next", "build", "coverage", "dist", "node_modules",
+    "target", "vendor", "venv", ".venv", "__pycache__",
+})
+
 
 def _license_text_families(text: str | None) -> set[str]:
     """ALL license families whose distinctive text appears (Sol finding 4:
@@ -9110,6 +9187,167 @@ def inspect_checkout(checkout_dir: str) -> dict:
         info["license_file_found"] = True
         info["license_families"] |= _license_text_families(read(str(name), 200_000))
     return info
+
+
+def _competitor_source_documents(checkout_dir: str, repository_url: str,
+                                 commit: str) -> tuple[list[dict], dict]:
+    """Return bounded, citable source evidence from a cloned repository.
+
+    The complete tree is indexed first. Source evidence is then selected in a
+    deterministic source-before-tests order and read from Git's object database;
+    candidate code is never checked out or executed. The limits bound model
+    context, and the receipt explicitly records indexed, inspected, and omitted
+    counts rather than pretending a bounded evidence window was the whole tree.
+    """
+    list_root, read = _tree_reader(checkout_dir)
+    if os.path.isdir(os.path.join(checkout_dir, ".git")):
+        listed = _run(
+            ["git", "-C", checkout_dir, "ls-tree", "-r", "--name-only", "-z", "HEAD"],
+            cwd=checkout_dir, timeout=60,
+        )
+        names = listed.stdout.split("\0") if listed.returncode == 0 else []
+    else:
+        names = []
+        for dirpath, dirnames, filenames in os.walk(checkout_dir):
+            dirnames[:] = [name for name in dirnames
+                           if name not in _COMPETITOR_SOURCE_SKIP_PARTS]
+            for name in filenames:
+                names.append(os.path.relpath(
+                    os.path.join(dirpath, name), checkout_dir).replace("\\", "/"))
+        if not names:
+            names = [str(name) for name in list_root()]
+
+    candidates: list[str] = []
+    for raw in names:
+        rel = str(raw or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        parts = {part.lower() for part in rel.split("/")}
+        base = rel.rsplit("/", 1)[-1].lower()
+        ext = os.path.splitext(base)[1].lower()
+        if parts & _COMPETITOR_SOURCE_SKIP_PARTS:
+            continue
+        if base.endswith((".min.js", ".min.css", ".map")):
+            continue
+        if ext in _COMPETITOR_SOURCE_EXTENSIONS or base in _COMPETITOR_SOURCE_NAMES:
+            candidates.append(rel)
+
+    def priority(rel: str) -> tuple:
+        low = rel.lower()
+        is_test = any(token in low for token in (
+            "/test/", "/tests/", ".test.", ".spec.", "_test.", "test_"))
+        is_docs = low.endswith(".md")
+        is_primary = low.startswith(("src/", "app/", "lib/", "packages/"))
+        return (is_test, is_docs, not is_primary, low)
+
+    candidates = sorted(set(candidates), key=priority)
+    selected = candidates[:36]
+    documents: list[dict] = []
+    total_chars = 0
+    for rel in selected:
+        content = read(rel, 16_000)
+        if not content or "\x00" in content:
+            continue
+        remaining = 160_000 - total_chars
+        if remaining <= 0:
+            break
+        excerpt = content[:min(16_000, remaining)]
+        total_chars += len(excerpt)
+        digest = hashlib.sha256(excerpt.encode("utf-8", "replace")).hexdigest()
+        documents.append({
+            "evidence_id": "code-" + hashlib.sha256(
+                f"{commit}:{rel}".encode("utf-8")).hexdigest()[:12],
+            "url": (repository_url.rstrip("/") + "/blob/" + commit + "/"
+                    + urllib.parse.quote(rel, safe="/")),
+            "title": rel,
+            "path": rel,
+            "sha256": digest,
+            "content": excerpt,
+            "evidence_kind": "inspected-source-code",
+            "truncated": len(content) >= 16_000,
+        })
+    receipt = {
+        "source_files_indexed": len(candidates),
+        "source_files_inspected": len(documents),
+        "source_files_omitted_from_model_context": max(
+            0, len(candidates) - len(documents)),
+        "source_excerpt_characters": total_chars,
+    }
+    return documents, receipt
+
+
+def inspect_public_competitor_source(competitor: dict, run=None) -> dict:
+    """Clone and inspect a public competitor repository without executing it."""
+    url = str(competitor.get("url") or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or port not in (None, 443)
+            or (parsed.hostname or "").lower() not in {
+            "github.com", "gitlab.com", "bitbucket.org"}):
+        return {
+            "source_inspection_ok": False,
+            "reason": "no supported public HTTPS repository URL",
+            "source_documents": [],
+        }
+    runner = _run if run is None else run
+    tmp = tempfile.mkdtemp(prefix="ff-competitor-source-")
+    dest = os.path.join(tmp, "checkout")
+    try:
+        clone_env = _scout_contract.strip_credential_env(_hermetic_git_env())
+        cloned = runner(
+            ["git", "-c", "protocol.allow=never",
+             "-c", "protocol.https.allow=always", "clone", "--depth", "1",
+             "--no-tags", "--no-checkout", "--", url, dest],
+            cwd=tmp, timeout=180, env=clone_env,
+        )
+        if cloned.returncode != 0:
+            return {
+                "source_inspection_ok": False,
+                "reason": "public repository clone failed: "
+                          + (_tail(cloned.stderr or cloned.stdout or "", 3)
+                             or f"exit {cloned.returncode}"),
+                "source_documents": [],
+            }
+        resolved = runner(
+            ["git", "-C", dest, "rev-parse", "HEAD"],
+            cwd=dest, timeout=60, env=clone_env,
+        )
+        commit = (resolved.stdout or "").strip() if resolved.returncode == 0 else ""
+        if not commit:
+            return {
+                "source_inspection_ok": False,
+                "reason": "cloned repository HEAD could not be resolved",
+                "source_documents": [],
+            }
+        documents, receipt = _competitor_source_documents(dest, url, commit)
+        if not documents:
+            return {
+                "source_inspection_ok": False,
+                "reason": "repository contained no readable source evidence",
+                "source_documents": [],
+                "commit": commit,
+                **receipt,
+            }
+        safety = inspect_checkout(dest)
+        return {
+            "source_inspection_ok": True,
+            "reason": "real shallow clone inspected through the Git object database",
+            "repository_url": url,
+            "commit": commit,
+            "source_documents": documents,
+            "install_scripts": safety["install_scripts"],
+            "native_build": safety["native_build"],
+            "dependency_burden": safety["dependency_burden"],
+            "license_families": sorted(safety["license_families"]),
+            "license_file_found": safety["license_file_found"],
+            **receipt,
+        }
+    finally:
+        _rmtree_force(tmp)
 
 
 def _rmtree_force(path: str) -> None:
@@ -9371,6 +9609,7 @@ def _run_scout_impl(args) -> int:
                 author=lambda system, prompt, schema: provider.structured(
                     system, prompt, schema, max_tokens=8000,
                     salvage_truncated=True),
+                source_inspector=inspect_public_competitor_source,
                 allow_credentialed_firecrawl=True,
                 log=lambda message: print(f"[scout competitor] {message}"),
                 scout_profile=(profile if not scout_error else None),
@@ -10601,26 +10840,9 @@ AUDIT_BATCH_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Purpose-gap assessment: one cheap-tier call per program that infers what the
-# program was created FOR from its own metadata and measures the distance between
-# that purpose and what the code delivers. Small single-file gaps ("code_fixable")
-# are fed through the SAME gated fix pipeline as audit defects; the rest land in
-# the report as a roadmap. Cap so a wildly ambitious model can't turn the audit
-# into an unbounded feature-building spree.
-MAX_PURPOSE_GAP_FIXES = 3
-
-# When the OWNER has authored a purpose contract for this program, gaps are no
-# longer guesses about an inferred purpose - they are unmet acceptance criteria
-# the owner wrote down. That earns a bigger share of the fix budget: closing them
-# IS the job ("bridge the gap between where it is and that purpose").
-MAX_PURPOSE_GAP_FIXES_AUTHORED = 12
-
-# Readiness blockers that name a real file get ONE bounded remediation pass at
-# the end of a run. Bounded because this runs after the cycle loop, with the
-# budget already largely spent: the point is to close the mechanical blockers
-# that no amount of semantic review will ever reach (an unpinned manifest, an
-# undeclared licence), not to open a second unbounded fix phase.
-MAX_READINESS_FIXES = 6
+# Purpose gaps and readiness blockers that name a real file enter the same
+# verified repair workflow as ordinary findings. Confidence, containment, and
+# verification are safety gates; severity and arbitrary item counts are not.
 
 PURPOSE_GAP_SYSTEM = (
     "You are a product-minded principal engineer. From the program's own metadata "
@@ -12103,10 +12325,8 @@ def _enrich_stack_with_toolchains(project_dir: str, info: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The aggression knob: which audited defects get auto-fixed. ===> KNOB <===
-# Default min_severity='low' fixes essentially everything the auditor is
-# confident about; 'info' notes are advisory and never auto-acted on. Raise to
-# 'high'/'critical' to touch only the scariest defects.
+# One repair contract: every code finding enters the gated fixer. Severity is
+# retained for ordering/reporting and CLI compatibility, not as a drop filter.
 # --------------------------------------------------------------------------- #
 def should_fix_finding(finding: dict, min_severity: str) -> bool:
     # A NON-CODE FINDING NEVER BECOMES A PATCH (owner order 2026-08-25).
@@ -12115,9 +12335,12 @@ def should_fix_finding(finding: dict, min_severity: str) -> bool:
     # than a habit. See finding_is_non_code for why the distinction exists.
     if finding_is_non_code(finding):
         return False
-    rank = SEVERITY_RANK.get(str(finding.get("severity", "")).lower(), 0)
-    floor = max(1, SEVERITY_RANK.get(min_severity.lower(), 1))  # never below 'low'
-    return rank >= floor
+    # Severity controls ordering and reporting, never whether a real code
+    # defect is repaired. A low/info defect knowingly left behind still makes
+    # "all files green" untrue. Keep the legacy argument so saved launchers and
+    # internal callers remain source-compatible.
+    del min_severity
+    return True
 
 
 # Keys a proxy upstream sometimes emits a finding's analysis under when it
@@ -12678,6 +12901,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
                 system, prompt, schema, max_tokens=8000,
                 salvage_truncated=True
             ),
+            source_inspector=inspect_public_competitor_source,
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
             target=_ff_execution.TOP_COMPETITORS,
@@ -12713,8 +12937,6 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
     pairs = module.competitor_findings(
         research,
         max_findings=_ff_execution.TOP_COMPETITORS,
-        severity_floor_rank=SEVERITY_RANK.get(str(args.fix_severity).lower(), 3),
-        severity_rank=SEVERITY_RANK,
         file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
         acceptance_total=(
             len(getattr(purpose_contract, "acceptance_criteria", []) or [])
@@ -12727,7 +12949,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
     ledger = research.get("bridge_ledger") or {}
     print(f"{pfx}competitor gate: {ledger.get('bridged', 0)}/"
           f"{ledger.get('candidates', 0)} candidate idea(s) entered the fix stream")
-    if not pairs or meter.over_limit():
+    if not pairs or not _model_work_available(meter, [author, cross]):
         return outcome
 
     findings_by_file: dict[str, list[dict]] = {}
@@ -18789,7 +19011,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         purpose_reviewer_final = reviewers[0] if reviewers else author
 
         print(f"{pfx}FlexFactor AUDIT | dir={project_dir}")
-        print(f"{pfx}providers={active} fix>={args.fix_severity} "
+        print(f"{pfx}providers={active} fix=all-code-findings "
               f"max_files={args.max_files} cycles={args.cycles} git={git} e2e_port={e2e_port}")
         print(f"{pfx}stack: node={stack['is_node']} python={stack['is_python']} "
               f"framework={stack['framework']} test_cmd={'yes' if stack['test_cmd'] else 'no'} "
@@ -19069,15 +19291,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # so the dashboard "Fix" bar spans the whole run (cycle 1 -> finish) and
         # never resets per cycle.
         fix_attempts: dict[str, int] = {}  # per-file fix attempts (anti-oscillation)
-        manual_review: set[str] = set()    # files still flagging high/critical after the cap
-        # Latest review per file across ALL cycles. `files` shrinks each cycle (clean
-        # files drop out) and `all_findings` only holds the last cycle, so low/info
-        # findings in files that converged early would otherwise be lost from the
-        # final report. This keeps every file's most-recent findings so the lows
-        # inventory is complete repo-wide.
+        manual_review: set[str] = set()    # files still flagging defects after the cap
+        # Latest review per file across ALL cycles. A later clean verdict removes
+        # the older finding set so the final report cannot list already-repaired
+        # low/info defects as intentionally abandoned work.
         latest_findings_by_file: dict[str, list[dict]] = {}
-        # Serious findings stay open until a later completed semantic review of
-        # that exact file returns clean/below-floor. Merely attempting a fix is
+        # Findings stay open until a later completed semantic review of that
+        # exact file returns clean. Merely attempting a fix is
         # not evidence that it worked, and an unrelated delta-only cycle must not
         # make a rejected/no-op finding disappear.
         unresolved_fix_findings: dict[str, list[dict]] = {}
@@ -19320,8 +19540,6 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                       f"{purpose_before['criteria_total']} acceptance criteria met "
                       f"({_lbl}); {len(b_gaps)} gap(s) stand between this program "
                       "and its purpose.")
-            authored_b = bool(purpose_before.get("authored"))
-            floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
             bridgeable_b: list[tuple[str, dict]] = []
             # Same accounting contract as competitor_findings' bridge_ledger
             # (2026-08-16): every gap the baseline found either bridges or is
@@ -19341,25 +19559,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 if not (g.get("code_fixable") and rel):
                     _gdrop("not code-fixable, or no file named", g)
                     continue
-                if (not authored_b and
-                        SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0) < floor_rank):
-                    _gdrop("inferred gap below the --fix-severity floor", g)
-                    continue
                 if _read_text_and_sha(project_dir, rel) is None:
                     _gdrop(f"named file unreadable in the repo: {rel}", g)
                     continue
                 bridgeable_b.append((rel, g))
             bridgeable_b.sort(key=lambda rg: -SEVERITY_RANK.get(
                 str(rg[1].get("severity", "")).lower(), 0))
-            cap_b = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored_b else MAX_PURPOSE_GAP_FIXES
             if not purpose_mutation_authorized:
-                cap_b = 0  # weakly-inferred/unresolved purpose: report only
-            for _rel, _g in bridgeable_b[cap_b:]:
-                # The cap truncation was the silent half: a top-N cut has no
-                # filter reason of its own, so its tail vanished entirely.
-                _gdrop(f"over the per-run bridge cap of {cap_b} "
-                       "(worst-severity first; picked up next cycle)", _g)
-            bridgeable_b = bridgeable_b[:cap_b]
+                for _rel, _g in bridgeable_b:
+                    _gdrop("purpose confidence does not authorize mutation", _g)
+                bridgeable_b = []
             purpose_before["bridge_ledger"] = {
                 "candidates": len(b_gaps),
                 "bridged": len(bridgeable_b),
@@ -19811,6 +20020,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     fix_notes.append(f"{rel}: could not be safely read (containment refused) - manual review")
                 all_findings = flat  # latest cycle reflects the current code state
                 latest_findings_by_file.update(b_findings)  # keep each file's most-recent findings
+                for rel in b_clean:
+                    latest_findings_by_file.pop(rel, None)
                 print(f"{pfx}Found {len(b_flat)} defect(s) across {len(b_findings)} file(s) "
                       f"(batch {bidx + 1}/{len(batches)}).")
                 report(defects=len(flat), severity=_severity_breakdown(flat),
@@ -19836,11 +20047,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     cycle_stopped = True
                     break
 
-                # Files in THIS batch that still have fixable (>= fix-severity) defects.
+                # Files in THIS batch that still have code defects.
                 batch_still_fixable = [rel for rel in batch
                                        if any(should_fix_finding(f, args.fix_severity)
                                               for f in b_findings.get(rel, []))]
-                # Anti-oscillation: a file repeatedly re-flagging serious defects after
+                # Anti-oscillation: a file repeatedly re-flagging defects after
                 # MAX_FIX_ATTEMPTS is set aside for manual review instead of looping forever.
                 batch_fixable = [rel for rel in batch_still_fixable
                                  if fix_attempts.get(rel, 0) < MAX_FIX_ATTEMPTS]
@@ -20083,7 +20294,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "review proved them resolved - NOT clean")
                     converged = False
                 elif manual_review:
-                    print(f"{pfx}STOP: {len(manual_review)} file(s) still flag critical/high after "
+                    print(f"{pfx}STOP: {len(manual_review)} file(s) still flag defects after "
                           f"{MAX_FIX_ATTEMPTS} attempts - set aside for manual review (no infinite loop)")
                     stop_reason = (f"converged except {len(manual_review)} file(s) needing manual "
                                    "review (not safely auto-fixable)")
@@ -20139,9 +20350,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         brain_clean = sorted(clean_files | run_clean)
         clean_map = _build_clean_map(project_dir, brain_clean, prior_clean, run_clean_sha)
 
-        # Low/info inventory: everything reviewed but below the auto-fix bar, gathered
-        # across ALL cycles (not just the last) so the list is complete repo-wide.
-        # Reported for the user, never auto-changed.
+        # Low/info inventory: unresolved low/info findings after the same repair
+        # attempts and follow-up reviews applied to every other severity.
         low_findings = [f for fs in latest_findings_by_file.values() for f in fs
                         if SEVERITY_RANK.get(str(f.get("severity", "")).lower(), 0) <= 1]
         low_findings = _dedupe_findings(low_findings)
@@ -20164,7 +20374,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         #     metadata and measure the distance between that purpose and what the
         #     code delivers - then BRIDGE it where safely possible. Small,
         #     localized, purpose-critical gaps (code_fixable, single existing
-        #     file, capped at MAX_PURPOSE_GAP_FIXES) go through the SAME gated
+        #     file) go through the SAME gated
         #     fix pipeline as audit defects (build gate + adversarial
         #     cross-check + rollback); everything else lands in the report as a
         #     concrete roadmap. This is what turns "no defects found" into
@@ -20215,21 +20425,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                       f"contract): {pct if pct is not None else '?'}% - {len(gaps)} gap(s)")
             for g in gaps:
                 all_findings.append(_gap_to_finding(g))
-            floor_rank = SEVERITY_RANK.get(str(args.fix_severity).lower(), 3)
-            authored = bool(purpose_gap.get("authored"))
-            # An OWNER-AUTHORED gap is an unmet requirement, not a suggestion, so
-            # it is never filtered out by --fix-severity: closing it is the job.
-            # Inferred gaps still respect the fix floor, because an inferred
-            # purpose is a guess and a guess should not drive a low-severity
-            # rewrite spree.
+            # Authored and inferred code-fixable gaps are both repair work.  The
+            # confidence gate above governs whether mutation is authorized;
+            # severity never silently narrows an authorized repair stream.
             bridgeable: list[tuple[str, dict]] = []
-            if not meter.over_limit():
+            if _model_work_available(meter, [author, cross]):
                 for g in gaps:
                     rel = str(g.get("file") or "").replace("\\", "/")
                     if not (g.get("code_fixable") and rel):
-                        continue
-                    if (not authored and
-                            SEVERITY_RANK.get(str(g.get("severity", "")).lower(), 0) < floor_rank):
                         continue
                     if _read_text_and_sha(project_dir, rel) is None:
                         continue  # nonexistent/unreadable target - roadmap only
@@ -20239,12 +20442,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # model happened to list first.
             bridgeable.sort(key=lambda rg: -SEVERITY_RANK.get(
                 str(rg[1].get("severity", "")).lower(), 0))
-            cap = MAX_PURPOSE_GAP_FIXES_AUTHORED if authored else MAX_PURPOSE_GAP_FIXES
             if not purpose_mutation_authorized:
-                cap = 0  # weakly-inferred/unresolved purpose: gaps are reported, not bridged
+                bridgeable = []  # weakly-inferred/unresolved purpose: report only
                 print(f"{pfx}purpose gaps reported but NOT bridged: purpose confidence is "
                       f"{purpose_confidence} ({purpose_auth_reason})")
-            bridgeable = bridgeable[:cap]
             verified_bridged: set[str] = set()
             if bridgeable:
                 print(f"{pfx}Bridging {len(bridgeable)} code-fixable purpose gap(s) "
@@ -20848,17 +21049,18 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # for no safety reason. The commit below is what is conditional
                 # on git, which is where the condition belongs.
                 if (_readiness_fixable and not dirty_abort
-                        and not infrastructure_abort and not meter.over_limit()):
-                    _capped = dict(list(_readiness_fixable.items())[:MAX_READINESS_FIXES])
+                        and not infrastructure_abort
+                        and _model_work_available(meter, [author, cross])):
+                    _repairable = dict(_readiness_fixable)
                     print(f"{pfx}readiness remediation: attempting "
-                          f"{len(_capped)} blocker(s) with a resolvable file "
-                          f"({', '.join(_capped)})")
+                          f"{len(_repairable)} blocker(s) with a resolvable file "
+                          f"({', '.join(_repairable)})")
                     report(phase="readiness remediation")
                     try:
                         _rf_applied, _rf_unverified, _rf_notes = _fix_files(
-                            author, cross, project_dir, _capped, stack, baseline_ok,
+                            author, cross, project_dir, _repairable, stack, baseline_ok,
                             args, meter=meter, oversized=oversized, report=report,
-                            done_set=set(), total_overall=max(1, len(_capped)),
+                            done_set=set(), total_overall=max(1, len(_repairable)),
                             commit_cb=None,
                             adversarial=getattr(args, "adversarial", True),
                             adversarial_rounds=getattr(args, "adversarial_rounds", 2),
@@ -21539,7 +21741,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                   "missing) - criteria met now: "
                   f"{met_after if met_after is not None else '?'}/{total_crit}.")
         _print_audit_summary(audit)
-        print(f"{pfx}Low/info issues catalogued (not auto-fixed): {len(low_findings)}")
+        print(f"{pfx}Low/info issues still open after repair attempts: {len(low_findings)}")
         print(f"{pfx}Cost: {meter.summary()}")
         report_path = _write_audit_report(project_dir, audit)
         print(f"{pfx}Full audit report: {report_path}")
@@ -22757,9 +22959,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
     if a["e2e"].get("log"):
         L += ["## Button/UI test output", "", "```", a["e2e"]["log"][:4000], "```", ""]
 
-    # The rest: defects NOT auto-fixed (below the fix-severity floor, or on files
-    # that could not be safely fixed). This is the curated "to-review" list.
-    floor = SEVERITY_RANK.get(str(a.get("fix_severity", "high")).lower(), 3)
+    # The rest: code defects that could not be safely fixed and verified.
     applied = set(a.get("applied_files") or [])
     unresolved = set(a.get("unresolved_files") or [])
     # RUNTIME-DATA EVIDENCE: what was actually read from production, or the
@@ -22820,19 +23020,16 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
         # code backlog item.
         if finding_is_non_code(f):
             continue
-        rank = SEVERITY_RANK.get(str(f.get("severity")).lower(), 0)
-        below_floor = rank < floor
-        unfixed_serious = (rank >= floor
-                           and (f.get("file") not in applied
-                                or f.get("file") in unresolved))
-        if below_floor or unfixed_serious:
+        unfixed = (f.get("file") not in applied
+                   or f.get("file") in unresolved)
+        if unfixed:
             remaining.setdefault(str(f.get("severity", "?")).lower(), []).append(f)
-    L += [f"## Remaining defects NOT auto-fixed (fix floor = {a.get('fix_severity', 'high')})", "",
-          "_These were found but left as-is - review and decide. Critical/high here means "
-          "a file that could not be safely auto-fixed (see manual-review list)._", ""]
+    L += ["## Remaining defects that could not be safely repaired", "",
+          "_Every code finding entered the repair workflow. Items here exhausted "
+          "safe attempts, were rejected by verification, or remain unresolved._", ""]
     total_remaining = sum(len(v) for v in remaining.values())
     if not total_remaining:
-        L += ["_None - every reported defect at or above the floor was fixed._", ""]
+        L += ["_None - every reported code defect was fixed and verified._", ""]
     for sev in ("critical", "high", "medium", "low", "info"):
         items = remaining.get(sev) or []
         if not items:
@@ -22844,7 +23041,7 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
                      f"_Suggested fix:_ {f.get('fix')}")
         L.append("")
     if a.get("manual_review"):
-        L += ["## Files needing MANUAL review (had critical/high that could not be auto-fixed)", ""]
+        L += ["## Files needing MANUAL review after safe repair attempts", ""]
         L += [f"- `{rel}`" for rel in a["manual_review"]] + [""]
 
     L += ["## Defects by file", ""]
@@ -22877,17 +23074,15 @@ def _write_audit_report(project_dir: str, a: dict) -> str:
 
 
 def _write_low_findings_report(project_dir: str, name: str, lows: list[dict]) -> str | None:
-    """Write a standalone, grouped-by-file checklist of every low/info finding that
-    was catalogued but deliberately NOT auto-fixed. This is the user-facing 'list of
-    the lows'. Returns the path, or None if there are no lows."""
+    """Write a grouped checklist of low/info findings still unresolved."""
     if not lows:
         return None
     by_file: dict[str, list[dict]] = {}
     for f in lows:
         by_file.setdefault(str(f.get("file", "(unknown)")), []).append(f)
     L = [f"# {name} — low / info findings ({len(lows)})", "",
-         f"_Generated {_now_iso()}. These are below the auto-fix bar and were left "
-         "unchanged on purpose. Review and decide per item._", "",
+         f"_Generated {_now_iso()}. These entered the same repair workflow as "
+         "every other code finding but remain unresolved after safe attempts._", "",
          f"**Files with low/info issues:** {len(by_file)}", ""]
     for rel in sorted(by_file):
         items = sorted(by_file[rel], key=lambda x: int(x.get("line") or 0))
@@ -23416,10 +23611,9 @@ def main(argv=None) -> int:
                             help="Re-review files the brain marked clean in a prior run.")
         parser.add_argument("--no-dashboard", action="store_false", dest="dashboard",
                             help="Don't launch the live progress dashboard window.")
-        parser.add_argument("--fix-severity", choices=["low", "medium", "high", "critical"],
-                            default="high", dest="fix_severity",
-                            help="Minimum defect severity to AUTO-FIX (default: high = fix only "
-                                 "critical + high; medium/low/info are reported, not changed).")
+        parser.add_argument("--fix-severity",
+                            choices=["info", "low", "medium", "high", "critical"],
+                            default="info", dest="fix_severity", help=argparse.SUPPRESS)
         parser.add_argument("--max-files", type=int, default=0, dest="max_files",
                             help="Compatibility argument; audit/prodready require 0 and "
                                  "reject any subset so pass 1 always uses the complete "
@@ -23568,6 +23762,10 @@ def main(argv=None) -> int:
         args.explicit_provider = _asked("--provider")
         if args.readiness is None:
             args.readiness = _prod
+        # One completion contract: every code finding enters the repair stream.
+        # Retain --fix-severity only as a parser-compatible legacy spelling;
+        # it cannot silently turn an audit into a partial repair.
+        args.fix_severity = "info"
         if _prod:
             # prodready = "make it production ready, don't ask me anything". The
             # flags below are the ones an owner would otherwise have to know to
@@ -23576,10 +23774,6 @@ def main(argv=None) -> int:
             # default. Applying fixes is the POINT of the mode (and of audit
             # too, since review-only was removed outright).
             args.apply = True
-            if args.fix_severity == "high":
-                # Production readiness means medium defects get fixed too; the
-                # build gate + adversarial verify still guard every one of them.
-                args.fix_severity = "medium"
             if args.branch_prefix == "flexfactor/audit-":
                 args.branch_prefix = "flexfactor/prodready-"
         # Owner directive (2026-08-10, extended to audit 2026-08-11): FlexFactor's

@@ -727,8 +727,10 @@ IDEA_SYSTEM = (
     "stated job must be REJECTED (accept=false), no matter how good the idea "
     "is in the abstract. Ground every claim in the evidence supplied; if the "
     "evidence does not establish that the competitor has this capability, say "
-    "so in `evidence_basis` and lower confidence. Never describe the "
-    "competitor's source code - you have not read it. Determine whether the "
+    "so in `evidence_basis` and lower confidence. When inspected-source-code "
+    "evidence is supplied, use it to identify concrete reusable behavior and "
+    "cite its exact code evidence ID; never claim source inspection when only "
+    "a product page was supplied. Determine whether the "
     "audited program already has the behavior; a duplicate must set "
     "`already_present=true` and `accept=false`. Record an adoption risk level, "
     "a concrete risk reason, mitigation for medium/high risk, the end-to-end "
@@ -984,6 +986,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          target: int = DEFAULT_TARGET, opener=None,
                          log=print, max_workers: int = 4,
                          file_list=None, author=None,
+                         source_inspector=None,
                          allow_credentialed_firecrawl: bool = False,
                          scout_profile=None, scout_attempted: bool = False,
                          scout_error: str = "") -> dict:
@@ -1004,6 +1007,10 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     `scout_profile` keeps the two discovery roles distinct: Scout's
     `url_search_query` values search public product/documentation URLs, while
     `repo_search_query` values alone are sent to Repo Rewards.
+    `source_inspector(competitor) -> dict` is FlexFactor/Scout's hermetic
+    shallow-clone inspector. When supplied, every open-source candidate must
+    produce real source documents before it can be counted as corroborated or
+    selected for implementation.
 
     Never raises: every failure becomes a named entry in `sources_skipped`.
     """
@@ -1021,6 +1028,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         "scout_url_queries": [], "scout_url_hits": [],
         "repo_rewards_attempted": rr_search is not None,
         "repo_rewards_queries": [], "repo_rewards_results": 0,
+        "source_inspection_required": source_inspector is not None,
+        "source_repositories_inspected": 0,
     }
     stack_txt = ", ".join(str(s) for s in stack) if stack else "(unknown)"
 
@@ -1258,9 +1267,32 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                     continue
                 key = _norm(full.split("/")[-1])
                 if key in merged:   # already found by name; keep the richer entry
-                    merged[key].setdefault("evidence_urls", [])
-                    if repo.get("htmlUrl") and repo["htmlUrl"] not in merged[key]["evidence_urls"]:
-                        merged[key]["evidence_urls"].append(repo["htmlUrl"])
+                    current = merged[key]
+                    current.setdefault("evidence_urls", [])
+                    if (repo.get("htmlUrl")
+                            and repo["htmlUrl"] not in current["evidence_urls"]):
+                        current["evidence_urls"].append(repo["htmlUrl"])
+                    # Repo Rewards turns a page-only candidate into an
+                    # attributable source repository. Preserve that stronger
+                    # identity and licence metadata so the mandatory clone and
+                    # legal reuse gate are not lost merely because web search
+                    # happened to discover the same name first.
+                    current["kind"] = "oss"
+                    current["url"] = repo.get("htmlUrl") or current.get("url") or ""
+                    current["stars"] = repo.get("stars") or current.get("stars")
+                    current["repo_description"] = (
+                        repo.get("description") or current.get("repo_description") or "")
+                    spdx = repo.get("licenseSpdx")
+                    if spdx:
+                        mode, reason = license_reuse_mode(
+                            spdx, source_available=True, compatible_fn=None)
+                        current.update({
+                            "license": spdx,
+                            "license_source": "repo-rewards",
+                            "reuse_mode": mode,
+                            "reuse_reason": reason,
+                        })
+                    current["discovery_source"] = "web+repo-rewards"
                     continue
                 spdx = repo.get("licenseSpdx")
                 mode, reason = license_reuse_mode(
@@ -1326,6 +1358,36 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             if doc["evidence_id"] not in {
                     row.get("evidence_id") for row in documents}:
                 documents.append(doc)
+        source_required = bool(source_inspector is not None and c.get("kind") == "oss")
+        c["source_inspection_required"] = source_required
+        if source_required:
+            try:
+                inspection = source_inspector(c) or {}
+            except Exception as exc:
+                inspection = {
+                    "source_inspection_ok": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "source_documents": [],
+                }
+            source_documents = [
+                row for row in (inspection.get("source_documents") or [])
+                if isinstance(row, dict) and row.get("evidence_id")
+            ]
+            c["source_inspection"] = {
+                key: value for key, value in inspection.items()
+                if key != "source_documents"
+            }
+            if inspection.get("source_inspection_ok") is True and source_documents:
+                for doc in source_documents:
+                    if doc["evidence_id"] not in {
+                            row.get("evidence_id") for row in documents}:
+                        documents.append(doc)
+            else:
+                failures.append((
+                    str(c.get("url") or "(repository)"),
+                    "source inspection failed: "
+                    + str(inspection.get("reason") or "no source evidence returned"),
+                ))
         return documents, failures
 
     if competitors:
@@ -1334,14 +1396,26 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             fetched = list(pool.map(_fetch_competitor, competitors))
         for c, (documents, failures) in zip(competitors, fetched):
             c["evidence_documents"] = documents
-            c["evidence_status"] = "verified" if documents else "unverified"
+            source_ok = (
+                not c.get("source_inspection_required")
+                or (c.get("source_inspection") or {}).get("source_inspection_ok") is True
+            )
+            c["evidence_status"] = (
+                "verified" if documents and source_ok else "unverified"
+            )
             for index, (url, why) in enumerate(failures, 1):
                 research["sources_skipped"].setdefault(
                     f"fetch:{c.get('name') or '(unnamed)'}:{index}",
                     f"{url} - {why}",
                 )
         if any(c.get("evidence_documents") for c in competitors):
-            research["sources_used"].append("fetched-public-pages")
+            research["sources_used"].append("fetched-capability-evidence")
+        research["source_repositories_inspected"] = sum(
+            1 for c in competitors
+            if (c.get("source_inspection") or {}).get("source_inspection_ok") is True
+        )
+        if research["source_repositories_inspected"]:
+            research["sources_used"].append("inspected-public-source-code")
 
     fetched_document_count = sum(
         len(c.get("evidence_documents") or []) for c in competitors)
@@ -1447,6 +1521,18 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                       if row.get("evidence_id")}
         idea, incomplete = _normalize_idea(
             raw, c["name"], valid_evidence_refs=valid_refs)
+        if (c.get("source_inspection_required") and idea.get("accept")
+                and not any(str(ref).startswith("code-")
+                            for ref in idea.get("evidence_refs") or [])):
+            idea["accept"] = False
+            idea["purpose_reason"] = (
+                "NOT ACTED ON: this open-source competitor's proposed capability "
+                "did not cite inspected source-code evidence. "
+                + str(idea.get("purpose_reason") or "")
+            )
+            incomplete = (
+                "accepted open-source idea did not cite inspected source-code evidence"
+            )
         if idea.get("already_present") is True and idea.get("accept"):
             idea["accept"] = False
             idea["purpose_reason"] = (
@@ -1508,7 +1594,10 @@ def competitor_findings(research: dict, max_findings: int = DEFAULT_FIX_STREAM_C
     The ledger is written onto `research` rather than returned so the existing
     return type (and every caller of it) is unchanged.
     """
-    rank = severity_rank or {"low": 1, "medium": 2, "high": 3, "critical": 4}
+    # Kept in the public signature so older integrations do not break.  Audit
+    # qualification is deliberately severity-blind: every accepted,
+    # code-fixable idea must enter the repair stream.
+    del severity_floor_rank, severity_rank
     out: list[tuple[str, dict]] = []
     dropped: dict[str, list[str]] = {}
     candidates = list(research.get("competitors") or [])
@@ -1576,10 +1665,6 @@ def competitor_findings(research: dict, max_findings: int = DEFAULT_FIX_STREAM_C
             if not (1 <= ref_num <= int(acceptance_total)):
                 _drop("accepted idea did not map to a valid acceptance criterion", c)
                 continue
-        if rank.get(str(idea.get("severity", "")).lower(), 0) < severity_floor_rank:
-            _drop(f"severity {idea.get('severity') or '(missing)'!r} is below "
-                  f"the --fix-severity floor", c)
-            continue
         if file_exists is not None and not file_exists(rel):
             _drop(f"named file does not exist in the repo: {rel}", c)
             continue
@@ -1641,7 +1726,9 @@ def report_lines(research: dict) -> list[str]:
          f"- **Repo Rewards endpoint:** `{research.get('rr_endpoint', '')}`",
          f"- **Repo Rewards repository searches executed:** "
          f"{len(research.get('repo_rewards_queries') or [])}; metadata results: "
-         f"{research.get('repo_rewards_results', 0)}"]
+         f"{research.get('repo_rewards_results', 0)}",
+         f"- **Public source repositories inspected:** "
+         f"{research.get('source_repositories_inspected', 0)}"]
     if research.get("scout_url_queries"):
         L.append("- **Scout URL query receipt:** "
                  + "; ".join(f"`{_ascii(q)}`"
@@ -1698,6 +1785,7 @@ def report_lines(research: dict) -> list[str]:
     L.append("")
     for c in research["competitors"]:
         idea = c.get("idea") or {}
+        source_inspection = c.get("source_inspection") or {}
         L += [f"### {c['name']}", "",
               "- **Evidence:** " + (", ".join(f"<{u}>" for u in (c.get("evidence_urls") or []))
                                      or "**none - unverified, not acted on**"),
@@ -1706,6 +1794,13 @@ def report_lines(research: dict) -> list[str]:
                     f"`{row.get('evidence_id')}` ({str(row.get('sha256') or '')[:12]})"
                     for row in (c.get("evidence_documents") or []))
                  or "**none - search links alone were not treated as evidence**"),
+              "- **Repository source inspection:** "
+              + ((f"commit `{source_inspection.get('commit')}`; "
+                  f"{source_inspection.get('source_files_inspected', 0)}/"
+                  f"{source_inspection.get('source_files_indexed', 0)} indexed "
+                  "source files supplied as bounded model evidence")
+                 if source_inspection.get("source_inspection_ok") is True
+                 else (str(source_inspection.get("reason") or "not applicable"))),
               f"- **Licence:** `{c.get('license')}` (via {c.get('license_source')})",
               f"- **Reuse mode:** `{c.get('reuse_mode')}` - {c.get('reuse_reason')}",
               f"- **Idea:** {idea.get('idea_title', '(none)')} - {idea.get('what_it_does', '')}",
