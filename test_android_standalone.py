@@ -44,10 +44,34 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
     pin and reusable-workflow pin to the Android release version.
     """
 
-    def test_the_cloud_engine_ref_matches_the_android_release(self):
+    def test_cloud_engine_ref_is_current_or_explicitly_staged_one_patch(self):
         source = (CLOUD / "lib" / "config.js").read_text(encoding="utf-8")
-        self.assertIn(
-            f'ENGINE_REF = "android-v{_android_version_name()}"', source)
+        match = re.search(r'ENGINE_REF = "(android-v[^"]+)"', source)
+        self.assertIsNotNone(match, "cloud config has no engine release pin")
+        cloud_ref = match.group(1)
+        android_ref = f"android-v{_android_version_name()}"
+        marker = CLOUD / "ENGINE_ROLLOUT_PENDING"
+        if cloud_ref == android_ref:
+            self.assertFalse(
+                marker.exists(),
+                "remove the completed engine rollout marker",
+            )
+        else:
+            self.assertTrue(
+                marker.is_file(),
+                "a cloud/Android version split requires an explicit rollout marker",
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), android_ref)
+            cloud_parts = cloud_ref.removeprefix("android-v").split(".")
+            android_parts = _android_version_name().split(".")
+            self.assertEqual(len(cloud_parts), 3)
+            self.assertEqual(len(android_parts), 3)
+            self.assertTrue(all(part.isdigit() for part in cloud_parts))
+            self.assertTrue(all(part.isdigit() for part in android_parts))
+            cloud_version = tuple(map(int, cloud_parts))
+            android_version = tuple(map(int, android_parts))
+            self.assertEqual(cloud_version[:2], android_version[:2])
+            self.assertEqual(cloud_version[2] + 1, android_version[2])
         self.assertFalse(
             (ANDROID / "java" / "com" / "firer" / "console" / "flexfactor" /
              "MobileWorkflow.java").exists(),
@@ -150,6 +174,32 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
+        model_install = workflow.split(
+            "- name: Install and start the hosted open model", 1)[1].split(
+                "- name: Install GitHub Copilot CLI", 1)[0]
+        self.assertIn('rm -f "$archive"', model_install)
+        self.assertLess(model_install.index('sudo tar --zstd -xf "$archive"'),
+                        model_install.index('rm -f "$archive"'))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull qwen2.5-coder:7b"))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull deepseek-coder:6.7b"))
+        android_workflow = (ROOT / ".github" / "workflows" /
+                            "android-client.yml").read_text(encoding="utf-8")
+        control_plane = android_workflow.split(
+            "- name: Verify the current managed control plane", 1)[1].split(
+                "- uses: gradle/actions/setup-gradle", 1)[0]
+        self.assertIn("[ -f cloud/ENGINE_ROLLOUT_PENDING ]", control_plane)
+        self.assertIn('pending_engine" != "$android_engine', control_plane)
+        self.assertIn("cloud_patch + 1", control_plane)
+        self.assertEqual(
+            control_plane.count(r"=~ ^[0-9]+\.[0-9]+\.[0-9]+$"), 2)
+        self.assertIn('expected_engine="$declared_engine"', control_plane)
+        self.assertIn('rollout_engine="$pending_engine"', control_plane)
+        self.assertIn(
+            '$rollout != "" and .engine_ref == $rollout', control_plane)
+        self.assertIn(
+            'declared_engine" != "$android_engine', control_plane)
         self.assertIn("options: [auto]", workflow)
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
@@ -387,6 +437,16 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("jarsigner -verify -strict", workflow)
         self.assertIn("-storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD", workflow)
         self.assertNotIn("bundle/play/app-release.aab", workflow)
+        model_install = workflow.split(
+            "- name: Verify both independent free model families live", 1)[1].split(
+                "- name: Record exact APK checksum", 1)[0]
+        self.assertIn('rm -f "$archive"', model_install)
+        self.assertLess(model_install.index('sudo tar --zstd -xf "$archive"'),
+                        model_install.index('rm -f "$archive"'))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull qwen2.5-coder:7b"))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull deepseek-coder:6.7b"))
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
         build_gate = build_gate.split(
             "- name: Verify both independent free model families live", 1)[0]

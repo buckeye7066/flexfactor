@@ -85,7 +85,7 @@ code-model families so the free fallback can still separate author and reviewer.
 
 ## Managed Android product
 
-Android 3.5.2 is a native phone interface, not a Termux or desktop remote-control
+Android 3.5.3 is a native phone interface, not a Termux or desktop remote-control
 screen. The user taps the icon, signs in with GitHub device authorization, picks
 one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so
@@ -112,7 +112,7 @@ Termux launch endpoints are retired; the web dashboard is viewer/steering only.
 See [android/README.md](android/README.md) and
 [cloud/THREAT_MODEL.md](cloud/THREAT_MODEL.md).
 
-Version 3.5.2 parses supported whole-file responses before any write. Definite
+Version 3.5.3 parses supported whole-file responses before any write. Definite
 prose-as-code or invalid source is discarded, never offered to a reviewer as a
 candidate; a file type without a safe pre-write parser is refused rather than
 implicitly approved. If the author meant “already good,” a different model

@@ -1,6 +1,6 @@
 # FlexFactor architecture
 
-This document describes the 0.6.2 engine, Android 3.5.2 client, and 1.1.2
+This document describes the 0.6.2 engine, Android 3.5.3 client, and 1.1.2
 managed control plane.
 
 ## Execution topology

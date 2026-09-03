@@ -68,17 +68,58 @@ jobs:
             echo "Could not resolve the Android release version" >&2
             exit 1
           fi
-          expected_engine="android-v${version_name}"
+          android_engine="android-v${version_name}"
+          declared_engine=$(sed -n \
+            's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
+            cloud/lib/config.js)
+          if [ -z "$declared_engine" ]; then
+            echo "Could not resolve the managed cloud engine" >&2
+            exit 1
+          fi
+          rollout_engine=""
+          if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
+            pending_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
+            if [ "$pending_engine" != "$android_engine" ]; then
+              echo "The staged rollout marker does not name $android_engine" >&2
+              exit 1
+            fi
+            cloud_version=${declared_engine#android-v}
+            if ! [[ "$cloud_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                || ! [[ "$version_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Staged cloud and Android versions must be major.minor.patch" >&2
+              exit 1
+            fi
+            IFS=. read -r cloud_major cloud_minor cloud_patch <<EOF
+          $cloud_version
+          EOF
+            IFS=. read -r android_major android_minor android_patch <<EOF
+          $version_name
+          EOF
+            if [ "$cloud_major" != "$android_major" ] \
+                || [ "$cloud_minor" != "$android_minor" ] \
+                || [ "$((cloud_patch + 1))" -ne "$android_patch" ]; then
+              echo "A staged cloud engine may lag Android by exactly one patch" >&2
+              exit 1
+            fi
+            rollout_engine="$pending_engine"
+          elif [ "$declared_engine" != "$android_engine" ]; then
+            echo "Cloud and Android engine pins differ without a rollout marker" >&2
+            exit 1
+          fi
+          expected_engine="$declared_engine"
           for attempt in {1..60}; do
             health=$(curl --fail --silent --show-error --retry 3 \
               https://flexfactor-cloud.vercel.app/api/health) || health='{}'
             if jq -e --arg engine "$expected_engine" \
-                '.ok == true and .oauth_device_configured == true and .engine_ref == $engine' \
+                --arg rollout "$rollout_engine" \
+                '.ok == true and .oauth_device_configured == true
+                 and (.engine_ref == $engine
+                      or ($rollout != "" and .engine_ref == $rollout))' \
                 <<<"$health"; then
               exit 0
             fi
             if [ "$attempt" -eq 60 ]; then
-              echo "Managed control plane is not serving $expected_engine: $health" >&2
+              echo "Managed control plane is not serving an authorized engine: $health" >&2
               exit 1
             fi
             sleep 10
@@ -130,6 +171,7 @@ jobs:
             88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d \
             "$archive" | sha256sum --check --strict
           sudo tar --zstd -xf "$archive" -C /usr
+          rm -f "$archive"
           ollama serve >"$RUNNER_TEMP/ollama.log" 2>&1 &
           for attempt in {1..60}; do
             curl --fail --silent http://127.0.0.1:11434/api/version && break
