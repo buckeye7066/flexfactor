@@ -319,6 +319,8 @@ def submit_session_prompt(prompt: str, targets: list[tuple[str, str]], *,
     session_id = uuid.uuid4().hex
     submissions = []
     for route in routed["routes"]:
+        if not route["instruction"]:
+            continue
         submissions.append(submit(
             route["program"], route["project_dir"], route["instruction"],
             source=source, root=root, session_id=session_id,

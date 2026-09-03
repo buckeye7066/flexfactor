@@ -94,6 +94,17 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(receipt["session_id"], target_row["session_id"])
         self.assertEqual("multi-program-session", target_row["scope"])
 
+    def test_session_prompt_does_not_leak_named_work_to_unmentioned_target(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        receipt = fs.submit_session_prompt(
+            "Target: keep login.",
+            [("Target", self.project), ("Other", other)],
+            root=self.root,
+        )
+        self.assertEqual(1, len(receipt["submission_ids"]))
+        self.assertEqual([], fs.list_comments("Other", other, root=self.root))
+
     def test_guidance_is_program_scoped_durable_and_injected_each_run(self):
         saved = fs.set_guidance(
             "Target", self.project,
