@@ -7623,6 +7623,70 @@ def _needs_final_publication(project_dir: str, initial_commit: str | None,
     return not contained
 
 
+# These gates answer a narrower question than whole-product readiness: is the
+# exact candidate safe to land?  Coverage, live-journey, purpose-fulfilment,
+# and competitive-coverage gaps keep the RUN incomplete, but they must not
+# strand an independently reviewed, test-green repair in a local checkout.
+# _publish_verified_head reruns the target's build and strongest suite again
+# immediately before the push.
+_PUBLICATION_EVIDENCE_GATE_IDS = frozenset({
+    "tests",
+    "secrets",
+    "inventory",
+    "rescan",
+    "blast-radius",
+    "independent-final-review",
+})
+_PUBLICATION_PRODUCT_GATE_IDS = frozenset({
+    "no-blind-competitor-copying",
+    "selected-capabilities-delivered",
+})
+
+
+def _publication_safety_ready(quality_gates: dict | None,
+                              product_invariants: dict | None) -> tuple[bool, str]:
+    """Return whether verified edits may be pushed while other work remains.
+
+    A target repository need not become fully production-ready in one run for
+    safe improvements to reach its default branch.  This gate separates
+    candidate safety from whole-product completion: it requires executable
+    tests, secret scanning, complete inventory/rescan/blast-radius evidence, an
+    exact-commit independent approval, and safe handling of any selected
+    competitor capability.  Other open gates still keep the run non-green.
+    """
+    def problems(container: dict | None, required: frozenset[str],
+                 label: str) -> list[str]:
+        rows = {
+            str(row.get("id") or ""): row
+            for row in ((container or {}).get("gates") or [])
+            if isinstance(row, dict) and str(row.get("id") or "")
+        }
+        missing = sorted(required - rows.keys())
+        failed = sorted(
+            gate_id for gate_id in required
+            if gate_id in rows and rows[gate_id].get("status") != "pass"
+        )
+        notes = [f"{label} gate missing: {gate_id}" for gate_id in missing]
+        notes.extend(
+            f"{label} gate not passed: {gate_id}="
+            f"{rows[gate_id].get('status') or 'unknown'}"
+            for gate_id in failed
+        )
+        return notes
+
+    blockers = problems(
+        quality_gates, _PUBLICATION_EVIDENCE_GATE_IDS, "evidence"
+    )
+    blockers.extend(problems(
+        product_invariants, _PUBLICATION_PRODUCT_GATE_IDS, "product safety"
+    ))
+    if blockers:
+        return False, "; ".join(blockers)
+    return True, (
+        "candidate safety gates passed; unrelated completeness gaps may remain"
+    )
+
+
 def _publish_verified_head(project_dir: str, branch: str | None, args,
                            stack: dict, commit: str | None) -> dict:
     """Publish only a fully verified HEAD and prove it landed on default.
@@ -21776,10 +21840,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                "Complete the invariant with executable evidence."),
                 })
 
-        # FINAL PUBLICATION GATE. Checkpoint commits deliberately remain local
-        # until every semantic, executable, deterministic, and independent
-        # review above approves the exact HEAD. A successful run with changes
-        # must then prove that HEAD is contained in origin's default branch.
+        # FINAL PUBLICATION GATE. Checkpoint commits remain local until the
+        # exact HEAD has executable, deterministic candidate-safety, and
+        # independent-review evidence. Whole-product gaps (for example missing
+        # route coverage or an unfulfilled purpose criterion) keep this run
+        # incomplete, but they do not strand otherwise safe repairs locally.
+        # Any changed run must still prove that exact HEAD is contained in
+        # origin's authoritative default branch.
         publication_commit = None
         if git:
             _pub_head = _git(["rev-parse", "HEAD"], project_dir)
@@ -21793,13 +21860,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             publication_required = bool(
                 applied_files or test_files or e2e.get("spec_files")
             )
-        prepublication_complete = bool(
-            converged
-            and suite_status is not False
-            and (readiness is None or readiness.get("ready") is not False)
-            and product_invariants.get("ready") is True
-            and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+        publication_safe, publication_safety_reason = _publication_safety_ready(
+            ((evidence or {}).get("quality_gates")
+             if isinstance(evidence, dict) else None),
+            product_invariants,
         )
+        prepublication_complete = publication_safe
         if not publication_required:
             publication = {
                 "required": False, "complete": True,
@@ -21812,7 +21878,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 "required": True, "complete": False,
                 "commit": publication_commit,
                 "default_branch": None, "remote_tip": None,
-                "reason": "final verification is incomplete; publication was not attempted",
+                "reason": (
+                    "candidate publication safety gate is incomplete: "
+                    + publication_safety_reason
+                ),
             }
         elif not git:
             publication = {
