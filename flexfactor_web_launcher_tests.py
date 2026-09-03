@@ -146,6 +146,16 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn(
             '"repos/$GITHUB_REPOSITORY/git/ref/heads/main"', workflow
         )
+        self.assertIn("resolve_tag_target() {", workflow)
+        self.assertGreaterEqual(
+            workflow.count('while [ "$object_type" = "tag" ]; do'), 2
+        )
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/compare/${base_sha}...${head_sha}"',
+            workflow,
+        )
+        self.assertIn('tag_commit=$(resolve_tag_target', workflow)
+        self.assertNotIn('awk -v peeled="refs/tags/$release_tag^{}"', workflow)
         self.assertIn('if [ "$tag_lookup_rc" -ne 0 ]; then', workflow)
         self.assertIn("Only a proven 404 means the tag is absent", workflow)
         self.assertIn(r"\(HTTP 404\)", workflow)
@@ -183,7 +193,7 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
             '"repos/$GITHUB_REPOSITORY/git/ref/heads/main"', resolve_live_main
         )
         prove_tag_containment = workflow.index(
-            'git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha"',
+            'require_ancestor "$source_sha" "$authorized_main_sha"',
             main_ref,
         )
         self.assertLess(resolve_live_main, main_ref)
