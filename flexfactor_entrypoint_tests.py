@@ -27,6 +27,7 @@ ENTRY_POINTS = {
 
 LAUNCHERS = ("flexfactor_launch.ps1", "flexfactor_audit_launch.ps1",
              "flexfactor_scout_launch.ps1", "flexfactor_glimmer_launch.ps1")
+WINDOWS_APP_ENTRY = "Start-App.ps1"
 
 PARITY_KEYS = ("tool_version", "modes", "wired", "exit_codes")
 
@@ -175,6 +176,16 @@ class InterpreterResolutionTests(unittest.TestCase):
 
 
 class EntryPointParityTests(unittest.TestCase):
+    def test_generic_windows_shortcut_entry_opens_the_real_launcher(self):
+        path = os.path.join(HERE, WINDOWS_APP_ENTRY)
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding="ascii") as fh:
+            source = fh.read()
+        self.assertIn('Join-Path $PSScriptRoot "flexfactor_launch.ps1"', source)
+        self.assertIn("-ExecutionPolicy Bypass -File $launcher @Rest", source)
+        self.assertNotIn("flexfactor.py", source)
+        source.encode("ascii")
+
     def test_every_source_entry_point_reports_one_runtime(self):
         manifests = {name: _manifest(argv) for name, argv in ENTRY_POINTS.items()}
         base = manifests["source-script"]
@@ -290,7 +301,7 @@ class EntryPointParityTests(unittest.TestCase):
                          "no PowerShell on this host: launcher parse UNVERIFIED (blocked, not passed)")
     def test_launchers_parse_under_powershell(self):
         ps = shutil.which("pwsh") or shutil.which("powershell")
-        for name in LAUNCHERS:
+        for name in LAUNCHERS + (WINDOWS_APP_ENTRY,):
             path = os.path.join(HERE, name).replace("'", "''")
             script = ("$t=$null;$e=$null;[System.Management.Automation.Language.Parser]"
                       "::ParseFile('" + path + "',[ref]$t,[ref]$e)|Out-Null;"
