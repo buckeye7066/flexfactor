@@ -12324,6 +12324,7 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertIn("strongest paid capacity first", text)
         self.assertNotIn("Provider [", text)
         self.assertNotIn("Model mode [", text)
+        self.assertNotIn("Paid accounts [", text)
         self.assertNotIn("Economy mode", text)
 
     def test_launcher_audit_apply_branch_passes_apply_and_yes(self):

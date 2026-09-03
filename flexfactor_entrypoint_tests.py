@@ -90,6 +90,7 @@ function global:python {{
         env = dict(os.environ)
         env.update(extra_env)
         env["FLEXFACTOR_LAUNCHER_CAPTURE"] = capture
+        env["FLEXFACTOR_SKIP_SOURCE_REFRESH"] = "1"
         # The launchers resolve their interpreter (.venv first, then `py -3.12`,
         # then PATH). This harness captures arguments by shadowing the `python`
         # COMMAND, so without pinning the resolution the test would run the real
@@ -254,6 +255,28 @@ class EntryPointParityTests(unittest.TestCase):
             self.assertNotIn(r"C:\Users\firer\flexfactor\flexfactor_run.py", src, name)
             # ASCII-only launcher constraint (WinPS 5.1 without a BOM mangles UTF-8).
             src.encode("ascii")
+
+    def test_every_desktop_launcher_refreshes_before_interaction(self):
+        refresh = os.path.join(HERE, "scripts", "flexfactor_source_refresh.ps1")
+        self.assertTrue(os.path.isfile(refresh))
+        with open(refresh, encoding="ascii") as fh:
+            source = fh.read()
+        self.assertIn('"fetch", "--quiet", "--no-tags", "origin", "main"', source)
+        self.assertIn("merge --ff-only --quiet origin/main", source)
+        self.assertIn("status --porcelain", source)
+        self.assertIn("merge-base --is-ancestor HEAD origin/main", source)
+        self.assertIn("WaitForExit(30000)", source)
+        self.assertIn("--no-renames --diff-filter=A", source)
+        self.assertIn("git@github.com:buckeye7066/flexfactor.git", source)
+        self.assertIn("flexfactor-refresh-needs-install", source)
+        self.assertIn("WaitForExit(600000)", source)
+        for name in LAUNCHERS:
+            with open(os.path.join(HERE, name), encoding="ascii") as fh:
+                launcher = fh.read()
+            self.assertIn("scripts\\flexfactor_source_refresh.ps1", launcher, name)
+            self.assertLess(launcher.index("Invoke-FlexFactorSourceRefresh"),
+                            launcher.index("Read-Host") if "Read-Host" in launcher
+                            else launcher.index("Invoke-FlexFactorPython"), name)
 
     def test_scout_launchers_require_explicit_remote_context_consent(self):
         for name in ("flexfactor_launch.ps1", "flexfactor_scout_launch.ps1"):
