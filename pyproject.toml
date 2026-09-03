@@ -70,10 +70,12 @@ py-modules = [
   "flexfactor_trust",
   "flexfactor_web",
   "flexfactor_wip",
+  "obsidian_memory",
 ]
 
 [tool.setuptools.package-data]
 flexfactor_assets = ["*.js"]
+competitors = ["*.json"]
 
 [tool.setuptools.packages.find]
 where = ["."]
