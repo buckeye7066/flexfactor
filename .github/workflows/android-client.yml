@@ -178,34 +178,40 @@ jobs:
             if [ "$attempt" -eq 60 ]; then cat "$RUNNER_TEMP/ollama.log"; exit 1; fi
             sleep 1
           done
-          ollama pull qwen2.5-coder:7b
-          ollama pull deepseek-coder:6.7b
           python - <<'PY'
-          import json, urllib.request
-          for model in ("qwen2.5-coder:7b", "deepseek-coder:6.7b"):
-              request = urllib.request.Request(
-                  "http://127.0.0.1:11434/api/chat",
-                  data=json.dumps({
-                  "model": model,
-                  "stream": False,
-                  "messages": [{"role": "user", "content": "Review this Python function: def ratio(total, count): return total / count. Return the requested JSON naming the runtime defect."}],
-                  "format": {
-                      "type": "object",
-                      "properties": {"defect": {"type": "string", "enum": ["division_by_zero"]}},
-                      "required": ["defect"],
-                      "additionalProperties": False,
-                  },
-                  "options": {"temperature": 0, "num_predict": 64},
-                  }).encode(),
-                  headers={"Content-Type": "application/json"},
-              )
-              with urllib.request.urlopen(request, timeout=600) as response:
-                  content = json.load(response)["message"]["content"]
-              answer = json.loads(content)
-              if answer != {"defect": "division_by_zero"}:
-                  raise SystemExit(
-                      f"hosted model {model} returned an unexpected answer: {answer!r}")
-              print(model, "FLEXFACTOR_READY", answer["defect"])
+          import json, subprocess, urllib.request
+
+          # Prove both independent families without retaining two large model
+          # images or two loaded runtimes on the constrained hosted runner.
+          for model in ("qwen2.5-coder:1.5b", "deepseek-coder:1.3b"):
+              subprocess.run(["ollama", "pull", model], check=True)
+              try:
+                  request = urllib.request.Request(
+                      "http://127.0.0.1:11434/api/chat",
+                      data=json.dumps({
+                      "model": model,
+                      "stream": False,
+                      "messages": [{"role": "user", "content": "Review this Python function: def ratio(total, count): return total / count. Return the requested JSON naming the runtime defect."}],
+                      "format": {
+                          "type": "object",
+                          "properties": {"defect": {"type": "string", "enum": ["division_by_zero"]}},
+                          "required": ["defect"],
+                          "additionalProperties": False,
+                      },
+                      "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 64},
+                      }).encode(),
+                      headers={"Content-Type": "application/json"},
+                  )
+                  with urllib.request.urlopen(request, timeout=600) as response:
+                      content = json.load(response)["message"]["content"]
+                  answer = json.loads(content)
+                  if answer != {"defect": "division_by_zero"}:
+                      raise SystemExit(
+                          f"hosted model {model} returned an unexpected answer: {answer!r}")
+                  print(model, "FLEXFACTOR_READY", answer["defect"])
+              finally:
+                  subprocess.run(["ollama", "stop", model], check=False)
+                  subprocess.run(["ollama", "rm", model], check=True)
           PY
       - name: Record exact APK checksum
         shell: bash
