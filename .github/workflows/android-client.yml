@@ -256,6 +256,27 @@ jobs:
           read_version() {
             sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p'
           }
+          resolve_tag_target() {
+            local object_type="$1" object_sha="$2" object_json
+            while [ "$object_type" = "tag" ]; do
+              object_json=$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")
+              object_type=$(printf '%s\n' "$object_json" | jq -r '.object.type')
+              object_sha=$(printf '%s\n' "$object_json" | jq -r '.object.sha')
+            done
+            test "$object_type" = "commit"
+            printf '%s\n' "$object_sha"
+          }
+          require_ancestor() {
+            local base_sha="$1" head_sha="$2" comparison
+            comparison=$(gh api \
+              "repos/$GITHUB_REPOSITORY/compare/${base_sha}...${head_sha}" \
+              --jq '.status')
+            case "$comparison" in
+              ahead|identical) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
           version_name=$(read_version < android/app/build.gradle.kts)
           test -n "$version_name"
           release_tag="android-v${version_name}"
@@ -264,13 +285,888 @@ jobs:
           authorized_main_sha="$GITHUB_SHA"
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             test "$GITHUB_REF_NAME" = "$release_tag"
+            pushed_tag=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag")
+            source_sha=$(resolve_tag_target \
+              "$(printf '%s\n' "$pushed_tag" | jq -r '.object.type')" \
+              "$(printf '%s\n' "$pushed_tag" | jq -r '.object.sha')")
+            printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}          else
+            version_changed=false
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                || { echo "An exact expected_sha is required" >&2; exit 1; }
+              test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER" \
+                || { echo "Only the repository owner may dispatch a release" >&2; exit 1; }
+              test "$GITHUB_REF" = "refs/heads/main"
+              test "$EXPECTED_SHA" = "$GITHUB_SHA" \
+                || { echo "main moved after release authorization" >&2; exit 1; }
+            else
+              if ! printf '%s' "$PREVIOUS_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                  || [ "$PREVIOUS_MAIN_SHA" = "0000000000000000000000000000000000000000" ]; then
+                echo "The previous main revision is unavailable" >&2
+                exit 1
+              fi
+              previous_version=$(git show \
+                "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
+              test -n "$previous_version"
+              if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
+            fi
+
+            tag_error="$RUNNER_TEMP/android-tag-lookup.err"
+            set +e
+            tag_object=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" \
+              2>"$tag_error")
+            tag_lookup_rc=$?
+            set -e
+            if [ "$tag_lookup_rc" -ne 0 ]; then
+              if grep -Eq '\(HTTP 404\)|Reference does not exist' "$tag_error"; then
+                # Only a proven 404 means the tag is absent. Authentication,
+                # network, and API failures remain hard errors.
+                should_publish=true
+              else
+                cat "$tag_error" >&2
+                echo "Could not determine whether $release_tag exists" >&2
+                exit "$tag_lookup_rc"
+              fi
+            else
+              tag_commit=$(resolve_tag_target \
+                "$(printf '%s\n' "$tag_object" | jq -r '.object.type')" \
+                "$(printf '%s\n' "$tag_object" | jq -r '.object.sha')")
+              printf '%s' "$tag_commit" | grep -Eq '^[0-9a-f]{40}$' \
+                || { echo "Could not resolve $release_tag to a commit" >&2; exit 1; }
+              require_ancestor "$tag_commit" "$GITHUB_SHA" \
+                || { echo "$release_tag is not an ancestor of main" >&2; exit 1; }
+              tag_version=$(git show \
+                "${tag_commit}:android/app/build.gradle.kts" | read_version)
+              test "$tag_version" = "$version_name"
+              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] \
+                  && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The existing release tag is not the authorized main commit" >&2
+                exit 1
+              fi
+              if [ "$version_changed" = true ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The newly declared version already belongs to another commit" >&2
+                exit 1
+              fi
+
+              release_json="$RUNNER_TEMP/android-release.json"
+              set +e
+              release_status=$(curl --silent --show-error --location \
+                --output "$release_json" --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")
+              release_lookup_rc=$?
+              set -e
+              if [ "$release_lookup_rc" -ne 0 ]; then
+                echo "Could not determine whether the GitHub Release is complete" >&2
+                exit "$release_lookup_rc"
+              fi
+              if [ "$release_status" = 404 ]; then
+                should_publish=true
+                if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                  source_sha="$GITHUB_SHA"
+                else
+                  source_sha="$tag_commit"
+                fi
+              elif [ "$release_status" = 200 ]; then
+                jq -e 'type == "object"' "$release_json" >/dev/null \
+                  || { echo "GitHub returned invalid release metadata" >&2; exit 1; }
+                set +e
+                jq -e \
+                    --arg tag "$release_tag" \
+                    --arg apk "flexfactor-${version_name}.apk" \
+                    --arg aab "flexfactor-${version_name}.aab" \
+                    '.tag_name == $tag and .draft == false and .prerelease == false
+                     and ([.assets[]?.name] | index($apk)) != null
+                     and ([.assets[]?.name] | index($aab)) != null
+                     and ([.assets[]?.name] | index("android-update.json")) != null' \
+                    "$release_json" >/dev/null
+                release_complete_rc=$?
+                set -e
+                if [ "$release_complete_rc" -eq 1 ]; then
+                  should_publish=true
+                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                    source_sha="$GITHUB_SHA"
+                  else
+                    source_sha="$tag_commit"
+                  fi
+                elif [ "$release_complete_rc" -ne 0 ]; then
+                  echo "GitHub returned invalid release asset metadata" >&2
+                  exit 1
+                fi
+              else
+                echo "GitHub Release lookup returned HTTP $release_status" >&2
+                exit 1
+              fi
+            fi
+          fi
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'authorized_main_sha=%s\n' "$authorized_main_sha" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: android-release
+    needs: [build, release-plan]
+    if: needs.release-plan.outputs.should_publish == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: android-release
+    concurrency:
+      group: android-release-${{ needs.release-plan.outputs.release_tag }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.release-plan.outputs.source_sha }}
+      AUTHORIZED_MAIN_SHA: ${{ needs.release-plan.outputs.authorized_main_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.13"
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
+      - name: Reauthorize a manual rerun and live main before signing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER" \
+              || { echo "Only the repository owner may run or rerun a manual release" >&2; exit 1; }
+          fi
+          printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$AUTHORIZED_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+            || { echo "main moved before signing authorization" >&2; exit 1; }
+      - name: Materialize protected release key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 is required" >&2; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/flexfactor-release.jks"
+          test -s "$RUNNER_TEMP/flexfactor-release.jks"
+      - name: Build signed production APK and Play app bundle
+        shell: bash
+        env:
+          FLEXFACTOR_ANDROID_KEYSTORE: ${{ runner.temp }}/flexfactor-release.jks
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          FLEXFACTOR_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FLEXFACTOR_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          test -n "$FLEXFACTOR_ANDROID_KEY_ALIAS"
+          test -n "$FLEXFACTOR_ANDROID_KEY_PASSWORD"
+          gradle --no-daemon -p android \
+            testDebugUnitTest testPlayUnitTest lintRelease lintPlay assembleRelease bundlePlay
+      - name: Verify signature and record provenance
+        shell: bash
+        env:
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          test -s "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" | tee android/app/build/outputs/apk/release/CERTIFICATE.txt
+          (cd android/app/build/outputs/apk/release && sha256sum app-release.apk > SHA256SUMS)
+          printf '%s\n' "$SOURCE_SHA" > android/app/build/outputs/apk/release/SOURCE_COMMIT
+          aab_dir="android/app/build/outputs/bundle/play"
+          aab="$aab_dir/app-play.aab"
+          test -s "$aab"
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          jarsigner -verify -strict \
+            -keystore "$RUNNER_TEMP/flexfactor-release.jks" \
+            -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
+          (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
+          printf '%s\n' "$SOURCE_SHA" > "$aab_dir/SOURCE_COMMIT"
+      - name: Create signed update manifest
+        shell: bash
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name "$apk")
+          version_code=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-code "$apk")
+          test "$RELEASE_TAG" = "android-v${version_name}"
+          mkdir -p "$release_dir"
+          release_apk="$release_dir/flexfactor-${version_name}.apk"
+          cp "$apk" "$release_apk"
+          release_aab="$release_dir/flexfactor-${version_name}.aab"
+          cp "android/app/build/outputs/bundle/play/app-play.aab" "$release_aab"
+          apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
+          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
+            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
+            > "$release_dir/android-update.json"
+      - name: Revalidate live main before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+            || { echo "main moved before release publication" >&2; exit 1; }
+      - name: Publish signed APK for in-app updates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
+            "android/app/build/outputs/apk/release/app-release.apk")
+          require_live_main() {
+            local live_main
+            live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+              --jq '.object.sha')
+            test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+              || { echo "main moved during release publication" >&2; return 1; }
+          }
+          resolve_tag_commit() {
+            local object_type object_sha
+            object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')
+            object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+            while [ "$object_type" = "tag" ]; do
+              object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')
+              object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')
+            done
+            test "$object_type" = "commit"
+            printf '%s\n' "$object_sha"
+          }
+          require_exact_tag() {
+            local tag_commit
+            tag_commit=$(resolve_tag_commit)
+            test "$tag_commit" = "$SOURCE_SHA" \
+              || { echo "Tag $RELEASE_TAG moved to $tag_commit during publication" >&2; return 1; }
+          }
+          release_is_complete() {
+            jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
+                --arg aab "flexfactor-${version_name}.aab" \
+              '(.tagName == $tag and .isDraft == false and .isPrerelease == false
+                and ([.assets[].name] | index($apk)) != null
+                and ([.assets[].name] | index($aab)) != null
+                and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+          }
+          tag_exists=false
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            tag_exists=true
+            require_exact_tag
+          else
+            # Create the exact lightweight tag before the draft release. This
+            # avoids asking `gh release create` to infer a mutable branch tip.
+            require_live_main
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$SOURCE_SHA" >/dev/null
+            require_exact_tag
+            tag_exists=true
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            require_live_main
+            require_exact_tag
+            # Fetch and validate the state BEFORE any draft mutation. An API or
+            # JSON failure aborts here; it is never conflated with an incomplete
+            # release and can never demote a healthy release.
+            release_state=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,assets)
+            printf '%s' "$release_state" \
+              | jq -e 'type == "object" and (.tagName | type == "string")
+                  and (.isDraft | type == "boolean")
+                  and (.isPrerelease | type == "boolean")
+                  and (.assets | type == "array")
+                  and all(.assets[]; type == "object"
+                    and (.name | type == "string"))' >/dev/null
+            set +e
+            printf '%s' "$release_state" | release_is_complete
+            release_complete_rc=$?
+            set -e
+            if [ "$release_complete_rc" -eq 0 ]; then
+              # A tag-triggered rerun can retain should_publish=true from its
+              # original plan. Never demote a healthy public release to draft.
+              echo "$RELEASE_TAG is already complete; no publication mutation required"
+              exit 0
+            elif [ "$release_complete_rc" -ne 1 ]; then
+              echo "Release completeness classifier failed" >&2
+              exit "$release_complete_rc"
+            fi
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft
+            require_exact_tag
+          else
+            require_live_main
+            require_exact_tag
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
+            require_exact_tag
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq 'select(.isDraft == true)' >/dev/null
+          existing_dir="$RUNNER_TEMP/existing-release-assets"
+          mkdir -p "$existing_dir"
+          asset_names=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name')
+          ensure_asset() {
+            local asset_path="$1"
+            local asset_name="$2"
+            local asset_label="$3"
+            require_live_main
+            require_exact_tag
+            if ! printf '%s\n' "$asset_names" | grep -Fqx "$asset_name"; then
+              gh release upload "$RELEASE_TAG" \
+                "$asset_path#$asset_label" \
+                --repo "$GITHUB_REPOSITORY"
+              require_exact_tag
+            fi
+            rm -f "$existing_dir/$asset_name"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" \
+              --dir "$existing_dir"
+            require_exact_tag
+            cmp -s "$asset_path" "$existing_dir/$asset_name" \
+              || { echo "Staged release asset $asset_name does not match this exact build" >&2; return 1; }
+            require_live_main
+          }
+          ensure_asset \
+            "$release_dir/flexfactor-${version_name}.apk" \
+            "flexfactor-${version_name}.apk" \
+            "FlexFactor Android ${version_name}"
+          ensure_asset \
+            "$release_dir/android-update.json" \
+            "android-update.json" \
+            "Signed update manifest"
+          ensure_asset \
+            "$release_dir/flexfactor-${version_name}.aab" \
+            "flexfactor-${version_name}.aab" \
+            "FlexFactor Android ${version_name} Play app bundle"
+          require_live_main
+          require_exact_tag
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease=false \
+            --latest \
+            --title "FlexFactor Android ${version_name}" \
+            --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
+          require_exact_tag
+          require_live_main
+          final_release_state=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets)
+          printf '%s' "$final_release_state" | release_is_complete
+      - name: Upload signed exact-commit Android release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flexfactor-android-${{ env.RELEASE_TAG }}-${{ needs.release-plan.outputs.source_sha }}
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/release/CERTIFICATE.txt
+            android/app/build/outputs/apk/release/SHA256SUMS
+            android/app/build/outputs/apk/release/SOURCE_COMMIT
+            android/app/build/outputs/bundle/play/app-play.aab
+            android/app/build/outputs/bundle/play/SHA256SUMS
+            android/app/build/outputs/bundle/play/SOURCE_COMMIT
+            android/app/build/outputs/apk/release/publish/flexfactor-*.aab
+            android/app/build/outputs/apk/release/publish/android-update.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Prove final remote release provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA"
+          object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '.object.type')
+          object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '.object.sha')
+          while [ "$object_type" = "tag" ]; do
+            object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+              --jq '.object.type')
+            object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+              --jq '.object.sha')
+          done
+          test "$object_type" = "commit"
+          test "$object_sha" = "$SOURCE_SHA"
+          version_name=${RELEASE_TAG#android-v}
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets \
+            | jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
+                --arg aab "flexfactor-${version_name}.aab" \
+              'select(.tagName == $tag and .isDraft == false and .isPrerelease == false
+               and ([.assets[].name] | index($apk)) != null
+               and ([.assets[].name] | index($aab)) != null
+               and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+ \
+              || { echo "Could not resolve the pushed release tag" >&2; exit 1; }
             authorized_main_sha=$(gh api \
               "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
               --jq '.object.sha')
-            printf '%s' "$authorized_main_sha" | grep -Eq '^[0-9a-f]{40}$' \
+            printf '%s' "$authorized_main_sha" | grep -Eq '^[0-9a-f]{40}          else
+            version_changed=false
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                || { echo "An exact expected_sha is required" >&2; exit 1; }
+              test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER" \
+                || { echo "Only the repository owner may dispatch a release" >&2; exit 1; }
+              test "$GITHUB_REF" = "refs/heads/main"
+              test "$EXPECTED_SHA" = "$GITHUB_SHA" \
+                || { echo "main moved after release authorization" >&2; exit 1; }
+            else
+              if ! printf '%s' "$PREVIOUS_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+                  || [ "$PREVIOUS_MAIN_SHA" = "0000000000000000000000000000000000000000" ]; then
+                echo "The previous main revision is unavailable" >&2
+                exit 1
+              fi
+              previous_version=$(git show \
+                "${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts" | read_version)
+              test -n "$previous_version"
+              if [ "$version_name" != "$previous_version" ]; then version_changed=true; fi
+            fi
+
+            tag_error="$RUNNER_TEMP/android-tag-lookup.err"
+            set +e
+            tag_rows=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" \
+              --jq '[.object.sha, .ref] | @tsv' 2>"$tag_error")
+            tag_lookup_rc=$?
+            set -e
+            if [ "$tag_lookup_rc" -ne 0 ]; then
+              if grep -Eq '\(HTTP 404\)|Reference does not exist' "$tag_error"; then
+                # Only a proven 404 means the tag is absent. Authentication,
+                # network, and API failures remain hard errors.
+                should_publish=true
+              else
+                cat "$tag_error" >&2
+                echo "Could not determine whether $release_tag exists" >&2
+                exit "$tag_lookup_rc"
+              fi
+            else
+              tag_commit=$(printf '%s\n' "$tag_rows" \
+                | awk -v peeled="refs/tags/$release_tag^{}" \
+                    '$2 == peeled {print $1; found=1} END {if (!found) exit 1}') \
+                || tag_commit=$(printf '%s\n' "$tag_rows" \
+                  | awk -v exact="refs/tags/$release_tag" '$2 == exact {print $1}')
+              printf '%s' "$tag_commit" | grep -Eq '^[0-9a-f]{40}$' \
+                || { echo "Could not resolve $release_tag to a commit" >&2; exit 1; }
+              git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA" \
+                || { echo "$release_tag is not an ancestor of main" >&2; exit 1; }
+              tag_version=$(git show \
+                "${tag_commit}:android/app/build.gradle.kts" | read_version)
+              test "$tag_version" = "$version_name"
+              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] \
+                  && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The existing release tag is not the authorized main commit" >&2
+                exit 1
+              fi
+              if [ "$version_changed" = true ] && [ "$tag_commit" != "$GITHUB_SHA" ]; then
+                echo "The newly declared version already belongs to another commit" >&2
+                exit 1
+              fi
+
+              release_json="$RUNNER_TEMP/android-release.json"
+              set +e
+              release_status=$(curl --silent --show-error --location \
+                --output "$release_json" --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")
+              release_lookup_rc=$?
+              set -e
+              if [ "$release_lookup_rc" -ne 0 ]; then
+                echo "Could not determine whether the GitHub Release is complete" >&2
+                exit "$release_lookup_rc"
+              fi
+              if [ "$release_status" = 404 ]; then
+                should_publish=true
+                if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                  source_sha="$GITHUB_SHA"
+                else
+                  source_sha="$tag_commit"
+                fi
+              elif [ "$release_status" = 200 ]; then
+                jq -e 'type == "object"' "$release_json" >/dev/null \
+                  || { echo "GitHub returned invalid release metadata" >&2; exit 1; }
+                set +e
+                jq -e \
+                    --arg tag "$release_tag" \
+                    --arg apk "flexfactor-${version_name}.apk" \
+                    --arg aab "flexfactor-${version_name}.aab" \
+                    '.tag_name == $tag and .draft == false and .prerelease == false
+                     and ([.assets[]?.name] | index($apk)) != null
+                     and ([.assets[]?.name] | index($aab)) != null
+                     and ([.assets[]?.name] | index("android-update.json")) != null' \
+                    "$release_json" >/dev/null
+                release_complete_rc=$?
+                set -e
+                if [ "$release_complete_rc" -eq 1 ]; then
+                  should_publish=true
+                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                    source_sha="$GITHUB_SHA"
+                  else
+                    source_sha="$tag_commit"
+                  fi
+                elif [ "$release_complete_rc" -ne 0 ]; then
+                  echo "GitHub returned invalid release asset metadata" >&2
+                  exit 1
+                fi
+              else
+                echo "GitHub Release lookup returned HTTP $release_status" >&2
+                exit 1
+              fi
+            fi
+          fi
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'authorized_main_sha=%s\n' "$authorized_main_sha" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: android-release
+    needs: [build, release-plan]
+    if: needs.release-plan.outputs.should_publish == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: android-release
+    concurrency:
+      group: android-release-${{ needs.release-plan.outputs.release_tag }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.release-plan.outputs.source_sha }}
+      AUTHORIZED_MAIN_SHA: ${{ needs.release-plan.outputs.authorized_main_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-plan.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.13"
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;35.0.0"
+      - name: Reauthorize a manual rerun and live main before signing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER" \
+              || { echo "Only the repository owner may run or rerun a manual release" >&2; exit 1; }
+          fi
+          printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s' "$AUTHORIZED_MAIN_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+            || { echo "main moved before signing authorization" >&2; exit 1; }
+      - name: Materialize protected release key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 is required" >&2; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/flexfactor-release.jks"
+          test -s "$RUNNER_TEMP/flexfactor-release.jks"
+      - name: Build signed production APK and Play app bundle
+        shell: bash
+        env:
+          FLEXFACTOR_ANDROID_KEYSTORE: ${{ runner.temp }}/flexfactor-release.jks
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          FLEXFACTOR_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FLEXFACTOR_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          test -n "$FLEXFACTOR_ANDROID_KEY_ALIAS"
+          test -n "$FLEXFACTOR_ANDROID_KEY_PASSWORD"
+          gradle --no-daemon -p android \
+            testDebugUnitTest testPlayUnitTest lintRelease lintPlay assembleRelease bundlePlay
+      - name: Verify signature and record provenance
+        shell: bash
+        env:
+          FLEXFACTOR_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          test -s "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk" | tee android/app/build/outputs/apk/release/CERTIFICATE.txt
+          (cd android/app/build/outputs/apk/release && sha256sum app-release.apk > SHA256SUMS)
+          printf '%s\n' "$SOURCE_SHA" > android/app/build/outputs/apk/release/SOURCE_COMMIT
+          aab_dir="android/app/build/outputs/bundle/play"
+          aab="$aab_dir/app-play.aab"
+          test -s "$aab"
+          test -n "$FLEXFACTOR_ANDROID_STORE_PASSWORD"
+          jarsigner -verify -strict \
+            -keystore "$RUNNER_TEMP/flexfactor-release.jks" \
+            -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
+          (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
+          printf '%s\n' "$SOURCE_SHA" > "$aab_dir/SOURCE_COMMIT"
+      - name: Create signed update manifest
+        shell: bash
+        run: |
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name "$apk")
+          version_code=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-code "$apk")
+          test "$RELEASE_TAG" = "android-v${version_name}"
+          mkdir -p "$release_dir"
+          release_apk="$release_dir/flexfactor-${version_name}.apk"
+          cp "$apk" "$release_apk"
+          release_aab="$release_dir/flexfactor-${version_name}.aab"
+          cp "android/app/build/outputs/bundle/play/app-play.aab" "$release_aab"
+          apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
+          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
+            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
+            > "$release_dir/android-update.json"
+      - name: Revalidate live main before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+            || { echo "main moved before release publication" >&2; exit 1; }
+      - name: Publish signed APK for in-app updates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_dir="android/app/build/outputs/apk/release/publish"
+          version_name=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest version-name \
+            "android/app/build/outputs/apk/release/app-release.apk")
+          require_live_main() {
+            local live_main
+            live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+              --jq '.object.sha')
+            test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
+              || { echo "main moved during release publication" >&2; return 1; }
+          }
+          resolve_tag_commit() {
+            local object_type object_sha
+            object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')
+            object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+            while [ "$object_type" = "tag" ]; do
+              object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')
+              object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')
+            done
+            test "$object_type" = "commit"
+            printf '%s\n' "$object_sha"
+          }
+          require_exact_tag() {
+            local tag_commit
+            tag_commit=$(resolve_tag_commit)
+            test "$tag_commit" = "$SOURCE_SHA" \
+              || { echo "Tag $RELEASE_TAG moved to $tag_commit during publication" >&2; return 1; }
+          }
+          release_is_complete() {
+            jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
+                --arg aab "flexfactor-${version_name}.aab" \
+              '(.tagName == $tag and .isDraft == false and .isPrerelease == false
+                and ([.assets[].name] | index($apk)) != null
+                and ([.assets[].name] | index($aab)) != null
+                and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+          }
+          tag_exists=false
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            tag_exists=true
+            require_exact_tag
+          else
+            # Create the exact lightweight tag before the draft release. This
+            # avoids asking `gh release create` to infer a mutable branch tip.
+            require_live_main
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$SOURCE_SHA" >/dev/null
+            require_exact_tag
+            tag_exists=true
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            require_live_main
+            require_exact_tag
+            # Fetch and validate the state BEFORE any draft mutation. An API or
+            # JSON failure aborts here; it is never conflated with an incomplete
+            # release and can never demote a healthy release.
+            release_state=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,assets)
+            printf '%s' "$release_state" \
+              | jq -e 'type == "object" and (.tagName | type == "string")
+                  and (.isDraft | type == "boolean")
+                  and (.isPrerelease | type == "boolean")
+                  and (.assets | type == "array")
+                  and all(.assets[]; type == "object"
+                    and (.name | type == "string"))' >/dev/null
+            set +e
+            printf '%s' "$release_state" | release_is_complete
+            release_complete_rc=$?
+            set -e
+            if [ "$release_complete_rc" -eq 0 ]; then
+              # A tag-triggered rerun can retain should_publish=true from its
+              # original plan. Never demote a healthy public release to draft.
+              echo "$RELEASE_TAG is already complete; no publication mutation required"
+              exit 0
+            elif [ "$release_complete_rc" -ne 1 ]; then
+              echo "Release completeness classifier failed" >&2
+              exit "$release_complete_rc"
+            fi
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft
+            require_exact_tag
+          else
+            require_live_main
+            require_exact_tag
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "FlexFactor Android ${version_name}" \
+              --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
+            require_exact_tag
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq 'select(.isDraft == true)' >/dev/null
+          existing_dir="$RUNNER_TEMP/existing-release-assets"
+          mkdir -p "$existing_dir"
+          asset_names=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name')
+          ensure_asset() {
+            local asset_path="$1"
+            local asset_name="$2"
+            local asset_label="$3"
+            require_live_main
+            require_exact_tag
+            if ! printf '%s\n' "$asset_names" | grep -Fqx "$asset_name"; then
+              gh release upload "$RELEASE_TAG" \
+                "$asset_path#$asset_label" \
+                --repo "$GITHUB_REPOSITORY"
+              require_exact_tag
+            fi
+            rm -f "$existing_dir/$asset_name"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" \
+              --dir "$existing_dir"
+            require_exact_tag
+            cmp -s "$asset_path" "$existing_dir/$asset_name" \
+              || { echo "Staged release asset $asset_name does not match this exact build" >&2; return 1; }
+            require_live_main
+          }
+          ensure_asset \
+            "$release_dir/flexfactor-${version_name}.apk" \
+            "flexfactor-${version_name}.apk" \
+            "FlexFactor Android ${version_name}"
+          ensure_asset \
+            "$release_dir/android-update.json" \
+            "android-update.json" \
+            "Signed update manifest"
+          ensure_asset \
+            "$release_dir/flexfactor-${version_name}.aab" \
+            "flexfactor-${version_name}.aab" \
+            "FlexFactor Android ${version_name} Play app bundle"
+          require_live_main
+          require_exact_tag
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease=false \
+            --latest \
+            --title "FlexFactor Android ${version_name}" \
+            --notes "Signed FlexFactor Android release from exact source commit ${SOURCE_SHA}."
+          require_exact_tag
+          require_live_main
+          final_release_state=$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets)
+          printf '%s' "$final_release_state" | release_is_complete
+      - name: Upload signed exact-commit Android release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flexfactor-android-${{ env.RELEASE_TAG }}-${{ needs.release-plan.outputs.source_sha }}
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/release/CERTIFICATE.txt
+            android/app/build/outputs/apk/release/SHA256SUMS
+            android/app/build/outputs/apk/release/SOURCE_COMMIT
+            android/app/build/outputs/bundle/play/app-play.aab
+            android/app/build/outputs/bundle/play/SHA256SUMS
+            android/app/build/outputs/bundle/play/SOURCE_COMMIT
+            android/app/build/outputs/apk/release/publish/flexfactor-*.aab
+            android/app/build/outputs/apk/release/publish/android-update.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Prove final remote release provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha')
+          test "$live_main" = "$AUTHORIZED_MAIN_SHA"
+          object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '.object.type')
+          object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '.object.sha')
+          while [ "$object_type" = "tag" ]; do
+            object_type=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+              --jq '.object.type')
+            object_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+              --jq '.object.sha')
+          done
+          test "$object_type" = "commit"
+          test "$object_sha" = "$SOURCE_SHA"
+          version_name=${RELEASE_TAG#android-v}
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets \
+            | jq -e --arg tag "$RELEASE_TAG" --arg apk "flexfactor-${version_name}.apk" \
+                --arg aab "flexfactor-${version_name}.aab" \
+              'select(.tagName == $tag and .isDraft == false and .isPrerelease == false
+               and ([.assets[].name] | index($apk)) != null
+               and ([.assets[].name] | index($aab)) != null
+               and ([.assets[].name] | index("android-update.json")) != null)' >/dev/null
+ \
               || { echo "Could not bind the tag run to live main" >&2; exit 1; }
-            git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha" \
-              || { echo "$GITHUB_SHA is not contained in live main" >&2; exit 1; }
+            require_ancestor "$source_sha" "$authorized_main_sha" \
+              || { echo "$source_sha is not contained in live main" >&2; exit 1; }
             should_publish=true
           else
             version_changed=false
