@@ -6584,13 +6584,15 @@ _PROGRAM_UNDERSTANDING_ITEM_KEYS = {
 }
 
 
-def _purpose_string_array(value, field: str):
+def _purpose_string_array(value, field: str, *, _depth: int = 0):
     """Losslessly recover common model envelopes for one string-array field.
 
     Returns ``(value, note)``. Ambiguous mappings and mixed/non-string arrays
     are returned unchanged so the schema guard can reject them and the model
     ladder can try another route. Mapping keys are never treated as claims.
     """
+    if _depth >= 4:
+        return value, ""
     if isinstance(value, str):
         return ([value] if value.strip() else []), "scalar string wrapped"
     keys = _PROGRAM_UNDERSTANDING_ITEM_KEYS[field]
@@ -6603,30 +6605,39 @@ def _purpose_string_array(value, field: str):
                 continue
             if not isinstance(item, dict):
                 return value, ""
-            candidates = [item.get(key) for key in keys
-                          if isinstance(item.get(key), str)
-                          and item.get(key).strip()]
-            candidates = list(dict.fromkeys(candidates))
-            if len(candidates) != 1:
+            nested, _note = _purpose_string_array(
+                item, field, _depth=_depth + 1)
+            if not isinstance(nested, list) or not all(
+                    isinstance(nested_item, str) for nested_item in nested):
                 return value, ""
-            out.append(candidates[0])
+            out.extend(nested)
             changed = True
-        return out, "object items reduced to their single text value" if changed else ""
+        return out, "object items reduced to string values" if changed else ""
     if isinstance(value, dict):
         # A named item (for example {"journey": "send then pay"}) is
         # unambiguous. Extra explanatory keys are ignored only when precisely
         # one field-specific value exists; competing candidates are rejected.
-        candidates = [value.get(key) for key in keys
-                      if isinstance(value.get(key), str)
-                      and value.get(key).strip()]
-        candidates = list(dict.fromkeys(candidates))
-        if len(candidates) == 1:
-            return [candidates[0]], "single named object wrapped"
-        for wrapper in (field, "items", "values", "entries"):
-            if wrapper in value:
-                nested, note = _purpose_string_array(value[wrapper], field)
-                if note:
-                    return nested, f"'{wrapper}' envelope removed"
+        present_keys = [key for key in keys if key in value]
+        wrappers = [wrapper for wrapper in (field, "items", "values", "entries")
+                    if wrapper in value]
+        numbered = [key for key in value if str(key).isdigit()]
+        # A direct field-specific value and an envelope are competing
+        # representations, as are multiple direct keys, envelopes, or a mix
+        # with a numbered-object representation. Count recognized keys by
+        # presence, not merely well-typed values, so a bad second
+        # representation cannot disappear during normalization.
+        if len(present_keys) == 1 and not wrappers and not numbered:
+            candidate = value[present_keys[0]]
+            if isinstance(candidate, str) and candidate.strip():
+                return [candidate], "single named object wrapped"
+            return value, ""
+        if not present_keys and len(wrappers) == 1 and not numbered:
+            wrapper = wrappers[0]
+            nested, _note = _purpose_string_array(
+                value[wrapper], field, _depth=_depth + 1)
+            if isinstance(nested, list) and all(
+                    isinstance(item, str) for item in nested):
+                return nested, f"'{wrapper}' envelope removed"
         # Numbered JSON objects are a frequent accidental rendering of arrays.
         # Values, never keys, are recovered and kept in numeric order.
         if value and all(str(key).isdigit() for key in value) \
@@ -6642,12 +6653,21 @@ def _normalize_program_understanding_response(data: dict) -> tuple[dict, list[st
     out = dict(data)
     recovered: list[str] = []
     for canonical, aliases in _PROGRAM_UNDERSTANDING_ALIASES.items():
-        if canonical in out and out.get(canonical) is not None:
-            continue
         present = [alias for alias in aliases if alias in out]
+        if canonical in out and out.get(canonical) is not None:
+            if present:
+                raise StructuredOutputShapeError(
+                    "Program-understanding output supplied competing keys for "
+                    f"'{canonical}': {canonical}, " + ", ".join(present))
+            continue
         if len(present) == 1:
-            out[canonical] = out[present[0]]
-            recovered.append(f"{canonical} from alias '{present[0]}'")
+            alias = present[0]
+            out[canonical] = out.pop(alias)
+            recovered.append(f"{canonical} from alias '{alias}'")
+        elif len(present) > 1:
+            raise StructuredOutputShapeError(
+                "Program-understanding output supplied competing aliases for "
+                f"'{canonical}': " + ", ".join(present))
     for field in _PROGRAM_UNDERSTANDING_ITEM_KEYS:
         if field not in out or out.get(field) is None:
             continue

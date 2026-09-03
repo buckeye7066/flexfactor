@@ -13087,6 +13087,110 @@ class ArrayItemShapeTests(unittest.TestCase):
         self.assertEqual(out["acceptance_criteria"],
                          ["A sent invoice can be paid"])
         self.assertEqual(out["evidence_refs"], ["README.md:4"])
+        self.assertNotIn("users", out)
+        self.assertNotIn("journeys", out)
+        self.assertEqual(
+            ff._check_structured_type(
+                out, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}"),
+            out,
+        )
+
+    def test_program_understanding_rejects_canonical_and_alias_conflict(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "users": ["conflicting audience"],
+            "core_journeys": ["send then pay"],
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        with self.assertRaises(ff.StructuredOutputShapeError) as caught:
+            ff._check_structured_type(
+                payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+        self.assertIn("primary_users", str(caught.exception))
+
+    def test_program_understanding_recovers_an_unambiguous_items_envelope(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": {"items": ["billing staff"]},
+            "core_journeys": {"items": ["send then pay"]},
+            "acceptance_criteria": {"values": ["A sent invoice can be paid"]},
+            "evidence_refs": {"entries": ["README.md:4"]},
+        }
+        out = ff._check_structured_type(
+            payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+        self.assertEqual(out["primary_users"], ["billing staff"])
+        self.assertEqual(out["core_journeys"], ["send then pay"])
+        self.assertEqual(out["acceptance_criteria"],
+                         ["A sent invoice can be paid"])
+        self.assertEqual(out["evidence_refs"], ["README.md:4"])
+
+    def test_program_understanding_rejects_competing_direct_and_envelope_values(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "core_journeys": {"journey": "send", "items": ["pay"]},
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        with self.assertRaises(ff.StructuredOutputShapeError) as caught:
+            ff._check_structured_type(
+                payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+        self.assertIn("core_journeys", str(caught.exception))
+
+    def test_program_understanding_rejects_second_malformed_recognized_key(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "core_journeys": {"journey": "send", "workflow": ["pay"]},
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        with self.assertRaises(ff.StructuredOutputShapeError):
+            ff._check_structured_type(
+                payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+
+    def test_program_understanding_rejects_named_and_numbered_conflict(self):
+        common = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        for journeys in (
+                {"journey": "send", "0": "pay"},
+                {"items": ["send"], "0": "pay"}):
+            with self.subTest(journeys=journeys):
+                payload = dict(common, core_journeys=journeys)
+                with self.assertRaises(ff.StructuredOutputShapeError):
+                    ff._check_structured_type(
+                        payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+
+    def test_program_understanding_rejects_competing_values_inside_list_item(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "core_journeys": [
+                {"journey": "send", "items": ["pay"]},
+            ],
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        with self.assertRaises(ff.StructuredOutputShapeError):
+            ff._check_structured_type(
+                payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
+
+    def test_program_understanding_rejects_competing_envelopes(self):
+        payload = {
+            "purpose": "Issue invoices and receive payment.",
+            "primary_users": ["billing staff"],
+            "core_journeys": {"items": ["send"], "values": ["pay"]},
+            "acceptance_criteria": ["A sent invoice can be paid"],
+            "evidence_refs": ["README.md:4"],
+        }
+        with self.assertRaises(ff.StructuredOutputShapeError):
+            ff._check_structured_type(
+                payload, ff.PROGRAM_UNDERSTANDING_SCHEMA, "{}")
 
     def test_program_understanding_missing_field_is_a_typed_shape_failure(self):
         payload = {
@@ -15267,6 +15371,27 @@ class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
         self.assertIsNotNone(contract)
         self.assertEqual(contract.primary_users, ["billing staff"])
         self.assertEqual(contract.core_journeys, ["send then pay"])
+        self.assertEqual(len(provider.prompts), 1)
+
+    def test_alias_only_response_completes_end_to_end(self):
+        class AliasProvider(self.Provider):
+            def structured(self, system, prompt, schema, **kwargs):
+                self.prompts.append((system, prompt, schema, kwargs))
+                return {
+                    "purpose": "Issue and receive payment for invoices.",
+                    "users": ["billing staff"],
+                    "journeys": ["send then pay"],
+                    "criteria": ["A sent invoice can be paid"],
+                    "citations": ["README.md:4"],
+                }
+
+        provider = AliasProvider([])
+        contract, error = ff._infer_purpose_contract(
+            provider, "Invoicer", self.tmp)
+        self.assertEqual(error, "")
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.primary_users, ["billing staff"])
+        self.assertEqual(contract.evidence_refs, ["README.md:4"])
         self.assertEqual(len(provider.prompts), 1)
 
     def test_ambiguous_mapping_is_rejected_after_a_specific_bounded_retry(self):
