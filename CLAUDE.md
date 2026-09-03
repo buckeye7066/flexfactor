@@ -148,10 +148,10 @@ FlexFactor reads **why the program exists** before it reads any code.
   the observed band is reported "WITHIN MEASUREMENT NOISE"**, never as criteria
   closed or regressed. A single-sample run reports variance `UNMEASURED` —
   which is NOT the same as stable and must never be printed as agreement.
-- Gap-driven fixing: an owner-authored gap is an unmet requirement, so it
-  **bypasses `--fix-severity`** and gets `MAX_PURPOSE_GAP_FIXES_AUTHORED` (12)
-  instead of 3, worst-severity first. Inferred gaps still respect the fix floor
-  (a guess must not drive a rewrite spree). The headline is
+- Gap-driven fixing: every authorized, code-fixable purpose gap enters the same
+  gated repair stream; severity and arbitrary item-count ceilings do not discard
+  work. Weak or unresolved inferred purpose remains report-only because it does
+  not authorize mutation. The headline is
   `gap_progress()` — "closed N of M gaps toward the purpose, unblocked K
   acceptance criteria" — not a score.
 - **Status vocabulary is enforced.** `production_ready_status()` only returns
@@ -200,8 +200,8 @@ search function and (in tests) the URL opener.
 - **Nothing is invented.** A name the model recalled that NO reachable source
   corroborated is kept, marked `evidence_status="unverified"`, has its `accept`
   forced to False with the reason prefixed `NOT ACTED ON:`, is excluded from the
-  verified count, and cannot bridge. Fewer than `--competitor-count` (5) is said
-  out loud by `coverage_note()` as a **SHORTFALL, not evidence that fewer
+  verified count, and cannot bridge. Fewer than the fixed top-three target is
+  said out loud by `coverage_note()` as a **SHORTFALL, not evidence that fewer
   competitors exist**. A report with no competitors says the research failed, not
   that the program has none.
 - **Search ladder is keyless.** SearXNG (`FLEXFACTOR_SEARXNG_URL`) → DuckDuckGo
@@ -211,11 +211,11 @@ search function and (in tests) the URL opener.
   this machine; `lite.duckduckgo.com` answers 200 with real organic results.**
   Do not "simplify" back to the html endpoint. Ad rows (`duckduckgo.com/y.js`)
   are filtered — a sponsored link is not a competitor finding.
-- **Bridging is bounded.** Only accepted + corroborated + licence-permitted +
-  `code_fixable` ideas with a real file enter `_fix_files`, capped by
-  `--competitor-fixes` (default 5) and still under `--fix-severity`, the build
-  gate and the adversarial verifier. The cap is checked BEFORE the append — a
-  post-append check let `--competitor-fixes 0` still emit one finding.
+- **Bridging is evidence-gated.** The inter-pass gate evaluates exactly the top
+  three competitors. An open-source idea must be accepted, licence-permitted,
+  `code_fixable`, targeted at a real file, and cite source read from a hermetic
+  shallow clone at an exact commit before entering `_fix_files`. Severity never
+  filters it; the build gate and adversarial verifier still apply.
 - **TRAP the tests pin:** `all_findings` is REASSIGNED wholesale by every cycle
   (`all_findings = flat`), so competitor findings appended at phase 1b would be
   silently discarded. They are merged in AFTER the cycle loop, next to the purpose
@@ -1001,8 +1001,8 @@ Closes two silent-failure holes the audit had:
   `_fix_files` roll the file back, so on a machine without Ruby every correct
   `.rb` fix would be silently discarded. Guarded by `shutil.which` + `_run`'s
   own `flexfactor_launch_error` marker (covers policy-block/timeout/not-found).
-- `prodready` mode = audit with `--apply`, `--fix-severity medium`, readiness ON,
-  branch prefix `flexfactor/prodready-`. There is no review-only override:
+- `prodready` mode = audit with `--apply`, all code-finding severities, readiness
+  ON, branch prefix `flexfactor/prodready-`. There is no review-only override:
   `--report-only`/`--dry-run` were removed from audit/prodready outright.
 - **Dirty-tree walk-away (2026-08-10).** Prodready no longer faceplants on a
   dirty tree (the GrantFlow failure). NOTE: `--snapshot-dirty` is NO LONGER A CLI

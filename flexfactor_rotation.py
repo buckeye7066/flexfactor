@@ -208,12 +208,12 @@ class Catalog:
 def catalog_staleness_note(catalog: Optional[Catalog]) -> Optional[str]:
     """One actionable sentence when the route catalog is stale, else None.
 
-    The warning is deliberately NOT suppressed and deliberately NOT acted on.
-    Not suppressed, because a stale catalog can still be offering a route whose
-    quota died hours ago -- silence would turn that into an unexplained error
-    tour. Not acted on, because the catalog belongs to AI Time: regenerating
-    another program's state behind the owner's back is not FlexFactor's call, so
-    this names the exact command and stops there.
+    The warning is deliberately NOT suppressed. This library does not mutate
+    AI Time's catalog; an orchestrating consumer may explicitly request AI Time
+    to refresh it before loading routes. A stale catalog can still offer a route
+    whose quota died hours ago, so silence would turn that into an unexplained
+    error tour. This names the exact command and leaves execution policy to the
+    consumer.
 
     Says WHICH file, HOW old, and WHAT to run -- "stale catalog" on its own told
     the reader nothing they could do.

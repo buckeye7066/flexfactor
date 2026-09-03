@@ -69,28 +69,33 @@ recorded in every run manifest rather than described as containment
 | Apply-nothing exit code | `EXIT_APPLIED_NOTHING = 3` so supervisors see the failure |
 | Publication is mandatory | writing modes require Git, origin, push, and merge |
 | Push requires green gate | exact-commit evidence guards both push and merge |
-| Budget cap | `--max-cost` hard-stops per-program spend |
+| Budget cap | `--max-cost` stops paid calls; the same run continues through available free/local AI Time routes |
 | Egress gate | High-confidence secrets/PII refused before any cloud call |
 | Command policy | Destructive/credentialed/deploy commands refused (rc 126) |
 | Version-aware review | Findings recommending removed APIs are dropped, and the drop is printed (`[version] <file>: dropped finding ...`) |
 
 ### Scenario Analysis
 
-- **Purpose-gap fixing** — owner-authored unmet acceptance criteria bypass
-  `--fix-severity` and receive up to 12 fix attempts each.
-- **Competitor research** — Phase 1b scrapes corroborated competitors, applies
-  the licence gate, and bridges accepted ideas into the fix queue (capped by
-  `--competitor-fixes`, default 5).
+- **Purpose-gap fixing** — every code-fixable unmet acceptance criterion enters
+  the gated repair workflow and receives bounded verified attempts.
+- **Competitor research** — between passes one and two, Program Scout searches
+  public product URLs while Repo Rewards searches repositories. Open-source
+  candidates are shallow-cloned without checkout, their source evidence is
+  inspected at an exact commit, and accepted improvements enter the fix queue
+  (fixed top-three gate).
 - **Production-readiness rubric** — 13 deterministic gates (no model calls)
   including structured-data validity, dependency pinning, and test-suite presence.
 
 ## Supported Constraints
 
-- `--fix-severity` — minimum severity level that triggers a fix attempt
-- `--max-cost` — maximum USD budget per program (default $150)
+- `--fix-severity` — legacy-compatible spelling; severity no longer removes a
+  code finding from the repair workflow
+- `--max-cost` — maximum paid USD budget per program (default $150); free/local
+  routes continue after paid budget is depleted
 - `--adversarial-rounds` — re-fix rounds before reject (default 2)
 - `--fix-prefetch` — parallel first-attempt generations (default 3)
-- `--competitor-fixes` — max bridged competitor findings per run (default 5)
+- `--competitor-fixes` — legacy-compatible spelling; the inter-pass gate is
+  fixed at the top three competitors
 - `--no-bootstrap` — advanced compatibility switch; verification remains
   fail-closed if dependencies are unavailable
 

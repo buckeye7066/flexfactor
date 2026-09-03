@@ -443,8 +443,8 @@ class CatalogTests(RotationTestCase):
 
     def test_the_stale_catalog_warning_is_actionable_and_said_once(self):
         """Neither suppress it nor repeat it: name the file, its age, and the
-        exact refresh command. FlexFactor never runs that command itself --
-        AI Time owns the catalog."""
+        exact refresh command. AI Time owns the catalog and FlexFactor requests
+        its refresh before route selection."""
         fresh = catalog(route("a/one", "pool-a"), age=60.0)
         self.assertIsNone(R.catalog_staleness_note(fresh))
         self.assertIsNone(R.catalog_staleness_note(None))
