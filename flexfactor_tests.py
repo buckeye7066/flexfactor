@@ -9002,7 +9002,8 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
             cycles=1, max_cycles=1, until_clean=False, include=[], exclude=[],
             review_workers=2, adversarial=True, adversarial_rounds=2, fix_prefetch=0,
             push=True, merge=True, tests=False, e2e=False, app_url=None,
-            full_suite=False, max_test_modules=4)
+            full_suite=False, max_test_modules=4,
+            auto_clean=False)  # isolated in flexfactor_autoclean_tests.py
 
         orig = {}
         stubs = {
