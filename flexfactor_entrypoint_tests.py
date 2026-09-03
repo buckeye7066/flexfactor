@@ -261,10 +261,15 @@ class EntryPointParityTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(refresh))
         with open(refresh, encoding="ascii") as fh:
             source = fh.read()
-        self.assertIn("fetch --quiet --no-tags origin main", source)
+        self.assertIn('"fetch", "--quiet", "--no-tags", "origin", "main"', source)
         self.assertIn("merge --ff-only --quiet origin/main", source)
         self.assertIn("status --porcelain", source)
         self.assertIn("merge-base --is-ancestor HEAD origin/main", source)
+        self.assertIn("WaitForExit(30000)", source)
+        self.assertIn("--no-renames --diff-filter=A", source)
+        self.assertIn("git@github.com:buckeye7066/flexfactor.git", source)
+        self.assertIn("flexfactor-refresh-needs-install", source)
+        self.assertIn("WaitForExit(600000)", source)
         for name in LAUNCHERS:
             with open(os.path.join(HERE, name), encoding="ascii") as fh:
                 launcher = fh.read()
