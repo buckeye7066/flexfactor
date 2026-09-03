@@ -2,7 +2,6 @@
 from __future__ import annotations
 import contextlib, json, os, random, socket, tempfile, threading, time, uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
 
 SCHEMA=1
 LEASE_TTL_S=15*60.0

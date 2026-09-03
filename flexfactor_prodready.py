@@ -20,7 +20,6 @@ from flexfactor_prodready_engine import *  # noqa: F403
 from flexfactor_prodready_engine import (
     Gate,
     _tracked_files,
-    _validate_jsonld,
     assess_readiness as _assess_readiness_core,
 )
 

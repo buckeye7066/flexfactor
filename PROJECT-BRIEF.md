@@ -2,7 +2,7 @@
 
 ## Purpose
 
-FlexFactor is a trustworthy local code auditor and refactorer. It reads why a
+FlexFactor is a managed code auditor and refactorer. It reads why a
 program exists (via a purpose contract), reviews every source file against that
 purpose, applies verified fixes, and publishes only when a green build and test
 suite confirm the work.
@@ -22,19 +22,27 @@ recorded in every run manifest rather than described as containment
 
 ### Review–Fix–Gate Cycle
 
-1. **Purpose baseline** — load the program's `purpose-contract` and score all
-   acceptance criteria before touching any file.
-2. **Parallel review** — each source file is reviewed concurrently by a judge
-   LLM against the purpose contract, producing a findings list with severities.
-3. **Edit-block fix generation** — fixes are expressed as search/replace edit
+1. **Governed repository preparation** — resolve one queued target, account its
+   complete Git-visible manifest, establish purpose, prepare dependencies, and
+   measure the publication baseline under one durable target receipt.
+2. **Purpose-first repair** — repair a red baseline and bridge authorized
+   purpose gaps inside the first whole-repository pass, then reconcile its
+   manifest before semantic review begins.
+3. **Semantic review** — review every eligible file against the purpose
+   contract. Worker concurrency may accelerate this one active target; it never
+   admits another repository concurrently.
+4. **Edit-block fix generation** — fixes are expressed as search/replace edit
    blocks (output scales with the change, not the file); a shrinking loop retries
    with fewer findings when the model output budget is exceeded.
-4. **Adversarial verification** — a second model reviews every candidate fix
+5. **Adversarial verification** — a second model reviews every candidate fix
    assuming it is wrong; the loop re-iterates on material residuals up to
    `--adversarial-rounds` (default 2) before rollback.
-5. **Publication gate** — build gate first, then the strongest test suite the
+6. **Exact-delta follow-up** — later passes review only verified byte changes
+   from the preceding pass; the top-three competitor gate runs between passes
+   one and two.
+7. **Publication gate** — build gate first, then the strongest test suite the
    project exposes; a defined-but-red suite is a hard publication failure.
-6. **Commit and sync** — verified commits are pushed with a plain
+8. **Commit and sync** — verified commits are pushed with a plain
    fast-forward `git push`; **nothing is ever force-pushed** (`--force-with-lease`
    described the deleted sandbox topology and `test_push_is_never_forced` pins
    its absence). A protected main that rejects the direct push falls back to
@@ -42,11 +50,13 @@ recorded in every run manifest rather than described as containment
 
 ### Scheduling and Resource Allocation
 
-- **Free-vs-paid failover** — a two-phase stream deadline (first-event budget
-  absorbs queuing; per-event idle timer) routes stalled calls to the paid rescue
-  path, rate-capped at 40 rescues/hour.
-- **Concurrent free-review pool** — every available free backend fills a shared
-  file queue; a fast backend naturally pulls more files with no hardcoded ratio.
+- **One quality-first ladder** — every call starts with the strongest available
+  paid or subscription route and descends to free/local capacity only after
+  stronger capacity is unavailable.
+- **Sequential repository queue** — 1–30 selected targets run one at a time and
+  resume from an atomically persisted receipt after interruption.
+- **Concurrent review workers** — workers may share a file queue within the one
+  active repository; this does not create a competing target scheduler.
 - **Fix prefetch pipeline** — `--fix-prefetch N` (default 3) runs first-attempt
   fix generations in background threads while the main thread applies and gates
   the current file.
@@ -57,7 +67,8 @@ recorded in every run manifest rather than described as containment
 |---|---|
 | No review-only mode | `--report-only`/`--dry-run` removed; argparse exits 2 |
 | Apply-nothing exit code | `EXIT_APPLIED_NOTHING = 3` so supervisors see the failure |
-| Push requires green gate | `final_ok is True` guards both push and merge |
+| Publication is mandatory | writing modes require Git, origin, push, and merge |
+| Push requires green gate | exact-commit evidence guards both push and merge |
 | Budget cap | `--max-cost` hard-stops per-program spend |
 | Egress gate | High-confidence secrets/PII refused before any cloud call |
 | Command policy | Destructive/credentialed/deploy commands refused (rc 126) |
@@ -80,20 +91,25 @@ recorded in every run manifest rather than described as containment
 - `--adversarial-rounds` — re-fix rounds before reject (default 2)
 - `--fix-prefetch` — parallel first-attempt generations (default 3)
 - `--competitor-fixes` — max bridged competitor findings per run (default 5)
-- `--no-bootstrap` — skip dependency installation before build gate
-- `--no-push` / `--no-merge` — opt out of automatic publication
-- `--economy` — use cheaper author tier (claude-sonnet-5) across all modes
+- `--no-bootstrap` — advanced compatibility switch; verification remains
+  fail-closed if dependencies are unavailable
+
+Legacy provider, economy, model-mode, parallel, and publication opt-out flags
+may still parse for saved-command compatibility, but they cannot select a
+different production execution policy.
 
 ## Use Cases
 
 1. **Audit a codebase** — `python flexfactor.py audit --program <path>`  
-   Finds and fixes defects; publishes verified result to the branch.
+   Finds and fixes defects; exit 0 requires the exact verified commit on the
+   authoritative remote default branch.
 
 2. **Production-readiness check** — `python flexfactor.py prodready --program <path>`  
    Installs deps, runs 13 rubric gates, fixes medium-and-above findings.
 
 3. **Scout an integration** — `python flexfactor.py scout --program <path>`  
-   Proposes third-party integrations; requires explicit `--apply` approval.
+   Researches source-backed improvements. Mutation requires explicit Scout
+   authorization and then the same verification/publication contract.
 
 4. **Single-file refactor** — `python flexfactor.py --file <f> --goal "..."`  
    Targeted rewrite of one file toward a stated goal.
@@ -102,7 +118,9 @@ recorded in every run manifest rather than described as containment
 
 - Edit blocks over whole-file regeneration — output proportional to change size.
 - Shrink-and-retry on budget overrun — worst-severity half retried, never skipped.
-- LRU brain cache — `clean_files` skip set avoids re-reviewing unchanged files.
+- LRU brain cache — prior hashes provide provenance and recovery evidence;
+  exhaustive Audit/Production Ready pass one still reviews the current complete
+  repository manifest.
 - Resume checkpoints — per-file delta flushes survive crashes; re-verifies hashes
   on recovery so stale entries are dropped.
 - Two-phase stream deadline — long-but-progressing generations are never killed;
@@ -111,18 +129,11 @@ recorded in every run manifest rather than described as containment
 ## Running Tests
 
 ```bash
-pip install -r requirements.txt
-python flexfactor_tests.py          # unit tests, no API keys needed
-python flexfactor_rotation_tests.py
-python flexfactor_node_lock_tests.py
-python flexfactor_prodready_persistence_tests.py
-python flexfactor_entrypoint_tests.py   # entry-point parity + clean wheel install outside the checkout
-python test_flexfactor_sandbox.py       # execution broker (Job Object / bwrap / rlimits)
-python test_flexfactor_wip.py           # orphan WIP transaction (real git repos)
-python test_flexfactor_partial.py       # partial structured output is failure evidence
-python test_flexfactor_ledger.py        # content-addressed chunk ledger
-python test_flexfactor_coverage.py      # direct function coverage evidence
-python test_flexfactor_purpose.py       # purpose evidence gathering + confidence
-python test_flexfactor_journeys.py      # browser journey engine (real Playwright when available)
-python flexfactor_dashboard.py --selftest
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e ".[all]"
+.venv/bin/python -m pytest -q
 ```
+
+The binding Ubuntu/Windows matrix in
+`.github/workflows/production-readiness.yml` also verifies a clean wheel,
+entry-point parity, the cloud service, and live release-policy gates.

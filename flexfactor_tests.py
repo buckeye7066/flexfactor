@@ -1430,706 +1430,6 @@ class FixDiffTests(unittest.TestCase):
 
 
 @unittest.skip(_RETIRED_LADDER_REASON)
-class RetiredPaidFreeProviderCharacterization(unittest.TestCase):
-    def tearDown(self):
-        # build_audit_providers publishes the chosen free backends in a MODULE
-        # GLOBAL, and audit_one_program wraps whatever is in it into the
-        # reviewer pool. Tests here call the real builder with stub providers,
-        # so leaving that global populated hands a LATER test's audit a pool of
-        # fakes: ResumeCheckpointTests then reviewed nothing and reported
-        # "provider errors/budget" - a failure with no connection to its own
-        # subject, and only when the two ran in the same process.
-        ff._LAST_FREE_REVIEW_POOL = []
-        ff._LAST_ROTATION_USABLE = 0
-        ff._PROVIDER_DIAGNOSIS = ""
-
-    def test_claude5_family_priced(self):
-        # Missing entries silently fall back to Opus-tier pricing (5/25), which
-        # overbills the meter and stops budget-capped runs early.
-        self.assertEqual(ff._price_for("claude-sonnet-5"), (3.0, 15.0))
-        self.assertEqual(ff._price_for("claude-fable-5"), (10.0, 50.0))
-        self.assertEqual(ff._price_for("claude-haiku-4-5"), (1.0, 5.0))
-        self.assertEqual(ff._price_for("claude-opus-4-8"), (5.0, 25.0))
-
-    def test_sonnet5_key_does_not_shadow_sonnet46(self):
-        self.assertEqual(ff._price_for("claude-sonnet-4-6"), (3.0, 15.0))
-
-    def test_economy_tier_defined_for_anthropic(self):
-        self.assertEqual(ff.ECONOMY_MODELS.get("anthropic"), "claude-sonnet-5")
-
-    def test_economy_routes_author_model(self):
-        # Exercise build_audit_providers itself (stubbed provider + key check):
-        # --economy picks the economy author when no explicit --model was given;
-        # an explicit --model always wins.
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
-            model = None
-            economy = True
-            use_both = False
-            secondary_model = None
-            judge_model = None
-            no_preflight = True  # this test checks model routing, not the live key ping
-
-        picked = []
-        real_key, real_make = ff._provider_key_present, ff.make_provider
-        ff._provider_key_present = lambda name: name == "anthropic"
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
-            picked.append(model) or object())
-        try:
-            ff.build_audit_providers(Args)
-            self.assertEqual(picked, ["claude-sonnet-5"])
-            picked.clear()
-            Args.model = "claude-opus-4-8"
-            ff.build_audit_providers(Args)
-            self.assertEqual(picked, ["claude-opus-4-8"])
-            picked.clear()
-            Args.model, Args.economy = None, False
-            ff.build_audit_providers(Args)
-            self.assertEqual(picked, [ff.DEFAULT_MODELS["anthropic"]])
-        finally:
-            ff._provider_key_present, ff.make_provider = real_key, real_make
-
-    def test_preflight_drops_dead_primary_and_falls_back(self):
-        """A dead half of the paid pair is a REFUSAL, not a quieter run.
-
-        Owner order 2026-08-28: "For the paid path, allow both Anthropic and
-        OpenAI API keys to be used. Each edit must be approved by both models."
-
-        Every approval gate in the fix loop - the adversarial verify and the
-        legacy single-shot veto both - is conditional on a second provider
-        existing. So the old behaviour here (anthropic dead -> continue on
-        openai alone) did not merely lose a reviewer: it silently removed the
-        approval step the paid path is named for, and reported the run as
-        normal. Paid mode now refuses and names the missing half. `--single`
-        (use_both=False) is how a one-model run is asked for on purpose - that
-        path still falls back, and is covered below."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        picked = []
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
-        ff._provider_health = lambda name, meter=None: (
-            (False, "credit balance is too low") if name == "anthropic" else (True, "ok"))
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
-            picked.append(name) or object())
-        try:
-            self.assertEqual([], ff.build_audit_providers(Args),
-                             "paid mode must not run one-model when --single "
-                             "was not asked for")
-            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
-            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
-            # ...and the deliberate single-model run still works, with openai
-            # as the fallback author exactly as before.
-            picked.clear()
-            Args.use_both = False
-            out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["openai"])
-            self.assertEqual(picked, ["openai"])
-        finally:
-            Args.use_both = True
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_free_pool_puts_the_second_free_backend_on_fix_approval(self):
-        """Two free backends up -> the second one CROSS-VERIFIES, not just reviews.
-
-        Owner order 2026-08-28, free path: "optimize the use of the free
-        platforms available where they work harmoniously towards a common
-        goal." The fix-approval gates (`_adversarial_verify_fix` and the legacy
-        veto) are conditional on a second provider being present, so returning a
-        single provider here means every free-path fix is accepted on the
-        author's own say-so while a usable second free backend sits idle for the
-        one decision a second opinion is worth most on."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "free"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            explicit_provider = False   # free-first only applies when unnamed
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        real_fcc = ff._auto_activate_fcc_proxy
-        real_rot = ff._build_rotating_provider
-        ff._provider_key_present = lambda name: True
-        ff._provider_free_routed = lambda name: name == "anthropic"
-        ff._auto_activate_fcc_proxy = lambda: None
-        ff._build_rotating_provider = lambda *a, **kw: None   # exercise the POOL path
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            names = [n for n, _ in ff.build_audit_providers(Args)]
-            self.assertEqual(["anthropic", "ollama"], names,
-                             "both free backends must be returned so the fix "
-                             "loop has a cross-model verifier")
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-            ff._auto_activate_fcc_proxy = real_fcc
-            ff._build_rotating_provider = real_rot
-
-    def test_rotation_returns_a_second_route_to_verify_every_fix(self):
-        """The default free path is rotation, and it returned ONE provider.
-
-        `cross = providers[1][1] if len(providers) > 1 else None` gates every
-        fix-approval path in the run, so a single-provider rotation meant the
-        normal free run wrote each fix on the author's own say-so while the rest
-        of the catalog (121 free routes over 23 pools, measured on this machine)
-        stood idle. Rotation now hands back a second independent route for the
-        cross-check, built quietly so the banner is not printed twice."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "free"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            explicit_provider = False
-
-        calls = []
-        real_build = ff._build_rotating_provider
-        real_usable = ff._LAST_ROTATION_USABLE
-        real_fcc = ff._auto_activate_fcc_proxy
-
-        def fake_build(a, meter, mode, quiet=False):
-            calls.append(quiet)
-            ff._LAST_ROTATION_USABLE = 7
-            return object()
-
-        ff._build_rotating_provider = fake_build
-        ff._auto_activate_fcc_proxy = lambda: None
-        try:
-            names = [n for n, _ in ff.build_audit_providers(Args)]
-            self.assertEqual(["rotation", "rotation-verify"], names)
-            self.assertEqual([False, True], calls,
-                             "the verifier must be built quietly - one banner "
-                             "per run, not two")
-        finally:
-            ff._build_rotating_provider = real_build
-            ff._LAST_ROTATION_USABLE = real_usable
-            ff._auto_activate_fcc_proxy = real_fcc
-
-    def test_rotation_with_one_usable_route_stays_single(self):
-        """One route cannot cross-check itself; claiming otherwise would be the
-        same silent-approval defect wearing the opposite mask."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "free"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            explicit_provider = False
-
-        real_build = ff._build_rotating_provider
-        real_usable = ff._LAST_ROTATION_USABLE
-        real_fcc = ff._auto_activate_fcc_proxy
-
-        def fake_build(a, meter, mode, quiet=False):
-            ff._LAST_ROTATION_USABLE = 1
-            return object()
-
-        ff._build_rotating_provider = fake_build
-        ff._auto_activate_fcc_proxy = lambda: None
-        try:
-            self.assertEqual(["rotation"],
-                             [n for n, _ in ff.build_audit_providers(Args)])
-        finally:
-            ff._build_rotating_provider = real_build
-            ff._LAST_ROTATION_USABLE = real_usable
-            ff._auto_activate_fcc_proxy = real_fcc
-
-    def test_paid_models_lets_the_owner_pick_one_account(self):
-        """`--paid-models anthropic|openai` is a DELIBERATE single-model paid run.
-
-        Owner request 2026-08-29: run paid on just one account when the other is
-        out of credit. That is not the silent downgrade the pair rule exists to
-        stop - it was asked for, it rides in the run manifest, and the pair rule
-        still applies whenever the choice is 'both'."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            paid_models = "openai"
-
-        picked = []
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        ff._provider_free_routed = lambda name: False
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
-            picked.append(name) or object())
-        try:
-            # Only OpenAI is usable, and only OpenAI was asked for: it runs.
-            ff._provider_key_present = lambda name: name == "openai"
-            self.assertEqual(["openai"],
-                             [n for n, _ in ff.build_audit_providers(Args)])
-            # The mirror case.
-            picked.clear()
-            Args.paid_models = "anthropic"
-            Args.provider = "openai"
-            ff._provider_key_present = lambda name: name == "anthropic"
-            self.assertEqual(["anthropic"],
-                             [n for n, _ in ff.build_audit_providers(Args)])
-            # ...and 'both' still refuses when one half is missing.
-            Args.paid_models = "both"
-            Args.provider = "anthropic"
-            self.assertEqual([], ff.build_audit_providers(Args))
-            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-
-    def test_paid_models_account_is_preflighted_not_assumed(self):
-        """The SELECTED account is the one that gets health-checked.
-
-        The first version of this flag reassigned `primary` AFTER the only
-        mandatory `_usable(primary)` check, so the check answered a question
-        nobody asked. Both directions were wrong, and both are pinned here:
-
-        1. `--provider anthropic --paid-models openai` with a healthy Anthropic
-           key passed preflight on ANTHROPIC, then handed the run an OpenAI
-           provider nobody had checked - the documented setup diagnosis was
-           replaced by a crash on the first model call.
-        2. `--provider ollama --model-mode paid --paid-models openai` was
-           refused for ollama's sake (ollama is not permitted in paid mode)
-           before a perfectly healthy OpenAI account was ever considered.
-
-        Asserting on the returned provider list alone is what let this through:
-        case 1 returns ["openai"] under BOTH the broken and fixed ordering if
-        the key is present. So case 1 gives OpenAI NO key - the state the
-        preflight exists to catch - and demands the refusal."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            paid_models = "openai"
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        built = []
-        ff._provider_free_routed = lambda name: False
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
-            built.append(name) or object())
-        try:
-            # 1. Healthy Anthropic must NOT vouch for an unusable OpenAI.
-            ff._provider_key_present = lambda name: name == "anthropic"
-            self.assertEqual([], ff.build_audit_providers(Args))
-            self.assertEqual([], built,
-                             "an unchecked provider was constructed for the "
-                             "account the preflight never looked at")
-            self.assertTrue(ff._PROVIDER_DIAGNOSIS,
-                            "refusing without a diagnosis is the failure this "
-                            "flag was supposed to avoid")
-            # 2. An unusable --provider must not veto the account chosen here.
-            built.clear()
-            Args.provider = "ollama"
-            ff._provider_key_present = lambda name: name == "openai"
-            self.assertEqual(["openai"],
-                             [n for n, _ in ff.build_audit_providers(Args)])
-        finally:
-            Args.provider = "anthropic"
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-
-    def test_paid_models_defaults_to_both_when_absent(self):
-        """Every existing caller and launcher omits the flag; omitting it must
-        keep the pair contract rather than silently becoming single-model."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-            # deliberately no paid_models attribute
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        ff._provider_key_present = lambda name: name == "anthropic"
-        ff._provider_free_routed = lambda name: False
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            self.assertEqual([], ff.build_audit_providers(Args))
-            self.assertIn("both", ff._PROVIDER_DIAGNOSIS.lower())
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-
-    def test_copilot_in_paid_mode_still_needs_both_models(self):
-        """`other` is only ever the other half of the anthropic/openai pair.
-
-        A paid run with --provider copilot therefore left paid_pair_required
-        false and ran alone - the pair promise broken by the one permitted paid
-        provider that never had a partner."""
-        class Args:
-            provider = "copilot"
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = True
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        ff._provider_free_routed = lambda name: False
-        try:
-            ff._provider_key_present = lambda name: name == "copilot"
-            self.assertEqual([], ff.build_audit_providers(Args))
-            self.assertIn("anthropic", ff._PROVIDER_DIAGNOSIS)
-            self.assertIn("openai", ff._PROVIDER_DIAGNOSIS)
-            # Both halves present: copilot authors, and a pair member reviews.
-            ff._provider_key_present = lambda name: True
-            names = [n for n, _ in ff.build_audit_providers(Args)]
-            self.assertEqual(["copilot", "anthropic"], names)
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-
-    def test_secondary_model_is_honoured_by_the_free_pool_verifier(self):
-        """--secondary-model is documented as the 2nd cross-check provider's
-        model. Honouring it only on the paid branch discards an explicit choice
-        with no message."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "free"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = "chosen-cross-checker"
-            judge_model = None
-            no_preflight = True
-            explicit_provider = False
-
-        picked = []
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_free = ff._provider_free_routed
-        real_fcc = ff._auto_activate_fcc_proxy
-        real_rot = ff._build_rotating_provider
-        ff._provider_key_present = lambda name: True
-        ff._provider_free_routed = lambda name: name == "anthropic"
-        ff._auto_activate_fcc_proxy = lambda: None
-        ff._build_rotating_provider = lambda *a, **kw: None
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (
-            picked.append((name, model)) or object())
-        try:
-            ff.build_audit_providers(Args)
-            self.assertIn(("ollama", "chosen-cross-checker"), picked)
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_free_routed = real_free
-            ff._auto_activate_fcc_proxy = real_fcc
-            ff._build_rotating_provider = real_rot
-
-    def test_paid_mode_runs_when_both_models_are_usable(self):
-        """The positive half of the pair rule: two healthy keys -> two providers,
-        author first and the cross-checker second."""
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
-        ff._provider_health = lambda name, meter=None: (True, "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            self.assertEqual(["anthropic", "openai"],
-                             [n for n, _ in ff.build_audit_providers(Args)])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_preflight_prefers_free_ollama_over_paid_fallback(self):
-        # Owner order 2026-08-11: "the preflight should be the free ollama as
-        # well - openai and anthropic are fallbacks." Dead cloud primary + live
-        # local ollama -> ollama becomes the author, BEFORE the other paid key;
-        # the usable cloud provider is KEPT as the cross-check reviewer (the
-        # zero-egress local-only rule applies only when the owner POINTS at
-        # ollama, not when preflight falls back to it).
-        class Args:
-            provider = "openai"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: True  # ollama never needs a key
-        ff._provider_health = lambda name, meter=None: (
-            (False, "credit balance is too low") if name == "openai" else (True, "ok"))
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["ollama"])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_free_first_engages_even_when_the_paid_key_is_HEALTHY(self):
-        # THE 2026-08-11 MONEY BUG. Free-first used to live only inside the
-        # `if not _usable(primary)` crash-handler, so a HEALTHY paid key meant
-        # ollama was never considered and the run billed real money (~$2.85/hr
-        # measured) while a loaded local model idled. When the owner did NOT type
-        # --provider, the local model must author and the cloud must cross-check.
-        class Args:
-            provider = "anthropic"       # argparse DEFAULT, not an owner choice
-            explicit_provider = False    # main sets this when --provider is absent
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: True
-        ff._provider_health = lambda name, meter=None: (True, "ok")  # ALL healthy
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            names = [n for n, _ in ff.build_audit_providers(Args)]
-            self.assertEqual(names[0], "ollama",
-                             "a healthy paid key must NOT suppress free-first")
-            self.assertEqual(names, ["ollama"])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_preflight_owner_chosen_usable_primary_still_wins(self):
-        # A usable owner-chosen cloud primary is never displaced by ollama.
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
-            model = None
-            economy = False
-            use_both = False
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: True
-        ff._provider_health = lambda name, meter=None: (True, "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["anthropic"])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_preflight_env_mismatch_prefers_free_routed_cloud_over_ollama(self):
-        # 2026-08-11 live failure: a stale script passed `--provider openai`
-        # while the launch env BLANKED OPENAI_API_KEY and configured anthropic
-        # through the FREE local proxy (ANTHROPIC_BASE_URL=127.0.0.1:8082 +
-        # ANTHROPIC_AUTH_TOKEN). The free-first chain then demoted the run to
-        # local ollama while the intended free cloud proxy sat idle. A KEYLESS
-        # primary + a FREE-ROUTED usable other cloud provider must resolve to
-        # the free cloud route (env wins over the stale argument).
-        from unittest import mock
-
-        class Args:
-            provider = "openai"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name != "openai"  # openai keyless
-        ff._provider_health = lambda name, meter=None: (True, "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            with mock.patch.dict(os.environ, {
-                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
-                    "ANTHROPIC_AUTH_TOKEN": "freecc",
-                    "ANTHROPIC_API_KEY": ""}):
-                out = ff.build_audit_providers(Args)
-            # anthropic (free proxy) is primary; keyless openai never appears.
-            self.assertEqual([n for n, _ in out], ["anthropic"])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_preflight_keyless_primary_without_free_route_still_falls_to_ollama(self):
-        # The env-mismatch guard fires ONLY for a free-routed other provider.
-        # With a real paid Anthropic key (no proxy signature), the owner's
-        # FREE-FIRST order still applies: keyless-openai primary -> ollama
-        # author, usable paid cloud kept as cross-check.
-        from unittest import mock
-
-        class Args:
-            provider = "openai"
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_make = ff.make_provider
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name != "openai"
-        ff._provider_health = lambda name, meter=None: (True, "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
-        try:
-            with mock.patch.dict(os.environ, {
-                    "ANTHROPIC_BASE_URL": "",
-                    "ANTHROPIC_AUTH_TOKEN": "",
-                    "ANTHROPIC_API_KEY": "sk-ant-realpaidkey"}):
-                out = ff.build_audit_providers(Args)
-            self.assertEqual([n for n, _ in out], ["ollama"])
-        finally:
-            ff._provider_key_present = real_key
-            ff.make_provider = real_make
-            ff._provider_health = real_health
-
-    def test_provider_free_routed_signatures(self):
-        from unittest import mock
-        # Loopback base URL counts, auth-token-without-key counts, a real paid
-        # key with no proxy signature does not, and openai never does.
-        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
-                                          "ANTHROPIC_AUTH_TOKEN": "",
-                                          "ANTHROPIC_API_KEY": "sk-ant-x"}):
-            self.assertTrue(ff._provider_free_routed("anthropic"))
-        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "",
-                                          "ANTHROPIC_AUTH_TOKEN": "freecc",
-                                          "ANTHROPIC_API_KEY": ""}):
-            self.assertTrue(ff._provider_free_routed("anthropic"))
-        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "",
-                                          "ANTHROPIC_AUTH_TOKEN": "",
-                                          "ANTHROPIC_API_KEY": "sk-ant-x"}):
-            self.assertFalse(ff._provider_free_routed("anthropic"))
-        self.assertFalse(ff._provider_free_routed("openai"))
-
-    def test_preflight_all_keys_dead_returns_empty_with_diagnosis(self):
-        # Every present key is rejected -> return [] AND set a credit-aware reason
-        # so the caller can tell the user to top up (vs "no key set").
-        class Args:
-            provider = "anthropic"
-            model_mode = "paid"   # these assert PAID-vendor selection; free admits no billable client
-            model = None
-            economy = False
-            use_both = True
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name in ("anthropic", "openai")
-        ff._provider_health = lambda name, meter=None: (False, "credit balance is too low")
-        try:
-            out = ff.build_audit_providers(Args)
-            self.assertEqual(out, [])
-            self.assertIn("credit", ff._PROVIDER_DIAGNOSIS.lower())
-        finally:
-            ff._provider_key_present = real_key
-            ff._provider_health = real_health
-
-    def test_paid_openai_dead_reports_credit_rejection_not_mode_exclusion(self):
-        # Live GrantFlow 2026-08-16: an explicit OpenAI-only paid run received
-        # a 429 credit_balance_exhausted preflight, but the summary claimed paid
-        # mode "excludes the configured routes".  The OpenAI route is permitted;
-        # its credential is simply unusable.  Preserve that distinction so the
-        # operator gets the actionable remedy instead of a false mode diagnosis.
-        class Args:
-            provider = "openai"
-            explicit_provider = True
-            model_mode = "paid"
-            model = None
-            economy = False
-            use_both = False
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key = ff._provider_key_present
-        real_health = ff._provider_health
-        ff._provider_key_present = lambda name: name == "openai"
-        ff._provider_health = lambda name, meter=None: (
-            False, "credit balance is too low")
-        try:
-            self.assertEqual(ff.build_audit_providers(Args), [])
-            diagnosis = ff._PROVIDER_DIAGNOSIS.lower()
-            self.assertIn("credit", diagnosis)
-            self.assertIn("rejected", diagnosis)
-            self.assertNotIn("excludes", diagnosis)
-        finally:
-            ff._provider_key_present = real_key
-            ff._provider_health = real_health
-
-
 class BestAvailableProviderContractTests(unittest.TestCase):
     """Every legacy selector converges on one orchestrated provider policy."""
 
@@ -2303,8 +1603,6 @@ class RotationDefaultProviderTests(unittest.TestCase):
                          ["best-available", "best-available-verifier"])
         import flexfactor_rotation as fr
         self.assertIsInstance(providers[0][1], fr.RotatingProvider)
-        self.assertEqual(ff._LAST_FREE_REVIEW_POOL, [],
-                         "rotation must not leave a stale free pool behind")
         self.assertIn("[rotation] ON:", err.getvalue())
 
     def test_ai_time_catalog_is_authoritative_over_builtin_guesses(self):
@@ -2329,16 +1627,13 @@ class RotationDefaultProviderTests(unittest.TestCase):
         """Run build_audit_providers with key/health/factory stubbed so the
         fall-through (non-rotation) path never touches a real backend."""
         real_key = ff._provider_key_present
-        real_health = ff._provider_health
         real_make = ff.make_provider
         ff._provider_key_present = lambda name: name == "anthropic"
-        ff._provider_health = lambda name, meter=None: (True, "ok")
         ff.make_provider = lambda name, model, meter=None, judge_model=None: object()
         try:
             return ff.build_audit_providers(args)
         finally:
             ff._provider_key_present = real_key
-            ff._provider_health = real_health
             ff.make_provider = real_make
 
     def test_ai_rotate_off_restores_prior_behaviour(self):
@@ -2762,171 +2057,6 @@ class RotationDefaultProviderTests(unittest.TestCase):
 
 
 @unittest.skip(_RETIRED_LADDER_REASON)
-class RetiredConcurrentFreePoolCharacterization(unittest.TestCase):
-    """2026-08-12 owner correction: the FCC proxy and local Ollama are both
-    genuinely free but not equally fast on this machine (Ollama is CPU-only -
-    a large-file review measured 20+ minutes locally vs under a minute
-    through the proxy). The old free-first check only ever tried
-    `_usable('ollama')` and picked a single winner, leaving a second usable
-    free backend completely idle. "make sure these different models are not
-    working independently... orchestrated... optimized" (owner) - these
-    tests prove build_audit_providers now builds a POOL when both are
-    usable, and that _review_all's dispatch genuinely self-balances by real
-    throughput rather than splitting work evenly or picking one and idling
-    the rest."""
-
-    def setUp(self):
-        # The module-level test guard neutralizes real network activation
-        # (see the top-of-file comment); remember it so each test can install
-        # its own fake and this always restores the neutral no-op after.
-        self._neutral_activate = ff._auto_activate_fcc_proxy
-
-    def tearDown(self):
-        ff._auto_activate_fcc_proxy = self._neutral_activate
-
-    def test_build_audit_providers_pools_fcc_and_ollama_when_both_usable(self):
-        from unittest import mock
-
-        class Args:
-            provider = "anthropic"       # argparse default, not an owner choice
-            explicit_provider = False    # free-first applies
-            model = None
-            economy = False
-            use_both = False
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        def fake_activate(timeout=3.0):
-            # Simulate a healthy proxy WITHOUT any real network call - mirrors
-            # what the real function does once its probe succeeds.
-            os.environ["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8082"
-            os.environ["ANTHROPIC_AUTH_TOKEN"] = "freecc"
-            return True
-
-        real_key_present = ff._provider_key_present
-        real_health = ff._provider_health
-        real_make = ff.make_provider
-        ff._auto_activate_fcc_proxy = fake_activate
-        ff._provider_key_present = lambda name: name in ("anthropic", "ollama")
-        ff._provider_health = lambda name, meter=None: (True, "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (name, object())
-        try:
-            with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "ANTHROPIC_AUTH_TOKEN": "",
-                                              "ANTHROPIC_API_KEY": ""}):
-                providers = ff.build_audit_providers(Args)
-                pool = ff._LAST_FREE_REVIEW_POOL
-        finally:
-            ff._provider_key_present = real_key_present
-            ff._provider_health = real_health
-            ff.make_provider = real_make
-            os.environ.pop("ANTHROPIC_BASE_URL", None)
-            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-        pool_names = [n for n, _, _ in pool]
-        self.assertEqual(pool_names, ["anthropic", "ollama"],
-                         "both free backends must be pooled, fcc first (fastest)")
-        self.assertEqual([n for n, _ in providers], ["anthropic"],
-                         "the AUTHOR/FIX phase stays single-provider - the fastest "
-                         "pool member - per the owner's 'don't overcomplicate the "
-                         "more-serial fix phase' instruction")
-
-    def test_only_ollama_usable_falls_back_to_single_entry_pool(self):
-        # The FCC proxy being down/unreachable must not break the existing
-        # single-free-backend path - same outcome as before this feature.
-        class Args:
-            provider = "anthropic"
-            explicit_provider = False
-            model = None
-            economy = False
-            use_both = False
-            secondary_model = None
-            judge_model = None
-            no_preflight = False
-
-        real_key_present = ff._provider_key_present
-        real_health = ff._provider_health
-        real_make = ff.make_provider
-        ff._auto_activate_fcc_proxy = lambda timeout=3.0: False  # proxy unreachable
-        ff._provider_key_present = lambda name: name == "ollama"
-        ff._provider_health = lambda name, meter=None: (name == "ollama", "ok")
-        ff.make_provider = lambda name, model, meter=None, judge_model=None: (name, object())
-        try:
-            providers = ff.build_audit_providers(Args)
-            pool = ff._LAST_FREE_REVIEW_POOL
-        finally:
-            ff._provider_key_present = real_key_present
-            ff._provider_health = real_health
-            ff.make_provider = real_make
-        self.assertEqual([n for n, _, _ in pool], ["ollama"])
-        self.assertEqual([n for n, _ in providers], ["ollama"])
-
-    def test_reviewer_pool_self_balances_toward_the_faster_backend(self):
-        # Direct proof of the dispatch mechanism: a "fast" backend and a
-        # "slow" backend pulling from the SAME shared file queue must have
-        # the fast one complete MORE files - no hardcoded ratio, just
-        # whichever backend's semaphore frees up first wins the next file.
-        calls = {"fast": 0, "slow": 0}
-        lock = threading.Lock()
-
-        class _FastProvider:
-            model = "fast-model"
-
-        class _SlowProvider:
-            model = "slow-model"
-
-        def fake_review(provider, rel, text, context="", project_dir=None):
-            name = "fast" if provider.model == "fast-model" else "slow"
-            with lock:
-                calls[name] += 1
-            time.sleep(0.002 if name == "fast" else 0.05)  # slow is 25x slower
-            return [], "ok"
-
-        real_read = ff._read_text_and_sha
-        real_review = ff.review_file
-        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = fake_review
-        pool = ff._ReviewerPool([
-            ("fast", _FastProvider(), 2),
-            ("slow", _SlowProvider(), 2),
-        ])
-        files = [f"f{i}.py" for i in range(60)]
-        try:
-            ff._review_all([], "/proj", files, workers=pool.total_concurrency(),
-                           reviewer_pool=pool)
-        finally:
-            ff._read_text_and_sha = real_read
-            ff.review_file = real_review
-        self.assertEqual(calls["fast"] + calls["slow"], len(files))
-        self.assertGreater(calls["fast"], calls["slow"],
-                           f"fast backend only got {calls['fast']} of {len(files)} files "
-                           f"(slow got {calls['slow']}) - pool is not self-balancing "
-                           "toward real throughput")
-
-    def test_legacy_single_reviewer_path_unaffected_when_no_pool_given(self):
-        # reviewer_pool defaults to None - every pre-existing _review_all
-        # caller/test must see EXACTLY the old behavior (every entry in
-        # `reviewers` reviews every file).
-        seen = []
-
-        class _R:
-            model = "m"
-
-        def fake_review(provider, rel, text, context="", project_dir=None):
-            seen.append(rel)
-            return [], "ok"
-
-        real_read = ff._read_text_and_sha
-        real_review = ff.review_file
-        ff._read_text_and_sha = lambda pd, rel, cap=0: (f"# {rel}\n", f"sha-{rel}")
-        ff.review_file = fake_review
-        try:
-            ff._review_all([_R()], "/proj", ["a.py", "b.py"], workers=1)
-        finally:
-            ff._read_text_and_sha = real_read
-            ff.review_file = real_review
-        self.assertEqual(sorted(seen), ["a.py", "b.py"])
-
-
 class CrossVerifyPromptTests(unittest.TestCase):
     def test_large_diff_is_capped_not_replaced_by_full_files(self):
         # A whole-file rewrite used to fall back to sending BOTH full copies to
@@ -3831,13 +2961,13 @@ class CleanFileHashMemoryTests(unittest.TestCase):
             p = os.path.join(tmp, "f.txt")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write("one")
-            s1 = ff._file_sha(p)
+            s1 = ff._file_sha_contained(tmp, "f.txt")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write("two")
-            s2 = ff._file_sha(p)
+            s2 = ff._file_sha_contained(tmp, "f.txt")
             self.assertIsNotNone(s1)
             self.assertNotEqual(s1, s2)
-            self.assertIsNone(ff._file_sha(os.path.join(tmp, "missing.txt")))
+            self.assertIsNone(ff._file_sha_contained(tmp, "missing.txt"))
 
     def test_changed_file_is_not_skipped(self):
         # Emulate the audit's skip decision: a remembered clean file is skipped
@@ -3847,13 +2977,13 @@ class CleanFileHashMemoryTests(unittest.TestCase):
             p = os.path.join(tmp, "f.txt")
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write("clean version")
-            recorded = ff._file_sha(p)
+            recorded = ff._file_sha_contained(tmp, "f.txt")
             # unchanged -> matches -> would skip
-            self.assertEqual(ff._file_sha(p), recorded)
+            self.assertEqual(ff._file_sha_contained(tmp, "f.txt"), recorded)
             # a human edits it afterwards -> hash differs -> must be re-reviewed
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write("clean version + a new bug")
-            self.assertNotEqual(ff._file_sha(p), recorded)
+            self.assertNotEqual(ff._file_sha_contained(tmp, "f.txt"), recorded)
 
 
 class BrainPersistenceTests(unittest.TestCase):
@@ -6146,7 +5276,6 @@ class _FakeResp:
 class _CapturingOpenAIClient:
     def __init__(self, sink):
         self._sink = sink
-        completions = self
 
         class Chat:
             def __init__(self, outer):
@@ -6378,78 +5507,6 @@ class CommitFailureIsFatalTests(unittest.TestCase):
             ff._git, ff._full_gate = real_git, real_gate
 
 
-class BudgetedHealthPingTests(unittest.TestCase):
-    """Round-4 defect 3: preflight health pings must be reserved/recorded against
-    the shared meter and the cache must be lock-guarded."""
-
-    def setUp(self):
-        self._saved = dict(ff._PROVIDER_HEALTH)
-        ff._PROVIDER_HEALTH.clear()
-
-    def tearDown(self):
-        ff._PROVIDER_HEALTH.clear()
-        ff._PROVIDER_HEALTH.update(self._saved)
-
-    def test_health_cache_has_a_lock(self):
-        self.assertTrue(hasattr(ff, "_PROVIDER_HEALTH_LOCK"))
-        # It must be an acquirable lock object.
-        self.assertTrue(ff._PROVIDER_HEALTH_LOCK.acquire(blocking=False))
-        ff._PROVIDER_HEALTH_LOCK.release()
-
-    def test_ping_records_against_the_meter(self):
-        # Fake the anthropic SDK so no network/key is needed; assert the meter sees
-        # the ping's tokens (i.e. the ping went through the budget path).
-        import types
-
-        class _Usage:
-            input_tokens = 5
-            output_tokens = 1
-
-        class _Msg:
-            usage = _Usage()
-
-        # Production ping() now streams (messages.stream(...).get_final_message())
-        # because the FCC proxy renders non-streaming messages.create() as raw
-        # SSE text rather than a Message. Mirror that call shape here so the
-        # stub feeds the same _Msg (with .usage) to _meter.
-        class _Stream:
-            def __enter__(self_):
-                return self_
-            def __exit__(self_, *exc):
-                return False
-            def get_final_message(self_):
-                return _Msg()
-
-        class _Messages:
-            def create(self, **kw):
-                return _Msg()
-            def stream(self, **kw):
-                return _Stream()
-
-        class _Anthropic:
-            def __init__(self):
-                self.messages = _Messages()
-
-        fake_mod = types.ModuleType("anthropic")
-        fake_mod.Anthropic = _Anthropic
-        real_mod = sys.modules.get("anthropic")
-        real_keypresent = ff._provider_key_present
-        sys.modules["anthropic"] = fake_mod
-        ff._provider_key_present = lambda name: name == "anthropic"
-        m = ff.CostMeter(limit_usd=None)
-        try:
-            ok, _reason = ff._provider_health("anthropic", m)
-        finally:
-            ff._provider_key_present = real_keypresent
-            if real_mod is not None:
-                sys.modules["anthropic"] = real_mod
-            else:
-                sys.modules.pop("anthropic", None)
-        self.assertTrue(ok)
-        self.assertGreater(m.usd, 0.0)      # the ping billed the shared meter
-        self.assertEqual(m._reserved, 0.0)  # reservation released after the ping
-
-
 class ScoutIntegrationPromptFencingTests(unittest.TestCase):
     """Round-4 defect 4: the integration patch prompt must fence the first model's
     plan AND raw project source, not just the repo summary."""
@@ -6679,67 +5736,6 @@ class WriteGeneratingPromptFencingTests(unittest.TestCase):
         self.assertTrue(any("<<<UNTRUSTED feedback START>>>" in r for r in rewrites),
                         "retry feedback must be fenced")
         self.assertIn("<<<UNTRUSTED candidate START>>>", grades[0])
-
-
-class HealthPingSingleFlightTests(unittest.TestCase):
-    """Round-5 defect 3: concurrent health checks issue EXACTLY ONE ping per
-    provider and go through the provider adapter."""
-
-    def setUp(self):
-        self._saved = dict(ff._PROVIDER_HEALTH)
-        ff._PROVIDER_HEALTH.clear()
-        ff._PROVIDER_HEALTH_INFLIGHT.clear()
-
-    def tearDown(self):
-        ff._PROVIDER_HEALTH.clear()
-        ff._PROVIDER_HEALTH_INFLIGHT.clear()
-        ff._PROVIDER_HEALTH.update(self._saved)
-
-    def test_concurrent_checks_ping_once_via_adapter(self):
-        import threading
-        import time as _t
-
-        pings = {"n": 0}
-        made = {"n": 0}
-        lock = threading.Lock()
-
-        class FakePingProvider:
-            def ping(self):
-                with lock:
-                    pings["n"] += 1
-                _t.sleep(0.05)  # hold so concurrent callers pile up on the in-flight Event
-
-        real_make = ff.make_provider
-        real_key = ff._provider_key_present
-
-        def fake_make(name, model, meter=None, judge_model=None):
-            with lock:
-                made["n"] += 1
-            return FakePingProvider()
-
-        ff.make_provider = fake_make
-        ff._provider_key_present = lambda name: True
-        try:
-            results = []
-            rlock = threading.Lock()
-
-            def worker():
-                r = ff._provider_health("anthropic", ff.CostMeter(None))
-                with rlock:
-                    results.append(r)
-
-            threads = [threading.Thread(target=worker) for _ in range(25)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        finally:
-            ff.make_provider = real_make
-            ff._provider_key_present = real_key
-        self.assertEqual(pings["n"], 1, "single-flight: exactly one ping")
-        self.assertEqual(made["n"], 1, "the ping went through exactly one adapter build")
-        self.assertTrue(all(r == (True, "ok") for r in results))
-        self.assertEqual(len(results), 25)
 
 
 class ModelNamedReadPathContainmentTests(unittest.TestCase):
@@ -11781,7 +10777,11 @@ class PaidRescueStampedeTests(unittest.TestCase):
         args = argparse.Namespace(provider="ollama", use_both=True, model=None,
                                   secondary_model=None, judge_model=None,
                                   economy=False, no_preflight=False)
-        with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+        # Own the catalog and credentials explicitly.  This test used to pass
+        # only when an earlier class leaked FLEXROT_TEST_KEY into os.environ;
+        # run order must not decide whether the production ladder exists.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("flexfactor_rotation.load_catalog", return_value=None), \
              mock.patch.dict(ff._OLLAMA_ROUTE_HEALTH, clear=True), \
              mock.patch.object(ff.OllamaProvider, "ping", lambda self: None):
             provs = ff.build_audit_providers(args, meter=None)
@@ -11794,7 +10794,8 @@ class PaidRescueStampedeTests(unittest.TestCase):
 
         def dead(self):
             raise OSError("connection refused")
-        with mock.patch.dict(ff._PROVIDER_HEALTH, clear=True), \
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("flexfactor_rotation.load_catalog", return_value=None), \
              mock.patch.dict(ff._OLLAMA_ROUTE_HEALTH, clear=True), \
              mock.patch.object(ff.OllamaProvider, "ping", dead):
             provs = ff.build_audit_providers(args, meter=None)
@@ -11815,8 +10816,18 @@ class PaidRescueStampedeTests(unittest.TestCase):
         args = argparse.Namespace(provider="ollama", use_both=True, model=None,
                                   secondary_model=None, judge_model=None,
                                   economy=False, no_preflight=True)
+        def dead(self):
+            raise OSError("connection refused")
+
+        # A caller's retired `--provider ollama` spelling cannot suppress the
+        # usable cloud routes in the one governed ladder.  Keep local inference
+        # unavailable here so the assertion cannot accidentally prove itself
+        # through Ollama.
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k",
-                                          "OPENAI_API_KEY": "k"}):
+                                          "OPENAI_API_KEY": "k"}, clear=True), \
+             mock.patch("flexfactor_rotation.load_catalog", return_value=None), \
+             mock.patch.dict(ff._OLLAMA_ROUTE_HEALTH, clear=True), \
+             mock.patch.object(ff.OllamaProvider, "ping", dead):
             provs = ff.build_audit_providers(args, meter=None)
         self.assertEqual([n for n, _ in provs],
                          ["best-available", "best-available-verifier"])
@@ -12433,99 +11444,6 @@ class AuditPipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(res.get("bootstrap"), [])
 
 
-class PurposeEngineSurvivesFullyPooledProvidersTests(unittest.TestCase):
-    """The purpose engine must still get a provider when the free pool covers
-    EVERY backend - the normal shape on this machine.
-
-    `reviewers` is deliberately filtered down to only what is GENUINELY
-    ADDITIONAL to the concurrent free-review pool. When the pool covers every
-    usable backend (anthropic-via-FCC + ollama pooled, providers==['anthropic'])
-    that list is EMPTY. The two assess_purpose_gap calls indexed it directly
-    (reviewers[-1] baseline, reviewers[0] final), so both raised IndexError,
-    both non-fatal handlers swallowed it, and the purpose-first phase never ran.
-    Live evidence, GrantFlow prodready 2026-08-13:
-    "purpose baseline failed (non-fatal): list index out of range".
-
-    This test drives the REAL audit_one_program in exactly that provider shape
-    and fails against the pre-fix code."""
-
-    def _run_fully_pooled(self, files):
-        captured = {}
-
-        def fake_run_audit(a):
-            captured["args"] = a
-            return 0
-
-        with _RepoFixture(files, production=True) as root:
-            with _patched(ff, "run_audit", fake_run_audit):
-                ff.main(["prodready", "--program", root, "--no-bootstrap",
-                         "--no-preflight", "--no-dashboard", "--no-tests",
-                         "--no-e2e", "--no-full-suite"])
-            args = captured["args"]
-            stub = _StubProvider()
-            seen = []
-
-            def fake_build(a, m=None):
-                # EXACTLY what build_audit_providers does when every usable
-                # backend is free and pooled: the pool holds it, and the
-                # returned provider list names the same backend - so the
-                # reviewers filter removes it and leaves [].
-                ff._LAST_FREE_REVIEW_POOL = [("stub", stub, 2)]
-                return [("stub", stub)]
-
-            def spy_assess(reviewer, *a, **kw):
-                seen.append(reviewer)
-                return {"gaps": [], "criteria_total": 0, "fulfillment_pct": 100}
-
-            real_pool = ff._LAST_FREE_REVIEW_POOL
-            try:
-                with _patched(ff, "build_audit_providers", fake_build), \
-                     _patched(ff, "_ensure_program_understanding",
-                              lambda *a, **k: _unit_purpose_understanding("Widget")), \
-                     _patched(ff, "assess_purpose_gap", spy_assess), \
-                     _patched(ff, "_full_gate",
-                              lambda d, s: (None, "(build stubbed offline in tests)")):
-                    res = ff.audit_one_program(root, args, 0, 1, None)
-            finally:
-                ff._LAST_FREE_REVIEW_POOL = real_pool
-            return res, seen, stub
-
-    def test_purpose_engine_still_runs_when_pool_covers_every_backend(self):
-        res, seen, stub = self._run_fully_pooled({
-            "package.json": '{"name":"x","scripts":{"build":"tsc"}}',
-            "README.md": "# Widget\n\nTurns widgets into gadgets for the owner.\n",
-            "src/app.js": "console.log(1);\n"})
-        self.assertIsNone(res.get("error"), res.get("error"))
-        self.assertTrue(
-            seen,
-            "assess_purpose_gap was NEVER called: with every backend pooled, "
-            "`reviewers` is empty and the old reviewers[-1]/reviewers[0] "
-            "indexing raised IndexError into a non-fatal handler, silently "
-            "disabling the purpose-first phase")
-        for reviewer in seen:
-            self.assertIsNotNone(
-                reviewer, "the purpose engine was handed a None provider")
-        self.assertIs(seen[0], stub,
-                      "the fallback must be the live author provider (pool[0])")
-
-    def test_audit_assesses_purpose_before_and_after(self):
-        _res, seen, _stub = self._run_fully_pooled({
-            "package.json": '{"name":"x","scripts":{"build":"tsc"}}',
-            "README.md": "# Widget\n\nTurns widgets into gadgets for the owner.\n",
-            "src/app.js": "console.log(1);\n"})
-        self.assertGreaterEqual(
-            len(seen), 2,
-            "audit_one_program must assess purpose before edits and again on the final tree")
-
-    def test_incomplete_purpose_assessment_revokes_convergence(self):
-        src = inspect.getsource(ff.audit_one_program)
-        self.assertIn(
-            "if (getattr(args, \"purpose_gap\", True) and purpose_blob",
-            src)
-        self.assertIn("converged = False", src)
-        self.assertIn("Purpose assessment evidence is incomplete", src)
-
-
 class ScoutBridge94to100Tests(unittest.TestCase):
     """Production exit criteria 98-100 (+ bridge 94-97 invariants)."""
 
@@ -12715,7 +11633,6 @@ class ScoutBridge94to100Tests(unittest.TestCase):
 
     def test_100_scout_cannot_mutate_without_flexfactor_apply_approval(self):
         sc = self.sc
-        import argparse
         proposal = {"commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
                     "repo": "o/r"}
 
@@ -14074,107 +12991,6 @@ class ArrayItemShapeTests(unittest.TestCase):
         self.assertEqual(ff._check_array_item_shape([1, 2], {}, ""), [1, 2])
 
 
-class PoolSizeRoutingTests(unittest.TestCase):
-    """Live GrantFlow run 2026-08-13: two '[skip] review failed via ollama
-    (timed out)' on big pages - CPU-only ollama cannot finish a large-file
-    review inside the timeout, and throughput self-balancing cannot save a
-    file that never completes. Files over _OLLAMA_MAX_REVIEW_BYTES must not
-    route to an ollama pool entry; an ollama-ONLY pool fails open."""
-
-    def test_big_file_skips_ollama(self):
-        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
-        idx = pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES + 1)
-        try:
-            self.assertEqual(pool.name(idx), "anthropic")
-        finally:
-            pool.release(idx)
-
-    def test_small_file_may_use_ollama(self):
-        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
-        # Exhaust anthropic; a small file must still be able to land on ollama.
-        a = pool.acquire(10)
-        b = pool.acquire(10)
-        try:
-            self.assertEqual({pool.name(a), pool.name(b)}, {"anthropic", "ollama"})
-        finally:
-            pool.release(a)
-            pool.release(b)
-
-    def test_ollama_only_pool_fails_open(self):
-        pool = ff._ReviewerPool([("ollama", object(), 1)])
-        idx = pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES * 10)
-        try:
-            self.assertEqual(pool.name(idx), "ollama")  # slow beats never
-        finally:
-            pool.release(idx)
-
-    def test_exclude_skips_a_backend_and_returns_minus_one_when_exhausted(self):
-        pool = ff._ReviewerPool([("anthropic", object(), 1), ("ollama", object(), 1)])
-        idx = pool.acquire(10, exclude={0})
-        try:
-            self.assertEqual(pool.name(idx), "ollama")
-        finally:
-            pool.release(idx)
-        self.assertEqual(pool.acquire(10, exclude={0, 1}), -1)
-
-    def test_exclude_is_honored_on_the_fail_open_path(self):
-        # A BIG file with an ollama-only pool takes the fail-open branch. If
-        # that branch ignored `exclude`, the retry loop would be handed the
-        # backend that just failed, forever.
-        pool = ff._ReviewerPool([("ollama", object(), 1)])
-        self.assertEqual(
-            pool.acquire(ff._OLLAMA_MAX_REVIEW_BYTES * 10, exclude={0}), -1)
-
-
-class PoolRetriesFailedFileOnAnotherBackendTests(unittest.TestCase):
-    """A backend failing ONE file must not blind-spot that file.
-
-    Live GrantFlow 2026-08-13, twice in one night: ollama timed out and the
-    file was logged '[skip] ... review failed via ollama (timed out)' then
-    'review INCOMPLETE (budget/error) - NOT clean' - while a HEALTHY anthropic
-    backend sat in the same pool able to review it in under a minute. Tuning
-    _OLLAMA_MAX_REVIEW_BYTES cannot fix this (30000 missed 23.5KB files, 15000
-    then missed 14,856-byte files); the sweep has to RETRY on another backend."""
-
-    def _run(self, entries):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "a.js"), "w", encoding="utf-8") as fh:
-                fh.write("console.log(1);\n")
-            pool = ff._ReviewerPool(entries)
-            return ff._review_all([], tmp, ["a.js"], reviewer_pool=pool)
-
-    def test_file_is_reviewed_by_the_healthy_backend_after_one_times_out(self):
-        calls = []
-
-        def fake_review_file(provider, rel, text, context="", project_dir=None):
-            calls.append(provider)
-            if provider == "slow":
-                raise RuntimeError("timed out")
-            return ([], "clean")
-
-        with _patched(ff, "review_file", fake_review_file):
-            _ff, _flat, _unread, reviewed_clean, incomplete = self._run(
-                [("ollama", "slow", 1), ("anthropic", "fast", 1)])
-        self.assertIn("a.js", reviewed_clean,
-                      "the healthy backend reviewed it, so it IS a completed "
-                      "clean review - not a blind spot")
-        self.assertNotIn("a.js", incomplete)
-        self.assertIn("fast", calls, "never retried on the healthy backend")
-
-    def test_still_incomplete_when_every_backend_fails_that_file(self):
-        # The safety property must survive the retry: if NOTHING could review
-        # it, it is still NOT clean.
-        def always_fail(provider, rel, text, context="", project_dir=None):
-            raise RuntimeError("timed out")
-
-        with _patched(ff, "review_file", always_fail):
-            _ff, _flat, _unread, reviewed_clean, incomplete = self._run(
-                [("ollama", "slow", 1), ("anthropic", "fast", 1)])
-        self.assertNotIn("a.js", reviewed_clean)
-        self.assertIn("a.js", incomplete)
-
-
 class TruncatedJsonSalvageTests(unittest.TestCase):
     """Live GrantFlow run 2026-08-10: on big files the FCC proxy's upstream cut
     long review completions mid-stream; the head was a VALID findings list but
@@ -14241,7 +13057,6 @@ class TruncatedJsonSalvageTests(unittest.TestCase):
         self.assertEqual(data["findings"][0]["title"], "good")
 
     def test_judge_opts_into_salvage(self):
-        import types
         seen = {}
 
         class _Prov:
@@ -14363,7 +13178,6 @@ class ProdreadyShipDefaultsTests(unittest.TestCase):
     green-final-build respectively); --no-push/--no-merge still win."""
 
     def _parse(self, mode, extra=()):
-        import types
         argv = [mode, "--program", "X", *extra]
         real_run_audit = ff.run_audit
         captured = {}
@@ -15368,8 +14182,14 @@ class BackpressureClassifierTests(unittest.TestCase):
 class PaidRescueGovernorTests(unittest.TestCase):
     """Bound the damage when classification is wrong anyway."""
 
+    @staticmethod
+    def _reset_ledger():
+        with ff._PAID_RESCUE_LOCK:
+            ff._PAID_RESCUE_TIMES.clear()
+            ff._PAID_RESCUE_COUNT = 0
+
     def setUp(self):
-        ff._reset_paid_rescue_ledger()
+        self._reset_ledger()
         self._cap = os.environ.get("FLEXFACTOR_PAID_RESCUE_PER_HOUR")
         self._proxy = ff._FCC_PROXY_ACTIVE
         self._health = ff._fcc_proxy_health
@@ -15377,7 +14197,7 @@ class PaidRescueGovernorTests(unittest.TestCase):
                       ("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY", "FLEXFACTOR_FALLBACK_OPENAI_KEY")}
 
     def tearDown(self):
-        ff._reset_paid_rescue_ledger()
+        self._reset_ledger()
         ff._FCC_PROXY_ACTIVE = self._proxy
         ff._fcc_proxy_health = self._health
         if self._cap is None:
@@ -21089,7 +19909,6 @@ class PartialOutputWiringTests(unittest.TestCase):
 
         def structured(self, system, prompt, schema, max_tokens=8000, model=None,
                        salvage_truncated=False):
-            import flexfactor_partial as fp
             data = ff._check_structured_type(self._salvaged, schema, "{}")
             return ff._mark_partial(data, '{"findings": [', "anthropic")
 
@@ -21384,9 +20203,6 @@ class OrphanWipWiringTests(unittest.TestCase):
     byte-for-byte, and publication is refused while separation is unproven."""
 
     def setUp(self):
-        # Module state another test may have left behind (the free review pool
-        # is a process-wide global populated by rotation tests).
-        ff._LAST_FREE_REVIEW_POOL = []
         ff._WIP_ACTIVE.clear()
 
     def _repo(self):

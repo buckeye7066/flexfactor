@@ -120,7 +120,10 @@ class SequentialOrchestrator:
     is atomically persisted as an owner-readable execution receipt.
     """
 
-    SCHEMA = 1
+    # Schema 2 makes exact final-tree reconciliation part of the durable
+    # contract.  Schema-1 success receipts cannot be resumed as though they had
+    # satisfied an invariant that did not exist when they were written.
+    SCHEMA = 2
 
     def __init__(self, mode: str, targets: Iterable[object], *,
                  state_path: str | None = None, queue_id: str | None = None):
@@ -215,9 +218,11 @@ class SequentialOrchestrator:
         }
         if item.get("competitor_gate") is not None:
             prior["competitor_gate"] = item.get("competitor_gate")
+        if item.get("finalization") is not None:
+            prior["finalization"] = item.get("finalization")
         item.setdefault("attempts", []).append(prior)
         for field in ("started_at", "finished_at", "exit_code", "note",
-                      "competitor_gate"):
+                      "competitor_gate", "finalization"):
             item.pop(field, None)
         item["passes"] = []
         item["status"] = "queued"
@@ -267,6 +272,15 @@ class SequentialOrchestrator:
             item["started_at"] = time.time()
             self._state["active_index"] = index
             self._state["status"] = "running"
+            self._save()
+
+    def note_active_target(self, note: object) -> None:
+        """Attach a bounded worker outcome to the durable target receipt."""
+        with self._lock:
+            index = self._state["active_index"]
+            if index is None:
+                raise OrchestrationOrderError("no target is active")
+            self._state["items"][index]["worker_note"] = str(note or "")[:1000]
             self._save()
 
     def begin_pass(self, number: int, scope: Iterable[object], *,
@@ -393,6 +407,108 @@ class SequentialOrchestrator:
             self._save()
             return changed
 
+    def reconcile_first_pass_scope(self, scope: Iterable[object]) -> list[str]:
+        """Replace pass one's manifest after governed pre-sweep mutations.
+
+        Audit and production-readiness may repair a red baseline or bridge an
+        authored purpose gap before the generic semantic sweep.  Those writes
+        still belong to pass one.  The repository manifest can therefore grow
+        between ``begin_pass`` and the sweep, but only while the exhaustive
+        first pass is active.  Recording the replacement here keeps the durable
+        receipt authoritative instead of letting pre-sweep work happen outside
+        it.
+        """
+        with self._lock:
+            index = self._state["active_index"]
+            if index is None:
+                raise OrchestrationOrderError("no target is active")
+            item = self._state["items"][index]
+            if len(item["passes"]) != 1:
+                raise OrchestrationOrderError(
+                    "only the active first pass may reconcile its scope"
+                )
+            record = item["passes"][0]
+            if (record.get("number") != 1 or record.get("status") != "running"
+                    or record.get("exhaustive") is not True
+                    or record.get("scope") != "whole-repository"):
+                raise OrchestrationOrderError(
+                    "only a running exhaustive whole-repository pass may "
+                    "reconcile its scope"
+                )
+            previous = list(record.get("files") or [])
+            paths = changed_file_scope(scope)
+            record["files"] = paths
+            record["scope_reconciled_at"] = time.time()
+            previous_set = set(previous)
+            paths_set = set(paths)
+            record.setdefault("scope_revisions", []).append({
+                "previous_files": previous,
+                "files": paths,
+                "added_files": [path for path in paths if path not in previous_set],
+                "removed_files": [path for path in previous if path not in paths_set],
+                "recorded_at": time.time(),
+            })
+            self._save()
+            return paths
+
+    def record_finalization(self, *, changed_files: Iterable[object],
+                            final_commit: object = None,
+                            quality_gates_passed: bool,
+                            publication_required: bool,
+                            publication_complete: bool,
+                            note: str = "") -> None:
+        """Reconcile the pass ledger with the exact final repository state.
+
+        Some deterministic completion work (currently readiness remediation)
+        can make a verified edit after the semantic pass loop.  It may not be
+        invisible to the durable receipt.  This record separates those files
+        from pass-owned edits and binds them to the final evidence and
+        publication gates that reviewed the resulting tree.
+        """
+        with self._lock:
+            index = self._state["active_index"]
+            if index is None:
+                raise OrchestrationOrderError("no target is active")
+            item = self._state["items"][index]
+            passes = list(item.get("passes") or [])
+            if not passes:
+                raise OrchestrationOrderError(
+                    "finalization requires a recorded repository pass"
+                )
+            if "finalization" in item:
+                raise OrchestrationOrderError("target finalization already recorded")
+            final_files = changed_file_scope(changed_files)
+            pass_files = changed_file_scope(
+                path
+                for row in passes
+                for path in (row.get("changed_files") or [])
+            )
+            gate_files = changed_file_scope(
+                (item.get("competitor_gate") or {}).get("implemented_files") or []
+            )
+            governed = set(pass_files + gate_files)
+            post_pass = [path for path in final_files if path not in governed]
+            gates_ok = bool(quality_gates_passed)
+            publication_ok = bool(publication_complete)
+            passes_complete = all(
+                row.get("status") == "completed" for row in passes)
+            item["finalization"] = {
+                "changed_files": final_files,
+                "pass_changed_files": pass_files,
+                "competitor_changed_files": gate_files,
+                "post_pass_changed_files": post_pass,
+                "final_commit": str(final_commit or ""),
+                "quality_gates_passed": gates_ok,
+                "passes_complete": passes_complete,
+                "publication_required": bool(publication_required),
+                "publication_complete": publication_ok,
+                "status": ("completed" if passes_complete and gates_ok
+                           and publication_ok else "failed"),
+                "note": str(note or "")[:1000],
+                "finished_at": time.time(),
+            }
+            self._save()
+
     def record_competitor_gate(self, *, attempted: bool, implemented_files: Iterable[object],
                                verified: int = 0, note: str = "",
                                not_applicable: bool = False) -> None:
@@ -435,6 +551,7 @@ class SequentialOrchestrator:
             if self._state["active_index"] != index:
                 raise OrchestrationOrderError("only the active target can finish")
             item = self._state["items"][index]
+            note = str(note or item.pop("worker_note", ""))
             code = int(exit_code)
             if item["passes"] and item["passes"][-1]["status"] == "running":
                 item["passes"][-1]["status"] = "interrupted"
@@ -489,6 +606,14 @@ class SequentialOrchestrator:
                     if pending:
                         failures.append(
                             "verified edits were not followed by the required exact-delta pass"
+                        )
+                if self.mode in {"audit", "prodready"}:
+                    finalization = item.get("finalization")
+                    if not isinstance(finalization, dict):
+                        failures.append("exact final-tree reconciliation was not recorded")
+                    elif finalization.get("status") != "completed":
+                        failures.append(
+                            "final quality or publication reconciliation did not complete"
                         )
                 if failures:
                     code = 1

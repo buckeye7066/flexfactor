@@ -7,7 +7,6 @@ reintroduce local-only mutation or provider-choice endpoints.
 
 import json
 import os
-import tempfile
 import threading
 import time
 import unittest
@@ -19,71 +18,16 @@ import flexfactor_web as web
 
 
 class RetiredPhoneLauncherTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = self.tmp.name
-        self.project = os.path.join(self.root, "target-app")
-        os.makedirs(os.path.join(self.project, ".git"))
-        self.env = {
-            "TERMUX_VERSION": "0.118.3",
-            "PREFIX": "/data/data/com.termux/files/usr",
-            "FLEXFACTOR_PROJECT_ROOTS": self.root,
-            "OPENAI_API_KEY": "test-secret-that-must-not-leak",
-        }
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_repository_discovery_still_contains_paths_for_viewer_metadata(self):
-        os.makedirs(os.path.join(self.root, "ordinary-folder"))
-        programs = web._available_phone_programs(self.env)
-        self.assertEqual(1, len(programs))
-        self.assertEqual("target-app", programs[0]["name"])
-        self.assertTrue(os.path.samefile(self.project, programs[0]["path"]))
-
-    def test_symlink_cannot_escape_a_configured_project_root(self):
-        project_root = os.path.join(self.root, "projects")
-        outside = os.path.join(self.root, "outside-repo")
-        os.makedirs(project_root)
-        os.makedirs(os.path.join(outside, ".git"))
-        link = os.path.join(project_root, "linked-outside")
-        try:
-            os.symlink(outside, link, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.assertFalse(web._path_within_root(
-                os.path.realpath(project_root), os.path.realpath(outside)))
-            return
-        env = dict(self.env, FLEXFACTOR_PROJECT_ROOTS=project_root)
-        self.assertEqual([], web._available_phone_programs(env))
-
-    def test_local_phone_launch_and_provider_mutation_are_retired(self):
-        spawned = []
-        cases = (
-            lambda: web.start_phone_run(
-                {"program": self.project, "mode": "audit", "provider": "openai"},
-                env=self.env, popen=lambda *a, **k: spawned.append(a)),
-            lambda: web.save_phone_provider(
-                {"provider": "openai", "api_key": "secret-value-long-enough"},
-                env=self.env,
-                provider_path=os.path.join(self.root, "providers.json")),
-            lambda: web.start_phone_provider_install(
-                {"provider": "openai"}, env=self.env,
-                popen=lambda *a, **k: spawned.append(a)),
-        )
-        for operation in cases:
-            with self.subTest(operation=operation), \
-                    self.assertRaisesRegex(ValueError, "retired"):
-                operation()
-        self.assertEqual(spawned, [])
-        self.assertFalse(os.path.exists(os.path.join(self.root, "providers.json")))
-
-    def test_phone_launch_state_is_permanently_unavailable(self):
-        state = web.phone_launch_state(self.env)
-        self.assertFalse(state["available"])
-        self.assertEqual(state["programs"], [])
-        self.assertEqual(state["providers"], [])
-        self.assertIn("signed FlexFactor Mobile", state["policy"])
-        self.assertIn("authoritative default branch", state["policy"])
+    def test_retired_local_launcher_implementation_is_not_shipped(self):
+        for name in (
+            "start_phone_run",
+            "save_phone_provider",
+            "start_phone_provider_install",
+            "_available_phone_programs",
+            "_provider_readiness",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(web, name))
 
     def test_retired_http_endpoints_require_auth_then_return_gone(self):
         web.Handler.token = "retired-phone-token"
@@ -150,29 +94,7 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
             web.dash.read_status = original
         row = next(item for item in state["programs"] if item["name"] == "stuck")
         self.assertEqual("quiet", row["liveness"])
-        self.assertFalse(state["launch"]["available"])
-
-    def test_reaper_clears_only_the_exited_child_pid(self):
-        with tempfile.TemporaryDirectory() as root:
-            pid_path = os.path.join(root, "audit.pid")
-            with open(pid_path, "w", encoding="utf-8") as stream:
-                stream.write("31337\n")
-            waited = threading.Event()
-
-            class Process:
-                pid = 31337
-
-                @staticmethod
-                def wait():
-                    waited.set()
-                    return 0
-
-            web._start_audit_reaper(Process(), pid_path)
-            self.assertTrue(waited.wait(2))
-            deadline = time.time() + 2
-            while os.path.exists(pid_path) and time.time() < deadline:
-                time.sleep(0.01)
-            self.assertFalse(os.path.exists(pid_path))
+        self.assertNotIn("launch", state)
 
     def test_android_launcher_is_native_managed_and_has_all_four_modes(self):
         path = os.path.join(

@@ -306,7 +306,6 @@ def commit_pending_changes(project_dir, *, run, verify=None):
         run, ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         project_dir)
     generated_tracked = [p for p in tracked_dirty if _generated_path(p)]
-    generated_untracked = [p for p in untracked if _generated_path(p)]
     if generated_tracked:
         ok, detail = _run_path_chunks(
             run, ["git", "checkout", "--"], generated_tracked, project_dir)

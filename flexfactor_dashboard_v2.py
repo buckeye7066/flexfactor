@@ -228,9 +228,6 @@ def main() -> None:
             L = x0 + 18          # left text margin
             inner_w = col_w - 36
             name = str(p.get("name") or f"program {i+1}")
-            phase = str(p.get("phase") or "")
-            done_flag = bool(p.get("done"))
-
             fix_done = int(p.get("fix_done") or 0)
             fix_total = int(p.get("fix_total") or 0)
             batch_n = int(p.get("files_total") or 0)
@@ -463,4 +460,3 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
     main()
-

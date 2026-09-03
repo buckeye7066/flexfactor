@@ -88,10 +88,6 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def _sha256_bytes(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
 def _sha256_file(path: Path) -> str | None:
     try:
         digest = hashlib.sha256()

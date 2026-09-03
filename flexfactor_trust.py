@@ -101,7 +101,7 @@ def trust_decision(project_dir: str, *,
             allowed=False,
             reason=("no trusted_repos configured — refusing unattended "
                     "install/build/test on an unknown tree. Add the path to "
-                    f"~/.flexfactor/policy.json trusted_repos, set "
+                    "~/.flexfactor/policy.json trusted_repos, set "
                     "FLEXFACTOR_TRUSTED_REPOS, or pass --trust-repo "
                     "(run-level; recorded in the manifest; not a sandbox)."),
             normalized_root=root,

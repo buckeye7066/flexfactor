@@ -145,7 +145,7 @@ class LedgerRoutingTests(unittest.TestCase):
     def test_the_report_line_names_this_programs_ledger(self):
         a = self._open("alpha3")
         ff._ledger("review", "AAA failure")
-        b = self._open("beta3")            # a later program opens its own
+        self._open("beta3")                # a later program opens its own
         ff._ERROR_LEDGER_VAR.set(a)        # ...this thread is still alpha3
         line = ff._error_ledger_report_line()
         self.assertIn("1 (see the Errors section below", line)

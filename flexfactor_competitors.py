@@ -1699,9 +1699,9 @@ def report_lines(research: dict) -> list[str]:
     for c in research["competitors"]:
         idea = c.get("idea") or {}
         L += [f"### {c['name']}", "",
-              f"- **Evidence:** " + (", ".join(f"<{u}>" for u in (c.get("evidence_urls") or []))
+              "- **Evidence:** " + (", ".join(f"<{u}>" for u in (c.get("evidence_urls") or []))
                                      or "**none - unverified, not acted on**"),
-              f"- **Fetched source documents:** "
+              "- **Fetched source documents:** "
               + (", ".join(
                     f"`{row.get('evidence_id')}` ({str(row.get('sha256') or '')[:12]})"
                     for row in (c.get("evidence_documents") or []))
@@ -1710,7 +1710,7 @@ def report_lines(research: dict) -> list[str]:
               f"- **Reuse mode:** `{c.get('reuse_mode')}` - {c.get('reuse_reason')}",
               f"- **Idea:** {idea.get('idea_title', '(none)')} - {idea.get('what_it_does', '')}",
               f"- **Value here:** {idea.get('why_valuable', '')}",
-              f"- **Purpose / criterion mapping:** "
+              "- **Purpose / criterion mapping:** "
               + (f"acceptance #{idea.get('acceptance_ref')}"
                  if str(idea.get('acceptance_ref') or '').strip() else "purpose-only")
               + f" - {idea.get('purpose_reason', '')}",
@@ -1723,7 +1723,7 @@ def report_lines(research: dict) -> list[str]:
               f"- **Wiring plan:** {idea.get('wiring_plan', '')}",
               f"- **Verification plan:** {idea.get('verification_plan', '')}",
               f"- **Implementation status:** {c.get('implementation_status', 'not applied')}",
-              f"- **Fix-stream decision:** "
+              "- **Fix-stream decision:** "
               + ((f"{'ENTERED the gated fix stream' if c.get('entered_fix_stream') else 'DID NOT enter the fix stream'}"
                   + (f" - {c.get('bridge_reason')}" if c.get('bridge_reason') else ""))
                  if ("bridge_status" in c or "entered_fix_stream" in c)

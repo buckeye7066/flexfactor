@@ -721,20 +721,6 @@ def _now_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def _file_sha(full_path: str) -> str | None:
-    """SHA-256 of a file's bytes, or None if it can't be read. Clean-file memory is
-    keyed to this so a file that CHANGED since it was marked clean is never skipped
-    just because its PATH was once clean."""
-    try:
-        h = hashlib.sha256()
-        with open(full_path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-
-
 @contextlib.contextmanager
 def _brain_file_lock(timeout: float = 10.0):
     """Best-effort cross-PROCESS advisory lock (exclusive lock file) so two
@@ -1865,14 +1851,6 @@ def paid_rescue_stats() -> dict:
                 "paid_rescue_hourly_cap": _paid_rescue_hourly_cap()}
 
 
-def _reset_paid_rescue_ledger() -> None:
-    """Test/`run` hook: clear the rolling window."""
-    global _PAID_RESCUE_COUNT
-    with _PAID_RESCUE_LOCK:
-        _PAID_RESCUE_TIMES.clear()
-        _PAID_RESCUE_COUNT = 0
-
-
 def _fallback_hold_active() -> bool:
     if not _fallback_available():
         return False
@@ -2116,7 +2094,6 @@ class AnthropicProvider:
         prompt = _egress_gate(prompt)
         sys_blocks = _cached_system(GRADE_SYSTEM)
         fmt = {"format": {"type": "json_schema", "schema": GRADE_SCHEMA}}
-        last_text: str | None = None
         try:
             with _budget_guard(self.meter, self.judge_model, len(prompt), 4000):
                 message = self._stream_structured(
@@ -2124,7 +2101,6 @@ class AnthropicProvider:
                     messages=[{"role": "user", "content": prompt}], fmt=fmt)
                 self._meter(message, self.judge_model)
                 text = next((b.text for b in message.content if b.type == "text"), None)
-                last_text = text
         except PaidRescueNeeded as pr:
             if not getattr(self, "_allow_cross_family_rescue", True):
                 raise CrossFamilyRescueRequired(pr.original) from pr.original
@@ -2211,7 +2187,7 @@ class AnthropicProvider:
             data = _mark_partial(data, text, "anthropic")
         return data
 
-    def _stream_structured(self, *, model, max_tokens, system, messages, fmt) -> "Message":
+    def _stream_structured(self, *, model, max_tokens, system, messages, fmt):
         """Streaming structured call WITH json_schema + tolerant-JSON retry.
 
         The Free Claude Code proxy on 127.0.0.1:8082 exposes only the Anthropic
@@ -4639,101 +4615,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
                                role_coordinator=role_coordinator)
 
 
-# Preflight health cache: {provider_name: (ok: bool, reason: str)}. Populated by
-# _provider_health() so a batch / --parallel run pings each provider at most once.
-# Lock-guarded AND single-flight: the first caller pings while the rest wait on an
-# in-progress Event, so concurrent audits issue EXACTLY ONE ping per provider.
-_PROVIDER_HEALTH: dict[str, tuple[bool, str]] = {}
-_PROVIDER_HEALTH_LOCK = threading.Lock()
-_PROVIDER_HEALTH_INFLIGHT: dict[str, threading.Event] = {}
-
-
-def _compute_provider_health(name: str, meter: "CostMeter | None" = None) -> tuple[bool, str]:
-    """Do the actual liveness check (never raises). The ping goes THROUGH the provider
-    adapter (make_provider(...).ping()), so every SDK call is funneled through the six
-    adapter methods + the _budget_guard reservation chokepoint + the meter."""
-    if not _provider_key_present(name):
-        return (False, "no API key set")
-    if name not in ("anthropic", "openai", "ollama", "copilot"):
-        return (False, f"unknown provider {name}")
-    if name == "ollama":
-        # Local server: a failed ping means Ollama isn't RUNNING - that is a
-        # hard "not usable" (fail closed), never a transient network blip.
-        try:
-            make_provider(name, DEFAULT_MODELS[name], meter).ping()
-            return (True, "ok")
-        except Exception as e:  # noqa: BLE001
-            return (False, f"local Ollama server unreachable ({type(e).__name__}); "
-                           "start Ollama and re-run")
-    try:
-        make_provider(name, DEFAULT_MODELS[name], meter).ping()
-        return (True, "ok")
-    except Exception as e:  # noqa: BLE001 - we deliberately classify by message
-        msg = str(e).lower()
-        dead = ("credit balance is too low" in msg or "insufficient_quota" in msg
-                or "exceeded your current quota" in msg
-                or "authentication" in msg or "invalid_api_key" in msg
-                or "invalid x-api-key" in msg or "permission" in msg
-                or "billing" in msg or "account is not active" in msg)
-        if dead:
-            reason = str(e).strip().splitlines()[0][:160] if str(e).strip() else "key rejected"
-            return (False, reason)
-        # Transient/unknown: fail open so a network blip can't disable a good key.
-        return (True, f"health check inconclusive ({type(e).__name__}); assuming usable")
-
-
-def _provider_health(name: str, meter: "CostMeter | None" = None) -> tuple[bool, str]:
-    """Is this provider's key actually USABLE right now? (not just present)
-
-    A key can be set but dead - out of credits, revoked, or org-disabled - in which
-    case picking it as the code AUTHOR crashes the audit on the first fix call. We
-    send ONE tiny 1-token judge-tier ping (via the adapter, so it's budgeted) and
-    classify: success -> (True); auth/credit/permission -> (False, reason) so
-    build_audit_providers falls back; transient -> FAIL OPEN (True).
-
-    SINGLE-FLIGHT: the result is cached, and while the first caller is pinging, any
-    concurrent caller waits on an in-flight Event instead of issuing its own ping."""
-    while True:
-        with _PROVIDER_HEALTH_LOCK:
-            if name in _PROVIDER_HEALTH:
-                return _PROVIDER_HEALTH[name]
-            ev = _PROVIDER_HEALTH_INFLIGHT.get(name)
-            if ev is None:
-                ev = threading.Event()
-                _PROVIDER_HEALTH_INFLIGHT[name] = ev
-                is_leader = True
-            else:
-                is_leader = False
-        if not is_leader:
-            ev.wait()          # a leader is already pinging; wait for its result
-            continue           # then loop back and read the now-populated cache
-        # Leader: run the single ping, publish the result, and wake the waiters.
-        # `res` is pre-bound so a result is ALWAYS cached (waiters never hang) even if
-        # the compute somehow raises (it is written not to).
-        res = (True, "health check errored; assuming usable")
-        try:
-            res = _compute_provider_health(name, meter)
-        finally:
-            with _PROVIDER_HEALTH_LOCK:
-                _PROVIDER_HEALTH[name] = res
-                _PROVIDER_HEALTH_INFLIGHT.pop(name, None)
-            ev.set()
-        return res
-
-
 # Set by build_audit_providers when it returns [] so the caller can explain WHY
 # (e.g. keys are present but every one is out of credits / rejected).
 _PROVIDER_DIAGNOSIS: str = ""
-
-# Set by build_audit_providers when the free-first POOL applies (2026-08-12
-# owner correction): [(name, provider, concurrency), ...] for every genuinely
-# free backend usable AT ONCE, so _review_all can keep them ALL busy on one
-# shared file queue instead of picking a single winner and idling the rest.
-# Empty when the pool doesn't apply (explicit --provider, only one free
-# backend usable, or neither usable). audit_one_program reads this
-# immediately after calling build_audit_providers, same pattern as
-# _PROVIDER_DIAGNOSIS.
-_LAST_FREE_REVIEW_POOL: list[tuple[str, object, int]] = []
 
 # Serializes build_audit_providers with the caller's read of the two globals
 # above. Both are a return channel, and audit_one_program runs in a thread pool
@@ -4741,16 +4625,6 @@ _LAST_FREE_REVIEW_POOL: list[tuple[str, object, int]] = []
 # another's build and its read - losing that program's free review pool, or
 # handing it another program's provider instances.
 _PROVIDER_BUILD_LOCK = threading.Lock()
-
-# Per-backend concurrency ceilings for the free-review pool, matching each
-# backend's OWN real capacity limit that already governs it elsewhere in this
-# file (not a new number invented for the pool):
-#   - FCC proxy: PROVIDER_MAX_CONCURRENCY=2 (see the stall-classifier comment
-#     block above _stream_deadline_seconds - a 3rd concurrent call queues).
-#   - Ollama: _ollama_gate()'s own default of 2 in-flight HTTP calls.
-_FCC_POOL_CONCURRENCY = 2
-_OLLAMA_POOL_CONCURRENCY = 2
-
 
 def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[str, object]]:
     """Build audit/prodready providers from the sole production model ladder.
@@ -4761,9 +4635,8 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     catalog has independent capacity) verifier are governed by the same
     strongest-paid-to-free availability policy.
     """
-    global _PROVIDER_DIAGNOSIS, _LAST_FREE_REVIEW_POOL
+    global _PROVIDER_DIAGNOSIS
     _PROVIDER_DIAGNOSIS = ""
-    _LAST_FREE_REVIEW_POOL = []
     _auto_activate_fcc_proxy()
     mode = normalize_model_mode(getattr(args, "model_mode", "best"))
     primary = _build_rotating_provider(args, meter, mode)
@@ -8606,6 +8479,13 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         elif not verify_cmds:
             verify_note = ("NOT VERIFIED - no build/test/lint/typecheck command detected, "
                            "so no command ran and nothing executed the project's code")
+        if verify_note:
+            verify_receipts.append({
+                "command": None,
+                "exit_code": None,
+                "status": "not-run",
+                "note": verify_note,
+            })
         if opts.verify and verify_cmds:
             verify_env = (_no_network_env()
                           if getattr(opts, "isolate_verify", True) else None)
@@ -10989,14 +10869,6 @@ _TEST_FILE_MARKERS = (".test.", ".spec.")
 _TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__"})
 
 
-def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return fh.read(cap)
-    except (OSError, UnicodeDecodeError):
-        return ""
-
-
 # TOCTOU-free containment. On POSIX we anchor from a ROOT directory fd and walk EACH
 # path component with openat + O_NOFOLLOW (O_DIRECTORY on intermediates), so neither the
 # leaf NOR any ANCESTOR may be a symlink and nothing is ever re-resolved by pathname
@@ -12598,8 +12470,8 @@ def review_files_batch(provider, items: list[tuple[str, str]],
     data = _judge(provider, AUDIT_SYSTEM, prompt, AUDIT_BATCH_SCHEMA,
                   max_tokens=REVIEW_MAX_TOKENS)
     # `_judge` enables salvage_truncated, so `data` may be a SALVAGED prefix.
-    # `review_file` raises PartialOutputError for exactly this case; this path -
-    # the default one for rotation runs, which set no reviewer_pool - did not.
+    # `review_file` raises PartialOutputError for exactly this case; the batch
+    # path must enforce the same rule independently.
     # A stream cut after a file's "findings":[] closes but before the response
     # ends yields every expected row, so the `missing` guard below cannot fire,
     # and that file was returned CLEAN off a truncated review.
@@ -16216,15 +16088,6 @@ def _assess_readiness_phase(project_dir: str, stack: dict, name: str,
             "blockers": [g.to_dict() for g in blockers]}
 
 
-def _guess_dev_url(stack: dict) -> str:
-    fw = stack.get("framework")
-    if fw == "next":
-        return "http://localhost:3000"
-    if fw == "react-scripts":
-        return "http://localhost:3000"
-    return "http://localhost:5173"  # vite/react default
-
-
 def _dev_server_command(stack: dict, port: int) -> tuple[list[str] | None, dict]:
     """Build the project's own dev-server command and an explicit test env."""
     script = stack.get("dev_script")
@@ -16866,23 +16729,6 @@ FIX_PREFETCH_WORKERS = 3  # first-attempt fix generations kept in flight ahead o
 REVIEW_FIX_BATCH_SIZE = max(1, int(os.environ.get(
     "FLEXFACTOR_REVIEW_FIX_BATCH_SIZE", "8")))
 
-# Files above this size never route to a CPU-only ollama pool entry for review
-# (measured on this machine: 20+ min then timeout, while FCC answers in <1 min).
-# Env-tunable; the pool fails open when ollama is the ONLY backend.
-# PERFORMANCE HEURISTIC, NOT A CORRECTNESS GATE. Every attempt to tune this by
-# guessing has been wrong within one run: 30000 let Reports.jsx (23.5KB) and
-# Settings.jsx (24.3KB) time out; 15000 - chosen as "well under the smallest
-# observed failure" - promptly let AdminKnowledgeBase.jsx (14,856 B) and
-# AdminSystemHealth.jsx (14,937 B) time out too, because the smallest OBSERVED
-# failure is only the smallest file that happened to be sampled, not the real
-# ceiling. So stop treating this number as the thing that keeps files from being
-# skipped: _review_all now RETRIES a failed file on another pool backend, and
-# this value only decides how often that retry is needed. 12000 reflects the
-# 14,856-byte failure with margin; being wrong again now costs one retry, not a
-# blind spot.
-_OLLAMA_MAX_REVIEW_BYTES = int(os.environ.get(
-    "FLEXFACTOR_OLLAMA_MAX_REVIEW_BYTES", "12000"))
-
 # Wall-clock ceiling for ALL fix attempts on ONE file. Individual model calls
 # are already deadline-bounded, but those budgets compound across stream
 # retries x fix tries x adversarial rounds - measured 59 minutes on a single
@@ -16893,83 +16739,11 @@ FIX_FILE_MAX_SECONDS = int(os.environ.get(
     "FLEXFACTOR_FIX_FILE_MAX_SECONDS", "900"))
 
 
-class _ReviewerPool:
-    """Concurrent orchestration across MULTIPLE free review backends that are
-    all genuinely usable at once (2026-08-12 owner correction: "make sure
-    these different models are not working independently, but are
-    orchestrated within FlexFactor so their work is optimized" - the FCC
-    proxy and local Ollama must not sit one idle while the other works).
-
-    Each entry carries its OWN concurrency ceiling (a semaphore, sized to
-    that backend's real capacity - see _FCC_POOL_CONCURRENCY/
-    _OLLAMA_POOL_CONCURRENCY). `acquire()` tries every backend's semaphore in
-    order and returns whichever has a free slot FIRST; a backend that
-    finishes a review quickly frees its slot sooner and gets checked (and
-    re-claimed) again immediately, so a fast backend naturally pulls more of
-    the shared file queue with no hardcoded ratio - self-balancing by real
-    throughput, exactly as asked."""
-
-    def __init__(self, entries: list[tuple[str, object, int]]):
-        self.entries = list(entries)  # [(name, provider, concurrency), ...]
-        self._sems = [threading.Semaphore(max(1, c)) for _, _, c in self.entries]
-
-    def total_concurrency(self) -> int:
-        return sum(max(1, c) for _, _, c in self.entries) if self.entries else 0
-
-    def acquire(self, size_bytes: int = 0,
-                exclude: "set[int] | None" = None) -> int:
-        """Block until SOME backend eligible for this file has a free slot;
-        return its index, or -1 when `exclude` rules out every backend.
-
-        SIZE-AWARE (live GrantFlow failures 2026-08-13): local Ollama on this
-        machine is CPU-only - a large-file review measured 20+ minutes and the
-        run logged '[skip] review failed via ollama (timed out)' on big pages
-        while the FCC backend answers the same file in under a minute. So
-        files over _OLLAMA_MAX_REVIEW_BYTES never go to an ollama entry.
-
-        That size gate is a PERFORMANCE heuristic ONLY - it is explicitly NOT
-        what makes the sweep correct, because every attempt to tune it has been
-        wrong: 30000 let 23.5KB/24.3KB files time out, and lowering it to 15000
-        promptly let 14,856-byte and 14,937-byte files time out too. Correctness
-        comes from the caller RETRYING a failed file on a different backend
-        (see _review_all), which is why `exclude` exists.
-
-        Fail-open: if every pool entry is ollama (owner pointed at ollama
-        explicitly), the gate stands down rather than deadlocking - slow
-        beats never. `exclude` is honored on BOTH paths; letting the fail-open
-        branch hand back an already-failed backend would spin the retry loop
-        forever."""
-        exclude = exclude or set()
-        eligible = [i for i, (name, _, _) in enumerate(self.entries)
-                    if (size_bytes <= _OLLAMA_MAX_REVIEW_BYTES
-                        or "ollama" not in name.lower())
-                    and i not in exclude]
-        if not eligible:
-            eligible = [i for i in range(len(self.entries)) if i not in exclude]
-        if not eligible:
-            return -1  # caller has burned through every backend for this file
-        while True:
-            for i in eligible:
-                if self._sems[i].acquire(blocking=False):
-                    return i
-            time.sleep(0.05)  # brief poll; every eligible slot is in flight
-
-    def release(self, idx: int) -> None:
-        self._sems[idx].release()
-
-    def provider(self, idx: int):
-        return self.entries[idx][1]
-
-    def name(self, idx: int) -> str:
-        return self.entries[idx][0]
-
-
 def _review_all(reviewers: list, project_dir: str,
                 files: list[str], report=None, meter=None,
                 workers: int = REVIEW_WORKERS,
                 context: str = "",
                 checkpoint_cb=None,
-                reviewer_pool: "_ReviewerPool | None" = None,
                 batch_semantic: bool = False,
                 single_provider_workers: int = 1
                 ) -> tuple[dict, list, set, dict, set]:
@@ -16999,16 +16773,7 @@ def _review_all(reviewers: list, project_dir: str,
         resumes from the last flush instead of re-reviewing the whole
         repository.
 
-    CONCURRENT FREE POOL (2026-08-12): `reviewer_pool`, when given, covers the
-    PRIMARY review duty for every file - one pool member reviews each file
-    (whichever backend's semaphore frees up first, see _ReviewerPool), so
-    multiple free backends work the shared file queue TOGETHER instead of one
-    idling while `reviewers` alone drives every file serially through a
-    single backend. `reviewers` still runs on top of the pool result for
-    every file when given alongside a pool (e.g. an explicit --use-both
-    cross-check reviewer) - unchanged cross-check semantics, just no longer
-    the only way to get review throughput. `reviewers` stays the ONLY review
-    mechanism when `reviewer_pool` is None (legacy path, unchanged)."""
+    Every configured reviewer must complete before a file can be clean."""
     supplied_count = len(files)
     files = _unique_review_paths(files)
     if len(files) != supplied_count:
@@ -17026,11 +16791,7 @@ def _review_all(reviewers: list, project_dir: str,
     stop = threading.Event()
 
     def _capped() -> bool:
-        pool_providers = ([provider for _name, provider, _n
-                           in reviewer_pool.entries]
-                          if reviewer_pool is not None else [])
-        return not _model_work_available(
-            meter, list(reviewers) + pool_providers)
+        return not _model_work_available(meter, list(reviewers))
 
     def _review_one(rel: str):
         # Re-check the budget at task start so queued work stops cleanly at the cap.
@@ -17046,57 +16807,10 @@ def _review_all(reviewers: list, project_dir: str,
         # files belongs at ENUMERATION, not as a pre-review 'clean'.)
         merged: list[dict] = []
         complete = True  # only a review where EVERY reviewer COMPLETED can be clean
-        # PRIMARY duty: one pool backend (whichever frees up first) reviews this
-        # file - see _ReviewerPool. Skipped entirely when no pool was given
-        # (legacy single/multi-reviewer path below is unchanged).
-        # A backend that FAILS this file (ollama timing out on a big page is the
-        # measured case) used to end the file's primary review right there:
-        # complete=False, "review INCOMPLETE - NOT clean", and a real blind spot
-        # for the whole cycle even though a HEALTHY sibling backend was sitting
-        # in the same pool able to review it in under a minute. Retry the file on
-        # the backends that have not failed it yet; only give up when every one
-        # of them has. This is what makes the size gate above a performance knob
-        # instead of a correctness gate.
-        if reviewer_pool is not None and reviewer_pool.entries:
-            failed_idx: set[int] = set()
-            while True:
-                idx = reviewer_pool.acquire(len(text), exclude=failed_idx)
-                if idx < 0:                    # no backend left to try
-                    complete = False
-                    break
-                try:
-                    findings, _summary = review_file(reviewer_pool.provider(idx), rel, text,
-                                                     context=context,
-                                                     project_dir=project_dir)
-                    merged.extend(findings)
-                    _report_route_quality(reviewer_pool.provider(idx),
-                                          "reviewer", "verified")
-                    break                      # reviewed successfully
-                except BudgetExceededError:
-                    stop.set()
-                    complete = False
-                    break
-                except Exception as ex:  # one bad LLM call must not abort the sweep
-                    failed_idx.add(idx)
-                    _report_route_quality(reviewer_pool.provider(idx),
-                                          "reviewer", "rejected")
-                    nm = reviewer_pool.name(idx)
-                    if len(failed_idx) < len(reviewer_pool.entries):
-                        print(f"  [retry] {rel}: review failed via {nm} ({ex}) "
-                              "- retrying on another backend")
-                        _ledger("review-retry", ex, program_file=rel, route=str(nm))
-                    else:
-                        print(f"  [skip] {rel}: review failed via {nm} ({ex}); "
-                              "every pool backend failed this file")
-                        _ledger("review", ex, program_file=rel, route=str(nm))
-                        complete = False
-                        break
-                finally:
-                    reviewer_pool.release(idx)
-        # CROSS-CHECK duty (unchanged semantics): every entry in `reviewers`
-        # reviews EVERY file too - this is the existing --use-both quality
-        # cross-check, orthogonal to the throughput pool above. When no pool
-        # was given, this loop IS the whole review (exactly as before).
+        # Every configured reviewer must complete. A provider error makes the
+        # file incomplete; the quality-first rotator owns route failover.
+        # Every entry reviews the file. The rotator performs transport failover;
+        # a separately constructed verifier preserves model-family independence.
         for reviewer in reviewers:
             if not complete:
                 break
@@ -17125,13 +16839,12 @@ def _review_all(reviewers: list, project_dir: str,
             return (rel, "incomplete")  # NEVER clean; re-reviewed next cycle
         return (rel, _dedupe_findings(merged), sha)
 
-    # PAID/API SEMANTIC BATCHING.  The ordinary path below intentionally stays
-    # intact for the free multi-backend pool and for embedders/tests that depend
-    # on one call per file.  Audit mode opts in.  One provider reviews a bounded
+    # SEMANTIC BATCHING. The ordinary path below remains for embedders/tests
+    # that depend on one call per file. Audit mode opts in. One provider reviews a bounded
     # group; the remaining providers are failover routes, not a findings UNION.
     # Independent per-fix and exact-commit verification still use the separate
     # provider later in the pipeline.
-    if batch_semantic and reviewer_pool is None and reviewers and total > 1:
+    if batch_semantic and reviewers and total > 1:
         ready: list[tuple[str, str, str]] = []
         for rel in files:
             if _capped():
@@ -17333,15 +17046,7 @@ def _review_all(reviewers: list, project_dir: str,
                   "(provider error/budget) - NOT marked clean, will be re-reviewed")
         return file_findings, flat, unreadable, reviewed_clean, incomplete
 
-    if reviewer_pool is not None and reviewer_pool.entries:
-        # As many OS threads as the pool can genuinely use at once (sum of
-        # every backend's own concurrency ceiling), capped by an explicit
-        # --review-workers if the owner set one lower, and never more than
-        # there are files.
-        n_workers = (max(1, min(workers, reviewer_pool.total_concurrency(), total))
-                    if total else 1)
-    else:
-        n_workers = max(1, min(workers, total)) if total else 1
+    n_workers = max(1, min(workers, total)) if total else 1
     with _CtxThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_review_one, rel): rel for rel in files}
         for fut in concurrent.futures.as_completed(futures):
@@ -18042,7 +17747,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             break
 
         if budget_hit:
-            print(f"  [stop] cost cap reached while fixing; stopping remaining fixes")
+            print("  [stop] cost cap reached while fixing; stopping remaining fixes")
             notes.append("stopped fixing at cost cap (budget reservation refused)")
             _tick(rel)
             break
@@ -18995,19 +18700,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # Dual-provider setup, REBUILT per program so no provider instance is shared
         # across programs/threads: author writes fixes, every provider reviews, the
         # 2nd provider (if any) cross-checks each fix. All share one cost meter.
-        # BUILD AND CAPTURE UNDER ONE LOCK. build_audit_providers hands its two
-        # results back through MODULE GLOBALS (_PROVIDER_DIAGNOSIS and
-        # _LAST_FREE_REVIEW_POOL), and audit_one_program runs concurrently in a
-        # ThreadPoolExecutor whenever --parallel > 1. Program B's reset of those
-        # globals could land between program A's build and A's read, so A
-        # silently lost its free review pool, or read B's pool and shared B's
-        # provider instances - exactly what the comment above says must never
-        # happen. Holding the lock across the build AND the reads makes the
-        # handoff atomic without changing the API the tests read.
+        # BUILD AND CAPTURE UNDER ONE LOCK. The diagnosis is a module-level
+        # return channel, so keep its write and read atomic for embedders that
+        # invoke multiple program audits in one process.
         with _PROVIDER_BUILD_LOCK:
             providers = build_audit_providers(args, meter)
             _diagnosis = _PROVIDER_DIAGNOSIS
-            _free_pool = list(_LAST_FREE_REVIEW_POOL)
         if not providers:
             why = _diagnosis or "no LLM API key found"
             print(
@@ -19071,27 +18769,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         _set_rotation_purpose(providers, display_name, purpose_contract, purpose_blob, pfx)
         _attach_ledger_suggester(author)
         cross = providers[1][1] if len(providers) > 1 else None
-        # CONCURRENT FREE POOL (2026-08-12): when build_audit_providers found
-        # multiple free backends usable at once, it populated
-        # _LAST_FREE_REVIEW_POOL - wrap it so _review_all splits the file
-        # queue across all of them instead of reviewing serially through the
-        # single `author` provider. `reviewers` then holds only whatever is
-        # GENUINELY additional to the pool (e.g. an explicit --use-both
-        # cross-check on a paid provider) so nothing gets double-reviewed by
-        # the same backend twice.
-        reviewer_pool = (_ReviewerPool(_free_pool)
-                         if _free_pool else None)
-        if reviewer_pool is not None:
-            pool_names = {n for n, _, _ in _free_pool}
-            reviewers = [p for n, p in providers if n not in pool_names]
-            active = " + ".join(f"{n}(pool):{getattr(p, 'model', p)}"
-                                for n, p, _ in _free_pool)
-            if reviewers:
-                active += ", " + ", ".join(f"{n}(cross):{p.model}"
-                                           for n, p in providers if n not in pool_names)
-        else:
-            reviewers = [p for _, p in providers]
-            active = ", ".join(f"{n}:{p.model}" for n, p in providers)
+        reviewers = [p for _, p in providers]
+        active = ", ".join(f"{n}:{p.model}" for n, p in providers)
         # PURPOSE ENGINE PROVIDER. The two assess_purpose_gap calls below used to
         # index `reviewers` directly ([-1] for the PHASE 1 baseline, [0] for the
         # final assessment). But `reviewers` is filtered to only what is
@@ -19115,6 +18794,29 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         print(f"{pfx}stack: node={stack['is_node']} python={stack['is_python']} "
               f"framework={stack['framework']} test_cmd={'yes' if stack['test_cmd'] else 'no'} "
               f"web={stack['is_web']}")
+
+        # Open the exhaustive pass before any repository preparation can
+        # mutate the target.  Auto-clean may commit owner work, merge green
+        # dependency PRs, and fast-forward the branch; bootstrap can update
+        # lockfiles.  Treating those as invisible setup made the queue receipt
+        # describe only a suffix of the repository transaction.
+        execution_orchestrator = getattr(args, "execution_orchestrator", None)
+        if execution_orchestrator is not None:
+            prework_manifest = _repository_review_manifest(project_dir)
+            if prework_manifest["blocking_files"]:
+                blocked = ", ".join(prework_manifest["blocking_files"][:8])
+                result["error"] = (
+                    "pre-work manifest contains "
+                    f"{len(prework_manifest['blocking_files'])} unreadable "
+                    f"regular file(s): {blocked}"
+                )
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                return result
+            execution_orchestrator.begin_pass(
+                1, prework_manifest["reviewable_files"],
+                whole_repository=True, scope_kind="whole-repository",
+                exhaustive=True,
+            )
 
         # 2. Sandbox: clean-tree gated, dedicated reversible branch (created ONCE;
         #    every cycle commits onto it). The branch is slug-named from this program,
@@ -19395,7 +19097,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         completed_review_files: set[str] = set()
         committed_any = False  # any checkpoint/cycle commit landed real work on the branch
         stop_reason = f"reached cycle cap ({cycle_cap})"
-        execution_orchestrator = getattr(args, "execution_orchestrator", None)
+        prepass_changed_files: list[str] = []
 
         # ================= PHASE 0: RED BASELINE FIRST ========================
         # A full project suite that was already red used to be discovered only
@@ -19810,6 +19512,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 checkpoint.set(files_total=total_to_review)
             print(f"{pfx}Pass-one manifest refreshed after pre-sweep work: "
                   f"{total_to_review} text file(s) require semantic review.")
+        if execution_orchestrator is not None:
+            execution_orchestrator.reconcile_first_pass_scope(all_files)
+            if initial_commit:
+                prepass_diff = _git(
+                    ["diff", "--name-only", "-z", initial_commit, "HEAD", "--"],
+                    project_dir,
+                )
+                if prepass_diff.returncode != 0:
+                    raise BranchStateError(
+                        "could not reconcile pre-pass repository mutations: "
+                        + _tail(prepass_diff.stderr or prepass_diff.stdout, 8)
+                    )
+                prepass_changed_files = _unique_review_paths(
+                    path for path in (prepass_diff.stdout or "").split("\0")
+                    if path and _read_text_and_sha(project_dir, path) is not None
+                )
 
         if purpose_files and not dirty_abort:
             # Purpose-critical files lead the sweep, so even a run that stops at
@@ -19871,7 +19589,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             if cycle == 1 and resume_findings:
                 skip = set(resume_findings)
                 sweep_files = [f for f in files if f not in skip]
-            if execution_orchestrator is not None:
+            if execution_orchestrator is not None and cycle > 1:
                 execution_orchestrator.begin_pass(
                     cycle,
                     all_files if cycle == 1 else sweep_files,
@@ -19907,7 +19625,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             unreadable: set[str] = set()
             reviewed_clean: dict[str, str] = {}
             review_incomplete: set[str] = set()
-            cycle_applied_files: list[str] = []  # verified byte changes in this cycle only
+            # Cycle one also owns verified red-baseline/purpose work completed
+            # before the generic sweep.  Carry it into the pass receipt so pass
+            # two's exact-delta scope cannot silently omit those mutations.
+            cycle_applied_files: list[str] = (
+                _unique_review_paths(
+                    prepass_changed_files + sorted(applied_set)
+                ) if cycle == 1 else []
+            )
             cycle_reviewed_files: set[str] = set()
             cycle_repair_candidates: set[str] = set()
             cycle_repair_attempted: set[str] = set()
@@ -19928,7 +19653,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         reviewers, project_dir, to_review, report=report, meter=meter,
                         workers=getattr(args, "review_workers", REVIEW_WORKERS),
                         context=purpose_blob, checkpoint_cb=_resume_checkpoint,
-                        reviewer_pool=reviewer_pool, batch_semantic=True,
+                        batch_semantic=True,
                         single_provider_workers=getattr(
                             args, "single_provider_review_workers", 1))
                 else:
@@ -20576,7 +20301,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 rf, rflat, runreadable, rclean, rincomplete = _review_all(
                     reviewers, project_dir, sorted(pending_bridge), report=report,
                     meter=meter, workers=getattr(args, "review_workers", REVIEW_WORKERS),
-                    context=purpose_blob, reviewer_pool=reviewer_pool,
+                    context=purpose_blob,
                     batch_semantic=True,
                     single_provider_workers=getattr(
                         args, "single_provider_review_workers", 1))
@@ -21339,6 +21064,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # with a success headline.
         evidence = None
         evidence_paths = None
+        final_changed_paths: list[str] = []
         if evidence_mod is not None and baseline_code_index is not None:
             try:
                 final_index = evidence_mod.build_repository_index(
@@ -21347,6 +21073,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     baseline_code_index, final_index))
                 changed_paths.update(str(p).replace("\\", "/") for p in applied_set)
                 changed_paths.update(str(p).replace("\\", "/") for p in test_files)
+                final_changed_paths = sorted(changed_paths)
                 rescan_evidence = evidence_mod.changed_file_rescan(
                     final_index, changed_paths)
                 blast_evidence = evidence_mod.dependency_blast_radius(
@@ -21673,6 +21400,19 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         elif publication_required:
             commit_status += "; merged/present on origin/" + str(
                 publication.get("default_branch") or "default"
+            )
+
+        if execution_orchestrator is not None:
+            final_quality_passed = bool(
+                ((evidence or {}).get("quality_gates") or {}).get("passed")
+            )
+            execution_orchestrator.record_finalization(
+                changed_files=final_changed_paths,
+                final_commit=publication_commit,
+                quality_gates_passed=final_quality_passed,
+                publication_required=publication_required,
+                publication_complete=bool(publication.get("complete")),
+                note=str(publication.get("reason") or stop_reason),
             )
 
         print(f"{pfx}Git: {commit_status}")
@@ -22186,37 +21926,27 @@ def run_audit(args) -> int:
 
     # 2. Audit each program in full isolation under the durable coordinator.
     queue_mode = "prodready" if getattr(args, "readiness", False) else "audit"
-    orchestrator = _ff_execution.SequentialOrchestrator(
-        queue_mode,
-        programs,
+    results: list[dict] = []
+
+    def _run_target(program, position, queue_total, orchestrator):
+        child_args = argparse.Namespace(**vars(args))
+        child_args.execution_orchestrator = orchestrator
+        print(f"[orchestrator] target {position}/{queue_total}: {program}")
+        result = audit_one_program(
+            program, child_args, position, queue_total, 5180)
+        results.append(result)
+        orchestrator.note_active_target(
+            result.get("stop_reason") or result.get("error") or "")
+        return _audit_exit_code([result], apply_requested=True)
+
+    queue_code, orchestrator = _ff_execution.run_sequential_queue(
+        queue_mode, programs, _run_target,
         state_path=os.environ.get("FLEXFACTOR_QUEUE_STATE") or None,
         queue_id=os.environ.get("FLEXFACTOR_QUEUE_ID") or None,
     )
     print(f"[orchestrator] queue {orchestrator.queue_id}: {total} target(s), "
-          f"strictly sequential; receipt {orchestrator.state_path}")
-    saved = orchestrator.snapshot()
-    prior_codes = [int(row.get("exit_code") or 0)
-                   for row in saved["items"][:orchestrator.next_index]]
-    queue_codes = list(prior_codes)
-    if orchestrator.next_index:
-        print(f"[orchestrator] resuming at target {orchestrator.next_index + 1}; "
-              f"{orchestrator.next_index} prior terminal outcome(s) remain in "
-              "the receipt")
-    results: list[dict] = []
-    for index in range(orchestrator.next_index, total):
-        program = programs[index]
-        orchestrator.start_target(index)
-        child_args = argparse.Namespace(**vars(args))
-        child_args.execution_orchestrator = orchestrator
-        print(f"[orchestrator] target {index + 1}/{total}: {program}")
-        result = audit_one_program(program, child_args, index + 1, total, 5180)
-        results.append(result)
-        target_code = _audit_exit_code([result], apply_requested=True)
-        target_code = orchestrator.finish_target(
-            index, target_code,
-            note=str(result.get("stop_reason") or result.get("error") or "")
-        )
-        queue_codes.append(target_code)
+          f"strictly sequential; receipt {orchestrator.state_path}; "
+          f"status={orchestrator.snapshot()['status']}")
 
     # 3. Batch summary + combined report.
     if results:
@@ -22227,8 +21957,7 @@ def run_audit(args) -> int:
 
     # Every run is an apply run now (review-only was removed outright), so the
     # applied-nothing exit-code contract applies unconditionally.
-    return (next((code for code in queue_codes if code != 0), 0)
-            or _audit_exit_code(results, apply_requested=True))
+    return queue_code or _audit_exit_code(results, apply_requested=True)
 
 
 def _run_simple_target_queue(args, attribute: str, runner, mode: str) -> int:
@@ -22238,41 +21967,22 @@ def _run_simple_target_queue(args, attribute: str, runner, mode: str) -> int:
     except _ff_execution.ExecutionContractError as exc:
         print(f"{mode} target queue rejected: {exc}", file=sys.stderr)
         return 2
-    orchestrator = _ff_execution.SequentialOrchestrator(
-        mode,
-        targets,
+    def _run_target(target, position, total, orchestrator):
+        child = argparse.Namespace(**vars(args))
+        setattr(child, attribute, target)
+        child.execution_orchestrator = orchestrator
+        print(f"[orchestrator] target {position}/{total}: {target}")
+        return int(runner(child))
+
+    code, orchestrator = _ff_execution.run_sequential_queue(
+        mode, targets, _run_target,
         state_path=os.environ.get("FLEXFACTOR_QUEUE_STATE") or None,
         queue_id=os.environ.get("FLEXFACTOR_QUEUE_ID") or None,
     )
     print(f"[orchestrator] queue {orchestrator.queue_id}: {len(targets)} "
-          f"target(s), strictly sequential; receipt {orchestrator.state_path}")
-    saved = orchestrator.snapshot()
-    codes: list[int] = [int(row.get("exit_code") or 0)
-                        for row in saved["items"][:orchestrator.next_index]]
-    if orchestrator.next_index:
-        print(f"[orchestrator] resuming at target {orchestrator.next_index + 1}; "
-              f"{orchestrator.next_index} prior terminal outcome(s) remain in "
-              "the receipt")
-    for index in range(orchestrator.next_index, len(targets)):
-        target = targets[index]
-        orchestrator.start_target(index)
-        child = argparse.Namespace(**vars(args))
-        setattr(child, attribute, target)
-        child.execution_orchestrator = orchestrator
-        print(f"[orchestrator] target {index + 1}/{len(targets)}: {target}")
-        try:
-            code = int(runner(child))
-        except (KeyboardInterrupt, SystemExit):
-            orchestrator.finish_target(index, 130, note="operator interruption")
-            raise
-        except BaseException as exc:
-            orchestrator.finish_target(
-                index, 1, note=f"{type(exc).__name__}: {exc}"
-            )
-            raise
-        code = orchestrator.finish_target(index, code)
-        codes.append(code)
-    return next((code for code in codes if code != 0), 0)
+          f"target(s), strictly sequential; receipt {orchestrator.state_path}; "
+          f"status={orchestrator.snapshot()['status']}")
+    return code
 
 
 def run_refactor_queue(args) -> int:
@@ -22440,7 +22150,7 @@ def _print_batch_summary(results: list[dict]) -> None:
         print(f"  {r['name']} | defects {r['defects']} | fixed {r['fixed']} | "
               f"tests {ts} | e2e {r['e2e_status']} | git {r['commit_status']}")
     ok = sum(1 for r in results if r.get("error") is None)
-    print(f"  ----")
+    print("  ----")
     print(f"  totals: {ok}/{len(results)} program(s) OK | "
           f"{tot_def} defect(s) found | {tot_fix} file(s) fixed")
 
@@ -23958,7 +23668,7 @@ def runtime_manifest() -> dict:
                  "flexfactor_errors",
                  "flexfactor_coverage", "flexfactor_journeys", "flexfactor_assets",
                  "flexfactor_web", "flexfactor_dashboard",
-                 "flexfactor_dashboard_v2", "flexfactor_self_audit_report"):
+                 "flexfactor_dashboard_v2"):
         try:
             mod = importlib.import_module(name)
             modules[name] = {"importable": True,

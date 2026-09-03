@@ -91,8 +91,6 @@ class FirstPartyDiscoveryTests(unittest.TestCase):
     an owner machine - not an exotic one."""
 
     def test_a_virtualenv_in_the_checkout_is_not_swept(self):
-        import tempfile
-
         made = []
         for rel in (os.path.join(".venv", "Lib", "site-packages", "vendored.py"),
                     os.path.join("venv", "lib", "vendored2.py"),

@@ -631,8 +631,6 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
     col_w = (W - pad * (n + 1)) / n
     top = 40
     bottom = H - pad
-    panel_h = bottom - top
-
     for i, p in enumerate(progs):
         cx = pad + i * (col_w + pad)
         # Panel.
@@ -640,7 +638,6 @@ def draw_frame(canvas, hits: list, shown: dict, W: float, H: float,
                                 fill=PANEL, width=1)
         name = str(p.get("name") or f"program {p.get('index', i + 1)}")
         phase = str(p.get("phase") or "")
-        done = bool(p.get("done"))
         cyc = p.get("cycle")
         cycles = p.get("cycles")
         # Label and colour come from the PHASE (terminal_label), never from

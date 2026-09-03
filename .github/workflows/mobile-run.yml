@@ -202,7 +202,7 @@ jobs:
           token: ${{ github.token }}
           path: target
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -258,6 +258,16 @@ jobs:
         run: |
           git config user.name "FlexFactor Mobile"
           git config user.email "flexfactor-mobile@users.noreply.github.com"
+          askpass="$RUNNER_TEMP/flexfactor-git-askpass.sh"
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'case "$1" in' \
+            '  *Username*) printf "%s\\n" x-access-token ;;' \
+            '  *) printf "%s\\n" "$GH_TOKEN" ;;' \
+            'esac' > "$askpass"
+          chmod 0700 "$askpass"
+          printf 'GIT_ASKPASS=%s\n' "$askpass" >> "$GITHUB_ENV"
+          printf 'GIT_TERMINAL_PROMPT=0\n' >> "$GITHUB_ENV"
 
       - name: Run FlexFactor
         id: flexfactor

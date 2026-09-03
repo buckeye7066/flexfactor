@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import tempfile
 import os
@@ -74,11 +75,36 @@ class OrchestratorTests(unittest.TestCase):
             queue_id="test-queue"
         )
 
+    @staticmethod
+    def _finalize(coordinator, changed_files=()):
+        coordinator.record_finalization(
+            changed_files=changed_files,
+            final_commit="verified-sha" if changed_files else None,
+            quality_gates_passed=True,
+            publication_required=bool(changed_files),
+            publication_complete=True,
+        )
+
     def test_only_one_target_can_be_active(self):
         coordinator = self._coordinator()
         coordinator.start_target(0)
         with self.assertRaises(execution.OrchestrationOrderError):
             coordinator.start_target(1)
+
+    def test_worker_outcome_note_survives_the_central_queue_runner(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, [], reviewed_files=["a.py"])
+        coordinator.record_competitor_gate(
+            attempted=False, implemented_files=[], verified=0,
+            not_applicable=True,
+        )
+        self._finalize(coordinator)
+        coordinator.note_active_target("verified no-op")
+        self.assertEqual(coordinator.finish_target(0, 0), 0)
+        self.assertEqual(
+            coordinator.snapshot()["items"][0]["note"], "verified no-op")
 
     def test_refactor_receipt_cannot_claim_a_whole_repository_pass(self):
         root = tempfile.mkdtemp(prefix="ff-refactor-scope-")
@@ -171,6 +197,77 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(record["exhaustive"])
         self.assertEqual(record["status"], "completed")
 
+    def test_running_first_pass_can_reconcile_a_post_repair_manifest(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        scope = coordinator.reconcile_first_pass_scope(
+            ["a.py", "generated/bridge.py"])
+        self.assertEqual(scope, ["a.py", "generated/bridge.py"])
+        record = coordinator.snapshot()["items"][0]["passes"][0]
+        self.assertEqual(record["files"], scope)
+        self.assertIn("scope_reconciled_at", record)
+        self.assertEqual(record["scope_revisions"][0]["added_files"],
+                         ["generated/bridge.py"])
+
+    def test_finalization_accounts_for_post_pass_mutations(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, ["a.py"], reviewed_files=["a.py"])
+        coordinator.record_competitor_gate(
+            attempted=True, implemented_files=[], verified=3)
+        coordinator.begin_pass(2, ["a.py"])
+        coordinator.finish_pass(2, [], reviewed_files=["a.py"])
+        self._finalize(coordinator, ["a.py", "requirements.txt"])
+        finalization = coordinator.snapshot()["items"][0]["finalization"]
+        self.assertEqual(finalization["pass_changed_files"], ["a.py"])
+        self.assertEqual(finalization["post_pass_changed_files"],
+                         ["requirements.txt"])
+        self.assertEqual(coordinator.finish_target(0, 0), 0)
+
+    def test_incomplete_pass_records_failed_finalization_without_raising(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.record_finalization(
+            changed_files=[], final_commit=None,
+            quality_gates_passed=False,
+            publication_required=False,
+            publication_complete=True,
+            note="semantic review incomplete",
+        )
+        finalization = coordinator.snapshot()["items"][0]["finalization"]
+        self.assertEqual(finalization["status"], "failed")
+        self.assertFalse(finalization["passes_complete"])
+        self.assertEqual(coordinator.finish_target(0, 1), 1)
+        self.assertEqual(
+            coordinator.snapshot()["items"][0]["passes"][0]["status"],
+            "interrupted",
+        )
+
+    def test_audit_success_requires_final_tree_reconciliation(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, [], reviewed_files=["a.py"])
+        coordinator.record_competitor_gate(
+            attempted=False, implemented_files=[], verified=0,
+            not_applicable=True)
+        coordinator.finish_target(0, 0)
+        item = coordinator.snapshot()["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("final-tree reconciliation", item["note"])
+
+    def test_scope_reconciliation_is_refused_after_pass_one(self):
+        coordinator = self._coordinator(("repo",))
+        coordinator.start_target(0)
+        coordinator.begin_pass(1, ["a.py"], whole_repository=True)
+        coordinator.finish_pass(1, [], reviewed_files=["a.py"])
+        with self.assertRaisesRegex(
+                execution.OrchestrationOrderError, "running exhaustive"):
+            coordinator.reconcile_first_pass_scope(["a.py", "late.py"])
+
     def test_success_is_refused_while_a_pass_is_active(self):
         coordinator = self._coordinator(("repo",))
         coordinator.start_target(0)
@@ -221,6 +318,7 @@ class OrchestratorTests(unittest.TestCase):
             attempted=False, implemented_files=[], verified=0,
             not_applicable=True,
         )
+        self._finalize(coordinator)
         self.assertEqual(coordinator.finish_target(0, 0), 0)
         item = coordinator.snapshot()["items"][0]
         self.assertEqual(item["status"], "completed")
@@ -259,6 +357,40 @@ class OrchestratorTests(unittest.TestCase):
         resumed.start_target(0)
         resumed.begin_pass(1, ["a.py"], whole_repository=True)
 
+    def test_recovery_archives_and_clears_a_stale_finalization(self):
+        root = tempfile.mkdtemp(prefix="ff-finalization-resume-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        path = os.path.join(root, "receipt.json")
+        first = execution.SequentialOrchestrator(
+            "audit", ["repo"], state_path=path, queue_id="finalization-resume")
+        first.start_target(0)
+        first.begin_pass(1, ["a.py"], whole_repository=True)
+        first.finish_pass(1, [], reviewed_files=["a.py"])
+        first.record_competitor_gate(
+            attempted=False, implemented_files=[], verified=0,
+            not_applicable=True)
+        self._finalize(first)
+
+        resumed = execution.SequentialOrchestrator(
+            "audit", ["repo"], state_path=path, queue_id="finalization-resume")
+        item = resumed.snapshot()["items"][0]
+        self.assertNotIn("finalization", item)
+        self.assertEqual(item["attempts"][0]["finalization"]["status"],
+                         "completed")
+        resumed.start_target(0)
+        resumed.begin_pass(1, ["a.py"], whole_repository=True)
+
+    def test_schema_one_receipt_is_rejected_instead_of_bypassing_finalization(self):
+        root = tempfile.mkdtemp(prefix="ff-schema-one-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        path = os.path.join(root, "receipt.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump({"schema": 1}, stream)
+        with self.assertRaisesRegex(
+                execution.ExecutionContractError, "unsupported schema"):
+            execution.SequentialOrchestrator(
+                "audit", ["repo"], state_path=path, queue_id="legacy")
+
     def test_queue_runner_never_overlaps_targets_and_persists_receipt(self):
         root = tempfile.mkdtemp(prefix="ff-queue-run-")
         self.addCleanup(__import__("shutil").rmtree, root, True)
@@ -278,6 +410,7 @@ class OrchestratorTests(unittest.TestCase):
             coordinator.record_competitor_gate(
                 attempted=True, implemented_files=[], verified=3
             )
+            self._finalize(coordinator)
             active.pop()
             return 0
 
@@ -304,6 +437,7 @@ class OrchestratorTests(unittest.TestCase):
             coordinator.record_competitor_gate(
                 attempted=True, implemented_files=[], verified=3
             )
+            self._finalize(coordinator)
             return 0
 
         code, coordinator = execution.run_sequential_queue(
