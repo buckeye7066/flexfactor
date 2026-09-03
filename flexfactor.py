@@ -1347,6 +1347,16 @@ class EgressBlockedError(RuntimeError):
     must not abort the sweep' handler degrades it to a per-file skip."""
 
 
+class StructuredOutputShapeError(RuntimeError):
+    """A model answered, but its JSON did not match the requested schema.
+
+    This is a route-output failure, not a programming error in the repository
+    being audited. The rotating provider treats this named exception as
+    retryable so one model that ignores structured-output instructions cannot
+    terminate the run while another usable route is available.
+    """
+
+
 def _egress_gate(text: str) -> str:
     action, out, findings = _egress.gate_text(text, mode=EGRESS_MODE)
     if action == "blocked":
@@ -3441,8 +3451,10 @@ def _check_array_item_shape(data, schema: dict, text: str):
     edits, and report success - the exact silent-no-op shape the exit-code-3
     rule exists to prevent. Raising degrades to the ordinary generation failure
     the existing retry / [skip] / another-backend paths already handle.
-    Arrays whose schema declares scalar items (`items.type == "string"`) are
-    untouched.
+    Arrays whose schema declares scalar strings are checked too. Outside the
+    narrow program-understanding recovery hook, wrong containers and mixed
+    arrays are rejected instead of reaching callers that would iterate mapping
+    keys or treat objects as text.
     """
     if not isinstance(data, dict):
         return data
@@ -3450,7 +3462,8 @@ def _check_array_item_shape(data, schema: dict, text: str):
         spec = spec or {}
         if spec.get("type") != "array":
             continue
-        if ((spec.get("items") or {}).get("type")) != "object":
+        item_type = (spec.get("items") or {}).get("type")
+        if item_type not in ("object", "string"):
             continue
         if prop not in data or data.get(prop) is None:
             continue          # absent key = a normal partial answer, not a fault
@@ -3466,16 +3479,21 @@ def _check_array_item_shape(data, schema: dict, text: str):
             # repo-rewards run, from the identical schema, one type further
             # out. Skipping validation for anything that is not a list makes
             # the guard fail open exactly where it must fail closed.
-            raise RuntimeError(
+            raise StructuredOutputShapeError(
                 f"Structured output's '{prop}' is a {type(value).__name__}, "
                 f"but the schema declares an array; len={len(text)} "
                 f"head={text[:200]!r}")
         for idx, element in enumerate(value):
-            if not isinstance(element, dict):
-                raise RuntimeError(
+            if item_type == "object" and not isinstance(element, dict):
+                raise StructuredOutputShapeError(
                     f"Structured output's '{prop}'[{idx}] is a "
                     f"{type(element).__name__}, but the schema declares an "
                     f"object; len={len(text)} head={text[:200]!r}")
+            if item_type == "string" and not isinstance(element, str):
+                raise StructuredOutputShapeError(
+                    f"Structured output's '{prop}'[{idx}] is a "
+                    f"{type(element).__name__}, but the schema declares a "
+                    f"string; len={len(text)} head={text[:200]!r}")
     return data
 
 
@@ -3495,6 +3513,26 @@ def _check_structured_type(data, schema: dict, text: str):
     retry/edit-fallback/[skip] handling already copes with."""
     expected = schema.get("type")
     if expected == "object" and isinstance(data, dict):
+        # Program understanding is a blocking semantic contract, so it gets a
+        # narrow shape-recovery pass before the generic schema guard. Most
+        # schemas intentionally accept partial objects and let their callers
+        # decide what absence means; this one cannot, because every field is
+        # required before repository review may begin.
+        if schema is globals().get("PROGRAM_UNDERSTANDING_SCHEMA"):
+            data, recovered = _normalize_program_understanding_response(data)
+            if recovered:
+                print("  [salvage] program-understanding output normalized: "
+                      + ", ".join(recovered))
+            missing = [name for name in schema.get("required", [])
+                       if name not in data or data.get(name) in (None, "", [])]
+            if missing:
+                raise StructuredOutputShapeError(
+                    "Program-understanding output omitted required non-empty "
+                    "field(s): " + ", ".join(missing))
+            if not isinstance(data.get("purpose"), str):
+                raise StructuredOutputShapeError(
+                    "Program-understanding output's 'purpose' must be a string, "
+                    f"not {type(data.get('purpose')).__name__}")
         # DECOY-OBJECT GUARD (measured 2026-08-14 probing the extraction order).
         # _extract_json_object returns the FIRST balanced {...} span, so a
         # response like `Here you go: {"ok":1}\n{"findings":[...` hands back the
@@ -3513,7 +3551,7 @@ def _check_structured_type(data, schema: dict, text: str):
                 salvaged = _rename_single_array_key(data, schema)
             if salvaged is not None:
                 return _check_array_item_shape(salvaged, schema, text)
-            raise RuntimeError(
+            raise StructuredOutputShapeError(
                 "Structured output matched no schema key (decoy/unrelated JSON "
                 f"object; expected one of {req}); len={len(text)} "
                 f"head={text[:200]!r}")
@@ -3545,11 +3583,11 @@ def _check_structured_type(data, schema: dict, text: str):
                 print(f"  [salvage] structured output was a bare list; wrapped "
                       f"into '{prop}' per schema (element fit {fit:.0%})")
                 return _check_array_item_shape({prop: data}, schema, text)
-        raise RuntimeError(
+        raise StructuredOutputShapeError(
             f"Structured output did not match schema (expected a JSON object, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
     if expected == "array" and not isinstance(data, list):
-        raise RuntimeError(
+        raise StructuredOutputShapeError(
             f"Structured output did not match schema (expected a JSON array, "
             f"got {type(data).__name__}); len={len(text)} head={text[:200]!r}")
     return _check_array_item_shape(data, schema, text)
@@ -6530,6 +6568,106 @@ PROGRAM_UNDERSTANDING_SCHEMA = {
 }
 
 
+_PROGRAM_UNDERSTANDING_ALIASES = {
+    "purpose": ("program_purpose", "mission", "objective"),
+    "primary_users": ("users", "target_users", "user_types", "audience"),
+    "core_journeys": ("journeys", "user_journeys", "workflows", "core_workflows"),
+    "acceptance_criteria": ("criteria", "success_criteria", "requirements"),
+    "evidence_refs": ("citations", "references", "source_refs", "evidence"),
+}
+
+_PROGRAM_UNDERSTANDING_ITEM_KEYS = {
+    "primary_users": ("user", "role", "name", "value", "text"),
+    "core_journeys": ("journey", "workflow", "description", "value", "text"),
+    "acceptance_criteria": ("criterion", "requirement", "description", "value", "text"),
+    "evidence_refs": ("path_or_ref", "evidence_ref", "source_ref", "ref", "path"),
+}
+
+
+def _purpose_string_array(value, field: str):
+    """Losslessly recover common model envelopes for one string-array field.
+
+    Returns ``(value, note)``. Ambiguous mappings and mixed/non-string arrays
+    are returned unchanged so the schema guard can reject them and the model
+    ladder can try another route. Mapping keys are never treated as claims.
+    """
+    if isinstance(value, str):
+        return ([value] if value.strip() else []), "scalar string wrapped"
+    keys = _PROGRAM_UNDERSTANDING_ITEM_KEYS[field]
+    if isinstance(value, list):
+        out: list[str] = []
+        changed = False
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+                continue
+            if not isinstance(item, dict):
+                return value, ""
+            candidates = [item.get(key) for key in keys
+                          if isinstance(item.get(key), str)
+                          and item.get(key).strip()]
+            candidates = list(dict.fromkeys(candidates))
+            if len(candidates) != 1:
+                return value, ""
+            out.append(candidates[0])
+            changed = True
+        return out, "object items reduced to their single text value" if changed else ""
+    if isinstance(value, dict):
+        # A named item (for example {"journey": "send then pay"}) is
+        # unambiguous. Extra explanatory keys are ignored only when precisely
+        # one field-specific value exists; competing candidates are rejected.
+        candidates = [value.get(key) for key in keys
+                      if isinstance(value.get(key), str)
+                      and value.get(key).strip()]
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) == 1:
+            return [candidates[0]], "single named object wrapped"
+        for wrapper in (field, "items", "values", "entries"):
+            if wrapper in value:
+                nested, note = _purpose_string_array(value[wrapper], field)
+                if note:
+                    return nested, f"'{wrapper}' envelope removed"
+        # Numbered JSON objects are a frequent accidental rendering of arrays.
+        # Values, never keys, are recovered and kept in numeric order.
+        if value and all(str(key).isdigit() for key in value) \
+                and all(isinstance(item, str) for item in value.values()):
+            ordered = [item for _key, item in sorted(
+                value.items(), key=lambda pair: int(str(pair[0])))]
+            return ordered, "numbered object converted to array"
+    return value, ""
+
+
+def _normalize_program_understanding_response(data: dict) -> tuple[dict, list[str]]:
+    """Normalize only lossless, field-specific purpose response variations."""
+    out = dict(data)
+    recovered: list[str] = []
+    for canonical, aliases in _PROGRAM_UNDERSTANDING_ALIASES.items():
+        if canonical in out and out.get(canonical) is not None:
+            continue
+        present = [alias for alias in aliases if alias in out]
+        if len(present) == 1:
+            out[canonical] = out[present[0]]
+            recovered.append(f"{canonical} from alias '{present[0]}'")
+    for field in _PROGRAM_UNDERSTANDING_ITEM_KEYS:
+        if field not in out or out.get(field) is None:
+            continue
+        normalized, note = _purpose_string_array(out[field], field)
+        if note:
+            out[field] = normalized
+            recovered.append(f"{field}: {note}")
+    return out, recovered
+
+
+def _validate_program_understanding_response(data):
+    """Provider-ladder validator for the blocking understanding contract."""
+    try:
+        diagnostic = json.dumps(data, ensure_ascii=False)[:2000]
+    except (TypeError, ValueError):
+        diagnostic = repr(data)[:2000]
+    return _check_structured_type(
+        data, PROGRAM_UNDERSTANDING_SCHEMA, diagnostic)
+
+
 def _clean_model_strings(values, *, limit: int, chars: int = 500) -> list[str]:
     """Bound and de-duplicate a model-authored JSON array of strings.
 
@@ -6608,25 +6746,53 @@ def _infer_purpose_contract(provider, display_name: str, project_dir: str,
         "path_or_ref below.\n\n" + evidence_block + authored_block + goal_block
     )
     errors: list[str] = []
-    attempts = (
-        base_prompt,
-        base_prompt + "\n\nThe previous response was unusable. Fill every field "
-        "with concrete non-empty values and cite only exact supplied refs.",
-    )
-    for prompt in attempts:
-        try:
-            data = provider.structured(
-                PROGRAM_UNDERSTANDING_SYSTEM, prompt,
-                PROGRAM_UNDERSTANDING_SCHEMA, max_tokens=6000,
-                salvage_truncated=False,
+    last_error = ""
+    for attempt in range(2):
+        prompt = base_prompt
+        if attempt:
+            prompt += (
+                "\n\nCORRECTION REQUIRED. The previous response failed validation: "
+                + last_error[:1200]
+                + "\nReturn exactly one JSON object in this shape; every bracketed "
+                "field must remain a JSON array even when it has one item:\n"
+                '{"purpose":"specific outcome","primary_users":["specific user"],'
+                '"core_journeys":["start-to-finish journey"],'
+                '"acceptance_criteria":["observable result"],'
+                '"evidence_refs":["exact supplied path_or_ref"]}'
             )
+        try:
+            validated_call = getattr(provider, "structured_validated", None)
+            if callable(validated_call):
+                # The callback runs inside RotatingProvider's route loop. A
+                # malformed answer is therefore attributed to that model and
+                # the same call descends to the next usable route before this
+                # outer bounded/corrective attempt is spent.
+                data = validated_call(
+                    PROGRAM_UNDERSTANDING_SYSTEM, prompt,
+                    PROGRAM_UNDERSTANDING_SCHEMA, max_tokens=6000,
+                    salvage_truncated=False,
+                    validator=_validate_program_understanding_response,
+                )
+            else:
+                data = provider.structured(
+                    PROGRAM_UNDERSTANDING_SYSTEM, prompt,
+                    PROGRAM_UNDERSTANDING_SCHEMA, max_tokens=6000,
+                    salvage_truncated=False,
+                )
+                data = _validate_program_understanding_response(data)
         except Exception as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
+            last_error = f"{type(exc).__name__}: {exc}"
+            errors.append(last_error)
             continue
         if not isinstance(data, dict):
-            errors.append(
+            last_error = (
                 f"understanding response was {type(data).__name__}, not an object")
+            errors.append(last_error)
             continue
+        data, recovered = _normalize_program_understanding_response(data)
+        if recovered:
+            print("  [salvage] program-understanding output normalized: "
+                  + ", ".join(recovered))
         array_fields = ("primary_users", "core_journeys",
                         "acceptance_criteria", "evidence_refs")
         malformed = [
@@ -6635,9 +6801,10 @@ def _infer_purpose_contract(provider, display_name: str, project_dir: str,
             or any(not isinstance(item, str) for item in data.get(name, []))
         ]
         if malformed:
-            errors.append(
+            last_error = (
                 "understanding field(s) must be arrays of strings: "
                 + ", ".join(malformed))
+            errors.append(last_error)
             continue
         purpose = " ".join(str(data.get("purpose") or "").split())[:2000]
         users = _clean_model_strings(data.get("primary_users"), limit=12)
@@ -6655,10 +6822,12 @@ def _infer_purpose_contract(provider, display_name: str, project_dir: str,
             ("evidence_refs", valid),
         ) if not value]
         if invalid:
-            errors.append("invented evidence reference(s): " + ", ".join(invalid[:4]))
+            last_error = "invented evidence reference(s): " + ", ".join(invalid[:4])
+            errors.append(last_error)
             continue
         if missing:
-            errors.append("missing required understanding field(s): " + ", ".join(missing))
+            last_error = "missing required understanding field(s): " + ", ".join(missing)
+            errors.append(last_error)
             continue
         contract = fp.inferred_contract(
             display_name, purpose, criteria, evidence=evidence,

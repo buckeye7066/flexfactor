@@ -1463,6 +1463,7 @@ class RotatingProvider:
         turn before the call is declared impossible.
         """
         intent = self._complete_intent(kwargs.pop("intent", None))
+        result_validator = kwargs.pop("_result_validator", None)
         # Budget attempts across EVERY tier this call may actually be served
         # from: next_route demotes DOWN TIER_CHAIN when the requested tier has
         # no candidate, so counting only the requested tier's pools starved a
@@ -1519,6 +1520,13 @@ class RotatingProvider:
                 self._on_route(selection)
             try:
                 result = getattr(self._provider_for(route), method)(*args, **kwargs)
+                if result_validator is not None:
+                    # Run semantic/schema validation BEFORE reporting the route
+                    # successful. CLI/Cursor adapters cannot import FlexFactor's
+                    # schema code, so validating only inside HTTP adapters let a
+                    # malformed subscription response escape the ladder and die
+                    # later in its caller.
+                    result = result_validator(result)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
                 # The shared USD meter can refuse a paid route after the call was
                 # selected. That is a policy boundary, not a provider failure.
@@ -1603,7 +1611,7 @@ class RotatingProvider:
         )
         return self._run("complete", self._tier, *args, **kwargs)
 
-    def structured(self, *args, **kwargs):
+    def _structured_call(self, args, kwargs, result_validator=None):
         # flexfactor's `_judge()` requests the cheap tier by passing
         # `model=provider.judge_model` — for a fixed provider that is a real
         # model id, for this one it is the ROTATING_JUDGE_MODEL sentinel. Honor
@@ -1618,7 +1626,25 @@ class RotatingProvider:
         kwargs.setdefault(
             "intent", CallIntent(ROLE_AUTHOR, (CAP_CODE_AUTHOR, CAP_STRUCTURED_JSON))
         )
+        if result_validator is not None:
+            kwargs["_result_validator"] = result_validator
         return self._run("structured", tier, *args, **kwargs)
+
+    def structured(self, *args, **kwargs):
+        return self._structured_call(args, kwargs)
+
+    def structured_validated(self, *args, validator, **kwargs):
+        """Structured call whose result must pass *validator* on each route.
+
+        A validator exception is handled inside the normal route-attempt loop,
+        so malformed output from one model descends to the next usable model
+        instead of being mistaken for a successful call and killing the outer
+        workflow. Fixed providers do not need this method; callers validate
+        their one response directly and retain their bounded corrective retry.
+        """
+        if not callable(validator):
+            raise TypeError("validator must be callable")
+        return self._structured_call(args, kwargs, validator)
 
     def grade(self, *args, **kwargs):
         # Grading is classification, not authoring: it belongs on the cheap
@@ -1821,6 +1847,11 @@ def _is_retryable(exc: BaseException) -> bool:
     if is_payload_fault(exc):
         # The next route gets the identical bytes and refuses them identically.
         return False
+    if type(exc).__name__ == "StructuredOutputShapeError":
+        # The request and schema are valid; this particular model ignored
+        # them. Another model can answer the same call correctly, so keep the
+        # single paid-to-free ladder moving instead of terminating the run.
+        return True
     if isinstance(exc, (TypeError, AttributeError, NameError, ImportError,
                         SyntaxError, IndentationError, AssertionError)):
         return False
