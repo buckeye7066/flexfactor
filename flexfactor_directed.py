@@ -191,6 +191,7 @@ exit 0
                 fh.write(driver_source)
             result = run(
                 [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass",
                  "-File", driver, candidate],
                 project_dir, timeout=60,
             )
@@ -307,6 +308,11 @@ def install(module_globals: dict) -> None:
         def _prewrite_source_syntax_details(project_dir, path, source, stack, *, allow_empty=False):
             ext = os.path.splitext(str(path or ""))[1].lower()
             if ext in _POWERSHELL_EXTS:
+                # Preserve the shared empty-source refusal that the generic prewrite
+                # gate enforces for every language when allow_empty is False.
+                text = str(source or "")
+                if not allow_empty and not text.strip():
+                    return False, "empty whole-file response", None
                 native = powershell_syntax_details(project_dir, path, source, run)
                 if native is not None:
                     return native
