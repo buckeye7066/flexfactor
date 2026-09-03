@@ -68,7 +68,38 @@ jobs:
             echo "Could not resolve the Android release version" >&2
             exit 1
           fi
-          expected_engine="android-v${version_name}"
+          android_engine="android-v${version_name}"
+          declared_engine=$(sed -n \
+            's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
+            cloud/lib/config.js)
+          if [ -z "$declared_engine" ]; then
+            echo "Could not resolve the managed cloud engine" >&2
+            exit 1
+          fi
+          if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
+            pending_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
+            if [ "$pending_engine" != "$android_engine" ]; then
+              echo "The staged rollout marker does not name $android_engine" >&2
+              exit 1
+            fi
+            cloud_version=${declared_engine#android-v}
+            IFS=. read -r cloud_major cloud_minor cloud_patch <<EOF
+          $cloud_version
+          EOF
+            IFS=. read -r android_major android_minor android_patch <<EOF
+          $version_name
+          EOF
+            if [ "$cloud_major" != "$android_major" ] \
+                || [ "$cloud_minor" != "$android_minor" ] \
+                || [ "$((cloud_patch + 1))" -ne "$android_patch" ]; then
+              echo "A staged cloud engine may lag Android by exactly one patch" >&2
+              exit 1
+            fi
+          elif [ "$declared_engine" != "$android_engine" ]; then
+            echo "Cloud and Android engine pins differ without a rollout marker" >&2
+            exit 1
+          fi
+          expected_engine="$declared_engine"
           for attempt in {1..60}; do
             health=$(curl --fail --silent --show-error --retry 3 \
               https://flexfactor-cloud.vercel.app/api/health) || health='{}'

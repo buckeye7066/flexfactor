@@ -178,6 +178,17 @@ class ManagedAndroidInvariants(unittest.TestCase):
                         model_install.index("ollama pull qwen2.5-coder:7b"))
         self.assertLess(model_install.index('rm -f "$archive"'),
                         model_install.index("ollama pull deepseek-coder:6.7b"))
+        android_workflow = (ROOT / ".github" / "workflows" /
+                            "android-client.yml").read_text(encoding="utf-8")
+        control_plane = android_workflow.split(
+            "- name: Verify the current managed control plane", 1)[1].split(
+                "- uses: gradle/actions/setup-gradle", 1)[0]
+        self.assertIn("[ -f cloud/ENGINE_ROLLOUT_PENDING ]", control_plane)
+        self.assertIn('pending_engine" != "$android_engine', control_plane)
+        self.assertIn("cloud_patch + 1", control_plane)
+        self.assertIn('expected_engine="$declared_engine"', control_plane)
+        self.assertIn(
+            'declared_engine" != "$android_engine', control_plane)
         self.assertIn("options: [auto]", workflow)
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
