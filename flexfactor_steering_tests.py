@@ -72,6 +72,52 @@ class SteeringTests(unittest.TestCase):
         self.assertIn("push verified work", by_name["GrantFlow"])
         self.assertIn("push verified work", by_name["SermonSmith"])
 
+    def test_explicit_target_wins_over_shared_words_inside_its_requirement(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target: show all programs in the dropdown.",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("all programs", by_name["Target"])
+        self.assertEqual("", by_name["Other"])
+
+    def test_bullets_follow_their_target_heading(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target:\n- keep login\nOther:\n- add exports",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("keep login", by_name["Target"])
+        self.assertNotIn("add exports", by_name["Target"])
+        self.assertIn("add exports", by_name["Other"])
+
+    def test_short_names_and_address_positions_are_supported(self):
+        db = os.path.join(self.root, "DB")
+        os.makedirs(db)
+        routed = fs.route_session_prompt(
+            "UI: call the DB only after login. DB: add the index.",
+            [("UI", self.project), ("DB", db)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("call the DB", by_name["UI"])
+        self.assertNotIn("call the DB", by_name["DB"])
+        self.assertIn("add the index", by_name["DB"])
+
+    def test_shared_checkout_alias_is_discarded_and_duplicate_target_is_accepted(self):
+        left = os.path.join(self.root, "left", "repo")
+        right = os.path.join(self.root, "right", "repo")
+        os.makedirs(left)
+        os.makedirs(right)
+        routed = fs.route_session_prompt(
+            "Alpha: fix login. Beta: add exports.",
+            [("Alpha", left), ("Beta", right), ("Alpha", left)],
+        )
+        self.assertEqual(["Alpha", "Beta"], [row["program"] for row in routed["routes"]])
+
     def test_session_prompt_is_durable_and_claimed_by_each_target_when_worked(self):
         other = os.path.join(self.root, "Other")
         os.makedirs(other)
@@ -104,6 +150,17 @@ class SteeringTests(unittest.TestCase):
         )
         self.assertEqual(1, len(receipt["submission_ids"]))
         self.assertEqual([], fs.list_comments("Other", other, root=self.root))
+
+    def test_session_submission_is_idempotent_for_a_queue_session(self):
+        first = fs.submit_session_prompt(
+            "Target: keep login.", [("Target", self.project)],
+            root=self.root, session_id="queue-one-prompt-one")
+        second = fs.submit_session_prompt(
+            "Target: keep login.", [("Target", self.project)],
+            root=self.root, session_id="queue-one-prompt-one")
+        self.assertEqual(first["submission_ids"], second["submission_ids"])
+        self.assertEqual(1, len(fs.list_comments("Target", self.project,
+                                                root=self.root)))
 
     def test_guidance_is_program_scoped_durable_and_injected_each_run(self):
         saved = fs.set_guidance(

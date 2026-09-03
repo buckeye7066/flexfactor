@@ -17,7 +17,7 @@ import uuid
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".flexfactor", "steering")
 MAX_COMMENT_CHARS = 4000
 MAX_GUIDANCE_CHARS = 4000
-MAX_SESSION_PROMPT_CHARS = 20000
+MAX_SESSION_PROMPT_CHARS = MAX_COMMENT_CHARS
 MAX_SESSION_TARGETS = 30
 MAX_RECORD_BYTES = 16384
 _BEGIN = "<<< FLEXFACTOR OPERATOR STEERING >>>"
@@ -178,20 +178,37 @@ def _alias_forms(program: str, project_dir: str) -> set[str]:
         item = re.sub(r"\.git$", "", item, flags=re.IGNORECASE)
         item = item.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         words = " ".join(re.findall(r"[a-z0-9]+", item.casefold()))
-        if len(words.replace(" ", "")) >= 3:
+        if len(words.replace(" ", "")) >= 2:
             forms.add(words)
             forms.add(words.replace(" ", ""))
     return {form for form in forms if form}
 
 
 def _mentions(segment: str, aliases: list[set[str]]) -> list[int]:
-    tokens = re.findall(r"[a-z0-9]+", segment.casefold())
-    words = " ".join(tokens)
-    padded = f" {words} "
+    addressed = re.sub(r"^(?:[-*+]|\d+[.)])\s*", "", segment.strip())
+    colon = addressed.find(":")
+    header = addressed[:colon] if 0 < colon <= 120 else ""
+    if header:
+        words = " ".join(re.findall(r"[a-z0-9]+", header.casefold()))
+        compact = words.replace(" ", "")
+    else:
+        words = " ".join(re.findall(r"[a-z0-9]+", addressed.casefold()))
+        words = re.sub(r"^(?:for|in|on|to)\s+(?:the\s+)?", "", words)
+        compact = words.replace(" ", "")
     found: list[int] = []
     for index, forms in enumerate(aliases):
-        if any((" " in form and f" {form} " in padded) or
-               (" " not in form and form in tokens) for form in forms):
+        if header:
+            padded = f" {words} "
+            matched = any(
+                (" " in form and f" {form} " in padded) or
+                (" " not in form and form in words.split()) or
+                (" " not in form and compact == form)
+                for form in forms)
+        else:
+            matched = any(
+                words == form or words.startswith(form + " ") or
+                compact == form for form in forms)
+        if matched:
             found.append(index)
     return found
 
@@ -247,18 +264,18 @@ def route_session_prompt(prompt: str, targets: list[tuple[str, str]]) -> dict:
         directory = _canonical(project_dir)
         key = (name.casefold(), directory)
         if key in seen:
-            raise ValueError(f"duplicate session target: {name}")
+            continue
         seen.add(key)
         canonical.append((name, directory))
     aliases = [_alias_forms(name, directory) for name, directory in canonical]
-    for left in range(len(aliases)):
-        for right in range(left + 1, len(aliases)):
-            overlap = aliases[left] & aliases[right]
-            if overlap:
-                raise ValueError(
-                    "ambiguous session target names: "
-                    f"{canonical[left][0]} and {canonical[right][0]} share "
-                    f"{sorted(overlap)[0]!r}")
+    alias_counts: dict[str, int] = {}
+    for forms in aliases:
+        for form in forms:
+            alias_counts[form] = alias_counts.get(form, 0) + 1
+    aliases = [
+        {form for form in forms if alias_counts.get(form) == 1}
+        for forms in aliases
+    ]
     routed: list[list[str]] = [[] for _ in canonical]
     evidence: list[dict] = []
     last_explicit: list[int] = []
@@ -273,17 +290,18 @@ def route_session_prompt(prompt: str, targets: list[tuple[str, str]]) -> dict:
     for segment in _prompt_segments(clean, aliases):
         named = _mentions(segment, aliases)
         reason = "explicit-target"
-        if global_rx.search(segment):
+        if named:
+            chosen = named
+            last_explicit = named
+        elif global_rx.search(segment):
             chosen = list(range(len(canonical)))
             reason = "explicit-shared"
             last_explicit = []
-        elif named:
-            chosen = named
-            last_explicit = named
         elif len(canonical) == 1:
             chosen = [0]
             reason = "single-target"
-        elif last_explicit and continuation_rx.search(segment):
+        elif last_explicit and (continuation_rx.search(segment) or
+                                re.match(r"^(?:[-*+]|\d+[.)])\s+", segment)):
             chosen = last_explicit
             reason = "target-continuation"
         else:
@@ -313,26 +331,38 @@ def route_session_prompt(prompt: str, targets: list[tuple[str, str]]) -> dict:
 
 
 def submit_session_prompt(prompt: str, targets: list[tuple[str, str]], *,
-                          source: str = "session", root: str | None = None) -> dict:
+                          source: str = "session", root: str | None = None,
+                          session_id: str = "") -> dict:
     """Durably queue every routed portion for its target's next checkpoint."""
     routed = route_session_prompt(prompt, targets)
-    session_id = uuid.uuid4().hex
-    submissions = []
+    session_id = str(session_id or uuid.uuid4().hex).strip()[:64]
+    if not session_id or not all(ch.isalnum() or ch in "-_" for ch in session_id):
+        raise ValueError("session identifier contains unsafe characters")
+    submission_ids: list[str] = []
     for route in routed["routes"]:
         if not route["instruction"]:
             continue
-        submissions.append(submit(
+        existing = next((row for row in _records(journal_path(
+            route["program"], route["project_dir"], root))
+            if row.get("kind") == "submission"
+            and row.get("session_id") == session_id
+            and row.get("scope") == "multi-program-session"), None)
+        if existing:
+            submission_ids.append(str(existing["id"]))
+            continue
+        saved = submit(
             route["program"], route["project_dir"], route["instruction"],
             source=source, root=root, session_id=session_id,
             scope="multi-program-session",
-        ))
+        )
+        submission_ids.append(saved["id"])
     return {
         "schema": 1,
         "session_id": session_id,
         "created_at": _now(),
         "routes": routed["routes"],
         "evidence": routed["evidence"],
-        "submission_ids": [item["id"] for item in submissions],
+        "submission_ids": submission_ids,
     }
 
 

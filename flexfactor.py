@@ -22449,8 +22449,9 @@ def run_audit(args) -> int:
         getattr(args, "session_prompt", "") or
         os.environ.get("FLEXFACTOR_SESSION_PROMPT", "") or ""
     ).strip()
+    session_routing: dict | None = None
     resolved_targets: list[tuple[str, str]] = []
-    if prompts or session_prompt:
+    if prompts or session_prompt or getattr(args, "dashboard", True):
         # Resolve the whole queue before any prompt is accepted. This prevents
         # a half-routed session where target 1 was journaled and target 2 later
         # proved to be a label with no source checkout.
@@ -22489,15 +22490,15 @@ def run_audit(args) -> int:
         args.guidance_prepared = True
     if session_prompt:
         try:
-            receipt = _ff_steering.submit_session_prompt(
-                session_prompt, resolved_targets, source="cli-session")
+            session_routing = _ff_steering.route_session_prompt(
+                session_prompt, resolved_targets)
         except (OSError, ValueError) as exc:
             print(f"session prompt was not routed: {exc}", file=sys.stderr)
             return 2
-        print(f"[session {receipt['session_id'][:8]}] prompt routed before work began:")
-        for route in receipt["routes"]:
+        print("[session preview] prompt routed before work begins:")
+        for route in session_routing["routes"]:
             preview = " ".join(str(route["instruction"]).split())
-            print(f"  - {route['program']}: {preview[:240]}")
+            print(f"  - {route['program']}: {preview[:240] or '(no assigned work)'}")
     if int(getattr(args, "parallel", 1) or 1) != 1:
         print("[orchestrator] --parallel is retired; targets run one at a time ",
               "in the selected order.", file=sys.stderr, sep="")
@@ -22514,8 +22515,33 @@ def run_audit(args) -> int:
               "or spent.", file=sys.stderr)
         return 2
 
+    if session_routing is not None:
+        queue_hint = str(
+            os.environ.get("FLEXFACTOR_QUEUE_ID") or
+            os.environ.get("FLEXFACTOR_QUEUE_STATE") or ""
+        ).strip()
+        stable_session_id = ""
+        if queue_hint:
+            identity = queue_hint + "\n" + session_prompt + "\n" + "\n".join(
+                f"{name}\t{os.path.normcase(os.path.abspath(path))}"
+                for name, path in resolved_targets)
+            stable_session_id = hashlib.sha256(
+                identity.encode("utf-8")).hexdigest()[:32]
+        try:
+            receipt = _ff_steering.submit_session_prompt(
+                session_prompt, resolved_targets, source="cli-session",
+                session_id=stable_session_id)
+        except (OSError, ValueError) as exc:
+            print(f"session prompt was not saved: {exc}", file=sys.stderr)
+            return 2
+        print(f"[session {receipt['session_id'][:8]}] routed guidance queued.")
+
     # Start fresh dashboard state and (optionally) launch the live graph window.
     _PROGRESS.reset()
+    for position, (display_name, project_dir) in enumerate(
+            resolved_targets, start=1):
+        _PROGRESS.update(position, name=display_name, dir=project_dir,
+                         phase="queued", done=False)
     if getattr(args, "dashboard", True):
         _launch_dashboard(total)
 
