@@ -137,10 +137,18 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn("paths:", pull_request_trigger)
         self.assertIn("PREVIOUS_MAIN_SHA: ${{ github.event.before }}", workflow)
         self.assertIn('"${PREVIOUS_MAIN_SHA}:android/app/build.gradle.kts"', workflow)
-        self.assertIn("git ls-remote --exit-code --tags origin", workflow)
-        self.assertIn('if [ "$tag_lookup_rc" -eq 2 ]', workflow)
-        self.assertIn('elif [ "$tag_lookup_rc" -ne 0 ]', workflow)
-        self.assertIn('"refs/tags/$release_tag"', workflow)
+        self.assertNotIn("git ls-remote --exit-code --tags origin", workflow)
+        self.assertNotIn("git fetch --no-tags origin", workflow)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", workflow)
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag"', workflow
+        )
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/git/ref/heads/main"', workflow
+        )
+        self.assertIn('if [ "$tag_lookup_rc" -ne 0 ]; then', workflow)
+        self.assertIn("Only a proven 404 means the tag is absent", workflow)
+        self.assertIn(r"\(HTTP 404\)", workflow)
         self.assertIn("releases/tags/$release_tag", workflow)
         self.assertIn('if [ "$release_status" = 404 ]', workflow)
         self.assertIn('elif [ "$release_status" = 200 ]', workflow)
@@ -168,24 +176,18 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn('source_sha="$tag_commit"', workflow)
         self.assertIn('authorized_main_sha="$GITHUB_SHA"', workflow)
         tag_plan = workflow.index('if [ "$GITHUB_REF_TYPE" = "tag" ]; then')
-        fetch_main = workflow.index("git fetch --no-tags origin", tag_plan)
-        resolve_fetched_main = workflow.index(
-            "authorized_main_sha=$(git rev-parse", fetch_main
+        resolve_live_main = workflow.index(
+            "authorized_main_sha=$(gh api", tag_plan
+        )
+        main_ref = workflow.index(
+            '"repos/$GITHUB_REPOSITORY/git/ref/heads/main"', resolve_live_main
         )
         prove_tag_containment = workflow.index(
             'git merge-base --is-ancestor "$GITHUB_SHA" "$authorized_main_sha"',
-            resolve_fetched_main,
+            main_ref,
         )
-        self.assertIn(
-            "+refs/heads/main:refs/remotes/origin/release-authorized-main",
-            workflow[fetch_main:resolve_fetched_main],
-        )
-        self.assertIn(
-            "refs/remotes/origin/release-authorized-main",
-            workflow[resolve_fetched_main:prove_tag_containment],
-        )
-        self.assertLess(fetch_main, resolve_fetched_main)
-        self.assertLess(resolve_fetched_main, prove_tag_containment)
+        self.assertLess(resolve_live_main, main_ref)
+        self.assertLess(main_ref, prove_tag_containment)
         self.assertIn("require_exact_tag()", workflow)
         self.assertGreaterEqual(workflow.count("require_exact_tag"), 8)
         self.assertIn("--draft", workflow)
