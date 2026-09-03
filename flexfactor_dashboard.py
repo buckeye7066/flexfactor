@@ -931,6 +931,30 @@ def submit_steering(name: str, project_dir: str, comment: str) -> tuple[bool, st
     return True, "queued - the running audit picks it up at its next checkpoint"
 
 
+def submit_session_steering(targets: list[tuple[str, str]],
+                            comment: str) -> tuple[bool, str]:
+    """Route one live prompt across the active/queued programs by name.
+
+    The same durable per-program journals are used, so the current target sees
+    its portion at the next checkpoint and later targets see theirs when their
+    turn begins. No instruction is stranded in dashboard-only state.
+    """
+    if _steer is None:
+        return False, "steering module not available in this tree"
+    text = str(comment or "").strip()
+    if not text:
+        return False, "type a comment first"
+    if not targets:
+        return False, "no programs are available to route"
+    try:
+        receipt = _steer.submit_session_prompt(
+            text, targets, source="desktop-dashboard-session")
+    except (ValueError, OSError) as e:
+        return False, f"not accepted: {e}"
+    return True, (f"routed session {receipt['session_id'][:8]} to "
+                  f"{len(receipt['routes'])} program(s)")
+
+
 def save_guidance(name: str, project_dir: str, prompt: str) -> tuple[bool, str]:
     """Save a standing, per-program guiding prompt from the desktop dashboard."""
     if _steer is None:
@@ -1049,7 +1073,10 @@ def _main() -> int:
 
     def do_send(_event=None) -> None:
         name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
-        ok, msg = submit_steering(name, pdir, entry.get())
+        if steer_target.get() == "All programs (auto-route)":
+            ok, msg = submit_session_steering(steer_targets_cache, entry.get())
+        else:
+            ok, msg = submit_steering(name, pdir, entry.get())
         if ok:
             entry.delete(0, "end")
         steer_note.set(msg)
@@ -1102,15 +1129,21 @@ def _main() -> int:
         steer_targets_cache[:] = targets
         labelled = steering_labels(targets)
         steer_by_label.clear()
+        steer_by_label["All programs (auto-route)"] = ("", "")
         steer_by_label.update({lab: (n, d) for lab, n, d in labelled})
         menu = target_menu["menu"]
         menu.delete(0, "end")
+        if len(labelled) > 1:
+            menu.add_command(label="All programs (auto-route)",
+                             command=lambda: steer_target.set(
+                                 "All programs (auto-route)"))
         for label, _n, _d in labelled:
             menu.add_command(label=label,
                              command=lambda lb=label: steer_target.set(lb))
         current = steer_target.get()
         if labelled and current not in steer_by_label:
-            steer_target.set(labelled[0][0])
+            steer_target.set("All programs (auto-route)"
+                             if len(labelled) > 1 else labelled[0][0])
         elif not labelled:
             steer_target.set("")
         load_guidance()

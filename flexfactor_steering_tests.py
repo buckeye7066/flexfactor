@@ -54,6 +54,126 @@ class SteeringTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fs.submit("Target", self.project, value, root=self.root)
 
+    def test_multi_program_prompt_routes_named_and_shared_requirements(self):
+        grant = os.path.join(self.root, "GrantFlow")
+        sermon = os.path.join(self.root, "sermonsmith")
+        os.makedirs(grant)
+        os.makedirs(sermon)
+        routed = fs.route_session_prompt(
+            "GrantFlow: repair billing. Also test tier enforcement. "
+            "SermonSmith: fix the Bible reader. All programs must push verified work.",
+            [("GrantFlow", grant), ("SermonSmith", sermon)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("repair billing", by_name["GrantFlow"])
+        self.assertIn("tier enforcement", by_name["GrantFlow"])
+        self.assertNotIn("Bible reader", by_name["GrantFlow"])
+        self.assertIn("Bible reader", by_name["SermonSmith"])
+        self.assertIn("push verified work", by_name["GrantFlow"])
+        self.assertIn("push verified work", by_name["SermonSmith"])
+
+    def test_explicit_target_wins_over_shared_words_inside_its_requirement(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target: show all programs in the dropdown.",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("all programs", by_name["Target"])
+        self.assertEqual("", by_name["Other"])
+
+    def test_semicolon_can_start_a_shared_requirement(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target: repair billing; all programs must run tests",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("repair billing", by_name["Target"])
+        self.assertIn("run tests", by_name["Target"])
+        self.assertIn("run tests", by_name["Other"])
+
+    def test_bullets_follow_their_target_heading(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target:\n- keep login\nOther:\n- add exports",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("keep login", by_name["Target"])
+        self.assertNotIn("add exports", by_name["Target"])
+        self.assertIn("add exports", by_name["Other"])
+
+    def test_short_names_and_address_positions_are_supported(self):
+        db = os.path.join(self.root, "DB")
+        os.makedirs(db)
+        routed = fs.route_session_prompt(
+            "UI: call the DB only after login. DB: add the index.",
+            [("UI", self.project), ("DB", db)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("call the DB", by_name["UI"])
+        self.assertNotIn("call the DB", by_name["DB"])
+        self.assertIn("add the index", by_name["DB"])
+
+    def test_shared_checkout_alias_is_discarded_and_duplicate_target_is_accepted(self):
+        left = os.path.join(self.root, "left", "repo")
+        right = os.path.join(self.root, "right", "repo")
+        os.makedirs(left)
+        os.makedirs(right)
+        routed = fs.route_session_prompt(
+            "Alpha: fix login. Beta: add exports.",
+            [("Alpha", left), ("Beta", right), ("Alpha", left)],
+        )
+        self.assertEqual(["Alpha", "Beta"], [row["program"] for row in routed["routes"]])
+
+    def test_session_prompt_is_durable_and_claimed_by_each_target_when_worked(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        receipt = fs.submit_session_prompt(
+            "Target: keep login. Other: add exports.",
+            [("Target", self.project), ("Other", other)],
+            root=self.root,
+        )
+        self.assertEqual(2, len(receipt["submission_ids"]))
+        target_context, target_ids, _ = fs.refresh_context(
+            "PURPOSE", "Target", self.project, "run-target", root=self.root)
+        other_context, other_ids, _ = fs.refresh_context(
+            "PURPOSE", "Other", other, "run-other", root=self.root)
+        self.assertIn("keep login", target_context)
+        self.assertNotIn("add exports", target_context)
+        self.assertIn("add exports", other_context)
+        self.assertEqual(1, len(target_ids))
+        self.assertEqual(1, len(other_ids))
+        target_row = fs.list_comments("Target", self.project, root=self.root)[0]
+        self.assertEqual(receipt["session_id"], target_row["session_id"])
+        self.assertEqual("multi-program-session", target_row["scope"])
+
+    def test_session_prompt_does_not_leak_named_work_to_unmentioned_target(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        receipt = fs.submit_session_prompt(
+            "Target: keep login.",
+            [("Target", self.project), ("Other", other)],
+            root=self.root,
+        )
+        self.assertEqual(1, len(receipt["submission_ids"]))
+        self.assertEqual([], fs.list_comments("Other", other, root=self.root))
+
+    def test_session_submission_is_idempotent_for_a_queue_session(self):
+        first = fs.submit_session_prompt(
+            "Target: keep login.", [("Target", self.project)],
+            root=self.root, session_id="queue-one-prompt-one")
+        second = fs.submit_session_prompt(
+            "Target: keep login.", [("Target", self.project)],
+            root=self.root, session_id="queue-one-prompt-one")
+        self.assertEqual(first["submission_ids"], second["submission_ids"])
+        self.assertEqual(1, len(fs.list_comments("Target", self.project,
+                                                root=self.root)))
+
     def test_guidance_is_program_scoped_durable_and_injected_each_run(self):
         saved = fs.set_guidance(
             "Target", self.project,
@@ -94,6 +214,25 @@ class SteeringTests(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertEqual("", __import__("flexfactor_dashboard").guidance_value(
                 "Target", self.project))
+        finally:
+            fs.DEFAULT_ROOT = original
+
+    def test_dashboard_can_auto_route_one_live_session_prompt(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        original = fs.DEFAULT_ROOT
+        fs.DEFAULT_ROOT = self.root
+        try:
+            ok, message = __import__("flexfactor_dashboard").submit_session_steering(
+                [("Target", self.project), ("Other", other)],
+                "Target: test login. Other: repair exports.",
+            )
+            self.assertTrue(ok, message)
+            self.assertIn("2 program", message)
+            self.assertIn("test login", fs.list_comments(
+                "Target", self.project, root=self.root)[0]["comment"])
+            self.assertIn("repair exports", fs.list_comments(
+                "Other", other, root=self.root)[0]["comment"])
         finally:
             fs.DEFAULT_ROOT = original
 
