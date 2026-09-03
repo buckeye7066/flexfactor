@@ -227,6 +227,16 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Free ephemeral runner disk for models and Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          # These preinstalled toolchains are not used by this Python/Node workflow.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h
+
       - name: Install and start the hosted open model
         shell: bash
         run: |
