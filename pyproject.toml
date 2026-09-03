@@ -30,7 +30,11 @@ all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
-flexfactor = "flexfactor:run_cli"
+# The installed CLI must enter through flexfactor_run so the directed/runtime
+# hardening installer is armed before run_cli executes. Pointing this at the
+# monolith bypassed the route filters, capacity guard, skip-dir guard and the
+# PowerShell/project-name protections installed by flexfactor_directed.
+flexfactor = "flexfactor_run:run_cli"
 
 [tool.setuptools]
 py-modules = [
