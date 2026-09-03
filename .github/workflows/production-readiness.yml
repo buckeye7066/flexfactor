@@ -195,10 +195,11 @@ jobs:
           python-version: "3.12"
       - name: Build exact-commit wheel
         run: python -m pip wheel . --no-deps --wheel-dir dist
-      - name: Installed-wheel smoke OUTSIDE the checkout (entry-point parity)
+      - name: Installed-wheel smoke OUTSIDE the checkout (functional parity)
         run: |
           python -m venv /tmp/ffvenv
-          /tmp/ffvenv/bin/python -m pip install -q --no-deps dist/*.whl
+          /tmp/ffvenv/bin/python -m pip install -q dist/*.whl
+          /tmp/ffvenv/bin/python -m pip check
           src_manifest="$(python flexfactor.py --runtime-manifest)"
           cd "$(mktemp -d)"
           inst_manifest="$(/tmp/ffvenv/bin/flexfactor --runtime-manifest)"
@@ -216,6 +217,17 @@ jobs:
           for mode in refactor scout audit prodready policy; do
             /tmp/ffvenv/bin/flexfactor "$mode" --help > /dev/null
           done
+          /tmp/ffvenv/bin/python - <<'PY'
+          import flexfactor as ff
+          assert ff._CODE_EXTS == set(ff._TREE_SITTER_LANGUAGE_BY_EXT)
+          failures = {}
+          for extension in sorted(ff._CODE_EXTS):
+              ok, note = ff._tree_sitter_source_syntax_ok(extension, b"")
+              if ok is not True:
+                  failures[extension] = note
+          assert not failures, failures
+          print("installed wheel parsed", len(ff._CODE_EXTS), "source extensions")
+          PY
       - name: Record SHA-256 checksums
         run: |
           python - <<'PY'

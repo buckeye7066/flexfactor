@@ -334,9 +334,49 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 "BEGIN { unlink 'owner-data' }\nprint 'safe';\n",
                 {},
             )
-        self.assertIsNone(ok)
-        self.assertIn("no safe pre-write parser", note)
+        self.assertIs(ok, True, note)
+        self.assertIn("Tree-sitter perl", note)
         forbidden.assert_not_called()
+
+    def test_every_advertised_source_extension_has_a_bundled_parser(self):
+        self.assertEqual(
+            ff._CODE_EXTS, set(ff._TREE_SITTER_LANGUAGE_BY_EXT),
+            "an advertised mutable source extension has no parser mapping",
+        )
+        for extension in sorted(ff._CODE_EXTS):
+            with self.subTest(extension=extension):
+                ok, note = ff._tree_sitter_source_syntax_ok(extension, b"")
+                self.assertIs(ok, True, note)
+
+    def test_previously_unhandled_languages_parse_before_mutation(self):
+        valid = {
+            "src/X.java": "class X { int value() { return 1; } }\n",
+            "src/lib.rs": "fn value() -> i32 { 1 }\n",
+            "src/X.cs": "class X { int Value() { return 1; } }\n",
+            "src/main.kt": 'fun main() { println("ok") }\n',
+            "src/main.swift": "func value() -> Int { return 1 }\n",
+        }
+        with tempfile.TemporaryDirectory() as project:
+            for path, source in valid.items():
+                with self.subTest(path=path):
+                    ok, note = ff._prewrite_source_syntax_ok(
+                        project, path, source, {},
+                    )
+                    self.assertIs(ok, True, note)
+                    bad, bad_note = ff._prewrite_source_syntax_ok(
+                        project, path, "{", {},
+                    )
+                    self.assertIs(bad, False, bad_note)
+
+    def test_install_refresh_discovers_new_repository_esbuild(self):
+        with tempfile.TemporaryDirectory() as project:
+            binary = os.path.join(project, "node_modules", ".bin", "esbuild")
+            os.makedirs(os.path.dirname(binary), exist_ok=True)
+            with open(binary, "w", encoding="utf-8") as handle:
+                handle.write("installed after initial detection\n")
+            stack = {"esbuild": None, "toolchains": []}
+            ff._refresh_verification_status(project, stack)
+        self.assertEqual(binary, stack["esbuild"])
 
     def test_all_mutation_modes_use_the_shared_native_source_preflight(self):
         for function in (
@@ -5360,11 +5400,22 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         path = "test_generated.py"
         calls = []
 
-        def runner(command, _project, timeout=900, env=None):
+        def runner(command, run_project, timeout=900, env=None):
             del timeout, env
             calls.append(command)
             if ".flexfactor-missing-" in command[-1]:
                 return ff.subprocess.CompletedProcess(command, 4, "", "missing")
+            with open(
+                    os.path.join(run_project, *path.split("/")),
+                    encoding="utf-8") as handle:
+                current = handle.read()
+            canary = re.search(
+                r"FLEXFACTOR_EXECUTION_CANARY_[0-9a-f]+", current,
+            )
+            if canary:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", canary.group(0),
+                )
             return ff.subprocess.CompletedProcess(command, 0, "1 passed", "")
 
         with _tempfile_ceiling.TemporaryDirectory() as project, \
@@ -5376,8 +5427,9 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 {"test_cmd": ["python", "-m", "pytest", "-q"]},
             )
         self.assertIs(ok, True, note)
-        self.assertEqual(2, len(calls))
+        self.assertEqual(3, len(calls))
         self.assertEqual(path, calls[1][-1])
+        self.assertEqual(path, calls[2][-1])
 
     def test_javascript_exact_file_with_only_skips_gets_no_credit(self):
         path = "tests/generated.test.js"
@@ -5390,6 +5442,17 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 return ff.subprocess.CompletedProcess(
                     command, 1, "", "no matching test file",
                 )
+            with open(
+                    os.path.join(_project, *path.split("/")),
+                    encoding="utf-8") as handle:
+                current = handle.read()
+            canary = re.search(
+                r"FLEXFACTOR_EXECUTION_CANARY_[0-9a-f]+", current,
+            )
+            if canary:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", canary.group(0),
+                )
             return ff.subprocess.CompletedProcess(
                 command, 0,
                 "ℹ tests 1\nℹ pass 0\nℹ fail 0\nℹ skipped 1\n",
@@ -5400,13 +5463,82 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
              mock.patch.object(ff, "_run", side_effect=runner):
             ok, note = ff._run_generated_test_file(
                 project,
-                {"path": path, "contents": "test.skip('later', () => {});\n"},
+                {"path": path, "contents": "test('later', () => {});\n"},
                 {"test_cmd": ["npm", "test"]},
             )
         self.assertIs(ok, False)
         self.assertIn("no executed-test evidence", note)
-        self.assertEqual(2, len(calls))
-        self.assertEqual(["npm", "test", "--", path], calls[1])
+        self.assertEqual(3, len(calls))
+        self.assertEqual(["npm", "test", "--", path], calls[2])
+
+    def test_forged_pass_text_and_early_exit_cannot_replace_execution_proof(self):
+        path = "test_forged.py"
+        source = (
+            "import os\n"
+            "os.write(1, b'1 passed\\n')\n"
+            "os._exit(0)\n"
+            "def test_never_collected():\n"
+            "    assert False\n"
+        )
+
+        def forged_runner(command, run_project, timeout=900, env=None):
+            del timeout, env
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(command, 4, "", "missing")
+            with open(os.path.join(run_project, path),
+                      encoding="utf-8") as handle:
+                current = handle.read()
+            # The import-time exit prevents even the mutated body from running;
+            # stdout still carries the forged legacy evidence.
+            self.assertIn("FLEXFACTOR_EXECUTION_CANARY_", current)
+            return ff.subprocess.CompletedProcess(command, 0, "1 passed", "")
+
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, path), "w", encoding="utf-8") as handle:
+                handle.write(source)
+            with mock.patch.object(ff, "_run", side_effect=forged_runner):
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": ["python", "-m", "pytest", "-q"]},
+                )
+        self.assertIs(ok, False)
+        self.assertIn("did not prove execution", note)
+
+    def test_real_pytest_rejects_import_time_exit_forgery(self):
+        path = "test_forged.py"
+        source = (
+            "import os\n"
+            "os.write(1, b'1 passed\\n')\n"
+            "os._exit(0)\n"
+            "def test_never_collected():\n"
+            "    assert False\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            trust = ff._grant_run_trust(project)
+            try:
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+        self.assertIs(ok, False)
+        self.assertIn("did not prove execution", note)
+
+    def test_real_pytest_accepts_only_after_canary_and_test_pass(self):
+        path = "test_generated.py"
+        source = "def test_generated():\n    assert 2 + 2 == 4\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            trust = ff._grant_run_trust(project)
+            try:
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+        self.assertIs(ok, True, note)
+        self.assertIn("failure canary", note)
 
     def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
         for source in (
@@ -5653,11 +5785,114 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             target = os.path.join(project, *rel.split("/"))
             self.assertTrue(os.path.isfile(target))
             with open(target, encoding="utf-8") as handle:
-                self.assertEqual(replacement, handle.read())
+                self.assertEqual(original, handle.read())
         self.assertEqual([], written)
         self.assertIsNone(status)
-        self.assertIn("changed during execution", refusal)
+        self.assertIn("unauthorized worktree", refusal)
         self.assertEqual([rel], rollback_failed)
+
+    def test_generated_tests_execute_only_in_copy_and_cannot_mutate_owner_files(self):
+        rel = "tests/test_side_effect.py"
+        source = (
+            "from pathlib import Path\n"
+            "def test_side_effect():\n"
+            "    Path('app.py').write_text('MUTATED\\n')\n"
+            "    Path('extra.py').write_text('EXTRA\\n')\n"
+            "    assert True\n"
+        )
+        seen_execution_dirs = []
+
+        def mutating_runner(run_project, _stack):
+            seen_execution_dirs.append(run_project)
+            with open(os.path.join(run_project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("MUTATED\n")
+            with open(os.path.join(run_project, "extra.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("EXTRA\n")
+            return True, "1 passed"
+
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            with mock.patch.object(
+                    ff, "_run_unit_tests", side_effect=mutating_runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            with open(os.path.join(project, "app.py"), encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+            self.assertFalse(os.path.exists(os.path.join(project, "extra.py")))
+            self.assertTrue(seen_execution_dirs)
+            self.assertNotEqual(
+                os.path.realpath(project), os.path.realpath(seen_execution_dirs[0]),
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py, extra.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_real_pytest_side_effects_are_confined_to_execution_copy(self):
+        rel = "tests/test_side_effect.py"
+        source = (
+            "from pathlib import Path\n"
+            "def test_side_effect():\n"
+            "    Path('app.py').write_text('MUTATED\\n')\n"
+            "    Path('extra.py').write_text('EXTRA\\n')\n"
+            "    assert True\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            trust = ff._grant_run_trust(project)
+            try:
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+            with open(os.path.join(project, "app.py"),
+                      encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+            self.assertFalse(os.path.exists(os.path.join(project, "extra.py")))
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py, extra.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_absolute_owner_mutation_is_detected_and_blocks_credit(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            owner = os.path.join(project, "app.py")
+            with open(owner, "w", encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+
+            def mutates_owner(_execution_dir, _stack):
+                with open(owner, "w", encoding="utf-8") as handle:
+                    handle.write("MUTATED\n")
+                return True, "1 passed"
+
+            with mock.patch.object(
+                    ff, "_run_unit_tests", side_effect=mutates_owner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("owner checkout changed: app.py", refusal)
+        self.assertEqual({rel, "app.py"}, set(rollback_failed))
 
 
 class PathContainmentTests(unittest.TestCase):

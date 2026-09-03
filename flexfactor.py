@@ -10927,11 +10927,34 @@ E2E_TEST_SYSTEM = (
 # JS/Python/JVM set so the ecosystems the toolchain detector can now BUILD are
 # also ecosystems the auditor can READ - detecting how to compile Elixir or C++
 # while skipping every .ex and .cpp file would gate a review that never happened.
-_CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+_CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".mjs", ".cjs", ".vue",
               ".svelte", ".go", ".rb", ".java", ".cs", ".php", ".rs", ".scala", ".kt",
               ".ex", ".exs", ".swift", ".dart", ".c", ".cc", ".cpp", ".cxx",
               ".h", ".hpp", ".m", ".mm", ".sh", ".bash", ".lua", ".pl", ".pm",
               ".clj", ".cljs", ".hs", ".jl", ".r", ".sql", ".tf", ".gradle"}
+
+# Every extension advertised above has a bundled, non-executing Tree-sitter
+# grammar.  This table is intentionally explicit and equality-tested: adding a
+# language to `_CODE_EXTS` without adding a safe pre-write parser must make CI
+# fail, not make that language silently read-only at runtime.  Ambiguous legacy
+# extensions follow the ecosystem FlexFactor's build detector assigns them to
+# (`.m`/`.mm` Objective-C, `.gradle` Groovy, `.tf` HCL).
+_TREE_SITTER_LANGUAGE_BY_EXT = {
+    ".py": "python",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+    ".cjs": "javascript", ".ts": "typescript", ".mts": "typescript",
+    ".cts": "typescript", ".tsx": "tsx",
+    ".vue": "vue", ".svelte": "svelte",
+    ".go": "go", ".rb": "ruby", ".java": "java", ".cs": "csharp",
+    ".php": "php", ".rs": "rust", ".scala": "scala", ".kt": "kotlin",
+    ".ex": "elixir", ".exs": "elixir", ".swift": "swift", ".dart": "dart",
+    ".c": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
+    ".h": "cpp", ".hpp": "cpp", ".m": "objc", ".mm": "objc",
+    ".sh": "bash", ".bash": "bash", ".lua": "lua",
+    ".pl": "perl", ".pm": "perl", ".clj": "clojure",
+    ".cljs": "clojure", ".hs": "haskell", ".jl": "julia", ".r": "r",
+    ".sql": "sql", ".tf": "hcl", ".gradle": "groovy",
+}
 # Legacy bounded-read ceiling for metadata and other intentionally sampled text.
 # Source enumeration and review do NOT use it as an exclusion ceiling: review_file
 # splits complete source into bounded chunks, so large files remain fully covered.
@@ -12086,6 +12109,15 @@ def _inventory_project(project_dir: str) -> dict:
             "entries": entries}
 
 
+def _find_project_esbuild(project_dir: str) -> str | None:
+    """Return the repository-local esbuild installed for this exact checkout."""
+    for candidate in ("esbuild.cmd", "esbuild.CMD", "esbuild"):
+        path = os.path.join(project_dir, "node_modules", ".bin", candidate)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _detect_stack(project_dir: str) -> dict:
     """Figure out how to build, test, and run the program with its OWN tooling."""
     info = {"is_node": False, "is_python": False, "framework": None, "scripts": {},
@@ -12139,11 +12171,7 @@ def _detect_stack(project_dir: str) -> dict:
         # single fixed file in ~0.3s instead of running the whole-project typecheck
         # (~minutes) after every fix. The full typecheck+build still runs at each
         # cycle commit, so verification stays comprehensive - just not per file.
-        for cand in ("esbuild.cmd", "esbuild.CMD", "esbuild"):
-            p = os.path.join(project_dir, "node_modules", ".bin", cand)
-            if os.path.isfile(p):
-                info["esbuild"] = p
-                break
+        info["esbuild"] = _find_project_esbuild(project_dir)
     if any(os.path.isfile(os.path.join(project_dir, f))
            for f in ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg")):
         info["is_python"] = True
@@ -14711,7 +14739,10 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     if not stack.get("test_cmd"):
         return None, "(no test runner detected)"
     print(f"    running tests: {' '.join(stack['test_cmd'])}")
-    r = _run(stack["test_cmd"], project_dir, timeout=1800)
+    r = _run(
+        stack["test_cmd"], project_dir, timeout=1800,
+        env=stack.get("_generated_test_env"),
+    )
     return (r.returncode == 0, _tail(r.stdout + "\n" + r.stderr, 40))
 
 
@@ -15125,6 +15156,48 @@ def _generated_test_source_has_case(path: str, source: str) -> bool:
     return False
 
 
+def _tree_sitter_source_syntax_ok(
+        extension: str, encoded: bytes,
+) -> tuple[bool | None, str]:
+    """Parse one candidate without importing or executing it.
+
+    The pinned language pack ships its grammars inside the wheel.  A missing
+    package/grammar is therefore an installation defect and remains tri-state
+    ``None`` so every mutation caller fails closed.  Tree-sitter deliberately
+    recovers after syntax errors; ``root_node.has_error`` is load-bearing here
+    and prevents a recovered partial tree from being accepted as valid source.
+    """
+    language = _TREE_SITTER_LANGUAGE_BY_EXT.get(extension)
+    if not language:
+        return None, f"no Tree-sitter grammar is registered for {extension or 'this type'}"
+    try:
+        from tree_sitter_language_pack import get_parser
+    except (ImportError, OSError) as exc:
+        return None, f"bundled Tree-sitter parser is unavailable: {exc}"
+    try:
+        root = get_parser(language).parse(encoded).root_node
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return None, f"bundled {language} parser is unavailable: {exc}"
+    if not root.has_error:
+        return True, f"Tree-sitter {language} syntax check"
+
+    first_error = None
+    pending = [root]
+    while pending:
+        node = pending.pop(0)
+        if node.is_error or node.is_missing:
+            first_error = node
+            break
+        pending[0:0] = list(node.children)
+    if first_error is None:
+        return False, f"Tree-sitter {language} reported a syntax error"
+    row, column = first_error.start_point
+    kind = "missing token" if first_error.is_missing else "syntax error"
+    return False, (
+        f"Tree-sitter {language} {kind} at line {row + 1}, column {column + 1}"
+    )
+
+
 def _prewrite_source_syntax_details(
         project_dir: str, path: str, source: str, stack: dict, *,
         allow_empty: bool = False,
@@ -15184,29 +15257,29 @@ def _prewrite_source_syntax_details(
                     command.append(f"--outfile={devnull}")
                 result = _run(command, project_dir, timeout=60)
                 if getattr(result, "flexfactor_launch_error", False):
-                    return None, "esbuild parser did not run", None
-                if result.returncode != 0:
+                    result = None
+                if result is not None and result.returncode != 0:
                     return False, (
                         _tail(result.stderr or result.stdout)
                         or "esbuild syntax check failed"
                     ), None
-                if ext in (".jsx", ".tsx"):
+                if result is not None and ext in (".jsx", ".tsx"):
                     transformed = result.stdout or ""
                     if not transformed.strip():
                         return False, "esbuild returned no transformed source", None
                     return True, "esbuild syntax and JSX transform", transformed
-                return True, "esbuild syntax check", source
+                if result is not None:
+                    return True, "esbuild syntax check", source
 
-            if ext in (".js", ".cjs", ".mjs"):
-                if not shutil.which("node"):
-                    return None, "node parser is not installed", None
+            if ext in (".js", ".cjs", ".mjs") and shutil.which("node"):
                 result = _run(["node", "--check", candidate], project_dir, timeout=60)
                 if getattr(result, "flexfactor_launch_error", False):
-                    return None, "node parser did not run", None
-                ok = result.returncode == 0
-                return ok, (
-                    _tail(result.stderr or result.stdout) or "node --check"
-                ), source if ok else None
+                    result = None
+                if result is not None:
+                    ok = result.returncode == 0
+                    return ok, (
+                        _tail(result.stderr or result.stdout) or "node --check"
+                    ), source if ok else None
 
             if ext in (".ts", ".cts", ".mts") and shutil.which("node"):
                 unsupported = ("bad option", "unknown option", "not allowed")
@@ -15218,7 +15291,7 @@ def _prewrite_source_syntax_details(
                     )
                     output = (result.stderr or "") + "\n" + (result.stdout or "")
                     if getattr(result, "flexfactor_launch_error", False):
-                        return None, "node TypeScript parser did not run", None
+                        break
                     if result.returncode == 0:
                         return True, f"node {flag} --check", source
                     if not any(marker in output.lower() for marker in unsupported):
@@ -15227,18 +15300,17 @@ def _prewrite_source_syntax_details(
                         ), None
 
             if ext == ".go":
-                if not shutil.which("gofmt"):
-                    return None, "gofmt parser is not installed", None
-                result = _run(
-                    ["gofmt", "-e", "-l", candidate],
-                    project_dir, timeout=60,
-                )
-                if getattr(result, "flexfactor_launch_error", False):
-                    return None, "gofmt parser did not run", None
-                ok = result.returncode == 0
-                return ok, (
-                    _tail(result.stderr or result.stdout) or "gofmt syntax check"
-                ), source if ok else None
+                if shutil.which("gofmt"):
+                    result = _run(
+                        ["gofmt", "-e", "-l", candidate],
+                        project_dir, timeout=60,
+                    )
+                    if not getattr(result, "flexfactor_launch_error", False):
+                        ok = result.returncode == 0
+                        return ok, (
+                            _tail(result.stderr or result.stdout)
+                            or "gofmt syntax check"
+                        ), source if ok else None
 
             # Reuse the same parse-only gates that protect an applied Audit or
             # Production Ready edit, but point them at this disposable file.
@@ -15256,16 +15328,18 @@ def _prewrite_source_syntax_details(
                 if _pr is not None and ext in safe_external_exts else None
             )
             if command:
-                if not shutil.which(command[0]):
-                    return None, f"{command[0]} parser is not installed", None
-                result = _run(command, project_dir, timeout=60)
-                if getattr(result, "flexfactor_launch_error", False):
-                    return None, f"{command[0]} parser did not run", None
-                ok = result.returncode == 0
-                return ok, (
-                    _tail(result.stderr or result.stdout)
-                    or f"{command[0]} syntax check"
-                ), source if ok else None
+                if shutil.which(command[0]):
+                    result = _run(command, project_dir, timeout=60)
+                    if not getattr(result, "flexfactor_launch_error", False):
+                        ok = result.returncode == 0
+                        return ok, (
+                            _tail(result.stderr or result.stdout)
+                            or f"{command[0]} syntax check"
+                        ), source if ok else None
+
+            tree_ok, tree_note = _tree_sitter_source_syntax_ok(ext, encoded)
+            if tree_ok is not None:
+                return tree_ok, tree_note, source if tree_ok else None
     except OSError as exc:
         return None, f"temporary syntax preflight failed: {exc}", None
     return None, (
@@ -15304,6 +15378,247 @@ def _selected_test_command(command: list[str], path: str) -> list[str]:
     return selected + [path]
 
 
+def _python_failure_canary_source(source: str, token: str) -> str | None:
+    """Replace every collectable Python test body with a unique hard failure."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    targets: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in tree.body:
+        if isinstance(node, function_types):
+            if (node.name.startswith("test_")
+                    and not _python_test_is_unconditionally_skipped(node)):
+                targets.append(node)
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {_ast_dotted_name(base) for base in node.bases}
+        collectable = node.name.startswith("Test") or any(
+            base.rsplit(".", 1)[-1] == "TestCase" for base in bases if base
+        )
+        if (not collectable
+                or _python_test_is_unconditionally_skipped(node)
+                or any(isinstance(member, function_types)
+                       and member.name == "__init__" for member in node.body)):
+            continue
+        targets.extend(
+            member for member in node.body
+            if (isinstance(member, function_types)
+                and member.name.startswith("test_")
+                and not _python_test_is_unconditionally_skipped(member))
+        )
+    if not targets:
+        return None
+    for node in targets:
+        node.body = [ast.Raise(
+            exc=ast.Call(
+                func=ast.Name(id="AssertionError", ctx=ast.Load()),
+                args=[ast.Constant(value=token)], keywords=[],
+            ),
+            cause=None,
+        )]
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree) + "\n"
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _javascript_test_callee(node, encoded: bytes) -> bool:
+    """Whether a Tree-sitter callee is a direct runnable test/it chain."""
+    if node is None:
+        return False
+    if node.type == "identifier":
+        return encoded[node.start_byte:node.end_byte] in (b"test", b"it")
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        name = encoded[prop.start_byte:prop.end_byte] if prop is not None else b""
+        return name in (b"each", b"only") and _javascript_test_callee(
+            node.child_by_field_name("object"), encoded,
+        )
+    if node.type == "call_expression":
+        return _javascript_test_callee(
+            node.child_by_field_name("function"), encoded,
+        )
+    return False
+
+
+def _javascript_failure_canary_source(
+        extension: str, source: str, token: str,
+) -> str | None:
+    """Replace direct JavaScript/TypeScript test callbacks with hard failures."""
+    language = {
+        ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
+        ".tsx": "tsx",
+    }.get(extension, "javascript")
+    try:
+        from tree_sitter_language_pack import get_parser
+        encoded = source.encode("utf-8", "strict")
+        root = get_parser(language).parse(encoded).root_node
+    except (ImportError, LookupError, OSError, RuntimeError,
+            TypeError, UnicodeEncodeError, ValueError):
+        return None
+    if root.has_error:
+        return None
+    replacements: list[tuple[int, int, bytes]] = []
+    statement = (
+        "{ throw new Error(" + json.dumps(token) + "); }"
+    ).encode("utf-8")
+    for top_level in root.named_children:
+        if top_level.type != "expression_statement" or not top_level.named_children:
+            continue
+        call = top_level.named_children[0]
+        if (call.type != "call_expression"
+                or not _javascript_test_callee(
+                    call.child_by_field_name("function"), encoded)):
+            continue
+        arguments = call.child_by_field_name("arguments")
+        callbacks = [
+            child for child in (arguments.named_children if arguments else [])
+            if child.type in ("arrow_function", "function_expression")
+        ]
+        if not callbacks:
+            continue
+        body = callbacks[-1].child_by_field_name("body")
+        if body is None:
+            continue
+        replacements.append((body.start_byte, body.end_byte, statement))
+    if not replacements:
+        return None
+    mutated = encoded
+    for start, end, replacement in sorted(replacements, reverse=True):
+        mutated = mutated[:start] + replacement + mutated[end:]
+    return mutated.decode("utf-8")
+
+
+def _generated_test_failure_canary_source(
+        path: str, source: str, token: str,
+) -> str | None:
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".py":
+        return _python_failure_canary_source(source, token)
+    if extension in _GENERATED_JS_TEST_EXTS:
+        return _javascript_failure_canary_source(extension, source, token)
+    return None
+
+
+def _generated_test_execution_env(project_dir: str, execution_dir: str) -> dict:
+    """Remove the owner checkout's pathname from an isolated test environment."""
+    original = os.path.abspath(project_dir)
+    isolated = os.path.abspath(execution_dir)
+    env = {}
+    for key, value in os.environ.items():
+        text = str(value)
+        env[key] = text.replace(original, isolated) if original in text else text
+    env["PWD"] = isolated
+    if "GITHUB_WORKSPACE" in env:
+        env["GITHUB_WORKSPACE"] = isolated
+    if "INIT_CWD" in env:
+        env["INIT_CWD"] = isolated
+    return env
+
+
+def _generated_test_snapshot_ignored(path: str) -> bool:
+    canonical = _canon_rel(path).strip("/")
+    if not canonical:
+        return False
+    parts = canonical.split("/")
+    return (
+        any(part in (_SKIP_DIRS | {".git"}) for part in parts)
+        or _is_ephemeral_path(canonical)
+        or _is_flexfactor_artifact(canonical)
+    )
+
+
+def _generated_test_worktree_snapshot(project_dir: str) -> dict[str, tuple]:
+    """Hash the publishable worktree plus branch/index state without following links."""
+    state: dict[str, tuple] = {}
+    root = os.path.abspath(project_dir)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        kept_dirs = []
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            rel = _canon_rel(os.path.relpath(full, root))
+            if _generated_test_snapshot_ignored(rel):
+                continue
+            try:
+                item = os.lstat(full)
+            except OSError as exc:
+                raise RuntimeError(f"could not snapshot {rel}: {exc}") from exc
+            if stat.S_ISLNK(item.st_mode):
+                try:
+                    target = os.readlink(full)
+                except OSError as exc:
+                    raise RuntimeError(f"could not snapshot link {rel}: {exc}") from exc
+                state[rel] = ("symlink", stat.S_IMODE(item.st_mode), target)
+            else:
+                kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = _canon_rel(os.path.relpath(full, root))
+            if _generated_test_snapshot_ignored(rel):
+                continue
+            try:
+                item = os.lstat(full)
+            except OSError as exc:
+                raise RuntimeError(f"could not snapshot {rel}: {exc}") from exc
+            if stat.S_ISLNK(item.st_mode):
+                try:
+                    target = os.readlink(full)
+                except OSError as exc:
+                    raise RuntimeError(f"could not snapshot link {rel}: {exc}") from exc
+                state[rel] = ("symlink", stat.S_IMODE(item.st_mode), target)
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                state[rel] = ("non-regular", stat.S_IFMT(item.st_mode))
+                continue
+            digest = _file_sha_contained(root, rel)
+            if digest is None:
+                raise RuntimeError(f"contained snapshot read was refused for {rel}")
+            state[rel] = (
+                "file", stat.S_IMODE(item.st_mode), int(item.st_size), digest,
+            )
+    if _is_git_repo(root):
+        for label, command in (
+                ("head", ["rev-parse", "--verify", "HEAD"]),
+                ("branch", ["symbolic-ref", "-q", "HEAD"]),
+                ("status", ["status", "--porcelain=v1", "-z",
+                            "--untracked-files=all"])):
+            result = _git(command, root)
+            # Detached HEAD makes symbolic-ref rc=1 and is itself valid state;
+            # preserve both status and output rather than treating that as an
+            # incomplete snapshot.
+            if label != "branch" and result.returncode != 0:
+                raise RuntimeError(f"could not snapshot git {label}: {_tail(result.stderr)}")
+            state[f"\0git-{label}"] = (
+                "git", int(result.returncode), result.stdout or "",
+            )
+    return state
+
+
+def _generated_test_snapshot_changes(
+        before: dict[str, tuple], after: dict[str, tuple],
+) -> list[str]:
+    return sorted(
+        key for key in (set(before) | set(after))
+        if before.get(key) != after.get(key)
+    )
+
+
+def _copy_generated_test_checkout(project_dir: str, destination: str) -> None:
+    """Create an independent execution copy; never share files or Git metadata."""
+    def ignore_git(_directory: str, names: list[str]) -> set[str]:
+        return {name for name in names if name == ".git"}
+
+    shutil.copytree(
+        project_dir, destination, symlinks=True, ignore=ignore_git,
+        copy_function=shutil.copy2,
+    )
+
+
 def _run_generated_test_file(project_dir: str, entry: dict,
                              stack: dict) -> tuple[bool, str]:
     """Execute one generated file and require file-specific runner evidence.
@@ -15319,6 +15634,7 @@ def _run_generated_test_file(project_dir: str, entry: dict,
     source = str(entry.get("contents") or "")
     extension = os.path.splitext(path)[1].lower()
     configured = [str(part) for part in (stack.get("test_cmd") or [])]
+    execution_env = stack.get("_generated_test_env")
     if not configured:
         return False, "no configured test command"
 
@@ -15335,7 +15651,7 @@ def _run_generated_test_file(project_dir: str, entry: dict,
         expression = "^(?:" + "|".join(re.escape(name) for name in names) + ")$"
         command = [configured[0], "test", "-json", "-count=1",
                    "-run", expression, package]
-        result = _run(command, project_dir, timeout=600)
+        result = _run(command, project_dir, timeout=600, env=execution_env)
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         passed: set[str] = set()
         skipped: set[str] = set()
@@ -15377,11 +15693,42 @@ def _run_generated_test_file(project_dir: str, entry: dict,
         return False, "could not establish an absent selector-control path"
     control = _run(
         _selected_test_command(base, missing_path), project_dir, timeout=600,
+        env=execution_env,
     )
     if control.returncode == 0:
         return False, "configured test runner ignored an absent exact-file selector"
+
+    # Stdout is controlled by the generated program and therefore cannot prove
+    # that the runner collected or executed a test.  First replace the exact
+    # declared test bodies (inside this disposable execution checkout) with an
+    # unpredictable failure.  The same selector must then fail and surface the
+    # token.  Import-time `os._exit(0)`, reporter monkey-patching, ignored file
+    # selectors, and fabricated "1 passed" text all fail this challenge.
+    token = "FLEXFACTOR_EXECUTION_CANARY_" + os.urandom(16).hex()
+    canary_source = _generated_test_failure_canary_source(path, source, token)
+    if canary_source is None:
+        return False, "could not construct an executable failure canary"
+    if _replace_contained(project_dir, path, canary_source) is None:
+        return False, "could not install the exact-file failure canary"
+    try:
+        canary = _run(
+            _selected_test_command(base, path), project_dir, timeout=600,
+            env=execution_env,
+        )
+        canary_output = (canary.stdout or "") + "\n" + (canary.stderr or "")
+    finally:
+        restored = _replace_contained(project_dir, path, source)
+    if restored is None:
+        return False, "could not restore generated source after failure canary"
+    if canary.returncode == 0 or token not in canary_output:
+        return False, (
+            "configured runner did not prove execution of the generated test "
+            "body with the failure canary: " + _tail(canary_output, 20)
+        )
+
     result = _run(
         _selected_test_command(base, path), project_dir, timeout=600,
+        env=execution_env,
     )
     output = (result.stdout or "") + "\n" + (result.stderr or "")
     if result.returncode != 0:
@@ -15391,7 +15738,10 @@ def _run_generated_test_file(project_dir: str, entry: dict,
             "exact generated test file reported no executed-test evidence: "
             + _tail(output, 20)
         )
-    return True, f"configured runner executed exact generated file {path}"
+    return True, (
+        f"configured runner executed exact generated file {path} and its "
+        "independent failure canary"
+    )
 
 
 def _write_and_run_generated_test_batch(
@@ -15539,41 +15889,139 @@ def _write_and_run_generated_test_batch(
             + ", ".join(changed)
         ), rollback_failed
 
-    status, log = _run_unit_tests(project_dir, stack)
-    changed = _changed_after_create(written_entries)
-    if changed:
+    try:
+        owner_before = _generated_test_worktree_snapshot(project_dir)
+    except RuntimeError as exc:
         rollback_failed = _rollback_created(written_entries)
         return [], None, "", (
-            "generated test content or identity changed during execution: "
-            + ", ".join(changed)
+            f"generated-test owner-worktree snapshot failed: {exc}"
         ), rollback_failed
-    if status is True and not _suite_reported_tests(log):
-        status = False
-        log = (log + "\n" if log else "") + (
-            "test command exited successfully but reported no executed-test evidence"
+
+    def _display_changes(changes: list[str]) -> str:
+        return ", ".join(
+            (f"<git-{item[5:]}>" if item.startswith("\0git-") else item)
+            for item in changes[:20]
         )
-    if status is True:
-        for entry in written_entries:
-            if not entry.get("_candidate_test"):
-                continue
-            executed, execution_note = _run_generated_test_file(
-                project_dir, entry, stack,
+
+    try:
+        with tempfile.TemporaryDirectory(
+                prefix="flexfactor-generated-tests-") as execution_parent:
+            execution_dir = os.path.join(execution_parent, "checkout")
+            _copy_generated_test_checkout(project_dir, execution_dir)
+            execution_stack = dict(stack)
+            execution_stack["_generated_test_env"] = (
+                _generated_test_execution_env(project_dir, execution_dir)
             )
-            if not executed:
-                rollback_failed = _rollback_created(written_entries)
-                return [], None, log, (
-                    f"generated test file was not individually executed: "
-                    f"{entry['path']}: {execution_note}"
-                ), rollback_failed
-            entry["_credit_as_test"] = True
-            entry["_execution_evidence"] = execution_note
-        changed = _changed_after_create(written_entries)
-        if changed:
-            rollback_failed = _rollback_created(written_entries)
-            return [], None, log, (
-                "generated test content or identity changed during exact-file "
-                "execution: " + ", ".join(changed)
-            ), rollback_failed
+            execution_before = _generated_test_worktree_snapshot(execution_dir)
+            trust_key = (
+                _grant_run_trust(execution_dir)
+                if _run_trust_allowed(project_dir) else None
+            )
+            try:
+                status, log = _run_unit_tests(execution_dir, execution_stack)
+                execution_changes = _generated_test_snapshot_changes(
+                    execution_before,
+                    _generated_test_worktree_snapshot(execution_dir),
+                )
+                owner_changes = _generated_test_snapshot_changes(
+                    owner_before,
+                    _generated_test_worktree_snapshot(project_dir),
+                )
+                receipt_changes = _changed_after_create(written_entries)
+                if execution_changes or owner_changes or receipt_changes:
+                    rollback_failed = _rollback_created(written_entries)
+                    rollback_failed.extend(
+                        item for item in owner_changes
+                        if not item.startswith("\0git-")
+                        and item not in rollback_failed
+                    )
+                    detail = []
+                    if execution_changes:
+                        detail.append(
+                            "isolated checkout changed: "
+                            + _display_changes(execution_changes)
+                        )
+                    if owner_changes:
+                        detail.append(
+                            "owner checkout changed: " + _display_changes(owner_changes)
+                        )
+                    if receipt_changes:
+                        detail.append(
+                            "generated identity changed: "
+                            + ", ".join(receipt_changes)
+                        )
+                    return [], None, log, (
+                        "generated test made an unauthorized worktree or Git "
+                        "mutation during suite execution (" + "; ".join(detail) + ")"
+                    ), rollback_failed
+
+                if status is True and not _suite_reported_tests(log):
+                    status = False
+                    log = (log + "\n" if log else "") + (
+                        "test command exited successfully but reported no "
+                        "executed-test evidence"
+                    )
+                if status is True:
+                    for entry in written_entries:
+                        if not entry.get("_candidate_test"):
+                            continue
+                        executed, execution_note = _run_generated_test_file(
+                            execution_dir, entry, execution_stack,
+                        )
+                        if not executed:
+                            rollback_failed = _rollback_created(written_entries)
+                            return [], None, log, (
+                                "generated test file was not individually executed: "
+                                f"{entry['path']}: {execution_note}"
+                            ), rollback_failed
+                        entry["_credit_as_test"] = True
+                        entry["_execution_evidence"] = execution_note
+
+                    execution_changes = _generated_test_snapshot_changes(
+                        execution_before,
+                        _generated_test_worktree_snapshot(execution_dir),
+                    )
+                    owner_changes = _generated_test_snapshot_changes(
+                        owner_before,
+                        _generated_test_worktree_snapshot(project_dir),
+                    )
+                    receipt_changes = _changed_after_create(written_entries)
+                    if execution_changes or owner_changes or receipt_changes:
+                        rollback_failed = _rollback_created(written_entries)
+                        rollback_failed.extend(
+                            item for item in owner_changes
+                            if not item.startswith("\0git-")
+                            and item not in rollback_failed
+                        )
+                        detail = []
+                        if execution_changes:
+                            detail.append(
+                                "isolated checkout changed: "
+                                + _display_changes(execution_changes)
+                            )
+                        if owner_changes:
+                            detail.append(
+                                "owner checkout changed: "
+                                + _display_changes(owner_changes)
+                            )
+                        if receipt_changes:
+                            detail.append(
+                                "generated identity changed: "
+                                + ", ".join(receipt_changes)
+                            )
+                        return [], None, log, (
+                            "generated test made an unauthorized worktree or Git "
+                            "mutation during exact-file execution ("
+                            + "; ".join(detail) + ")"
+                        ), rollback_failed
+            finally:
+                _revoke_run_trust(trust_key)
+    except (OSError, RuntimeError, shutil.Error) as exc:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            "generated tests could not be isolated and verified: "
+            f"{type(exc).__name__}: {exc}"
+        ), rollback_failed
     return written_entries, status, log, "", []
 
 
@@ -15604,8 +16052,13 @@ def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
                              log=lambda m: print(f"{pfx}{m}"))
 
 
-def _refresh_verification_status(stack: dict) -> None:
-    """Recompute whether the build gate is real, after bootstrap has run."""
+def _refresh_verification_status(project_dir: str, stack: dict) -> None:
+    """Refresh all install-dependent verifier capability after bootstrap."""
+    # node_modules does not normally exist during the initial stack scan.  An
+    # install can make esbuild available moments later; retaining the stale
+    # None made every otherwise valid TSX candidate fail closed for the entire
+    # run even though its parser had just been installed.
+    stack["esbuild"] = _find_project_esbuild(project_dir)
     try:
         import flexfactor_prodready as _pr
     except Exception:
@@ -18689,7 +19142,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # detect-time value was computed before any of it ran. Recompute, or
             # the run reports a stale UNVERIFIED warning for a repo it just
             # successfully bootstrapped.
-            _refresh_verification_status(stack)
+            _refresh_verification_status(project_dir, stack)
             if git:
                 bootstrap_status = _git(["status", "--porcelain=v1", "-z"], project_dir)
                 if bootstrap_status.returncode == 0:

@@ -14,7 +14,13 @@ license = { text = "Proprietary" }
 # optional extras rather than hard install requirements. Version floors are
 # pinned to the tested-compatible releases; the Py3.12 SDK compat is fragile
 # (see CLAUDE.md), so do not float these upward without re-running the tests.
-dependencies = []
+dependencies = [
+  "tree-sitter==0.26.0",
+  "tree-sitter-c-sharp==0.23.5",
+  "tree-sitter-embedded-template==0.25.0",
+  "tree-sitter-yaml==0.7.2",
+  "tree-sitter-language-pack==0.7.2",
+]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
