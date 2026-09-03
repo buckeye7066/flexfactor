@@ -76,6 +76,7 @@ jobs:
             echo "Could not resolve the managed cloud engine" >&2
             exit 1
           fi
+          rollout_engine=""
           if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
             pending_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
             if [ "$pending_engine" != "$android_engine" ]; then
@@ -100,6 +101,7 @@ jobs:
               echo "A staged cloud engine may lag Android by exactly one patch" >&2
               exit 1
             fi
+            rollout_engine="$pending_engine"
           elif [ "$declared_engine" != "$android_engine" ]; then
             echo "Cloud and Android engine pins differ without a rollout marker" >&2
             exit 1
@@ -109,12 +111,15 @@ jobs:
             health=$(curl --fail --silent --show-error --retry 3 \
               https://flexfactor-cloud.vercel.app/api/health) || health='{}'
             if jq -e --arg engine "$expected_engine" \
-                '.ok == true and .oauth_device_configured == true and .engine_ref == $engine' \
+                --arg rollout "$rollout_engine" \
+                '.ok == true and .oauth_device_configured == true
+                 and (.engine_ref == $engine
+                      or ($rollout != "" and .engine_ref == $rollout))' \
                 <<<"$health"; then
               exit 0
             fi
             if [ "$attempt" -eq 60 ]; then
-              echo "Managed control plane is not serving $expected_engine: $health" >&2
+              echo "Managed control plane is not serving an authorized engine: $health" >&2
               exit 1
             fi
             sleep 10

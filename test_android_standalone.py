@@ -195,6 +195,9 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertEqual(
             control_plane.count(r"=~ ^[0-9]+\.[0-9]+\.[0-9]+$"), 2)
         self.assertIn('expected_engine="$declared_engine"', control_plane)
+        self.assertIn('rollout_engine="$pending_engine"', control_plane)
+        self.assertIn(
+            '$rollout != "" and .engine_ref == $rollout', control_plane)
         self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
         self.assertIn("options: [auto]", workflow)
