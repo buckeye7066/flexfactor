@@ -16,6 +16,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MODES = new Set(["refactor", "scout", "audit", "prodready"]);
 const RUN_FIELDS = new Set([
   "request_id", "mode", "provider", "repository", "ref", "file", "goal",
+  "guidance",
   "scout_apply", "max_cost", "threshold", "max_iterations",
 ]);
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
@@ -333,6 +334,7 @@ export function validateRunRequest(source) {
     ref: typeof source.ref === "string" ? source.ref.trim() : "",
     file: typeof source.file === "string" ? source.file.trim() : "",
     goal: typeof source.goal === "string" ? source.goal.trim() : "",
+    guidance: typeof source.guidance === "string" ? source.guidance.trim() : "",
     scout_apply: source.scout_apply === true,
     max_cost: Number(source.max_cost),
     threshold: Number(source.threshold),
@@ -369,6 +371,10 @@ export function validateRunRequest(source) {
     }
   } else if (request.file || request.goal) {
     throw new ServiceError(400, "invalid_run", "File and goal are only valid for Option 1.");
+  }
+  if (request.guidance.length > 4_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(request.guidance)) {
+    throw new ServiceError(400, "invalid_guidance",
+      "Guiding prompts must contain at most 4,000 printable characters.");
   }
   if (request.mode !== "scout" && request.scout_apply) {
     throw new ServiceError(400, "invalid_run", "Scout apply is only valid for Option 2.");
@@ -590,6 +596,7 @@ function workflowInputs(request) {
     target_ref: request.ref,
     file: request.file,
     goal: request.goal,
+    guidance: request.guidance,
     scout_apply: String(request.scout_apply),
     max_cost: cost,
     threshold: String(request.threshold),

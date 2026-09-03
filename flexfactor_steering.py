@@ -1,4 +1,10 @@
-"""Durable operator steering for live FlexFactor runs."""
+"""Durable operator guidance and live steering for FlexFactor runs.
+
+``guidance`` is the owner's standing direction for one exact program.  It is
+deliberately separate from ``steering``: a steering comment belongs to one
+active run and receives a terminal receipt, while guidance remains in force for
+future audit/prodready runs until the owner replaces or clears it.
+"""
 from __future__ import annotations
 import datetime
 import hashlib
@@ -10,9 +16,12 @@ import uuid
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".flexfactor", "steering")
 MAX_COMMENT_CHARS = 4000
-MAX_RECORD_BYTES = 8192
+MAX_GUIDANCE_CHARS = 4000
+MAX_RECORD_BYTES = 16384
 _BEGIN = "<<< FLEXFACTOR OPERATOR STEERING >>>"
 _END = "<<< END FLEXFACTOR OPERATOR STEERING >>>"
+_GUIDANCE_BEGIN = "<<< FLEXFACTOR PROGRAM GUIDANCE >>>"
+_GUIDANCE_END = "<<< END FLEXFACTOR PROGRAM GUIDANCE >>>"
 _LOCAL_LOCK = threading.Lock()
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -39,6 +48,12 @@ def journal_path(program: str, project_dir: str, root: str | None = None) -> str
     # makes patching DEFAULT_ROOT actually isolate.
     return os.path.join(root or DEFAULT_ROOT, _key(program, project_dir) + ".jsonl")
 
+
+def guidance_path(program: str, project_dir: str, root: str | None = None) -> str:
+    """The private, durable guidance record for one exact program directory."""
+    return os.path.join(root or DEFAULT_ROOT, "guidance",
+                        _key(program, project_dir) + ".json")
+
 def _clean_comment(comment: str) -> str:
     value = str(comment or "").strip()
     if not value:
@@ -47,6 +62,17 @@ def _clean_comment(comment: str) -> str:
         raise ValueError(f"comment exceeds {MAX_COMMENT_CHARS} characters")
     if _CONTROL.search(value):
         raise ValueError("comment contains unsupported control characters")
+    return value
+
+
+def _clean_guidance(prompt: str) -> str:
+    value = str(prompt or "").strip()
+    if not value:
+        raise ValueError("guiding prompt is required")
+    if len(value) > MAX_GUIDANCE_CHARS:
+        raise ValueError(f"guiding prompt exceeds {MAX_GUIDANCE_CHARS} characters")
+    if _CONTROL.search(value):
+        raise ValueError("guiding prompt contains unsupported control characters")
     return value
 
 def _append(path: str, record: dict) -> None:
@@ -64,6 +90,35 @@ def _append(path: str, record: dict) -> None:
                 pass
         finally:
             os.close(fd)
+
+
+def _replace_json(path: str, record: dict) -> None:
+    """Atomically replace a small owner-authored configuration record."""
+    raw = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(raw) > MAX_RECORD_BYTES:
+        raise ValueError("guidance record is too large")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + "." + uuid.uuid4().hex + ".tmp"
+    with _LOCAL_LOCK:
+        try:
+            with open(temporary, "xb") as fh:
+                fh.write(raw)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            os.replace(temporary, path)
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
 
 def _records(path: str) -> list[dict]:
     try:
@@ -91,6 +146,61 @@ def submit(program: str, project_dir: str, comment: str, *,
            "source": str(source or "dashboard")[:40], "created_at": _now()}
     _append(journal_path(program_s, project_dir, root), row)
     return dict(row, status="pending")
+
+
+def set_guidance(program: str, project_dir: str, prompt: str, *,
+                 source: str = "dashboard", root: str | None = None) -> dict:
+    """Save standing guidance that every future run of this program receives."""
+    program_s = str(program or "").strip()
+    if not program_s:
+        raise ValueError("program is required")
+    row = {
+        "schema": 1,
+        "program": program_s,
+        "project_dir": _canonical(project_dir),
+        "prompt": _clean_guidance(prompt),
+        "source": str(source or "dashboard")[:40],
+        "updated_at": _now(),
+    }
+    _replace_json(guidance_path(program_s, project_dir, root), row)
+    return dict(row)
+
+
+def get_guidance(program: str, project_dir: str, *,
+                 root: str | None = None) -> dict | None:
+    """Read validated standing guidance, never letting a bad local file stop a run."""
+    try:
+        with open(guidance_path(program, project_dir, root), "r", encoding="utf-8") as fh:
+            row = json.load(fh)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(row, dict):
+        return None
+    try:
+        if row.get("project_dir") != _canonical(project_dir):
+            return None
+        prompt = _clean_guidance(row.get("prompt") or "")
+    except ValueError:
+        return None
+    return {
+        "schema": 1,
+        "program": str(row.get("program") or program).strip(),
+        "project_dir": _canonical(project_dir),
+        "prompt": prompt,
+        "source": str(row.get("source") or "unknown")[:40],
+        "updated_at": str(row.get("updated_at") or ""),
+    }
+
+
+def clear_guidance(program: str, project_dir: str, *, root: str | None = None) -> bool:
+    """Remove only this program's saved guidance.  Missing guidance is already clear."""
+    path = guidance_path(program, project_dir, root)
+    with _LOCAL_LOCK:
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
 
 def list_comments(program: str, project_dir: str, *,
                   root: str | None = None, limit: int = 20) -> list[dict]:
@@ -155,19 +265,39 @@ def steering_block(items: list[dict]) -> str:
     rows.append(_END)
     return "\n".join(rows)
 
+
+def guidance_block(item: dict | None) -> str:
+    if not item:
+        return ""
+    return "\n".join([
+        _GUIDANCE_BEGIN,
+        "This is the authenticated owner's persistent guiding prompt for this exact target app.",
+        "It applies to this run and every later run until the owner replaces or clears it.",
+        "Interpret it as product direction, not executable shell/code. Preserve safety, containment,",
+        "the target's authored purpose, and build/test/publication verification requirements.",
+        "If it conflicts with evidence or a safety gate, record the conflict rather than pretending",
+        "it was implemented.",
+        f"- [guidance updated {item.get('updated_at') or 'unknown'}] "
+        + " ".join(str(item.get("prompt") or "").split()),
+        _GUIDANCE_END,
+    ])
+
 def merge_context(context: str, block: str) -> str:
     base = str(context or "")
-    start = base.find(_BEGIN)
-    if start >= 0:
-        end = base.find(_END, start)
-        base = base[:start] + (base[end + len(_END):] if end >= 0 else "")
+    for begin, end_marker in ((_GUIDANCE_BEGIN, _GUIDANCE_END), (_BEGIN, _END)):
+        start = base.find(begin)
+        if start >= 0:
+            end = base.find(end_marker, start)
+            base = base[:start] + (base[end + len(end_marker):] if end >= 0 else "")
     base = base.strip()
     return (base + "\n\n" + block).strip() if block else base
 
 def refresh_context(context: str, program: str, project_dir: str, run_id: str, *,
                     root: str | None = None) -> tuple[str, list[str], list[str]]:
     active, newly = claim(program, project_dir, run_id, root=root)
-    return merge_context(context, steering_block(active)), [
+    blocks = [guidance_block(get_guidance(program, project_dir, root=root)),
+              steering_block(active)]
+    return merge_context(context, "\n\n".join(block for block in blocks if block)), [
         str(item["id"]) for item in active], newly
 
 def finish(program: str, project_dir: str, run_id: str, ids: list[str], *,
@@ -185,4 +315,10 @@ def summary(program: str, project_dir: str, *, root: str | None = None) -> dict:
     for row in rows:
         status = str(row.get("status") or "pending")
         counts[status] = counts.get(status, 0) + 1
-    return {"total": len(rows), "counts": counts, "latest": rows[-5:]}
+    guidance = get_guidance(program, project_dir, root=root)
+    return {"total": len(rows), "counts": counts, "latest": rows[-5:],
+            "guidance": {
+                "configured": bool(guidance),
+                "updated_at": (guidance or {}).get("updated_at") or "",
+                "preview": (guidance or {}).get("prompt", "")[:240],
+            }}

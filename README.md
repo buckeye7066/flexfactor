@@ -75,6 +75,8 @@ python flexfactor.py refactor --file src/app.py --goal "Make failures explicit"
 python flexfactor.py scout --program /path/to/repo
 python flexfactor.py audit --program /repo/one --program /repo/two --yes
 python flexfactor.py prodready --program /path/to/repo --yes
+python flexfactor.py audit --program /path/to/repo \
+  --guiding-prompt "Keep the existing login and complete every promised user journey." --yes
 python flexfactor.py --runtime-manifest
 ```
 
@@ -91,6 +93,13 @@ one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so
 a phone crash after GitHub accepted a request recovers the existing run rather
 than dispatching a duplicate.
+
+Each selected repository also has a **Set guiding prompt** control. Its saved
+direction travels with every new run for that repository and is merged into the
+purpose/review/fix context before model work begins. The desktop dashboard has
+the same per-program control; `--guiding-prompt` accepts one prompt for each
+`--program`, in the same order. This is distinct from live steering, which is a
+one-run instruction sent to an audit already in progress.
 
 The managed control plane:
 
@@ -133,9 +142,11 @@ Durable state lives outside target repositories under `~/.flexfactor/`:
 - `status.json`: dashboard state.
 
 Recovery reuses a review only when its file SHA and policy match. Interrupted
-work is never converted to clean. Owner work under `--allow-dirty` is captured
-on an orphan ref, excluded from FlexFactor commits, and restored only after a
-fingerprint check.
+merge/rebase/cherry-pick/revert operations are safely aborted before ordinary
+cleanup; an unmerged index with no safe operation to abort is reported without
+guessing a conflict side. Remaining owner work is captured on an orphan ref,
+excluded from FlexFactor commits, and restored only after a fingerprint check
+instead of causing a recoverable unclean-tree stop.
 
 ## Security boundaries
 

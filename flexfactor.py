@@ -18681,6 +18681,34 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             return result
         result["dir"] = project_dir
 
+        # Standing guidance is program-scoped, durable owner direction - not a
+        # one-run comment.  Cloud/mobile callers pass it through the environment
+        # for this exact target; the CLI saves it before queue admission.  A bad
+        # prompt never kills a repair run: it is recorded and the already-saved
+        # valid guidance (if any) remains available to the normal context path.
+        _guidance_arg = getattr(args, "guiding_prompt", "")
+        # argparse uses a list for repeatable CLI prompts; those were already
+        # persisted by run_audit. A single string is the cloud/mobile input.
+        if isinstance(_guidance_arg, (list, tuple)):
+            _guidance_arg = ""
+        runtime_guidance = str(
+            _guidance_arg or os.environ.get("FLEXFACTOR_GUIDING_PROMPT", "") or ""
+        ).strip()
+        if runtime_guidance and not getattr(args, "guidance_prepared", False):
+            try:
+                guidance = _ff_steering.set_guidance(
+                    display_name, project_dir, runtime_guidance,
+                    source="run-input",
+                )
+                result["guidance"] = {
+                    "configured": True,
+                    "updated_at": guidance.get("updated_at") or "",
+                }
+                print(f"{pfx}Saved guiding prompt for {display_name}; it will apply to future runs.")
+            except (OSError, ValueError) as exc:
+                result["guidance_error"] = str(exc)
+                print(f"{pfx}warning: guiding prompt was not saved: {exc}", file=sys.stderr)
+
         # Audit/prodready are exhaustive product modes. Subset controls are
         # valid for internal helpers and Scout, but accepting one here would
         # make a deliberately partial population indistinguishable from a
@@ -18872,6 +18900,38 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             )
             print(f"{pfx}error: {result['error']}", file=sys.stderr)
             return result
+        # Repair an interrupted merge/rebase/cherry-pick before branch/head
+        # checks.  The old path tried ordinary cleanup against an unmerged
+        # index, then died on a dirty tree.  Autoclean uses Git's own safe abort
+        # operation; when no safe recovery exists it gives an accounted blocker.
+        if getattr(args, "auto_clean", True):
+            try:
+                import flexfactor_autoclean as _autoclean
+                _recovered = _autoclean.recover_interrupted_git_operation(
+                    project_dir, run=_brokered_tuple_runner)
+                result["git_recovery"] = _recovered
+                if _recovered["acted_on"]:
+                    print(f"{pfx}" + _autoclean.format_summary({
+                        "candidates": _recovered["candidates"],
+                        "acted_on": len(_recovered["acted_on"]),
+                        "skipped": len(_recovered["skipped"]),
+                        "failed": len(_recovered["failed"]),
+                        "steps": [_recovered],
+                    }).replace("\n", f"\n{pfx}"))
+                if _recovered["failed"]:
+                    detail = "; ".join(
+                        str(row.get("reason") or row.get("item") or "Git recovery failed")
+                        for row in _recovered["failed"]
+                    )
+                    result["error"] = "Git recovery needs attention: " + detail[:600]
+                    _ledger("git-recovery", result["error"], kind="environment")
+                    print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                    return result
+            except Exception as exc:
+                result["error"] = f"Git recovery failed: {type(exc).__name__}: {exc}"
+                _ledger("git-recovery", result["error"], kind="environment")
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                return result
         if not _git_current_branch(project_dir):
             result["error"] = (
                 "production mutation requires a named Git branch; detached "
@@ -19131,15 +19191,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 _ledger("autoclean", exc)
 
         tree_dirty = git and not _git_tree_clean(project_dir)
-        if tree_dirty and not args.allow_dirty:
-            print(f"{pfx}error: working tree isn't clean. Commit or stash first, or pass "
-                  "--allow-dirty to have FlexFactor snapshot your uncommitted work to an "
-                  "ORPHAN ref (refs/flexfactor-wip/*) for the run and restore it "
-                  "byte-for-byte at the end. Your WIP never becomes part of "
-                  "FlexFactor's commits and is never pushed.",
-                  file=sys.stderr)
-            result["error"] = "working tree isn't clean"
-            return result
+        if tree_dirty and not getattr(args, "allow_dirty", False):
+            # A normal dirty tree has already been offered to autoclean.  If it
+            # remains (for example a test/bootstrap side effect or a commit
+            # failure), stopping here strands the repair behind precisely the
+            # recoverable "unclean head" state the runner was asked to resolve.
+            # The orphan snapshot below keeps every byte out of FlexFactor's
+            # commits and restores it at the end, so continuing is safer than a
+            # manual stash/abort loop and does not claim owner work as ours.
+            print(f"{pfx}working tree remains dirty after cleanup; preserving it in "
+                  "an orphan WIP snapshot and continuing the repair.", file=sys.stderr)
+            result["wip_snapshot_auto"] = True
         prev_branch = _git_current_branch(project_dir) if git else None
         # NO SANDBOX BRANCH (owner order 2026-08-11). Work lands on the branch the
         # repo is already on, so a verified fix IS in the repo the moment it commits -
@@ -22124,6 +22186,32 @@ def run_audit(args) -> int:
         print(f"audit target queue rejected: {exc}", file=sys.stderr)
         return 2
     total = len(programs)
+    prompts = list(getattr(args, "guiding_prompt", []) or [])
+    if prompts:
+        if len(prompts) != total:
+            print("guiding prompts rejected: provide exactly one --guiding-prompt "
+                  "for each --program, in the same order.", file=sys.stderr)
+            return 2
+        # Persist before the mutation confirmation so an accepted run has one
+        # durable source of truth. Resolve each target using the same resolver
+        # audit_one_program uses; a bare label or shortcut must not create an
+        # orphaned prompt under a name that no run will ever claim.
+        for position, (program, prompt) in enumerate(zip(programs, prompts), start=1):
+            try:
+                display_name, _ = resolve_program_input(program)
+                project_dir = resolve_project_dir(program, display_name)
+                if not project_dir or not os.path.isdir(project_dir):
+                    raise ValueError("target could not be resolved to a local source folder")
+                _ff_steering.set_guidance(display_name, project_dir, prompt,
+                                          source="cli")
+                print(f"[guidance] saved prompt for target {position}/{total}: {display_name}")
+            except (OSError, ValueError) as exc:
+                print(f"guiding prompt for target {position}/{total} was not saved: {exc}",
+                      file=sys.stderr)
+                return 2
+        # audit_one_program must not stringify argparse's list or rewrite the
+        # same records. Mobile/cloud have a single string and leave this false.
+        args.guidance_prepared = True
     if int(getattr(args, "parallel", 1) or 1) != 1:
         print("[orchestrator] --parallel is retired; targets run one at a time ",
               "in the selected order.", file=sys.stderr, sep="")
@@ -23500,6 +23588,12 @@ def main(argv=None) -> int:
         parser.add_argument("--program", required=True, action="append",
                             help="Program to audit: a project folder, file, .lnk, URL, or name. "
                                  "Repeatable up to 30; the orchestrator runs them one at a time.")
+        parser.add_argument("--guiding-prompt", action="append", default=[],
+                            dest="guiding_prompt",
+                            help="Standing owner direction for one program. Repeat once per "
+                                 "--program in the same order; each prompt is saved privately "
+                                 "and injected into this and future audit/prodready runs for "
+                                 "that exact program.")
         parser.add_argument("--parallel", type=int, default=1, dest="parallel",
                             help=argparse.SUPPRESS)
         parser.add_argument("--provider",

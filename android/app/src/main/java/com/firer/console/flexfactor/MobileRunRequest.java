@@ -36,6 +36,7 @@ public final class MobileRunRequest {
     public final String ref;
     public final String file;
     public final String goal;
+    public final String guidance;
     public final boolean scoutApply;
     public final double maxCost;
     public final int threshold;
@@ -51,7 +52,14 @@ public final class MobileRunRequest {
             String goal, boolean scoutApply, double maxCost, int threshold,
             int maxIterations) {
         this(UUID.randomUUID().toString(), mode, repository, ref, file, goal,
-                scoutApply, maxCost, threshold, maxIterations);
+                scoutApply, maxCost, threshold, maxIterations, "");
+    }
+
+    public MobileRunRequest(Mode mode, String repository, String ref, String file,
+            String goal, boolean scoutApply, double maxCost, int threshold,
+            int maxIterations, String guidance) {
+        this(UUID.randomUUID().toString(), mode, repository, ref, file, goal,
+                scoutApply, maxCost, threshold, maxIterations, guidance);
     }
 
     MobileRunRequest(String requestId, Mode mode, String repository, String ref,
@@ -63,6 +71,13 @@ public final class MobileRunRequest {
     MobileRunRequest(String requestId, Mode mode, String repository, String ref,
             String file, String goal, boolean scoutApply, double maxCost, int threshold,
             int maxIterations) {
+        this(requestId, mode, repository, ref, file, goal, scoutApply, maxCost,
+                threshold, maxIterations, "");
+    }
+
+    MobileRunRequest(String requestId, Mode mode, String repository, String ref,
+            String file, String goal, boolean scoutApply, double maxCost, int threshold,
+            int maxIterations, String guidance) {
         this.requestId = clean(requestId);
         this.mode = mode;
         this.provider = Provider.AUTO;
@@ -70,6 +85,7 @@ public final class MobileRunRequest {
         this.ref = clean(ref);
         this.file = clean(file);
         this.goal = clean(goal);
+        this.guidance = clean(guidance);
         this.scoutApply = scoutApply;
         this.maxCost = maxCost;
         this.threshold = threshold;
@@ -108,6 +124,9 @@ public final class MobileRunRequest {
         if (mode != Mode.REFACTOR && (!file.isEmpty() || !goal.isEmpty())) {
             throw new IllegalArgumentException("File and goal are only valid for Option 1.");
         }
+        if (guidance.length() > 4000 || hasControlCharacters(guidance)) {
+            throw new IllegalArgumentException("Guiding prompts must contain at most 4,000 printable characters.");
+        }
         if (mode != Mode.SCOUT && scoutApply) {
             throw new IllegalArgumentException("Scout apply is only valid for Option 2.");
         }
@@ -122,6 +141,7 @@ public final class MobileRunRequest {
         values.put("target_ref", ref);
         values.put("file", file);
         values.put("goal", goal);
+        values.put("guidance", guidance);
         values.put("scout_apply", Boolean.toString(scoutApply));
         values.put("max_cost", formatCost(maxCost));
         values.put("threshold", Integer.toString(threshold));
@@ -136,6 +156,15 @@ public final class MobileRunRequest {
 
     private static String clean(String value) {
         return value == null ? "" : value.trim();
+    }
+
+    private static boolean hasControlCharacters(String value) {
+        for (int index = 0; index < value.length(); index++) {
+            char c = value.charAt(index);
+            if ((c >= 0 && c <= 8) || (c >= 11 && c <= 12)
+                    || (c >= 14 && c <= 31) || c == 127) return true;
+        }
+        return false;
     }
 
     private static boolean isCanonicalUuid(String value) {

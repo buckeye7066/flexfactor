@@ -931,6 +931,42 @@ def submit_steering(name: str, project_dir: str, comment: str) -> tuple[bool, st
     return True, "queued - the running audit picks it up at its next checkpoint"
 
 
+def save_guidance(name: str, project_dir: str, prompt: str) -> tuple[bool, str]:
+    """Save a standing, per-program guiding prompt from the desktop dashboard."""
+    if _steer is None:
+        return False, "guidance module not available in this tree"
+    if not name or not project_dir:
+        return False, "no program selected"
+    try:
+        _steer.set_guidance(name, project_dir, prompt, source="desktop-dashboard")
+    except (ValueError, OSError) as e:
+        return False, f"not saved: {e}"
+    return True, "guiding prompt saved for this program's future runs"
+
+
+def clear_guidance(name: str, project_dir: str) -> tuple[bool, str]:
+    """Clear only the selected program's standing guiding prompt."""
+    if _steer is None:
+        return False, "guidance module not available in this tree"
+    if not name or not project_dir:
+        return False, "no program selected"
+    try:
+        removed = _steer.clear_guidance(name, project_dir)
+    except OSError as e:
+        return False, f"not cleared: {e}"
+    return True, "guiding prompt cleared" if removed else "no guiding prompt was saved"
+
+
+def guidance_value(name: str, project_dir: str) -> str:
+    """Current prompt for the selected program, safe for a Tk callback."""
+    if _steer is None or not name or not project_dir:
+        return ""
+    try:
+        return str((_steer.get_guidance(name, project_dir) or {}).get("prompt") or "")
+    except (ValueError, OSError):
+        return ""
+
+
 def steering_labels(targets: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
     """(menu label, program, dir) with labels that cannot collide.
 
@@ -972,9 +1008,10 @@ def _main() -> int:
     root.geometry("960x620")
     root.minsize(420, 420)
 
-    # Steering panel FIRST (side="bottom"), so the canvas below it takes the
-    # remaining space instead of squeezing the controls off-screen when the
-    # window is small.
+    # Guidance and steering panels FIRST (side="bottom"), so the canvas below
+    # takes the remaining space instead of squeezing controls off-screen.
+    guidance_bar = tk.Frame(root, bg=BG)
+    guidance_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
     steer_bar = tk.Frame(root, bg=BG)
     steer_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
 
@@ -988,7 +1025,14 @@ def _main() -> int:
     # guarantees is unique, so two same-named programs stay distinguishable.
     steer_by_label: dict[str, tuple[str, str]] = {}
 
-    tk.Label(steer_bar, text="Steer:", bg=BG, fg=DIM).pack(side="left")
+    tk.Label(guidance_bar, text="Guiding prompt:", bg=BG, fg=DIM).pack(side="left")
+    guidance_entry = tk.Entry(guidance_bar, bg=PANEL, fg=TEXT, insertbackground=TEXT,
+                               relief="flat", highlightthickness=1,
+                               highlightbackground=DIM, highlightcolor=TEXT)
+    guidance_entry.pack(side="left", fill="x", expand=True, padx=(6, 8), ipady=4)
+    guidance_note = tk.StringVar(value="select a program to set its standing direction")
+
+    tk.Label(steer_bar, text="One-run steering:", bg=BG, fg=DIM).pack(side="left")
     target_menu = tk.OptionMenu(steer_bar, steer_target, "")
     target_menu.configure(bg=BG, fg=TEXT, highlightthickness=0, activebackground=BG,
                           activeforeground=TEXT, width=16, anchor="w")
@@ -1017,6 +1061,38 @@ def _main() -> int:
     note.pack(side="left")
     entry.bind("<Return>", do_send)
 
+    def load_guidance(_event=None) -> None:
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
+        guidance_entry.delete(0, "end")
+        guidance_entry.insert(0, guidance_value(name, pdir))
+        guidance_note.set("saved prompt applies to every future audit"
+                          if guidance_entry.get().strip()
+                          else "no saved prompt for this program")
+
+    def do_save_guidance(_event=None) -> None:
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
+        ok, msg = save_guidance(name, pdir, guidance_entry.get())
+        guidance_note.set(msg)
+
+    def do_clear_guidance() -> None:
+        name, pdir = steer_by_label.get(steer_target.get(), ("", ""))
+        ok, msg = clear_guidance(name, pdir)
+        if ok:
+            guidance_entry.delete(0, "end")
+        guidance_note.set(msg)
+
+    save_guidance_button = tk.Button(guidance_bar, text="Save", command=do_save_guidance,
+                                     bg=PANEL, fg=TEXT, activebackground=PANEL,
+                                     activeforeground=TEXT, relief="flat", padx=14)
+    save_guidance_button.pack(side="left", padx=(0, 6))
+    clear_guidance_button = tk.Button(guidance_bar, text="Clear", command=do_clear_guidance,
+                                      bg=PANEL, fg=TEXT, activebackground=PANEL,
+                                      activeforeground=TEXT, relief="flat", padx=10)
+    clear_guidance_button.pack(side="left", padx=(0, 8))
+    tk.Label(guidance_bar, textvariable=guidance_note, bg=BG, fg=DIM,
+             anchor="w", width=34).pack(side="left")
+    guidance_entry.bind("<Return>", do_save_guidance)
+
     def refresh_targets(progs: list[dict]) -> None:
         """Keep the program picker in step with the run, without stomping on a
         selection the operator already made."""
@@ -1037,6 +1113,9 @@ def _main() -> int:
             steer_target.set(labelled[0][0])
         elif not labelled:
             steer_target.set("")
+        load_guidance()
+
+    steer_target.trace_add("write", load_guidance)
 
     def refresh_note() -> None:
         name, pdir = steer_by_label.get(steer_target.get(), ("", ""))

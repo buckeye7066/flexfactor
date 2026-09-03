@@ -37,6 +37,10 @@ on:
         description: Goal for refactor mode
         required: false
         type: string
+      guidance:
+        description: Standing owner direction for this target program
+        required: false
+        type: string
       scout_apply:
         description: Emit Scout integration proposals
         required: true
@@ -66,6 +70,7 @@ on:
       target_ref: {required: true, type: string}
       file: {required: false, type: string, default: ""}
       goal: {required: false, type: string, default: ""}
+      guidance: {required: false, type: string, default: ""}
       scout_apply: {required: true, type: boolean}
       max_cost: {required: true, type: string}
       threshold: {required: true, type: string}
@@ -117,6 +122,7 @@ jobs:
           INPUT_TARGET_REF: ${{ inputs.target_ref }}
           INPUT_FILE: ${{ inputs.file }}
           INPUT_GOAL: ${{ inputs.goal }}
+          INPUT_GUIDANCE: ${{ inputs.guidance }}
           INPUT_MAX_COST: ${{ inputs.max_cost }}
           INPUT_THRESHOLD: ${{ inputs.threshold }}
           INPUT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
@@ -134,6 +140,7 @@ jobs:
           ref = os.environ["INPUT_TARGET_REF"]
           file = os.environ["INPUT_FILE"]
           goal = os.environ["INPUT_GOAL"].strip()
+          guidance = os.environ["INPUT_GUIDANCE"].strip()
           uuid.UUID(request_id)
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
@@ -163,6 +170,10 @@ jobs:
                   raise SystemExit("refactor goal is missing or too long")
           elif file or goal:
               raise SystemExit("file and goal are only valid in refactor mode")
+          if (len(guidance) > 4000
+                  or any(ord(c) < 32 and c not in "\t\n\r" for c in guidance)
+                  or "\x7f" in guidance):
+              raise SystemExit("guiding prompt is invalid or too long")
 
           request = urllib.request.Request(
               "https://api.github.com/repos/" + repository,
@@ -276,6 +287,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
+          FLEXFACTOR_GUIDING_PROMPT: ${{ inputs.guidance }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
           SCOUT_APPLY: ${{ inputs.scout_apply }}
           MAX_COST: ${{ inputs.max_cost }}

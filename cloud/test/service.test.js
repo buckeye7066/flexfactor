@@ -175,12 +175,18 @@ test("all four domain requests are accepted and mode-specific invariants fail cl
   assert.equal(validateRunRequest(validRun({ mode: "scout", scout_apply: true })).mode, "scout");
   assert.equal(validateRunRequest(validRun({ mode: "audit" })).mode, "audit");
   assert.equal(validateRunRequest(validRun({ mode: "prodready" })).mode, "prodready");
+  assert.equal(validateRunRequest(validRun({
+    guidance: "Keep the existing login and complete every promised user journey.",
+  })).guidance, "Keep the existing login and complete every promised user journey.");
   assert.throws(() => validateRunRequest(validRun({ mode: "audit", scout_apply: true })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ ref: "../main" })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ max_cost: 151 })), ServiceError);
   assert.throws(() => validateRunRequest(validRun({ provider: "openai" })), ServiceError);
   assert.throws(() => validateRunRequest({ ...validRun(), economy: true }), ServiceError);
   assert.throws(() => validateRunRequest({ ...validRun(), use_both: true }), ServiceError);
+  assert.throws(() => validateRunRequest(validRun({ guidance: "bad\u0000prompt" })), ServiceError);
+  assert.throws(() => validateRunRequest(validRun({ guidance: "x".repeat(4_001) })), ServiceError);
+  assert.match(mobileWorkflow(), /guidance:/);
 });
 
 test("repository discovery returns one bounded page of administrable targets", async () => {

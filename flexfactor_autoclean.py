@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 
 #: Check conclusions that do not block a merge. A check that has NOT REACHED a
@@ -205,6 +206,85 @@ def _run_path_chunks(run, prefix, paths, cwd, chunk=100):
         if code != 0:
             return False, out
     return True, ""
+
+
+# --------------------------------------------------------------------------
+# Step 0: interrupted Git operations
+# --------------------------------------------------------------------------
+def recover_interrupted_git_operation(project_dir, *, run):
+    """Abort a detected interrupted Git operation before ordinary cleanup.
+
+    A normal dirty tree is handled by ``commit_pending_changes``.  An unfinished
+    merge/rebase/cherry-pick/revert is different: its unmerged index makes
+    ``git add -A`` fail, after which the old runner simply stopped at "working
+    tree isn't clean."  Git supplies a purpose-built abort command for each
+    operation, which restores its pre-operation state without choosing either
+    side of the conflict.  A bare unmerged index with no operation marker is
+    *reported* rather than guessed at; selecting conflict content is an owner
+    decision, not a cleanup action.
+    """
+    res = _result("interrupted-git-operation")
+    markers = (
+        ("MERGE_HEAD", ["git", "merge", "--abort"], "merge"),
+        ("CHERRY_PICK_HEAD", ["git", "cherry-pick", "--abort"], "cherry-pick"),
+        ("REVERT_HEAD", ["git", "revert", "--abort"], "revert"),
+    )
+    active = []
+    for marker, command, label in markers:
+        code, out = run(["git", "rev-parse", "--git-path", marker], project_dir)
+        if code != 0:
+            res["candidates"] = 1
+            res["failed"].append({"item": "git metadata", "reason": str(out)[:160]})
+            return res
+        path = str(out or "").strip()
+        if path and os.path.exists(path if os.path.isabs(path)
+                                else os.path.join(project_dir, path)):
+            active.append((label, command))
+    # Git stores rebase state in a directory instead of a single named ref.
+    code, git_dir = run(["git", "rev-parse", "--git-dir"], project_dir)
+    if code != 0:
+        res["candidates"] = 1
+        res["failed"].append({"item": "git metadata", "reason": str(git_dir)[:160]})
+        return res
+    base = str(git_dir or "").strip()
+    if base and not os.path.isabs(base):
+        base = os.path.join(project_dir, base)
+    if base and (os.path.isdir(os.path.join(base, "rebase-merge"))
+                 or os.path.isdir(os.path.join(base, "rebase-apply"))):
+        active.append(("rebase", ["git", "rebase", "--abort"]))
+
+    # Multiple active markers means Git state is inconsistent.  Do not run a
+    # sequence of aborts against it and call that recovery.
+    res["candidates"] = len(active)
+    if not active:
+        code, unmerged = run(["git", "diff", "--name-only", "--diff-filter=U"], project_dir)
+        if code != 0:
+            res["candidates"] = 1
+            res["failed"].append({"item": "unmerged check", "reason": str(unmerged)[:160]})
+        elif str(unmerged or "").strip():
+            res["candidates"] = 1
+            res["failed"].append({
+                "item": "unmerged index",
+                "reason": "conflicted paths exist without a recoverable Git operation; no side was chosen",
+            })
+        return res
+    if len(active) != 1:
+        for label, _command in active:
+            res["failed"].append({"item": label,
+                                  "reason": "multiple interrupted Git operations detected"})
+        return res
+    label, command = active[0]
+    code, out = run(command, project_dir)
+    if code != 0:
+        res["failed"].append({"item": label, "reason": str(out)[:240]})
+        return res
+    check, unmerged = run(["git", "diff", "--name-only", "--diff-filter=U"], project_dir)
+    if check != 0 or str(unmerged or "").strip():
+        res["failed"].append({"item": label,
+                              "reason": "abort ran but the index still has unmerged paths"})
+        return res
+    res["acted_on"].append("aborted interrupted " + label)
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -631,7 +711,8 @@ def clean_repo(project_dir, repo=None, report=None, *, run, verify=None):
     """
     say = report if callable(report) else (lambda *a, **k: None)
     steps = []
-    plan = ((commit_pending_changes, False),
+    plan = ((recover_interrupted_git_operation, False),
+            (commit_pending_changes, False),
             (land_open_prs, True),
             (report_dependabot, True),
             (report_open_issues, True),

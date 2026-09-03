@@ -43,6 +43,7 @@ public final class MainActivity extends Activity {
     private static final String LOGIN = "github_login";
     private static final String REPOSITORY = "selected_repository";
     private static final String REF = "selected_ref";
+    private static final String GUIDANCE_PREFIX = "guiding_prompt.";
     private static final String LAST_RUN_ID = "last_run_id";
     private static final String LAST_RUN_REPOSITORY = "last_run_repository";
     private static final String LAST_RUN_REQUEST_ID = "last_run_request_id";
@@ -156,6 +157,9 @@ public final class MainActivity extends Activity {
         repositoryButton.setContentDescription("Choose a GitHub repository");
         repositoryButton.setOnClickListener(view -> chooseRepository());
         content.addView(repositoryButton, margins(0, 4, 0, 12));
+        Button guidingPrompt = button("Set guiding prompt for this repository");
+        guidingPrompt.setOnClickListener(view -> showGuidanceDialog());
+        content.addView(guidingPrompt, margins(0, 0, 0, 12));
 
         content.addView(section("Model policy"));
         content.addView(text("Best available automatically: strongest paid capacity first, "
@@ -578,6 +582,61 @@ public final class MainActivity extends Activity {
                 .show();
     }
 
+    private String guidanceFor(String repository) {
+        String target = repository == null ? "" : repository.trim();
+        return target.isEmpty() ? "" : preferences.getString(GUIDANCE_PREFIX + target, "");
+    }
+
+    private void showGuidanceDialog() {
+        String repository = preferences.getString(REPOSITORY, "").trim();
+        if (repository.isEmpty()) {
+            showError("Choose a repository first",
+                    "Guiding prompts are saved separately for each repository.");
+            return;
+        }
+        EditText prompt = input("Standing direction for " + repository);
+        prompt.setSingleLine(false);
+        prompt.setMinLines(5);
+        prompt.setText(guidanceFor(repository));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Guiding prompt · " + repository)
+                .setMessage("This direction is included in every new FlexFactor run for this repository until you replace or clear it. It remains inside the normal purpose, test, and publication gates.")
+                .setView(prompt)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", null)
+                .setPositiveButton("Save", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                preferences.edit().remove(GUIDANCE_PREFIX + repository).apply();
+                dialog.dismiss();
+                Toast.makeText(this, "Guiding prompt cleared for " + repository,
+                        Toast.LENGTH_LONG).show();
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                String value = prompt.getText().toString().trim();
+                if (value.isEmpty()) {
+                    prompt.setError("Enter a guiding prompt, or choose Clear.");
+                    return;
+                }
+                try {
+                    // Reuse the request validator so the phone refuses text the
+                    // cloud runner would reject rather than failing after dispatch.
+                    new MobileRunRequest(MobileRunRequest.Mode.AUDIT, repository,
+                            preferences.getString(REF, "main"), "", "", false,
+                            1, 90, 1, value);
+                    preferences.edit().putString(GUIDANCE_PREFIX + repository, value).apply();
+                    dialog.dismiss();
+                    Toast.makeText(this, "Guiding prompt saved for " + repository,
+                            Toast.LENGTH_LONG).show();
+                } catch (IllegalArgumentException rejected) {
+                    prompt.setError(rejected.getMessage());
+                }
+            });
+        });
+        dialog.show();
+    }
+
     private void showRefactorDialog() {
         if (!requireReadyTarget()) return;
         LinearLayout form = form();
@@ -617,7 +676,8 @@ public final class MainActivity extends Activity {
                                     preferences.getString(REF, "main"),
                                     path, goal.getText().toString(), false, 25,
                                     Integer.parseInt(threshold.getText().toString().trim()),
-                                    Integer.parseInt(iterations.getText().toString().trim())));
+                                    Integer.parseInt(iterations.getText().toString().trim()),
+                                    guidanceFor(preferences.getString(REPOSITORY, ""))));
                         }
                         if (requests.isEmpty() || requests.size() > MobileRunQueue.MAX_TARGETS) {
                             throw new IllegalArgumentException("Choose from 1 through 30 files.");
@@ -708,7 +768,8 @@ public final class MainActivity extends Activity {
         return new MobileRunRequest(mode,
                 preferences.getString(REPOSITORY, ""),
                 preferences.getString(REF, "main"),
-                file, goal, scoutApply, cost, 90, 6);
+                file, goal, scoutApply, cost, 90, 6,
+                guidanceFor(preferences.getString(REPOSITORY, "")));
     }
 
     private void confirmAndDispatch(MobileRunRequest request) {
@@ -776,7 +837,8 @@ public final class MainActivity extends Activity {
                         GitHubApi.Repository repository = repositories.get(i);
                         requests.add(new MobileRunRequest(mode,
                                 repository.fullName, repository.defaultBranch,
-                                "", "", scoutApply, cost, 90, 6));
+                                "", "", scoutApply, cost, 90, 6,
+                                guidanceFor(repository.fullName)));
                     }
                     if (requests.isEmpty() || requests.size() > MobileRunQueue.MAX_TARGETS) {
                         showError("Check the queue",

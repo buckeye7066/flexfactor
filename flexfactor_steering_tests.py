@@ -54,6 +54,49 @@ class SteeringTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fs.submit("Target", self.project, value, root=self.root)
 
+    def test_guidance_is_program_scoped_durable_and_injected_each_run(self):
+        saved = fs.set_guidance(
+            "Target", self.project,
+            "Keep the existing login and make every user journey genuinely usable.",
+            root=self.root,
+        )
+        self.assertTrue(os.path.isfile(fs.guidance_path("Target", self.project, self.root)))
+        self.assertEqual(saved["prompt"], fs.get_guidance(
+            "Target", self.project, root=self.root)["prompt"])
+        first, active, _ = fs.refresh_context(
+            "PURPOSE", "Target", self.project, "run-1", root=self.root)
+        self.assertEqual([], active)
+        self.assertIn(fs._GUIDANCE_BEGIN, first)
+        self.assertIn("genuinely usable", first)
+        second, _, _ = fs.refresh_context(first, "Target", self.project, "run-2",
+                                          root=self.root)
+        self.assertEqual(1, second.count(fs._GUIDANCE_BEGIN))
+        self.assertIn("genuinely usable", second)
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        self.assertIsNone(fs.get_guidance("Target", other, root=self.root))
+        self.assertTrue(fs.clear_guidance("Target", self.project, root=self.root))
+        cleared, _, _ = fs.refresh_context(second, "Target", self.project, "run-3",
+                                           root=self.root)
+        self.assertNotIn(fs._GUIDANCE_BEGIN, cleared)
+
+    def test_dashboard_guidance_helpers_persist_and_clear(self):
+        original = fs.DEFAULT_ROOT
+        fs.DEFAULT_ROOT = self.root
+        try:
+            ok, message = __import__("flexfactor_dashboard").save_guidance(
+                "Target", self.project, "Prioritize a complete end-to-end workflow.")
+            self.assertTrue(ok, message)
+            self.assertIn("end-to-end", __import__("flexfactor_dashboard").guidance_value(
+                "Target", self.project))
+            ok, message = __import__("flexfactor_dashboard").clear_guidance(
+                "Target", self.project)
+            self.assertTrue(ok, message)
+            self.assertEqual("", __import__("flexfactor_dashboard").guidance_value(
+                "Target", self.project))
+        finally:
+            fs.DEFAULT_ROOT = original
+
     def test_web_dashboard_identifies_the_on_phone_engine(self):
         self.assertEqual(
             "this phone",

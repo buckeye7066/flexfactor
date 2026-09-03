@@ -98,6 +98,44 @@ class CommitPendingChangesTests(unittest.TestCase):
         ac.summarise([res])  # must not raise
 
 
+class InterruptedGitRecoveryTests(unittest.TestCase):
+    def test_interrupted_merge_is_aborted_before_normal_cleanup(self):
+        d = _repo()
+        _git(["checkout", "-qb", "feature"], d)
+        with open(os.path.join(d, "seed.txt"), "w") as fh:
+            fh.write("feature\n")
+        _git(["commit", "-am", "feature"], d)
+        _git(["checkout", "-q", "main"], d)
+        with open(os.path.join(d, "seed.txt"), "w") as fh:
+            fh.write("main\n")
+        _git(["commit", "-am", "main"], d)
+        merged = _git(["merge", "feature"], d)
+        self.assertNotEqual(0, merged.returncode)
+        self.assertTrue(_git(["diff", "--name-only", "--diff-filter=U"], d).stdout.strip())
+
+        recovered = ac.recover_interrupted_git_operation(d, run=_test_runner)
+
+        self.assertEqual(["aborted interrupted merge"], recovered["acted_on"])
+        self.assertEqual([], recovered["failed"])
+        self.assertEqual("", _git(["status", "--porcelain"], d).stdout.strip())
+        self.assertEqual("main", _git(["rev-parse", "--abbrev-ref", "HEAD"], d).stdout.strip())
+
+    def test_bare_unmerged_index_is_blocked_without_guessing_a_side(self):
+        d = _repo()
+        _git(["update-index", "--index-info"], d)  # a harmless command to retain a normal index
+        # A synthetic conflict entry does not carry MERGE_HEAD. Recovery must
+        # report rather than destructively pick ours/theirs.
+        blob = _git(["hash-object", "-w", "seed.txt"], d).stdout.strip()
+        stream = f"100644 {blob} 1\tseed.txt\n100644 {blob} 2\tseed.txt\n100644 {blob} 3\tseed.txt\n"
+        proc = subprocess.run(["git", "update-index", "--index-info"], cwd=d,
+                              input=stream, text=True, capture_output=True)
+        self.assertEqual(0, proc.returncode)
+        recovered = ac.recover_interrupted_git_operation(d, run=_test_runner)
+        self.assertEqual([], recovered["acted_on"])
+        self.assertEqual(1, len(recovered["failed"]))
+        self.assertIn("no side was chosen", recovered["failed"][0]["reason"])
+
+
 class SweptTreeIsVerifiedTests(unittest.TestCase):
     """Autoclean VERIFIES what it commits, and never reads `None` as a pass.
 
