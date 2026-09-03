@@ -114,6 +114,25 @@ class DashboardAndManagedMobileTests(unittest.TestCase):
         self.assertIn("Choose up to 30 repositories", activity)
         self.assertIn("run one at a time", activity)
 
+    def test_android_model_proof_bounds_runner_resources(self):
+        path = os.path.join(
+            os.path.dirname(__file__), ".github", "workflows", "android-client.yml")
+        with open(path, encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertIn('"qwen2.5-coder:1.5b"', workflow)
+        self.assertIn('"deepseek-coder:1.3b"', workflow)
+        self.assertNotIn("qwen2.5-coder:7b", workflow)
+        self.assertNotIn("deepseek-coder:6.7b", workflow)
+        self.assertIn(
+            'subprocess.run(["ollama", "pull", model], check=True)', workflow
+        )
+        self.assertIn(
+            'subprocess.run(["ollama", "stop", model], check=False)', workflow
+        )
+        self.assertIn(
+            'subprocess.run(["ollama", "rm", model], check=True)', workflow
+        )
+
     def test_android_main_release_creates_the_exact_version_tag(self):
         path = os.path.join(
             os.path.dirname(__file__), ".github", "workflows", "android-client.yml")
