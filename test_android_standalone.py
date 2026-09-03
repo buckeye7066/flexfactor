@@ -437,6 +437,16 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("jarsigner -verify -strict", workflow)
         self.assertIn("-storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD", workflow)
         self.assertNotIn("bundle/play/app-release.aab", workflow)
+        model_install = workflow.split(
+            "- name: Verify both independent free model families live", 1)[1].split(
+                "- name: Record exact APK checksum", 1)[0]
+        self.assertIn('rm -f "$archive"', model_install)
+        self.assertLess(model_install.index('sudo tar --zstd -xf "$archive"'),
+                        model_install.index('rm -f "$archive"'))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull qwen2.5-coder:7b"))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull deepseek-coder:6.7b"))
         build_gate = workflow.split("- name: Unit tests, lint, and debug APK", 1)[1]
         build_gate = build_gate.split(
             "- name: Verify both independent free model families live", 1)[0]
