@@ -5894,6 +5894,77 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIn("owner checkout changed: app.py", refusal)
         self.assertEqual({rel, "app.py"}, set(rollback_failed))
 
+    def test_internal_symlink_is_rewritten_into_execution_copy(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            owner = os.path.join(project, "app.py")
+            alias = os.path.join(project, "alias.py")
+            with open(owner, "w", encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            try:
+                os.symlink("app.py", alias)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            def writes_through_confined_link(execution_dir, _stack):
+                execution_alias = os.path.join(execution_dir, "alias.py")
+                self.assertTrue(os.path.islink(execution_alias))
+                self.assertNotEqual(
+                    os.path.realpath(alias), os.path.realpath(execution_alias),
+                )
+                with open(execution_alias, "w", encoding="utf-8") as handle:
+                    handle.write("MUTATED\n")
+                return True, "1 passed"
+
+            with mock.patch.object(
+                    ff, "_run_unit_tests",
+                    side_effect=writes_through_confined_link):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            with open(owner, encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_external_symlink_is_refused_before_generated_test_execution(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as parent:
+            project = os.path.join(parent, "project")
+            os.mkdir(project)
+            outside = os.path.join(parent, "outside.py")
+            with open(outside, "w", encoding="utf-8") as handle:
+                handle.write("EXTERNAL\n")
+            try:
+                os.symlink(outside, os.path.join(project, "external.py"))
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            forbidden_runner = mock.Mock(side_effect=AssertionError(
+                "external symlink reached generated-test execution"
+            ))
+            with mock.patch.object(
+                    ff, "_run_unit_tests", forbidden_runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            with open(outside, encoding="utf-8") as handle:
+                self.assertEqual("EXTERNAL\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("symlink escapes", refusal)
+        self.assertEqual([rel], rollback_failed)
+        forbidden_runner.assert_not_called()
+
 
 class PathContainmentTests(unittest.TestCase):
     """Round-3 defect 2: model-generated paths must be contained to the repo; a

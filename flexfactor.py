@@ -15609,14 +15609,128 @@ def _generated_test_snapshot_changes(
 
 
 def _copy_generated_test_checkout(project_dir: str, destination: str) -> None:
-    """Create an independent execution copy; never share files or Git metadata."""
+    """Create an independent execution copy; never share paths or Git metadata.
+
+    ``copytree(..., symlinks=True)`` alone is not isolation: an absolute link,
+    or a relative link through an external ancestor, keeps pointing outside the
+    copy.  Copy links without following them, then replace every copied link
+    with a relative link to the corresponding object *inside* the execution
+    root.  A broken, VCS-directed, or externally resolving link fails before a
+    test process starts.  Hard links are already broken by ``copy2``.
+    """
     def ignore_git(_directory: str, names: list[str]) -> set[str]:
         return {name for name in names if name == ".git"}
 
+    source_root = os.path.realpath(project_dir)
+    execution_root = os.path.realpath(destination)
+    # Windows junctions and mount-point reparses are not consistently reported
+    # by os.path.islink(), and copytree can otherwise descend through them.
+    # They cannot be safely rewritten with os.readlink(), so reject them before
+    # copy instead of allowing a platform-specific escape from the disposable
+    # root. Ordinary symbolic links take the confined rewrite path below.
+    for dirpath, dirnames, filenames in os.walk(
+            source_root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            source_item = os.path.join(dirpath, name)
+            if _is_reparse(source_item) and not os.path.islink(source_item):
+                rel = os.path.relpath(source_item, source_root)
+                raise RuntimeError(
+                    "repository contains a non-symbolic reparse point that "
+                    f"cannot be copied safely: {rel}"
+                )
     shutil.copytree(
-        project_dir, destination, symlinks=True, ignore=ignore_git,
+        source_root, destination, symlinks=True, ignore=ignore_git,
         copy_function=shutil.copy2,
     )
+
+    copied_links: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(
+            execution_root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            copied = os.path.join(dirpath, name)
+            if os.path.islink(copied):
+                copied_links.append((
+                    os.path.relpath(copied, execution_root), copied,
+                ))
+            elif _is_reparse(copied):
+                rel = os.path.relpath(copied, execution_root)
+                raise RuntimeError(
+                    "copied worktree contains an unconfined reparse point: "
+                    f"{rel}"
+                )
+
+    for rel, copied in copied_links:
+        try:
+            link_text = os.readlink(copied)
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not inspect copied symlink {rel}: {exc}"
+            ) from exc
+        source_link = os.path.join(source_root, rel)
+        unresolved_target = (
+            link_text if os.path.isabs(link_text)
+            else os.path.join(os.path.dirname(source_link), link_text)
+        )
+        source_target = os.path.realpath(unresolved_target)
+        try:
+            contained = (
+                os.path.commonpath((source_root, source_target)) == source_root
+            )
+        except ValueError:
+            contained = False
+        if not contained:
+            raise RuntimeError(
+                f"repository symlink escapes the generated-test execution copy: {rel}"
+            )
+        target_rel = _canon_rel(os.path.relpath(source_target, source_root))
+        if (not target_rel or target_rel == "."
+                or any(part.casefold() == ".git"
+                       for part in target_rel.split("/"))
+                or not os.path.exists(source_target)):
+            raise RuntimeError(
+                f"repository symlink has no safe copied target: {rel}"
+            )
+        copied_target = os.path.join(
+            execution_root, *target_rel.split("/"),
+        )
+        try:
+            copied_target_root = os.path.commonpath(
+                (execution_root, os.path.realpath(copied_target)),
+            )
+        except ValueError:
+            copied_target_root = ""
+        if copied_target_root != execution_root or not os.path.exists(copied_target):
+            raise RuntimeError(
+                f"repository symlink target was not copied safely: {rel}"
+            )
+        replacement = os.path.relpath(copied_target, os.path.dirname(copied))
+        target_is_directory = os.path.isdir(copied_target)
+        try:
+            os.unlink(copied)
+            os.symlink(
+                replacement, copied, target_is_directory=target_is_directory,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not confine copied symlink {rel}: {exc}"
+            ) from exc
+
+    # Revalidate the finished copy, not just source-side observations.  Every
+    # link that a test can traverse must resolve below this disposable root.
+    for rel, copied in copied_links:
+        try:
+            confined = (
+                os.path.commonpath(
+                    (execution_root, os.path.realpath(copied)),
+                ) == execution_root
+                and os.path.exists(copied)
+            )
+        except (OSError, ValueError):
+            confined = False
+        if not confined:
+            raise RuntimeError(
+                f"copied symlink is not confined to the execution root: {rel}"
+            )
 
 
 def _run_generated_test_file(project_dir: str, entry: dict,
