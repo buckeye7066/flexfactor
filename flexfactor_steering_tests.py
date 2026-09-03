@@ -83,6 +83,18 @@ class SteeringTests(unittest.TestCase):
         self.assertIn("all programs", by_name["Target"])
         self.assertEqual("", by_name["Other"])
 
+    def test_semicolon_can_start_a_shared_requirement(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target: repair billing; all programs must run tests",
+            [("Target", self.project), ("Other", other)],
+        )
+        by_name = {row["program"]: row["instruction"] for row in routed["routes"]}
+        self.assertIn("repair billing", by_name["Target"])
+        self.assertIn("run tests", by_name["Target"])
+        self.assertIn("run tests", by_name["Other"])
+
     def test_bullets_follow_their_target_heading(self):
         other = os.path.join(self.root, "Other")
         os.makedirs(other)

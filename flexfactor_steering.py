@@ -228,9 +228,12 @@ def _prompt_segments(prompt: str, aliases: list[set[str]]) -> list[str]:
             changed = False
             next_candidates: list[str] = []
             for candidate in candidates:
-                parts = re.split(r";\s+(?=[A-Za-z0-9_.\-/ ]{2,80}:)", candidate,
-                                 maxsplit=1)
-                if len(parts) == 2 and _mentions(parts[1], aliases):
+                parts = re.split(r";\s+", candidate, maxsplit=1)
+                shared = (len(parts) == 2 and re.match(
+                    r"^(all|both|each|every)\s+(selected\s+)?"
+                    r"(programs?|apps?|repos(?:itories)?)\b",
+                    parts[1], re.IGNORECASE))
+                if len(parts) == 2 and (_mentions(parts[1], aliases) or shared):
                     next_candidates.extend(parts)
                     changed = True
                 else:
