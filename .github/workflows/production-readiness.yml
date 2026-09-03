@@ -136,6 +136,7 @@ jobs:
                    test_flexfactor_journeys.py \
                    test_ci_skip_policy.py \
                    test_live_cursor_aitime_proof.py \
+                   test_stale_runtime_recurrence.py \
                    tests/test_cursor_provider.py; do
             if [ ! -f "$t" ]; then echo "MISSING required test module: $t"; exit 1; fi
             echo "=== $t"
