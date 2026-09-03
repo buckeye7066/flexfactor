@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""FlexFactor 0.6.1 — managed code improvement with four modes.
+r"""FlexFactor 0.6.2 — managed code improvement with four modes.
 
 Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
 one quality-first paid-to-free model ladder. A request may contain up to 30
@@ -16,6 +16,7 @@ default branch. A local commit or open pull request is not success.
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 import codecs
 import concurrent.futures
@@ -36,6 +37,8 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -640,18 +643,12 @@ def _contained_path(project_dir: str, rel) -> str | None:
     drive-relative paths ('C:x'), UNC paths ('\\\\host\\share'), '~' home paths, and
     any '..' traversal that resolves outside the repo root - so a hostile or confused
     model response can never overwrite files outside the target repo."""
-    if not rel or not isinstance(rel, str):
-        return None
-    r = rel.strip().strip('"').replace("\\", "/")
-    if not r or r.startswith("~"):
-        return None
-    # Absolute (POSIX '/x' or Windows 'C:/x'), UNC ('//host'), or drive-relative
-    # ('C:x' - which os.path.join would let DISCARD project_dir on Windows).
-    if os.path.isabs(rel) or os.path.isabs(r) or r.startswith("//") or re.match(r"^[A-Za-z]:", r):
+    comps = _rel_components(rel)
+    if comps is None:
         return None
     try:
         root = os.path.realpath(project_dir)
-        full = os.path.realpath(os.path.join(root, r))
+        full = os.path.realpath(os.path.join(root, *comps))
     except OSError:
         return None
     # Must be the root itself or strictly below it (blocks '..' escapes + symlinks).
@@ -672,7 +669,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.6.1"
+TOOL_VERSION = "0.6.2"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -1919,6 +1916,24 @@ class PaidRescueNeeded(RuntimeError):
         self.original = original
 
 
+class CrossFamilyRescueRequired(RuntimeError):
+    """Tell the outer rotator to select and record a different provider route.
+
+    A rotated Anthropic adapter may rescue through paid Anthropic transparently,
+    because the model family is unchanged. It may not return an OpenAI result
+    under the selected Anthropic route identity; raising this route-scoped
+    transport failure lets the quality-first ladder try a separately recorded
+    route instead.
+    """
+
+    def __init__(self, original: BaseException):
+        super().__init__(
+            "selected provider family exhausted; outer-ladder failover required: "
+            f"{type(original).__name__}: {original}"
+        )
+        self.original = original
+
+
 class AnthropicProvider:
     def __init__(self, model: str, judge_model: str | None = None):
         import anthropic  # imported lazily so OpenAI-only users need not install it
@@ -1931,6 +1946,11 @@ class AnthropicProvider:
         self.client = anthropic.Anthropic()
         self._paid_client_obj = None   # lazy real-API rescue client (paid key)
         self._oai_rescue = None        # lazy OpenAIProvider rescue delegate
+        # Fixed-provider callers retain the legacy same-call OpenAI rescue.
+        # RotatingProvider factories turn this off because their route ledger
+        # must describe the family that actually produced the result; the outer
+        # ladder performs cross-family failover with an auditable new route.
+        self._allow_cross_family_rescue = True
 
     def _paid_client(self):
         """Real-API Anthropic client built from the rescue key, or None. Explicit
@@ -2077,6 +2097,8 @@ class AnthropicProvider:
                             message = self._paid_message(kwargs, exc2)
                 self._meter(message, self.model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2104,6 +2126,8 @@ class AnthropicProvider:
                 text = next((b.text for b in message.content if b.type == "text"), None)
                 last_text = text
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2143,6 +2167,8 @@ class AnthropicProvider:
                     messages=[{"role": "user", "content": prompt}], fmt=fmt)
                 self._meter(message, use_model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2328,6 +2354,8 @@ class AnthropicProvider:
                             message = self._paid_message(kwargs, exc2)
                 self._meter(message, self.judge_model)
         except PaidRescueNeeded as pr:
+            if not getattr(self, "_allow_cross_family_rescue", True):
+                raise CrossFamilyRescueRequired(pr.original) from pr.original
             oai = self._openai_rescue_provider()
             if oai is None:
                 raise pr.original
@@ -2983,34 +3011,61 @@ def _ollama_route_health(route) -> tuple[bool, str]:
     return result
 
 
-def _coerce_issue(item) -> str:
-    """Normalize one issue to a string. Graders without schema enforcement (e.g.
-    OpenAI json mode) sometimes return issues as dicts; flatten them so downstream
-    string joins never crash."""
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        parts = [str(v) for v in item.values() if v]
-        return " - ".join(parts) if parts else json.dumps(item)
-    return str(item)
-
-
 def _parse_grade(text: str) -> Grade:
     data, _ = _extract_json_object(text)
     if data is None:
         raise ValueError(f"grade response was not JSON; head={text[:200]!r}")
-    try:
-        grade = max(0, min(100, int(float(data.get("grade") or 0))))  # clamp to 0..100
-    except (TypeError, ValueError):
-        grade = 0
-    raw_issues = data.get("issues") or []
-    if not isinstance(raw_issues, list):
-        raw_issues = [raw_issues]
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"grade response was {type(data).__name__}, expected an object"
+        )
+    required = {"grade", "meets_goal", "rationale", "issues"}
+    missing = sorted(required - set(data))
+    extra = sorted(set(data) - required)
+    if missing:
+        raise ValueError("grade response omitted required field(s): "
+                         + ", ".join(missing))
+    if extra:
+        raise ValueError("grade response contained unknown field(s): "
+                         + ", ".join(extra))
+    if type(data["grade"]) is not int:
+        raise ValueError("grade response field 'grade' must be an integer")
+    if type(data["meets_goal"]) is not bool:
+        raise ValueError("grade response field 'meets_goal' must be a boolean")
+    if not isinstance(data["rationale"], str):
+        raise ValueError("grade response field 'rationale' must be a string")
+    raw_issues = data["issues"]
+    if (not isinstance(raw_issues, list)
+            or any(not isinstance(issue, str) for issue in raw_issues)):
+        raise ValueError("grade response field 'issues' must be an array of strings")
+    grade = max(0, min(100, data["grade"]))  # schema cannot express this range
+    if grade < 100 and not raw_issues:
+        raise ValueError("a sub-100 grade must include at least one concrete issue")
     return Grade(
         grade=grade,
-        meets_goal=bool(data.get("meets_goal", False)),
-        rationale=str(data.get("rationale", "")),
-        issues=[_coerce_issue(x) for x in raw_issues],
+        meets_goal=data["meets_goal"],
+        rationale=data["rationale"],
+        issues=list(raw_issues),
+    )
+
+
+def _normalize_grade(value) -> Grade:
+    """Return one provider grade as the core ``Grade`` contract.
+
+    HTTP adapters already return ``Grade``. Subscription CLI adapters return
+    their JSON response as text, and a rotating provider deliberately preserves
+    the backing adapter's value. Normalize at this shared boundary so a raw CLI
+    response cannot escape a guarded provider call and fail later during field
+    access. Malformed or non-object responses raise and therefore fail closed.
+    """
+    if isinstance(value, Grade):
+        return value
+    if isinstance(value, str):
+        return _parse_grade(value)
+    if isinstance(value, dict):
+        return _parse_grade(json.dumps(value))
+    raise TypeError(
+        f"grader returned {type(value).__name__}, expected Grade, JSON text, or object"
     )
 
 
@@ -3043,6 +3098,77 @@ def _strip_code_fences(code: str) -> str:
             return "\n"
         lines = body[:matches[-1]]
     return "\n".join(lines).strip() + "\n"
+
+
+def _reject_nonfinite_json_constant(value: str):
+    """Make the permissive stdlib JSON decoder enforce RFC JSON numbers."""
+    raise ValueError(f"non-finite constant {value!r} is not valid JSON")
+
+
+def _inproc_source_syntax_ok(
+        path: str, source: str, *, allow_empty: bool = False,
+) -> tuple[bool | None, str]:
+    """Parse a whole-file model response without writing or executing it.
+
+    ``True`` means a stdlib parser accepted the source, ``False`` means the
+    response is definitely invalid for the selected file type, and ``None``
+    means no safe in-process parser is available. Mutation callers must accept
+    only ``True``; ``None`` is a named fail-closed refusal, never an implicit
+    approval. The project publication gate remains authoritative for every
+    type; this earlier gate prevents a reviewer from blessing obvious
+    prose-as-code and lets Refactor assess the *actual original file* when an
+    author answers "already good" in prose. Generated responses must never be
+    empty. ``allow_empty`` exists only for validating an already-versioned
+    original: empty Python and TOML files are syntactically valid, while the
+    relevant parser still rejects formats such as empty JSON.
+
+    Keep this helper side-effect free.  In particular, never import or execute
+    the candidate Python module merely to validate it.
+    """
+    text = str(source or "")
+    try:
+        encoded = text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        return False, f"source is not UTF-8 encodable: {exc}"
+    if not text.strip() and not allow_empty:
+        return False, "empty whole-file response"
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    try:
+        if ext in (".py", ".pyi"):
+            # Compile the exact UTF-8 bytes the contained text writer would
+            # persist.  Python accepts an on-disk UTF-8 BOM, but compiling the
+            # decoded str rejects its leading U+FEFF as a non-printable
+            # character.  Bytes keep this preflight aligned with the real
+            # parser and also validate UTF-8 encoding before any write.
+            detected_encoding, _ = tokenize.detect_encoding(
+                io.BytesIO(encoded).readline,
+            )
+            normalized_encoding = detected_encoding.lower().replace(
+                "_", "",
+            ).replace("-", "")
+            if normalized_encoding not in {"utf8", "utf8sig"}:
+                return False, (
+                    "python source encoding must be UTF-8; "
+                    f"declared {detected_encoding!r}"
+                )
+            compile(
+                encoded,
+                str(path or "<candidate>"),
+                "exec",
+                dont_inherit=True,
+            )
+            return True, "python parse"
+        if ext == ".json":
+            json.loads(text, parse_constant=_reject_nonfinite_json_constant)
+            return True, "json parse"
+        if ext == ".toml":
+            import tomllib
+            tomllib.loads(text)
+            return True, "toml parse"
+    except (SyntaxError, UnicodeError, ValueError, TypeError, RecursionError,
+            MemoryError, OverflowError) as exc:
+        return False, f"{ext.lstrip('.') or 'source'} parse error: {exc}"
+    return None, "no safe in-process parser for this file type"
 
 
 def _extract_json_object(text: str):
@@ -3750,7 +3876,11 @@ def _judge_intent(provider, schema: dict) -> dict:
     the author's family). Everything else is a judge that must emit JSON.
     """
     try:
-        if schema is ADVERSARIAL_VERIFY_SCHEMA or schema is FINAL_REVIEW_SCHEMA:
+        if schema in (
+                FIX_VERIFY_SCHEMA,
+                ADVERSARIAL_VERIFY_SCHEMA,
+                FINAL_REVIEW_SCHEMA,
+        ):
             return _intent_kw(provider, "reviewer", "code_review", "structured_json", "honest")
         if schema is AUDIT_FINDINGS_SCHEMA:
             return _intent_kw(provider, "reviewer", "code_review", "structured_json")
@@ -3878,8 +4008,15 @@ def _rotation_route_provider(route):
             # that succeeded.
             prov._paid_client_obj = None
             prov._oai_rescue = None
+            prov._allow_cross_family_rescue = False
             return prov
-        return AnthropicProvider(wire, judge_model=wire)
+        prov = AnthropicProvider(wire, judge_model=wire)
+        # A route selected as Anthropic may use paid Anthropic rescue, but it
+        # must never return an OpenAI result under an Anthropic identity. Let
+        # RotatingProvider observe the failure and select OpenAI as a distinct
+        # outer-ladder route so author/reviewer separation stays provable.
+        prov._allow_cross_family_rescue = False
+        return prov
     if route.api == "gemini":
         import openai
         # Google serves an OpenAI-compatible surface, so the existing
@@ -4318,7 +4455,13 @@ def _builtin_route_catalog(fr):
         ),
         fr.Route(
             id="builtin/copilot", backend="copilot", backend_label="GitHub Copilot",
-            model="auto", wire_model="auto", api="copilot-cli", base_url="",
+            # Programmatic Copilot calls must pin a concrete model.  An opaque
+            # `auto` route cannot prove that a later OpenAI/Anthropic reviewer
+            # belongs to a different family from the model that authored the
+            # candidate.  The CLI adapter forwards this exact identity with
+            # --model rather than merely labelling an auto-selected response.
+            model="claude-sonnet-4.6", wire_model="claude-sonnet-4.6",
+            api="copilot-cli", base_url="",
             pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
             tier=fr.STRONG, capabilities=model_capabilities,
             capabilities_source="declared",
@@ -5070,12 +5213,22 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             outcome["note"] = (outcome["note"] +
                                " The implementation attempt produced no safe delta.").strip()
             return outcome
-        grade = provider.grade(
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, rel, candidate, stack,
+        )
+        if syntax_ok is not True:
+            outcome["note"] = (
+                outcome["note"]
+                + " The implementation attempt was rejected before write: "
+                + syntax_note
+            ).strip()
+            return outcome
+        grade = _normalize_grade(provider.grade(
             purpose + f"\n\nGOAL: {args.goal}\n\nCANDIDATE CODE:\n"
             + _fence_untrusted("candidate", candidate)
             + "\n\nGrade whether the goal and applicable competitor capabilities are "
               "implemented without regression."
-        )
+        ))
         if grade.meets_goal is not True or grade.grade < int(args.threshold):
             outcome["note"] = (outcome["note"] +
                                f" Implementation was rejected at grade {grade.grade}.").strip()
@@ -5229,6 +5382,12 @@ def run(args) -> int:
               file=sys.stderr)
         return 2
     purpose_blob = purpose_contract.prompt_block(max_chars=10000)
+    # Detect the selected repository's native parser before the first model
+    # candidate.  Python/JSON/TOML can be parsed in-process; JavaScript,
+    # TypeScript, Go and the other fast-gated languages require the repository
+    # toolchain.  A candidate must pass that parser in a disposable file before
+    # it is eligible for grading or an owner-worktree write.
+    stack = _detect_stack(root)
     print(f"Program understanding: {purpose_confidence}; "
           f"{len(purpose_contract.primary_users)} primary user(s), "
           f"{len(purpose_contract.core_journeys)} core journey(s), "
@@ -5241,6 +5400,7 @@ def run(args) -> int:
     feedback = ""  # previous grader's complaints, fed into the next rewrite (empty on rep 1)
 
     for i in range(1, args.max_iterations + 1):
+        approved_original_fallback = False
         # GOAL is the user's own trusted instruction; the CURRENT FILE and the prior
         # grader FEEDBACK are UNTRUSTED (the file can carry hostile comments, and the
         # feedback echoes source excerpts) and the rewrite is written to disk - fence
@@ -5254,26 +5414,163 @@ def run(args) -> int:
             "Rewrite the entire file to achieve the goal. Return only the new file contents."
         )
         candidate = _strip_code_fences(provider.complete(rewrite_instruction))
+        candidate_matches_original = candidate == original
 
-        if not candidate.strip():
+        if not candidate.strip() and not candidate_matches_original:
             # A blank rewrite would erase the file if accepted - score it 0 so the
             # policy never selects it, and tell the next rep to return the full file.
             grade = Grade(0, False, "Model returned an empty file.",
                           ["Return the complete file contents, not an empty response."])
         else:
-            grade_prompt = (
-                purpose_blob + f"\n\nGOAL: {args.goal}\n\n"
-                "CANDIDATE CODE:\n" + _fence_untrusted("candidate", candidate) + "\n\n"
-                "Grade how well the candidate satisfies the goal."
+            syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                root, args.file, candidate, stack,
             )
-            grade = provider.grade(grade_prompt)
+            if syntax_ok is not True or candidate_matches_original:
+                # Never let an author response authorize an unchanged result.
+                # This covers both invalid prose/code and syntactically-valid
+                # text equal to the newline-normalized preview: the latter may
+                # conceal CRLF or other exact-byte differences.  Review the
+                # exact original file independently instead.  It becomes a
+                # no-op candidate only on an explicit threshold pass; the
+                # unchanged path below still runs the full project gate and
+                # proves this exact baseline is on remote default.
+                # `_load_source_text` intentionally returns a bounded,
+                # newline-normalized preview for ordinary prompts.  That
+                # preview is not the exact versioned file and therefore can
+                # never authorize an unchanged result.  Re-read through the
+                # contained raw-byte chokepoint, detect truncation, require
+                # strict UTF-8, and show the independent reviewer only that
+                # complete payload.  A file too large for this one-call proof
+                # is refused rather than partially approved.
+                exact_original: str | None = None
+                if EGRESS_MODE == "redact":
+                    original_syntax_ok = False
+                    original_syntax_note = (
+                        "exact original review is unavailable in redact mode "
+                        "because the reviewer would receive altered source"
+                    )
+                else:
+                    exact_bytes = _read_bytes_contained(
+                        root, rel, cap=MAX_REVIEW_BYTES + 1,
+                    )
+                    if exact_bytes is None:
+                        original_syntax_ok = False
+                        original_syntax_note = (
+                            "exact original bytes could not be safely read"
+                        )
+                    elif len(exact_bytes) > MAX_REVIEW_BYTES:
+                        original_syntax_ok = False
+                        original_syntax_note = (
+                            "exact original exceeds the independent no-op review "
+                            f"limit ({MAX_REVIEW_BYTES} bytes)"
+                        )
+                    else:
+                        try:
+                            exact_original = exact_bytes.decode(
+                                "utf-8", errors="strict"
+                            )
+                        except UnicodeDecodeError as exc:
+                            original_syntax_ok = False
+                            original_syntax_note = (
+                                f"exact original is not UTF-8: {exc}"
+                            )
+                        else:
+                            original_syntax_ok, original_syntax_note = (
+                                _prewrite_source_syntax_ok(
+                                    root, args.file, exact_original, stack,
+                                    allow_empty=True,
+                                )
+                            )
+                if candidate_matches_original:
+                    response_description = "unchanged author candidate"
+                    print(
+                        f"[rep {i}] unchanged author candidate requires "
+                        "exact-byte independent review"
+                    )
+                else:
+                    response_description = "invalid author response"
+                    print(
+                        f"[rep {i}] author response rejected before write: "
+                        f"{syntax_note}"
+                    )
+                if original_syntax_ok is True:
+                    grade_prompt = (
+                        purpose_blob + f"\n\nGOAL: {args.goal}\n\n"
+                        "EXACT ORIGINAL FILE (the author response is not "
+                        "authorization for a no-op):\n"
+                        + _fence_exact_utf8_text("original", exact_original)
+                        + "\n\nGrade whether retaining this exact original file fully "
+                          "satisfies the goal. Set meets_goal true only when no "
+                          "source change is required."
+                    )
+                    independent_grade = getattr(
+                        provider, "grade_independent", None
+                    )
+                    try:
+                        if not callable(independent_grade):
+                            raise RuntimeError(
+                                "the active model ladder cannot prove a "
+                                "non-author reviewer"
+                            )
+                        original_grade = _normalize_grade(
+                            independent_grade(grade_prompt)
+                        )
+                    except Exception as exc:
+                        candidate = ""
+                        grade = Grade(
+                            0,
+                            False,
+                            f"The {response_description} required independent "
+                            f"no-op review was unavailable: {type(exc).__name__}: {exc}",
+                            ["Return changed, complete valid source or obtain "
+                             "independent approval of the exact original."],
+                        )
+                    else:
+                        if (original_grade.meets_goal is True
+                                and original_grade.grade >= int(args.threshold)):
+                            # Keep the normalized working copy as the no-op
+                            # sentinel; no write occurs.  Authorization above
+                            # was based on the complete exact bytes.
+                            candidate = original
+                            grade = original_grade
+                            approved_original_fallback = True
+                        else:
+                            candidate = ""
+                            grade = Grade(
+                                original_grade.grade,
+                                False,
+                                f"The {response_description} did not authorize a "
+                                "no-op; the exact original file was not approved "
+                                "unchanged: "
+                                + original_grade.rationale,
+                                ["Return changed, complete valid source."]
+                                + list(original_grade.issues),
+                            )
+                else:
+                    candidate = ""
+                    grade = Grade(
+                        0,
+                        False,
+                        f"The {response_description} could not authorize a no-op; "
+                        "the original "
+                        f"file could not support a verified no-op: {original_syntax_note}",
+                        ["Return changed, complete valid source."],
+                    )
+            else:
+                grade_prompt = (
+                    purpose_blob + f"\n\nGOAL: {args.goal}\n\n"
+                    "CANDIDATE CODE:\n" + _fence_untrusted("candidate", candidate) + "\n\n"
+                    "Grade how well the candidate satisfies the goal."
+                )
+                grade = _normalize_grade(provider.grade(grade_prompt))
 
         history.append(grade)
         print(f"[rep {i}] grade={grade.grade} meets_goal={grade.meets_goal} - {grade.rationale}")
         if grade.issues:
             print("        remaining issues: " + "; ".join(grade.issues))
 
-        if candidate.strip() and grade.grade > best_grade:
+        if (approved_original_fallback
+                or (candidate.strip() and grade.grade > best_grade)):
             best_grade, best_code = grade.grade, candidate
             best_review = grade
 
@@ -5365,7 +5662,6 @@ def run(args) -> int:
             )
             return okay, detail
 
-        stack = _detect_stack(root)
         try:
             final_ok, gate_log = _publication_gate(root, stack)
         except Exception as exc:
@@ -5484,7 +5780,6 @@ def run(args) -> int:
                 file=sys.stderr,
             )
             return 1
-        stack = _detect_stack(root)
         try:
             checkpoint_status = _commit_and_sync(
                 root, branch, branch, args, f"refactor {rel}", stack
@@ -5523,11 +5818,11 @@ def run(args) -> int:
         if execution_orchestrator is not None:
             execution_orchestrator.begin_pass(2, delta)
         current = str(competitor.get("current") or current)
-        follow_up = provider.grade(
+        follow_up = _normalize_grade(provider.grade(
             purpose_blob + f"\n\nGOAL: {args.goal}\n\nFINAL EXACT-DELTA FILE:\n"
             + _fence_untrusted("candidate", current)
             + "\n\nRe-check only this edited file for goal satisfaction and regression."
-        )
+        ))
         if (follow_up.meets_goal is not True
                 or follow_up.grade < int(args.threshold)):
             print(
@@ -6829,6 +7124,10 @@ class ApplyError(Exception):
     """A change was generated but failed to apply/verify cleanly (-> rollback)."""
 
 
+SCOUT_MAX_PATCH_FILES = 30
+SCOUT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
+
+
 class BranchStateError(Exception):
     """A git operation failed in a way that makes it UNSAFE to continue the audit -
     the tree is on the wrong branch, or add/diff failed so a commit would capture
@@ -6985,6 +7284,9 @@ def _run_target_code(cmd: list[str], cwd: str, timeout: int, env: dict | None,
 
 _INTERPRETERS = {"python", "python3", "pythonw", "py", "node"}
 _SYNTAX_ONLY_MODULES = {"py_compile", "compileall", "ast", "tokenize"}
+_NODE_TYPESCRIPT_SYNTAX_FLAGS = {
+    "--experimental-transform-types", "--experimental-strip-types",
+}
 
 
 def _tool_authored_syntax_check(cmd: list[str]) -> bool:
@@ -7003,6 +7305,10 @@ def _tool_authored_syntax_check(cmd: list[str]) -> bool:
     if not args:
         return False
     if args[0] in ("-c", "-e", "--check", "-p", "--eval", "--print"):
+        return True
+    if (exe == "node" and len(args) >= 3
+            and args[0] in _NODE_TYPESCRIPT_SYNTAX_FLAGS
+            and args[1] == "--check"):
         return True
     if args[0] == "-m" and len(args) > 1 and args[1] in _SYNTAX_ONLY_MODULES:
         return True
@@ -8015,12 +8321,68 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     without Git, an origin, a named branch, mandatory publication, or an
     independent reviewer are refused before the first write.
     """
-    files = [f for f in (patch.get("files") or [])
-             if f.get("path") and f.get("contents") is not None]
+    # Default only an absent/explicit-null field.  A falsey object or string is
+    # still malformed model output and must not be silently converted into an
+    # empty batch while package-only mutations continue.
+    raw_files = patch.get("files")
+    if raw_files is None:
+        raw_files = []
+    if not isinstance(raw_files, list):
+        return ApplyResult(
+            repo_name, "refused-invalid-source",
+            f"generated 'files' is not a list ({type(raw_files).__name__})",
+        )
+    if len(raw_files) > SCOUT_MAX_PATCH_FILES:
+        return ApplyResult(
+            repo_name, "refused-invalid-source",
+            f"generated Scout batch names {len(raw_files)} files "
+            f"(max {SCOUT_MAX_PATCH_FILES})",
+        )
+    files: list[dict[str, str]] = []
+    seen_file_paths: set[str] = set()
+    for index, item in enumerate(raw_files):
+        if not isinstance(item, dict):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} is not an object "
+                f"({type(item).__name__})",
+            )
+        path = item.get("path")
+        contents = item.get("contents")
+        if not isinstance(path, str) or not path.strip():
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} has no valid repository path",
+            )
+        if not isinstance(contents, str):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file {path!r} has non-text contents "
+                f"({type(contents).__name__})",
+            )
+        identity = _portable_rel_identity(path)
+        if identity is None:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file entry {index} has an invalid repository path",
+            )
+        canonical_path, path_key = identity
+        if path_key in seen_file_paths:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated Scout batch names duplicate path {canonical_path!r}",
+            )
+        seen_file_paths.add(path_key)
+        files.append({"path": canonical_path, "contents": contents})
     # Packages are MODEL OUTPUT: validate shape + every spec BEFORE any
     # mutation, so a malformed or option-like entry can never write a file,
     # raise past the rollback, or reach npm.
-    packages = patch.get("packages") or []
+    # As with ``files``, default only an absent/explicit-null field.  Falsey
+    # non-list model output is malformed and must not disappear into an empty
+    # list while otherwise-valid source proceeds toward publication.
+    packages = patch.get("packages")
+    if packages is None:
+        packages = []
     if not isinstance(packages, list):
         return ApplyResult(repo_name, "refused-unsafe-packages",
                            f"generated 'packages' is not a list ({type(packages).__name__})")
@@ -8030,6 +8392,43 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                            f"refused unsafe package spec(s) from the generated plan: "
                            f"{bad_specs!r} (only plain registry names, optionally @scoped "
                            "and @versioned, are installable)")
+
+    stack = _detect_stack(project_dir)
+
+    # Scout's integration patch is model-authored source just like Refactor,
+    # Audit, Production Ready, and structural escalation output.  Validate the
+    # complete batch before even detecting a verifier or taking the first
+    # rollback snapshot: an earlier valid entry must not be written merely
+    # because a later entry is invalid.  Requiring an affirmative parser result
+    # also makes parser-unavailable source types an explicit refusal.  A valid
+    # empty file is permitted only when creating a definitively missing path;
+    # an integration may never erase an existing file with an empty rewrite.
+    for item in files:
+        path = item["path"]
+        full = _contained_path(project_dir, path)
+        literal = os.path.join(project_dir, path.replace("\\", "/"))
+        if full is None or os.path.islink(literal):
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file path escapes the repo or is a symlink: {path!r}",
+            )
+        existence = _contained_existence(project_dir, path)
+        if existence == "refused":
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated file path could not be safely inspected: {path!r}",
+            )
+        allow_empty_create = existence == "missing" and not item["contents"].strip()
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, path, item["contents"], stack,
+            allow_empty=allow_empty_create,
+        )
+        if syntax_ok is not True:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated Scout source rejected before write for {path}: "
+                f"{syntax_note}",
+            )
     if not files and not packages:
         return ApplyResult(repo_name, "infeasible", "No concrete edits were produced.")
 
@@ -8105,8 +8504,15 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
     def _snapshot(rel: str) -> None:
         if rel in backups or rel in created:
             return
-        data = _read_bytes_contained(project_dir, rel)
+        data = _read_bytes_contained(
+            project_dir, rel, cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
+        )
         if data is not None:
+            if len(data) > SCOUT_SNAPSHOT_MAX_BYTES:
+                raise ApplyError(
+                    f"cannot safely snapshot {rel!r}: file exceeds the "
+                    f"{SCOUT_SNAPSHOT_MAX_BYTES}-byte rollback limit"
+                )
             backups[rel] = data  # readable existing file -> restore on rollback
             return
         # A None read is NOT automatically "created". Use tri-state existence: only a
@@ -8130,10 +8536,14 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             # based, not branch based, so it is unaffected.
             pass
 
-        # Snapshot package manifests too: npm install rewrites them and we must be
-        # able to restore them on rollback in the non-git path.
-        for manifest in ("package.json", "package-lock.json"):
-            _snapshot(manifest)
+        # Snapshot package manifests only when this plan can run npm install.
+        # Source-only integrations cannot change an unrelated lockfile, and a
+        # large owner lockfile must not block those otherwise bounded edits.
+        # A manifest explicitly named in ``files`` is still snapshotted by the
+        # ordinary per-file loop below.
+        if packages and is_node:
+            for manifest in ("package.json", "package-lock.json"):
+                _snapshot(manifest)
 
         # Write the generated files (backing up originals / marking new ones).
         # Every path goes through the containment chokepoint: an integration patch
@@ -8222,8 +8632,24 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 return {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
             except (ValueError, UnicodeDecodeError):
                 return {}
-        deps_before = _deps_of(backups.get("package.json"))
-        deps_after = _deps_of(_read_bytes_contained(project_dir, "package.json"))
+        dependency_manifest_changed = (
+            bool(packages and is_node)
+            or _portable_rel_member("package.json", file_list)
+        )
+        if dependency_manifest_changed:
+            deps_before = _deps_of(backups.get("package.json"))
+            deps_after_raw = _read_bytes_contained(
+                project_dir, "package.json", cap=SCOUT_SNAPSHOT_MAX_BYTES + 1,
+            )
+            if (deps_after_raw is not None
+                    and len(deps_after_raw) > SCOUT_SNAPSHOT_MAX_BYTES):
+                raise ApplyError(
+                    "post-install package.json exceeds the bounded rollback limit"
+                )
+            deps_after = _deps_of(deps_after_raw)
+        else:
+            deps_before = {}
+            deps_after = {}
         changed_files = sorted(file_list)
         if git:
             st = _git(["status", "--porcelain"], project_dir)
@@ -8256,7 +8682,6 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         if not candidate_sha or candidate_sha == baseline_sha:
             raise ApplyError("candidate commit could not be resolved")
 
-        stack = _detect_stack(project_dir)
         review_summary = {
             "mode": "scout",
             "repository": repo_name,
@@ -8417,6 +8842,28 @@ def _fence_untrusted(label: str, text: str) -> str:
     body = body.replace("<<<UNTRUSTED", "<< <UNTRUSTED").replace("UNTRUSTED>>>", "UNTRUSTED> >>")
     return (f"{_UNTRUSTED_PREAMBLE}\n"
             f"<<<UNTRUSTED {label} START>>>\n{body}\n<<<UNTRUSTED {label} END>>>")
+
+
+def _fence_exact_utf8_text(label: str, text: str) -> str:
+    """Frame complete strict-UTF-8 text without changing any source character.
+
+    Ordinary untrusted fencing deliberately breaks forged marker substrings.
+    That is safe for contextual source, but it cannot prove an exact-file no-op.
+    A JSON string is reversible, and escaping angle brackets prevents its data
+    from spelling either boundary in the prompt.  Because callers first decode
+    strict UTF-8, decoding this JSON string and re-encoding UTF-8 reconstructs
+    the original bytes exactly, including CRLF and literal delimiter text.
+    """
+    encoded = json.dumps(text, ensure_ascii=True)
+    encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e")
+    return (
+        f"{_UNTRUSTED_PREAMBLE}\n"
+        f"<<<UNTRUSTED {label} JSON START>>>\n"
+        "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+        "review and preserve every character):\n"
+        f"{encoded}\n"
+        f"<<<UNTRUSTED {label} JSON END>>>"
+    )
 
 
 def _summarize_repo_for_judge(result: dict) -> str:
@@ -9987,10 +10434,16 @@ TEST_GEN_SCHEMA = {
 _SUITE_EXECUTION_EVIDENCE = re.compile(
     r"(?im)(?:collected\s+[1-9]\d*"           # pytest
     r"|[1-9]\d*\s+(?:tests?|passed|examples?)"  # vitest/jest/cargo/rspec
+    r"|(?:tests?|pass)\s+[1-9]\d*"            # node --test spec summary
     r"|test files\s+[1-9]\d*"                 # vitest summary
     r"|^ok\s+\S+"                             # go: one line per package that ran
     r"|passed:\s*[1-9]\d*"                    # dotnet
     r"|tests run:\s*[1-9]\d*)"                # maven/surefire
+)
+
+_NODE_TEST_SUMMARY_LINE = re.compile(
+    r"(?im)^[ \t]*(?:[#ℹ]\s*)?"
+    r"(tests|pass|fail|skipped|todo)\s*:?\s*(\d+)\b"
 )
 
 
@@ -10010,12 +10463,29 @@ def _suite_reported_tests(suite_log: str) -> bool:
     forcing a genuine re-run, because `test_status` is None on that path so the
     generated-files clause cannot carry the evidence either.
 
+    Node's summary reports both discovery and outcomes. A nonzero ``tests``
+    count is not execution evidence when every discovered test was skipped or
+    TODO, so a detected Node summary must include at least one pass and zero
+    failures. This check runs before the looser cross-ecosystem patterns.
+
     Go's empty case is `?  example/pkg [no test files]`, which starts with `?`
     and cannot match the `^ok ` clause - the distinction is already in the
     output, it just was not being read. Zero counts never match, by
     construction: every numeric clause requires [1-9] first.
     """
-    return bool(_SUITE_EXECUTION_EVIDENCE.search(suite_log or ""))
+    log = suite_log or ""
+    node_counts: dict[str, int] = {}
+    for key, raw_count in _NODE_TEST_SUMMARY_LINE.findall(log):
+        normalized = key.lower()
+        node_counts[normalized] = node_counts.get(normalized, 0) + int(raw_count)
+    if "tests" in node_counts and any(
+            key in node_counts for key in ("pass", "fail", "skipped", "todo")):
+        return bool(
+            node_counts["tests"] > 0
+            and node_counts.get("pass", 0) > 0
+            and node_counts.get("fail", 0) == 0
+        )
+    return bool(_SUITE_EXECUTION_EVIDENCE.search(log))
 
 
 def _review_residue_is_not_an_outage(reviewed: int, candidates: int) -> bool:
@@ -10141,6 +10611,28 @@ def _test_generation_scope(all_files: list[str], max_modules: int
     if max_modules <= 0:
         return candidates, []
     return candidates[:max_modules], candidates[max_modules:]
+
+
+def _existing_changed_sources(project_dir: str, paths) -> list[str]:
+    """Return every changed source path that still exists after mutation.
+
+    Structural fixes may create files or rename them to destinations absent
+    from the pre-mutation source inventory.  Conversely, a rename source is a
+    touched path but no longer exists.  Resolve the live contained paths here
+    so focused regression generation covers new destinations without trying to
+    read deleted sources.
+    """
+    current: set[str] = set()
+    for raw in paths:
+        identity = _portable_rel_identity(str(raw or ""))
+        if identity is None:
+            continue
+        rel = identity[0]
+        if (os.path.splitext(rel)[1].lower() in _CODE_EXTS
+                and not _is_test_path(rel)
+                and _contained_existence(project_dir, rel) == "exists"):
+            current.add(rel)
+    return sorted(current)
 
 AUDIT_SYSTEM = (
     "You are a senior code auditor performing an evidence-first, adversarial "
@@ -10409,6 +10901,12 @@ UNIT_TEST_SYSTEM = (
     "You are a test engineer writing REAL, runnable unit tests using the project's "
     "existing test framework and conventions. Cover each exported function, "
     "including edge cases and error paths. Import from the actual module path shown. "
+    "For JavaScript and TypeScript, declare unskipped test()/it() calls directly at "
+    "module scope, never inside describe(), a conditional, or a helper. For Python, "
+    "use unskipped module-level test_ functions or methods on a Test* class. "
+    "Every returned file must itself be an executable test selected by its exact "
+    "path; never return conftest, runner config, setup, plugin, fixture-only, or "
+    "other support files. "
     "Tests must run as-is with no network or external services (stub/mock those). "
     "Return only the test file(s). Respond with JSON only."
 )
@@ -10429,11 +10927,34 @@ E2E_TEST_SYSTEM = (
 # JS/Python/JVM set so the ecosystems the toolchain detector can now BUILD are
 # also ecosystems the auditor can READ - detecting how to compile Elixir or C++
 # while skipping every .ex and .cpp file would gate a review that never happened.
-_CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+_CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".mjs", ".cjs", ".vue",
               ".svelte", ".go", ".rb", ".java", ".cs", ".php", ".rs", ".scala", ".kt",
               ".ex", ".exs", ".swift", ".dart", ".c", ".cc", ".cpp", ".cxx",
               ".h", ".hpp", ".m", ".mm", ".sh", ".bash", ".lua", ".pl", ".pm",
               ".clj", ".cljs", ".hs", ".jl", ".r", ".sql", ".tf", ".gradle"}
+
+# Every extension advertised above has a bundled, non-executing Tree-sitter
+# grammar.  This table is intentionally explicit and equality-tested: adding a
+# language to `_CODE_EXTS` without adding a safe pre-write parser must make CI
+# fail, not make that language silently read-only at runtime.  Ambiguous legacy
+# extensions follow the ecosystem FlexFactor's build detector assigns them to
+# (`.m`/`.mm` Objective-C, `.gradle` Groovy, `.tf` HCL).
+_TREE_SITTER_LANGUAGE_BY_EXT = {
+    ".py": "python",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
+    ".cjs": "javascript", ".ts": "typescript", ".mts": "typescript",
+    ".cts": "typescript", ".tsx": "tsx",
+    ".vue": "vue", ".svelte": "svelte",
+    ".go": "go", ".rb": "ruby", ".java": "java", ".cs": "csharp",
+    ".php": "php", ".rs": "rust", ".scala": "scala", ".kt": "kotlin",
+    ".ex": "elixir", ".exs": "elixir", ".swift": "swift", ".dart": "dart",
+    ".c": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
+    ".h": "cpp", ".hpp": "cpp", ".m": "objc", ".mm": "objc",
+    ".sh": "bash", ".bash": "bash", ".lua": "lua",
+    ".pl": "perl", ".pm": "perl", ".clj": "clojure",
+    ".cljs": "clojure", ".hs": "haskell", ".jl": "julia", ".r": "r",
+    ".sql": "sql", ".tf": "hcl", ".gradle": "groovy",
+}
 # Legacy bounded-read ceiling for metadata and other intentionally sampled text.
 # Source enumeration and review do NOT use it as an exclusion ceiling: review_file
 # splits complete source into bounded chunks, so large files remain fully covered.
@@ -10464,7 +10985,8 @@ FIX_WHOLE_MAX_TOKENS = 128000   # generate_file_fix() whole-file regen
 # most 3 extra cheap calls; a file that still cannot emit one edit is genuinely
 # beyond this model, and is reported as such rather than retried forever.
 _EDIT_SHRINK_STEPS = 3
-_TEST_MARKERS = (".test.", ".spec.", "__tests__", "/tests/", "/test/", "test_")
+_TEST_FILE_MARKERS = (".test.", ".spec.")
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__"})
 
 
 def _read_full(path: str, cap: int = MAX_REVIEW_BYTES) -> str:
@@ -10511,7 +11033,8 @@ def _same_id(a, b) -> bool:
 
 def _rel_components(rel: str) -> list[str] | None:
     """Split a repo-relative path into safe components, or None if it is absolute,
-    drive-relative, UNC, '~'-rooted, or contains any '..' traversal."""
+    drive-relative, UNC, '~'-rooted, contains traversal, or has a component
+    whose Windows pathname semantics could alias a different repository leaf."""
     if not rel or not isinstance(rel, str):
         return None
     if "\x00" in rel:  # NUL byte: truncation/injection guard
@@ -10525,8 +11048,50 @@ def _rel_components(rel: str) -> list[str] | None:
             continue
         if part == "..":
             return None
+        # Win32 strips trailing spaces/periods, treats these punctuation marks
+        # and ASCII controls specially, exposes ':' as an alternate-data-stream
+        # separator, and reserves device stems even when an extension follows.
+        # Reject those spellings on every host so an all-before-any preflight
+        # cannot validate two names that become one leaf on Windows.
+        if (part[-1] in " ."
+                or any(ord(ch) < 32 or ch in '<>:"|?*' for ch in part)):
+            return None
+        device_stem = part.split(".", 1)[0].casefold()
+        if (device_stem in {
+                "con", "prn", "aux", "nul", "conin$", "conout$"}
+                # Win32 also recognizes the Latin-1 superscript digits as
+                # device numbers. COM¹.py and LPT³.txt are reserved aliases,
+                # not ordinary repository files.
+                or re.fullmatch(r"(?:com|lpt)(?:[1-9]|[¹²³])", device_stem)):
+            return None
         comps.append(part)
     return comps or None
+
+
+def _portable_rel_identity(rel: str) -> tuple[str, str] | None:
+    """Canonical repository spelling plus a portable duplicate identity.
+
+    The spelling is used for every later worktree operation. The identity is
+    NFC-normalized and case-folded so a model-generated batch cannot name one
+    macOS/Windows leaf more than once while appearing distinct on Linux.
+    """
+    components = _rel_components(rel)
+    if components is None:
+        return None
+    canonical = "/".join(components)
+    return canonical, unicodedata.normalize("NFC", canonical).casefold()
+
+
+def _portable_rel_member(path: str, candidates) -> bool:
+    """Whether candidates name ``path`` under portable worktree semantics."""
+    wanted = _portable_rel_identity(path)
+    if wanted is None:
+        return False
+    return any(
+        identity is not None and identity[1] == wanted[1]
+        for identity in (_portable_rel_identity(candidate)
+                         for candidate in candidates)
+    )
 
 
 @contextlib.contextmanager
@@ -10766,6 +11331,163 @@ def _write_contained(project_dir: str, rel: str, content, newline: str = "") -> 
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=True)
 
 
+@dataclass(frozen=True)
+class _ContainedCreateResult:
+    """Outcome of create-only generated-file persistence.
+
+    ``complete=False`` means this call created a live pathname but failed while
+    filling or validating it. The pathname is intentionally retained because
+    no portable identity-conditional unlink exists; callers must treat it as a
+    dirty rollback and block publication.
+    """
+
+    path: str
+    receipt: tuple[os.stat_result, bytes] | None
+    complete: bool
+
+
+def _create_contained(project_dir: str, rel: str, content
+                      ) -> _ContainedCreateResult | None:
+    """Atomically create a missing file and return identity plus content digest.
+
+    Unlike `_write_contained`, this never replaces an existing regular leaf.
+    Generated tests use it after a missing-path preflight so a file raced in by
+    the owner cannot be overwritten.  The returned identity binds any later
+    rollback to the file this call actually created.  The digest also prevents
+    an in-place rewrite on the same inode from retaining execution credit.
+    """
+    comps = _rel_components(rel)
+    if comps is None:
+        return None
+    try:
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    except (TypeError, UnicodeEncodeError):
+        return None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | (
+        os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0
+    )
+
+    if _POSIX_NOFOLLOW:
+        with _walked_parent_fd(project_dir, comps, make_dirs=True) as (parent, leaf):
+            if parent is None:
+                return None
+            fd = None
+            leaf_created = False
+            try:
+                fd = os.open(leaf, flags, 0o600, dir_fd=parent)
+                leaf_created = True
+                mv = memoryview(data)
+                written = 0
+                while written < len(mv):
+                    count = os.write(fd, mv[written:])
+                    if count <= 0:
+                        raise OSError("short/zero write to created file")
+                    written += count
+                final_identity = os.fstat(fd)
+                os.close(fd)
+                fd = None
+                return _ContainedCreateResult(
+                    os.path.join(os.path.realpath(project_dir), *comps),
+                    (final_identity, hashlib.sha256(data).digest()), True,
+                )
+            except OSError:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if leaf_created:
+                    return _ContainedCreateResult(
+                        os.path.join(os.path.realpath(project_dir), *comps),
+                        None, False,
+                    )
+                return None
+
+    if not _CONTAINMENT_FALLBACK_OK:
+        return None
+    status, parent_full = _win_walk(project_dir, comps, make_dirs=True)
+    if status != "ok":
+        return None
+    literal = os.path.join(parent_full, comps[-1])
+    fd = None
+    leaf_created = False
+    try:
+        parent_identity = os.stat(parent_full)
+        fd = os.open(literal, flags, 0o600)
+        leaf_created = True
+        mv = memoryview(data)
+        written = 0
+        while written < len(mv):
+            count = os.write(fd, mv[written:])
+            if count <= 0:
+                raise OSError("short/zero write to created file")
+            written += count
+        final_identity = os.fstat(fd)
+        os.close(fd)
+        fd = None
+        if not _same_id(os.stat(parent_full), parent_identity):
+            raise OSError("created-file parent identity changed")
+        return _ContainedCreateResult(
+            literal, (final_identity, hashlib.sha256(data).digest()), True,
+        )
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if leaf_created:
+            return _ContainedCreateResult(literal, None, False)
+        return None
+
+
+def _created_contained_matches(project_dir: str, rel: str,
+                               receipt: tuple[os.stat_result, bytes]) -> bool:
+    """Whether `rel` still has the exact identity and bytes in a create receipt."""
+    try:
+        identity, expected_digest = receipt
+    except (TypeError, ValueError):
+        return False
+    with _open_contained_fd(project_dir, rel) as fd:
+        if fd is None:
+            return False
+        try:
+            current = os.fstat(fd)
+            if (not _same_id(current, identity)
+                    or stat.S_IMODE(current.st_mode) != stat.S_IMODE(identity.st_mode)):
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.digest() == expected_digest
+        except OSError:
+            return False
+
+
+def _unlink_created_contained(project_dir: str, rel: str,
+                              receipt: tuple[os.stat_result, bytes]) -> bool:
+    """Report a generated file gone without ever deleting a live pathname.
+
+    Python exposes pathname-based unlinking, but no portable
+    ``unlink-this-inode-only`` primitive.  A receipt check followed by
+    ``unlink(rel)`` is therefore unsafe: another process can replace ``rel``
+    after the check and before the unlink.  Missing is the only cleanup state
+    we can prove safe.  A still-present file is retained and reported as a
+    failed rollback so the caller marks the audit dirty and blocks publication.
+
+    ``receipt`` remains part of the API because callers persist it as the
+    evidence that makes ordinary post-run mutation detection fail closed.  It
+    must never be used to authorize a later pathname unlink.
+    """
+    existence = _contained_existence(project_dir, rel)
+    if existence == "missing":
+        return True
+    return False
+
+
 def _replace_contained(project_dir: str, rel: str, content) -> str | None:
     """Like _write_contained but REPLACES a leaf that is a symlink (os.replace no-follow)
     instead of refusing it - for fix-loop candidate writes and rollback RESTORES of an
@@ -10782,18 +11504,23 @@ def _replace_contained(project_dir: str, rel: str, content) -> str | None:
     return _write_win(project_dir, comps, data, refuse_symlink_leaf=False)
 
 
-def _read_bytes_contained(project_dir: str, rel: str, cap: int = MAX_REVIEW_BYTES) -> bytes | None:
+def _read_bytes_contained(project_dir: str, rel: str,
+                          cap: int | None = MAX_REVIEW_BYTES) -> bytes | None:
     """Read a repo-relative file's RAW BYTES through the same fd chokepoint as
     _read_contained (for backups/snapshots that must round-trip exactly). Returns the
     bytes, or None on any refusal (missing / symlink / junction ancestor / escape /
-    fail-closed). Distinguishes 'no original' (None) from 'empty file' (b"")."""
+    fail-closed). Distinguishes 'no original' (None) from 'empty file' (b"").
+    ``cap=None`` reads the complete payload for exact-copy and rollback paths."""
     with _open_contained_fd(project_dir, rel) as fd:
         if fd is None:
             return None
         try:
             buf = bytearray()
-            while len(buf) < cap:
-                chunk = os.read(fd, min(65536, cap - len(buf)))
+            while cap is None or len(buf) < cap:
+                want = 65536 if cap is None else min(65536, cap - len(buf))
+                if want <= 0:
+                    break
+                chunk = os.read(fd, want)
                 if not chunk:
                     break
                 buf += chunk
@@ -11066,8 +11793,15 @@ def _canon_rel(rel: str) -> str:
 
 
 def _is_test_path(rel: str) -> bool:
-    low = rel.replace("\\", "/").lower()
-    return any(m in low for m in _TEST_MARKERS) or os.path.basename(low).startswith("test_")
+    canonical = _canon_rel(rel)
+    parts = canonical.split("/")
+    base = parts[-1] if parts else ""
+    return (
+        any(part.casefold() in _TEST_DIR_NAMES for part in parts[:-1])
+        or base.startswith("test_")
+        or base.endswith(("_test.py", "_test.go"))
+        or any(marker in base for marker in _TEST_FILE_MARKERS)
+    )
 
 
 def _git_real_files(project_dir: str) -> set[str] | None:
@@ -11375,6 +12109,15 @@ def _inventory_project(project_dir: str) -> dict:
             "entries": entries}
 
 
+def _find_project_esbuild(project_dir: str) -> str | None:
+    """Return the repository-local esbuild installed for this exact checkout."""
+    for candidate in ("esbuild.cmd", "esbuild.CMD", "esbuild"):
+        path = os.path.join(project_dir, "node_modules", ".bin", candidate)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _detect_stack(project_dir: str) -> dict:
     """Figure out how to build, test, and run the program with its OWN tooling."""
     info = {"is_node": False, "is_python": False, "framework": None, "scripts": {},
@@ -11428,11 +12171,7 @@ def _detect_stack(project_dir: str) -> dict:
         # single fixed file in ~0.3s instead of running the whole-project typecheck
         # (~minutes) after every fix. The full typecheck+build still runs at each
         # cycle commit, so verification stays comprehensive - just not per file.
-        for cand in ("esbuild.cmd", "esbuild.CMD", "esbuild"):
-            p = os.path.join(project_dir, "node_modules", ".bin", cand)
-            if os.path.isfile(p):
-                info["esbuild"] = p
-                break
+        info["esbuild"] = _find_project_esbuild(project_dir)
     if any(os.path.isfile(os.path.join(project_dir, f))
            for f in ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg")):
         info["is_python"] = True
@@ -11973,7 +12712,8 @@ def _merge_unresolved_file_findings(current: dict[str, list[dict]],
             list(current.get(rel) or []) + [dict(row) for row in rows])
 
 
-def _next_cycle_review_paths(changed_files, incomplete_files=()) -> list[str]:
+def _next_cycle_review_paths(changed_files, incomplete_files=(), *,
+                             project_dir: str | None = None) -> list[str]:
     """Build the only legitimate scope for a follow-up semantic pass.
 
     Cycle 1 is the complete line-by-line sweep. A later cycle may re-read only
@@ -11984,7 +12724,15 @@ def _next_cycle_review_paths(changed_files, incomplete_files=()) -> list[str]:
     they do not violate the owner's changed-files-only follow-up contract.
     """
     del incomplete_files  # compatibility with old callers; deliberately excluded
-    return _unique_review_paths(_ff_execution.changed_file_scope(changed_files))
+    paths = _unique_review_paths(_ff_execution.changed_file_scope(changed_files))
+    if project_dir is not None:
+        # Structural mutation accounting names both sides of a rename. The
+        # deleted source remains in that ledger, but it cannot be a later
+        # semantic-review target. A refused path remains in scope so a
+        # containment problem becomes an explicit incomplete-review blocker.
+        paths = [path for path in paths
+                 if _contained_existence(project_dir, path) != "missing"]
+    return paths
 
 
 def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
@@ -12926,6 +13674,7 @@ STRUCTURAL_MAX_RENAMES = 3      # renames one plan may perform
 STRUCTURAL_MAX_NEED_FILES = 8   # companion files the model may ask to read
 STRUCTURAL_MAX_PER_RUN = 10     # escalation attempts per _fix_files pass
 STRUCTURAL_WRITE_MAX_CHARS = 400_000   # per-file contents ceiling
+STRUCTURAL_RENAME_MAX_BYTES = 8 * 1024 * 1024  # bounded owner-byte move/snapshot
 
 STRUCTURAL_FIX_SCHEMA = {
     "type": "object",
@@ -12987,11 +13736,45 @@ def _structural_repo_listing(project_dir: str, cap_files: int = 400,
     return text[:cap_chars]
 
 
+def _structural_plan_shape_error(plan) -> str:
+    """Validate model-returned container types before any plan field is used."""
+    if not isinstance(plan, dict):
+        return f"plan is not an object ({type(plan).__name__})"
+    if type(plan.get("changed")) is not bool:
+        return "plan 'changed' is not a boolean"
+    for field in ("writes", "renames"):
+        value = plan.get(field)
+        if value is not None and not isinstance(value, list):
+            return "plan is malformed (writes/renames not lists)"
+    need_files = plan.get("need_files")
+    if (need_files is not None
+            and (not isinstance(need_files, list)
+                 or any(not isinstance(path, str) for path in need_files))):
+        return "plan 'need_files' is not a list of paths"
+    fixed_titles = plan.get("fixed_titles")
+    if (not isinstance(fixed_titles, list)
+            or any(not isinstance(title, str) for title in fixed_titles)):
+        return "plan 'fixed_titles' is not a list of strings"
+    if not isinstance(plan.get("notes"), str):
+        return "plan 'notes' is not a string"
+    return ""
+
+
 def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     """Validate a plan against containment + policy rules. Returns '' when
     acceptable, else the refusal reason (the plan is then NOT applied)."""
-    writes = plan.get("writes") or []
-    renames = plan.get("renames") or []
+    shape_error = _structural_plan_shape_error(plan)
+    if shape_error:
+        return shape_error
+    # The schema requires arrays.  Default only an absent/explicit-null field;
+    # falsey model values such as False, "", and {} remain malformed and must
+    # stop the entire plan before even a different valid operation is inspected.
+    writes = plan.get("writes")
+    renames = plan.get("renames")
+    if writes is None:
+        writes = []
+    if renames is None:
+        renames = []
     if not isinstance(writes, list) or not isinstance(renames, list):
         return "plan is malformed (writes/renames not lists)"
     if not writes and not renames:
@@ -13001,7 +13784,25 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
     if len(renames) > STRUCTURAL_MAX_RENAMES:
         return f"plan renames {len(renames)} files (max {STRUCTURAL_MAX_RENAMES})"
 
-    def bad_path(p) -> str:
+    seen_paths: dict[str, tuple[str, str]] = {}
+    # A write to an exact rename destination rewrites the moved owner file, not
+    # a newly-created path. Resolve that ownership before validating writes so
+    # the source must have been shown and empty-file policy cannot misclassify
+    # the still-missing destination as a safe empty creation.
+    rename_destination_sources: dict[str, str] = {}
+    for rename in renames:
+        if not isinstance(rename, dict):
+            continue
+        raw_source = rename.get("from")
+        raw_destination = rename.get("to")
+        if not isinstance(raw_source, str) or not isinstance(raw_destination, str):
+            continue
+        source_identity = _portable_rel_identity(raw_source)
+        destination_identity = _portable_rel_identity(raw_destination)
+        if source_identity is not None and destination_identity is not None:
+            rename_destination_sources[destination_identity[0]] = source_identity[0]
+
+    def bad_path(p, role: str) -> str:
         if not isinstance(p, str) or not p.strip():
             return "empty path in plan"
         cp = _canon_rel(p)
@@ -13009,27 +13810,60 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
             return f"path touches .git: {p}"
         if _rel_components(cp) is None:
             return f"path refused by containment: {p}"
+        identity = _portable_rel_identity(cp)
+        if identity is None:
+            return f"path refused by containment: {p}"
+        canonical, key = identity
+        previous = seen_paths.get(key)
+        if previous is not None:
+            previous_path, previous_role = previous
+            # The apply transaction deliberately performs renames before
+            # writes, so one exact destination may be rewritten with complete
+            # generated contents after its owner bytes move.  This is the only
+            # repeated identity that has deterministic semantics.  Portable
+            # aliases with different spelling and every third/other occurrence
+            # remain a preflight refusal.
+            intentional_move_then_write = bool(
+                canonical == previous_path
+                and {role, previous_role} == {"write", "rename-destination"}
+            )
+            if intentional_move_then_write:
+                seen_paths[key] = (
+                    canonical, "write+rename-destination"
+                )
+                return ""
+            return (f"plan aliases one repository path more than once: "
+                    f"{previous_path!r} and {canonical!r}")
+        seen_paths[key] = (canonical, role)
         return ""
 
     for w in writes:
         p = w.get("path") if isinstance(w, dict) else None
-        why = bad_path(p)
+        why = bad_path(p, "write")
         if why:
             return why
         if not isinstance(w.get("contents"), str):
             return f"write without string contents: {p}"
         if len(w["contents"]) > STRUCTURAL_WRITE_MAX_CHARS:
             return f"write exceeds {STRUCTURAL_WRITE_MAX_CHARS} chars: {p}"
-        ex = _contained_existence(project_dir, _canon_rel(p))
+        canonical_write = _portable_rel_identity(p)[0]
+        owner_path = rename_destination_sources.get(
+            canonical_write, canonical_write
+        )
+        ex = _contained_existence(project_dir, owner_path)
         if ex == "refused":
             return f"existence check refused for {p}"
-        if ex == "exists" and _canon_rel(p) not in shown:
+        if ex == "exists" and owner_path not in shown:
+            if owner_path != canonical_write:
+                return (f"plan rewrites {p} after moving {owner_path} without "
+                        "having seen its contents")
             return f"plan rewrites {p} without having seen its contents"
     for r in renames:
         src_p = r.get("from") if isinstance(r, dict) else None
         dst_p = r.get("to") if isinstance(r, dict) else None
-        for p in (src_p, dst_p):
-            why = bad_path(p)
+        for p, role in ((src_p, "rename-source"),
+                        (dst_p, "rename-destination")):
+            why = bad_path(p, role)
             if why:
                 return why
         if _contained_existence(project_dir, _canon_rel(src_p)) != "exists":
@@ -13037,6 +13871,31 @@ def _structural_plan_errors(project_dir: str, plan: dict, shown: set) -> str:
         if _contained_existence(project_dir, _canon_rel(dst_p)) != "missing":
             return f"rename target already exists (or refused): {dst_p}"
     return ""
+
+
+def _read_complete_structural_text(project_dir: str, rel: str) -> tuple[str | None, str]:
+    """Read one complete bounded UTF-8 owner file for structural planning.
+
+    `_read_contained` is intentionally a preview reader and cannot distinguish
+    a complete file from a truncated prefix at its ceiling.  Whole-file
+    structural rewrites may only call a source "shown" after this helper has
+    observed EOF inside the bound.
+    """
+    payload = _read_bytes_contained(
+        project_dir, rel, cap=MAX_REVIEW_BYTES + 1,
+    )
+    if payload is None:
+        return None, "missing or contained read refused"
+    if len(payload) > MAX_REVIEW_BYTES:
+        return (
+            None,
+            f"exceeds the complete structural planning limit "
+            f"({MAX_REVIEW_BYTES} bytes)",
+        )
+    try:
+        return payload.decode("utf-8", errors="strict"), ""
+    except UnicodeDecodeError as exc:
+        return None, f"is not strict UTF-8: {exc}"
 
 
 def _cross_verify_structural(reviewer, rel: str, targets: list, ops_text: str) -> tuple:
@@ -13056,8 +13915,22 @@ def _cross_verify_structural(reviewer, rel: str, targets: list, ops_text: str) -
         data = _judge(reviewer, FIX_VERIFY_SYSTEM, prompt, FIX_VERIFY_SCHEMA)
     except Exception as ex:
         return True, f"cross-verify skipped: {ex}"
-    keep = (str(data.get("verdict")) == "keep") and not data.get("regressions")
-    reason = "; ".join(str(i) for i in (data.get("issues") or [])) or str(data.get("verdict"))
+    issues = data.get("issues")
+    keep = (
+        str(data.get("verdict")) == "keep"
+        and data.get("resolves") is True
+        and data.get("regressions") is False
+        and isinstance(issues, list)
+        and not issues
+    )
+    if issues:
+        reason = "; ".join(str(item) for item in issues)
+    elif data.get("resolves") is not True:
+        reason = "reviewer says the listed defects remain unresolved"
+    elif data.get("regressions") is not False:
+        reason = "reviewer reports a regression"
+    else:
+        reason = str(data.get("verdict"))
     return keep, reason
 
 
@@ -13073,9 +13946,14 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     'failed' (plan refused / apply error / gate broke / veto - EVERY touched
     path restored) with a reason string. Never raises on a model/apply failure;
     the audit must outlive this pass."""
-    primary = _read_contained(project_dir, rel)
+    primary, primary_read_note = _read_complete_structural_text(
+        project_dir, rel
+    )
     if primary is None:
-        return ("failed", "contained read of the primary file was refused")
+        return (
+            "failed",
+            f"complete read of the primary file was refused: {primary_read_note}",
+        )
     bullets = "\n".join(
         f"- [{f.get('severity')}] line {f.get('line')} - {f.get('title')}: "
         f"{f.get('problem')} => FIX: {f.get('fix')}" for f in targets)
@@ -13098,14 +13976,21 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                                       STRUCTURAL_FIX_SCHEMA,
                                       max_tokens=FIX_WHOLE_MAX_TOKENS, **kwargs),
             FIX_FILE_MAX_SECONDS)
+        shape_error = _structural_plan_shape_error(plan)
+        if shape_error:
+            return ("failed", f"structural plan refused: {shape_error}")
         need = [str(p) for p in (plan.get("need_files") or [])][:STRUCTURAL_MAX_NEED_FILES]
         if not plan.get("changed") and need:
             extra_parts = []
             for p in need:
                 cp = _canon_rel(p)
-                text = _read_contained(project_dir, cp)
+                text, read_note = _read_complete_structural_text(
+                    project_dir, cp
+                )
                 if text is None:
-                    extra_parts.append(f"REQUESTED FILE {cp}: (missing or refused)")
+                    extra_parts.append(
+                        f"REQUESTED FILE {cp}: (not shown: {read_note})"
+                    )
                 else:
                     shown.add(cp)
                     extra_parts.append(f"REQUESTED FILE {cp}:\n"
@@ -13118,6 +14003,9 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                     STRUCTURAL_FIX_SCHEMA,
                     max_tokens=FIX_WHOLE_MAX_TOKENS, **kwargs),
                 FIX_FILE_MAX_SECONDS)
+            shape_error = _structural_plan_shape_error(plan)
+            if shape_error:
+                return ("failed", f"structural plan refused: {shape_error}")
     except _AbandonedCallTimeout:
         return ("failed", "structural planning exceeded the per-file wall clock")
     except BudgetExceededError:
@@ -13132,16 +14020,120 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
     if why:
         return ("failed", f"plan refused: {why}")
 
-    writes = [(_canon_rel(w["path"]), w["contents"]) for w in plan.get("writes") or []]
-    renames = [(_canon_rel(r["from"]), _canon_rel(r["to"]))
+    writes = [(_portable_rel_identity(w["path"])[0], w["contents"])
+              for w in plan.get("writes") or []]
+    renames = [(_portable_rel_identity(r["from"])[0],
+                _portable_rel_identity(r["to"])[0])
                for r in plan.get("renames") or []]
+
+    # Structural escalation is still model-authored source.  Validate EVERY
+    # generated file before the first worktree mutation, just like the ordinary
+    # single-file fix path.  A parser-unavailable result is a refusal, not an
+    # invitation to rely on a later broad build or semantic reviewer.  Empty
+    # source is allowed only for a newly-created file whose parser says it is
+    # valid (for example an empty Python package marker); a plan may never erase
+    # an existing file by calling an empty rewrite syntactically valid.
+    rename_destinations = {dst: src for src, dst in renames}
+    for p, contents in writes:
+        existence = _contained_existence(project_dir, p)
+        allow_empty_create = (
+            p not in rename_destinations
+            and existence == "missing"
+            and not contents.strip()
+        )
+        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+            project_dir, p, contents, stack,
+            allow_empty=allow_empty_create,
+        )
+        if syntax_ok is not True:
+            return (
+                "failed",
+                f"structural source rejected before write for {p}: {syntax_note}",
+            )
+
+    # A rename can change the source identity: bytes harmless as notes.txt can
+    # become executable as new.py.  Read each owner payload with a hard bound
+    # and parse it against the destination whenever a safe parser exists.
+    # Same-extension moves with no in-process parser preserve both bytes and
+    # type, so they remain eligible for the normal file/project gates.  An
+    # unsupported extension-changing move fails closed.
+    rename_payloads: dict[tuple[str, str], bytes] = {}
+    write_paths = {path for path, _contents in writes}
+    for src_p, dst_p in renames:
+        source_bytes = _read_bytes_contained(
+            project_dir, src_p, cap=STRUCTURAL_RENAME_MAX_BYTES + 1,
+        )
+        if source_bytes is None:
+            return (
+                "failed",
+                f"structural rename source read was refused for {src_p}",
+            )
+        if len(source_bytes) > STRUCTURAL_RENAME_MAX_BYTES:
+            return (
+                "failed",
+                f"structural rename source exceeds "
+                f"{STRUCTURAL_RENAME_MAX_BYTES} bytes: {src_p}",
+            )
+        try:
+            # The rename below copies these exact bytes. A replacement-decoded
+            # preview is not evidence that the on-disk payload is valid source.
+            source = source_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as ex:
+            return (
+                "failed",
+                f"structural rename source rejected before write for "
+                f"{src_p} -> {dst_p}: invalid UTF-8 ({ex})",
+            )
+        # A complete validated write to the destination makes these copied
+        # bytes only a transactional move intermediate: they are overwritten
+        # before any gate or reviewer can retain them. Validate the source
+        # against the destination type only for a byte-preserving rename.
+        if dst_p not in write_paths:
+            syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                project_dir, dst_p, source, stack, allow_empty=True,
+            )
+            same_type = (
+                os.path.splitext(src_p)[1].casefold()
+                == os.path.splitext(dst_p)[1].casefold()
+            )
+            if syntax_ok is False or (syntax_ok is None and not same_type):
+                return (
+                    "failed",
+                    f"structural rename source rejected before write for "
+                    f"{src_p} -> {dst_p}: {syntax_note}",
+                )
+        rename_payloads[(src_p, dst_p)] = source_bytes
+
     touched = [p for p, _ in writes] + [p for pair in renames for p in pair]
     snapshots = {}
+    rename_destination_paths = set(rename_destinations)
     for p in dict.fromkeys(touched):
         ex = _contained_existence(project_dir, p)
         if ex == "refused":
             return ("failed", f"existence check refused for {p}")
-        snapshots[p] = _read_bytes_contained(project_dir, p) if ex == "exists" else None
+        if p in rename_destination_paths and ex != "missing":
+            return ("failed", f"rename target changed before apply: {p}")
+        if ex == "exists":
+            snapshot = _read_bytes_contained(
+                project_dir, p, cap=STRUCTURAL_RENAME_MAX_BYTES + 1,
+            )
+            if snapshot is None:
+                return ("failed", f"snapshot read was refused for {p}")
+            if len(snapshot) > STRUCTURAL_RENAME_MAX_BYTES:
+                return (
+                    "failed",
+                    f"structural snapshot exceeds "
+                    f"{STRUCTURAL_RENAME_MAX_BYTES} bytes: {p}",
+                )
+            snapshots[p] = snapshot
+        else:
+            snapshots[p] = None
+    for pair, payload in rename_payloads.items():
+        if snapshots.get(pair[0]) != payload:
+            return (
+                "failed",
+                f"rename source changed during preflight: {pair[0]}",
+            )
 
     def _rollback() -> bool:
         ok = True
@@ -13153,40 +14145,71 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 ok = (_replace_contained(project_dir, p, data) is not None) and ok
         return ok
 
-    applied_ops = []
-    for src_p, dst_p in renames:
-        data = _read_bytes_contained(project_dir, src_p)
-        moved = (data is not None
-                 and _replace_contained(project_dir, dst_p, data) is not None
-                 and _unlink_contained(project_dir, src_p))
-        if not moved:
-            _rollback()
-            return ("failed", f"rename {src_p} -> {dst_p} refused (rolled back)")
-        applied_ops.append(f"rename {src_p} -> {dst_p}")
-    for p, contents in writes:
-        was = snapshots.get(p)
-        if _replace_contained(project_dir, p, contents) is None:
-            _rollback()
-            return ("failed", f"contained write refused for {p} (rolled back)")
-        applied_ops.append(("rewrite " if was is not None else "create ") + p)
+    def _failed_after_rollback(detail: str) -> tuple[str, str]:
+        try:
+            restored = _rollback()
+        except Exception:
+            restored = False
+        if not restored:
+            raise DirtyTreeError(dict.fromkeys([rel] + touched))
+        return "failed", f"{detail} (rolled back)"
 
-    unverified = False
+    applied_ops = []
+    try:
+        for src_p, dst_p in renames:
+            data = rename_payloads[(src_p, dst_p)]
+            moved = (data is not None
+                     and _replace_contained(project_dir, dst_p, data) is not None
+                     and _unlink_contained(project_dir, src_p))
+            if not moved:
+                return _failed_after_rollback(
+                    f"rename {src_p} -> {dst_p} was refused"
+                )
+            applied_ops.append(f"rename {src_p} -> {dst_p}")
+        for p, contents in writes:
+            was = snapshots.get(p)
+            if _replace_contained(project_dir, p, contents) is None:
+                return _failed_after_rollback(
+                    f"contained write was refused for {p}"
+                )
+            moved_here = p in rename_destination_paths
+            applied_ops.append(
+                ("rewrite " if was is not None or moved_here else "create ") + p
+            )
+    except DirtyTreeError:
+        raise
+    except Exception as exc:
+        return _failed_after_rollback(
+            f"structural apply raised {type(exc).__name__}: {exc}"
+        )
+
+    unverified_paths: list[str] = []
     to_gate = [p for p, _ in writes] + [dst for _, dst in renames]
     for p in dict.fromkeys(to_gate):
         if os.path.splitext(p)[1].lower() not in _CODE_EXTS:
             continue
-        ok, log = _gate_file(project_dir, p, stack, baseline_ok)
+        try:
+            ok, log = _gate_file(project_dir, p, stack, baseline_ok)
+        except Exception as exc:
+            return _failed_after_rollback(
+                f"syntax gate raised for {p}: {type(exc).__name__}: {exc}"
+            )
         if ok is False:
-            if not _rollback():
-                return ("failed", f"gate broke on {p} AND rollback was refused - tree dirty")
-            return ("failed", f"syntax gate failed on {p}: {log[:200]} (rolled back)")
+            return _failed_after_rollback(
+                f"syntax gate failed on {p}: {log[:200]}"
+            )
         if ok is None:
-            unverified = True
+            unverified_paths.append(p)
 
     if cross is not None:
         parts = []
+        moved_payloads = {
+            dst: rename_payloads[(src, dst)] for src, dst in renames
+        }
         for p, contents in writes:
             was = snapshots.get(p)
+            if was is None:
+                was = moved_payloads.get(p)
             if was is not None:
                 try:
                     parts.append(_fix_diff(was.decode("utf-8", "replace"), contents, p))
@@ -13196,11 +14219,18 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
                 parts.append(f"NEW FILE {p}:\n{contents[:8000]}")
         for src_p, dst_p in renames:
             parts.append(f"RENAME {src_p} -> {dst_p}")
-        keep, reason = _cross_verify_structural(cross, rel, targets, "\n\n".join(parts))
+        try:
+            keep, reason = _cross_verify_structural(
+                cross, rel, targets, "\n\n".join(parts)
+            )
+        except Exception as exc:
+            return _failed_after_rollback(
+                f"cross-model verification raised {type(exc).__name__}: {exc}"
+            )
         if not keep:
-            if not _rollback():
-                return ("failed", "cross-model veto AND rollback refused - tree dirty")
-            return ("failed", f"cross-model rejected the structural fix: {reason}")
+            return _failed_after_rollback(
+                f"cross-model rejected the structural fix: {reason}"
+            )
 
     detail = {"fixed_titles": plan.get("fixed_titles") or [],
               "notes": str(plan.get("notes") or ""),
@@ -13209,8 +14239,9 @@ def attempt_structural_fix(author, cross, project_dir: str, rel: str,
               # re-reviewed. Rename sources are deletions; destinations and all
               # writes are the exact current-byte delta for the next sweep.
               "changed_files": _unique_review_paths(
-                  [p for p, _ in writes] + [dst for _, dst in renames])}
-    return ("unverified" if unverified else "fixed", detail)
+                  [p for p, _ in writes] + [dst for _, dst in renames]),
+              "unverified_paths": unverified_paths}
+    return ("unverified" if unverified_paths else "fixed", detail)
 
 
 def _gate_file(project_dir: str, rel_path: str, stack: dict, baseline_ok: bool) -> tuple[bool | None, str]:
@@ -13708,8 +14739,1404 @@ def _run_unit_tests(project_dir: str, stack: dict) -> tuple[bool | None, str]:
     if not stack.get("test_cmd"):
         return None, "(no test runner detected)"
     print(f"    running tests: {' '.join(stack['test_cmd'])}")
-    r = _run(stack["test_cmd"], project_dir, timeout=1800)
+    r = _run(
+        stack["test_cmd"], project_dir, timeout=1800,
+        env=stack.get("_generated_test_env"),
+    )
     return (r.returncode == 0, _tail(r.stdout + "\n" + r.stderr, 40))
+
+
+def _validated_generated_test_entries(gen: dict) -> list[dict]:
+    """Validate test-entry properties before the audit consumer uses them.
+
+    The shared structured-output guard proves that array members are objects,
+    but providers without native schema enforcement can still return wrong
+    property types inside those objects.  Keep this consumer boundary strict
+    so malformed ``path`` or ``contents`` values become the surrounding
+    module's ordinary generation failure instead of escaping as AttributeError.
+    """
+    if not isinstance(gen, dict):
+        raise RuntimeError(
+            f"test generation returned {type(gen).__name__}, not an object"
+        )
+    files = gen.get("files")
+    if files is None:
+        return []
+    if not isinstance(files, list):
+        raise RuntimeError(
+            f"test generation 'files' is {type(files).__name__}, not an array"
+        )
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"test generation files[{index}] is "
+                f"{type(item).__name__}, not an object"
+            )
+        for field in ("path", "contents"):
+            value = item.get(field)
+            if not isinstance(value, str):
+                raise RuntimeError(
+                    f"test generation files[{index}].{field} is "
+                    f"{type(value).__name__}, not a string"
+                )
+    return files
+
+
+_GENERATED_JS_TEST_EXTS = frozenset(
+    {".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs", ".cts", ".mts"}
+)
+
+
+def _javascript_regex_can_start(projected: list[str]) -> bool:
+    """Conservatively identify a JavaScript regular-expression literal slash."""
+    index = len(projected) - 1
+    while index >= 0 and projected[index].isspace():
+        index -= 1
+    if index < 0:
+        return True
+    previous = projected[index]
+    if previous in "([{:;,=!?&|+-*%^~<>":
+        return True
+    if previous == ")":
+        depth = 1
+        cursor = index - 1
+        while cursor >= 0 and depth:
+            if projected[cursor] == ")":
+                depth += 1
+            elif projected[cursor] == "(":
+                depth -= 1
+            cursor -= 1
+        if depth == 0:
+            while cursor >= 0 and projected[cursor].isspace():
+                cursor -= 1
+            end = cursor + 1
+            while cursor >= 0 and (
+                    projected[cursor].isalnum() or projected[cursor] in "_$"):
+                cursor -= 1
+            if "".join(projected[cursor + 1:end]) in {
+                    "if", "for", "while", "with", "switch", "catch"}:
+                return True
+    if previous.isalnum() or previous in "_$":
+        end = index + 1
+        while index >= 0 and (
+                projected[index].isalnum() or projected[index] in "_$"):
+            index -= 1
+        return "".join(projected[index + 1:end]) in {
+            "await", "case", "delete", "do", "else", "in", "instanceof",
+            "new", "of", "return", "throw", "typeof", "void", "yield",
+        }
+    return False
+
+
+def _slash_language_code_projection(
+        source: str, *, mask_regex: bool, raw_backticks: bool,
+) -> str:
+    """Mask inert lexical regions in JavaScript-like slash-comment syntax.
+
+    This deliberately masks complete template literals, including interpolation,
+    because generated tests do not need to hide their declarations inside a
+    template expression.  Preserving newlines lets the caller require a direct,
+    statement-level declaration without executing model-authored source.  Go
+    callers disable regex handling and select raw-backtick semantics.
+    """
+    projected: list[str] = []
+    index = 0
+    state = "code"
+    quote = ""
+    regex_class = False
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if char == "/" and following == "/":
+                projected.extend((" ", " "))
+                index += 2
+                state = "line-comment"
+                continue
+            if char == "/" and following == "*":
+                projected.extend((" ", " "))
+                index += 2
+                state = "block-comment"
+                continue
+            if (mask_regex and char == "/"
+                    and _javascript_regex_can_start(projected)):
+                projected.append(" ")
+                index += 1
+                state = "regex"
+                regex_class = False
+                continue
+            if char in ("'", '"', "`"):
+                projected.append(" ")
+                quote = char
+                state = "literal"
+                index += 1
+                continue
+            projected.append(char)
+            index += 1
+            continue
+        if state == "line-comment":
+            projected.append("\n" if char == "\n" else " ")
+            index += 1
+            if char == "\n":
+                state = "code"
+            continue
+        if state == "block-comment":
+            if char == "*" and following == "/":
+                projected.extend((" ", " "))
+                index += 2
+                state = "code"
+                continue
+            projected.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+        if state == "regex":
+            if char == "\\" and index + 1 < len(source):
+                projected.extend((" ", "\n" if following == "\n" else " "))
+                index += 2
+                continue
+            if char == "\n":
+                projected.append("\n")
+                index += 1
+                state = "code"
+                continue
+            projected.append(" ")
+            index += 1
+            if char == "[":
+                regex_class = True
+            elif char == "]":
+                regex_class = False
+            elif char == "/" and not regex_class:
+                while index < len(source) and source[index].isalpha():
+                    projected.append(" ")
+                    index += 1
+                state = "code"
+            continue
+        if (char == "\\" and index + 1 < len(source)
+                and not (raw_backticks and quote == "`")):
+            projected.append(" ")
+            projected.append("\n" if following == "\n" else " ")
+            index += 2
+            continue
+        projected.append("\n" if char == "\n" else " ")
+        index += 1
+        if char == quote:
+            state = "code"
+    return "".join(projected)
+
+
+def _javascript_code_projection(source: str) -> str:
+    """Return only executable JavaScript/TypeScript lexical structure."""
+    return _slash_language_code_projection(
+        source, mask_regex=True, raw_backticks=False,
+    )
+
+
+def _go_code_projection(source: str) -> str:
+    """Return Go code with comments, interpreted strings, and raw strings masked."""
+    return _slash_language_code_projection(
+        source, mask_regex=False, raw_backticks=True,
+    )
+
+
+def _javascript_source_has_module_test(source: str) -> bool:
+    """Find a direct, runnable module-level JavaScript test declaration."""
+    projected = _javascript_code_projection(source)
+    declaration = re.compile(
+        r"^[ \t]*(?:it|test)\s*(?:\.\s*(?:each|only)\s*)*\("
+    )
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    statement_tail = ""
+    for line in projected.splitlines(keepends=True):
+        tail = statement_tail.rstrip()
+        deferred_tail = tail.endswith((
+            "=>", "&&", "||", "??", "?", ",", "=", "+", "-", "*", "/", "%",
+        ))
+        conditional_tail = bool(re.search(
+            r"(?:^|\W)(?:if|for|while|with)\s*\([^;{}]*\)\s*$"
+            r"|(?:^|\W)(?:else|do)\s*$",
+            tail,
+            flags=re.DOTALL,
+        ))
+        if (brace_depth == 0 and paren_depth == 0 and bracket_depth == 0
+                and not deferred_tail and not conditional_tail
+                and declaration.match(line)):
+            return True
+        for char in line:
+            if char == "{":
+                brace_depth += 1
+            elif char == "}":
+                brace_depth = max(0, brace_depth - 1)
+            elif char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            statement_tail += char
+            if char in ";{}":
+                statement_tail = ""
+        if len(statement_tail) > 4096:
+            statement_tail = statement_tail[-4096:]
+    return False
+
+
+def _runner_collectable_generated_test_path(path: str) -> bool:
+    """Whether a default native runner can collect this executable test path."""
+    canonical = _canon_rel(path)
+    parts = canonical.split("/")
+    base = parts[-1] if parts else ""
+    ext = os.path.splitext(base)[1]
+    if ext == ".py":
+        return base.startswith("test_") or base.endswith("_test.py")
+    if ext == ".go":
+        return base.endswith("_test.go")
+    if ext in _GENERATED_JS_TEST_EXTS:
+        return (
+            ".test." in base
+            or ".spec." in base
+            or "__tests__" in parts[:-1]
+        )
+    return False
+
+
+def _ast_dotted_name(node: ast.AST) -> str:
+    """Return a conservative dotted name for decorator and base expressions."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _ast_dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _python_test_is_unconditionally_skipped(
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> bool:
+    """Whether pytest/unittest will unconditionally skip this test container."""
+    for decorator in node.decorator_list:
+        call = decorator if isinstance(decorator, ast.Call) else None
+        target = call.func if call is not None else decorator
+        leaf = _ast_dotted_name(target).lower().rsplit(".", 1)[-1]
+        if leaf == "skip":
+            return True
+        if leaf in ("skipif", "skipunless"):
+            condition = call.args[0] if call is not None and call.args else None
+            if isinstance(condition, ast.Constant):
+                active = bool(condition.value)
+                if leaf == "skipunless":
+                    active = not active
+                if not active:
+                    continue
+            # A runtime-dependent conditional skip cannot prove this generated
+            # test will execute in the current runner, so it receives no credit.
+            return True
+    return False
+
+
+def _python_value_has_skip_marker(node: ast.AST) -> bool:
+    """Whether a module-level pytestmark value can suppress test execution."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_python_value_has_skip_marker(item) for item in node.elts)
+    target = node.func if isinstance(node, ast.Call) else node
+    return _ast_dotted_name(target).lower().rsplit(".", 1)[-1] in {
+        "skip", "skipif", "skipunless",
+    }
+
+
+def _python_source_has_collectable_test(tree: ast.Module) -> bool:
+    """Find an unskipped module/class-level test that pytest can collect."""
+    function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    for statement in tree.body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            if (_ast_dotted_name(call.func).lower().endswith("pytest.skip")
+                    and any(keyword.arg == "allow_module_level"
+                            and isinstance(keyword.value, ast.Constant)
+                            and keyword.value.value is True
+                            for keyword in call.keywords)):
+                return False
+        value = None
+        targets: list[ast.AST] = []
+        if isinstance(statement, ast.Assign):
+            value, targets = statement.value, list(statement.targets)
+        elif isinstance(statement, ast.AnnAssign):
+            value, targets = statement.value, [statement.target]
+        if (value is not None
+                and any(isinstance(target, ast.Name)
+                        and target.id == "pytestmark" for target in targets)
+                and _python_value_has_skip_marker(value)):
+            return False
+    for node in tree.body:
+        if isinstance(node, function_types):
+            if (node.name.startswith("test_")
+                    and not _python_test_is_unconditionally_skipped(node)):
+                return True
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {_ast_dotted_name(base) for base in node.bases}
+        collectable_class = node.name.startswith("Test") or any(
+            base.rsplit(".", 1)[-1] == "TestCase" for base in bases if base
+        )
+        has_constructor = any(
+            isinstance(member, function_types) and member.name == "__init__"
+            for member in node.body
+        )
+        if (not collectable_class or has_constructor
+                or _python_test_is_unconditionally_skipped(node)):
+            continue
+        if any(
+                isinstance(member, function_types)
+                and member.name.startswith("test_")
+                and not _python_test_is_unconditionally_skipped(member)
+                for member in node.body):
+            return True
+    return False
+
+
+def _go_runnable_test_names(source: str) -> list[str]:
+    """Return generated Go tests that cannot unconditionally self-skip.
+
+    The lexical projection removes comments and strings first, so braces and
+    ``t.Skip`` text in examples cannot affect the scan. Any Skip/SkipNow call
+    on the test parameter is conservatively disqualifying; runtime-dependent
+    skips cannot establish that generated behavior executed.
+    """
+    projected = _go_code_projection(source)
+    declaration = re.compile(
+        r"(?m)^\s*func\s+(Test[A-Z0-9_]\w*)\s*\(\s*"
+        r"([A-Za-z_]\w*)\s+\*testing\.T\s*\)\s*\{"
+    )
+    runnable: list[str] = []
+    for match in declaration.finditer(projected):
+        depth = 1
+        cursor = match.end()
+        while cursor < len(projected) and depth:
+            if projected[cursor] == "{":
+                depth += 1
+            elif projected[cursor] == "}":
+                depth -= 1
+            cursor += 1
+        if depth:
+            continue
+        parameter = re.escape(match.group(2))
+        body = projected[match.end():cursor - 1]
+        if re.search(
+                rf"\b{parameter}\s*\.\s*Skip(?:f|Now)?\s*\(", body):
+            continue
+        runnable.append(match.group(1))
+    return runnable
+
+
+def _generated_test_source_has_case(path: str, source: str) -> bool:
+    """Conservative source-level evidence that an executable test declares a case."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".py":
+        try:
+            tree = ast.parse(source, filename=path)
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+        return _python_source_has_collectable_test(tree)
+    if ext == ".go":
+        return bool(_go_runnable_test_names(source))
+    if ext in _GENERATED_JS_TEST_EXTS:
+        # Raw JSX/TSX needs parser-backed transformation before declaration
+        # matching.  The batch preflight supplies the transformed JavaScript
+        # under a .js identity; direct raw-source calls fail closed.
+        if ext in (".jsx", ".tsx"):
+            return False
+        # Only direct module-level declarations execute deterministically when
+        # the runner loads the generated file.  Calls hidden in an uncalled
+        # helper or conditional cannot inherit credit from unrelated tests.
+        return _javascript_source_has_module_test(source)
+    return False
+
+
+def _tree_sitter_source_syntax_ok(
+        extension: str, encoded: bytes,
+) -> tuple[bool | None, str]:
+    """Parse one candidate without importing or executing it.
+
+    The pinned language pack ships its grammars inside the wheel.  A missing
+    package/grammar is therefore an installation defect and remains tri-state
+    ``None`` so every mutation caller fails closed.  Tree-sitter deliberately
+    recovers after syntax errors; ``root_node.has_error`` is load-bearing here
+    and prevents a recovered partial tree from being accepted as valid source.
+    """
+    language = _TREE_SITTER_LANGUAGE_BY_EXT.get(extension)
+    if not language:
+        return None, f"no Tree-sitter grammar is registered for {extension or 'this type'}"
+    try:
+        from tree_sitter_language_pack import get_parser
+    except (ImportError, OSError) as exc:
+        return None, f"bundled Tree-sitter parser is unavailable: {exc}"
+    try:
+        root = get_parser(language).parse(encoded).root_node
+    except (LookupError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return None, f"bundled {language} parser is unavailable: {exc}"
+    if not root.has_error:
+        return True, f"Tree-sitter {language} syntax check"
+
+    first_error = None
+    pending = [root]
+    while pending:
+        node = pending.pop(0)
+        if node.is_error or node.is_missing:
+            first_error = node
+            break
+        pending[0:0] = list(node.children)
+    if first_error is None:
+        return False, f"Tree-sitter {language} reported a syntax error"
+    row, column = first_error.start_point
+    kind = "missing token" if first_error.is_missing else "syntax error"
+    return False, (
+        f"Tree-sitter {language} {kind} at line {row + 1}, column {column + 1}"
+    )
+
+
+def _prewrite_source_syntax_details(
+        project_dir: str, path: str, source: str, stack: dict, *,
+        allow_empty: bool = False,
+) -> tuple[bool | None, str, str | None]:
+    """Parse model-authored source in a disposable file before owner mutation.
+
+    JSX/TSX is transformed by the already-required esbuild parser so markup
+    text becomes quoted JavaScript data and TypeScript generics disappear before
+    generated-test declaration matching. Other languages return their unchanged
+    parsed source. No candidate is imported, evaluated, or written inside the
+    target repository. ``None`` means the required parser was unavailable and
+    every mutation caller must fail closed.
+    """
+    inproc_ok, inproc_note = _inproc_source_syntax_ok(
+        path, source, allow_empty=allow_empty,
+    )
+    if inproc_ok is not None:
+        return inproc_ok, inproc_note, source if inproc_ok else None
+
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        encoded = source.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        return False, f"source is not UTF-8 encodable: {exc}", None
+    try:
+        with tempfile.TemporaryDirectory(prefix="flexfactor-test-parse-") as temp_dir:
+            candidate = os.path.join(temp_dir, "candidate" + ext)
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
+                | (os.O_NOFOLLOW if _HAS_O_NOFOLLOW else 0),
+                0o600,
+            )
+            try:
+                view = memoryview(encoded)
+                written = 0
+                while written < len(view):
+                    count = os.write(fd, view[written:])
+                    if count <= 0:
+                        raise OSError("short/zero write to syntax candidate")
+                    written += count
+            finally:
+                os.close(fd)
+
+            if ext in _ESBUILD_EXTS and stack.get("esbuild"):
+                command = [
+                    stack["esbuild"], candidate, "--bundle=false",
+                    "--log-level=error",
+                ]
+                if ext in (".jsx", ".tsx"):
+                    command.extend((
+                        "--format=esm", "--jsx=transform",
+                        "--tree-shaking=false",
+                    ))
+                else:
+                    devnull = "NUL" if os.name == "nt" else "/dev/null"
+                    command.append(f"--outfile={devnull}")
+                result = _run(command, project_dir, timeout=60)
+                if getattr(result, "flexfactor_launch_error", False):
+                    result = None
+                if result is not None and result.returncode != 0:
+                    return False, (
+                        _tail(result.stderr or result.stdout)
+                        or "esbuild syntax check failed"
+                    ), None
+                if result is not None and ext in (".jsx", ".tsx"):
+                    transformed = result.stdout or ""
+                    if not transformed.strip():
+                        return False, "esbuild returned no transformed source", None
+                    return True, "esbuild syntax and JSX transform", transformed
+                if result is not None:
+                    return True, "esbuild syntax check", source
+
+            if ext in (".js", ".cjs", ".mjs") and shutil.which("node"):
+                result = _run(["node", "--check", candidate], project_dir, timeout=60)
+                if getattr(result, "flexfactor_launch_error", False):
+                    result = None
+                if result is not None:
+                    ok = result.returncode == 0
+                    return ok, (
+                        _tail(result.stderr or result.stdout) or "node --check"
+                    ), source if ok else None
+
+            if ext in (".ts", ".cts", ".mts") and shutil.which("node"):
+                unsupported = ("bad option", "unknown option", "not allowed")
+                for flag in ("--experimental-transform-types",
+                             "--experimental-strip-types"):
+                    result = _run(
+                        ["node", flag, "--check", candidate],
+                        project_dir, timeout=60,
+                    )
+                    output = (result.stderr or "") + "\n" + (result.stdout or "")
+                    if getattr(result, "flexfactor_launch_error", False):
+                        break
+                    if result.returncode == 0:
+                        return True, f"node {flag} --check", source
+                    if not any(marker in output.lower() for marker in unsupported):
+                        return False, (
+                            _tail(output) or "TypeScript syntax check failed"
+                        ), None
+
+            if ext == ".go":
+                if shutil.which("gofmt"):
+                    result = _run(
+                        ["gofmt", "-e", "-l", candidate],
+                        project_dir, timeout=60,
+                    )
+                    if not getattr(result, "flexfactor_launch_error", False):
+                        ok = result.returncode == 0
+                        return ok, (
+                            _tail(result.stderr or result.stdout)
+                            or "gofmt syntax check"
+                        ), source if ok else None
+
+            # Reuse the same parse-only gates that protect an applied Audit or
+            # Production Ready edit, but point them at this disposable file.
+            # Python and Go took stricter paths above. Only the gates known not
+            # to execute compile-time user hooks are eligible here: `perl -c`,
+            # for example, executes BEGIN/CHECK blocks and is therefore not a
+            # safe pre-write parser for model-authored source.
+            try:
+                import flexfactor_prodready as _pr
+            except Exception:
+                _pr = None
+            safe_external_exts = {".rb", ".php", ".sh", ".bash", ".lua"}
+            command = (
+                _pr.syntax_gate_cmd(candidate)
+                if _pr is not None and ext in safe_external_exts else None
+            )
+            if command:
+                if shutil.which(command[0]):
+                    result = _run(command, project_dir, timeout=60)
+                    if not getattr(result, "flexfactor_launch_error", False):
+                        ok = result.returncode == 0
+                        return ok, (
+                            _tail(result.stderr or result.stdout)
+                            or f"{command[0]} syntax check"
+                        ), source if ok else None
+
+            tree_ok, tree_note = _tree_sitter_source_syntax_ok(ext, encoded)
+            if tree_ok is not None:
+                return tree_ok, tree_note, source if tree_ok else None
+    except OSError as exc:
+        return None, f"temporary syntax preflight failed: {exc}", None
+    return None, (
+        f"no safe pre-write parser is available for {ext or 'this type'}"
+    ), None
+
+
+def _prewrite_source_syntax_ok(
+        project_dir: str, path: str, source: str, stack: dict, *,
+        allow_empty: bool = False,
+) -> tuple[bool | None, str]:
+    """Two-field mutation preflight shared by all four product modes."""
+    ok, note, _case_source = _prewrite_source_syntax_details(
+        project_dir, path, source, stack, allow_empty=allow_empty,
+    )
+    return ok, note
+
+
+def _generated_test_source_syntax_ok(
+        project_dir: str, path: str, source: str, stack: dict,
+) -> tuple[bool | None, str, str | None]:
+    """Generated-test preflight plus parser-normalized case source."""
+    return _prewrite_source_syntax_details(
+        project_dir, path, source, stack,
+    )
+
+
+def _selected_test_command(command: list[str], path: str) -> list[str]:
+    """Add one exact test-file selector using the configured runner protocol."""
+    selected = [str(part) for part in command]
+    if not selected:
+        return []
+    executable = os.path.basename(selected[0]).lower()
+    if executable in {"npm", "npm.cmd", "pnpm", "pnpm.cmd"}:
+        return selected + ([] if "--" in selected else ["--"]) + [path]
+    return selected + [path]
+
+
+def _python_failure_canary_source(source: str, token: str) -> str | None:
+    """Replace every collectable Python test body with a unique hard failure."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    targets: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in tree.body:
+        if isinstance(node, function_types):
+            if (node.name.startswith("test_")
+                    and not _python_test_is_unconditionally_skipped(node)):
+                targets.append(node)
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {_ast_dotted_name(base) for base in node.bases}
+        collectable = node.name.startswith("Test") or any(
+            base.rsplit(".", 1)[-1] == "TestCase" for base in bases if base
+        )
+        if (not collectable
+                or _python_test_is_unconditionally_skipped(node)
+                or any(isinstance(member, function_types)
+                       and member.name == "__init__" for member in node.body)):
+            continue
+        targets.extend(
+            member for member in node.body
+            if (isinstance(member, function_types)
+                and member.name.startswith("test_")
+                and not _python_test_is_unconditionally_skipped(member))
+        )
+    if not targets:
+        return None
+    for node in targets:
+        node.body = [ast.Raise(
+            exc=ast.Call(
+                func=ast.Name(id="AssertionError", ctx=ast.Load()),
+                args=[ast.Constant(value=token)], keywords=[],
+            ),
+            cause=None,
+        )]
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree) + "\n"
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _javascript_test_callee(node, encoded: bytes) -> bool:
+    """Whether a Tree-sitter callee is a direct runnable test/it chain."""
+    if node is None:
+        return False
+    if node.type == "identifier":
+        return encoded[node.start_byte:node.end_byte] in (b"test", b"it")
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        name = encoded[prop.start_byte:prop.end_byte] if prop is not None else b""
+        return name in (b"each", b"only") and _javascript_test_callee(
+            node.child_by_field_name("object"), encoded,
+        )
+    if node.type == "call_expression":
+        return _javascript_test_callee(
+            node.child_by_field_name("function"), encoded,
+        )
+    return False
+
+
+def _javascript_failure_canary_source(
+        extension: str, source: str, token: str,
+) -> str | None:
+    """Replace direct JavaScript/TypeScript test callbacks with hard failures."""
+    language = {
+        ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
+        ".tsx": "tsx",
+    }.get(extension, "javascript")
+    try:
+        from tree_sitter_language_pack import get_parser
+        encoded = source.encode("utf-8", "strict")
+        root = get_parser(language).parse(encoded).root_node
+    except (ImportError, LookupError, OSError, RuntimeError,
+            TypeError, UnicodeEncodeError, ValueError):
+        return None
+    if root.has_error:
+        return None
+    replacements: list[tuple[int, int, bytes]] = []
+    statement = (
+        "{ throw new Error(" + json.dumps(token) + "); }"
+    ).encode("utf-8")
+    for top_level in root.named_children:
+        if top_level.type != "expression_statement" or not top_level.named_children:
+            continue
+        call = top_level.named_children[0]
+        if (call.type != "call_expression"
+                or not _javascript_test_callee(
+                    call.child_by_field_name("function"), encoded)):
+            continue
+        arguments = call.child_by_field_name("arguments")
+        callbacks = [
+            child for child in (arguments.named_children if arguments else [])
+            if child.type in ("arrow_function", "function_expression")
+        ]
+        if not callbacks:
+            continue
+        body = callbacks[-1].child_by_field_name("body")
+        if body is None:
+            continue
+        replacements.append((body.start_byte, body.end_byte, statement))
+    if not replacements:
+        return None
+    mutated = encoded
+    for start, end, replacement in sorted(replacements, reverse=True):
+        mutated = mutated[:start] + replacement + mutated[end:]
+    return mutated.decode("utf-8")
+
+
+def _generated_test_failure_canary_source(
+        path: str, source: str, token: str,
+) -> str | None:
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".py":
+        return _python_failure_canary_source(source, token)
+    if extension in _GENERATED_JS_TEST_EXTS:
+        return _javascript_failure_canary_source(extension, source, token)
+    return None
+
+
+def _generated_test_execution_env(project_dir: str, execution_dir: str) -> dict:
+    """Remove the owner checkout's pathname from an isolated test environment."""
+    original = os.path.abspath(project_dir)
+    isolated = os.path.abspath(execution_dir)
+    env = {}
+    for key, value in os.environ.items():
+        text = str(value)
+        env[key] = text.replace(original, isolated) if original in text else text
+    env["PWD"] = isolated
+    if "GITHUB_WORKSPACE" in env:
+        env["GITHUB_WORKSPACE"] = isolated
+    if "INIT_CWD" in env:
+        env["INIT_CWD"] = isolated
+    return env
+
+
+def _generated_test_snapshot_ignored(path: str) -> bool:
+    canonical = _canon_rel(path).strip("/")
+    if not canonical:
+        return False
+    parts = canonical.split("/")
+    return (
+        any(part in (_SKIP_DIRS | {".git"}) for part in parts)
+        or _is_ephemeral_path(canonical)
+        or _is_flexfactor_artifact(canonical)
+    )
+
+
+def _generated_test_worktree_snapshot(project_dir: str) -> dict[str, tuple]:
+    """Hash the publishable worktree plus branch/index state without following links."""
+    state: dict[str, tuple] = {}
+    root = os.path.abspath(project_dir)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        kept_dirs = []
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            rel = _canon_rel(os.path.relpath(full, root))
+            if _generated_test_snapshot_ignored(rel):
+                continue
+            try:
+                item = os.lstat(full)
+            except OSError as exc:
+                raise RuntimeError(f"could not snapshot {rel}: {exc}") from exc
+            if stat.S_ISLNK(item.st_mode):
+                try:
+                    target = os.readlink(full)
+                except OSError as exc:
+                    raise RuntimeError(f"could not snapshot link {rel}: {exc}") from exc
+                state[rel] = ("symlink", stat.S_IMODE(item.st_mode), target)
+            else:
+                kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = _canon_rel(os.path.relpath(full, root))
+            if _generated_test_snapshot_ignored(rel):
+                continue
+            try:
+                item = os.lstat(full)
+            except OSError as exc:
+                raise RuntimeError(f"could not snapshot {rel}: {exc}") from exc
+            if stat.S_ISLNK(item.st_mode):
+                try:
+                    target = os.readlink(full)
+                except OSError as exc:
+                    raise RuntimeError(f"could not snapshot link {rel}: {exc}") from exc
+                state[rel] = ("symlink", stat.S_IMODE(item.st_mode), target)
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                state[rel] = ("non-regular", stat.S_IFMT(item.st_mode))
+                continue
+            digest = _file_sha_contained(root, rel)
+            if digest is None:
+                raise RuntimeError(f"contained snapshot read was refused for {rel}")
+            state[rel] = (
+                "file", stat.S_IMODE(item.st_mode), int(item.st_size), digest,
+            )
+    if _is_git_repo(root):
+        for label, command in (
+                ("head", ["rev-parse", "--verify", "HEAD"]),
+                ("branch", ["symbolic-ref", "-q", "HEAD"]),
+                ("status", ["status", "--porcelain=v1", "-z",
+                            "--untracked-files=all"])):
+            result = _git(command, root)
+            # Detached HEAD makes symbolic-ref rc=1 and is itself valid state;
+            # preserve both status and output rather than treating that as an
+            # incomplete snapshot.
+            if label != "branch" and result.returncode != 0:
+                raise RuntimeError(f"could not snapshot git {label}: {_tail(result.stderr)}")
+            state[f"\0git-{label}"] = (
+                "git", int(result.returncode), result.stdout or "",
+            )
+    return state
+
+
+def _generated_test_snapshot_changes(
+        before: dict[str, tuple], after: dict[str, tuple],
+) -> list[str]:
+    return sorted(
+        key for key in (set(before) | set(after))
+        if before.get(key) != after.get(key)
+    )
+
+
+def _copy_generated_test_checkout(project_dir: str, destination: str) -> None:
+    """Create an independent execution copy; never share paths or Git metadata.
+
+    ``copytree(..., symlinks=True)`` alone is not isolation: an absolute link,
+    or a relative link through an external ancestor, keeps pointing outside the
+    copy.  Copy links without following them, then replace every copied link
+    with a relative link to the corresponding object *inside* the execution
+    root.  A broken, VCS-directed, or externally resolving link fails before a
+    test process starts.  Hard links are already broken by ``copy2``.
+    """
+    def ignore_git(_directory: str, names: list[str]) -> set[str]:
+        return {name for name in names if name == ".git"}
+
+    source_root = os.path.realpath(project_dir)
+    execution_root = os.path.realpath(destination)
+    # Windows junctions and mount-point reparses are not consistently reported
+    # by os.path.islink(), and copytree can otherwise descend through them.
+    # They cannot be safely rewritten with os.readlink(), so reject them before
+    # copy instead of allowing a platform-specific escape from the disposable
+    # root. Ordinary symbolic links take the confined rewrite path below.
+    for dirpath, dirnames, filenames in os.walk(
+            source_root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            source_item = os.path.join(dirpath, name)
+            if _is_reparse(source_item) and not os.path.islink(source_item):
+                rel = os.path.relpath(source_item, source_root)
+                raise RuntimeError(
+                    "repository contains a non-symbolic reparse point that "
+                    f"cannot be copied safely: {rel}"
+                )
+    shutil.copytree(
+        source_root, destination, symlinks=True, ignore=ignore_git,
+        copy_function=shutil.copy2,
+    )
+
+    copied_links: list[tuple[str, str]] = []
+    for dirpath, dirnames, filenames in os.walk(
+            execution_root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            copied = os.path.join(dirpath, name)
+            if os.path.islink(copied):
+                copied_links.append((
+                    os.path.relpath(copied, execution_root), copied,
+                ))
+            elif _is_reparse(copied):
+                rel = os.path.relpath(copied, execution_root)
+                raise RuntimeError(
+                    "copied worktree contains an unconfined reparse point: "
+                    f"{rel}"
+                )
+
+    for rel, copied in copied_links:
+        try:
+            link_text = os.readlink(copied)
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not inspect copied symlink {rel}: {exc}"
+            ) from exc
+        source_link = os.path.join(source_root, rel)
+        unresolved_target = (
+            link_text if os.path.isabs(link_text)
+            else os.path.join(os.path.dirname(source_link), link_text)
+        )
+        source_target = os.path.realpath(unresolved_target)
+        try:
+            contained = (
+                os.path.commonpath((source_root, source_target)) == source_root
+            )
+        except ValueError:
+            contained = False
+        if not contained:
+            raise RuntimeError(
+                f"repository symlink escapes the generated-test execution copy: {rel}"
+            )
+        target_rel = _canon_rel(os.path.relpath(source_target, source_root))
+        if (not target_rel or target_rel == "."
+                or any(part.casefold() == ".git"
+                       for part in target_rel.split("/"))
+                or not os.path.exists(source_target)):
+            raise RuntimeError(
+                f"repository symlink has no safe copied target: {rel}"
+            )
+        copied_target = os.path.join(
+            execution_root, *target_rel.split("/"),
+        )
+        try:
+            copied_target_root = os.path.commonpath(
+                (execution_root, os.path.realpath(copied_target)),
+            )
+        except ValueError:
+            copied_target_root = ""
+        if copied_target_root != execution_root or not os.path.exists(copied_target):
+            raise RuntimeError(
+                f"repository symlink target was not copied safely: {rel}"
+            )
+        replacement = os.path.relpath(copied_target, os.path.dirname(copied))
+        target_is_directory = os.path.isdir(copied_target)
+        try:
+            os.unlink(copied)
+            os.symlink(
+                replacement, copied, target_is_directory=target_is_directory,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not confine copied symlink {rel}: {exc}"
+            ) from exc
+
+    # Revalidate the finished copy, not just source-side observations.  Every
+    # link that a test can traverse must resolve below this disposable root.
+    for rel, copied in copied_links:
+        try:
+            confined = (
+                os.path.commonpath(
+                    (execution_root, os.path.realpath(copied)),
+                ) == execution_root
+                and os.path.exists(copied)
+            )
+        except (OSError, ValueError):
+            confined = False
+        if not confined:
+            raise RuntimeError(
+                f"copied symlink is not confined to the execution root: {rel}"
+            )
+
+
+def _run_generated_test_file(project_dir: str, entry: dict,
+                             stack: dict) -> tuple[bool, str]:
+    """Execute one generated file and require file-specific runner evidence.
+
+    A broad green suite cannot prove that its configured discovery included a
+    particular generated path. Python/JavaScript runners therefore receive an
+    exact path selector after a missing-path probe proves they honor it. Go is
+    scoped to the generated file's package and every declared test must emit a
+    JSON ``pass`` action. Unsupported selectors fail closed and receive no
+    coverage or competitor-capability credit.
+    """
+    path = str(entry.get("path") or "")
+    source = str(entry.get("contents") or "")
+    extension = os.path.splitext(path)[1].lower()
+    configured = [str(part) for part in (stack.get("test_cmd") or [])]
+    execution_env = stack.get("_generated_test_env")
+    if not configured:
+        return False, "no configured test command"
+
+    if extension == ".go":
+        executable = os.path.basename(configured[0]).lower()
+        if executable not in {"go", "go.exe"} or len(configured) < 2 \
+                or configured[1] != "test":
+            return False, "configured command is not the Go test runner"
+        names = _go_runnable_test_names(source)
+        if not names:
+            return False, "generated Go file has no runnable test names"
+        directory = os.path.dirname(path).replace("\\", "/") or "."
+        package = "." if directory == "." else "./" + directory
+        expression = "^(?:" + "|".join(re.escape(name) for name in names) + ")$"
+        command = [configured[0], "test", "-json", "-count=1",
+                   "-run", expression, package]
+        result = _run(command, project_dir, timeout=600, env=execution_env)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        passed: set[str] = set()
+        skipped: set[str] = set()
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            name = event.get("Test") if isinstance(event, dict) else None
+            action = event.get("Action") if isinstance(event, dict) else None
+            if name in names and action == "pass":
+                passed.add(name)
+            elif name in names and action == "skip":
+                skipped.add(name)
+        missing = sorted(set(names) - passed)
+        if result.returncode != 0 or missing or skipped:
+            detail = _tail(output, 20)
+            return False, (
+                "Go runner did not pass every generated test "
+                f"(missing={missing}, skipped={sorted(skipped)}): {detail}"
+            )
+        return True, f"Go runner passed {len(passed)} generated test(s) in {path}"
+
+    if extension == ".py":
+        command_text = " ".join(configured).lower()
+        base = (configured if "pytest" in command_text else
+                [sys.executable, "-m", "pytest", "-q"])
+    elif extension in _GENERATED_JS_TEST_EXTS:
+        base = configured
+    else:
+        return False, f"no exact-file execution protocol for {extension or 'this type'}"
+
+    token = hashlib.sha256((path + "\0" + source).encode(
+        "utf-8", "strict")).hexdigest()[:16]
+    directory = os.path.dirname(path).replace("\\", "/")
+    missing_name = f".flexfactor-missing-{token}{extension}"
+    missing_path = f"{directory}/{missing_name}" if directory else missing_name
+    if _contained_existence(project_dir, missing_path) != "missing":
+        return False, "could not establish an absent selector-control path"
+    control = _run(
+        _selected_test_command(base, missing_path), project_dir, timeout=600,
+        env=execution_env,
+    )
+    if control.returncode == 0:
+        return False, "configured test runner ignored an absent exact-file selector"
+
+    # Stdout is controlled by the generated program and therefore cannot prove
+    # that the runner collected or executed a test.  First replace the exact
+    # declared test bodies (inside this disposable execution checkout) with an
+    # unpredictable failure.  The same selector must then fail and surface the
+    # token.  Import-time `os._exit(0)`, reporter monkey-patching, ignored file
+    # selectors, and fabricated "1 passed" text all fail this challenge.
+    token = "FLEXFACTOR_EXECUTION_CANARY_" + os.urandom(16).hex()
+    canary_source = _generated_test_failure_canary_source(path, source, token)
+    if canary_source is None:
+        return False, "could not construct an executable failure canary"
+    if _replace_contained(project_dir, path, canary_source) is None:
+        return False, "could not install the exact-file failure canary"
+    try:
+        canary = _run(
+            _selected_test_command(base, path), project_dir, timeout=600,
+            env=execution_env,
+        )
+        canary_output = (canary.stdout or "") + "\n" + (canary.stderr or "")
+    finally:
+        restored = _replace_contained(project_dir, path, source)
+    if restored is None:
+        return False, "could not restore generated source after failure canary"
+    if canary.returncode == 0 or token not in canary_output:
+        return False, (
+            "configured runner did not prove execution of the generated test "
+            "body with the failure canary: " + _tail(canary_output, 20)
+        )
+
+    result = _run(
+        _selected_test_command(base, path), project_dir, timeout=600,
+        env=execution_env,
+    )
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.returncode != 0:
+        return False, "exact generated test file failed: " + _tail(output, 20)
+    if not _suite_reported_tests(output):
+        return False, (
+            "exact generated test file reported no executed-test evidence: "
+            + _tail(output, 20)
+        )
+    return True, (
+        f"configured runner executed exact generated file {path} and its "
+        "independent failure canary"
+    )
+
+
+def _write_and_run_generated_test_batch(
+        project_dir: str, candidates: list[dict], stack: dict,
+) -> tuple[list[dict], bool | None, str, str, list[str]]:
+    """Parse a complete model-generated test batch before its first write.
+
+    Returns ``(written_entries, test_status, test_log, refusal, rollback_failed)``.
+    Invalid syntax and source types without a safe non-executing parser fail
+    closed. The all-before-any preflight prevents a valid first entry from
+    reaching the worktree when a later entry is malformed. Create receipts bind
+    rollback and post-run credit to the exact files this transaction created.
+    """
+    prepared: list[dict] = []
+    seen_paths: set[str] = set()
+    for index, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            return [], None, "", (
+                f"generated test entry {index} is not an object"
+            ), []
+        path = str(item.get("path") or "").replace("\\", "/")
+        contents = item.get("contents")
+        if not path or not isinstance(contents, str) or not contents.strip():
+            return [], None, "", (
+                f"generated test entry {index} has no non-empty text source"
+            ), []
+        identity = _portable_rel_identity(path)
+        if identity is None:
+            return [], None, "", (
+                f"generated test entry {index} has an invalid repository path"
+            ), []
+        # One canonical spelling is both the worktree identity and the
+        # duplicate key.  Without this, `tests/x.py` and `./tests//x.py`
+        # preflight as two missing files but write the same leaf twice.
+        path, key = identity
+        if not _is_test_path(path):
+            return [], None, "", (
+                f"generated test entry {index} is not at a recognized test "
+                f"path: {path!r}"
+            ), []
+        # Reject case-only aliases on every host.  macOS normally uses a
+        # case-insensitive filesystem even though os.path.normcase() retains
+        # POSIX case, so relying on the host path module lets `Same.py` and
+        # `same.py` preflight as two files before both writes hit one leaf.
+        # The universal rejection is intentionally stricter on case-sensitive
+        # hosts: generated tests never need two case-only-distinct identities.
+        if key in seen_paths:
+            return [], None, "", (
+                f"generated test batch names duplicate path {path!r}"
+            ), []
+        seen_paths.add(key)
+        # Every generated file must be the executable test whose exact path is
+        # selected below. Runner-autoloaded support/config files (most notably
+        # pytest's conftest.py) can install hooks that turn unrelated failures
+        # into passes while receiving no file-specific execution proof of their
+        # own. Self-contained tests need no such artifact, so reject the whole
+        # batch before its first write rather than letting one influence either
+        # the broad suite or an exact-file verification.
+        credit_as_test = _runner_collectable_generated_test_path(path)
+        if not credit_as_test:
+            return [], None, "", (
+                "generated runner support/config artifacts are not permitted; "
+                f"every generated file must be an executable exact-run test: {path}"
+            ), []
+        existence = _contained_existence(project_dir, path)
+        if existence != "missing":
+            return [], None, "", (
+                f"generated test refused overwrite of {path!r} "
+                f"({existence}); existing tests are owner code"
+            ), []
+        syntax_ok, syntax_note, case_source = _generated_test_source_syntax_ok(
+            project_dir, path, contents, stack,
+        )
+        if syntax_ok is not True:
+            return [], None, "", (
+                f"generated test source rejected before write for {path}: "
+                f"{syntax_note}"
+            ), []
+        normalized = dict(item)
+        case_path = path
+        if os.path.splitext(path)[1].lower() in (".jsx", ".tsx"):
+            case_path = os.path.splitext(path)[0] + ".js"
+        if credit_as_test and (
+                case_source is None
+                or not _generated_test_source_has_case(case_path, case_source)):
+            return [], None, "", (
+                f"generated executable test declares no collectable test case: {path}"
+            ), []
+        normalized.update(
+            path=path, contents=contents,
+            _candidate_test=credit_as_test, _credit_as_test=False,
+        )
+        prepared.append(normalized)
+
+    if not prepared:
+        return [], None, "", "no non-empty generated test source was produced", []
+    written_entries: list[dict] = []
+
+    def _rollback_created(entries: list[dict]) -> list[str]:
+        failed = []
+        for entry in entries:
+            receipt = entry.get("_creation_identity")
+            if receipt is None or not _unlink_created_contained(
+                    project_dir, entry["path"], receipt):
+                failed.append(entry["path"])
+        return failed
+
+    def _changed_after_create(entries: list[dict]) -> list[str]:
+        changed = []
+        for entry in entries:
+            receipt = entry.get("_creation_identity")
+            if receipt is None or not _created_contained_matches(
+                    project_dir, entry["path"], receipt):
+                changed.append(entry["path"])
+        return changed
+
+    for item in prepared:
+        created = _create_contained(project_dir, item["path"], item["contents"])
+        if created is None:
+            rollback_failed = _rollback_created(written_entries)
+            return [], None, "", (
+                f"generated test atomic create was refused for {item['path']!r}"
+            ), rollback_failed
+        if not created.complete or created.receipt is None:
+            rollback_failed = _rollback_created(written_entries)
+            if item["path"] not in rollback_failed:
+                rollback_failed.append(item["path"])
+            return [], None, "", (
+                "generated test atomic create failed after creating and "
+                f"retaining {item['path']!r}; manual recovery is required"
+            ), rollback_failed
+        normalized = dict(item)
+        # Keep the already-validated canonical repository-relative identity. The
+        # contained writer may return a host spelling that differs from the
+        # repository spelling; coverage and rollback use the canonical key.
+        normalized["path"] = item["path"]
+        normalized["_creation_identity"] = created.receipt
+        written_entries.append(normalized)
+
+    changed = _changed_after_create(written_entries)
+    if changed:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            "generated test content or identity changed before execution: "
+            + ", ".join(changed)
+        ), rollback_failed
+
+    try:
+        owner_before = _generated_test_worktree_snapshot(project_dir)
+    except RuntimeError as exc:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            f"generated-test owner-worktree snapshot failed: {exc}"
+        ), rollback_failed
+
+    def _display_changes(changes: list[str]) -> str:
+        return ", ".join(
+            (f"<git-{item[5:]}>" if item.startswith("\0git-") else item)
+            for item in changes[:20]
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(
+                prefix="flexfactor-generated-tests-") as execution_parent:
+            execution_dir = os.path.join(execution_parent, "checkout")
+            _copy_generated_test_checkout(project_dir, execution_dir)
+            execution_stack = dict(stack)
+            execution_stack["_generated_test_env"] = (
+                _generated_test_execution_env(project_dir, execution_dir)
+            )
+            execution_before = _generated_test_worktree_snapshot(execution_dir)
+            trust_key = (
+                _grant_run_trust(execution_dir)
+                if _run_trust_allowed(project_dir) else None
+            )
+            try:
+                status, log = _run_unit_tests(execution_dir, execution_stack)
+                execution_changes = _generated_test_snapshot_changes(
+                    execution_before,
+                    _generated_test_worktree_snapshot(execution_dir),
+                )
+                owner_changes = _generated_test_snapshot_changes(
+                    owner_before,
+                    _generated_test_worktree_snapshot(project_dir),
+                )
+                receipt_changes = _changed_after_create(written_entries)
+                if execution_changes or owner_changes or receipt_changes:
+                    rollback_failed = _rollback_created(written_entries)
+                    rollback_failed.extend(
+                        item for item in owner_changes
+                        if not item.startswith("\0git-")
+                        and item not in rollback_failed
+                    )
+                    detail = []
+                    if execution_changes:
+                        detail.append(
+                            "isolated checkout changed: "
+                            + _display_changes(execution_changes)
+                        )
+                    if owner_changes:
+                        detail.append(
+                            "owner checkout changed: " + _display_changes(owner_changes)
+                        )
+                    if receipt_changes:
+                        detail.append(
+                            "generated identity changed: "
+                            + ", ".join(receipt_changes)
+                        )
+                    return [], None, log, (
+                        "generated test made an unauthorized worktree or Git "
+                        "mutation during suite execution (" + "; ".join(detail) + ")"
+                    ), rollback_failed
+
+                if status is True and not _suite_reported_tests(log):
+                    status = False
+                    log = (log + "\n" if log else "") + (
+                        "test command exited successfully but reported no "
+                        "executed-test evidence"
+                    )
+                if status is True:
+                    for entry in written_entries:
+                        if not entry.get("_candidate_test"):
+                            continue
+                        executed, execution_note = _run_generated_test_file(
+                            execution_dir, entry, execution_stack,
+                        )
+                        if not executed:
+                            rollback_failed = _rollback_created(written_entries)
+                            return [], None, log, (
+                                "generated test file was not individually executed: "
+                                f"{entry['path']}: {execution_note}"
+                            ), rollback_failed
+                        entry["_credit_as_test"] = True
+                        entry["_execution_evidence"] = execution_note
+
+                    execution_changes = _generated_test_snapshot_changes(
+                        execution_before,
+                        _generated_test_worktree_snapshot(execution_dir),
+                    )
+                    owner_changes = _generated_test_snapshot_changes(
+                        owner_before,
+                        _generated_test_worktree_snapshot(project_dir),
+                    )
+                    receipt_changes = _changed_after_create(written_entries)
+                    if execution_changes or owner_changes or receipt_changes:
+                        rollback_failed = _rollback_created(written_entries)
+                        rollback_failed.extend(
+                            item for item in owner_changes
+                            if not item.startswith("\0git-")
+                            and item not in rollback_failed
+                        )
+                        detail = []
+                        if execution_changes:
+                            detail.append(
+                                "isolated checkout changed: "
+                                + _display_changes(execution_changes)
+                            )
+                        if owner_changes:
+                            detail.append(
+                                "owner checkout changed: "
+                                + _display_changes(owner_changes)
+                            )
+                        if receipt_changes:
+                            detail.append(
+                                "generated identity changed: "
+                                + ", ".join(receipt_changes)
+                            )
+                        return [], None, log, (
+                            "generated test made an unauthorized worktree or Git "
+                            "mutation during exact-file execution ("
+                            + "; ".join(detail) + ")"
+                        ), rollback_failed
+            finally:
+                _revoke_run_trust(trust_key)
+    except (OSError, RuntimeError, shutil.Error) as exc:
+        rollback_failed = _rollback_created(written_entries)
+        return [], None, "", (
+            "generated tests could not be isolated and verified: "
+            f"{type(exc).__name__}: {exc}"
+        ), rollback_failed
+    return written_entries, status, log, "", []
 
 
 def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
@@ -13739,8 +16166,13 @@ def _run_bootstrap_phase(project_dir: str, stack: dict, pfx: str = "",
                              log=lambda m: print(f"{pfx}{m}"))
 
 
-def _refresh_verification_status(stack: dict) -> None:
-    """Recompute whether the build gate is real, after bootstrap has run."""
+def _refresh_verification_status(project_dir: str, stack: dict) -> None:
+    """Refresh all install-dependent verifier capability after bootstrap."""
+    # node_modules does not normally exist during the initial stack scan.  An
+    # install can make esbuild available moments later; retaining the stale
+    # None made every otherwise valid TSX candidate fail closed for the entire
+    # run even though its parser had just been installed.
+    stack["esbuild"] = _find_project_esbuild(project_dir)
     try:
         import flexfactor_prodready as _pr
     except Exception:
@@ -15306,7 +17738,7 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
         # is fed back as an objection so the author can SALVAGE the fix instead of
         # the file being abandoned. The file is left as the original unless an
         # attempt fully passes both the build gate AND the cross-model check.
-        outcome = None        # 'fixed' | 'unverified' | 'revert' | 'reject' | 'noop' | 'skip'
+        outcome = None        # 'fixed' | 'unverified' | 'revert' | 'reject' | 'invalid' | 'noop' | 'skip'
         kept_patch = None
         kept_ok = None
         feedback = ""
@@ -15459,9 +17891,35 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                 except Exception as ex:
                     outcome = ("skip", str(ex))
                     break
-            if not patch.get("changed") or not (patch.get("contents") or "").strip():
+            candidate_contents = patch.get("contents")
+            if (not patch.get("changed") or candidate_contents is None
+                    or (isinstance(candidate_contents, str)
+                        and not candidate_contents.strip())):
                 outcome = ("noop", patch.get("notes", ""))
                 break
+            if not isinstance(candidate_contents, str):
+                syntax_ok = False
+                syntax_note = "whole-file response contents were not text"
+            else:
+                syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                    project_dir, rel, candidate_contents, stack,
+                )
+            if syntax_ok is not True:
+                # This shared writer serves the ordinary Audit/Production Ready
+                # fix stream and their between-pass competitor gate.  Reject a
+                # definite parser failure before the candidate can touch the
+                # worktree, project gate, or independent reviewer.
+                outcome = ("invalid", syntax_note)
+                feedback = (
+                    "Your previous response was not valid whole-file source and "
+                    f"was rejected before write: {syntax_note}. Return the complete "
+                    "file contents in the file's native syntax."
+                )
+                if adv_active:
+                    build_tries += 1
+                    if build_tries >= MAX_FIX_TRIES:
+                        break
+                continue
             # TOCTOU-free write of the candidate (and the rollbacks below), anchored at
             # the repo root and walked per-component on POSIX. CHECK the result: if the
             # contained write is refused (ancestor/leaf swap, or POSIX-fail-closed) we
@@ -15660,6 +18118,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             _report_route_quality(author, "author",
                                   "build_failed" if ("build" in why or "gate" in why
                                                      or "syntax" in why) else "rejected")
+        elif kind == "invalid":
+            _report_route_quality(author, "author", "build_failed")
         elif kind == "noop":
             _report_route_quality(author, "author", "noop")
         if kind == "fixed":
@@ -15743,6 +18203,8 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     s_kind, s_detail = attempt_structural_fix(
                         author, cross, project_dir, rel, targets, stack,
                         baseline_ok, str(outcome[1] or ""))
+                except DirtyTreeError:
+                    raise
                 except Exception as ex:  # noqa: BLE001 - never kill the audit
                     s_kind, s_detail = "failed", f"structural pass crashed: {str(ex)[:200]}"
                 if s_kind in ("fixed", "unverified"):
@@ -15752,12 +18214,20 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
                     mark = "" if s_kind == "fixed" else "  [unverified]"
                     print(f"  [fixed-structural]{mark} {rel}: {fixed} "
                           f"({s_detail.get('summary', 'cross-file operations')})")
-                    structural_changed = list(s_detail.get("changed_files") or [rel])
-                    applied.extend(structural_changed)
+                    structural_paths = [
+                        _canon_rel(path)
+                        for path in (s_detail.get("changed_files") or [rel])
+                        if isinstance(path, str) and _rel_components(path) is not None
+                    ]
+                    for changed_path in structural_paths:
+                        if changed_path not in applied:
+                            applied.append(changed_path)
                     if done_set is not None:
                         done_set.add(rel)
                     if s_kind == "unverified":
-                        unverified.append(rel)
+                        for changed_path in s_detail.get("unverified_paths") or []:
+                            if changed_path not in unverified:
+                                unverified.append(changed_path)
                     notes.append(f"{rel}: STRUCTURAL fix applied "
                                  f"({s_detail.get('summary', '')}): "
                                  f"{s_detail.get('notes', '')}")
@@ -15794,6 +18264,13 @@ def _fix_files(author, cross, project_dir: str, file_findings: dict, stack: dict
             errors += 1
             print(f"  [reject] {rel}: cross-model rejected after {MAX_FIX_TRIES} tries")
             notes.append(f"{rel}: rejected by cross-model review: {outcome[1]}")
+        elif kind == "invalid":
+            errors += 1
+            print(f"  [reject-invalid] {rel}: invalid source rejected before write "
+                  f"after {attempt} attempt(s) ({outcome[1]})")
+            notes.append(
+                f"{rel}: invalid source rejected before write: {outcome[1]}"
+            )
         _tick(rel)
     if prefetch_pool is not None:
         prefetch_pool.shutdown(wait=False, cancel_futures=True)
@@ -16779,7 +19256,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # detect-time value was computed before any of it ran. Recompute, or
             # the run reports a stale UNVERIFIED warning for a repo it just
             # successfully bootstrapped.
-            _refresh_verification_status(stack)
+            _refresh_verification_status(project_dir, stack)
             if git:
                 bootstrap_status = _git(["status", "--porcelain=v1", "-z"], project_dir)
                 if bootstrap_status.returncode == 0:
@@ -17908,7 +20385,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # Pass 1 covered the entire codebase. Every follow-up is an exact
             # delta pass: only verified files whose bytes changed THIS pass,
             # including verified competitor-gate edits before pass 2.
-            files = _next_cycle_review_paths(cycle_applied_files)
+            files = _next_cycle_review_paths(
+                cycle_applied_files, project_dir=project_dir,
+            )
 
         # Reattach findings that were outside a later changed-files-only pass.
         # This happens before purpose/readiness/evidence phases so every consumer
@@ -18214,17 +20693,22 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "verification_plan": str(_idea.get("verification_plan") or ""),
                 })
         test_files: list[str] = []
+        generated_test_files: list[str] = []
+        test_creation_receipts: dict[str, os.stat_result] = {}
         tests_by_source: dict[str, list[str]] = {}
         tests_by_capability: dict[str, list[str]] = {}
+        generated_test_candidates: list[dict] = []
+        generated_test_batch_refused = False
         test_status = None
         if (args.tests and stack.get("test_cmd") and not dirty_abort
                 and not infrastructure_abort):
             print(f"{pfx}Generating focused regression tests for changed behavior...")
             if checkpoint is not None:
                 checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
-            changed_for_tests = sorted(
-                rel for rel in (set(applied_set) | set(bridged_early) | set(bridged_files))
-                if rel in set(all_files) and not _is_test_path(rel))
+            changed_for_tests = _existing_changed_sources(
+                project_dir,
+                set(applied_set) | set(bridged_early) | set(bridged_files),
+            )
             test_candidates, omitted = _test_generation_scope(
                 changed_for_tests, args.max_test_modules)
             if omitted:
@@ -18272,6 +20756,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             "test generation returned "
                             f"{type(gen).__name__}, not an object")
                     _check_array_item_shape(gen, TEST_GEN_SCHEMA, "")
+                    validated_generated_files = (
+                        _validated_generated_test_entries(gen)
+                    )
                 except Exception as ex:
                     print(f"{pfx}[skip] tests for {rel}: {ex}")
                     manual_review.add(rel)
@@ -18284,36 +20771,76 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         "fix": "Generate and run tests that exercise every reachable function.",
                     })
                     continue
-                for f in gen.get("files") or []:
-                    p = str(f.get("path") or "").replace("\\", "/")
-                    if not p or not (f.get("contents") or "").strip():
+                for f in validated_generated_files:
+                    p = f["path"].replace("\\", "/")
+                    if not p or not f["contents"].strip():
                         continue
-                    existence = _contained_existence(project_dir, p)
-                    if existence != "missing":
-                        print(f"{pfx}[skip] generated test refused overwrite of "
-                              f"{p!r} ({existence}); existing tests are owner code")
-                        manual_review.add(rel)
-                        continue
-                    written = _write_contained(project_dir, p, f["contents"])
-                    if written is None:  # escapes repo / symlinked leaf -> refuse
-                        print(f"{pfx}[skip] generated test path escapes/symlinked, refused: {p!r}")
-                        manual_review.add(rel)
-                        continue
-                    _test_rel = os.path.relpath(written, project_dir).replace("\\", "/")
-                    test_files.append(_test_rel)
-                    tests_by_source.setdefault(rel.replace("\\", "/"), []).append(_test_rel)
-                    _capability_test_evidence = (
-                        _ff_product_invariants.collect_capability_test_evidence(
-                            test_path=_test_rel,
-                            contents=str(f.get("contents") or ""),
-                            required_capabilities=_required_capabilities,
+                    # Do not write here. Every model-generated test from every
+                    # changed source is accumulated first, then the shared batch
+                    # chokepoint parses ALL of them before writing ANY of them.
+                    generated_test_candidates.append({
+                        "path": p,
+                        "contents": f["contents"],
+                        "source": rel.replace("\\", "/"),
+                        "required_capabilities": _required_capabilities,
+                    })
+
+            generated_test_status = None
+            generated_test_log = ""
+            if generated_test_candidates:
+                (written_tests, generated_test_status, generated_test_log,
+                 refusal, rollback_failed) = _write_and_run_generated_test_batch(
+                    project_dir, generated_test_candidates, stack,
+                )
+                if refusal:
+                    generated_test_batch_refused = True
+                    affected_sources = {
+                        str(item.get("source") or "")
+                        for item in generated_test_candidates
+                        if item.get("source")
+                    }
+                    manual_review.update(affected_sources)
+                    print(f"{pfx}[skip] generated test batch refused: {refusal}")
+                    all_findings.append({
+                        "file": "(unit tests)", "line": 0, "severity": "high",
+                        "category": "test-coverage",
+                        "title": "Generated test source failed pre-write validation",
+                        "problem": refusal,
+                        "fix": ("Generate complete parser-valid test source; unsupported "
+                                "source types require a safe non-executing parser."),
+                    })
+                    if rollback_failed:
+                        dirty_abort = True
+                        manual_review.update(rollback_failed)
+                        fix_notes.append(
+                            "generated-test pre-run rollback refused for: "
+                            + ", ".join(rollback_failed)
                         )
-                    )
-                    for _capability_id, _paths in _capability_test_evidence.items():
-                        tests_by_capability.setdefault(
-                            _capability_id, []).extend(_paths)
-            if test_files:
-                ok, log = _run_unit_tests(project_dir, stack)
+                else:
+                    for item in written_tests:
+                        _test_rel = item["path"]
+                        generated_test_files.append(_test_rel)
+                        test_creation_receipts[_test_rel] = item["_creation_identity"]
+                        if not item.get("_credit_as_test"):
+                            continue
+                        _source_rel = str(item.get("source") or "")
+                        _required_capabilities = list(
+                            item.get("required_capabilities") or []
+                        )
+                        test_files.append(_test_rel)
+                        tests_by_source.setdefault(_source_rel, []).append(_test_rel)
+                        _capability_test_evidence = (
+                            _ff_product_invariants.collect_capability_test_evidence(
+                                test_path=_test_rel,
+                                contents=item["contents"],
+                                required_capabilities=_required_capabilities,
+                            )
+                        )
+                        for _capability_id, _paths in _capability_test_evidence.items():
+                            tests_by_capability.setdefault(
+                                _capability_id, []).extend(_paths)
+            if generated_test_files:
+                ok, log = generated_test_status, generated_test_log
                 test_status = ok
                 # `ok` is TRI-STATE (_run_unit_tests -> bool | None). Read it
                 # with `is True`, never truthiness: the two happen to agree for
@@ -18322,21 +20849,25 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # printing PASS.
                 print(f"{pfx}unit tests: "
                       f"{'PASS' if ok is True else 'FAIL' if ok is False else 'n/a'}")
-                if ok is False:
+                if ok is not True:
                     all_findings.append({
                         "file": "(unit tests)", "line": 0, "severity": "high", "category": "bug",
                         "title": "Generated unit tests fail against current code",
-                        "problem": "Tests exercising real functions failed:\n" + log,
+                        "problem": ("Tests exercising real functions failed or "
+                                    "lacked executable evidence:\n" + log),
                         "fix": "Repair the implicated functions until the suite passes.",
                     })
                     # Generated tests are candidates until the project's own runner
-                    # accepts them.  A red candidate is removed transactionally so
-                    # its errors remain in evidence without poisoning every later
-                    # gate or leaving an uncommitted tree on timeout.
-                    rejected = list(test_files)
+                    # accepts them. A red candidate may not be deleted by pathname:
+                    # there is no portable identity-conditional unlink, so another
+                    # process could replace it between an identity check and unlink.
+                    # Retain it, mark the rollback dirty, and block publication.
+                    rejected = list(generated_test_files)
                     rollback_failed = []
                     for generated in rejected:
-                        if not _unlink_contained(project_dir, generated):
+                        receipt = test_creation_receipts.get(generated)
+                        if receipt is None or not _unlink_created_contained(
+                                project_dir, generated, receipt):
                             rollback_failed.append(generated)
                     if rollback_failed:
                         dirty_abort = True
@@ -18348,6 +20879,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                             f"rejected and removed {len(rejected)} generated test "
                             "file(s) after the native test command failed")
                         test_files = []
+                        generated_test_files = []
+                        test_creation_receipts = {}
                         tests_by_source = {}
                         tests_by_capability = {}
                         # THE VERDICT DIED WITH THE FILES IT DESCRIBED.
@@ -18383,7 +20916,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 # Save the generated tests too (so they land in the repo).
                 if git and ok is True and test_files:
                     print(f"{pfx}git: {_commit_and_sync(project_dir, branch, prev_branch, args, 'unit tests', stack)}")
-            elif test_candidates:
+            elif test_candidates and not generated_test_batch_refused:
                 manual_review.update(test_candidates)
                 all_findings.append({
                     "file": "(unit tests)", "line": 0, "severity": "high",

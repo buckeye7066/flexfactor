@@ -1,4 +1,4 @@
-# FlexFactor - Recovery and rollback (0.6.1)
+# FlexFactor - Recovery and rollback (0.6.2)
 
 ## 1. Orphan WIP transaction (audit / prodready with `--allow-dirty`)
 

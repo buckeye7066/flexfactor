@@ -1,4 +1,4 @@
-# FlexFactor Mobile 3.5.1
+# FlexFactor Mobile 3.5.2
 
 FlexFactor Mobile is the native managed interface for all four FlexFactor
 modes. It does not require a PC, a personal access token, Termux, or a local
@@ -59,9 +59,10 @@ output, failed gate, or unproven publication remains incomplete in the app.
 Run details and the bounded in-app artifact remain correlated to the request
 UUID.
 
-Version 3.5.1 also accepts an unchanged Refactor result only after the complete
-project gate and authoritative remote-default containment proof pass. Markdown
-wrappers and trailing provider explanations cannot be written as source.
+Version 3.5.2 rejects definitely invalid whole-file responses before any write.
+An “already good” explanation cannot review itself: the independent reviewer
+must approve the exact original source, after which the complete project gate
+and authoritative remote-default containment proof must still pass.
 
 ## Build
 
@@ -79,11 +80,11 @@ When an automatic release needs an exact rerun or repair, the repository owner
 may manually dispatch `android-client.yml` from GitHub Actions and provide the
 current 40-character `main` SHA. The workflow rejects other actors, ref drift,
 an older conflicting tag, and any `main` movement before it accesses signing
-material and again immediately before publication.
-Manual reruns reauthorize the current triggering actor. Automatic recovery may
-rebuild an older exact tag already contained in the authorized `main` tip; it
-stages a draft and rechecks the live branch, tag target, and complete asset set
-before and after publication.
+material and again immediately before publication. Manual reruns reauthorize
+the current triggering actor. Automatic recovery may rebuild an older exact
+tag already contained in the authorized `main` tip; it stages a draft and
+rechecks the live branch, tag target, and complete asset set before and after
+publication.
 
 ## Release signing and updates
 

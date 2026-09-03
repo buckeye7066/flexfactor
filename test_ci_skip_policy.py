@@ -16,6 +16,13 @@ class SkipPolicyTests(unittest.TestCase):
                 r"'no live catalog at C:\\Users\\runneradmin\\AppData\\Local\\AITime\\routes.json'")
         self.assertEqual(policy.verify("Windows", text), [])
 
+    def test_posix_race_schedule_is_an_explained_windows_skip(self):
+        text = (
+            "test_failed_create (T.test_failed_create) ... skipped "
+            "'the replacement schedule is POSIX-specific'"
+        )
+        self.assertEqual(policy.verify("Windows", text), [])
+
     def test_capability_gain_may_remove_an_allowed_skip(self):
         self.assertEqual(policy.verify("Linux", "Ran 1 test\nOK"), [])
 

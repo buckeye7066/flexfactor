@@ -71,6 +71,24 @@ CLI_BINARIES = {
     "copilot-cli": "copilot",
 }
 
+_GRADE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grade": {"type": "integer"},
+        "meets_goal": {"type": "boolean"},
+        "rationale": {"type": "string"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["grade", "meets_goal", "rationale", "issues"],
+    "additionalProperties": False,
+}
+
+_GRADE_SYSTEM = (
+    "You are a strict independent code reviewer. Grade the candidate against "
+    "the stated goal. Reserve 90 or above for a complete result without "
+    "correctness or completeness defects. Return only the requested JSON."
+)
+
 
 def _extensions_enabled() -> bool:
     """Same switch the Cursor adapter honours, so one flag governs both.
@@ -102,7 +120,8 @@ def _recursion_guard_env() -> Dict[str, str]:
     return env
 
 
-def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
+def _argv_for(api: str, binary: str, system: Optional[str],
+              model: Optional[str] = None) -> list:
     """Non-interactive argv for one CLI. The PROMPT is never included here."""
     api = str(api or "").lower()
     if api == "claude-code":
@@ -124,19 +143,25 @@ def _argv_for(api: str, binary: str, system: Optional[str]) -> list:
     if api == "copilot-cli":
         # Silent programmatic mode reads the prompt from stdin. No tools are
         # allowlisted: FlexFactor needs model inference here, not a second agent
-        # with shell or filesystem authority.
-        return [binary, "-s", "--no-ask-user", "--no-auto-update", "--no-color",
+        # with shell or filesystem authority.  Pin the catalog's concrete model
+        # so the rotation ledger records the family that actually served the
+        # call; `auto` remains accepted for ordinary calls but is explicitly
+        # ineligible for family-independent authorization upstream.
+        argv = [binary, "-s", "--no-ask-user", "--no-auto-update", "--no-color",
                 "--no-custom-instructions"]
+        if model:
+            argv += ["--model", str(model)]
+        return argv
     raise CliUnavailable(f"no CLI argv defined for api '{api}'")
 
 
 def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
-             timeout: float) -> str:
+             timeout: float, model: Optional[str] = None) -> str:
     if os.environ.get(_RECURSION_MARKER):
         raise CliUnavailable(
             f"refusing to invoke {binary}: already running inside a "
             "CLI-provider call (nested agents would fan out per rotation step)")
-    argv = _argv_for(api, binary, system)
+    argv = _argv_for(api, binary, system, model)
     # `codex exec` takes no --append-system-prompt, so the theme is prepended
     # to the prompt instead. Losing it would let a rotated call wander off the
     # run's task, which is the whole reason the theme block exists.
@@ -263,6 +288,7 @@ class CliProvider:
                 return _run_cli(
                     self.api, self._binary, prompt, system=system,
                     timeout=float(timeout or self._timeout),
+                    model=self.model,
                 )
             except SubscriptionUnavailable as exc:
                 # RotatingProvider recognizes CliUnavailable as a fault of this
@@ -280,6 +306,7 @@ class CliProvider:
         return _run_cli(
             self.api, self._binary, prompt, system=system,
             timeout=float(timeout or self._timeout),
+            model=self.model,
         )
 
     #: Cost label. Both CLIs are flat-rate, so rotated calls bill $0.
@@ -321,8 +348,21 @@ class CliProvider:
         return self._complete(prompt, system=system, max_tokens=max_tokens)
 
     def grade(self, prompt: str, *, system: Optional[str] = None,
-              max_tokens: int = 4096, **_: Any) -> str:
-        return self.complete(prompt, system=system, max_tokens=max_tokens)
+              max_tokens: int = 4096, **_: Any) -> Dict[str, Any]:
+        """Request the same typed grade contract as the HTTP adapters.
+
+        A plain ``complete`` call leaves the CLI free to answer in prose. The
+        rotating provider preserves that raw string, so downstream attribute
+        access used to fail despite a healthy reviewer. Reuse the JSON-schema
+        transport here; the core still independently normalizes and validates
+        the result before any grade can authorize code.
+        """
+        return self.structured(
+            system or _GRADE_SYSTEM,
+            prompt,
+            _GRADE_SCHEMA,
+            max_tokens=max_tokens,
+        )
 
     def structured(self, system: str, prompt: Optional[str] = None,
                    schema: Optional[Dict[str, Any]] = None,

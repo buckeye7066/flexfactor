@@ -94,6 +94,19 @@ def _unit_competitor_outcome(_args, _provider, _project_dir, _rel,
         "research": {"competitors": []}, "current": current,
     }
 
+
+@contextlib.contextmanager
+def _unit_refactor_prerequisites():
+    """Satisfy production pre-gates in tests aimed at later refactor logic."""
+    with mock.patch.object(
+        ff, "_ensure_program_understanding",
+        return_value=_unit_purpose_understanding(),
+    ), mock.patch.object(
+        ff, "_refactor_top_three_gate",
+        side_effect=_unit_competitor_outcome,
+    ):
+        yield
+
 # --------------------------------------------------------------------------- #
 # NEVER touch the owner's real FlexFactor state from a test run.
 #
@@ -224,6 +237,402 @@ class ReleaseIdentityTests(unittest.TestCase):
 
 
 class RefactorResponseNormalizationTests(unittest.TestCase):
+    def test_source_syntax_preflight_rejects_python_prose(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "calculator.py",
+            "Looking at the current file, it is already well-written with:\n",
+        )
+        self.assertFalse(ok)
+        self.assertIn("parse error", reason)
+
+    def test_source_syntax_preflight_accepts_utf8_bom_python_bytes(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "bom.py", "\ufeffVALUE = 1\n"
+        )
+        self.assertIs(ok, True, reason)
+
+    def test_source_syntax_preflight_rejects_non_utf8_python_cookie(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "encoded.py", "# coding: latin-1\nVALUE = 'é'\n",
+        )
+        self.assertIs(ok, False)
+        self.assertIn("encoding must be UTF-8", reason)
+        for cookie in ("utf-8", "UTF_8", "utf8"):
+            accepted, note = ff._inproc_source_syntax_ok(
+                "encoded.py", f"# coding: {cookie}\nVALUE = 'é'\n",
+            )
+            self.assertIs(accepted, True, note)
+
+    def test_source_syntax_preflight_parses_data_without_writing(self):
+        self.assertEqual(
+            True, ff._inproc_source_syntax_ok("settings.json", '{"safe": true}')[0]
+        )
+        self.assertEqual(
+            False, ff._inproc_source_syntax_ok("settings.json", "not json")[0]
+        )
+        self.assertEqual(
+            True, ff._inproc_source_syntax_ok("pyproject.toml", 'name = "safe"')[0]
+        )
+        self.assertIsNone(
+            ff._inproc_source_syntax_ok("README.md", "ordinary prose")[0]
+        )
+
+    def test_external_source_languages_use_disposable_native_preflight(self):
+        cases = (
+            ("src/app.js", "export const value = 1;\n", {}, "node"),
+            ("src/app.ts", "export const value: number = 1;\n",
+             {"esbuild": "esbuild"}, "esbuild"),
+            ("cmd/app.go", "package main\nfunc main() {}\n", {}, "gofmt"),
+            ("lib/app.rb", "VALUE = 1\n", {}, "ruby"),
+        )
+        for path, source, stack, expected_tool in cases:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+                 mock.patch.object(
+                     ff, "_run",
+                     return_value=ff.subprocess.CompletedProcess([], 0, "", ""),
+                 ) as parser:
+                ok, note = ff._prewrite_source_syntax_ok(
+                    project, path, source, stack,
+                )
+                self.assertIs(ok, True, note)
+                command = parser.call_args.args[0]
+                self.assertEqual(expected_tool, os.path.basename(command[0]))
+                candidate_arg = next(
+                    arg for arg in command[1:]
+                    if arg.endswith(os.path.splitext(path)[1])
+                )
+                self.assertFalse(
+                    candidate_arg.startswith(os.path.realpath(project))
+                )
+
+    def test_external_parser_failure_refuses_source_before_write(self):
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+             mock.patch.object(
+                 ff, "_run",
+                 return_value=ff.subprocess.CompletedProcess(
+                     [], 1, "", "SyntaxError: unexpected token",
+                 ),
+             ):
+            ok, note = ff._prewrite_source_syntax_ok(
+                project, "src/app.js", "export const = ;\n", {},
+            )
+        self.assertIs(ok, False)
+        self.assertIn("unexpected token", note)
+
+    def test_perl_compile_time_hooks_are_never_run_as_a_parser(self):
+        forbidden = mock.Mock(
+            side_effect=AssertionError("perl -c would execute a BEGIN block")
+        )
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff.shutil, "which", return_value="/usr/bin/perl"), \
+             mock.patch.object(ff, "_run", forbidden):
+            ok, note = ff._prewrite_source_syntax_ok(
+                project,
+                "script.pl",
+                "BEGIN { unlink 'owner-data' }\nprint 'safe';\n",
+                {},
+            )
+        self.assertIs(ok, True, note)
+        self.assertIn("Tree-sitter perl", note)
+        forbidden.assert_not_called()
+
+    def test_every_advertised_source_extension_has_a_bundled_parser(self):
+        self.assertEqual(
+            ff._CODE_EXTS, set(ff._TREE_SITTER_LANGUAGE_BY_EXT),
+            "an advertised mutable source extension has no parser mapping",
+        )
+        for extension in sorted(ff._CODE_EXTS):
+            with self.subTest(extension=extension):
+                ok, note = ff._tree_sitter_source_syntax_ok(extension, b"")
+                self.assertIs(ok, True, note)
+
+    def test_previously_unhandled_languages_parse_before_mutation(self):
+        valid = {
+            "src/X.java": "class X { int value() { return 1; } }\n",
+            "src/lib.rs": "fn value() -> i32 { 1 }\n",
+            "src/X.cs": "class X { int Value() { return 1; } }\n",
+            "src/main.kt": 'fun main() { println("ok") }\n',
+            "src/main.swift": "func value() -> Int { return 1 }\n",
+        }
+        with tempfile.TemporaryDirectory() as project:
+            for path, source in valid.items():
+                with self.subTest(path=path):
+                    ok, note = ff._prewrite_source_syntax_ok(
+                        project, path, source, {},
+                    )
+                    self.assertIs(ok, True, note)
+                    bad, bad_note = ff._prewrite_source_syntax_ok(
+                        project, path, "{", {},
+                    )
+                    self.assertIs(bad, False, bad_note)
+
+    def test_install_refresh_discovers_new_repository_esbuild(self):
+        with tempfile.TemporaryDirectory() as project:
+            binary = os.path.join(project, "node_modules", ".bin", "esbuild")
+            os.makedirs(os.path.dirname(binary), exist_ok=True)
+            with open(binary, "w", encoding="utf-8") as handle:
+                handle.write("installed after initial detection\n")
+            stack = {"esbuild": None, "toolchains": []}
+            ff._refresh_verification_status(project, stack)
+        self.assertEqual(binary, stack["esbuild"])
+
+    def test_all_mutation_modes_use_the_shared_native_source_preflight(self):
+        for function in (
+                ff.run,
+                ff._refactor_top_three_gate,
+                ff._apply_integration_impl,
+                ff.attempt_structural_fix,
+                ff._fix_files):
+            with self.subTest(function=function.__name__):
+                self.assertIn(
+                    "_prewrite_source_syntax_ok(", inspect.getsource(function)
+                )
+
+    def test_source_syntax_preflight_rejects_nonfinite_json_constants(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            ok, reason = ff._inproc_source_syntax_ok(
+                "settings.json", '{"value": ' + constant + "}"
+            )
+            self.assertFalse(ok, constant)
+            self.assertIn("not valid JSON", reason)
+
+    def test_source_syntax_preflight_rejects_lone_unicode_surrogates(self):
+        ok, reason = ff._inproc_source_syntax_ok(
+            "settings.json", '{"value": "\ud800"}'
+        )
+        self.assertFalse(ok)
+        self.assertIn("not UTF-8 encodable", reason)
+
+    def test_source_syntax_preflight_rejects_parser_recursion(self):
+        deeply_nested_toml = "value = " + "[" * 2000 + "0" + "]" * 2000
+        ok, reason = ff._inproc_source_syntax_ok(
+            "adversarial.toml", deeply_nested_toml
+        )
+        self.assertFalse(ok)
+        self.assertIn("parse error", reason)
+
+    def test_original_validation_allows_only_parser_valid_empty_source(self):
+        self.assertEqual(
+            True,
+            ff._inproc_source_syntax_ok(
+                "empty.py", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            True,
+            ff._inproc_source_syntax_ok(
+                "empty.toml", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            False,
+            ff._inproc_source_syntax_ok(
+                "empty.json", "", allow_empty=True
+            )[0],
+        )
+        self.assertEqual(
+            False, ff._inproc_source_syntax_ok("generated.py", "")[0]
+        )
+
+    def test_missing_source_parser_fails_closed_before_review_or_publication(self):
+        import tempfile
+        import types
+
+        original = "export const add = (left: number, right: number) => left + right;\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return original
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("unparsed source must not reach a reviewer")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.ts")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain typed addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
+
+    def test_competitor_gate_rejects_prose_before_grade_or_write(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Competitors:
+            @staticmethod
+            def research_competitors(*_args, **_kwargs):
+                return {"verified": 3, "coverage_note": "three corroborated"}
+
+            @staticmethod
+            def competitor_findings(*_args, **_kwargs):
+                return [("calculator.py", {
+                    "title": "clear errors",
+                    "problem": "opaque input failure",
+                    "fix": "validate inputs",
+                })]
+
+        class Provider:
+            @staticmethod
+            def complete(_prompt):
+                return "The file already has all of these capabilities.\n"
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("invalid source must not reach the grader")
+
+        args = types.SimpleNamespace(goal="keep addition clear", threshold=90)
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(ff, "_competitors_module", return_value=Competitors()), \
+             mock.patch.object(
+                 ff, "resolve_repo_rewards_url", return_value=(None, "offline")
+             ):
+            outcome = ff._refactor_top_three_gate(
+                args, Provider(), tmp, "calculator.py", original, {}, "main",
+                purpose_mutation_authorized=True,
+            )
+        self.assertEqual([], outcome["implemented_files"])
+        self.assertEqual(original, outcome["current"])
+        self.assertIn("rejected before write", outcome["note"])
+        self.assertIn("parse error", outcome["note"])
+
+    def test_orchestrated_competitor_gate_rejects_invalid_source_before_write(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Competitors:
+            _ascii = staticmethod(lambda value: str(value))
+
+            @staticmethod
+            def research_competitors(*_args, **_kwargs):
+                return {
+                    "competitors": [],
+                    "sources_skipped": {},
+                    "coverage_note": "three corroborated competitors",
+                    "bridge_ledger": {"bridged": 1, "candidates": 1},
+                }
+
+            @staticmethod
+            def competitor_findings(*_args, **_kwargs):
+                return [("calculator.py", {
+                    "severity": "high",
+                    "line": 1,
+                    "title": "clear errors",
+                    "problem": "opaque input failure",
+                    "fix": "validate inputs",
+                })]
+
+        class Author:
+            model = "test-author"
+            calls = 0
+
+            @classmethod
+            def structured(cls, *_args, **_kwargs):
+                cls.calls += 1
+                return {
+                    "changed": True,
+                    "contents": "The file already has all requested capabilities.\n",
+                    "fixed_titles": ["clear errors"],
+                    "notes": "already done",
+                }
+
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid source reached the worktree")
+        )
+        forbidden_gate = mock.Mock(
+            side_effect=AssertionError("invalid source reached the file gate")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("invalid source reached the reviewer")
+        )
+        args = types.SimpleNamespace(
+            fix_severity="medium",
+            whole_file_fixes=True,
+            fix_prefetch=0,
+            adversarial=True,
+            adversarial_rounds=2,
+            adversarial_materiality="material",
+            structural_fixes=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            with mock.patch.object(
+                    ff, "_competitors_module", return_value=Competitors()), \
+                 mock.patch.object(
+                    ff, "resolve_repo_rewards_url", return_value=(None, "offline")
+                 ), \
+                 mock.patch.object(ff, "_replace_contained", forbidden_write), \
+                 mock.patch.object(ff, "_gate_file", forbidden_gate), \
+                 mock.patch.object(
+                    ff, "_adversarial_verify_fix", forbidden_review
+                 ), \
+                 mock.patch.object(ff, "_report_route_quality", return_value=None):
+                outcome = ff._run_top_competitor_gate(
+                    args=args,
+                    pfx="",
+                    report=lambda **_kwargs: None,
+                    checkpoint=None,
+                    display_name="calculator",
+                    purpose_blob="clear integer addition",
+                    stack={"ecosystems": ["python"]},
+                    purpose_reviewer=Author(),
+                    author=Author(),
+                    cross=object(),
+                    project_dir=tmp,
+                    all_files=["calculator.py"],
+                    meter=ff.CostMeter(limit_usd=None),
+                    baseline_ok=True,
+                    oversized=[],
+                    noop_stats={},
+                    errors_total=0,
+                    done_set=set(),
+                    total_to_review=1,
+                    git=False,
+                    branch="main",
+                    prev_branch="main",
+                    purpose_contract=types.SimpleNamespace(
+                        authored=False, acceptance_criteria=[]
+                    ),
+                )
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(original, retained)
+        self.assertEqual([], outcome["applied"])
+        self.assertEqual([], outcome["unverified"])
+        self.assertEqual(5, Author.calls)
+        self.assertTrue(any(
+            "invalid source rejected before write" in note
+            for note in outcome["notes"]
+        ))
+        forbidden_write.assert_not_called()
+        forbidden_gate.assert_not_called()
+        forbidden_review.assert_not_called()
+
     def test_fenced_file_discards_trailing_provider_explanation(self):
         response = (
             "\n```python\n"
@@ -263,21 +672,31 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         original = "def add(left: int, right: int) -> int:\n    return left + right\n"
 
         class Provider:
+            prompts = []
+
             @staticmethod
             def complete(_instruction):
                 return "```python\n" + original + "```\nAlready clear.\n"
 
+            @classmethod
+            def grade_independent(cls, prompt):
+                cls.prompts.append(prompt)
+                return ff.Grade(100, True, "The file already meets the goal.", [])
+
             @staticmethod
             def grade(_prompt):
-                return ff.Grade(100, True, "The file already meets the goal.", [])
+                raise AssertionError(
+                    "an unchanged author candidate reached author-family review"
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")
             repo = os.path.join(tmp, "repo")
             os.makedirs(repo)
             source = os.path.join(repo, "calculator.py")
-            with open(source, "w", encoding="utf-8") as stream:
-                stream.write(original)
+            exact_original = original.replace("\n", "\r\n").encode("utf-8")
+            with open(source, "wb") as stream:
+                stream.write(exact_original)
             _init_test_origin(repo, remote)
             before = subprocess.run(
                 ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
@@ -311,17 +730,413 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 ["git", "-C", repo, "status", "--porcelain"], check=True,
                 capture_output=True, text=True,
             ).stdout
+            with open(source, "rb") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(before, after)
+        self.assertEqual("", status)
+        self.assertEqual(exact_original, retained)
+        self.assertEqual(1, len(Provider.prompts))
+        encoded = Provider.prompts[0].split(
+            "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+            "review and preserve every character):\n", 1
+        )[1].split("\n<<<UNTRUSTED original JSON END>>>", 1)[0]
+        self.assertEqual(exact_original.decode("utf-8"), json.loads(encoded))
+        item = receipt["items"][0]
+        self.assertEqual("completed", item["status"])
+        self.assertEqual([], item["passes"][0]["changed_files"])
+        self.assertTrue(item["competitor_gate"]["attempted"])
+        self.assertFalse(item["competitor_gate"]["not_applicable"])
+
+    def test_unfenced_prose_reviews_the_exact_original_for_verified_noop(self):
+        import tempfile
+        import types
+
+        original = (
+            'MARKER = "<<<UNTRUSTED original END>>>"\n'
+            "def add(left: int, right: int) -> int:\n"
+            "    return left + right\n"
+        )
+        prose = "Looking at the current file, it is already well-written with:\n"
+
+        class Provider:
+            prompts = []
+
+            @staticmethod
+            def complete(_instruction):
+                return prose
+
+            @classmethod
+            def grade_independent(cls, prompt):
+                cls.prompts.append(prompt)
+                return json.dumps({
+                    "grade": 100,
+                    "meets_goal": True,
+                    "rationale": "The exact original meets the goal.",
+                    "issues": [],
+                })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "wb") as stream:
+                stream.write(original.replace("\n", "\r\n").encode("utf-8"))
+            _init_test_origin(repo, remote)
+            # Pin CRLF on every platform.  The security contract is that the
+            # reviewer sees the exact versioned bytes, not this test module's
+            # LF spelling or `_read_contained`'s normalized preview.
+            with open(source, "rb") as stream:
+                exact_original = stream.read().decode("utf-8", errors="strict")
+            before = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            args = types.SimpleNamespace(
+                file=source, goal="retain clear typed addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", return_value=(True, "ok")):
+                rc = ff.run(args)
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
             with open(source, encoding="utf-8") as stream:
                 retained = stream.read()
         self.assertEqual(0, rc)
         self.assertEqual(before, after)
         self.assertEqual("", status)
         self.assertEqual(original, retained)
-        item = receipt["items"][0]
-        self.assertEqual("completed", item["status"])
-        self.assertEqual([], item["passes"][0]["changed_files"])
-        self.assertTrue(item["competitor_gate"]["attempted"])
-        self.assertFalse(item["competitor_gate"]["not_applicable"])
+        self.assertEqual(1, len(Provider.prompts))
+        self.assertIn("EXACT ORIGINAL FILE", Provider.prompts[0])
+        encoded = Provider.prompts[0].split(
+            "JSON-ENCODED UTF-8 TEXT (one complete JSON string; decode it before "
+            "review and preserve every character):\n", 1
+        )[1].split("\n<<<UNTRUSTED original JSON END>>>", 1)[0]
+        self.assertEqual(exact_original, json.loads(encoded))
+        self.assertNotIn("<<<UNTRUSTED original END>>>", Provider.prompts[0])
+        self.assertEqual(original, exact_original.replace("\r\n", "\n"))
+        self.assertNotIn(prose.strip(), Provider.prompts[0])
+
+    def test_redact_mode_refuses_exact_original_noop_review(self):
+        import tempfile
+        import types
+
+        original = 'API_TOKEN = "sk-sensitive-owner-value-123456789"\n'
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return original
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("redacted exact source reached review")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "settings.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the configured token", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(ff, "EGRESS_MODE", "redact"), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()
+                 ), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
+
+    def test_non_utf8_original_cannot_reach_noop_review(self):
+        import tempfile
+        import types
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "The current file already satisfies the goal.\n"
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("altered non-UTF-8 source reached review")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "wb") as stream:
+                stream.write(b"# invalid UTF-8 follows: \xff\nVALUE = 1\n")
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the exact file", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, "rb") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(b"# invalid UTF-8 follows: \xff\nVALUE = 1\n", retained)
+        gate.assert_not_called()
+
+    def test_oversized_original_cannot_be_partially_approved_as_noop(self):
+        import tempfile
+        import types
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "The current file already satisfies the goal.\n"
+
+            @staticmethod
+            def grade_independent(_prompt):
+                raise AssertionError("truncated original reached no-op review")
+
+        original = "# " + ("x" * 128) + "\nVALUE = 1\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="retain the exact file", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(ff, "MAX_REVIEW_BYTES", 64), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()
+                 ), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
+
+    def test_valid_empty_original_can_be_independently_approved_as_noop(self):
+        import tempfile
+        import types
+
+        class Provider:
+            prompts = []
+
+            @staticmethod
+            def complete(_instruction):
+                return "The empty module already meets the requested goal.\n"
+
+            @classmethod
+            def grade_independent(cls, prompt):
+                cls.prompts.append(prompt)
+                return ff.Grade(
+                    100, True, "The exact empty original meets the goal.", []
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "empty.py")
+            with open(source, "w", encoding="utf-8"):
+                pass
+            _init_test_origin(repo, remote)
+            before = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            args = types.SimpleNamespace(
+                file=source, goal="keep this namespace-only package marker",
+                threshold=90, max_iterations=1, max_cost=1,
+                push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(
+                    ff, "_publication_gate", return_value=(True, "ok")
+                 ) as gate:
+                rc = ff.run(args)
+            after = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(before, after)
+        self.assertEqual("", status)
+        self.assertEqual("", retained)
+        self.assertEqual(1, len(Provider.prompts))
+        gate.assert_called_once()
+
+    def test_invalid_author_prose_cannot_claim_noop_without_original_approval(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class Provider:
+            @staticmethod
+            def complete(_instruction):
+                return "Looking at the current file, it is already well-written with:\n"
+
+            @staticmethod
+            def grade_independent(_prompt):
+                return json.dumps({
+                    "grade": 95,
+                    "meets_goal": "false",
+                    "rationale": "The exact original misses validation.",
+                    "issues": [],
+                })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="add input validation", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+            status = subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"], check=True,
+                capture_output=True, text=True,
+            ).stdout
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        self.assertEqual("", status)
+        gate.assert_not_called()
+
+    def test_approved_original_supersedes_an_earlier_higher_rejected_candidate(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+        rejected = "def add(left, right):\n    return int(left) + int(right)\n"
+
+        class Provider:
+            completions = [
+                "```python\n" + rejected + "```",
+                "The original file is already the clearer implementation.\n",
+            ]
+
+            @classmethod
+            def complete(cls, _instruction):
+                return cls.completions.pop(0)
+
+            @staticmethod
+            def grade(_prompt):
+                return ff.Grade(
+                    99, False, "The rewrite changes accepted input behavior.",
+                    ["Preserve the original behavior."],
+                )
+
+            @staticmethod
+            def grade_independent(_prompt):
+                return ff.Grade(90, True, "The exact original meets the goal.", [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="preserve clear addition", threshold=90,
+                max_iterations=2, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider", return_value=Provider()), \
+                 mock.patch.object(ff, "_publication_gate", return_value=(True, "ok")):
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(0, rc)
+        self.assertEqual(original, retained)
+
+    def test_invalid_output_cannot_self_certify_a_noop(self):
+        import tempfile
+        import types
+
+        original = "def add(left, right):\n    return left + right\n"
+
+        class SameModelProvider:
+            @staticmethod
+            def complete(_instruction):
+                return "The original already looks good.\n"
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("self-review must not be used as fallback")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = os.path.join(tmp, "origin.git")
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            source = os.path.join(repo, "calculator.py")
+            with open(source, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            _init_test_origin(repo, remote)
+            args = types.SimpleNamespace(
+                file=source, goal="preserve clear addition", threshold=90,
+                max_iterations=1, max_cost=1, push=True, merge=True,
+            )
+            with _unit_refactor_prerequisites(), \
+                 mock.patch.object(
+                    ff, "_best_available_provider",
+                    return_value=SameModelProvider()), \
+                 mock.patch.object(ff, "_publication_gate") as gate:
+                rc = ff.run(args)
+            with open(source, encoding="utf-8") as stream:
+                retained = stream.read()
+        self.assertEqual(1, rc)
+        self.assertEqual(original, retained)
+        gate.assert_not_called()
 
     def test_unchanged_near_miss_cannot_become_noop_success(self):
         import tempfile
@@ -335,8 +1150,12 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(89, False, "The requested goal remains unmet.", [])
+
+            @staticmethod
+            def grade(_prompt):
+                raise AssertionError("unchanged source reached ordinary review")
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = os.path.join(tmp, "origin.git")
@@ -373,7 +1192,7 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(100, True, "Already satisfies the goal.", [])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,7 +1274,7 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 return "```python\n" + original + "```\n"
 
             @staticmethod
-            def grade(_prompt):
+            def grade_independent(_prompt):
                 return ff.Grade(100, True, "Already satisfies the goal.", [])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1720,6 +2539,17 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertNotEqual(ff._price_for(priced), (0.0, 0.0))
         # A genuinely unknown, unregistered id still bills fail-closed premium.
         self.assertEqual(ff._price_for("some-unknown-model-id"), ff._DEFAULT_PRICE)
+
+    def test_rotated_anthropic_route_disables_hidden_cross_family_rescue(self):
+        import flexfactor_rotation as fr
+        route = fr.Route.from_json(
+            self._route("anthropic/claude-sonnet-4.6", api="anthropic")
+        )
+        stub = mock.Mock()
+        with mock.patch.object(ff, "AnthropicProvider", return_value=stub):
+            provider = ff._rotation_route_provider(route)
+        self.assertIs(provider, stub)
+        self.assertIs(provider._allow_cross_family_rescue, False)
 
     def test_unusable_routes_are_dropped_with_named_reasons(self):
         import flexfactor_rotation as fr
@@ -3629,11 +4459,11 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             res = ff.apply_integration(
                 project, "demo",
-                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                  "packages": []},
                 self._opts(True))
             self.assertEqual(res.status, "skipped-unverified")
-            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertFalse(os.path.exists(os.path.join(project, "new.py")))
 
     def test_python_project_uses_its_real_test_gate(self):
         import tempfile
@@ -3698,12 +4528,1442 @@ class ScoutUnverifiedRetentionTests(unittest.TestCase):
             before = open(os.path.join(project, "package.json"), "rb").read()
             res = ff.apply_integration(
                 project, "demo",
-                {"files": [{"path": "new.js", "contents": "unsafe"}],
+                {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                  "packages": []},
                 self._opts(False))
             self.assertEqual(res.status, "skipped-unverified")
-            self.assertFalse(os.path.exists(os.path.join(project, "new.js")))
+            self.assertFalse(os.path.exists(os.path.join(project, "new.py")))
             self.assertEqual(open(os.path.join(project, "package.json"), "rb").read(), before)
+
+
+class ScoutSourcePreflightTests(unittest.TestCase):
+    """Scout must parse the complete generated batch before its first mutation."""
+
+    def test_falsey_non_list_file_batch_cannot_become_package_only_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("malformed Scout batch reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        for raw_files in ({}, ""):
+            with self.subTest(raw_files=raw_files), \
+                 tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+                 mock.patch.object(ff, "_write_contained", forbidden), \
+                 mock.patch.object(ff, "_run", forbidden), \
+                 mock.patch.object(ff, "_git", forbidden), \
+                 mock.patch.object(ff, "_independent_final_review", forbidden), \
+                 mock.patch.object(ff, "_publish_verified_head", forbidden):
+                result = ff.apply_integration(
+                    project,
+                    "candidate/repo",
+                    {"files": raw_files, "packages": ["safe-package@1.0.0"]},
+                    opts,
+                )
+
+            self.assertEqual("refused-invalid-source", result.status)
+            self.assertIn("'files' is not a list", result.detail)
+        forbidden.assert_not_called()
+
+    def test_falsey_non_list_packages_cannot_publish_valid_source(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("malformed packages reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        for raw_packages in ({}, "", False):
+            with self.subTest(raw_packages=raw_packages), \
+                 tempfile.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+                 mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+                 mock.patch.object(ff, "_write_contained", forbidden), \
+                 mock.patch.object(ff, "_detect_verify", forbidden), \
+                 mock.patch.object(ff, "_run", forbidden), \
+                 mock.patch.object(ff, "_git", forbidden), \
+                 mock.patch.object(ff, "_independent_final_review", forbidden), \
+                 mock.patch.object(ff, "_publish_verified_head", forbidden):
+                result = ff.apply_integration(
+                    project,
+                    "candidate/repo",
+                    {
+                        "files": [{"path": "valid.py", "contents": "VALUE = 1\n"}],
+                        "packages": raw_packages,
+                    },
+                    opts,
+                )
+
+            self.assertEqual("refused-unsafe-packages", result.status)
+            self.assertIn("'packages' is not a list", result.detail)
+        forbidden.assert_not_called()
+
+    def test_invalid_later_file_refuses_every_write_and_downstream_gate(self):
+        import tempfile
+        import types
+
+        forbidden_snapshot = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached snapshot")
+        )
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached write")
+        )
+        forbidden_verify = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached verification")
+        )
+        forbidden_git = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached commit")
+        )
+        forbidden_review = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached reviewer")
+        )
+        forbidden_publish = mock.Mock(
+            side_effect=AssertionError("invalid Scout source reached publication")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": "good.py", "contents": "VALUE = 1\n"},
+                {"path": "broken.py", "contents": "This is prose, not Python.\n"},
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden_snapshot), \
+             mock.patch.object(ff, "_write_contained", forbidden_write), \
+             mock.patch.object(ff, "_detect_verify", forbidden_verify), \
+             mock.patch.object(ff, "_run", forbidden_verify), \
+             mock.patch.object(ff, "_git", forbidden_git), \
+             mock.patch.object(ff, "_independent_final_review", forbidden_review), \
+             mock.patch.object(ff, "_publish_verified_head", forbidden_publish):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("broken.py", result.detail)
+        self.assertIn("rejected before write", result.detail)
+        forbidden_snapshot.assert_not_called()
+        forbidden_write.assert_not_called()
+        forbidden_verify.assert_not_called()
+        forbidden_git.assert_not_called()
+        forbidden_review.assert_not_called()
+        forbidden_publish.assert_not_called()
+
+    def test_portable_alias_batch_is_refused_before_scout_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("Scout path alias reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": "pkg/caf\u00e9.py", "contents": "VALUE = 1\n"},
+                {"path": "pkg/cafe\u0301.py", "contents": "VALUE = 2\n"},
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_git_worktree_root", return_value=None), \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+             mock.patch.object(ff, "_write_contained", forbidden), \
+             mock.patch.object(ff, "_detect_verify", forbidden), \
+             mock.patch.object(ff, "_run", forbidden), \
+             mock.patch.object(ff, "_git", forbidden), \
+             mock.patch.object(ff, "_independent_final_review", forbidden), \
+             mock.patch.object(ff, "_publish_verified_head", forbidden):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("duplicate path", result.detail)
+        forbidden.assert_not_called()
+
+    def test_scout_batch_above_thirty_files_is_refused_before_mutation(self):
+        import tempfile
+        import types
+
+        forbidden = mock.Mock(
+            side_effect=AssertionError("oversized Scout batch reached mutation")
+        )
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=True, merge=True,
+            final_reviewer=object(), isolate_verify=True,
+        )
+        patch = {
+            "files": [
+                {"path": f"generated/file_{index}.py", "contents": "VALUE = 1\n"}
+                for index in range(31)
+            ],
+            "packages": [],
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_read_bytes_contained", forbidden), \
+             mock.patch.object(ff, "_write_contained", forbidden), \
+             mock.patch.object(ff, "_detect_verify", forbidden):
+            result = ff.apply_integration(project, "candidate/repo", patch, opts)
+        self.assertEqual("refused-invalid-source", result.status)
+        self.assertIn("max 30", result.detail)
+        forbidden.assert_not_called()
+
+
+class GradePayloadValidationTests(unittest.TestCase):
+    """Every reviewer route must satisfy the complete no-op authorization schema."""
+
+    def test_complete_grade_payload_is_accepted(self):
+        parsed = ff._parse_grade(json.dumps({
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "The exact candidate meets the goal.",
+            "issues": [],
+        }))
+        self.assertEqual(100, parsed.grade)
+        self.assertIs(parsed.meets_goal, True)
+        self.assertEqual([], parsed.issues)
+
+    def test_missing_required_grade_field_is_rejected(self):
+        complete = {
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "complete",
+            "issues": [],
+        }
+        for missing in tuple(complete):
+            payload = dict(complete)
+            payload.pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                    ValueError, "omitted required"):
+                ff._parse_grade(json.dumps(payload))
+
+    def test_wrong_grade_property_types_and_unknown_fields_are_rejected(self):
+        complete = {
+            "grade": 100,
+            "meets_goal": True,
+            "rationale": "complete",
+            "issues": [],
+        }
+        bad_values = {
+            "grade": (100.0, True, "100"),
+            "meets_goal": (1, "true"),
+            "rationale": (None, {"text": "complete"}),
+            "issues": ("none", [1], [{}]),
+        }
+        for field, values in bad_values.items():
+            for value in values:
+                payload = dict(complete)
+                payload[field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    ff._parse_grade(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            ff._parse_grade(json.dumps({**complete, "approval": True}))
+
+    def test_sub_hundred_grade_requires_a_concrete_issue(self):
+        with self.assertRaisesRegex(ValueError, "sub-100"):
+            ff._parse_grade(json.dumps({
+                "grade": 99,
+                "meets_goal": False,
+                "rationale": "One problem remains.",
+                "issues": [],
+            }))
+
+
+class GeneratedTestSourcePreflightTests(unittest.TestCase):
+    """Audit/Production Ready parse every generated test before any write."""
+
+    def test_invalid_later_test_reaches_neither_writer_nor_runner(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("invalid generated test reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("invalid generated test reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_good.py",
+             "contents": "def test_good():\n    assert True\n"},
+            {"path": "tests/test_broken.py", "contents": "This is not Python.\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("test_broken.py", refusal)
+        self.assertIn("rejected before write", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_non_test_destination_is_refused_before_every_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("production source reached test writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("non-test source reached test runner")
+        )
+        candidates = [
+            {"path": "tests/test_good.py", "contents": "def test_ok():\n    assert True\n"},
+            {"path": "src/helper.py", "contents": "VALUE = 1\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("not at a recognized test path", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_valid_batch_is_written_then_run_and_call_site_is_wired(self):
+        runner = mock.Mock(return_value=(True, "1 test passed"))
+        focused = mock.Mock(return_value=(True, "exact file passed"))
+        candidates = [
+            {"path": "tests/test_one.py", "contents": "def test_one():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run_unit_tests", runner), \
+             mock.patch.object(ff, "_run_generated_test_file", focused):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+            self.assertTrue(os.path.isfile(os.path.join(project, "tests", "test_one.py")))
+        self.assertEqual(["tests/test_one.py"],
+                         [item["path"] for item in written])
+        self.assertEqual([True],
+                         [item["_credit_as_test"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("1 test passed", log)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+        runner.assert_called_once()
+        focused.assert_called_once()
+        self.assertIn(
+            "_write_and_run_generated_test_batch(",
+            inspect.getsource(ff.audit_one_program),
+        )
+
+    def test_writer_host_path_cannot_replace_validated_relative_identity(self):
+        candidates = [
+            {"path": "./tests//test_one.py",
+             "contents": "def test_one():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "1 test passed")), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(True, "exact file passed"),
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual(["tests/test_one.py"], [item["path"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
+    def test_duplicate_generated_path_is_refused_before_overwrite(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("duplicate generated path reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("duplicate generated path reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_same.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "./tests//test_same.py",
+             "contents": "def test_two():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_case_only_generated_alias_is_refused_on_every_host(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("case-only alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("case-only alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_Same.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_same.py",
+             "contents": "def test_two():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_unicode_normalization_alias_is_refused_on_every_host(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("Unicode alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("Unicode alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_caf\u00e9.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_cafe\u0301.py",
+             "contents": "def test_two():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("duplicate path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_windows_trailing_dot_alias_is_refused_before_every_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("Windows trailing-dot alias reached write")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("Windows trailing-dot alias reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_case.py",
+             "contents": "def test_one():\n    assert True\n"},
+            {"path": "tests/test_case.py.",
+             "contents": "def test_two():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("invalid repository path", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_support_artifacts_are_refused_before_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("support-only batch reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("support-only batch reached runner")
+        )
+        candidates = [
+            {"path": "tests/capability.json", "contents": '{"case": 1}\n'},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("support/config artifacts are not permitted", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_pytest_conftest_cannot_modify_a_generated_test_run(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("autoloaded plugin reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("autoloaded plugin reached runner")
+        )
+        candidates = [
+            {
+                "path": "tests/test_generated.py",
+                "contents": "def test_generated():\n    assert True\n",
+            },
+            {
+                "path": "tests/conftest.py",
+                "contents": (
+                    "def pytest_runtest_makereport(item, call):\n"
+                    "    call.excinfo = None\n"
+                ),
+            },
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates,
+                    {"test_cmd": ["python", "-m", "pytest"]},
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertEqual("", log)
+        self.assertIn("support/config artifacts are not permitted", refusal)
+        self.assertIn("tests/conftest.py", refusal)
+        self.assertEqual([], rollback_failed)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_executable_without_a_declared_case_is_refused_before_write(self):
+        forbidden_write = mock.Mock(
+            side_effect=AssertionError("case-free module reached writer")
+        )
+        forbidden_runner = mock.Mock(
+            side_effect=AssertionError("case-free module reached runner")
+        )
+        candidates = [
+            {"path": "tests/test_empty.py", "contents": "VALUE = 1\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_create_contained", forbidden_write), \
+             mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+            written, status, _log, refusal, _rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("declares no collectable test case", refusal)
+        forbidden_write.assert_not_called()
+        forbidden_runner.assert_not_called()
+
+    def test_non_native_case_test_suffix_never_receives_execution_credit(self):
+        for rel in ("Widget_Test.py", "widget_TEST.go", "unit.Test.js"):
+            with self.subTest(rel=rel):
+                self.assertFalse(ff._runner_collectable_generated_test_path(rel))
+
+    def test_nested_and_unconditionally_skipped_python_tests_get_no_credit(self):
+        cases = (
+            "def helper():\n"
+            "    def test_hidden():\n"
+            "        assert True\n",
+            "import pytest\n"
+            "@pytest.mark.skip(reason='not running')\n"
+            "def test_skipped():\n"
+            "    assert True\n",
+            "import pytest\n"
+            "@pytest.mark.skip(reason='class skipped')\n"
+            "class TestSkipped:\n"
+            "    def test_member(self):\n"
+            "        assert True\n",
+            "import pytest\n"
+            "pytestmark = pytest.mark.skip(reason='module skipped')\n"
+            "def test_module():\n"
+            "    assert True\n",
+            "import pytest\n"
+            "pytest.skip('module skipped', allow_module_level=True)\n"
+            "def test_module():\n"
+            "    assert True\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("non-collectable Python reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/test_hidden_{index}.py",
+                          "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_module_and_test_class_python_cases_are_collectable(self):
+        for source in (
+                "def test_module():\n    assert True\n",
+                "class TestGroup:\n    def test_member(self):\n        assert True\n",
+                "import unittest\nclass Group(unittest.TestCase):\n"
+                "    def test_member(self):\n        self.assertTrue(True)\n"):
+            with self.subTest(source=source):
+                self.assertTrue(ff._generated_test_source_has_case(
+                    "tests/test_generated.py", source,
+                ))
+
+    def test_go_comment_and_raw_string_examples_are_not_test_cases(self):
+        for source in (
+                "package x\n/*\nfunc TestFake(t *testing.T) {}\n*/\n",
+                "package x\nvar example = `\nfunc TestFake(t *testing.T) {}\n`\n"):
+            with self.subTest(source=source):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+        self.assertTrue(ff._generated_test_source_has_case(
+            "generated_test.go",
+            "package x\nvar example = `path\\`\n"
+            "func TestReal(t *testing.T) {}\n",
+        ))
+
+    def test_go_skip_and_skipnow_tests_never_receive_execution_credit(self):
+        for call in ("Skip", "Skipf", "SkipNow"):
+            source = (
+                "package x\nimport \"testing\"\n"
+                f"func TestGenerated(t *testing.T) {{ t.{call}() }}\n"
+            )
+            with self.subTest(call=call):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+
+    def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
+        cases = (
+            "test.skip('skipped', () => {});\n",
+            "it.skip('skipped', () => {});\n",
+            "test.todo('later');\n",
+            "it.todo('later');\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("non-running test reached writer")
+            )
+            forbidden_runner = mock.Mock(
+                side_effect=AssertionError("non-running test reached runner")
+            )
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "javascript parse", source),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", forbidden_runner):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/generated_{index}.test.js",
+                          "contents": source}],
+                        {"test_cmd": ["npm", "test"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            forbidden_runner.assert_not_called()
+
+    def test_javascript_comments_and_literals_never_receive_execution_credit(self):
+        cases = (
+            "// test('line comment', () => {});\n",
+            "/*\ntest('block comment', () => {});\n*/\n",
+            "const example = \"test('quoted', () => {})\";\n",
+            "const example = `before\nit('template', () => {})\nafter`;\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("non-code text reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "javascript parse", source),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/generated_text_{index}.test.js",
+                          "contents": source}],
+                        {"test_cmd": ["npm", "test"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_javascript_hidden_scope_declarations_never_receive_credit(self):
+        cases = (
+            "function register() {\n  test('hidden', () => {});\n}\n",
+            "if (false) {\n  it('hidden', () => {});\n}\n",
+            "describe('group', () => {\n  test('nested', () => {});\n});\n",
+            "function register() {\n  const pattern = /}/;\n"
+            "  test('hidden after regex', () => {});\n}\n",
+            "const register = () =>\ntest('arrow body', () => {});\n",
+            "if (false)\nit('conditional body', () => {});\n",
+        )
+        for index, source in enumerate(cases):
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("hidden JavaScript reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            with self.subTest(source=source), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(True, "javascript parse", source),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": f"tests/hidden_{index}.test.js",
+                          "contents": source}],
+                        {"test_cmd": ["npm", "test"]},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_module_javascript_case_after_regex_literal_is_collectable(self):
+        source = "const pattern = /{/;\ntest('runs', () => pattern.test('{'));\n"
+        self.assertTrue(ff._generated_test_source_has_case(
+            "tests/regex.test.js", source,
+        ))
+
+    def test_jsx_text_never_receives_execution_credit(self):
+        cases = (
+            ("tests/generated_text.test.jsx", "test('not executed');"),
+            ("tests/generated_text.test.tsx", "it('not executed');"),
+        )
+        for path, text in cases:
+            source = (
+                "const view = (\n"
+                "  <div>\n"
+                f"{text}\n"
+                "  </div>\n"
+                ");\n"
+            )
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("JSX text reached writer")
+            )
+            passing_existing_suite = mock.Mock(return_value=(True, "1 passed"))
+            transformed = (
+                "const view = React.createElement(\"div\", null, "
+                f"\"{text}\");\n"
+            )
+            with self.subTest(path=path), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(
+                     ff, "_generated_test_source_syntax_ok",
+                     return_value=(
+                         True, "esbuild syntax and JSX transform", transformed,
+                     ),
+                 ), \
+                 mock.patch.object(ff, "_create_contained", forbidden_write), \
+                 mock.patch.object(ff, "_run_unit_tests", passing_existing_suite):
+                written, status, _log, refusal, _rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project,
+                        [{"path": path, "contents": source}],
+                        {"test_cmd": ["npm", "test"], "esbuild": "esbuild"},
+                    )
+                )
+            self.assertEqual([], written)
+            self.assertIsNone(status)
+            self.assertIn("declares no collectable test case", refusal)
+            forbidden_write.assert_not_called()
+            passing_existing_suite.assert_not_called()
+
+    def test_tsx_generic_before_real_case_remains_collectable(self):
+        path = "tests/generic.test.tsx"
+        source = (
+            "const identity = <T,>(value: T) => value;\n\n"
+            "test('runs', () => {\n"
+            "  expect(identity(1)).toBe(1);\n"
+            "});\n"
+        )
+        transformed = (
+            "const identity = (value) => value;\n\n"
+            "test('runs', () => {\n"
+            "  expect(identity(1)).toBe(1);\n"
+            "});\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_generated_test_source_syntax_ok",
+                 return_value=(
+                     True, "esbuild syntax and JSX transform", transformed,
+                 ),
+             ), \
+             mock.patch.object(
+                 ff, "_run_unit_tests", return_value=(True, "1 passed"),
+             ), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(True, "exact file passed"),
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project,
+                    [{"path": path, "contents": source}],
+                    {"test_cmd": ["npm", "test"], "esbuild": "esbuild"},
+                )
+            )
+        self.assertEqual([path], [item["path"] for item in written])
+        self.assertIs(status, True)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
+    def test_generated_file_gets_no_credit_without_exact_file_execution(self):
+        path = "test_generated.py"
+        candidate = {
+            "path": path,
+            "contents": "def test_generated():\n    assert True\n",
+        }
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run_unit_tests", return_value=(True, "1 passed"),
+             ), \
+             mock.patch.object(
+                 ff, "_run_generated_test_file",
+                 return_value=(False, "configured discovery omitted this path"),
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, [candidate],
+                    {"test_cmd": ["python", "-m", "pytest", "-q"]},
+                )
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("not individually executed", refusal)
+        self.assertEqual([path], rollback_failed)
+
+    def test_python_exact_file_selector_is_probed_then_executed(self):
+        path = "test_generated.py"
+        calls = []
+
+        def runner(command, run_project, timeout=900, env=None):
+            del timeout, env
+            calls.append(command)
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(command, 4, "", "missing")
+            with open(
+                    os.path.join(run_project, *path.split("/")),
+                    encoding="utf-8") as handle:
+                current = handle.read()
+            canary = re.search(
+                r"FLEXFACTOR_EXECUTION_CANARY_[0-9a-f]+", current,
+            )
+            if canary:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", canary.group(0),
+                )
+            return ff.subprocess.CompletedProcess(command, 0, "1 passed", "")
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run", side_effect=runner):
+            ok, note = ff._run_generated_test_file(
+                project,
+                {"path": path,
+                 "contents": "def test_generated():\n    assert True\n"},
+                {"test_cmd": ["python", "-m", "pytest", "-q"]},
+            )
+        self.assertIs(ok, True, note)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(path, calls[1][-1])
+        self.assertEqual(path, calls[2][-1])
+
+    def test_javascript_exact_file_with_only_skips_gets_no_credit(self):
+        path = "tests/generated.test.js"
+        calls = []
+
+        def runner(command, _project, timeout=900, env=None):
+            del timeout, env
+            calls.append(command)
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", "no matching test file",
+                )
+            with open(
+                    os.path.join(_project, *path.split("/")),
+                    encoding="utf-8") as handle:
+                current = handle.read()
+            canary = re.search(
+                r"FLEXFACTOR_EXECUTION_CANARY_[0-9a-f]+", current,
+            )
+            if canary:
+                return ff.subprocess.CompletedProcess(
+                    command, 1, "", canary.group(0),
+                )
+            return ff.subprocess.CompletedProcess(
+                command, 0,
+                "ℹ tests 1\nℹ pass 0\nℹ fail 0\nℹ skipped 1\n",
+                "",
+            )
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run", side_effect=runner):
+            ok, note = ff._run_generated_test_file(
+                project,
+                {"path": path, "contents": "test('later', () => {});\n"},
+                {"test_cmd": ["npm", "test"]},
+            )
+        self.assertIs(ok, False)
+        self.assertIn("no executed-test evidence", note)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(["npm", "test", "--", path], calls[2])
+
+    def test_forged_pass_text_and_early_exit_cannot_replace_execution_proof(self):
+        path = "test_forged.py"
+        source = (
+            "import os\n"
+            "os.write(1, b'1 passed\\n')\n"
+            "os._exit(0)\n"
+            "def test_never_collected():\n"
+            "    assert False\n"
+        )
+
+        def forged_runner(command, run_project, timeout=900, env=None):
+            del timeout, env
+            if ".flexfactor-missing-" in command[-1]:
+                return ff.subprocess.CompletedProcess(command, 4, "", "missing")
+            with open(os.path.join(run_project, path),
+                      encoding="utf-8") as handle:
+                current = handle.read()
+            # The import-time exit prevents even the mutated body from running;
+            # stdout still carries the forged legacy evidence.
+            self.assertIn("FLEXFACTOR_EXECUTION_CANARY_", current)
+            return ff.subprocess.CompletedProcess(command, 0, "1 passed", "")
+
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, path), "w", encoding="utf-8") as handle:
+                handle.write(source)
+            with mock.patch.object(ff, "_run", side_effect=forged_runner):
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": ["python", "-m", "pytest", "-q"]},
+                )
+        self.assertIs(ok, False)
+        self.assertIn("did not prove execution", note)
+
+    def test_real_pytest_rejects_import_time_exit_forgery(self):
+        path = "test_forged.py"
+        source = (
+            "import os\n"
+            "os.write(1, b'1 passed\\n')\n"
+            "os._exit(0)\n"
+            "def test_never_collected():\n"
+            "    assert False\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            trust = ff._grant_run_trust(project)
+            try:
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+        self.assertIs(ok, False)
+        self.assertIn("did not prove execution", note)
+
+    def test_real_pytest_accepts_only_after_canary_and_test_pass(self):
+        path = "test_generated.py"
+        source = "def test_generated():\n    assert 2 + 2 == 4\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            trust = ff._grant_run_trust(project)
+            try:
+                ok, note = ff._run_generated_test_file(
+                    project, {"path": path, "contents": source},
+                    {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+        self.assertIs(ok, True, note)
+        self.assertIn("failure canary", note)
+
+    def test_runnable_javascript_each_and_only_declarations_are_recognized(self):
+        for source in (
+                "test('runs', () => {});",
+                "it.only('runs', () => {});",
+                "test.each([[1]])('runs %s', () => {});",
+                "test.only.each([[1]])('runs %s', () => {});"):
+            with self.subTest(source=source):
+                self.assertTrue(ff._generated_test_source_has_case(
+                    "tests/generated.test.js", source,
+                ))
+        self.assertFalse(ff._generated_test_source_has_case(
+            "tests/generated.test.tsx",
+            "test('raw TSX is not parser-backed', () => <Widget />);\n",
+        ))
+
+    def test_success_exit_without_collection_evidence_is_a_failure(self):
+        candidates = [
+            {"path": "tests/test_one.py",
+             "contents": "def test_one():\n    assert True\n"},
+        ]
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(ff, "_run_unit_tests", return_value=(True, "success")):
+            written, status, log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+        self.assertEqual(["tests/test_one.py"], [item["path"] for item in written])
+        self.assertIs(status, False)
+        self.assertIn("reported no executed-test evidence", log)
+        self.assertEqual("", refusal)
+        self.assertEqual([], rollback_failed)
+
+    def test_javascript_typescript_and_go_have_nonexecuting_preflight(self):
+        cases = (
+            ("tests/unit.test.js", "test('x', () => {});\n", {}, "node"),
+            ("tests/unit.test.ts", "test('x', () => {});\n",
+             {"esbuild": "esbuild"}, "esbuild"),
+            ("unit_test.go",
+             "package unit\nimport \"testing\"\nfunc TestX(t *testing.T) {}\n",
+             {}, "gofmt"),
+        )
+        for path, source, stack, expected_tool in cases:
+            with self.subTest(path=path), \
+                 _tempfile_ceiling.TemporaryDirectory() as project, \
+                 mock.patch.object(ff.shutil, "which", return_value="/tool"), \
+                 mock.patch.object(
+                     ff, "_run",
+                     return_value=ff.subprocess.CompletedProcess([], 0, "", ""),
+                 ) as parser:
+                ok, note, case_source = ff._generated_test_source_syntax_ok(
+                    project, path, source, stack,
+                )
+                self.assertIs(ok, True, note)
+                self.assertEqual(source, case_source)
+                command = parser.call_args.args[0]
+                self.assertEqual(expected_tool, os.path.basename(command[0]))
+                candidate_arg = next(
+                    arg for arg in command[1:]
+                    if arg.endswith(os.path.splitext(path)[1])
+                )
+                self.assertFalse(candidate_arg.startswith(os.path.realpath(project)))
+
+    def test_tsx_preflight_returns_parser_transformed_case_source(self):
+        source = (
+            "const identity = <T,>(value: T) => value;\n"
+            "test('runs', () => <Widget />);\n"
+        )
+        transformed = (
+            "const identity = (value) => value;\n"
+            "test(\"runs\", () => React.createElement(Widget, null));\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run",
+                 return_value=ff.subprocess.CompletedProcess(
+                     [], 0, transformed, "",
+                 ),
+             ) as parser:
+            ok, note, case_source = ff._generated_test_source_syntax_ok(
+                project,
+                "tests/generic.test.tsx",
+                source,
+                {"esbuild": "esbuild"},
+            )
+        self.assertIs(ok, True, note)
+        self.assertEqual(transformed, case_source)
+        command = parser.call_args.args[0]
+        self.assertIn("--format=esm", command)
+        self.assertIn("--jsx=transform", command)
+        self.assertIn("--tree-shaking=false", command)
+        self.assertFalse(any(arg.startswith("--outfile=") for arg in command))
+
+    def test_atomic_create_refuses_raced_in_owner_file_without_overwrite(self):
+        candidates = [
+            {"path": "tests/test_owner.py",
+             "contents": "def test_generated():\n    assert True\n"},
+        ]
+        real_existence = ff._contained_existence
+        raced = False
+
+        def race_owner_file(project, rel):
+            nonlocal raced
+            if rel == "tests/test_owner.py" and not raced:
+                raced = True
+                target = os.path.join(project, "tests", "test_owner.py")
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "w", encoding="utf-8") as handle:
+                    handle.write("OWNER = True\n")
+                return "missing"
+            return real_existence(project, rel)
+
+        runner = mock.Mock(
+            side_effect=AssertionError("raced-in owner file reached runner")
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_contained_existence", side_effect=race_owner_file,
+             ), \
+             mock.patch.object(ff, "_run_unit_tests", runner):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project, candidates, {"test_cmd": ["python", "-m", "pytest"]}
+                )
+            )
+            with open(os.path.join(project, "tests", "test_owner.py"),
+                      encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("atomic create was refused", refusal)
+        self.assertEqual([], rollback_failed)
+        runner.assert_not_called()
+
+    def test_identity_bound_rollback_preserves_replacement_owner_file(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            created = ff._create_contained(
+                project, "tests/test_one.py",
+                "def test_generated():\n    assert True\n",
+            )
+            self.assertIsNotNone(created)
+            replacement = os.path.join(project, "owner.py")
+            with open(replacement, "w", encoding="utf-8") as handle:
+                handle.write("OWNER = True\n")
+            target = os.path.join(project, "tests", "test_one.py")
+            os.replace(replacement, target)
+            self.assertFalse(ff._unlink_created_contained(
+                project, "tests/test_one.py", created.receipt,
+            ))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+
+    def test_cleanup_retains_owner_replacement_raced_after_observation(self):
+        """No observed state can authorize a later pathname unlink."""
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            rel = "tests/test_one.py"
+            created = ff._create_contained(
+                project, rel, "def test_generated():\n    assert True\n",
+            )
+            self.assertIsNotNone(created)
+            target = os.path.join(project, *rel.split("/"))
+            real_existence = ff._contained_existence
+
+            def observe_then_replace(root, path):
+                self.assertEqual("exists", real_existence(root, path))
+                replacement = os.path.join(project, "owner.py")
+                with open(replacement, "w", encoding="utf-8") as handle:
+                    handle.write("OWNER = True\n")
+                os.replace(replacement, target)
+                return "exists"
+
+            # The prior vulnerable implementation performed a receipt check
+            # after this observation and then unlinked by name.  The safe
+            # boundary has no check-then-unlink authorization sequence at all.
+            with mock.patch.object(
+                    ff, "_contained_existence",
+                    side_effect=observe_then_replace), \
+                 mock.patch.object(ff, "_unlink_contained") as unlink:
+                self.assertFalse(ff._unlink_created_contained(
+                    project, rel, created.receipt,
+                ))
+            unlink.assert_not_called()
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+
+    def test_failed_create_retains_raced_owner_file_and_reports_dirty(self):
+        if not ff._POSIX_NOFOLLOW:
+            self.skipTest("the replacement schedule is POSIX-specific")
+        rel = "tests/test_short_write.py"
+        source = "def test_generated():\n    assert True\n"
+        runner = mock.Mock(
+            side_effect=AssertionError("partial generated file reached tests")
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            target = os.path.join(project, *rel.split("/"))
+
+            def replace_then_short_write(_fd, _data):
+                replacement = os.path.join(project, "owner.py")
+                with open(replacement, "w", encoding="utf-8") as handle:
+                    handle.write("OWNER = True\n")
+                os.replace(replacement, target)
+                return 0
+
+            with mock.patch.object(ff.os, "write",
+                                   side_effect=replace_then_short_write), \
+                 mock.patch.object(ff, "_run_unit_tests", runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("OWNER = True\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("retaining", refusal)
+        self.assertEqual([rel], rollback_failed)
+        runner.assert_not_called()
+
+    def test_in_place_test_rewrite_revokes_execution_credit(self):
+        rel = "tests/test_self_rewrite.py"
+        original = "def test_generated():\n    assert True\n"
+        replacement = "def test_substituted():\n    assert True\n"
+
+        def rewrite_during_run(project, _stack):
+            target = os.path.join(project, *rel.split("/"))
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(replacement)
+            return True, "1 passed"
+
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             mock.patch.object(
+                 ff, "_run_unit_tests", side_effect=rewrite_during_run,
+             ):
+            written, status, _log, refusal, rollback_failed = (
+                ff._write_and_run_generated_test_batch(
+                    project,
+                    [{"path": rel, "contents": original}],
+                    {"test_cmd": ["python", "-m", "pytest"]},
+                )
+            )
+            target = os.path.join(project, *rel.split("/"))
+            self.assertTrue(os.path.isfile(target))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual(original, handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("unauthorized worktree", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_generated_tests_execute_only_in_copy_and_cannot_mutate_owner_files(self):
+        rel = "tests/test_side_effect.py"
+        source = (
+            "from pathlib import Path\n"
+            "def test_side_effect():\n"
+            "    Path('app.py').write_text('MUTATED\\n')\n"
+            "    Path('extra.py').write_text('EXTRA\\n')\n"
+            "    assert True\n"
+        )
+        seen_execution_dirs = []
+
+        def mutating_runner(run_project, _stack):
+            seen_execution_dirs.append(run_project)
+            with open(os.path.join(run_project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("MUTATED\n")
+            with open(os.path.join(run_project, "extra.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("EXTRA\n")
+            return True, "1 passed"
+
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            with mock.patch.object(
+                    ff, "_run_unit_tests", side_effect=mutating_runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": ["python", "-m", "pytest"]},
+                    )
+                )
+            with open(os.path.join(project, "app.py"), encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+            self.assertFalse(os.path.exists(os.path.join(project, "extra.py")))
+            self.assertTrue(seen_execution_dirs)
+            self.assertNotEqual(
+                os.path.realpath(project), os.path.realpath(seen_execution_dirs[0]),
+            )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py, extra.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_real_pytest_side_effects_are_confined_to_execution_copy(self):
+        rel = "tests/test_side_effect.py"
+        source = (
+            "from pathlib import Path\n"
+            "def test_side_effect():\n"
+            "    Path('app.py').write_text('MUTATED\\n')\n"
+            "    Path('extra.py').write_text('EXTRA\\n')\n"
+            "    assert True\n"
+        )
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            with open(os.path.join(project, "app.py"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            trust = ff._grant_run_trust(project)
+            try:
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            finally:
+                ff._revoke_run_trust(trust)
+            with open(os.path.join(project, "app.py"),
+                      encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+            self.assertFalse(os.path.exists(os.path.join(project, "extra.py")))
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py, extra.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_absolute_owner_mutation_is_detected_and_blocks_credit(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            owner = os.path.join(project, "app.py")
+            with open(owner, "w", encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+
+            def mutates_owner(_execution_dir, _stack):
+                with open(owner, "w", encoding="utf-8") as handle:
+                    handle.write("MUTATED\n")
+                return True, "1 passed"
+
+            with mock.patch.object(
+                    ff, "_run_unit_tests", side_effect=mutates_owner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("owner checkout changed: app.py", refusal)
+        self.assertEqual({rel, "app.py"}, set(rollback_failed))
+
+    def test_internal_symlink_is_rewritten_into_execution_copy(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            owner = os.path.join(project, "app.py")
+            alias = os.path.join(project, "alias.py")
+            with open(owner, "w", encoding="utf-8") as handle:
+                handle.write("OWNER\n")
+            try:
+                os.symlink("app.py", alias)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            def writes_through_confined_link(execution_dir, _stack):
+                execution_alias = os.path.join(execution_dir, "alias.py")
+                self.assertTrue(os.path.islink(execution_alias))
+                self.assertNotEqual(
+                    os.path.realpath(alias), os.path.realpath(execution_alias),
+                )
+                with open(execution_alias, "w", encoding="utf-8") as handle:
+                    handle.write("MUTATED\n")
+                return True, "1 passed"
+
+            with mock.patch.object(
+                    ff, "_run_unit_tests",
+                    side_effect=writes_through_confined_link):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            with open(owner, encoding="utf-8") as handle:
+                self.assertEqual("OWNER\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("isolated checkout changed: app.py", refusal)
+        self.assertEqual([rel], rollback_failed)
+
+    def test_external_symlink_is_refused_before_generated_test_execution(self):
+        rel = "tests/test_generated.py"
+        source = "def test_generated():\n    assert True\n"
+        with _tempfile_ceiling.TemporaryDirectory() as parent:
+            project = os.path.join(parent, "project")
+            os.mkdir(project)
+            outside = os.path.join(parent, "outside.py")
+            with open(outside, "w", encoding="utf-8") as handle:
+                handle.write("EXTERNAL\n")
+            try:
+                os.symlink(outside, os.path.join(project, "external.py"))
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            forbidden_runner = mock.Mock(side_effect=AssertionError(
+                "external symlink reached generated-test execution"
+            ))
+            with mock.patch.object(
+                    ff, "_run_unit_tests", forbidden_runner):
+                written, status, _log, refusal, rollback_failed = (
+                    ff._write_and_run_generated_test_batch(
+                        project, [{"path": rel, "contents": source}],
+                        {"test_cmd": [sys.executable, "-m", "pytest", "-q"]},
+                    )
+                )
+            with open(outside, encoding="utf-8") as handle:
+                self.assertEqual("EXTERNAL\n", handle.read())
+        self.assertEqual([], written)
+        self.assertIsNone(status)
+        self.assertIn("symlink escapes", refusal)
+        self.assertEqual([rel], rollback_failed)
+        forbidden_runner.assert_not_called()
 
 
 class PathContainmentTests(unittest.TestCase):
@@ -3717,6 +5977,45 @@ class PathContainmentTests(unittest.TestCase):
                         "../outside.js", "C:evil", r"\\host\share\x", "~/secrets",
                         "sub/../../escape.js"):
                 self.assertIsNone(ff._contained_path(tmp, bad), f"should reject {bad!r}")
+
+    def test_portable_membership_matches_manifest_case_and_normalization(self):
+        self.assertTrue(ff._portable_rel_member(
+            "package.json", ["Package.json"],
+        ))
+        self.assertTrue(ff._portable_rel_member(
+            "docs/café.json", ["docs/cafe\u0301.json"],
+        ))
+        self.assertFalse(ff._portable_rel_member(
+            "package.json", ["packages/example.json"],
+        ))
+        source = inspect.getsource(ff._apply_integration_impl)
+        self.assertIn(
+            '_portable_rel_member("package.json", file_list)', source,
+        )
+
+    def test_windows_alias_components_are_rejected_on_every_host(self):
+        import tempfile
+        aliases = (
+            "tests/case.py.", "tests/trailing /case.py", "tests/file.py:stream",
+            "tests/NUL.txt", "tests/con.py", "tests/COM1", "tests/lpt9.js",
+            "tests/CONIN$.txt", "tests/conout$.py",
+            "tests/COM¹.py", "tests/com²", "tests/LPT³.txt",
+            "tests/bad?.py", "tests/control\x01.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in aliases:
+                self.assertIsNone(ff._rel_components(bad), bad)
+                self.assertIsNone(ff._contained_path(tmp, bad), bad)
+            for device_alias in (
+                    "COM¹.py", "com²", "LPT³.txt", "CONIN$.txt", "conout$.py"):
+                self.assertIsNone(
+                    ff._write_contained(tmp, device_alias, "blocked"), device_alias
+                )
+                self.assertIsNone(
+                    ff._replace_contained(tmp, device_alias, "blocked"), device_alias
+                )
+                self.assertFalse(ff._unlink_contained(tmp, device_alias), device_alias)
+                self.assertFalse(os.path.lexists(os.path.join(tmp, device_alias)))
 
     def test_safe_relative_paths_are_allowed(self):
         import tempfile
@@ -3748,7 +6047,7 @@ class PathContainmentTests(unittest.TestCase):
                      "packages": []}
             res = ff.apply_integration(proj, "repo", patch, Opts)
             self.assertFalse(os.path.exists(outside))  # <-- escapes + writes on pre-fix
-            self.assertIn(res.status, ("verify-failed", "error"))
+            self.assertEqual(res.status, "refused-invalid-source")
 
 
 class CommitSyncGitRcTests(unittest.TestCase):
@@ -3966,7 +6265,7 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
         )
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn(
-            "_next_cycle_review_paths(cycle_applied_files)", source)
+            "cycle_applied_files, project_dir=project_dir", source)
         self.assertNotIn(
             "_next_cycle_review_paths(cycle_applied_files, all_review_incomplete)",
             source,
@@ -3974,6 +6273,21 @@ class IncompleteReviewLedgerTests(unittest.TestCase):
         self.assertNotIn("list(fixable_files) + sorted(all_review_incomplete)", source)
         self.assertIn(
             '"review_incomplete": len(all_review_incomplete)', source)
+
+    def test_followup_scope_excludes_deleted_rename_source_only(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project:
+            destination = os.path.join(project, "src", "new.py")
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with open(destination, "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            self.assertEqual(
+                ["src/new.py"],
+                ff._next_cycle_review_paths(
+                    ["src/old.py", "src/new.py"], project_dir=project,
+                ),
+            )
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn("project_dir=project_dir", source)
 
     @staticmethod
     def _finding(rel, severity="high", title="still broken"):
@@ -5993,15 +8307,102 @@ class SnapshotTriStateTests(unittest.TestCase):
                     return ff.subprocess.CompletedProcess(cmd, 1, "", "npm mock fail")
                 return real_run(cmd, cwd, timeout=timeout, **kwargs)
             ff._run = fail_install
-            patch = {"files": [{"path": "new.js", "contents": "console.log(1)"}],
+            patch = {"files": [{"path": "new.py", "contents": "VALUE = 1\n"}],
                      "packages": ["lodash"]}
             try:
                 res = ff.apply_integration(proj, "repo", patch, self._Opts)
             finally:
                 ff._run = real_run
             self.assertIn(res.status, ("verify-failed", "error"))    # npm mock failed -> rollback
-            # The genuinely-created new.js was snapshotted 'created' and unlinked on rollback.
-            self.assertFalse(os.path.exists(os.path.join(proj, "new.js")))
+            # The genuinely-created new.py was snapshotted 'created' and unlinked on rollback.
+            self.assertFalse(os.path.exists(os.path.join(proj, "new.py")))
+
+    def test_large_rewritten_file_is_restored_without_snapshot_truncation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            original = ("# " + ("x" * (ff.MAX_REVIEW_BYTES + 32))
+                        + "\nVALUE = 1\n").encode()
+            target = os.path.join(proj, "large.py")
+            with open(target, "wb") as fh:
+                fh.write(original)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            real_run = ff._run
+
+            def fail_install(cmd, cwd, timeout=900, **kwargs):
+                if list(cmd[:2]) == ["npm", "install"]:
+                    return ff.subprocess.CompletedProcess(
+                        cmd, 1, "", "forced install failure"
+                    )
+                return real_run(cmd, cwd, timeout=timeout, **kwargs)
+
+            ff._run = fail_install
+            patch = {
+                "files": [{"path": "large.py", "contents": "VALUE = 2\n"}],
+                "packages": ["lodash"],
+            }
+            try:
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            finally:
+                ff._run = real_run
+            self.assertIn(result.status, ("verify-failed", "error"))
+            with open(target, "rb") as fh:
+                self.assertEqual(original, fh.read())
+
+    def test_oversized_scout_snapshot_is_refused_before_generated_write(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            original = ("# " + ("x" * 300) + "\nVALUE = 1\n").encode()
+            target = os.path.join(proj, "large.py")
+            with open(target, "wb") as fh:
+                fh.write(original)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            forbidden_write = mock.Mock(
+                side_effect=AssertionError("oversized snapshot reached generated write")
+            )
+            patch = {
+                "files": [{"path": "large.py", "contents": "VALUE = 2\n"}],
+                "packages": [],
+            }
+            with mock.patch.object(ff, "SCOUT_SNAPSHOT_MAX_BYTES", 256), \
+                 mock.patch.object(ff, "_write_contained", forbidden_write):
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            self.assertEqual("verify-failed", result.status)
+            self.assertIn("rollback limit", result.detail)
+            forbidden_write.assert_not_called()
+            with open(target, "rb") as fh:
+                self.assertEqual(original, fh.read())
+
+    def test_source_only_plan_does_not_snapshot_unrelated_large_lockfile(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "package.json"), "w", encoding="utf-8") as fh:
+                fh.write('{"name":"x","scripts":{"build":"node -e \\"process.exit(0)\\""}}')
+            lock_path = os.path.join(proj, "package-lock.json")
+            with open(lock_path, "w", encoding="utf-8") as fh:
+                fh.write("x" * 300)
+            _init_test_origin(proj, os.path.join(tmp, "remote.git"))
+            refused_write = mock.Mock(return_value=None)
+            patch = {
+                "files": [{"path": "new.py", "contents": "VALUE = 2\n"}],
+                "packages": [],
+            }
+            with mock.patch.object(ff, "SCOUT_SNAPSHOT_MAX_BYTES", 256), \
+                 mock.patch.object(ff, "_write_contained", refused_write):
+                result = ff.apply_integration(proj, "repo", patch, self._Opts)
+            self.assertEqual("verify-failed", result.status)
+            self.assertIn("could not safely write 'new.py'", result.detail)
+            self.assertNotIn("rollback limit", result.detail)
+            refused_write.assert_called_once_with(proj, "new.py", "VALUE = 2\n")
 
 
 def _try_dir_symlink(link, target_dir):
@@ -6716,11 +9117,18 @@ class SweepOrdersSourceBeforeTestsTests(unittest.TestCase):
     def test_the_test_path_markers_catch_the_real_world_shapes(self):
         for rel in ("src/pages/MyProfiles.test.jsx", "a/b.spec.ts",
                     "src/__tests__/x.js", "backend/tests/health.test.js",
-                    "pkg/test/util.go", "api/test_client.py"):
+                    "pkg/test/util.go", "api/test_client.py", "tests/helper.py",
+                    "widget_test.py", "pkg/widget_test.go"):
             self.assertTrue(ff._is_test_path(rel), f"{rel} not detected as a test")
         for rel in ("src/pages/MyProfiles.jsx", "backend/server.js",
-                    "src/utils/fieldDisplay.js", "src/latest/contest.js"):
+                    "src/utils/fieldDisplay.js", "src/latest/contest.js",
+                    "src/latest_helper.py"):
             self.assertFalse(ff._is_test_path(rel), f"{rel} wrongly called a test")
+
+    def test_native_test_filename_conventions_are_case_sensitive(self):
+        for rel in ("Widget_Test.py", "widget_TEST.go", "Home.Test.jsx",
+                    "Test_widget.py"):
+            self.assertFalse(ff._is_test_path(rel), rel)
 
 
 class ReviewFixBatchSizeTests(unittest.TestCase):
@@ -7023,15 +9431,25 @@ class CanonicalFileKeyTests(unittest.TestCase):
             done_set = set()
             real_edits = ff.generate_file_fix_edits
             real_gate = ff._gate_file
+            real_syntax = ff._prewrite_source_syntax_ok
             try:
                 ff.generate_file_fix_edits = fake_edits
                 ff._gate_file = lambda *a, **k: (True, "")
+                # This regression is about canonical path identity, not parser
+                # availability.  Supply the parse success that a supported
+                # production source type must provide; the dedicated
+                # normalization tests prove parser-unavailable types fail
+                # closed before any write.
+                ff._prewrite_source_syntax_ok = lambda *a, **k: (
+                    True, "fixture parser"
+                )
                 applied, _unver, _notes = ff._fix_files(
                     object(), None, tmp, findings, self.STACK, True, args,
                     done_set=done_set, adversarial=False)
             finally:
                 ff.generate_file_fix_edits = real_edits
                 ff._gate_file = real_gate
+                ff._prewrite_source_syntax_ok = real_syntax
 
         self.assertEqual(len(gen_calls), 1,
                          f"the file was fixed more than once: {gen_calls}")
@@ -8314,8 +10732,8 @@ class ScoutEndToEndTests(unittest.TestCase):
         ff._ensure_program_understanding = (
             lambda *a, **k: _unit_purpose_understanding("FixtureApp"))
         ff.generate_integration = lambda provider, project_dir, blob, need, result: (
-            {"files": [{"path": "widget_integration.js",
-                        "contents": "export const widget = 1;\n"}],
+            {"files": [{"path": "widget_integration.json",
+                        "contents": '{"widget": 1}\n'}],
              "packages": ["left-pad"], "commit_message": "Integrate good/widget",
              "post_steps": []}, "plan")
         ff._independent_final_review = (
@@ -8370,7 +10788,7 @@ class ScoutEndToEndTests(unittest.TestCase):
             # The hostile candidate (higher finalScore, LLM said ADOPT) must
             # have NO branch and NO applied change.
             self.assertNotIn("injector", branches)
-            self.assertTrue(os.path.exists(os.path.join(tmp, "widget_integration.js")))
+            self.assertTrue(os.path.exists(os.path.join(tmp, "widget_integration.json")))
             log = self._git_out(tmp, "log", "--oneline", "-3")
             self.assertIn("Integrate good/widget", log)
             report = os.path.join(tmp, "fixtureapp_repo_rewards_report.md")
@@ -9169,7 +11587,8 @@ class OllamaProviderTests(unittest.TestCase):
 
     def test_grade_parses(self):
         body = {"message": {"content": json.dumps(
-            {"grade": 88, "meets_goal": True, "rationale": "ok", "issues": []})}}
+            {"grade": 88, "meets_goal": False, "rationale": "one issue",
+             "issues": ["finish the remaining behavior"]})}}
         p = ff.OllamaProvider("coder")
         self._fake_opener(p, [], body)
         g = p.grade("grade this")
@@ -11006,6 +13425,24 @@ class SuiteExecutionEvidenceTests(unittest.TestCase):
         self.assertTrue(ff._suite_reported_tests(
             "Tests run: 12, Failures: 0, Errors: 0, Skipped: 0"))
 
+    def test_node_spec_reporter_nonzero_summary_counts(self):
+        self.assertTrue(ff._suite_reported_tests("ℹ tests 1\nℹ pass 1"))
+        self.assertFalse(ff._suite_reported_tests("ℹ tests 0\nℹ pass 0"))
+
+    def test_node_discovery_without_a_pass_gets_no_execution_credit(self):
+        for log in (
+                "ℹ tests 1\nℹ pass 0\nℹ fail 0\nℹ skipped 1\nℹ todo 0",
+                "# tests 1\n# pass 0\n# fail 0\n# skipped 0\n# todo 1",
+                "ok 1 - generated # SKIP unavailable\n"
+                "# tests 1\n# pass 0\n# fail 0\n# skipped 1"):
+            with self.subTest(log=log):
+                self.assertFalse(ff._suite_reported_tests(log))
+
+    def test_node_summary_with_any_failure_gets_no_execution_credit(self):
+        self.assertFalse(ff._suite_reported_tests(
+            "ℹ tests 2\nℹ pass 1\nℹ fail 1\nℹ skipped 0"
+        ))
+
     def test_the_original_shapes_still_count(self):
         for log in (" Test Files  19 passed (20)\n      Tests  108 passed",
                     "collected 113 items\n113 passed in 4.2s",
@@ -11546,6 +13983,22 @@ class ArrayItemShapeTests(unittest.TestCase):
                    "notes": "n"}
         out = ff._check_structured_type(payload, ff.TEST_GEN_SCHEMA, "{}")
         self.assertEqual(out, payload)
+
+    def test_generated_test_consumer_rejects_wrong_property_types(self):
+        malformed = (
+            {"files": [{"path": "tests/x.py", "contents": 1}], "notes": "n"},
+            {"files": [{"path": 1, "contents": "assert True\n"}], "notes": "n"},
+            {"files": [{"contents": "assert True\n"}], "notes": "n"},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaises(RuntimeError) as caught:
+                ff._validated_generated_test_entries(payload)
+            self.assertIn("not a string", str(caught.exception))
+
+    def test_generated_test_consumer_returns_validated_entries(self):
+        entries = [{"path": "tests/x.py", "contents": "def test_x(): pass\n"}]
+        payload = {"files": entries, "notes": "n"}
+        self.assertIs(entries, ff._validated_generated_test_entries(payload))
 
     def test_scalar_item_arrays_still_accept_strings(self):
         # fixed_titles declares items.type=string. Validating it as objects
@@ -12505,6 +14958,28 @@ class PaidFallbackRescueTests(unittest.TestCase):
         self.assertEqual(out, {"ok": True})
         self.assertEqual(seen["model"], ff.DEFAULT_MODELS["openai"],
                          "an author-tier call must map to the OpenAI author tier")
+
+    def test_rotating_reviewer_refuses_hidden_openai_rescue(self):
+        os.environ["FLEXFACTOR_FALLBACK_OPENAI_KEY"] = "sk-test"
+        prov = self._provider()
+        prov._allow_cross_family_rescue = False
+
+        def fake_swd(client, *, deadline_s=None, **kw):
+            raise ConnectionError("anthropic route unavailable")
+
+        ff._stream_with_deadline = fake_swd
+        rescue = mock.Mock()
+        rescue.structured.return_value = {"verdict": "approve"}
+        prov._oai_rescue = rescue
+
+        with self.assertRaises(ff.CrossFamilyRescueRequired) as cm:
+            prov.structured("review", "candidate", {"type": "object"},
+                            model=prov.judge_model)
+        self.assertIn("outer-ladder failover required", str(cm.exception))
+        import flexfactor_rotation as fr
+        self.assertTrue(fr.is_transport_dead_error(cm.exception))
+        self.assertTrue(fr._is_retryable(cm.exception))
+        rescue.structured.assert_not_called()
 
     @_needs_anthropic_sdk
     def test_garbage_output_rescues_when_keys_present(self):
@@ -15068,6 +17543,21 @@ class GoverningPurposeCoverageTests(unittest.TestCase):
         selected2, omitted2 = ff._test_generation_scope(files, 2)
         self.assertEqual(selected2, ["src/a.py", "src/b.py"])
         self.assertEqual(omitted2, ["src/c.js"])
+
+    def test_changed_source_scope_includes_new_destinations_not_deleted_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "new.py"), "w", encoding="utf-8") as fh:
+                fh.write("VALUE = 1\n")
+            with open(os.path.join(tmp, "src", "test_new.py"), "w", encoding="utf-8") as fh:
+                fh.write("def test_value(): pass\n")
+            with open(os.path.join(tmp, "src", "notes.md"), "w", encoding="utf-8") as fh:
+                fh.write("# Changed documentation\n")
+            selected = ff._existing_changed_sources(
+                tmp,
+                {"src/deleted.py", "src/new.py", "src/test_new.py", "src/notes.md"},
+            )
+        self.assertEqual(["src/new.py"], selected)
 
     def test_inventory_accounts_for_source_binary_and_artifact_subtrees(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -18239,7 +20729,7 @@ class ScoutInlineApplyReportsWhatItDidTests(unittest.TestCase):
         return proj, remote
 
     def _apply(self, proj):
-        patch = {"files": [{"path": "added.js", "contents": "export const a = 1;\n"}],
+        patch = {"files": [{"path": "added.py", "contents": "VALUE = 1\n"}],
                  "packages": [], "commit_message": "Integrate demo"}
         def approve(_reviewer, _project, _baseline, candidate, _evidence):
             return {"verdict": "approve", "commit": candidate,
@@ -18857,8 +21347,17 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
     def test_tool_authored_syntax_checks_are_exempt_but_scripts_are_not(self):
         self.assertTrue(ff._tool_authored_syntax_check([sys.executable, "-c", "print(1)"]))
         self.assertTrue(ff._tool_authored_syntax_check(["node", "--check", "a.js"]))
+        self.assertTrue(ff._tool_authored_syntax_check(
+            ["node", "--experimental-transform-types", "--check", "a.ts"]
+        ))
+        self.assertTrue(ff._tool_authored_syntax_check(
+            ["node", "--experimental-strip-types", "--check", "a.ts"]
+        ))
         self.assertTrue(ff._tool_authored_syntax_check(["python", "-m", "py_compile", "a.py"]))
         self.assertFalse(ff._tool_authored_syntax_check(["python", "-m", "pytest"]))
+        self.assertFalse(ff._tool_authored_syntax_check(
+            ["node", "--experimental-transform-types", "a.ts"]
+        ))
         self.assertFalse(ff._tool_authored_syntax_check(["node", "explore.cjs", "http://x"]))
         self.assertFalse(ff._tool_authored_syntax_check(["python", "script.py"]))
 

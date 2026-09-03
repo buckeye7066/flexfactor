@@ -17,3 +17,12 @@ pytest==9.1.1
 # and build isolation disabled.  Keep its PEP 517 backend in the reproducible
 # development environment instead of letting pip fetch it implicitly.
 setuptools==84.0.0
+# In-process, non-executing syntax parsers for every source extension FlexFactor
+# advertises as mutable.  0.7.2 is the last bundled-grammar release: later
+# releases download grammars on first use, which would make the pre-write gate
+# network-dependent and unable to operate inside an offline verification run.
+tree-sitter==0.26.0
+tree-sitter-c-sharp==0.23.5
+tree-sitter-embedded-template==0.25.0
+tree-sitter-yaml==0.7.2
+tree-sitter-language-pack==0.7.2

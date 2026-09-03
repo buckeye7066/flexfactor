@@ -40,9 +40,9 @@ def real_route(rid: str, pool: str) -> rotation.Route:
     )
 
 
-def real_catalog(route: rotation.Route) -> rotation.Catalog:
+def real_catalog(*routes: rotation.Route) -> rotation.Catalog:
     return rotation.Catalog(
-        routes=[route], generated_at="2026-08-27T00:00:00+00:00",
+        routes=list(routes), generated_at="2026-08-27T00:00:00+00:00",
         age_seconds=0.0, path="<capacity-test>")
 
 
@@ -256,6 +256,39 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
         self.assertLess(time.time() - started, 5,
                         "the pin failure entered the capacity wait loop "
                         "instead of failing fast")
+
+    def test_reviewer_family_impossibility_is_fatal_not_a_12_hour_wait(self):
+        os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "30"
+        author = real_route("openai/gpt-5.6-sol", "openai:author")
+        reviewer = real_route("openai/gpt-5.6-luna", "openai:review")
+        author = rotation.Route(**{
+            **author.__dict__, "model": "gpt-5.6-sol",
+            "wire_model": "gpt-5.6-sol", "tier": rotation.FRONTIER,
+        })
+        reviewer = rotation.Route(**{
+            **reviewer.__dict__, "model": "gpt-5.6-luna",
+            "wire_model": "gpt-5.6-luna", "tier": rotation.LIGHT,
+        })
+        store = rotation.StateStore(os.path.join(
+            self.tmp.name, "rotation-separation.json",
+        ))
+        provider = rotation.RotatingProvider(
+            rotation.Rotator(real_catalog(author, reviewer), store,
+                             app="separation-app"),
+            lambda route: type("Backing", (), {
+                "complete": lambda self, *a, **k: "authored",
+                "grade": lambda self, *a, **k: {"grade": 100},
+            })(),
+            tier=rotation.FRONTIER, judge_tier=rotation.LIGHT,
+            allow_paid=True,
+        )
+        self.assertEqual("authored", provider.complete("system", "prompt"))
+        started = time.time()
+        with self.assertRaises(rotation.ReviewerSeparationError):
+            provider.grade_independent()
+        self.assertLess(time.time() - started, 5)
+        self.assertFalse(cap._waitable_rotation_error(
+            rotation.ReviewerSeparationError("no light route available")))
 
     def test_a_dead_waiter_row_does_not_block_the_queue(self):
         """Ctrl-C/taskkill/reboot while QUEUED leaves the waiter row in the

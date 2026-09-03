@@ -209,6 +209,8 @@ def recommended_program_parallelism(requested,model_mode="free"):
     except Exception: return 1
 
 def _waitable_rotation_error(exc):
+    if type(exc).__name__ == "ReviewerSeparationError":
+        return False
     text=f"{type(exc).__name__} {exc}".lower(); return any(x in text for x in ("no strong route available","no frontier route available","no light route available","every strong pool failed","every frontier pool failed","every light pool failed","rate limit","quota","allowance","cooling down"))
 
 def _capacity_should_wait(exc,runtime):
@@ -286,6 +288,11 @@ def install():
                     # the text markers below, so the substring test turned the
                     # pin's actionable message into a 12-hour silent wait loop.
                     # Type beats text -- re-raise before the text is consulted.
+                    raise
+                except r.ReviewerSeparationError:
+                    # No amount of capacity waiting can create an independent
+                    # reviewer family. Fail immediately instead of entering the
+                    # default twelve-hour retry loop.
                     raise
                 except r.RotationError as exc:
                     rt=(_MANAGER.snapshot().get("runtime") or {})

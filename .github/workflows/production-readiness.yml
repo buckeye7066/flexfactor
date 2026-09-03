@@ -195,17 +195,18 @@ jobs:
           python-version: "3.12"
       - name: Build exact-commit wheel
         run: python -m pip wheel . --no-deps --wheel-dir dist
-      - name: Installed-wheel smoke OUTSIDE the checkout (entry-point parity)
+      - name: Installed-wheel smoke OUTSIDE the checkout (functional parity)
         run: |
           python -m venv /tmp/ffvenv
-          /tmp/ffvenv/bin/python -m pip install -q --no-deps dist/*.whl
+          /tmp/ffvenv/bin/python -m pip install -q dist/*.whl
+          /tmp/ffvenv/bin/python -m pip check
           src_manifest="$(python flexfactor.py --runtime-manifest)"
           cd "$(mktemp -d)"
           inst_manifest="$(/tmp/ffvenv/bin/flexfactor --runtime-manifest)"
           python - "$src_manifest" "$inst_manifest" <<'PY'
           import json, sys
           src, inst = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-          assert inst["tool_version"] == "0.6.1" == src["tool_version"], (inst["tool_version"], src["tool_version"])
+          assert inst["tool_version"] == "0.6.2" == src["tool_version"], (inst["tool_version"], src["tool_version"])
           for key in ("modes", "wired", "exit_codes"):
               assert inst[key] == src[key], (key, inst[key], src[key])
           missing = [k for k, v in inst["modules"].items() if not v["importable"]]
@@ -216,6 +217,17 @@ jobs:
           for mode in refactor scout audit prodready policy; do
             /tmp/ffvenv/bin/flexfactor "$mode" --help > /dev/null
           done
+          /tmp/ffvenv/bin/python - <<'PY'
+          import flexfactor as ff
+          assert ff._CODE_EXTS == set(ff._TREE_SITTER_LANGUAGE_BY_EXT)
+          failures = {}
+          for extension in sorted(ff._CODE_EXTS):
+              ok, note = ff._tree_sitter_source_syntax_ok(extension, b"")
+              if ok is not True:
+                  failures[extension] = note
+          assert not failures, failures
+          print("installed wheel parsed", len(ff._CODE_EXTS), "source extensions")
+          PY
       - name: Record SHA-256 checksums
         run: |
           python - <<'PY'
@@ -231,7 +243,7 @@ jobs:
       - name: Upload exact-commit release candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: flexfactor-0.6.1-${{ github.sha }}
+          name: flexfactor-0.6.2-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 90

@@ -23,6 +23,7 @@ _ALLOW: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {
         (re.compile(r"^POSIX openat component-walk unavailable on this platform$"), 6),
         (re.compile(r"^review_files entry not present - covered by review_file test$"), 1),
         (re.compile(r"^POSIX openat write path unavailable on this platform$"), 1),
+        (re.compile(r"^the replacement schedule is POSIX-specific$"), 1),
         (re.compile(r"^no live catalog at .*AITime[\\/]+routes\.json$"), 1),
         (re.compile(r"^BLOCKED: no OS network isolation on this host "), 1),
         (re.compile(r"^BLOCKED: no sufficient OS sandbox "), 1),

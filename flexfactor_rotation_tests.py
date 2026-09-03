@@ -22,12 +22,13 @@ import flexfactor_rotation as R
 
 def route(rid: str, pool: str, tier: str = R.FRONTIER,
           cost: str = R.SUBSCRIPTION, enabled: bool = True,
-          backend: str = "", model: str = "", **kw) -> R.Route:
+          backend: str = "", model: str = "", wire_model: str = "",
+          **kw) -> R.Route:
     return R.Route(
         id=rid, backend=backend or rid.split("/")[0],
         backend_label=backend or rid.split("/")[0],
         model=model or rid.split("/", 1)[-1],
-        wire_model=model or rid.split("/", 1)[-1],
+        wire_model=wire_model or model or rid.split("/", 1)[-1],
         api="openai", base_url="https://example.invalid/v1",
         pool=pool, cost_class=cost, tier=tier, enabled=enabled, **kw)
 
@@ -693,12 +694,14 @@ class RotatingProviderTests(RotationTestCase):
 
     def test_grading_uses_the_cheap_tier_not_the_author_tier(self):
         prov = self._provider(catalog(
-            route("front/big", "pool-front", tier=R.FRONTIER),
-            route("light/small", "pool-light", tier=R.LIGHT)))
+            route("front/big", "pool-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/small", "pool-light", tier=R.LIGHT,
+                  model="claude-sonnet-5")))
         self.assertEqual(prov.complete("x"), "completed by front/big")
         self.assertEqual(prov.grade()["by"], "light/small")
 
-    def test_grader_avoids_the_author_model_family_when_an_alternative_exists(self):
+    def test_independent_grader_proves_an_alternative_family_was_used(self):
         prov = self._provider(catalog(
             route("front/gpt-5.6-sol", "openai-front", tier=R.FRONTIER,
                   model="gpt-5.6-sol"),
@@ -708,7 +711,9 @@ class RotatingProviderTests(RotationTestCase):
                   model="claude-sonnet-5"),
         ))
         self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
-        self.assertEqual(prov.grade()["by"], "light/claude-sonnet-5")
+        self.assertEqual(
+            prov.grade_independent()["by"], "light/claude-sonnet-5"
+        )
 
     def test_grader_fails_closed_when_only_an_author_family_exists(self):
         prov = self._provider(catalog(
@@ -719,7 +724,125 @@ class RotatingProviderTests(RotationTestCase):
         ), judge_tier=R.LIGHT)
         self.assertEqual(prov.complete("x"), "completed by front/gpt-5.6-sol")
         with self.assertRaisesRegex(R.RotationError, "independent"):
-            prov.grade()
+            prov.grade_independent()
+
+    def test_independent_grader_requires_a_recorded_author(self):
+        prov = self._provider(catalog(
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+        ), tier=R.LIGHT, judge_tier=R.LIGHT)
+        with self.assertRaisesRegex(R.RotationError, "recorded candidate author"):
+            prov.grade_independent()
+
+    def test_independent_grader_refuses_an_opaque_auto_author(self):
+        prov = self._provider(catalog(
+            route("front/copilot", "copilot", tier=R.FRONTIER, model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/copilot")
+        with self.assertRaisesRegex(R.RotationError, "opaque author"):
+            prov.grade_independent()
+
+    def test_codex_cli_author_is_treated_as_openai_for_independence(self):
+        prov = self._provider(catalog(
+            route("front/codex", "codex-cli:subscription", tier=R.FRONTIER,
+                  model="codex"),
+            route("light/gpt", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/codex")
+        self.assertEqual(prov.role_coordinator.author_families, {"openai"})
+        with self.assertRaisesRegex(
+                R.ReviewerSeparationError, "independent reviewer"):
+            prov.grade_independent()
+
+    def test_independence_uses_wire_model_not_catalog_label(self):
+        prov = self._provider(catalog(
+            route("front/mislabeled", "author", tier=R.FRONTIER,
+                  model="gpt-5.6-sol", wire_model="claude-sonnet-4.6"),
+            route("light/claude", "review-claude", tier=R.LIGHT,
+                  model="claude-sonnet-5"),
+            route("light/qwen", "review-qwen", tier=R.LIGHT,
+                  model="qwen3-coder"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/mislabeled")
+        self.assertEqual(prov.role_coordinator.author_families, {"anthropic"})
+        prov.grade_independent()
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("qwen3-coder", selection.route.wire_model)
+
+    def test_unknown_wire_aliases_are_opaque_not_independent_families(self):
+        prov = self._provider(catalog(
+            route("front/author", "external-author", tier=R.FRONTIER,
+                  model="author-prod", wire_model="author-prod"),
+            route("light/reviewer", "external-review", tier=R.LIGHT,
+                  model="review-prod", wire_model="review-prod"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/author")
+        self.assertEqual({"unknown"}, prov.role_coordinator.author_families)
+        with self.assertRaises(R.ReviewerSeparationError):
+            prov.grade_independent()
+
+    def test_exact_review_intent_refuses_an_opaque_auto_author(self):
+        prov = self._provider(catalog(
+            route("front/external", "external-front", tier=R.FRONTIER,
+                  model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/external")
+        final_review = R.CallIntent(
+            R.ROLE_REVIEWER,
+            (R.CAP_CODE_REVIEW, R.CAP_STRUCTURED_JSON),
+        )
+        with self.assertRaisesRegex(R.RotationError, "opaque author"):
+            prov.structured("system", "exact patch", {}, intent=final_review)
+
+    def _cross_verify_provider(self):
+        prov = self._provider(catalog(
+            route("front/gpt", "openai-front", tier=R.FRONTIER,
+                  model="gpt-5.6-sol"),
+            route("light/gpt", "openai-light", tier=R.LIGHT,
+                  model="gpt-5.6-luna"),
+            route("light/auto", "opaque-light", tier=R.LIGHT,
+                  model="auto"),
+            route("light/claude", "anthropic-light", tier=R.LIGHT,
+                  model="claude-sonnet-4.6"),
+        ))
+        self.assertEqual(prov.complete("author"), "completed by front/gpt")
+        self.assertEqual(prov.role_coordinator.author_families, {"openai"})
+        return prov
+
+    def test_ordinary_cross_verify_excludes_author_and_opaque_families(self):
+        import flexfactor as F
+
+        prov = self._cross_verify_provider()
+        F._cross_verify_fix(
+            prov, "code.py", "VALUE = 1\n", "VALUE = 2\n", [],
+        )
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("claude-sonnet-4.6", selection.route.model)
+
+    def test_structural_cross_verify_excludes_author_and_opaque_families(self):
+        import flexfactor as F
+
+        prov = self._cross_verify_provider()
+        F._cross_verify_structural(
+            prov, "code.py", [], "rewrite code.py",
+        )
+        selection = prov.role_coordinator.last_selection[R.ROLE_REVIEWER]
+        self.assertEqual("claude-sonnet-4.6", selection.route.model)
+
+    def test_independent_grader_refuses_an_opaque_auto_reviewer(self):
+        prov = self._provider(catalog(
+            route("front/qwen", "qwen-front", tier=R.FRONTIER,
+                  model="qwen3-coder"),
+            route("light/auto", "opaque-light", tier=R.LIGHT, model="auto"),
+        ))
+        self.assertEqual(prov.complete("x"), "completed by front/qwen")
+        with self.assertRaisesRegex(R.RotationError, "reviewer.?family|independent"):
+            prov.grade_independent()
 
     def test_separate_ladder_instances_share_author_identity(self):
         coordinator = R.RoleCoordinator()
