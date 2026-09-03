@@ -330,7 +330,7 @@ jobs:
             tag_lookup_rc=$?
             set -e
             if [ "$tag_lookup_rc" -ne 0 ]; then
-              if grep -Eq '\\(HTTP 404\\)|Reference does not exist' "$tag_error"; then
+              if grep -Eq '\(HTTP 404\)|Reference does not exist' "$tag_error"; then
                 # Only a proven 404 means the tag is absent. Authentication,
                 # network, and API failures remain hard errors.
                 should_publish=true
