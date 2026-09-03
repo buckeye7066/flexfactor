@@ -83,6 +83,11 @@ jobs:
               exit 1
             fi
             cloud_version=${declared_engine#android-v}
+            if ! [[ "$cloud_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                || ! [[ "$version_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Staged cloud and Android versions must be major.minor.patch" >&2
+              exit 1
+            fi
             IFS=. read -r cloud_major cloud_minor cloud_patch <<EOF
           $cloud_version
           EOF

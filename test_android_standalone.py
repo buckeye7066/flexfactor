@@ -62,8 +62,14 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
                 "a cloud/Android version split requires an explicit rollout marker",
             )
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), android_ref)
-            cloud_version = tuple(map(int, cloud_ref.removeprefix("android-v").split(".")))
-            android_version = tuple(map(int, _android_version_name().split(".")))
+            cloud_parts = cloud_ref.removeprefix("android-v").split(".")
+            android_parts = _android_version_name().split(".")
+            self.assertEqual(len(cloud_parts), 3)
+            self.assertEqual(len(android_parts), 3)
+            self.assertTrue(all(part.isdigit() for part in cloud_parts))
+            self.assertTrue(all(part.isdigit() for part in android_parts))
+            cloud_version = tuple(map(int, cloud_parts))
+            android_version = tuple(map(int, android_parts))
             self.assertEqual(cloud_version[:2], android_version[:2])
             self.assertEqual(cloud_version[2] + 1, android_version[2])
         self.assertFalse(
@@ -186,6 +192,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("[ -f cloud/ENGINE_ROLLOUT_PENDING ]", control_plane)
         self.assertIn('pending_engine" != "$android_engine', control_plane)
         self.assertIn("cloud_patch + 1", control_plane)
+        self.assertEqual(
+            control_plane.count(r"=~ ^[0-9]+\.[0-9]+\.[0-9]+$"), 2)
         self.assertIn('expected_engine="$declared_engine"', control_plane)
         self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
