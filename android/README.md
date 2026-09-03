@@ -1,4 +1,4 @@
-# FlexFactor Mobile 3.5.2
+# FlexFactor Mobile 3.5.3
 
 FlexFactor Mobile is the native managed interface for all four FlexFactor
 modes. It does not require a PC, a personal access token, Termux, or a local
@@ -59,7 +59,7 @@ output, failed gate, or unproven publication remains incomplete in the app.
 Run details and the bounded in-app artifact remain correlated to the request
 UUID.
 
-Version 3.5.2 rejects definitely invalid whole-file responses before any write.
+Version 3.5.3 rejects definitely invalid whole-file responses before any write.
 An “already good” explanation cannot review itself: the independent reviewer
 must approve the exact original source, after which the complete project gate
 and authoritative remote-default containment proof must still pass.

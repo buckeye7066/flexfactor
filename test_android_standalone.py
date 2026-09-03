@@ -150,6 +150,14 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
         self.assertIn("ollama serve", workflow)
         self.assertIn("88e0d36bd90121595e5516c84f6ab61b546368fbd2d825b4aae70999c949649d", workflow)
+        model_install = workflow.split(
+            "- name: Install and start the hosted open model", 1)[1].split(
+                "- name: Install GitHub Copilot CLI", 1)[0]
+        self.assertIn('rm -f "$archive"', model_install)
+        self.assertLess(model_install.index('sudo tar --zstd -xf "$archive"'),
+                        model_install.index('rm -f "$archive"'))
+        self.assertLess(model_install.index('rm -f "$archive"'),
+                        model_install.index("ollama pull qwen2.5-coder:7b"))
         self.assertIn("options: [auto]", workflow)
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
