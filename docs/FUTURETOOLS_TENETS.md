@@ -73,7 +73,14 @@ read-only ranking input.
 Writing outside the target repository is deliberate: generating context must
 not make a clean repository dirty and trip FlexFactor's own dirty-tree gate.
 `FLEXFACTOR_STATE_DIR` and an explicit `--output` are rejected when their
-resolved evidence path is inside the audited repository.
+resolved evidence path is inside the audited repository, another selected
+repository, or any Git worktree. This includes the default
+`~/.flexfactor/context` location when the user's home directory is itself a
+Git worktree: set `FLEXFACTOR_STATE_DIR` to a directory outside every worktree
+in that environment. The integrated ranker otherwise records the refusal and
+continues with FlexFactor's canonical non-Tenets ordering; the standalone
+`flexfactor-context` command returns its validation error without writing a
+manifest.
 
 Linux additionally requires `FLEXFACTOR_TENETS_CGROUP_ROOT` to name a real,
 owner-delegated cgroup-v2 directory with `memory`, `pids`, and `cgroup.kill`
