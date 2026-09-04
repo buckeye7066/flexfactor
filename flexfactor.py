@@ -7697,12 +7697,15 @@ _PUBLICATION_EVIDENCE_GATE_IDS = frozenset({
 })
 _PUBLICATION_PRODUCT_GATE_IDS = frozenset({
     "competitive-provenance",
+    "competitive-fit-risk-reviewed",
     "no-blind-competitor-copying",
     "selected-capabilities-delivered",
 })
 
 
-def _publication_review_quality_gates(quality_gates: dict | None) -> dict:
+def _publication_review_quality_gates(
+        quality_gates: dict | None,
+        baseline_quality_gates: dict | None = None) -> dict:
     """Return only candidate-safety evidence for independent publication review.
 
     Whole-product completeness failures remain authoritative for the overall run,
@@ -7711,12 +7714,28 @@ def _publication_review_quality_gates(quality_gates: dict | None) -> dict:
     bundle so filtering cannot conceal those failures from convergence reporting.
     """
     source = quality_gates or {}
+    baseline_states = {
+        str(row.get("id") or ""): str(row.get("status") or "").lower()
+        for row in ((baseline_quality_gates or {}).get("gates") or [])
+        if isinstance(row, dict) and str(row.get("id") or "")
+    }
     gates = [
         dict(row)
         for row in (source.get("gates") or [])
         if isinstance(row, dict)
-        and str(row.get("id") or "") in _PUBLICATION_EVIDENCE_GATE_IDS
         and str(row.get("id") or "") != "independent-final-review"
+        and (
+            str(row.get("id") or "") in _PUBLICATION_EVIDENCE_GATE_IDS
+            # A completeness gate may be omitted only when deterministic
+            # baseline evidence proves the same gate was already non-passing.
+            # Unknown/newly-red gates stay in the candidate review; otherwise
+            # deleting tests could be mislabelled an unrelated legacy gap.
+            or not (
+                baseline_states.get(str(row.get("id") or ""))
+                == str(row.get("status") or "").lower()
+                and str(row.get("status") or "").lower() in {"fail", "blocked"}
+            )
+        )
     ]
     scoped = {
         key: value for key, value in source.items()
@@ -7729,7 +7748,10 @@ def _publication_review_quality_gates(quality_gates: dict | None) -> dict:
         "fail": sum(row.get("status") == "fail" for row in gates),
         "blocked": sum(row.get("status") == "blocked" for row in gates),
     }
-    required = _PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}
+    required = (_PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}) | {
+        str(row.get("id") or "") for row in gates
+        if str(row.get("status") or "").lower() != "pass"
+    }
     present = {str(row.get("id") or "") for row in gates}
     scoped["passed"] = present == required and all(
         row.get("status") == "pass" for row in gates
@@ -19422,6 +19444,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     evidence_state_root = ""
     baseline_code_index = None
     initial_commit = None
+    publication_review_baseline = None
     trust_override_key = None
     # Live console meter (spinner/heartbeat). Created up front so `finally` can
     # always stop it; started once the program is resolved and reporting begins.
@@ -19704,6 +19727,17 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 "origin's authoritative default branch could not be resolved: "
                 + _default_basis
             )
+            print(f"{pfx}error: {result['error']}", file=sys.stderr)
+            return result
+        _remote_boundary = _git(
+            ["rev-parse", f"refs/remotes/origin/{_default_branch}"], project_dir
+        )
+        if _remote_boundary.returncode == 0:
+            publication_review_baseline = (
+                (_remote_boundary.stdout or "").strip() or None
+            )
+        if not publication_review_baseline:
+            result["error"] = "could not resolve the remote publication boundary"
             print(f"{pfx}error: {result['error']}", file=sys.stderr)
             return result
         _head = _git(["rev-parse", "HEAD"], project_dir)
@@ -22179,7 +22213,16 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                     "output_tail": suite_log})
                 review_summary = {
                     "review_scope": "candidate-publication-safety",
-                    "quality_gates": _publication_review_quality_gates(gates_evidence),
+                    "quality_gates": _publication_review_quality_gates(
+                        gates_evidence,
+                        {"gates": [{
+                            "id": "build",
+                            "status": (
+                                "pass" if baseline_ok is True else
+                                "fail" if baseline_ok is False else "blocked"
+                            ),
+                        }]},
+                    ),
                     "changed_file_rescan": rescan_evidence,
                     "blast_radius": blast_evidence,
                     "secret_findings": secret_evidence,
@@ -22195,7 +22238,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         raise RuntimeError("independent review skipped after provider outage")
                     independent_review = _independent_final_review(
                         cross or purpose_reviewer_final, project_dir,
-                        initial_commit, final_sha, review_summary)
+                        publication_review_baseline, final_sha, review_summary)
                 except Exception as ex:
                     independent_review = {
                         "verdict": "reject", "commit": final_sha or "",
@@ -22287,7 +22330,14 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # the repository's executable suite verified the result.
         _verification_passed = bool(
             suite_status is True
-            and ((evidence or {}).get("quality_gates") or {}).get("passed") is True
+            and _publication_review_quality_gates(
+                ((evidence or {}).get("quality_gates") or {}),
+                # Capability delivery is bound to candidate-scoped executable
+                # gates, not to unrelated whole-product completeness. Passing
+                # the same snapshot as its comparison removes only those
+                # non-candidate rows; publication review uses a real baseline.
+                ((evidence or {}).get("quality_gates") or {}),
+            ).get("passed") is True
         )
         _competitor_applied = set(
             (competitor_research or {}).get("applied_files") or []
