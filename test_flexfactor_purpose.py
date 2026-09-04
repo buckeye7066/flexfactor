@@ -234,7 +234,7 @@ class PurposeContractV2Tests(_TempRepo):
                 "i-safety", "Never change an invoice total.",
             )],
             evidence=[self._evidence(
-                locator="policy/receipt-safety.md",
+                locator="https://example.invalid/policy/receipt-safety",
                 content_hash="b" * 64,
                 observed_at="2026-09-04T05:06:07+00:00",
                 excerpt="Owner approval and immutable totals are required.",
@@ -256,7 +256,9 @@ class PurposeContractV2Tests(_TempRepo):
         self.assertIn("MUTATION INVARIANTS", prompt)
         self.assertIn("Never change an invoice total.", prompt)
         self.assertIn("evidence_refs=0", prompt)
-        self.assertIn("locator=policy/receipt-safety.md", prompt)
+        self.assertIn(
+            "locator=https://example.invalid/policy/receipt-safety", prompt
+        )
         self.assertIn("content_hash=" + "b" * 64, prompt)
         self.assertIn("observed_at=2026-09-04T05:06:07+00:00", prompt)
         self.assertIn("excerpt=Owner approval", prompt)
@@ -607,6 +609,37 @@ class PurposeContractV2Tests(_TempRepo):
             ))
         finally:
             outside.unlink(missing_ok=True)
+
+    def test_path_shaped_documentation_evidence_is_hashed_as_repository_bytes(self):
+        documentation = Path(self.root) / "docs" / "PURPOSE.md"
+        documentation.parent.mkdir()
+        documentation.write_text(
+            "# Purpose\n\nIssue owner-approved receipts.\n", encoding="utf-8"
+        )
+        digest = __import__("hashlib").sha256(
+            documentation.read_bytes()
+        ).hexdigest()
+        valid = self._contract(evidence=[self._evidence(
+            kind="documentation",
+            locator="docs/PURPOSE.md",
+            content_hash=digest,
+        )])
+
+        self.assertIsNotNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
+        stale = self._contract(evidence=[self._evidence(
+            kind="documentation",
+            locator="docs/PURPOSE.md",
+            content_hash="0" * 64,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            stale, evidence_root=self.root
+        ))
+        documentation.unlink()
+        self.assertIsNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
 
     def test_local_evidence_descriptor_must_still_match_directory_entry(self):
         source = Path(self.root) / "src" / "receipt.py"
@@ -998,6 +1031,61 @@ class PurposeContractV2Tests(_TempRepo):
              mock.patch("builtins.open", side_effect=denied):
             contract, rejected = fp.find_contract_with_status("Receipt Maker")
         self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_dangling_or_raced_registry_entry_is_not_an_optional_miss(self):
+        missing = Path(self.root) / "missing-registry.json"
+        programs, rejected = fp._load_registry_with_status(str(missing))
+        self.assertEqual(programs, {})
+        self.assertFalse(rejected)
+
+        dangling = Path(self.root) / "dangling-registry.json"
+        try:
+            dangling.symlink_to(missing)
+        except OSError:
+            pass
+        else:
+            programs, rejected = fp._load_registry_with_status(str(dangling))
+            self.assertEqual(programs, {})
+            self.assertTrue(rejected)
+
+        present = Path(self.root) / "raced-registry.json"
+        present.write_text('{"programs": {}}', encoding="utf-8")
+        real_open = open
+
+        def vanished(path, *args, **kwargs):
+            if os.fspath(path) == str(present):
+                raise FileNotFoundError("registry target vanished")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=vanished):
+            programs, rejected = fp._load_registry_with_status(str(present))
+        self.assertEqual(programs, {})
+        self.assertTrue(rejected)
+
+        fstat_calls = 0
+        real_fstat = fp.os.fstat
+
+        def changed_while_reading(descriptor):
+            nonlocal fstat_calls
+            observed = real_fstat(descriptor)
+            fstat_calls += 1
+            if fstat_calls == 2:
+                changed = mock.Mock()
+                for field in (
+                    "st_mode", "st_dev", "st_ino", "st_size",
+                    "st_mtime_ns", "st_ctime_ns",
+                ):
+                    setattr(changed, field, getattr(observed, field))
+                changed.st_mtime_ns += 1
+                return changed
+            return observed
+
+        with mock.patch.object(
+            fp.os, "fstat", side_effect=changed_while_reading
+        ):
+            programs, rejected = fp._load_registry_with_status(str(present))
+        self.assertEqual(programs, {})
         self.assertTrue(rejected)
 
     def test_schema_requires_nonempty_evidence_references(self):

@@ -372,14 +372,43 @@ def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:
     """
     p = path or registry_path()
     try:
-        with open(p, encoding="utf-8") as fh:
-            doc = json.load(fh)
+        authority_entry = os.lstat(p)
     except FileNotFoundError:
         return {}, False
+    except OSError:
+        return {}, True
+    if not stat.S_ISREG(authority_entry.st_mode):
+        # Symlinks (including dangling ones), directories, and special files
+        # are present authority entries we cannot bind to stable owner bytes.
+        return {}, True
+
+    def _identity(value) -> tuple[int, int, int, int, int, int]:
+        return (
+            int(value.st_mode),
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            int(value.st_ctime_ns),
+        )
+
+    try:
+        with open(p, encoding="utf-8") as fh:
+            opened_before = os.fstat(fh.fileno())
+            if (not stat.S_ISREG(opened_before.st_mode)
+                    or _identity(opened_before) != _identity(authority_entry)):
+                return {}, True
+            doc = json.load(fh)
+            opened_after = os.fstat(fh.fileno())
+        current = os.lstat(p)
     except Exception:
         # Any ordinary backend/decoder/parser failure means authority could not
         # be established.  BaseException subclasses (interrupts/exits) still
         # propagate.
+        return {}, True
+    if (not stat.S_ISREG(current.st_mode)
+            or _identity(opened_before) != _identity(opened_after)
+            or _identity(opened_after) != _identity(current)):
         return {}, True
     if not isinstance(doc, dict) or not isinstance(doc.get("programs"), dict):
         return {}, True
@@ -603,19 +632,58 @@ def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
     )
 
 
+def _v2_evidence_requires_local_hash(
+    record: dict, evidence_root: str | None
+) -> bool:
+    """Whether a locator represents repository bytes that must be verified.
+
+    Evidence ``kind`` describes why a record matters, not where its bytes
+    live.  Documentation, history, and runtime records can still point at a
+    repository file.  Treat every path-shaped locator as local, and also treat
+    an existing directory entry as local whenever a root is available; only
+    an explicit HTTP(S) locator is unambiguously remote. The source/test/
+    schema/route kinds remain local even when no root was supplied, so direct
+    callers cannot grant them authority without verifying their bytes.
+    """
+    if record.get("kind") in _V2_LOCAL_EVIDENCE_KINDS:
+        return True
+    locator = record.get("locator")
+    if not isinstance(locator, str) or not locator.strip():
+        return False
+    value = locator.strip()
+    if re.fullmatch(r"https?://[^\s]+", value, flags=re.IGNORECASE):
+        return False
+    relative = Path(value)
+    if (relative.is_absolute() or relative.drive or "/" in value
+            or "\\" in value or bool(relative.suffix)):
+        return True
+    if not evidence_root:
+        return False
+    try:
+        os.lstat(Path(evidence_root).expanduser() / relative)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable directory entry is not evidence that the locator is
+        # external to the repository; send it through the fail-closed verifier.
+        return True
+
+
 def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
     """Bind local evidence records to actual contained repository bytes.
 
     A syntactically valid 64-character string is not evidence.  Before a v2
-    contract can authorize mutation, each local source/test/schema/route record
-    must name a regular file inside the audited checkout and its SHA-256 must
-    match the bytes read from that file.  Missing roots, traversal, symlink
-    escapes, races, and read errors all deny authority.
+    contract can authorize mutation, every record whose locator denotes local
+    repository bytes must name a regular file inside the audited checkout and
+    its SHA-256 must match the bytes read from that file.  ``kind`` alone never
+    exempts a local documentation/history/runtime record. Missing roots,
+    traversal, symlink escapes, races, and read errors all deny authority.
     """
     records = [
         record for record in (entry.get("evidence") or [])
         if isinstance(record, dict)
-        and record.get("kind") in _V2_LOCAL_EVIDENCE_KINDS
+        and _v2_evidence_requires_local_hash(record, evidence_root)
     ]
     if not records:
         return True

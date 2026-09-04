@@ -8,54 +8,37 @@
       "id": "cb-1",
       "text": "One durable orchestrator accepts 1 through 30 targets and admits exactly one at a time.",
       "confidence": "verified",
-      "evidence_refs": [
-        0
-      ]
+      "evidence_refs": [0]
     },
     {
       "id": "cb-2",
       "text": "Audit and Production Ready run at most six semantic passes: the whole repository first, a top-three competitor capability gate, then only the immediately preceding verified edit delta.",
       "confidence": "verified",
-      "evidence_refs": [
-        0,
-        2
-      ]
+      "evidence_refs": [0, 2]
     },
     {
       "id": "cb-3",
       "text": "Every model call uses one strongest-paid-to-free availability ladder; legacy provider, paid/free, and economy flags cannot select another production path.",
       "confidence": "verified",
-      "evidence_refs": [
-        1,
-        2
-      ]
+      "evidence_refs": [1, 2]
     },
     {
       "id": "cb-4",
       "text": "All ladder instances in one run share author-family identity and reviewer calls fail closed unless a family that authored none of the candidate is available.",
       "confidence": "verified",
-      "evidence_refs": [
-        1,
-        2
-      ]
+      "evidence_refs": [1, 2]
     },
     {
       "id": "cb-5",
       "text": "Intermediate checkpoints stay local; completion after a change requires green executable and evidence gates, complete exact-commit independent review, and remote-default ancestry proof for that SHA.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "cb-6",
       "text": "Android persists a 30-target sequential queue; the cloud atomically claims each request UUID, recovers an existing GitHub workflow instead of duplicating dispatch after a crash, and removes phone-supplied secrets at terminal status.",
       "confidence": "verified",
-      "evidence_refs": [
-        3,
-        4,
-        6
-      ]
+      "evidence_refs": [3, 4, 6]
     }
   ],
   "aspirations": [
@@ -63,9 +46,7 @@
       "id": "asp-1",
       "text": "OS-enforced Windows network isolation in addition to current process-tree and resource controls.",
       "confidence": "unknown",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     }
   ],
   "users": [
@@ -73,20 +54,13 @@
       "id": "u-1",
       "text": "Owners running Refactor, Scout, Audit, or Production Ready on their repositories from the signed Android app, desktop launchers, or CLI.",
       "confidence": "verified",
-      "evidence_refs": [
-        0,
-        2,
-        3
-      ]
+      "evidence_refs": [0, 2, 3]
     },
     {
       "id": "u-2",
       "text": "Supervisors consuming exit codes, queue receipts, run manifests, error ledgers, and evidence bundles.",
       "confidence": "verified",
-      "evidence_refs": [
-        0,
-        2
-      ]
+      "evidence_refs": [0, 2]
     }
   ],
   "outcomes": [
@@ -94,18 +68,13 @@
       "id": "o-1",
       "text": "Verified corrections land on the authoritative remote default branch without force-push and owner WIP is restored by fingerprint.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "o-2",
       "text": "Every incomplete provider, verification, review, publication, or release condition remains visible as BLOCKED or IN PROGRESS.",
       "confidence": "verified",
-      "evidence_refs": [
-        2,
-        7
-      ]
+      "evidence_refs": [2, 7]
     }
   ],
   "workflows": [
@@ -113,34 +82,25 @@
       "id": "w-1",
       "text": "Audit: publication preflight, inventory and purpose, whole-repository pass 1, top-three competitor gate, exact-delta passes 2 through 6, native and browser verification, evidence, independent exact-commit review, publication, and remote-default proof.",
       "confidence": "verified",
-      "evidence_refs": [
-        0,
-        2
-      ]
+      "evidence_refs": [0, 2]
     },
     {
       "id": "w-2",
       "text": "Production Ready executes the Audit workflow with its full readiness rubric and unattended production defaults.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "w-3",
       "text": "Scout profiles and researches improvements; mutation requires explicit Scout authorization and the same verification and publication contract.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "w-4",
       "text": "Refactor rewrites selected files toward explicit goals and accepts no change until project verification, independent review, and publication prove it.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     }
   ],
   "invariants": [
@@ -148,67 +108,49 @@
       "id": "i-1",
       "text": "No review-only or dry-run escape exists in Audit or Production Ready.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-2",
       "text": "A verifier outage leaves the target unchanged and creates no successful publication.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-3",
       "text": "Owner WIP never becomes an ancestor of a FlexFactor-published branch.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-4",
       "text": "Partial output never authorizes clean, ready, approval, commit publication, or merge.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-5",
       "text": "A host capability that is not enforced is named as best effort, never claimed as containment.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-6",
       "text": "Every claimed gate must have run; unknown and unavailable are not passes.",
       "confidence": "verified",
-      "evidence_refs": [
-        2,
-        7
-      ]
+      "evidence_refs": [2, 7]
     },
     {
       "id": "i-7",
       "text": "A changed run cannot exit successfully until the exact reviewed SHA is proven on the authoritative remote default branch.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     },
     {
       "id": "i-8",
       "text": "No reviewer from any candidate author family can certify the final commit.",
       "confidence": "verified",
-      "evidence_refs": [
-        1,
-        2
-      ]
+      "evidence_refs": [1, 2]
     }
   ],
   "acceptance_criteria": [
@@ -239,9 +181,7 @@
       "id": "g-1",
       "text": "Windows raw-socket network isolation is best effort rather than OS enforced.",
       "confidence": "verified",
-      "evidence_refs": [
-        2
-      ]
+      "evidence_refs": [2]
     }
   ],
   "evidence": [
@@ -283,8 +223,8 @@
     {
       "kind": "documentation",
       "locator": "docs/PURPOSE.md",
-      "content_hash": "72fe5cf3b1cb3e25d0f0dd04988bdd262fc92d401061a1de56f5c7030a56b691",
-      "observed_at": "2026-09-02T08:32:38Z",
+      "content_hash": "2f501c2f7cb869b0b2f562d5e2e4b7946f661f32fcdea8b591730d4e57c62732",
+      "observed_at": "2026-09-04T08:52:06Z",
       "excerpt": "Governing purpose and production completion contract."
     },
     {
