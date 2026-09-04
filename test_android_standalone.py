@@ -199,6 +199,14 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn(
             '$rollout != "" and .engine_ref == $rollout', control_plane)
         self.assertIn(
+            "the deployed control plane can still",
+            control_plane,
+        )
+        self.assertIn(
+            "not serving $expected_engine or staged $rollout_engine",
+            control_plane,
+        )
+        self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
         self.assertIn("options: [auto]", workflow)
         self.assertNotIn('--provider "$PROVIDER"', workflow)

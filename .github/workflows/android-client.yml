@@ -78,6 +78,9 @@ jobs:
           fi
           rollout_engine=""
           if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
+            # During a tag-first rollout, the deployed control plane can still
+            # report the declared (previous) engine until the cloud deploy lands.
+            # The marker authorizes the pending Android tag for that transition.
             pending_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
             if [ "$pending_engine" != "$android_engine" ]; then
               echo "The staged rollout marker does not name $android_engine" >&2
@@ -119,7 +122,7 @@ jobs:
               exit 0
             fi
             if [ "$attempt" -eq 60 ]; then
-              echo "Managed control plane is not serving an authorized engine: $health" >&2
+              echo "Managed control plane is not serving $expected_engine or staged $rollout_engine: $health" >&2
               exit 1
             fi
             sleep 10
