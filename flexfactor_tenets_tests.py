@@ -7,6 +7,7 @@ import io
 import inspect
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -130,6 +131,20 @@ class TenetsContextTests(unittest.TestCase):
             ft.generate_tenets_context(
                 self.root, "audit", output=other / "context.json"
             )
+
+    def test_default_state_is_rejected_when_home_is_a_git_worktree(self) -> None:
+        home = Path(self.temp.name) / "git-managed-home"
+        home.mkdir()
+        (home / ".git").mkdir()
+        with mock.patch.dict(
+            os.environ, {"FLEXFACTOR_STATE_DIR": ""}, clear=False
+        ), mock.patch.object(
+            ft.Path, "home", return_value=home
+        ), mock.patch.object(ft, "_find_tenets_executable") as finder:
+            with self.assertRaisesRegex(ValueError, "outside every Git repository"):
+                ft.generate_tenets_context(self.root, "audit")
+        finder.assert_not_called()
+        self.assertFalse((home / ".flexfactor").exists())
 
     def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
         failures = (
@@ -521,6 +536,44 @@ class TenetsContextTests(unittest.TestCase):
         )
         contain.assert_called_once_with(process)
 
+    def test_reader_thread_start_failure_becomes_an_operational_error(self) -> None:
+        process = mock.Mock(pid=417, returncode=None)
+        process.poll.return_value = None
+        process.stdout = io.BytesIO(b"")
+        process.stderr = io.BytesIO(b"")
+        with mock.patch.object(ft.os, "name", "nt"), \
+             mock.patch.object(ft.sys, "platform", "win32"), \
+             mock.patch.object(ft.subprocess, "Popen", return_value=process), \
+             mock.patch.object(
+                 ft, "_contain_and_resume_windows_process", return_value=9123
+             ), mock.patch.object(
+                 ft.threading.Thread,
+                 "start",
+                 side_effect=RuntimeError("cannot start new thread"),
+             ), mock.patch.object(ft, "_terminate_process_tree") as terminate:
+            with self.assertRaisesRegex(
+                OSError, "bounded Tenets output reader"
+            ):
+                ft._run_bounded_process(
+                    ("C:/trusted/tenets.exe", "rank"),
+                    cwd=self.root,
+                    timeout_seconds=1,
+                )
+        terminate.assert_called_once_with(
+            process, windows_job=9123, linux_cgroup=None
+        )
+
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="tenets"
+        ), mock.patch.object(
+            ft,
+            "_run_bounded_process",
+            side_effect=OSError("could not start a bounded Tenets output reader"),
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("could not start", result.message)
+
     def test_windows_resume_failure_closes_the_containment_job(self) -> None:
         process = mock.Mock(pid=417)
         with mock.patch.object(
@@ -819,7 +872,13 @@ class TenetsContextTests(unittest.TestCase):
             str(ranker), str(ready), str(survivor), str(helper_pid_file),
             str(helper), str(supervisor_pid_file),
         ])
-        tracked_pids: list[int] = []
+        tracked_processes: dict[int, int] = {}
+
+        def pidfd_has_exited(pidfd: int) -> bool:
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            return bool(poller.poll(0))
+
         try:
             deadline = time.monotonic() + 5
             while (not all(path.exists() for path in (
@@ -828,23 +887,29 @@ class TenetsContextTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertTrue(ready.exists(), "ranker never reached contained execution")
             for path in (supervisor_pid_file, helper_pid_file):
-                tracked_pids.append(int(path.read_text(encoding="utf-8")))
+                pid = int(path.read_text(encoding="utf-8"))
+                tracked_processes[pid] = os.pidfd_open(pid)
             process.kill()
             process.wait(timeout=2)
             time.sleep(3)
             self.assertFalse(survivor.exists())
-            for pid in tracked_pids:
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(pid, 0)
+            for pid, pidfd in tracked_processes.items():
+                # pidfds retain the exact process identity across numeric PID
+                # reuse and become readable as soon as a process exits, even
+                # if container PID 1 leaves that process in zombie state.
+                self.assertTrue(pidfd_has_exited(pidfd), pid)
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=2)
-            for pid in tracked_pids:
+            for _pid, pidfd in tracked_processes.items():
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    if not pidfd_has_exited(pidfd):
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                finally:
+                    os.close(pidfd)
 
     @unittest.skipUnless(
         sys.platform.startswith("linux")

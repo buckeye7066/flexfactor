@@ -253,41 +253,10 @@ def _validate_external_evidence_path(
         )
     enclosing = _containing_git_worktree(candidate)
     if enclosing is not None:
-        # Do not reject the built-in default state directory under the user's
-        # home when $HOME itself is a Git worktree (common for dotfiles).
-        # This preserves the safe default of ~/.flexfactor/context/... while
-        # continuing to forbid explicit destinations inside arbitrary worktrees.
-        try:
-            state_override = os.environ.get("FLEXFACTOR_STATE_DIR", "").strip()
-            default_state_root = None if state_override else _state_root().expanduser().resolve(strict=False)
-        except Exception:
-            default_state_root = None
-        allow_home_state = False
-        if default_state_root is not None:
-            try:
-                # Candidate is within the default state root
-                if candidate.is_relative_to(default_state_root):
-                    # Allow only when the detected enclosing worktree is an ancestor
-                    # of the default state root (e.g., $HOME), not a .git placed
-                    # inside ~/.flexfactor itself.
-                    if default_state_root.is_relative_to(enclosing):
-                        allow_home_state = True
-            except AttributeError:
-                # Fallback for older Python without is_relative_to
-                try:
-                    candidate.relative_to(default_state_root)
-                    try:
-                        default_state_root.relative_to(enclosing)
-                        allow_home_state = True
-                    except ValueError:
-                        allow_home_state = False
-                except ValueError:
-                    allow_home_state = False
-        if not allow_home_state:
-            raise ValueError(
-                "FlexFactor state/evidence must be outside every Git repository "
-                f"(destination is inside {enclosing})"
-            )
+        raise ValueError(
+            "FlexFactor state/evidence must be outside every Git repository "
+            f"(destination is inside {enclosing})"
+        )
     return candidate
 
 
@@ -1439,7 +1408,17 @@ def _run_bounded_process(
             ),
         )
         for reader in readers:
-            reader.start()
+            try:
+                reader.start()
+            except RuntimeError as exc:
+                # Thread creation can fail under an ordinary host resource
+                # ceiling.  Translate that operational launch failure into
+                # the same OSError boundary used by the optional adapter, so
+                # generate_tenets_context degrades without a traceback while
+                # BaseException interrupts continue to propagate unchanged.
+                raise OSError(
+                    "could not start a bounded Tenets output reader"
+                ) from exc
             started_readers.append(reader)
 
         deadline = time.monotonic() + timeout_seconds

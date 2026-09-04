@@ -272,6 +272,46 @@ class SteeringTests(unittest.TestCase):
             "Target", self.project, root=self.root
         ))
 
+    def test_newer_legacy_alias_guidance_wins_over_current_physical_key(self):
+        alias = os.path.join(self.root, "Newer Legacy Target Alias")
+        try:
+            os.symlink(self.project, alias, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        current_path = fs.guidance_path("Target", self.project, self.root)
+        legacy_path = os.path.join(
+            self.root,
+            "guidance",
+            fs._legacy_key("Target", alias) + ".json",
+        )
+        fs._replace_json(current_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._canonical(self.project),
+            "prompt": "Older physical-key guidance.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        })
+        fs._replace_json(legacy_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "prompt": "Newest authenticated alias guidance.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T01:00:00+00:00",
+        })
+
+        loaded = fs.get_guidance("Target", self.project, root=self.root)
+
+        self.assertEqual(
+            loaded["prompt"], "Newest authenticated alias guidance."
+        )
+        self.assertFalse(os.path.exists(legacy_path))
+        self.assertEqual(
+            fs.get_guidance("Target", self.project, root=self.root)["prompt"],
+            "Newest authenticated alias guidance.",
+        )
+
     def test_clear_guidance_removes_valid_legacy_alias_without_loading_it(self):
         alias = os.path.join(self.root, "Legacy Clear Alias")
         try:

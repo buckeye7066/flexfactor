@@ -558,31 +558,48 @@ def get_guidance(program: str, project_dir: str, *,
     except (OSError, TypeError, ValueError):
         row = None
     validated = _validated_guidance_row(row, program, project_dir)
-    if validated is not None:
-        return validated
 
     # Version 1 records written before physical canonicalization were keyed by
     # the exact symlink/junction spelling used at save time.  Validate both the
     # old filename and the stored physical target before migrating, so an
     # upgrade never drops authenticated owner direction or accepts a renamed
-    # file as authority.
-    legacy = _legacy_guidance_matches(
+    # file as authority.  Always compare those records with the current-key
+    # record: an owner may have updated guidance through an alias immediately
+    # before upgrading, and the newest valid direction must win regardless of
+    # which spelling produced its filename.
+    candidates = _legacy_guidance_matches(
         program, project_dir, root=root
     )
-    if not legacy:
+    if validated is not None:
+        candidates.append((path, validated))
+    if not candidates:
         return None
-    legacy.sort(key=lambda item: (
+    by_path: dict[str, tuple[str, dict]] = {}
+    for candidate_path, candidate_row in candidates:
+        normalized_path = os.path.normcase(os.path.abspath(candidate_path))
+        existing = by_path.get(normalized_path)
+        if existing is None or (
+            candidate_row.get("updated_at", ""), candidate_row["program"]
+        ) > (
+            existing[1].get("updated_at", ""), existing[1]["program"]
+        ):
+            by_path[normalized_path] = (candidate_path, candidate_row)
+    candidates = list(by_path.values())
+    candidates.sort(key=lambda item: (
         item[1].get("updated_at", ""), item[1]["program"], item[0]
     ))
-    selected = legacy[-1][1]
-    try:
-        _replace_json(path, selected)
-    except (OSError, ValueError):
-        return selected
+    selected_path, selected = candidates[-1]
+    current_path = os.path.normcase(os.path.abspath(path))
+    if (os.path.normcase(os.path.abspath(selected_path)) != current_path
+            or validated != selected):
+        try:
+            _replace_json(path, selected)
+        except (OSError, ValueError):
+            return selected
     with _LOCAL_LOCK:
-        for old_path, _row in legacy:
+        for old_path, _row in candidates:
             if os.path.normcase(os.path.abspath(old_path)) == \
-                    os.path.normcase(os.path.abspath(path)):
+                    current_path:
                 continue
             try:
                 os.remove(old_path)
