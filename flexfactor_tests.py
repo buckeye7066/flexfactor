@@ -257,7 +257,9 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         )
         self.assertIs(ok, False)
         self.assertIn("encoding must be UTF-8", reason)
-        for cookie in ("utf-8", "UTF_8", "utf8"):
+        # PEP 263 aliases that still describe the exact bytes written by the
+        # UTF-8 persistence path remain valid, including UTF-8-with-signature.
+        for cookie in ("utf-8", "UTF_8", "utf8", "utf-8-sig", "UTF_8_SIG"):
             accepted, note = ff._inproc_source_syntax_ok(
                 "encoded.py", f"# coding: {cookie}\nVALUE = 'é'\n",
             )
