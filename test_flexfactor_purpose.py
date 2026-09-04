@@ -222,6 +222,53 @@ class PurposeContractV2Tests(_TempRepo):
             ["Upload an invoice and export its receipt."],
         )
 
+    def test_required_v2_claims_and_evidence_reach_mutation_prompt(self):
+        contract_doc = self._contract(
+            outcomes=[self._claim(
+                "o-safety", "Only an owner-approved receipt is published.",
+                "supported",
+            )],
+            invariants=[self._claim(
+                "i-safety", "Never change an invoice total.",
+            )],
+            evidence=[self._evidence(
+                locator="policy/receipt-safety.md",
+                content_hash="b" * 64,
+                observed_at="2026-09-04T05:06:07+00:00",
+                excerpt="Owner approval and immutable totals are required.",
+            )],
+            acceptance_criteria=["A" * 9000],
+        )
+
+        contract = fp._contract_from_registry(contract_doc)
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.structured_claims["outcomes"],
+                         contract_doc["outcomes"])
+        self.assertEqual(contract.structured_claims["invariants"],
+                         contract_doc["invariants"])
+        self.assertEqual(contract.contract_evidence, contract_doc["evidence"])
+        prompt = contract.prompt_block(max_chars=10000)
+        self.assertIn("REQUIRED OUTCOMES", prompt)
+        self.assertIn("Only an owner-approved receipt is published.", prompt)
+        self.assertIn("confidence=supported", prompt)
+        self.assertIn("MUTATION INVARIANTS", prompt)
+        self.assertIn("Never change an invoice total.", prompt)
+        self.assertIn("evidence_refs=0", prompt)
+        self.assertIn("locator=policy/receipt-safety.md", prompt)
+        self.assertIn("content_hash=" + "b" * 64, prompt)
+        self.assertIn("observed_at=2026-09-04T05:06:07+00:00", prompt)
+        self.assertIn("excerpt=Owner approval", prompt)
+        capped_prompt = contract.prompt_block()
+        self.assertEqual(len(capped_prompt), 6000)
+        self.assertIn("Never change an invoice total.", capped_prompt)
+        self.assertIn("locator=policy/receipt-safety.md", capped_prompt)
+        serialized = contract.to_dict()
+        self.assertEqual(serialized["structured_claims"]["outcomes"],
+                         contract_doc["outcomes"])
+        self.assertEqual(serialized["contract_evidence"],
+                         contract_doc["evidence"])
+
     def test_malformed_v2_claim_rejects_the_entire_contract(self):
         for unsafe in (
             7,
@@ -375,6 +422,88 @@ class PurposeContractV2Tests(_TempRepo):
         confidence = fp.purpose_confidence(contract, {})
         self.assertEqual(confidence, "unresolved")
         self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_invalid_alias_match_blocks_later_valid_alias(self):
+        invalid_alias = self._contract(
+            name="Damaged Receipt Contract",
+            aliases=["receipt bus"],
+            evidence=[],
+        )
+        unrelated_valid_alias = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "aliases": ["receipt-bus"],
+        }
+
+        contract = fp.find_contract("Receipt Bus", registry={
+            "damaged-contract": invalid_alias,
+            "another-product": unrelated_valid_alias,
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_duplicate_valid_alias_is_ambiguous_and_unresolved(self):
+        contract = fp.find_contract("Receipt Bus", registry={
+            "first-product": {
+                "name": "First Product",
+                "purpose": "First purpose.",
+                "aliases": ["receipt-bus"],
+            },
+            "second-product": {
+                "name": "Second Product",
+                "purpose": "Second purpose.",
+                "aliases": ["receipt bus"],
+            },
+        })
+
+        self.assertIsNone(contract)
+
+    def test_invalid_path_match_blocks_later_valid_path(self):
+        invalid_path = self._contract(
+            name="Damaged Path Contract",
+            evidence=[],
+            local_path=self.root,
+        )
+        unrelated_valid_path = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "local_path": self.root,
+        }
+
+        contract = fp.find_contract("Unmatched Name", self.root, registry={
+            "damaged-contract": invalid_path,
+            "another-product": unrelated_valid_path,
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_one_valid_alias_or_path_match_still_resolves(self):
+        valid = {
+            "name": "Receipt Maker",
+            "purpose": "Create the requested receipt.",
+            "primary_users": ["Bookkeepers"],
+            "core_journeys": ["Export one receipt"],
+            "aliases": ["receipt-bus"],
+            "local_path": self.root,
+        }
+
+        alias_contract = fp.find_contract(
+            "Receipt Bus", registry={"receipt-maker": valid})
+        path_contract = fp.find_contract(
+            "Unmatched Name", self.root, registry={"receipt-maker": valid})
+
+        self.assertEqual(alias_contract.purpose, "Create the requested receipt.")
+        self.assertEqual(path_contract.purpose, "Create the requested receipt.")
 
     def test_checked_in_contract_passes_runtime_validator(self):
         with open(os.path.join(os.path.dirname(fp.__file__),

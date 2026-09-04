@@ -203,6 +203,15 @@ class PurposeContract:
     #: evidence that was merely available from evidence the model actually
     #: relied on.
     evidence_refs: list[str] = field(default_factory=list)
+    #: Complete evidence-bearing claim records from a validated v2 owner
+    #: contract, keyed by their schema section.  Keeping the records (rather
+    #: than only projecting users/workflows to strings) preserves the claim
+    #: identity, confidence, and evidence relationship at the mutation gate.
+    structured_claims: dict[str, list[dict]] = field(default_factory=dict)
+    #: Complete top-level evidence records from a validated v2 owner contract.
+    #: This is deliberately separate from ``evidence_ledger``, whose records
+    #: use the discovery/inference ``path_or_ref`` shape.
+    contract_evidence: list[dict] = field(default_factory=list)
     contradictions: list[dict] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
     #: One of PURPOSE_CONFIDENCE_LEVELS. "owner-authored" for authored contracts.
@@ -243,16 +252,52 @@ class PurposeContract:
             "PURPOSE (what this program was created to do):",
             self.purpose or "(not stated)",
         ]
+        # Required v2 claims must appear before lower-authority/contextual
+        # material so a prompt-size cap cannot silently discard the outcome or
+        # a safety invariant while still labelling the contract owner-authored.
+        # The compact record form retains the exact confidence and evidence
+        # linkage the validator used when it granted mutation authority.
+        required_sections = (
+            ("users", "PRIMARY USERS"),
+            ("outcomes", "REQUIRED OUTCOMES"),
+            ("workflows", "CORE END-TO-END JOURNEYS"),
+            ("invariants", "MUTATION INVARIANTS"),
+        )
+        if self.structured_claims:
+            for key, heading in required_sections:
+                claims = self.structured_claims.get(key) or []
+                if not claims:
+                    continue
+                lines += ["", f"{heading}:"]
+                for claim in claims:
+                    refs = ",".join(str(ref) for ref in claim["evidence_refs"])
+                    lines.append(
+                        f"  - [{claim['id']} | confidence={claim['confidence']} | "
+                        f"evidence_refs={refs}] {claim['text']}"
+                    )
+            if self.contract_evidence:
+                lines += ["", "CONTRACT EVIDENCE (indexes used above):"]
+                for index, record in enumerate(self.contract_evidence):
+                    evidence_line = (
+                        f"  - [{index}] kind={record['kind']}; "
+                        f"locator={record['locator']}; "
+                        f"content_hash={record['content_hash']}; "
+                        f"observed_at={record['observed_at']}"
+                    )
+                    if record.get("excerpt"):
+                        evidence_line += f"; excerpt={record['excerpt']}"
+                    lines.append(evidence_line)
+        else:
+            if self.primary_users:
+                lines += ["", "PRIMARY USERS:"]
+                lines += [f"  - {user}" for user in self.primary_users]
+            if self.core_journeys:
+                lines += ["", "CORE END-TO-END JOURNEYS:"]
+                lines += [f"  - {journey}" for journey in self.core_journeys]
         if self.acceptance_criteria:
             lines += ["", "ACCEPTANCE CRITERIA (the program is not finished until "
                           "every one of these is true):"]
             lines += [f"  {i}. {c}" for i, c in enumerate(self.acceptance_criteria, 1)]
-        if self.primary_users:
-            lines += ["", "PRIMARY USERS:"]
-            lines += [f"  - {user}" for user in self.primary_users]
-        if self.core_journeys:
-            lines += ["", "CORE END-TO-END JOURNEYS:"]
-            lines += [f"  - {journey}" for journey in self.core_journeys]
         if self.evidence_refs:
             lines += ["", "EVIDENCE ACTUALLY CITED FOR THIS INFERENCE:"]
             lines += [f"  - {ref}" for ref in self.evidence_refs]
@@ -331,27 +376,42 @@ def find_contract(program_name: str, project_dir: str | None = None,
             # another entry that merely claims this slug as an alias can load
             # an unrelated program's purpose and authorize the wrong mutation.
             return _contract_from_registry(reg[k])
-    # Alias.
+    # Alias. Identity selectors are authoritative even when the selected
+    # record is malformed. Multiple records claiming the same alias are also
+    # ambiguous. In either case fail unresolved instead of continuing until an
+    # unrelated parseable record happens to grant mutation authority.
+    alias_matches = []
     for entry in reg.values():
         if not isinstance(entry, dict):
             continue
-        alias_slugs = {slugify(a) for a in (entry.get("aliases") or [])}
+        raw_aliases = entry.get("aliases") or []
+        if not isinstance(raw_aliases, list):
+            continue
+        alias_slugs = {
+            slugify(alias) for alias in raw_aliases if isinstance(alias, str)
+        }
         alias_slugs |= {s.replace("-", "") for s in list(alias_slugs)}
         if alias_slugs & set(keys):
-            contract = _contract_from_registry(entry)
-            if contract is not None:
-                return contract
+            alias_matches.append(entry)
+    if alias_matches:
+        if len(alias_matches) != 1:
+            return None
+        return _contract_from_registry(alias_matches[0])
     # Same checkout on disk.
     if project_dir:
         want = os.path.normcase(os.path.abspath(project_dir))
+        path_matches = []
         for entry in reg.values():
             if not isinstance(entry, dict):
                 continue
             lp = entry.get("local_path")
-            if lp and os.path.normcase(os.path.abspath(lp)) == want:
-                contract = _contract_from_registry(entry)
-                if contract is not None:
-                    return contract
+            if isinstance(lp, str) and lp \
+                    and os.path.normcase(os.path.abspath(lp)) == want:
+                path_matches.append(entry)
+        if path_matches:
+            if len(path_matches) != 1:
+                return None
+            return _contract_from_registry(path_matches[0])
     return None
 
 
@@ -590,6 +650,14 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
         authored=True,
         source=entry.get("source") or {"doc": REGISTRY_REL, "authored_by": "owner"},
         evidence_refs=list(entry.get("evidence_refs") or []),
+        structured_claims={
+            section: [dict(claim) for claim in entry.get(section, [])]
+            for section in (*_V2_CLAIM_SECTIONS, "resolved_contradictions")
+            if is_v2 and section in entry
+        },
+        contract_evidence=(
+            [dict(record) for record in entry["evidence"]] if is_v2 else []
+        ),
     )
 
 
