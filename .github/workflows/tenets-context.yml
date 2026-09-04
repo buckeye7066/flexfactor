@@ -67,7 +67,7 @@ jobs:
           from importlib.metadata import version
           assert version("tenets") == "0.13.3", version("tenets")
           PY
-      - name: Prove sibling executable resolution and real ranking
+      - name: Prove trusted executable resolution and real ranking
         shell: bash
         env:
           CONTEXT_OUTPUT: ${{ runner.temp }}/tenets-context.json
@@ -95,10 +95,14 @@ jobs:
           os.environ["PATH"] = os.pathsep.join(filtered)
 
           executable = ft._find_tenets_executable()
-          assert executable, "Tenets was not resolved beside the selected Python"
-          assert Path(executable).resolve().parent == interpreter_dir, (
-              executable,
+          assert executable, "Tenets was not resolved from the active Python installation"
+          trusted_dirs = {
               interpreter_dir,
+              Path(sys.prefix).resolve() / ("Scripts" if os.name == "nt" else "bin"),
+          }
+          assert Path(executable).resolve().parent in trusted_dirs, (
+              executable,
+              sorted(str(path) for path in trusted_dirs),
           )
 
           result = ft.generate_tenets_context(
