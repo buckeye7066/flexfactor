@@ -764,7 +764,8 @@ class Rotator:
             )
             if resolved_pin:
                 outcome["selection"] = self._resolve_pin(
-                    resolved_pin, state, now, pin_strict, tier, allow_paid, reasons)
+                    resolved_pin, state, now, pin_strict, tier, allow_paid,
+                    reasons, intent)
                 if outcome.get("selection") is not None:
                     self._stamp(state, outcome["selection"], now)
                 return
@@ -835,7 +836,8 @@ class Rotator:
     # -- pin ---------------------------------------------------------------
     def _resolve_pin(self, pin: str, state: Dict[str, Any], now: float,
                      strict: bool, tier: str, allow_paid: bool,
-                     reasons: Dict[str, str]) -> Optional[Selection]:
+                     reasons: Dict[str, str],
+                     intent: Optional[CallIntent] = None) -> Optional[Selection]:
         """Runs INSIDE the state lock, so it must never call back into
         next_route -- that would re-enter the lock and deadlock. The non-strict
         fallback therefore inlines a tier walk instead of recursing."""
@@ -854,6 +856,13 @@ class Rotator:
         # re-selected an exhausted daily allowance on every call.
         usable = [r for r in matches if r.enabled
                   and (allow_paid or r.is_free)
+                  and not (intent is not None and intent.avoid_families
+                           and route_model_family(r) in (
+                               set(intent.avoid_families)
+                               | set(_OPAQUE_MODEL_FAMILIES)))
+                  and not (intent is not None and intent.needs and r.capabilities
+                           and any(need not in r.capabilities
+                                   for need in intent.needs))
                   and not _cooling(state, r.pool, now)
                   and not _cooling(state, f"route:{r.id}", now)
                   and not _cooling(state, f"credential:{credential_key(r)}", now)
@@ -865,6 +874,11 @@ class Rotator:
                         return r.disabled_reason or "disabled"
                     if not allow_paid and not r.is_free:
                         return "paid-metered, and allow_paid is off"
+                    if (intent is not None and intent.avoid_families
+                            and route_model_family(r) in (
+                                set(intent.avoid_families)
+                                | set(_OPAQUE_MODEL_FAMILIES))):
+                        return "excluded reviewer model family"
                     if _cooling(state, f"allowance:{allowance_key(r)}", now):
                         return (f"{allowance_key(r)} allowance exhausted "
                                 "(account-wide)")
@@ -878,7 +892,7 @@ class Rotator:
             start = TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT)
             for candidate_tier in TIER_CHAIN[start:]:
                 fallback = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons)
+                    candidate_tier, allow_paid, state, now, reasons, intent)
                 if fallback is not None:
                     fallback.catalog_stale = self.catalog.is_stale
                     return fallback

@@ -8419,16 +8419,37 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
                 f"generated file path could not be safely inspected: {path!r}",
             )
         allow_empty_create = existence == "missing" and not item["contents"].strip()
-        syntax_ok, syntax_note = _prewrite_source_syntax_ok(
-            project_dir, path, item["contents"], stack,
-            allow_empty=allow_empty_create,
-        )
-        if syntax_ok is not True:
+        try:
+            item["contents"].encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
             return ApplyResult(
                 repo_name, "refused-invalid-source",
                 f"generated Scout source rejected before write for {path}: "
-                f"{syntax_note}",
+                f"source is not UTF-8 encodable: {exc}",
             )
+        if not item["contents"].strip() and not allow_empty_create:
+            return ApplyResult(
+                repo_name, "refused-invalid-source",
+                f"generated Scout source rejected before write for {path}: "
+                "an integration may not erase an existing file",
+            )
+        # Parse code and structured data for which FlexFactor has a safe,
+        # non-executing parser. Other project artifacts (stylesheets,
+        # templates, Markdown, YAML, etc.) are still protected by containment,
+        # symlink, batch, UTF-8 and the mandatory project verification gates;
+        # lack of a language parser must not make those files unwritable.
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (_CODE_EXTS | {".pyi", ".json", ".toml"}):
+            syntax_ok, syntax_note = _prewrite_source_syntax_ok(
+                project_dir, path, item["contents"], stack,
+                allow_empty=allow_empty_create,
+            )
+            if syntax_ok is not True:
+                return ApplyResult(
+                    repo_name, "refused-invalid-source",
+                    f"generated Scout source rejected before write for {path}: "
+                    f"{syntax_note}",
+                )
     if not files and not packages:
         return ApplyResult(repo_name, "infeasible", "No concrete edits were produced.")
 
@@ -15103,8 +15124,9 @@ def _go_runnable_test_names(source: str) -> list[str]:
 
     The lexical projection removes comments and strings first, so braces and
     ``t.Skip`` text in examples cannot affect the scan. Any Skip/SkipNow call
-    on the test parameter is conservatively disqualifying; runtime-dependent
-    skips cannot establish that generated behavior executed.
+    on a receiver within the test body is conservatively disqualifying,
+    including calls on nested subtest parameters; runtime-dependent skips
+    cannot establish that generated behavior executed.
     """
     projected = _go_code_projection(source)
     declaration = re.compile(
@@ -15123,10 +15145,9 @@ def _go_runnable_test_names(source: str) -> list[str]:
             cursor += 1
         if depth:
             continue
-        parameter = re.escape(match.group(2))
         body = projected[match.end():cursor - 1]
         if re.search(
-                rf"\b{parameter}\s*\.\s*Skip(?:f|Now)?\s*\(", body):
+                r"\b[A-Za-z_]\w*\s*\.\s*Skip(?:f|Now)?\s*\(", body):
             continue
         runnable.append(match.group(1))
     return runnable
@@ -15618,8 +15639,12 @@ def _copy_generated_test_checkout(project_dir: str, destination: str) -> None:
     root.  A broken, VCS-directed, or externally resolving link fails before a
     test process starts.  Hard links are already broken by ``copy2``.
     """
-    def ignore_git(_directory: str, names: list[str]) -> set[str]:
-        return {name for name in names if name == ".git"}
+    def ignore_execution_artifacts(_directory: str, names: list[str]) -> set[str]:
+        # A checked-out local virtualenv is neither project source nor an
+        # execution dependency we can safely transplant. Its interpreter links
+        # intentionally resolve outside the repository and would otherwise be
+        # rejected as escapes during the symlink-confinement pass below.
+        return {name for name in names if name in {".git", ".venv"}}
 
     source_root = os.path.realpath(project_dir)
     execution_root = os.path.realpath(destination)
@@ -15639,7 +15664,7 @@ def _copy_generated_test_checkout(project_dir: str, destination: str) -> None:
                     f"cannot be copied safely: {rel}"
                 )
     shutil.copytree(
-        source_root, destination, symlinks=True, ignore=ignore_git,
+        source_root, destination, symlinks=True, ignore=ignore_execution_artifacts,
         copy_function=shutil.copy2,
     )
 
