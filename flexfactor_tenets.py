@@ -23,11 +23,12 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import sysconfig
-import stat as _stat
 import tempfile
 import threading
 import time
@@ -41,6 +42,7 @@ MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 MAX_RANKER_MEMORY_BYTES = 1024 * 1024 * 1024
 MAX_RANKER_PROCESSES = 64
+LINUX_CGROUP_ROOT_ENV = "FLEXFACTOR_TENETS_CGROUP_ROOT"
 # Python sequences cannot contain more than sys.maxsize elements. Using
 # that interpreter bound neutralizes the caller's review quota without
 # imposing a smaller, arbitrary repository cutoff before prioritization.
@@ -196,16 +198,30 @@ def _state_root() -> Path:
 def _default_output_path(project_root: Path) -> Path:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", project_root.name).strip("-._") or "project"
     identity = hashlib.sha256(str(project_root).encode("utf-8")).hexdigest()[:12]
-    return _state_root() / "context" / f"{slug}-{identity}" / "tenets-context.json"
+    candidate = (
+        _state_root() / "context" / f"{slug}-{identity}" / "tenets-context.json"
+    ).resolve(strict=False)
+    try:
+        candidate.relative_to(project_root)
+    except ValueError:
+        return candidate
+    raise ValueError(
+        "FlexFactor state/evidence must be outside the audited repository"
+    )
 
 
 def _resolve_output_path(project_root: Path, output: str | os.PathLike[str] | None) -> Path:
     if output is None:
-        return _default_output_path(project_root).resolve(strict=False)
+        return _default_output_path(project_root)
     candidate = Path(output).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
-    return candidate.resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(project_root)
+    except ValueError:
+        return resolved
+    raise ValueError("Tenets evidence output must be outside the audited repository")
 
 
 def _trusted_tenets_directories(
@@ -531,37 +547,211 @@ def _enable_linux_child_subreaper() -> None:
         raise OSError(error, os.strerror(error))
 
 
-def _apply_linux_ranker_resource_limits() -> None:
-    """Apply inherited kernel limits before the optional ranker is launched."""
+def _enable_linux_parent_death_signal(expected_parent_pid: int) -> None:
+    """Ask the kernel to stop the supervisor if its FlexFactor parent dies."""
     if not sys.platform.startswith("linux"):
-        raise OSError("Linux ranker resource limits are unavailable")
+        raise OSError("Linux parent-death signalling is unavailable")
+    if expected_parent_pid <= 1 or os.getppid() != expected_parent_pid:
+        raise OSError("the FlexFactor parent changed before containment")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
+    if prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # The parent can exit between getppid() and prctl().  Linux does not send a
+    # retroactive signal in that race, so prove the same live parent remains.
+    if os.getppid() != expected_parent_pid:
+        raise OSError("the FlexFactor parent died during containment")
+
+
+def _apply_linux_ranker_file_limit() -> None:
+    """Bound individual file writes in addition to aggregate cgroup limits."""
+    if not sys.platform.startswith("linux"):
+        raise OSError("Linux ranker file limits are unavailable")
     try:
         import resource
 
-        # IMPORTANT: Do not set RLIMIT_NPROC here. On Linux this limit is
-        # enforced per real user ID across the whole host, not per supervised
-        # subprocess tree. Lowering it inside the short‑lived supervisor can
-        # make Popen fail with EAGAIN on developer machines that already have
-        # many processes/threads, degrading ranking without improving safety.
-        policies = (
-            (resource.RLIMIT_AS, MAX_RANKER_MEMORY_BYTES),
-            # Tenets currently writes JSON to stdout. Keep a file-size limit
-            # as defense in depth for libraries or descendants that open files
-            # in the disposable isolation directory.
-            (resource.RLIMIT_FSIZE, MAX_STDOUT_BYTES),
+        _soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        effective = (
+            MAX_STDOUT_BYTES
+            if hard == resource.RLIM_INFINITY
+            else min(MAX_STDOUT_BYTES, int(hard))
         )
-        for resource_id, requested in policies:
-            _soft, hard = resource.getrlimit(resource_id)
-            effective = (
-                requested
-                if hard == resource.RLIM_INFINITY
-                else min(requested, int(hard))
-            )
-            if effective < 1:
-                raise OSError("an inherited ranker resource limit is unusable")
-            resource.setrlimit(resource_id, (effective, effective))
+        if effective < 1:
+            raise OSError("an inherited file-size limit is unusable")
+        resource.setrlimit(resource.RLIMIT_FSIZE, (effective, effective))
     except (AttributeError, ImportError, OSError, ValueError) as exc:
-        raise OSError(f"could not enforce Linux ranker resource limits: {exc}") from exc
+        raise OSError(f"could not enforce Linux ranker file limits: {exc}") from exc
+
+
+def _linux_cgroup_root() -> Path:
+    """Return a verified owner-delegated cgroup-v2 directory.
+
+    RLIMIT_AS is per process and RLIMIT_NPROC is per real user (and ignored by
+    root), so neither is a process-tree boundary.  Linux ranking is optional:
+    without a delegated cgroup that exposes aggregate memory/PID controls and
+    atomic tree kill, the safe behavior is to retain canonical file order.
+    """
+    configured = os.environ.get(LINUX_CGROUP_ROOT_ENV, "").strip()
+    if not configured:
+        raise OSError(
+            f"{LINUX_CGROUP_ROOT_ENV} is required for Linux Tenets containment"
+        )
+    candidate = Path(configured).expanduser().resolve(strict=True)
+    system_root = Path("/sys/fs/cgroup").resolve(strict=True)
+    try:
+        candidate.relative_to(system_root)
+    except ValueError as exc:
+        raise OSError("the Tenets cgroup root is outside cgroup v2") from exc
+    if not candidate.is_dir() or candidate.is_symlink():
+        raise OSError("the Tenets cgroup root is not a real directory")
+    controllers = candidate / "cgroup.controllers"
+    subtree = candidate / "cgroup.subtree_control"
+    try:
+        available = set(controllers.read_text(encoding="ascii").split())
+        enabled = set(subtree.read_text(encoding="ascii").replace("+", "").split())
+    except OSError as exc:
+        raise OSError("the Tenets cgroup delegation cannot be inspected") from exc
+    if not {"memory", "pids"}.issubset(available | enabled):
+        raise OSError("the Tenets cgroup lacks memory and pids controllers")
+    return candidate
+
+
+def _write_cgroup_control(path: Path, value: str) -> None:
+    try:
+        path.write_text(value + "\n", encoding="ascii")
+        observed = path.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise OSError(f"could not set cgroup control {path.name}") from exc
+    if observed != value:
+        raise OSError(f"cgroup control {path.name} did not retain its limit")
+
+
+def _prepare_linux_ranker_cgroup() -> Path:
+    """Create one empty, aggregate-limited cgroup for one ranker invocation."""
+    parent = _linux_cgroup_root()
+    for _attempt in range(8):
+        boundary = parent / (
+            f"rank-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
+        )
+        try:
+            boundary.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise OSError("could not create the Tenets cgroup boundary") from exc
+    else:
+        raise OSError("could not allocate a unique Tenets cgroup boundary")
+    try:
+        required = (
+            "cgroup.procs", "cgroup.events", "cgroup.kill",
+            "memory.max", "memory.oom.group", "pids.max",
+        )
+        if any(not (boundary / name).is_file() for name in required):
+            raise OSError("the delegated cgroup lacks required controls")
+        _write_cgroup_control(boundary / "memory.max", str(MAX_RANKER_MEMORY_BYTES))
+        _write_cgroup_control(boundary / "memory.oom.group", "1")
+        _write_cgroup_control(boundary / "pids.max", str(MAX_RANKER_PROCESSES))
+        swap_limit = boundary / "memory.swap.max"
+        if swap_limit.is_file():
+            _write_cgroup_control(swap_limit, "0")
+        return boundary
+    except Exception:
+        try:
+            boundary.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _join_linux_ranker_cgroup(boundary: Path) -> None:
+    """Move the trusted supervisor into the prepared boundary before Tenets."""
+    try:
+        (boundary / "cgroup.procs").write_text(
+            f"{os.getpid()}\n", encoding="ascii"
+        )
+        members = set((boundary / "cgroup.procs").read_text(
+            encoding="ascii").split())
+    except OSError as exc:
+        raise OSError("the Tenets cgroup membership cannot be verified") from exc
+    if str(os.getpid()) not in members:
+        raise OSError("the Tenets supervisor did not enter its cgroup")
+
+
+def _kill_linux_ranker_cgroup(boundary: Path) -> None:
+    """Atomically terminate every task still in the job-scoped boundary."""
+    try:
+        (boundary / "cgroup.kill").write_text("1\n", encoding="ascii")
+    except OSError as exc:
+        raise OSError("could not atomically kill the Tenets cgroup") from exc
+
+
+def _linux_ranker_cgroup_populated(boundary: Path) -> bool:
+    """Return the kernel's membership state for one invocation boundary."""
+    try:
+        rows = {}
+        for line in (boundary / "cgroup.events").read_text(
+                encoding="ascii").splitlines():
+            key, separator, value = line.partition(" ")
+            if separator:
+                rows[key] = value.strip()
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise OSError("the Tenets cgroup membership cannot be inspected") from exc
+    if rows.get("populated") not in {"0", "1"}:
+        raise OSError("the Tenets cgroup reported an invalid membership state")
+    return rows["populated"] == "1"
+
+
+def _cleanup_linux_ranker_cgroup(boundary: Path) -> None:
+    """Remove an empty invocation boundary; never hide a populated one."""
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            if not _linux_ranker_cgroup_populated(boundary):
+                boundary.rmdir()
+                return
+        except FileNotFoundError:
+            return
+        if time.monotonic() >= deadline:
+            raise OSError("the Tenets cgroup is still populated")
+        time.sleep(0.01)
+
+
+def _finalize_linux_ranker_cgroup(boundary: Path) -> None:
+    """Prove a supervisor's cgroup empty, killing it atomically if necessary.
+
+    A reaped supervisor is not itself cleanup evidence: it may have returned
+    125 because procfs inventory or pidfd signalling failed while a
+    session-escaped descendant remained alive. The parent therefore retains
+    the kernel cgroup handle and independently verifies membership after every
+    exit path.
+    """
+    try:
+        populated = _linux_ranker_cgroup_populated(boundary)
+    except FileNotFoundError:
+        return
+    except OSError:
+        # If membership cannot be proven empty, fail toward containment.  A
+        # successful cgroup.kill is safe on an empty boundary and covers every
+        # task atomically if the supervisor left descendants behind.
+        _kill_linux_ranker_cgroup(boundary)
+    else:
+        if populated:
+            _kill_linux_ranker_cgroup(boundary)
+    _cleanup_linux_ranker_cgroup(boundary)
 
 
 def _linux_direct_child_pids() -> tuple[int, ...]:
@@ -665,16 +855,33 @@ def _terminate_linux_supervisor_children(timeout_seconds: float = 2.0) -> bool:
     return not _linux_direct_child_pids()
 
 
-def _linux_supervise_command(command: Sequence[str]) -> int:
+def _linux_supervise_command(
+    command: Sequence[str],
+    *,
+    cgroup_boundary: Path,
+    expected_parent_pid: int,
+    max_runtime_seconds: float,
+) -> int:
     """Run one command behind a subreaper that owns orphaned descendants.
 
     This function executes only in the isolated supervisor subprocess started
     below. Keeping the subreaper out of the long-lived FlexFactor process
     avoids adopting or signalling unrelated concurrent tools.
     """
-    if not command:
+    if (not command or expected_parent_pid <= 1
+            or not math.isfinite(max_runtime_seconds)
+            or max_runtime_seconds <= 0):
         return 125
+    received_signal: list[int | None] = [None]
+
+    def _request_stop(signum, _frame) -> None:
+        received_signal[0] = int(signum)
+
+    for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(handled, _request_stop)
     try:
+        _enable_linux_parent_death_signal(expected_parent_pid)
+        _join_linux_ranker_cgroup(cgroup_boundary)
         _enable_linux_child_subreaper()
         # Prove procfs inventory is available before any optional ranker code
         # executes. Without it the supervisor cannot safely enumerate adoptees.
@@ -684,21 +891,14 @@ def _linux_supervise_command(command: Sequence[str]) -> int:
         # of the containment boundary.
         self_pidfd = os.pidfd_open(os.getpid())
         os.close(self_pidfd)
-        # Apply the limits in this short-lived supervisor. They are inherited
-        # by the ranker and every descendant without constraining FlexFactor's
-        # primary audit process.
-        _apply_linux_ranker_resource_limits()
+        # Aggregate memory/process ceilings come from the cgroup. RLIMIT_FSIZE
+        # remains useful for each file a descendant may open in isolation.
+        _apply_linux_ranker_file_limit()
     except OSError as exc:
         print(f"flexfactor Tenets containment unavailable: {exc}", file=sys.stderr)
         return 125
-
-    received_signal: list[int | None] = [None]
-
-    def _request_stop(signum, _frame) -> None:
-        received_signal[0] = int(signum)
-
-    for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(handled, _request_stop)
+    if received_signal[0] is not None:
+        return 128 + received_signal[0]
     try:
         child = subprocess.Popen(tuple(command), shell=False)
     except OSError as exc:
@@ -706,7 +906,12 @@ def _linux_supervise_command(command: Sequence[str]) -> int:
         return 125
 
     stop_started: float | None = None
+    supervisor_deadline = time.monotonic() + max_runtime_seconds
+    deadline_expired = False
     while True:
+        if time.monotonic() >= supervisor_deadline and received_signal[0] is None:
+            received_signal[0] = signal.SIGTERM
+            deadline_expired = True
         requested = received_signal[0]
         if requested is not None:
             if stop_started is None:
@@ -726,21 +931,25 @@ def _linux_supervise_command(command: Sequence[str]) -> int:
         except subprocess.TimeoutExpired:
             continue
 
+    result = 125
     try:
         cleaned = _terminate_linux_supervisor_children()
     except OSError as exc:
         print(f"flexfactor could not verify Tenets descendant cleanup: {exc}",
               file=sys.stderr)
-        return 125
+        cleaned = False
     if not cleaned:
         print("flexfactor could not terminate every Tenets descendant",
               file=sys.stderr)
-        return 125
-    if received_signal[0] is not None:
-        return 128 + received_signal[0]
-    if returncode < 0:
-        return 128 + abs(returncode)
-    return min(returncode, 255)
+    elif deadline_expired:
+        result = 124
+    elif received_signal[0] is not None:
+        result = 128 + received_signal[0]
+    elif returncode < 0:
+        result = 128 + abs(returncode)
+    else:
+        result = min(returncode, 255)
+    return result
 
 
 def _read_bounded_pipe(
@@ -788,7 +997,8 @@ def _read_bounded_pipe(
 
 
 def _terminate_process_tree(
-    process: subprocess.Popen[bytes], *, windows_job: int | None = None
+    process: subprocess.Popen[bytes], *, windows_job: int | None = None,
+    linux_cgroup: Path | None = None,
 ) -> None:
     """Stop the ranker and every helper it created.
 
@@ -849,22 +1059,18 @@ def _terminate_process_tree(
             process.send_signal(signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 3
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         if process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-        # If the supervisor was force‑killed or exited before completing its
-        # pidfd‑based cleanup, there may still be retained process‑group
-        # members. Best‑effort: kill the group if it remains.
-        if _posix_process_group_alive(process.pid):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+            if linux_cgroup is None:
+                raise OSError(
+                    "cannot escalate Linux Tenets cleanup without its cgroup"
+                )
+            # Killing only the subreaper would orphan a setsid() helper. The
+            # cgroup kill control is the one atomic handle that covers the
+            # supervisor, direct ranker, and every descendant together.
+            _kill_linux_ranker_cgroup(linux_cgroup)
     else:
         # The group can outlive its leader.  Address the retained PGID even
         # when Popen.poll() already reports that the direct process exited.
@@ -918,6 +1124,7 @@ def _run_bounded_process(
         raise ValueError("output limits must be positive")
     process_group: dict[str, Any]
     process_command = tuple(str(part) for part in command)
+    linux_cgroup: Path | None = None
     if os.name == "nt":
         process_group = {
             # CREATE_SUSPENDED closes the launch/assignment race: no ranker or
@@ -928,6 +1135,7 @@ def _run_bounded_process(
             ),
         }
     elif sys.platform.startswith("linux"):
+        linux_cgroup = _prepare_linux_ranker_cgroup()
         process_group = {"start_new_session": True}
         # The target shares this new session, but cannot escape cleanup by
         # creating another one: after it exits, the dedicated Linux subreaper
@@ -938,6 +1146,12 @@ def _run_bounded_process(
             "-S",
             str(Path(__file__).resolve(strict=True)),
             "--_linux-subprocess-supervisor",
+            "--cgroup",
+            str(linux_cgroup),
+            "--parent-pid",
+            str(os.getpid()),
+            "--max-runtime",
+            str(timeout_seconds + 5.0),
             "--",
             *process_command,
         )
@@ -1020,13 +1234,19 @@ def _run_bounded_process(
         timed_out = False
         while process.poll() is None:
             if overflow_event.wait(timeout=0.02):
-                _terminate_process_tree(process, windows_job=windows_job)
+                _terminate_process_tree(
+                    process, windows_job=windows_job,
+                    linux_cgroup=linux_cgroup,
+                )
                 tree_closed = True
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
-                _terminate_process_tree(process, windows_job=windows_job)
+                _terminate_process_tree(
+                    process, windows_job=windows_job,
+                    linux_cgroup=linux_cgroup,
+                )
                 tree_closed = True
                 break
             try:
@@ -1034,13 +1254,20 @@ def _run_bounded_process(
             except subprocess.TimeoutExpired:
                 continue
 
-        # A reaped Linux supervisor has already verified its adopted-child set
-        # is empty. Its numeric PID/PGID is now recyclable and must not be
-        # signalled. Windows Job Objects, by contrast, remain the authoritative
-        # descendant handle after their leader exits and must always be closed.
+        # A reaped Linux supervisor's numeric PID/PGID is now recyclable and
+        # must not be signalled. Its retained cgroup is independently verified
+        # in finally below, because exit 125 can mean supervisor cleanup failed.
+        # Windows Job Objects remain the authoritative descendant handle after
+        # their leader exits and must always be closed.
         if not tree_closed:
-            _terminate_process_tree(process, windows_job=windows_job)
-            tree_closed = True
+            if sys.platform.startswith("linux") and process.poll() is not None:
+                tree_closed = True
+            else:
+                _terminate_process_tree(
+                    process, windows_job=windows_job,
+                    linux_cgroup=linux_cgroup,
+                )
+                tree_closed = True
         reader_deadline = time.monotonic() + 3
         for reader in started_readers:
             reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
@@ -1067,11 +1294,17 @@ def _run_bounded_process(
                     sys.platform.startswith("linux")
                     and process.poll() is not None
                 ):
-                    _terminate_process_tree(process, windows_job=windows_job)
+                    _terminate_process_tree(
+                        process, windows_job=windows_job,
+                        linux_cgroup=linux_cgroup,
+                    )
             except Exception:
                 try:
                     if process.poll() is None:
-                        process.kill()
+                        if linux_cgroup is not None:
+                            _kill_linux_ranker_cgroup(linux_cgroup)
+                        else:
+                            process.kill()
                 except Exception:
                     pass
             tree_closed = True
@@ -1080,6 +1313,12 @@ def _run_bounded_process(
         for reader in started_readers:
             if reader.is_alive():
                 reader.join(timeout=1)
+        if linux_cgroup is not None:
+            # Supervisor exit is not proof of descendant cleanup: it reports
+            # status 125 when its procfs/pidfd cleanup cannot be verified.  The
+            # parent owns an independent kernel boundary and must prove it
+            # empty (or atomically kill it) before releasing that handle.
+            _finalize_linux_ranker_cgroup(linux_cgroup)
 
 
 def _isolated_tenets_environment(project_root: Path, isolation_root: Path) -> dict[str, str]:
@@ -1322,6 +1561,17 @@ _CACHE_SKIP_DIRECTORIES = frozenset({
 })
 
 
+def _entry_is_traversal_boundary(entry: os.DirEntry[str], stat_result: os.stat_result) -> bool:
+    """Treat every link/reparse directory as data, never as a walk edge."""
+    if entry.is_symlink():
+        return True
+    attributes = int(getattr(stat_result, "st_file_attributes", 0) or 0)
+    if attributes & int(getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+        return True
+    is_junction = getattr(entry, "is_junction", None)
+    return bool(callable(is_junction) and is_junction())
+
+
 def _repository_state_fingerprint(project_root: Path) -> str:
     """Fingerprint reviewable tree metadata so post-mutation rankings expire.
 
@@ -1345,26 +1595,22 @@ def _repository_state_fingerprint(project_root: Path) -> str:
             path = Path(entry.path)
             relative = path.relative_to(project_root).as_posix()
             try:
-                st = entry.stat(follow_symlinks=False)
+                stat = entry.stat(follow_symlinks=False)
                 digest.update(
                     (
-                        f"{relative}\0{st.st_mode}\0{st.st_size}\0"
-                        f"{st.st_mtime_ns}\0{st.st_ctime_ns}\n"
+                        f"{relative}\0{stat.st_mode}\0{stat.st_size}\0"
+                        f"{stat.st_mtime_ns}\0{stat.st_ctime_ns}\n"
                     ).encode("utf-8", errors="surrogateescape")
                 )
-                if entry.is_symlink():
-                    digest.update(
-                        os.readlink(path).encode("utf-8", errors="surrogateescape")
-                    )
-                elif entry.is_dir(follow_symlinks=False) and entry.name not in _CACHE_SKIP_DIRECTORIES:
-                    # On Windows, directory junctions (reparse-point directories)
-                    # are not reported as symlinks; treat them as non-traversable
-                    # to prevent the walk from leaving the repository root.
-                    if os.name == "nt":
-                        attrs = getattr(st, "st_file_attributes", 0)
-                        reparse = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
-                        if attrs & reparse:
-                            continue
+                if _entry_is_traversal_boundary(entry, stat):
+                    try:
+                        target = os.readlink(path)
+                    except OSError:
+                        target = "[reparse-boundary]"
+                    digest.update(target.encode(
+                        "utf-8", errors="surrogateescape"))
+                elif entry.is_dir(follow_symlinks=False) \
+                        and entry.name not in _CACHE_SKIP_DIRECTORIES:
                     pending.append(path)
             except OSError as exc:
                 digest.update(
@@ -1420,16 +1666,52 @@ def _program_identity(value: str | os.PathLike[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
+def _resolved_cli_program_dir(program: str) -> Path | None:
+    """Resolve every CLI-supported program form through FlexFactor's resolver."""
+    try:
+        import flexfactor
+
+        resolver = getattr(flexfactor, "resolve_project_dir", None)
+        if not callable(resolver):
+            return None
+        cleaned = str(program or "").strip().strip('"')
+        if not cleaned:
+            return None
+        hint = cleaned.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        hint = re.sub(r"\.lnk$", "", hint, flags=re.IGNORECASE)
+        resolved = resolver(cleaned, hint)
+        if not resolved:
+            return None
+        candidate = Path(resolved).expanduser().resolve(strict=True)
+        return candidate if candidate.is_dir() else None
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+
+
 def _program_candidates(programs: Sequence[str]) -> list[tuple[int, str, str, str]]:
     candidates: list[tuple[int, str, str, str]] = []
     for index, program in enumerate(programs):
-        candidate = Path(program).expanduser()
-        try:
-            candidate_full = os.path.normcase(str(candidate.resolve(strict=False)))
-        except OSError:
-            candidate_full = os.path.normcase(str(candidate.absolute()))
+        resolved = _resolved_cli_program_dir(program)
+        cleaned = str(program or "").strip().strip('"')
+        if resolved is not None:
+            candidate_full = os.path.normcase(str(resolved))
+            identity = _program_identity(program)
+        else:
+            # A URL, shortcut, or path-like alias has an authoritative resolver.
+            # If that resolver rejects it, its coincidental trailing basename
+            # must not fall through to another checkout's owner prompt.  Keep
+            # the historical normalized-name fallback only for a genuinely
+            # fuzzy display name such as "Family Stewardship".
+            structured_alias = (
+                cleaned.casefold().startswith(("http://", "https://"))
+                or cleaned.casefold().endswith(".lnk")
+                or "/" in cleaned
+                or "\\" in cleaned
+            )
+            candidate_full = ""
+            identity = "" if structured_alias else _program_identity(program)
         candidates.append(
-            (index, program, candidate_full, _program_identity(program))
+            (index, program, candidate_full, identity)
         )
     return candidates
 
@@ -1442,8 +1724,10 @@ def _matching_program_index(
     candidates = _program_candidates(programs)
     exact = [index for index, _program, full, _identity in candidates
              if full == root_full]
-    if exact:
+    if len(exact) == 1:
         return exact[0]
+    if exact:
+        return None
     root_identity = _program_identity(root.name)
     identity_matches = [
         index for index, _program, _full, identity in candidates
@@ -1489,6 +1773,22 @@ def _default_task(mode: str) -> str:
     )
 
 
+def _durable_guidance_task(project: str | os.PathLike[str]) -> str | None:
+    """Load exact-project standing owner guidance before using generic scope."""
+    try:
+        import flexfactor_steering
+
+        guidance = flexfactor_steering.get_guidance_for_project(
+            str(Path(project).expanduser().resolve(strict=True))
+        )
+    except (ImportError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(guidance, Mapping):
+        return None
+    prompt = str(guidance.get("prompt") or "").strip()
+    return prompt or None
+
+
 def _argv_task(
     argv: Sequence[str] | None,
     *,
@@ -1528,12 +1828,16 @@ def _argv_task(
             selected = _matching_program_index(programs, project)
             if selected is not None and selected < len(guiding_prompts):
                 return guiding_prompts[selected]
-        if len(guiding_prompts) == 1:
+        elif len(guiding_prompts) == 1:
             return guiding_prompts[0]
 
     goals = _argv_values(args, "--goal")
     if goals:
         return goals[0]
+    if project is not None:
+        durable = _durable_guidance_task(project)
+        if durable:
+            return durable
     return _default_task(mode)
 
 def _infer_project_root(args: Sequence[Any], kwargs: Mapping[str, Any]) -> Path | None:
@@ -1758,7 +2062,31 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     return 0 if result.status == "ok" or not args.strict else 1
 
 
+def _run_linux_supervisor_cli(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--cgroup", required=True)
+    parser.add_argument("--parent-pid", required=True, type=int)
+    parser.add_argument("--max-runtime", required=True, type=float)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    try:
+        args = parser.parse_args(list(argv))
+        boundary = Path(args.cgroup).resolve(strict=True)
+        system_root = Path("/sys/fs/cgroup").resolve(strict=True)
+        boundary.relative_to(system_root)
+        command = list(args.command)
+        if command[:1] == ["--"]:
+            command = command[1:]
+    except (OSError, ValueError, SystemExit):
+        return 125
+    return _linux_supervise_command(
+        command,
+        cgroup_boundary=boundary,
+        expected_parent_pid=args.parent_pid,
+        max_runtime_seconds=args.max_runtime,
+    )
+
+
 if __name__ == "__main__":
-    if sys.argv[1:3] == ["--_linux-subprocess-supervisor", "--"]:
-        raise SystemExit(_linux_supervise_command(sys.argv[3:]))
+    if sys.argv[1:2] == ["--_linux-subprocess-supervisor"]:
+        raise SystemExit(_run_linux_supervisor_cli(sys.argv[2:]))
     raise SystemExit(run_cli())

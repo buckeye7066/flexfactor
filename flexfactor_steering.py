@@ -184,8 +184,17 @@ def _alias_forms(program: str, project_dir: str) -> set[str]:
     return {form for form in forms if form}
 
 
+def _strip_list_marker(segment: str) -> str:
+    """Remove a real leading list marker while preserving item content."""
+    value = segment.strip()
+    # A marker is structural only when whitespace separates it from its text.
+    # Without that boundary, decimal/model numbers and negative values are
+    # legitimate content (for example, "3.5 ton" or "-20 degree").
+    return re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", value)
+
+
 def _mentions(segment: str, aliases: list[set[str]]) -> list[int]:
-    addressed = re.sub(r"^(?:[-*+]|\d+[.)])\s*", "", segment.strip())
+    addressed = _strip_list_marker(segment)
     colon = addressed.find(":")
     header = addressed[:colon] if 0 < colon <= 120 else ""
     if header:
@@ -411,6 +420,50 @@ def get_guidance(program: str, project_dir: str, *,
         "source": str(row.get("source") or "unknown")[:40],
         "updated_at": str(row.get("updated_at") or ""),
     }
+
+
+def get_guidance_for_project(project_dir: str, *,
+                             root: str | None = None) -> dict | None:
+    """Return the newest valid standing guidance for one exact directory.
+
+    Early launch adapters know the resolved checkout before ``run_one_audit``
+    has recovered its display name. Guidance identity historically includes
+    both values, so guessing the display name would silently drop a saved owner
+    instruction. Scan only the private bounded guidance directory, then route
+    every candidate back through ``get_guidance`` so a renamed, forged, large,
+    symlinked, or mismatched record cannot become authority.
+    """
+    guidance_root = os.path.join(root or DEFAULT_ROOT, "guidance")
+    try:
+        entries = sorted(os.scandir(guidance_root), key=lambda item: item.name)
+    except OSError:
+        return None
+    matches: list[dict] = []
+    for entry in entries[:5000]:
+        if (not re.fullmatch(r"[0-9a-f]{32}\.json", entry.name)
+                or not entry.is_file(follow_symlinks=False)):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+            if info.st_size > MAX_RECORD_BYTES:
+                continue
+            with open(entry.path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, TypeError, ValueError):
+            continue
+        program = str(raw.get("program") or "").strip() if isinstance(raw, dict) else ""
+        if not program:
+            continue
+        expected_path = os.path.normcase(os.path.abspath(
+            guidance_path(program, project_dir, root)))
+        if os.path.normcase(os.path.abspath(entry.path)) != expected_path:
+            continue
+        validated = get_guidance(program, project_dir, root=root)
+        if validated is not None:
+            matches.append(validated)
+    if not matches:
+        return None
+    return max(matches, key=lambda row: (row.get("updated_at", ""), row["program"]))
 
 
 def clear_guidance(program: str, project_dir: str, *, root: str | None = None) -> bool:

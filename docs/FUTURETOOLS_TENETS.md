@@ -54,10 +54,10 @@ and writes a deterministic JSON manifest under:
 ~/.flexfactor/context/<project>-<path-hash>/tenets-context.json
 ```
 
-For machine-readable ranking, the adapter gives Tenets an isolated temporary
-`--output` file and reads that bounded JSON file after the CLI exits. This avoids
-TTY/console-output differences across Windows and Linux while keeping the real
-pinned Tenets CLI in the execution path.
+For machine-readable ranking, the adapter drains Tenets' stdout concurrently,
+enforces an 8 MiB ceiling, and parses that bounded JSON only after the CLI
+exits. It never gives the optional process a separately writable result file.
+The temporary directory is solely its isolated working directory and home.
 
 The Tenets process also starts in that temporary directory rather than in the
 audited checkout. Its home, configuration, cache, and data directories are
@@ -72,7 +72,23 @@ read-only ranking input.
 
 Writing outside the target repository is deliberate: generating context must
 not make a clean repository dirty and trip FlexFactor's own dirty-tree gate.
-Use `--output` to select another evidence path.
+`FLEXFACTOR_STATE_DIR` and an explicit `--output` are rejected when their
+resolved evidence path is inside the audited repository.
+
+Linux additionally requires `FLEXFACTOR_TENETS_CGROUP_ROOT` to name a real,
+owner-delegated cgroup-v2 directory with `memory`, `pids`, and `cgroup.kill`
+controls. Each ranking gets a fresh child cgroup capped at 1 GiB and 64 tasks.
+If that aggregate job boundary is unavailable, ranking degrades without
+launching Tenets and the canonical FlexFactor sweep continues unchanged.
+Windows uses the equivalent aggregate memory/task limits on its Job Object.
+
+This is a resource and process-lifecycle boundary for the exact pinned,
+installation-owned Tenets package; Linux cgroup delegation is not a privilege
+sandbox against malicious code already running as the same operating-system
+user. FlexFactor never executes code from the audited repository, strips
+ambient executable/import lookup, and refuses an unowned or wrong-version
+ranker. Environments that treat the ranker itself as hostile must additionally
+run FlexFactor behind a dedicated OS identity or privileged sandbox broker.
 
 Desktop launches resolve `tenets.exe` beside the selected virtual-environment
 Python before consulting the ambient `PATH`. This matches FlexFactor's
@@ -100,10 +116,12 @@ identity after the direct ranker exits, adopts orphan helpers even when they
 called `setsid()`, and terminates every adoptee before closing its output pipes.
 On Windows, the ranker starts suspended, is assigned to a kill-on-close Job
 Object, and only then resumes, so no helper can escape in the
-launch-to-containment interval. The Linux supervisor applies inherited kernel
-address-space, process-count, and file-size limits before it launches Tenets;
-the Windows Job Object applies an aggregate memory limit and active-process
-limit. Other POSIX systems do not provide either
+launch-to-containment interval. The Linux supervisor enters a fresh delegated
+cgroup-v2 boundary before it launches Tenets; that boundary applies aggregate
+memory and task limits and supplies atomic whole-tree kill. A parent-death
+signal plus an independent supervisor deadline cover abrupt FlexFactor exit.
+The Windows Job Object applies equivalent aggregate memory and active-process
+limits. Other POSIX systems do not provide either
 boundary through Python's supported process API; FlexFactor therefore records
 Tenets as degraded and does not launch it there instead of claiming an
 escapable process group as containment. Timeouts must be positive finite

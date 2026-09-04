@@ -107,6 +107,21 @@ class SteeringTests(unittest.TestCase):
         self.assertNotIn("add exports", by_name["Target"])
         self.assertIn("add exports", by_name["Other"])
 
+    def test_numeric_and_hyphenated_item_prefixes_are_not_list_markers(self):
+        for item in (
+            "3.5 ton air conditioner",
+            "5.11 tactical boots",
+            "-20 degree medical freezer",
+        ):
+            with self.subTest(item=item):
+                self.assertEqual(item, fs._strip_list_marker(item))
+
+        # Real unordered and numbered markers retain their routing semantics.
+        self.assertEqual("5 ton air conditioner",
+                         fs._strip_list_marker("- 5 ton air conditioner"))
+        self.assertEqual("11 tactical boots",
+                         fs._strip_list_marker("1. 11 tactical boots"))
+
     def test_short_names_and_address_positions_are_supported(self):
         db = os.path.join(self.root, "DB")
         os.makedirs(db)

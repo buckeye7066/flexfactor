@@ -18,6 +18,8 @@ jobs:
   adapter-tests:
     name: adapter-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      FLEXFACTOR_TENETS_CGROUP_ROOT: /sys/fs/cgroup/flexfactor-tenets-adapter-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +31,24 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Delegate aggregate Linux ranker limits
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          parent=$(dirname "$FLEXFACTOR_TENETS_CGROUP_ROOT")
+          for controller in memory pids; do
+            grep -qw "$controller" "$parent/cgroup.controllers"
+            if ! grep -qw "$controller" "$parent/cgroup.subtree_control"; then
+              printf '+%s\n' "$controller" | sudo tee "$parent/cgroup.subtree_control" >/dev/null
+            fi
+          done
+          sudo mkdir "$FLEXFACTOR_TENETS_CGROUP_ROOT"
+          sudo chown "$(id -u):$(id -g)" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.procs" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
+          printf '+memory\n+pids\n' \
+            > "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
       - name: Compile and run hermetic adapter tests
         shell: bash
         env:
@@ -47,6 +67,8 @@ jobs:
   live-tenets:
     name: live-tenets (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      FLEXFACTOR_TENETS_CGROUP_ROOT: /sys/fs/cgroup/flexfactor-tenets-live-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +80,24 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Delegate aggregate Linux ranker limits
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          parent=$(dirname "$FLEXFACTOR_TENETS_CGROUP_ROOT")
+          for controller in memory pids; do
+            grep -qw "$controller" "$parent/cgroup.controllers"
+            if ! grep -qw "$controller" "$parent/cgroup.subtree_control"; then
+              printf '+%s\n' "$controller" | sudo tee "$parent/cgroup.subtree_control" >/dev/null
+            fi
+          done
+          sudo mkdir "$FLEXFACTOR_TENETS_CGROUP_ROOT"
+          sudo chown "$(id -u):$(id -g)" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.procs" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
+          printf '+memory\n+pids\n' \
+            > "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
       - name: Install FlexFactor with the pinned Tenets integration
         shell: bash
         run: |

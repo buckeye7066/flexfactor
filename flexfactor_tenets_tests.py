@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import io
+import inspect
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,13 @@ import unittest
 from unittest import mock
 
 import flexfactor_tenets as ft
+
+
+_LIVE_PROCESS_BOUNDARY = (
+    os.name == "nt"
+    or (sys.platform.startswith("linux")
+        and bool(os.environ.get(ft.LINUX_CGROUP_ROOT_ENV, "").strip()))
+)
 
 
 class TenetsContextTests(unittest.TestCase):
@@ -73,6 +83,20 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "tenets")
         self.assertEqual(payload["expected_version"], "0.13.3")
         self.assertEqual(payload["adapter_version"], 2)
+
+    def test_state_and_explicit_evidence_paths_inside_target_are_rejected(self) -> None:
+        unsafe_state = self.root / ".flexfactor-state"
+        with mock.patch.dict(
+            os.environ, {"FLEXFACTOR_STATE_DIR": str(unsafe_state)}, clear=False
+        ), mock.patch.object(ft, "_find_tenets_executable") as finder:
+            with self.assertRaisesRegex(ValueError, "outside the audited repository"):
+                ft.generate_tenets_context(self.root, "audit")
+        finder.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "outside the audited repository"):
+            ft.generate_tenets_context(
+                self.root, "audit", output=self.root / "tenets-context.json"
+            )
+        self.assertFalse(unsafe_state.exists())
 
     def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
         failures = (
@@ -256,8 +280,8 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(result.status, "degraded")
         self.assertIn("timeout", result.message)
 
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "Linux supervisor lifecycle contract")
+    @unittest.skipUnless(_LIVE_PROCESS_BOUNDARY,
+                         "live aggregate process boundary is unavailable")
     def test_interrupt_cleans_ranker_before_propagating(self) -> None:
         survivor_file = Path(self.temp.name) / "interrupted-ranker-survived"
         script = (
@@ -276,6 +300,8 @@ class TenetsContextTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(survivor_file.exists())
 
+    @unittest.skipUnless(_LIVE_PROCESS_BOUNDARY,
+                         "live aggregate process boundary is unavailable")
     def test_oversized_output_is_terminated_and_bounded_for_both_streams(self) -> None:
         scripts = {
             "stdout": "import sys; sys.stdout.buffer.write(b'x' * 4096); sys.stdout.flush()",
@@ -303,15 +329,18 @@ class TenetsContextTests(unittest.TestCase):
         process.pid = 424242
         process.wait.side_effect = subprocess.TimeoutExpired("tenets", 2)
 
+        boundary = Path("/sys/fs/cgroup/flexfactor-test")
         with mock.patch.object(ft.os, "killpg") as kill_group, \
              mock.patch.object(ft, "_posix_process_group_alive", return_value=True), \
+             mock.patch.object(ft, "_kill_linux_ranker_cgroup") as kill_cgroup, \
              mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 4.0]):
-            ft._terminate_process_tree(process)
+            ft._terminate_process_tree(process, linux_cgroup=boundary)
 
         kill_group.assert_not_called()
         process.send_signal.assert_called_once_with(ft.signal.SIGTERM)
         process.terminate.assert_not_called()
-        process.kill.assert_called_once_with()
+        process.kill.assert_not_called()
+        kill_cgroup.assert_called_once_with(boundary)
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "Linux supervisor lifecycle contract")
@@ -324,8 +353,8 @@ class TenetsContextTests(unittest.TestCase):
         process.send_signal.assert_not_called()
         process.kill.assert_not_called()
 
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "Linux descendant lifecycle contract")
+    @unittest.skipUnless(_LIVE_PROCESS_BOUNDARY,
+                         "live aggregate process boundary is unavailable")
     def test_descendant_is_killed_when_the_direct_ranker_exits_zero(self) -> None:
         survivor_file = Path(self.temp.name) / "descendant-survived"
         script = (
@@ -348,8 +377,8 @@ class TenetsContextTests(unittest.TestCase):
         time.sleep(1.2)
         self.assertFalse(survivor_file.exists())
 
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "Linux child-subreaper containment contract")
+    @unittest.skipUnless(_LIVE_PROCESS_BOUNDARY,
+                         "live aggregate process boundary is unavailable")
     def test_setsid_descendant_cannot_escape_after_ranker_exits_zero(self) -> None:
         survivor_file = Path(self.temp.name) / "setsid-descendant-survived"
         script = (
@@ -372,13 +401,14 @@ class TenetsContextTests(unittest.TestCase):
         time.sleep(1.2)
         self.assertFalse(survivor_file.exists())
 
-    @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "Linux child-subreaper containment contract")
+    @unittest.skipUnless(_LIVE_PROCESS_BOUNDARY,
+                         "live aggregate process boundary is unavailable")
     def test_timeout_cleans_ranker_and_helper_that_both_escape_session(self) -> None:
         survivor_file = Path(self.temp.name) / "timeout-setsid-survived"
         script = (
             "import os,signal,subprocess,sys,time; "
-            "os.setsid(); signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+            "getattr(os,'setsid',lambda:None)(); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             "subprocess.Popen([sys.executable,'-c',"
             "'import pathlib,sys,time; time.sleep(2); pathlib.Path(sys.argv[1]).write_text(\"alive\"); time.sleep(60)',"
             "sys.argv[1]],start_new_session=True); time.sleep(60)"
@@ -434,6 +464,30 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(job, 9123)
         self.assertEqual(order, ["contain", "resume"])
 
+    def test_windows_launch_is_suspended_before_job_assignment(self) -> None:
+        process = mock.Mock(pid=417, returncode=0)
+        process.poll.return_value = 0
+        process.stdout = io.BytesIO(b"")
+        process.stderr = io.BytesIO(b"")
+        with mock.patch.object(ft.os, "name", "nt"), \
+             mock.patch.object(ft.sys, "platform", "win32"), \
+             mock.patch.object(ft.subprocess, "Popen", return_value=process) as popen, \
+             mock.patch.object(
+                 ft, "_contain_and_resume_windows_process", return_value=9123
+             ) as contain, \
+             mock.patch.object(ft, "_terminate_process_tree"):
+            result = ft._run_bounded_process(
+                ("C:/trusted/tenets.exe", "rank"),
+                cwd=self.root,
+                timeout_seconds=1,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            popen.call_args.kwargs["creationflags"] & 0x00000004,
+            0x00000004,
+        )
+        contain.assert_called_once_with(process)
+
     def test_windows_resume_failure_closes_the_containment_job(self) -> None:
         process = mock.Mock(pid=417)
         with mock.patch.object(
@@ -454,23 +508,210 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(memory_limit, ft.MAX_RANKER_MEMORY_BYTES)
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
-                         "Linux resource-limit contract")
-    def test_linux_supervisor_applies_memory_process_and_file_limits(self) -> None:
+                         "Linux containment contract")
+    def test_linux_uses_cgroup_for_aggregate_limits_and_rlimit_only_for_files(self) -> None:
         fake_resource = types.SimpleNamespace(
-            RLIMIT_AS=1,
-            RLIMIT_NPROC=2,
             RLIMIT_FSIZE=3,
             RLIM_INFINITY=-1,
             getrlimit=mock.Mock(return_value=(-1, -1)),
             setrlimit=mock.Mock(),
         )
         with mock.patch.dict(sys.modules, {"resource": fake_resource}):
-            ft._apply_linux_ranker_resource_limits()
+            ft._apply_linux_ranker_file_limit()
         self.assertEqual(fake_resource.setrlimit.call_args_list, [
-            mock.call(1, (ft.MAX_RANKER_MEMORY_BYTES, ft.MAX_RANKER_MEMORY_BYTES)),
-            mock.call(2, (ft.MAX_RANKER_PROCESSES, ft.MAX_RANKER_PROCESSES)),
             mock.call(3, (ft.MAX_STDOUT_BYTES, ft.MAX_STDOUT_BYTES)),
         ])
+        source = inspect.getsource(ft._prepare_linux_ranker_cgroup)
+        self.assertIn('"memory.max"', source)
+        self.assertIn('"pids.max"', source)
+        self.assertIn('"cgroup.kill"', source)
+        self.assertNotIn("RLIMIT_AS", source)
+        self.assertNotIn("RLIMIT_NPROC", source)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux containment contract")
+    def test_linux_without_delegated_cgroup_never_launches_optional_ranker(self) -> None:
+        with mock.patch.dict(os.environ, {ft.LINUX_CGROUP_ROOT_ENV: ""}), \
+             mock.patch.object(ft.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(OSError, ft.LINUX_CGROUP_ROOT_ENV):
+                ft._run_bounded_process(
+                    (sys.executable, "-c", "print('must not run')"),
+                    cwd=self.root,
+                    timeout_seconds=1,
+                )
+        popen.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux containment contract")
+    def test_reaped_supervisor_cannot_leave_a_populated_cgroup_alive(self) -> None:
+        boundary = Path(self.temp.name) / "ranker-cgroup"
+        boundary.mkdir()
+        events = boundary / "cgroup.events"
+        events.write_text("populated 1\nfrozen 0\n", encoding="ascii")
+        descendant = subprocess.Popen([
+            sys.executable, "-S", "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ])
+
+        def atomic_kill(observed_boundary: Path) -> None:
+            self.assertEqual(observed_boundary, boundary)
+            descendant.kill()
+            descendant.wait(timeout=2)
+            events.write_text("populated 0\nfrozen 0\n", encoding="ascii")
+
+        def kernel_cleanup(observed_boundary: Path) -> None:
+            self.assertEqual(observed_boundary, boundary)
+            self.assertFalse(ft._linux_ranker_cgroup_populated(boundary))
+            # cgroupfs control files are virtual and do not make rmdir report
+            # ENOTEMPTY; remove the fixture's regular stand-in explicitly.
+            events.unlink()
+            boundary.rmdir()
+
+        try:
+            with mock.patch.object(
+                ft, "_kill_linux_ranker_cgroup", side_effect=atomic_kill
+            ) as kill_cgroup, mock.patch.object(
+                ft, "_cleanup_linux_ranker_cgroup", side_effect=kernel_cleanup
+            ) as cleanup_cgroup:
+                # This is the state left when a reaped supervisor reports 125
+                # after its procfs/pidfd descendant inventory failed.
+                ft._finalize_linux_ranker_cgroup(boundary)
+            kill_cgroup.assert_called_once_with(boundary)
+            cleanup_cgroup.assert_called_once_with(boundary)
+            self.assertIsNotNone(descendant.poll())
+            self.assertFalse(boundary.exists())
+        finally:
+            if descendant.poll() is None:
+                descendant.kill()
+                descendant.wait(timeout=2)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux supervisor deadline contract")
+    def test_linux_supervisor_has_an_independent_absolute_deadline(self) -> None:
+        class DeadlineChild:
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def send_signal(self, _signum: int) -> None:
+                self.stopped = True
+                self.returncode = -signal.SIGTERM
+
+            def kill(self) -> None:
+                self.stopped = True
+                self.returncode = -signal.SIGKILL
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.stopped:
+                    assert self.returncode is not None
+                    return self.returncode
+                time.sleep(min(float(timeout or 0), 0.02))
+                raise subprocess.TimeoutExpired("ranker", timeout)
+
+        child = DeadlineChild()
+        started = time.monotonic()
+        with mock.patch.object(ft.signal, "signal"), \
+             mock.patch.object(ft, "_enable_linux_parent_death_signal"), \
+             mock.patch.object(ft, "_join_linux_ranker_cgroup"), \
+             mock.patch.object(ft, "_enable_linux_child_subreaper"), \
+             mock.patch.object(ft, "_linux_direct_child_pids", return_value=()), \
+             mock.patch.object(ft, "_terminate_linux_supervisor_children", return_value=True), \
+             mock.patch.object(ft, "_apply_linux_ranker_file_limit"), \
+             mock.patch.object(ft.os, "pidfd_open", return_value=12345), \
+             mock.patch.object(ft.os, "close"), \
+             mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 1.0, 1.0]), \
+             mock.patch.object(ft.subprocess, "Popen", return_value=child):
+            result = ft._linux_supervise_command(
+                (sys.executable, "-S", "-c", "import time; time.sleep(60)"),
+                cgroup_boundary=Path("/unused-test-cgroup"),
+                expected_parent_pid=4242,
+                max_runtime_seconds=0.05,
+            )
+        self.assertEqual(result, 124, (child.stopped, child.returncode))
+        self.assertLess(time.monotonic() - started, 2)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux parent-death contract")
+    def test_parent_sigkill_stops_ranker_and_setsid_descendant(self) -> None:
+        scripts = Path(self.temp.name) / "parent-death"
+        scripts.mkdir()
+        ready = scripts / "ranker-ready"
+        survivor = scripts / "helper-survived"
+        supervisor_pid_file = scripts / "supervisor.pid"
+        helper_pid_file = scripts / "helper.pid"
+        helper = scripts / "helper.py"
+        helper.write_text(
+            "import os,pathlib,sys,time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "time.sleep(2)\n"
+            "pathlib.Path(sys.argv[2]).write_text('alive')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        ranker = scripts / "ranker.py"
+        ranker.write_text(
+            "import pathlib,signal,subprocess,sys,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "subprocess.Popen([sys.executable,sys.argv[4],sys.argv[3],sys.argv[2]], "
+            "start_new_session=True)\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        supervisor = scripts / "supervisor.py"
+        supervisor.write_text(
+            "import os,pathlib,sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import flexfactor_tenets as ft\n"
+            "ft._join_linux_ranker_cgroup=lambda _path: None\n"
+            "ft._apply_linux_ranker_file_limit=lambda: None\n"
+            "raise SystemExit(ft._linux_supervise_command(\n"
+            " [sys.executable,sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6]],\n"
+            " cgroup_boundary=pathlib.Path('/unused-test-cgroup'),\n"
+            " expected_parent_pid=os.getppid(), max_runtime_seconds=30))\n",
+            encoding="utf-8",
+        )
+        adapter = scripts / "adapter.py"
+        adapter.write_text(
+            "import pathlib,subprocess,sys,time\n"
+            "child=subprocess.Popen([sys.executable,*sys.argv[1:]])\n"
+            "pathlib.Path(sys.argv[-1]).write_text(str(child.pid))\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        module_root = str(Path(ft.__file__).resolve().parent)
+        process = subprocess.Popen([
+            sys.executable, str(adapter), str(supervisor), module_root,
+            str(ranker), str(ready), str(survivor), str(helper_pid_file),
+            str(helper), str(supervisor_pid_file),
+        ])
+        tracked_pids: list[int] = []
+        try:
+            deadline = time.monotonic() + 5
+            while (not all(path.exists() for path in (
+                    ready, supervisor_pid_file, helper_pid_file))
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "ranker never reached contained execution")
+            for path in (supervisor_pid_file, helper_pid_file):
+                tracked_pids.append(int(path.read_text(encoding="utf-8")))
+            process.kill()
+            process.wait(timeout=2)
+            time.sleep(3)
+            self.assertFalse(survivor.exists())
+            for pid in tracked_pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            for pid in tracked_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_ranker_never_runs_from_or_resolves_helpers_through_target(self) -> None:
         target_bin = self.root / "tools"
@@ -647,6 +888,16 @@ class TenetsContextTests(unittest.TestCase):
             ft.cached_tenets_context(self.root, "audit")
         self.assertEqual(generate.call_count, 2)
 
+    def test_windows_reparse_directory_is_a_fingerprint_walk_boundary(self) -> None:
+        entry = mock.Mock()
+        entry.is_symlink.return_value = False
+        entry.is_junction.return_value = False
+        fake_stat = types.SimpleNamespace(st_file_attributes=0x400)
+        with mock.patch.object(
+            ft.stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, create=True
+        ):
+            self.assertTrue(ft._entry_is_traversal_boundary(entry, fake_stat))
+
 
     def test_distribution_version_mismatch_disables_execution(self) -> None:
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
@@ -713,6 +964,27 @@ class TenetsContextTests(unittest.TestCase):
             self.assertEqual(
                 ft._argv_task(["prodready"], project=self.root),
                 "repair the mobile launch path",
+            )
+
+    def test_saved_guidance_drives_future_context_without_repeated_flag(self) -> None:
+        import flexfactor_steering
+
+        guidance_root = Path(self.temp.name) / "standing-guidance"
+        with mock.patch.object(
+            flexfactor_steering, "DEFAULT_ROOT", str(guidance_root)
+        ), mock.patch.dict(os.environ, {
+            "FLEXFACTOR_TENETS_TASK": "",
+            "FLEXFACTOR_SESSION_PROMPT": "",
+            "FLEXFACTOR_GUIDING_PROMPT": "",
+        }, clear=False):
+            flexfactor_steering.set_guidance(
+                "Owner Display Name", str(self.root),
+                "preserve the durable owner workflow",
+            )
+            self.assertEqual(
+                ft._argv_task(["prodready", "--program", "friendly alias"],
+                              project=self.root),
+                "preserve the durable owner workflow",
             )
 
     def test_environment_session_prompt_routes_per_target_before_ranking(self) -> None:
@@ -805,6 +1077,48 @@ class TenetsContextTests(unittest.TestCase):
                 ft._argv_task(argv, project=second),
                 "repair second checkout",
             )
+
+    def test_shortcut_url_file_and_fuzzy_aliases_use_resolved_target_identity(self) -> None:
+        first = self.root.parent / "resolved-one"
+        second = self.root.parent / "resolved-two"
+        first.mkdir()
+        second.mkdir()
+        programs = ["Product.lnk", "https://github.com/acme/second"]
+        argv = [
+            "audit", "--program", programs[0],
+            "--guiding-prompt", "repair shortcut target",
+            "--program", programs[1],
+            "--guiding-prompt", "repair URL target",
+        ]
+        import flexfactor
+
+        def resolve(raw, _hint):
+            return {programs[0]: str(first), programs[1]: str(second)}.get(raw)
+
+        with mock.patch.object(flexfactor, "resolve_project_dir", side_effect=resolve), \
+             mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            self.assertEqual(
+                ft._argv_task(argv, project=second), "repair URL target"
+            )
+
+    def test_rejected_structured_alias_cannot_fall_through_by_basename(self) -> None:
+        target = self.root.parent / "grantflow"
+        target.mkdir()
+        alias = "https://github.com/untrusted/grantflow"
+        argv = [
+            "audit", "--program", alias,
+            "--guiding-prompt", "apply the unrelated repository prompt",
+        ]
+        import flexfactor
+
+        with mock.patch.object(
+            flexfactor, "resolve_project_dir", return_value=None
+        ), mock.patch.dict(
+            os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
+        ):
+            task = ft._argv_task(argv, project=target)
+        self.assertNotIn("unrelated repository prompt", task)
+        self.assertIn("production readiness", task)
 
     def test_ambiguous_program_basename_does_not_guess_a_prompt(self) -> None:
         first = self.root.parent / "one" / "app"
@@ -1024,6 +1338,23 @@ class TenetsInstallTests(unittest.TestCase):
 
 
 class TenetsManifestAndEntryTests(unittest.TestCase):
+    def test_linux_ci_delegates_real_aggregate_cgroup_controls(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parent
+            / ".github" / "workflows" / "tenets-context.yml"
+        ).read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            workflow.count("FLEXFACTOR_TENETS_CGROUP_ROOT:"), 2
+        )
+        self.assertGreaterEqual(
+            workflow.count("Delegate aggregate Linux ranker limits"), 2
+        )
+        for required in (
+            "cgroup.controllers", "cgroup.subtree_control",
+            "printf '+memory\\n+pids\\n'", "sudo chown",
+        ):
+            self.assertIn(required, workflow)
+
     def test_manifest_reviewable_files_are_ranked_without_dropping_members(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

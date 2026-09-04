@@ -532,15 +532,20 @@ _PROCESS_LAUNCH_SITES = {
         "Optional local Tenets 0.13.3 context ranker launches only the exact "
         "console script resolved from the active Python installation after exact "
         "distribution-version validation; the child gets an empty PATH and "
-        "disabled GitPython executable, shell=False, a new process group, and "
-        "bounded time/output."
+        "disabled GitPython executable, shell=False, and bounded time/output. "
+        "Linux requires an aggregate memory/PID-capped cgroup-v2 boundary with "
+        "atomic tree kill before launching a subreaper supervisor. Windows "
+        "starts suspended, joins an aggregate-capped kill-on-close Job Object, "
+        "and only then resumes."
     ),
     "flexfactor_tenets.py::_linux_supervise_command": (
         "Dedicated -I/-S Linux supervisor launch boundary. The parent has "
         "already resolved and version-validated the exact Tenets executable, "
         "supplied the isolated environment and cwd, and bounded time/output. "
-        "Before shell=False Popen, this process enables child-subreaper mode "
-        "and proves procfs inventory so setsid descendants remain owned."
+        "Before shell=False Popen, this process joins its prepared cgroup, "
+        "arms parent-death signalling and an independent deadline, enables "
+        "child-subreaper mode, and proves procfs/pidfd inventory so setsid "
+        "descendants remain owned."
     ),
     "obsidian_memory.py::run_aibus": (
         "Optional owner-memory bridge, independent of the audited target: "
