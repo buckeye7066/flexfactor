@@ -705,20 +705,39 @@ class PurposeContractV2Tests(_TempRepo):
         candidate = self._contract(evidence=[self._evidence(
             kind="schema", locator="src/receipt.py", content_hash=digest,
         )])
-        resolved_source = source.resolve()
-        real_stat = fp.os.stat
+        real_fstat = fp.os.fstat
+        calls = 0
 
-        def replaced(path, *args, **kwargs):
-            observed = real_stat(path, *args, **kwargs)
-            if Path(path) == resolved_source \
-                    and kwargs.get("follow_symlinks") is False:
-                changed = mock.Mock(wraps=observed)
-                changed.st_dev = observed.st_dev
-                changed.st_ino = observed.st_ino + 1
-                return changed
+        class ChangedStat:
+            def __init__(self, original):
+                self._original = original
+                self.st_dev = original.st_dev
+                self.st_ino = original.st_ino + 1
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+            def __getitem__(self, index):
+                return self._original[index]
+
+            def __iter__(self):
+                return iter(self._original)
+
+            def __len__(self):
+                return len(self._original)
+
+        def replaced(descriptor):
+            nonlocal calls
+            observed = real_fstat(descriptor)
+            calls += 1
+            if calls >= 3:
+                return ChangedStat(observed)
             return observed
 
-        with mock.patch.object(fp.os, "stat", side_effect=replaced):
+        # The pathname and handle metadata shapes legitimately differ on
+        # Windows. Simulate an actual directory-entry replacement instead by
+        # changing the identity seen through the independently opened handle.
+        with mock.patch.object(fp.os, "fstat", side_effect=replaced):
             self.assertIsNone(fp._contract_from_registry(
                 candidate, evidence_root=self.root
             ))
@@ -1076,6 +1095,80 @@ class PurposeContractV2Tests(_TempRepo):
 
         self.assertEqual(alias_contract.purpose, "Create the requested receipt.")
         self.assertEqual(path_contract.purpose, "Create the requested receipt.")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_local_evidence_symlink_is_rejected_consistently(self):
+        target = Path(self.root) / "src" / "receipt.py"
+        target.parent.mkdir()
+        target.write_text("trusted\n", encoding="utf-8")
+        link = Path(self.root) / "receipt-evidence"
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        digest = __import__("hashlib").sha256(target.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="source", locator="receipt-evidence", content_hash=digest,
+        )])
+
+        self.assertIsNone(fp._contract_from_registry(
+            candidate, evidence_root=self.root
+        ))
+
+    def test_path_handle_identity_differences_do_not_reject_regular_authority(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        contract_doc = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+        targets = {
+            os.path.normcase(os.path.abspath(str(source))),
+            os.path.normcase(os.path.abspath(
+                os.path.join(self.root, ".flexfactor-purpose.json")
+            )),
+        }
+        real_lstat = fp.os.lstat
+
+        class DivergentPathStat:
+            def __init__(self, original):
+                self._original = original
+                self.st_dev = int(original.st_dev) + 100003
+                self.st_ino = int(original.st_ino) + 100019
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+            def __getitem__(self, index):
+                return self._original[index]
+
+            def __iter__(self):
+                return iter(self._original)
+
+            def __len__(self):
+                return len(self._original)
+
+        def is_target(path) -> bool:
+            try:
+                return os.path.normcase(
+                    os.path.abspath(os.fspath(path))
+                ) in targets
+            except (TypeError, ValueError):
+                return False
+
+        def divergent_lstat(path, *args, **kwargs):
+            value = real_lstat(path, *args, **kwargs)
+            return DivergentPathStat(value) if is_target(path) else value
+
+        with mock.patch.object(fp.os, "lstat", side_effect=divergent_lstat):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+
+        self.assertFalse(rejected)
+        self.assertIsNotNone(contract)
 
     def test_checked_in_contract_passes_runtime_validator(self):
         with open(os.path.join(os.path.dirname(fp.__file__),

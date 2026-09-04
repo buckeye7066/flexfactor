@@ -685,16 +685,56 @@ def _v2_evidence_requires_local_hash(
     ) is None
 
 
-def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
-    """Bind local evidence records to actual contained repository bytes.
+def _stable_handle_identity(value) -> tuple[int, int, int, int, int, int]:
+    """Return identity fields that are comparable across live handles."""
+    return (
+        int(stat.S_IFMT(value.st_mode)),
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
 
-    A syntactically valid 64-character string is not evidence.  Before a v2
-    contract can authorize mutation, every record whose locator denotes local
-    repository bytes must name a regular file inside the audited checkout and
-    its SHA-256 must match the bytes read from that file.  ``kind`` alone never
-    exempts a local documentation/history/runtime record. Missing roots,
-    traversal, symlink escapes, races, and read errors all deny authority.
-    """
+
+def _stable_path_handle_shape(value) -> tuple[int, int]:
+    """Compare pathname metadata to handle metadata without inode assumptions."""
+    return int(stat.S_IFMT(value.st_mode)), int(value.st_size)
+
+
+def _contained_regular_entry(
+    root: Path, relative: Path,
+) -> tuple[Path, object] | None:
+    """Resolve one contained regular file while rejecting every symlink component."""
+    if relative.is_absolute() or relative.drive:
+        return None
+    parts = relative.parts
+    if not parts or any(
+        part in {"", ".", ".."} or "\x00" in part for part in parts
+    ):
+        return None
+    current = root
+    try:
+        entry = None
+        for index, part in enumerate(parts):
+            current = current / part
+            entry = os.lstat(current)
+            if stat.S_ISLNK(entry.st_mode):
+                return None
+            if index < len(parts) - 1:
+                if not stat.S_ISDIR(entry.st_mode):
+                    return None
+            elif not stat.S_ISREG(entry.st_mode):
+                return None
+        resolved = current.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved, entry
+
+
+def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
+    """Bind local evidence records to stable, contained regular-file bytes."""
     records = [
         record for record in (entry.get("evidence") or [])
         if isinstance(record, dict)
@@ -710,6 +750,7 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
         return False
     if not root.is_dir():
         return False
+
     prepared = []
     aggregate_size = 0
     for record in records:
@@ -717,41 +758,36 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
         if not isinstance(locator, str) or not locator.strip():
             return False
         relative = Path(locator.strip())
-        if relative.is_absolute() or relative.drive:
+        prepared_entry = _contained_regular_entry(root, relative)
+        if prepared_entry is None:
             return False
-        try:
-            candidate = (root / relative).resolve(strict=True)
-            candidate.relative_to(root)
-            # Reject a FIFO/device/socket before a blocking open. O_NONBLOCK
-            # below also closes the lstat/open race if an attacker swaps a
-            # regular file for a FIFO after this check.
-            candidate_info = os.lstat(candidate)
-            if not stat.S_ISREG(candidate_info.st_mode):
-                return False
-            if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
-                return False
-            aggregate_size += candidate_info.st_size
-            if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
-                return False
-            prepared.append((record, relative, candidate))
-        except (OSError, ValueError):
+        candidate, candidate_info = prepared_entry
+        if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
             return False
+        aggregate_size += candidate_info.st_size
+        if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+            return False
+        prepared.append((record, relative, candidate, candidate_info))
 
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    flags |= int(getattr(os, "O_NONBLOCK", 0))
     aggregate_opened_size = 0
     aggregate_read = 0
-    for record, relative, candidate in prepared:
+    for record, relative, candidate, candidate_info in prepared:
         try:
-            flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
-            flags |= int(getattr(os, "O_NOFOLLOW", 0))
-            flags |= int(getattr(os, "O_NONBLOCK", 0))
-            descriptor = os.open(candidate, flags)
+            descriptor = os.open(root / relative, flags)
             try:
-                opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode):
+                opened_before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_before.st_mode)
+                    or _stable_path_handle_shape(opened_before)
+                    != _stable_path_handle_shape(candidate_info)
+                ):
                     return False
-                if opened.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                if opened_before.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
                     return False
-                aggregate_opened_size += opened.st_size
+                aggregate_opened_size += opened_before.st_size
                 if aggregate_opened_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
                     return False
                 digest = hashlib.sha256()
@@ -770,21 +806,35 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
                         if aggregate_read > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
                             return False
                         digest.update(chunk)
+                opened_after = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
-            # Resolve again after reading so a concurrently replaced path cannot
-            # turn an outside file into apparently contained evidence.  Also
-            # compare the live directory entry to the descriptor that supplied
-            # the bytes: resolving to the same lexical path is insufficient if
-            # an attacker swaps and restores a parent symlink around open().
-            current = (root / relative).resolve(strict=True)
-            current_info = os.stat(candidate, follow_symlinks=False)
-            if current != candidate or (
-                current_info.st_dev,
-                current_info.st_ino,
-            ) != (
-                opened.st_dev,
-                opened.st_ino,
+
+            current_entry = _contained_regular_entry(root, relative)
+            if current_entry is None:
+                return False
+            current, current_info = current_entry
+            current_descriptor = os.open(root / relative, flags)
+            try:
+                current_opened = os.fstat(current_descriptor)
+            finally:
+                os.close(current_descriptor)
+            latest_entry = _contained_regular_entry(root, relative)
+            if latest_entry is None:
+                return False
+            latest, latest_info = latest_entry
+            if (
+                current != candidate
+                or latest != candidate
+                or not stat.S_ISREG(current_opened.st_mode)
+                or _stable_handle_identity(opened_before)
+                != _stable_handle_identity(opened_after)
+                or _stable_handle_identity(opened_after)
+                != _stable_handle_identity(current_opened)
+                or _stable_path_handle_shape(current_info)
+                != _stable_path_handle_shape(current_opened)
+                or _stable_path_handle_shape(latest_info)
+                != _stable_path_handle_shape(current_opened)
             ):
                 return False
         except (OSError, ValueError):
@@ -1066,54 +1116,73 @@ def _contract_from_repo_lookup(
     for rel in IN_REPO_CONTRACT_FILES:
         unresolved = root / rel
         try:
-            os.lstat(unresolved)
+            authority_entry = os.lstat(unresolved)
         except FileNotFoundError:
             continue
         except OSError:
             return None, True
-        try:
-            path = unresolved.resolve(strict=True)
-        except Exception:
+        if not stat.S_ISREG(authority_entry.st_mode):
             return None, True
-        try:
-            path.relative_to(root)
-        except ValueError:
+        prepared_contract = _contained_regular_entry(root, Path(rel))
+        if prepared_contract is None:
             return None, True
-        try:
-            info = path.stat()
-        except Exception:
-            return None, True
-        if not stat.S_ISREG(info.st_mode):
+        path, info = prepared_contract
+        if (
+            _stable_path_handle_shape(info)
+            != _stable_path_handle_shape(authority_entry)
+        ):
             return None, True
         if info.st_size > IN_REPO_CONTRACT_MAX_BYTES:
             return None, True
+
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        flags |= int(getattr(os, "O_NONBLOCK", 0))
         try:
-            flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
-            flags |= int(getattr(os, "O_NOFOLLOW", 0))
-            flags |= int(getattr(os, "O_NONBLOCK", 0))
-            descriptor = os.open(path, flags)
+            descriptor = os.open(unresolved, flags)
             try:
-                opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode) \
-                        or opened.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+                opened_before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_before.st_mode)
+                    or opened_before.st_size > IN_REPO_CONTRACT_MAX_BYTES
+                    or _stable_path_handle_shape(opened_before)
+                    != _stable_path_handle_shape(info)
+                ):
                     return None, True
-                with os.fdopen(
-                    descriptor, "rb", closefd=False
-                ) as fh:
+                with os.fdopen(descriptor, "rb", closefd=False) as fh:
                     raw = fh.read(IN_REPO_CONTRACT_MAX_BYTES + 1)
                 if len(raw) > IN_REPO_CONTRACT_MAX_BYTES:
                     return None, True
                 body = raw.decode("utf-8")
+                opened_after = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
-            current = unresolved.resolve(strict=True)
-            current_info = os.stat(path, follow_symlinks=False)
-            if current != path or (
-                current_info.st_dev,
-                current_info.st_ino,
-            ) != (
-                opened.st_dev,
-                opened.st_ino,
+
+            current_entry = _contained_regular_entry(root, Path(rel))
+            if current_entry is None:
+                return None, True
+            current, current_info = current_entry
+            current_descriptor = os.open(unresolved, flags)
+            try:
+                current_opened = os.fstat(current_descriptor)
+            finally:
+                os.close(current_descriptor)
+            latest_entry = _contained_regular_entry(root, Path(rel))
+            if latest_entry is None:
+                return None, True
+            latest, latest_info = latest_entry
+            if (
+                current != path
+                or latest != path
+                or not stat.S_ISREG(current_opened.st_mode)
+                or _stable_handle_identity(opened_before)
+                != _stable_handle_identity(opened_after)
+                or _stable_handle_identity(opened_after)
+                != _stable_handle_identity(current_opened)
+                or _stable_path_handle_shape(current_info)
+                != _stable_path_handle_shape(current_opened)
+                or _stable_path_handle_shape(latest_info)
+                != _stable_path_handle_shape(current_opened)
             ):
                 return None, True
         except Exception:
