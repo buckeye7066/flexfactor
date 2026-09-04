@@ -160,18 +160,27 @@ class _TempRepo(unittest.TestCase):
 
 
 class PurposeContractV2Tests(_TempRepo):
+    @staticmethod
+    def _claim(claim_id: str, text: str, confidence: str = "verified",
+               refs: list[int] | None = None) -> dict:
+        return {
+            "id": claim_id,
+            "text": text,
+            "confidence": confidence,
+            "evidence_refs": [0] if refs is None else refs,
+        }
+
     def test_structured_users_and_workflows_populate_runtime_contract(self):
         _w(self.root, ".flexfactor-purpose.json", json.dumps({
             "schema": "flexfactor.purpose_contract.v2",
             "name": "Receipt Maker",
             "purpose": "Turn invoices into receipts.",
             "users": [
-                {"id": "u-1", "text": "Bookkeepers", "confidence": "verified"},
-                {"id": "u-2", "text": "Business owners", "confidence": "verified"},
+                self._claim("u-1", "Bookkeepers"),
+                self._claim("u-2", "Business owners", "supported"),
             ],
             "workflows": [
-                {"id": "w-1", "text": "Upload an invoice and export its receipt.",
-                 "confidence": "verified"},
+                self._claim("w-1", "Upload an invoice and export its receipt."),
             ],
             "acceptance_criteria": ["A receipt can be exported."],
         }))
@@ -189,24 +198,58 @@ class PurposeContractV2Tests(_TempRepo):
         contract = fp._contract_from_registry({
             "name": "Safe",
             "purpose": "Do the safe thing.",
-            "users": [{"id": "u-1", "confidence": "verified"}, 7, "Operator"],
+            "users": [self._claim("u-1", "Operator"), 7],
             "workflows": {"w-1": "Never use mapping keys as prose"},
         })
 
         self.assertEqual(contract.primary_users, [])
         self.assertEqual(contract.core_journeys, [])
 
-    def test_blank_v2_text_rejects_the_whole_section(self):
-        contract = fp._contract_from_registry({
-            "name": "Safe",
-            "purpose": "Do the safe thing.",
-            "users": [
-                {"id": "u-1", "text": "Operator"},
-                {"id": "u-2", "text": "   "},
-            ],
-        })
+    def test_blank_or_incomplete_v2_claim_rejects_the_whole_section(self):
+        for unsafe in (
+            {"id": "u-2", "text": "   ", "confidence": "verified",
+             "evidence_refs": [0]},
+            {"id": "u-2", "text": "Operator", "confidence": "verified"},
+            {"id": "", "text": "Operator", "confidence": "verified",
+             "evidence_refs": [0]},
+            {"id": "u-2", "text": "Operator", "confidence": "verified",
+             "evidence_refs": [-1]},
+        ):
+            with self.subTest(unsafe=unsafe):
+                contract = fp._contract_from_registry({
+                    "name": "Safe",
+                    "purpose": "Do the safe thing.",
+                    "users": [self._claim("u-1", "Bookkeeper"), unsafe],
+                })
+                self.assertEqual(contract.primary_users, [])
 
-        self.assertEqual(contract.primary_users, [])
+    def test_non_authoritative_v2_claim_never_unlocks_an_authored_section(self):
+        for confidence in ("inferred", "contradicted", "unknown", "bogus"):
+            with self.subTest(confidence=confidence):
+                contract = fp._contract_from_registry({
+                    "name": "Safe",
+                    "purpose": "Do the safe thing.",
+                    "users": [self._claim("u-1", "Operator", confidence)],
+                })
+                self.assertEqual(contract.primary_users, [])
+
+    def test_legacy_lists_remain_supported_but_are_also_atomic(self):
+        contract = fp._contract_from_registry({
+            "name": "Legacy",
+            "purpose": "Keep compatibility.",
+            "primary_users": [" Operators ", "Owners"],
+            "users": [self._claim("u-1", "Ignored structured fallback")],
+            "core_journeys": ["Run the complete flow"],
+        })
+        self.assertEqual(contract.primary_users, ["Operators", "Owners"])
+        self.assertEqual(contract.core_journeys, ["Run the complete flow"])
+
+        malformed = fp._contract_from_registry({
+            "name": "Legacy",
+            "purpose": "Keep compatibility.",
+            "primary_users": ["Operator", 7],
+        })
+        self.assertEqual(malformed.primary_users, [])
 
 
 class GatherEvidenceFullFixtureTests(_TempRepo):
