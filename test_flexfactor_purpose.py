@@ -159,6 +159,44 @@ class _TempRepo(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+class PurposeContractV2Tests(_TempRepo):
+    def test_structured_users_and_workflows_populate_runtime_contract(self):
+        _w(self.root, ".flexfactor-purpose.json", json.dumps({
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Receipt Maker",
+            "purpose": "Turn invoices into receipts.",
+            "users": [
+                {"id": "u-1", "text": "Bookkeepers", "confidence": "verified"},
+                {"id": "u-2", "text": "Business owners", "confidence": "verified"},
+            ],
+            "workflows": [
+                {"id": "w-1", "text": "Upload an invoice and export its receipt.",
+                 "confidence": "verified"},
+            ],
+            "acceptance_criteria": ["A receipt can be exported."],
+        }))
+
+        contract = fp.find_contract("Receipt Maker", self.root, registry={})
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.primary_users, ["Bookkeepers", "Business owners"])
+        self.assertEqual(
+            contract.core_journeys,
+            ["Upload an invoice and export its receipt."],
+        )
+
+    def test_malformed_v2_records_do_not_turn_metadata_into_claims(self):
+        contract = fp._contract_from_registry({
+            "name": "Safe",
+            "purpose": "Do the safe thing.",
+            "users": [{"id": "u-1", "confidence": "verified"}, 7, "Operator"],
+            "workflows": {"w-1": "Never use mapping keys as prose"},
+        })
+
+        self.assertEqual(contract.primary_users, ["Operator"])
+        self.assertEqual(contract.core_journeys, [])
+
+
 class GatherEvidenceFullFixtureTests(_TempRepo):
     def setUp(self):
         super().setUp()

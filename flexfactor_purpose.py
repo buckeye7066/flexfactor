@@ -343,12 +343,40 @@ def find_contract(program_name: str, project_dir: str | None = None,
 
 
 def _contract_from_registry(entry: dict) -> PurposeContract:
+    def _text_items(primary: str, structured: str) -> list[str]:
+        """Read both the original string-list fields and v2 evidence records.
+
+        Purpose contract v2 names the human-facing sections ``users`` and
+        ``workflows`` and stores each statement as an evidence-bearing object.
+        Treating those sections as absent forced an otherwise complete authored
+        contract through model inference at startup.  Besides wasting a call,
+        an unavailable or malformed provider made the audit stop at "finding
+        purpose" even though the owner had already supplied the answer.
+
+        Keep this conversion deliberately narrow: only strings and non-empty
+        ``text`` strings are claims.  IDs, confidence labels, and mapping keys
+        must never accidentally become purpose prose.
+        """
+        raw = entry.get(primary)
+        if raw is None:
+            raw = entry.get(structured)
+        if not isinstance(raw, list):
+            return []
+        values: list[str] = []
+        for item in raw:
+            value = item if isinstance(item, str) else (
+                item.get("text") if isinstance(item, dict) else None
+            )
+            if isinstance(value, str) and value.strip():
+                values.append(value.strip())
+        return values
+
     return PurposeContract(
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
         slug=entry.get("slug") or "",
         purpose=entry.get("purpose") or "",
-        primary_users=list(entry.get("primary_users") or []),
-        core_journeys=list(entry.get("core_journeys") or []),
+        primary_users=_text_items("primary_users", "users"),
+        core_journeys=_text_items("core_journeys", "workflows"),
         acceptance_criteria=list(entry.get("acceptance_criteria") or []),
         aliases=list(entry.get("aliases") or []),
         repo=entry.get("repo"),
