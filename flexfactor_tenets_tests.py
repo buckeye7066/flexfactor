@@ -139,6 +139,21 @@ class TenetsContextTests(unittest.TestCase):
         self.assertTrue(written_path)
         self.assertFalse(written_path[0].exists())
 
+    def test_valid_output_file_ignores_non_utf8_console_status(self) -> None:
+        payload = {"files": [{"path": "src/app.py", "score": 0.97}]}
+
+        def runner(command, **_kwargs):
+            output_path = Path(command[command.index("--output") + 1])
+            output_path.write_text(json.dumps(payload), encoding="utf-8")
+            return self._process(stdout=b"status:\xff\xfe\n")
+
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
+        ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+
     def test_empty_valid_result_is_degraded_not_success(self) -> None:
         completed = self._process(stdout=b'{"files": []}')
         with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
@@ -196,6 +211,24 @@ class TenetsContextTests(unittest.TestCase):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
         self.assertIn("safety limit", result.message)
+
+    def test_temporary_output_allocation_failure_is_fail_open_for_cli(self) -> None:
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(
+            ft.tempfile, "TemporaryDirectory", side_effect=OSError("temporary storage unavailable")
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("temporary storage unavailable", result.message)
+
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(
+            ft.tempfile, "TemporaryDirectory", side_effect=OSError("temporary storage unavailable")
+        ), mock.patch("builtins.print"):
+            code = ft.run_cli([str(self.root), "audit", "--strict"])
+        self.assertEqual(code, 1)
 
     def test_malformed_json_is_fail_open(self) -> None:
         completed = self._process(stdout=b"not-json")
@@ -306,6 +339,21 @@ class TenetsContextTests(unittest.TestCase):
             ):
                 self.assertEqual(ft._argv_task(argv), expected)
 
+    def test_multi_program_guiding_prompts_route_to_matching_project(self) -> None:
+        first = self.root.parent / "GrantFlow"
+        second = self.root.parent / "family-stewardship"
+        first.mkdir(exist_ok=True)
+        second.mkdir(exist_ok=True)
+        argv = [
+            "audit",
+            "--program", str(first),
+            "--guiding-prompt", "repair grant matching",
+            "--program", "family stewardship",
+            "--guiding-prompt", "repair family workflow",
+        ]
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            self.assertEqual(ft._argv_task(argv, project=first), "repair grant matching")
+            self.assertEqual(ft._argv_task(argv, project=second), "repair family workflow")
 
 class TenetsInstallTests(unittest.TestCase):
     def setUp(self) -> None:

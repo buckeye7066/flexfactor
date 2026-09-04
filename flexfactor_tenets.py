@@ -485,10 +485,11 @@ def generate_tenets_context(
             "--format",
             "json",
         )
-        temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
-        rank_output = Path(temporary_output.name) / "ranked-files.json"
-        invocation_command = command + ("--output", str(rank_output))
+        temporary_output = None
         try:
+            temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
+            rank_output = Path(temporary_output.name) / "ranked-files.json"
+            invocation_command = command + ("--output", str(rank_output))
             completed = _run_bounded_process(
                 invocation_command,
                 cwd=root,
@@ -516,12 +517,12 @@ def generate_tenets_context(
                     f"Tenets output could not be read safely: {completed.read_error}"
                 )
             else:
-                stdout = stdout_bytes.decode("utf-8", errors="strict")
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
                 if completed.returncode != 0:
+                    stdout_diagnostic = stdout_bytes.decode("utf-8", errors="replace")
                     status = "degraded"
                     message = _bounded_text(
-                        f"Tenets exited with status {completed.returncode}: {stderr or stdout}"
+                        f"Tenets exited with status {completed.returncode}: {stderr or stdout_diagnostic}"
                     )
                 else:
                     payload_bytes = stdout_bytes
@@ -548,7 +549,8 @@ def generate_tenets_context(
             status = "degraded"
             message = _bounded_text(f"Tenets could not start: {exc}")
         finally:
-            temporary_output.cleanup()
+            if temporary_output is not None:
+                temporary_output.cleanup()
 
     duration = round(max(0.0, time.monotonic() - started), 6)
     result = TenetsContextResult(
@@ -596,25 +598,79 @@ def cached_tenets_context(
         return _RESULT_CACHE.setdefault(key, result)
 
 
-def _argv_task(argv: Sequence[str] | None) -> str:
+def _argv_values(args: Sequence[str], flag: str) -> list[str]:
+    """Return every non-empty value supplied for one CLI flag, in order."""
+    values: list[str] = []
+    prefix = flag + "="
+    for index, item in enumerate(args):
+        if item == flag and index + 1 < len(args):
+            value = str(args[index + 1]).strip()
+            if value:
+                values.append(value)
+        elif isinstance(item, str) and item.startswith(prefix):
+            value = item.partition("=")[2].strip()
+            if value:
+                values.append(value)
+    return values
+
+
+def _program_identity(value: str | os.PathLike[str]) -> str:
+    """Portable identity used only to associate a prompt with its target root."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    name = Path(text).name or text
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def _argv_task(
+    argv: Sequence[str] | None,
+    *,
+    project: str | os.PathLike[str] | None = None,
+) -> str:
     override = os.environ.get("FLEXFACTOR_TENETS_TASK", "").strip()
     if override:
         return override
     args = list(argv or ())
-    mode = next((item for item in args if item in {"refactor", "scout", "audit", "prodready"}), "audit")
-    task_flags = ("--session-prompt", "--guiding-prompt", "--goal")
-    for flag in task_flags:
-        for index, item in enumerate(args):
-            if item == flag and index + 1 < len(args) and args[index + 1].strip():
-                return args[index + 1].strip()
-            prefix = flag + "="
-            if item.startswith(prefix) and item.partition("=")[2].strip():
-                return item.partition("=")[2].strip()
+    mode = next(
+        (item for item in args if item in {"refactor", "scout", "audit", "prodready"}),
+        "audit",
+    )
+
+    session_prompts = _argv_values(args, "--session-prompt")
+    if session_prompts:
+        return session_prompts[0]
+
+    guiding_prompts = _argv_values(args, "--guiding-prompt")
+    programs = _argv_values(args, "--program")
+    if guiding_prompts:
+        if project is not None and programs:
+            root = Path(project).expanduser().resolve(strict=False)
+            root_full = os.path.normcase(str(root))
+            root_identity = _program_identity(root.name)
+            for index, program in enumerate(programs):
+                if index >= len(guiding_prompts):
+                    break
+                candidate = Path(program).expanduser()
+                try:
+                    candidate_full = os.path.normcase(str(candidate.resolve(strict=False)))
+                except OSError:
+                    candidate_full = os.path.normcase(str(candidate.absolute()))
+                if (
+                    candidate_full == root_full
+                    or _program_identity(program) == root_identity
+                ):
+                    return guiding_prompts[index]
+        if len(guiding_prompts) == 1:
+            return guiding_prompts[0]
+
+    goals = _argv_values(args, "--goal")
+    if goals:
+        return goals[0]
     return (
         f"{mode} this application for production readiness: prioritize broken user journeys, "
         "security and privacy defects, release blockers, failure handling, and missing tests"
     )
-
 
 def _infer_project_root(args: Sequence[Any], kwargs: Mapping[str, Any]) -> Path | None:
     for key in ("project_dir", "project", "root", "program"):
@@ -729,13 +785,13 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
         prior_manifest = module_globals.get("_repository_review_manifest")
         if not callable(prior_enum) and not callable(prior_manifest):
             return
-        task = _argv_task(argv)
         canonicalize = module_globals.get("_canon_rel")
 
         def context_for(root: Path) -> TenetsContextResult | None:
             if not enabled():
                 return None
             try:
+                task = _argv_task(argv, project=root)
                 result = cached_tenets_context(root, task)
             except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
