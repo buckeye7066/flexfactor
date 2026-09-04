@@ -24366,6 +24366,9 @@ def run_cli(argv=None) -> int:
     import flexfactor_directed as _runtime_directed
     _runtime_directed.install(globals())
     _ff_directed.install(globals())
+    import sys as _runtime_sys
+    import flexfactor_tenets as _runtime_tenets
+    _runtime_tenets.install(globals(), argv=(argv if argv is not None else _runtime_sys.argv[1:]))
     if argv is not None and len(argv) == 1 and argv[0] == "--runtime-manifest":
         print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))
         return 0

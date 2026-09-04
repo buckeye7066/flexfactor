@@ -523,6 +523,12 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "flexfactor_tenets.py::_run_bounded_process": (
+        "Optional local Tenets 0.13.3 context ranker launches only the exact "
+        "console script resolved from the active Python installation after exact "
+        "distribution-version validation; ambient PATH and target-controlled "
+        "executables are rejected, shell=False, and time/output are bounded."
+    ),
     "obsidian_memory.py::run_aibus": (
         "Optional owner-memory bridge, independent of the audited target: "
         "it launches only the owner-configured Python interpreter and AI Bus "

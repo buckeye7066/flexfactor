@@ -14,7 +14,8 @@ caller input still fails closed so the wrong repository is never analyzed.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from importlib import metadata as importlib_metadata
 import hashlib
 import inspect
 import json
@@ -22,7 +23,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -203,35 +203,63 @@ def _resolve_output_path(project_root: Path, output: str | os.PathLike[str] | No
     return candidate.resolve(strict=False)
 
 
+def _trusted_tenets_directories(
+    *, interpreter: str | os.PathLike[str] | None = None, platform_name: str | None = None
+) -> tuple[Path, ...]:
+    interpreter_path = Path(interpreter or sys.executable).expanduser().resolve(strict=False)
+    windows = (platform_name or os.name) == "nt"
+    candidates = [interpreter_path.parent]
+    prefix_scripts = Path(sys.prefix).expanduser().resolve(strict=False) / ("Scripts" if windows else "bin")
+    if prefix_scripts not in candidates:
+        candidates.append(prefix_scripts)
+    return tuple(candidates)
+
+
+def _is_trusted_tenets_executable(
+    executable: str | os.PathLike[str],
+    *,
+    interpreter: str | os.PathLike[str] | None = None,
+    platform_name: str | None = None,
+) -> bool:
+    windows = (platform_name or os.name) == "nt"
+    expected_names = {"tenets.exe", "tenets"} if windows else {"tenets"}
+    candidate = Path(executable).expanduser().resolve(strict=False)
+    if candidate.name.lower() not in {name.lower() for name in expected_names}:
+        return False
+    if candidate.parent not in _trusted_tenets_directories(
+        interpreter=interpreter, platform_name=platform_name
+    ):
+        return False
+    return candidate.is_file() and (windows or os.access(candidate, os.X_OK))
+
+
 def _find_tenets_executable(
     *,
     interpreter: str | os.PathLike[str] | None = None,
     platform_name: str | None = None,
     path_value: str | None = None,
 ) -> str | None:
-    """Resolve Tenets beside the selected Python before consulting ambient PATH."""
-    interpreter_path = Path(interpreter or sys.executable).expanduser().resolve(strict=False)
+    """Resolve Tenets only from the active Python installation, never PATH."""
+    del path_value  # API compatibility only. Ambient PATH is intentionally ignored.
     windows = (platform_name or os.name) == "nt"
     executable_names = ("tenets.exe", "tenets") if windows else ("tenets",)
-    candidate_dirs = [interpreter_path.parent]
-    prefix_dir = Path(sys.prefix).expanduser().resolve(strict=False)
-    prefix_scripts = prefix_dir / ("Scripts" if windows else "bin")
-    if prefix_scripts not in candidate_dirs:
-        candidate_dirs.append(prefix_scripts)
-
-    for directory in candidate_dirs:
+    for directory in _trusted_tenets_directories(
+        interpreter=interpreter, platform_name=platform_name
+    ):
         for name in executable_names:
             candidate = directory / name
-            if candidate.is_file() and (windows or os.access(candidate, os.X_OK)):
-                return str(candidate)
-
-    search_path = os.environ.get("PATH") if path_value is None else path_value
-    for name in executable_names:
-        found = shutil.which(name, path=search_path)
-        if found:
-            return found
+            if _is_trusted_tenets_executable(
+                candidate, interpreter=interpreter, platform_name=platform_name
+            ):
+                return str(candidate.resolve(strict=False))
     return None
 
+
+def _tenets_distribution_version() -> str | None:
+    try:
+        return importlib_metadata.version("tenets")
+    except importlib_metadata.PackageNotFoundError:
+        return None
 
 def _read_bounded_pipe(
     pipe: BinaryIO,
@@ -246,7 +274,14 @@ def _read_bounded_pipe(
     total = 0
     try:
         while True:
-            chunk = pipe.read(64 * 1024)
+            read1 = getattr(pipe, "read1", None)
+            if callable(read1):
+                chunk = read1(64 * 1024)
+            else:
+                try:
+                    chunk = os.read(pipe.fileno(), 64 * 1024)
+                except (AttributeError, OSError, ValueError):
+                    chunk = pipe.read(64 * 1024)
             if not chunk:
                 return
             remaining = max(0, limit - total)
@@ -417,12 +452,26 @@ def generate_tenets_context(
     output_path = _resolve_output_path(root, output)
     started = time.monotonic()
     resolved_executable = executable or _find_tenets_executable()
+    explicit_untrusted = bool(executable and not _is_trusted_tenets_executable(executable))
+    if explicit_untrusted:
+        resolved_executable = None
+    installed_version = _tenets_distribution_version()
+    if resolved_executable and installed_version != TENETS_VERSION:
+        resolved_executable = None
     command: tuple[str, ...] = ()
     status = "unavailable"
-    message = (
-        f"Tenets {TENETS_VERSION} is not installed; install FlexFactor with "
-        "the context extra (or the all extra) to enable local file ranking."
-    )
+    if installed_version and installed_version != TENETS_VERSION:
+        message = (
+            f"Tenets version mismatch: expected {TENETS_VERSION}, found {installed_version}; "
+            "ranking disabled so an untested tool cannot influence audit order."
+        )
+    elif explicit_untrusted:
+        message = "Tenets executable is outside the active Python installation; ranking disabled."
+    else:
+        message = (
+            f"Tenets {TENETS_VERSION} is not installed; install FlexFactor with "
+            "the context extra (or the all extra) to enable local file ranking."
+        )
     files: tuple[RankedFile, ...] = ()
 
     if resolved_executable:
@@ -516,7 +565,15 @@ def generate_tenets_context(
         output_path=str(output_path),
         command=command,
     )
-    _atomic_write_json(output_path, result.to_dict())
+    try:
+        _atomic_write_json(output_path, result.to_dict())
+    except OSError as exc:
+        # Optional context ranking must not abort an audit because evidence storage failed.
+        result = replace(
+            result,
+            message=_bounded_text(f"{result.message} Evidence write failed: {exc}"),
+            output_path="",
+        )
     return result
 
 
@@ -545,11 +602,14 @@ def _argv_task(argv: Sequence[str] | None) -> str:
         return override
     args = list(argv or ())
     mode = next((item for item in args if item in {"refactor", "scout", "audit", "prodready"}), "audit")
-    for index, item in enumerate(args):
-        if item == "--goal" and index + 1 < len(args) and args[index + 1].strip():
-            return args[index + 1].strip()
-        if item.startswith("--goal=") and item.partition("=")[2].strip():
-            return item.partition("=")[2].strip()
+    task_flags = ("--session-prompt", "--guiding-prompt", "--goal")
+    for flag in task_flags:
+        for index, item in enumerate(args):
+            if item == flag and index + 1 < len(args) and args[index + 1].strip():
+                return args[index + 1].strip()
+            prefix = flag + "="
+            if item.startswith(prefix) and item.partition("=")[2].strip():
+                return item.partition("=")[2].strip()
     return (
         f"{mode} this application for production readiness: prioritize broken user journeys, "
         "security and privacy defects, release blockers, failure handling, and missing tests"
@@ -660,63 +720,78 @@ def _call_with_lifted_cap(
 
 
 def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | None = None) -> None:
-    """Idempotently prioritize FlexFactor's complete source sweep with Tenets.
-
-    Tenets runs before a bounded review cap is applied. The canonical enumerator
-    still owns containment, skip rules, clean-file memory, and candidate
-    discovery. The wrapper only lifts a detected cap for that one enumeration,
-    reorders those canonical candidates, and reapplies exactly the same cap.
-    """
+    """Idempotently prioritize canonical audit candidates without changing membership."""
     with _INSTALL_LOCK:
         if module_globals.get("_FLEXFACTOR_TENETS_INSTALLED"):
             return
         module_globals["_FLEXFACTOR_TENETS_INSTALLED"] = True
-        prior = module_globals.get("_enumerate_source_files")
-        if not callable(prior):
+        prior_enum = module_globals.get("_enumerate_source_files")
+        prior_manifest = module_globals.get("_repository_review_manifest")
+        if not callable(prior_enum) and not callable(prior_manifest):
             return
         task = _argv_task(argv)
         canonicalize = module_globals.get("_canon_rel")
 
-        def enumerate_source_files(*args: Any, **kwargs: Any) -> Any:
+        def context_for(root: Path) -> TenetsContextResult | None:
             if not enabled():
-                return prior(*args, **kwargs)
-            root = _infer_project_root(args, kwargs)
-            if root is None:
-                return prior(*args, **kwargs)
+                return None
             try:
                 result = cached_tenets_context(root, task)
             except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
-                return prior(*args, **kwargs)
+                return None
             module_globals["_TENETS_CONTEXT_LAST"] = result.to_dict()
-            if result.status != "ok":
-                return prior(*args, **kwargs)
+            return result if result.status == "ok" else None
 
-            try:
-                source_files, cap = _call_with_lifted_cap(
-                    prior,
-                    module_globals,
-                    args,
-                    kwargs,
-                )
-            except Exception as exc:
-                # Tenets is optional. If uncapped discovery cannot complete,
-                # retry the canonical capped call and report degraded ranking.
-                message = _bounded_text(
-                    f"uncapped enumeration failed; original order preserved: {exc}"
-                )
-                degraded = result.to_dict()
-                degraded["status"] = "degraded"
-                degraded["message"] = message
-                module_globals["_TENETS_CONTEXT_LAST"] = degraded
-                module_globals["_TENETS_CONTEXT_LAST_ERROR"] = message
-                return prior(*args, **kwargs)
-            prioritized = _prioritize_paths(source_files, result.files, canonicalize)
-            return _limit_paths(prioritized, cap)
+        if callable(prior_enum):
+            def enumerate_source_files(*args: Any, **kwargs: Any) -> Any:
+                root = _infer_project_root(args, kwargs)
+                if root is None:
+                    return prior_enum(*args, **kwargs)
+                result = context_for(root)
+                if result is None:
+                    return prior_enum(*args, **kwargs)
+                try:
+                    source_files, cap = _call_with_lifted_cap(
+                        prior_enum, module_globals, args, kwargs
+                    )
+                except Exception as exc:
+                    message = _bounded_text(
+                        f"uncapped enumeration failed; original order preserved: {exc}"
+                    )
+                    degraded = result.to_dict()
+                    degraded["status"] = "degraded"
+                    degraded["message"] = message
+                    module_globals["_TENETS_CONTEXT_LAST"] = degraded
+                    module_globals["_TENETS_CONTEXT_LAST_ERROR"] = message
+                    return prior_enum(*args, **kwargs)
+                prioritized = _prioritize_paths(source_files, result.files, canonicalize)
+                return _limit_paths(prioritized, cap)
 
-        enumerate_source_files._tenets_wrapped = True  # type: ignore[attr-defined]
-        module_globals["_enumerate_source_files"] = enumerate_source_files
+            enumerate_source_files._tenets_wrapped = True  # type: ignore[attr-defined]
+            module_globals["_enumerate_source_files"] = enumerate_source_files
 
+        if callable(prior_manifest):
+            def repository_review_manifest(*args: Any, **kwargs: Any) -> Any:
+                manifest = prior_manifest(*args, **kwargs)
+                if not isinstance(manifest, Mapping):
+                    return manifest
+                root = _infer_project_root(args, kwargs)
+                if root is None:
+                    return manifest
+                result = context_for(root)
+                if result is None:
+                    return manifest
+                reviewable = manifest.get("reviewable_files")
+                prioritized = _prioritize_paths(reviewable, result.files, canonicalize)
+                if prioritized is reviewable:
+                    return manifest
+                updated = dict(manifest)
+                updated["reviewable_files"] = prioritized
+                return updated
+
+            repository_review_manifest._tenets_wrapped = True  # type: ignore[attr-defined]
+            module_globals["_repository_review_manifest"] = repository_review_manifest
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

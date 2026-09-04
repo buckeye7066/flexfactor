@@ -27,10 +27,13 @@ class TenetsContextTests(unittest.TestCase):
             clear=False,
         )
         self.state_patch.start()
+        self.version_patch = mock.patch.object(ft, "_tenets_distribution_version", return_value=ft.TENETS_VERSION)
+        self.version_patch.start()
         with ft._RESULT_CACHE_LOCK:
             ft._RESULT_CACHE.clear()
 
     def tearDown(self) -> None:
+        self.version_patch.stop()
         self.state_patch.stop()
         self.temp.cleanup()
 
@@ -67,21 +70,29 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(payload["expected_version"], "0.13.3")
         self.assertEqual(payload["adapter_version"], 2)
 
-    def test_virtualenv_sibling_executable_precedes_ambient_path(self) -> None:
+    def test_trusted_interpreter_install_resolution_ignores_ambient_path(self) -> None:
         scripts = Path(self.temp.name) / "venv" / "Scripts"
         scripts.mkdir(parents=True)
         interpreter = scripts / "python.exe"
         interpreter.write_bytes(b"")
         tenets = scripts / "tenets.exe"
         tenets.write_bytes(b"")
-        with mock.patch.object(ft.shutil, "which", return_value="C:/global/tenets.exe") as which:
+        with mock.patch.object(ft.sys, "prefix", str(Path(self.temp.name) / "other-prefix")):
             found = ft._find_tenets_executable(
-                interpreter=interpreter,
-                platform_name="nt",
-                path_value="",
+                interpreter=interpreter, platform_name="nt", path_value=str(self.root)
             )
         self.assertEqual(Path(found or ""), tenets.resolve())
-        which.assert_not_called()
+
+    def test_ambient_path_tenets_is_never_executed(self) -> None:
+        fake = self.root / ("tenets.exe" if os.name == "nt" else "tenets")
+        fake.write_bytes(b"MZ" if os.name == "nt" else b"x")
+        if os.name != "nt":
+            fake.chmod(0o755)
+        with mock.patch.object(ft.sys, "prefix", str(Path(self.temp.name) / "empty-prefix")):
+            found = ft._find_tenets_executable(
+                interpreter=Path(self.temp.name) / "python", path_value=str(self.root)
+            )
+        self.assertIsNone(found)
 
     def test_success_keeps_only_safe_unique_repository_paths(self) -> None:
         outside = self.root.parent / "secret.txt"
@@ -237,6 +248,63 @@ class TenetsContextTests(unittest.TestCase):
             second = ft.cached_tenets_context(self.root, "audit")
         self.assertIs(first, second)
         generate.assert_called_once()
+
+
+    def test_distribution_version_mismatch_disables_execution(self) -> None:
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
+             mock.patch.object(ft, "_tenets_distribution_version", return_value="0.13.2"), \
+             mock.patch.object(ft, "_run_bounded_process") as runner:
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("version mismatch", result.message)
+        runner.assert_not_called()
+
+    def test_evidence_write_failure_preserves_safe_ranking(self) -> None:
+        payload = {"files": [{"path": "src/app.py", "score": 1.0}]}
+        completed = self._process(stdout=json.dumps(payload).encode())
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
+             mock.patch.object(ft, "_run_bounded_process", return_value=completed), \
+             mock.patch.object(ft, "_atomic_write_json", side_effect=OSError("read only")):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+        self.assertEqual(result.output_path, "")
+        self.assertIn("Evidence write failed", result.message)
+
+    def test_reader_prefers_available_byte_read1(self) -> None:
+        class Pipe:
+            def __init__(self):
+                self.calls = 0
+            def read1(self, _size):
+                self.calls += 1
+                return b"abcdef" if self.calls == 1 else b""
+            def read(self, _size):
+                raise AssertionError("blocking read must not be used when read1 exists")
+            def close(self):
+                pass
+        chunks = []
+        overflow = __import__("threading").Event()
+        state = {}
+        lock = __import__("threading").Lock()
+        ft._read_bounded_pipe(
+            Pipe(), limit=3, stream_name="stdout", chunks=chunks,
+            overflow_event=overflow, state=state, state_lock=lock,
+        )
+        self.assertTrue(overflow.is_set())
+        self.assertEqual(b"".join(chunks), b"abc")
+        self.assertEqual(state.get("overflow_stream"), "stdout")
+
+    def test_audit_prompt_spellings_drive_context_task(self) -> None:
+        for argv, expected in (
+            (["audit", "--session-prompt", "repair billing"], "repair billing"),
+            (["prodready", "--session-prompt=repair auth"], "repair auth"),
+            (["audit", "--guiding-prompt", "repair queue"], "repair queue"),
+            (["audit", "--guiding-prompt=repair launch"], "repair launch"),
+        ):
+            with self.subTest(argv=argv), mock.patch.dict(
+                os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
+            ):
+                self.assertEqual(ft._argv_task(argv), expected)
 
 
 class TenetsInstallTests(unittest.TestCase):
@@ -436,6 +504,54 @@ class TenetsInstallTests(unittest.TestCase):
             result = runtime["_enumerate_source_files"](str(self.root))
         self.assertEqual(result, original)
         context.assert_not_called()
+
+
+class TenetsManifestAndEntryTests(unittest.TestCase):
+    def test_manifest_reviewable_files_are_ranked_without_dropping_members(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = ["src/first.py", "src/second.py", "src/target.py"]
+            def manifest(project_dir):
+                return {
+                    "reviewable_files": list(original),
+                    "binary_files": ["asset.bin"],
+                    "count": 4,
+                }
+            runtime = {
+                "_repository_review_manifest": manifest,
+                "_canon_rel": lambda value: value.replace("\\", "/").removeprefix("./"),
+            }
+            ranked = ft.TenetsContextResult(
+                schema_version=1,
+                tool="tenets",
+                expected_version=ft.TENETS_VERSION,
+                adapter_version=2,
+                status="ok",
+                project_root=str(root),
+                task="audit",
+                files=(ft.RankedFile("src/target.py", 1.0),),
+                message="ok",
+                duration_seconds=0.0,
+                output_path="",
+                command=("tenets",),
+            )
+            with mock.patch.object(ft, "cached_tenets_context", return_value=ranked):
+                ft.install(runtime, argv=["audit", "--session-prompt", "target task"])
+                first = runtime["_repository_review_manifest"](str(root))
+                second = runtime["_repository_review_manifest"](str(root))
+            self.assertEqual(
+                first["reviewable_files"],
+                ["src/target.py", "src/first.py", "src/second.py"],
+            )
+            self.assertCountEqual(first["reviewable_files"], original)
+            self.assertEqual(second["reviewable_files"], first["reviewable_files"])
+            self.assertEqual(first["binary_files"], ["asset.bin"])
+
+    def test_shared_run_cli_arms_tenets_for_direct_entrypoints(self) -> None:
+        import inspect
+        import flexfactor as ff
+        source = inspect.getsource(ff.run_cli)
+        self.assertIn("_runtime_tenets.install(globals()", source)
 
 
 if __name__ == "__main__":
