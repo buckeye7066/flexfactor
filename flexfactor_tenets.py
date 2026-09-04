@@ -1318,7 +1318,11 @@ def _run_bounded_process(
             # status 125 when its procfs/pidfd cleanup cannot be verified.  The
             # parent owns an independent kernel boundary and must prove it
             # empty (or atomically kill it) before releasing that handle.
-            _finalize_linux_ranker_cgroup(linux_cgroup)
+            try:
+                _finalize_linux_ranker_cgroup(linux_cgroup)
+            except OSError:
+                # Cleanup failure must not replace a successful result or mask an interrupt.
+                pass
 
 
 def _isolated_tenets_environment(project_root: Path, isolation_root: Path) -> dict[str, str]:
@@ -1746,7 +1750,17 @@ def _routed_session_task(
     if selected is None:
         return None
     candidates = _program_candidates(programs)
-    targets = [(program, full) for _index, program, full, _identity in candidates]
+    # Build targets safely:
+    # - Exclude unresolved entries (empty project_dir) so one bad alias does not
+    #   cause routing to reject the entire set.
+    # - If the selected match was identity-only with no resolved path, substitute
+    #   the actual current project's directory so routing can still target it.
+    project_full = os.path.normcase(str(Path(project).expanduser().resolve(strict=False)))
+    targets: list[tuple[str, str]] = []
+    for index, program, full, _identity in candidates:
+        effective_full = project_full if (index == selected and not full) else full
+        if effective_full:
+            targets.append((program, effective_full))
     try:
         import flexfactor_steering
 
@@ -1754,6 +1768,8 @@ def _routed_session_task(
     except (ImportError, OSError, ValueError):
         return None
     _index, selected_program, selected_full, _identity = candidates[selected]
+    if not selected_full:
+        selected_full = project_full
     for route in routed.get("routes", ()):
         if not isinstance(route, Mapping):
             continue
@@ -1777,10 +1793,10 @@ def _durable_guidance_task(project: str | os.PathLike[str]) -> str | None:
     """Load exact-project standing owner guidance before using generic scope."""
     try:
         import flexfactor_steering
-
-        guidance = flexfactor_steering.get_guidance_for_project(
-            str(Path(project).expanduser().resolve(strict=True))
-        )
+        # Use the same identity as guidance storage (abspath + normcase) so
+        # symlink/junction checkouts find their saved record.
+        canonical = os.path.normcase(os.path.abspath(str(Path(project).expanduser())))
+        guidance = flexfactor_steering.get_guidance_for_project(canonical)
     except (ImportError, OSError, TypeError, ValueError):
         return None
     if not isinstance(guidance, Mapping):
