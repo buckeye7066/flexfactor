@@ -281,6 +281,27 @@ def install(module_globals: dict) -> None:
             code_exts.add(extension)
             tree_languages[extension] = "powershell"
 
+    # tree-sitter-language-pack's PowerShell grammar emits an ERROR node for an
+    # empty file even though an empty .ps1/.psm1/.psd1 is valid PowerShell. Keep
+    # the bundled parser for real source, but normalize that grammar edge case so
+    # the syntax contract matches the language rather than the parser quirk.
+    prior_tree_sitter = module_globals.get("_tree_sitter_source_syntax_ok")
+    if (callable(prior_tree_sitter)
+            and not getattr(prior_tree_sitter, "_powershell_empty_hardened", False)):
+        @functools.wraps(prior_tree_sitter)
+        def _tree_sitter_source_syntax_ok(extension, source):
+            ext = str(extension or "").lower()
+            if ext in _POWERSHELL_EXTS:
+                try:
+                    empty = not source or not source.strip()
+                except (AttributeError, TypeError):
+                    empty = False
+                if empty:
+                    return True, "Tree-sitter powershell: empty source is syntactically valid"
+            return prior_tree_sitter(extension, source)
+        _tree_sitter_source_syntax_ok._powershell_empty_hardened = True
+        module_globals["_tree_sitter_source_syntax_ok"] = _tree_sitter_source_syntax_ok
+
     # Preserve precise local checkout matching, then recover only a unique
     # one/two-edit typo. Ambiguous names still fail closed.
     prior_find_project = module_globals.get("_find_local_project")
