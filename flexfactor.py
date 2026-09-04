@@ -16813,18 +16813,155 @@ FINAL_REVIEW_SYSTEM = (
 )
 
 
+def _git_tree_entry_at(
+    repository_dir: str, commit_sha: str, repository_path: str,
+) -> tuple[str, str, str] | None:
+    """Return one literal tree entry without consulting checkout bytes."""
+    listed = _git(
+        ["-c", "core.quotePath=false", "--literal-pathspecs", "ls-tree",
+         commit_sha, "--", repository_path],
+        repository_dir,
+    )
+    if listed.returncode != 0:
+        raise OSError("Git tree lookup failed")
+    lines = (listed.stdout or "").splitlines()
+    if not lines:
+        return None
+    if len(lines) != 1 or "\t" not in lines[0]:
+        raise OSError("Git tree lookup was ambiguous")
+    metadata, observed_path = lines[0].split("\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or observed_path != repository_path:
+        raise OSError("Git tree entry did not match the requested path")
+    mode, object_type, object_id = fields
+    if re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None:
+        raise OSError("Git tree entry had an invalid object id")
+    return mode, object_type, object_id
+
+
+def _git_repository_scope(project_dir: str) -> tuple[str, str]:
+    """Return the enclosing Git root and the target's path beneath it."""
+    target = os.path.realpath(os.path.abspath(project_dir))
+    top = _git(["rev-parse", "--show-toplevel"], project_dir)
+    if top.returncode != 0 or not (top.stdout or "").strip():
+        raise OSError("target Git root could not be resolved")
+    root = os.path.realpath(os.path.abspath((top.stdout or "").strip()))
+    try:
+        common = os.path.commonpath([root, target])
+    except ValueError:
+        raise OSError("target was not contained by its Git root") from None
+    if os.path.normcase(common) != os.path.normcase(root):
+        raise OSError("target was not contained by its Git root")
+    relative = os.path.relpath(target, root)
+    prefix = "" if relative == "." else relative.replace(os.sep, "/")
+    if prefix.startswith("../") or prefix == "..":
+        raise OSError("target path escaped its Git root")
+    return root, prefix
+
+
+def _authority_repository_path(target_prefix: str, locator: str) -> str:
+    """Resolve one contract locator lexically beneath the audited target."""
+    value = str(locator or "").strip()
+    if not value or "\x00" in value or "\\" in value \
+            or value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        raise ValueError("authority locator was not safely repository-relative")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("authority locator contained a control character")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("authority locator escaped its target")
+    return "/".join(([target_prefix] if target_prefix else []) + parts)
+
+
+def _git_attribute_paths(repository_path: str) -> list[str]:
+    """Committed attribute files that can transform one checkout path."""
+    parts = repository_path.split("/")
+    return [
+        "/".join(parts[:depth] + [".gitattributes"])
+        for depth in range(len(parts))
+    ]
+
+
+def _git_path_identity(
+    repository_dir: str, commit_sha: str, repository_path: str,
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Bind a path to immutable objects, traversing initialized submodules.
+
+    A superproject tree stops at a ``160000`` gitlink.  When cited evidence is
+    below that boundary, continue in the original initialized submodule's
+    object database at the pinned commit.  Working-tree contents are never
+    used for the identity comparison.
+    """
+    parts = repository_path.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Git identity path was not safely relative")
+    chain: list[tuple[str, str, str]] = []
+    current_repository = repository_dir
+    current_commit = commit_sha
+    remaining = parts
+    while remaining:
+        crossed_submodule = False
+        for index in range(1, len(remaining) + 1):
+            prefix = "/".join(remaining[:index])
+            entry = _git_tree_entry_at(
+                current_repository, current_commit, prefix
+            )
+            if entry is None:
+                return None
+            mode, object_type, object_id = entry
+            if index == len(remaining):
+                chain.append(entry)
+                return tuple(chain)
+            if mode == "040000" and object_type == "tree":
+                continue
+            if mode == "160000" and object_type == "commit":
+                chain.append(entry)
+                submodule_dir = os.path.join(
+                    current_repository, *remaining[:index]
+                )
+                probe = _git(["rev-parse", "--git-dir"], submodule_dir)
+                if probe.returncode != 0:
+                    raise OSError(
+                        "cited pinned submodule was not initialized locally"
+                    )
+                current_repository = submodule_dir
+                current_commit = object_id
+                remaining = remaining[index:]
+                crossed_submodule = True
+                break
+            raise OSError("authority path crossed a non-directory Git object")
+        if not crossed_submodule:
+            break
+    raise OSError("authority Git object identity was incomplete")
+
+
+def _identity_is_regular_blob(
+    identity: tuple[tuple[str, str, str], ...] | None,
+) -> bool:
+    return bool(
+        identity
+        and identity[-1][0] in {"100644", "100755"}
+        and identity[-1][1] == "blob"
+    )
+
+
 def _revalidate_final_purpose_authority(
     project_dir: str,
+    baseline_sha: str | None,
     final_sha: str,
     supplied_contract: dict,
     purpose_confidence: str,
 ) -> tuple[bool, str]:
-    """Rebind a v2 authorizing contract to the exact final checkout.
+    """Rebind a v2 authorizing contract to immutable candidate objects.
 
     A candidate may change the contract itself or any repository bytes cited by
     its evidence ledger. The startup copy must not certify that different final
-    tree. Evidence-bearing v2 contracts are therefore loaded again at the final
-    SHA and must remain byte-for-byte equivalent after normalized serialization.
+    tree. Evidence-bearing v2 contracts are therefore reloaded from the original
+    checkout only after Git proves that the selected contract and every cited
+    local evidence path have identical object identities at baseline and final
+    SHA. This preserves checkout-specific EOL/filter semantics while preventing
+    dirty bytes from standing in for a changed commit. Gitlink traversal binds
+    evidence inside initialized submodules to the pinned submodule objects.
     Legacy and inferred contracts carry no ``contract_evidence`` and retain
     their existing final-review behavior.
     """
@@ -16833,6 +16970,8 @@ def _revalidate_final_purpose_authority(
         return True, ""
     if not isinstance(contract_evidence, list):
         return False, "purpose contract evidence ledger was not a list"
+    if not baseline_sha:
+        return False, "final purpose authority baseline commit was unavailable"
     same_head, head_reason = _ff_ledger.head_matches(
         _git_argv, project_dir, final_sha
     )
@@ -16845,49 +16984,84 @@ def _revalidate_final_purpose_authority(
     name = str(supplied_contract.get("name") or "").strip()
     if not callable(lookup) or not name:
         return False, "final purpose authority could not be reloaded"
-    # Never reload from the caller's mutable working tree. HEAD can name the
-    # reviewed commit while unstaged/ignored files restore stale authority
-    # bytes on disk. A local shared clone materializes only final_sha's Git
-    # objects and does not mutate the source repository's worktree metadata.
     try:
-        with tempfile.TemporaryDirectory(prefix="flexfactor-purpose-final-") as tmp:
-            exact_checkout = os.path.join(tmp, "candidate")
-            cloned = _git(
-                ["-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=",
-                 "-c", "filter.lfs.required=false", "clone", "--quiet",
-                 "--shared", "--no-checkout", "--", project_dir,
-                 exact_checkout],
-                project_dir,
+        repository_root, target_prefix = _git_repository_scope(project_dir)
+        contract_files = [
+            str(path).replace("\\", "/")
+            for path in getattr(purpose_mod, "IN_REPO_CONTRACT_FILES", ())
+        ]
+        source = supplied_contract.get("source")
+        source_doc = str(
+            source.get("doc") if isinstance(source, dict) else ""
+        ).replace("\\", "/")
+        if source_doc in contract_files:
+            contract_files = contract_files[:contract_files.index(source_doc) + 1]
+
+        authority_paths: list[tuple[str, str]] = []
+        compared_attribute_paths: set[str] = set()
+
+        def add_authority_path(kind: str, repository_path: str) -> None:
+            for attribute_path in _git_attribute_paths(repository_path):
+                if attribute_path not in compared_attribute_paths:
+                    authority_paths.append((
+                        "purpose checkout attributes", attribute_path
+                    ))
+                    compared_attribute_paths.add(attribute_path)
+            authority_paths.append((kind, repository_path))
+
+        for relative in contract_files:
+            add_authority_path(
+                "purpose contract",
+                _authority_repository_path(target_prefix, relative),
             )
-            if cloned.returncode != 0:
+        local_classifier = getattr(
+            purpose_mod, "_v2_evidence_requires_local_hash", None
+        )
+        if not callable(local_classifier):
+            raise RuntimeError("purpose evidence classifier was unavailable")
+        for record in contract_evidence:
+            if not isinstance(record, dict):
+                raise ValueError("purpose evidence record was not a mapping")
+            if not local_classifier(record, project_dir):
+                continue
+            add_authority_path(
+                "cited purpose evidence",
+                _authority_repository_path(
+                    target_prefix, str(record.get("locator") or "")
+                ),
+            )
+
+        selected_contract_path = (
+            _authority_repository_path(target_prefix, source_doc)
+            if source_doc in contract_files else None
+        )
+        for kind, repository_path in authority_paths:
+            before = _git_path_identity(
+                repository_root, baseline_sha, repository_path
+            )
+            after = _git_path_identity(
+                repository_root, final_sha, repository_path
+            )
+            if before != after:
                 return False, (
-                    "final purpose authority exact-tree clone failed: "
-                    + _tail((cloned.stderr or cloned.stdout or ""), 4)
+                    f"final purpose authority changed {kind}: "
+                    + repository_path
                 )
-            checked_out = _git(
-                ["-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=",
-                 "-c", "filter.lfs.required=false", "checkout", "--quiet",
-                 "--detach", final_sha],
-                exact_checkout,
-            )
-            if checked_out.returncode != 0:
+            if kind == "cited purpose evidence" \
+                    and not _identity_is_regular_blob(after):
                 return False, (
-                    "final purpose authority exact-tree checkout failed: "
-                    + _tail((checked_out.stderr or checked_out.stdout or ""), 4)
+                    "final purpose authority could not bind cited evidence: "
+                    + repository_path
                 )
-            exact_head = _git(["rev-parse", "HEAD"], exact_checkout)
-            exact_status = _git(
-                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                exact_checkout,
-            )
-            if (
-                exact_head.returncode != 0
-                or (exact_head.stdout or "").strip() != final_sha
-                or exact_status.returncode != 0
-                or bool(exact_status.stdout or "")
-            ):
-                return False, "final purpose authority exact-tree checkout was not clean"
-            fresh, authority_rejected = lookup(name, exact_checkout)
+            if repository_path == selected_contract_path \
+                    and not _identity_is_regular_blob(after):
+                return False, "final purpose authority contract was not committed"
+
+        # Use the original target path for identity selectors (notably registry
+        # ``local_path``) and for its existing checkout conversion semantics.
+        # The immutable object comparison above is what prevents dirty restored
+        # bytes from hiding a contract/evidence mutation in final_sha.
+        fresh, authority_rejected = lookup(name, project_dir)
     except Exception as exc:
         return False, (
             "final purpose authority reload failed: "
@@ -16959,7 +17133,8 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
             "reason": "purpose confidence was not supplied or was invalid",
         }
     authority_ok, authority_reason = _revalidate_final_purpose_authority(
-        project_dir, final_sha, purpose_contract, purpose_confidence
+        project_dir, baseline_sha, final_sha,
+        purpose_contract, purpose_confidence,
     )
     if not authority_ok:
         return {

@@ -169,6 +169,10 @@ IN_REPO_CONTRACT_MAX_BYTES = 256 * 1024
 # gate. The checked-in FlexFactor evidence is below 2 MiB; 16 MiB leaves ample
 # headroom while rejecting databases, disk images, and huge sparse artifacts.
 V2_LOCAL_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024
+# A per-record ceiling is insufficient when a small contract cites many large
+# sparse files.  Preflight every local record and reject the whole ledger
+# before opening anything if their aggregate declared size exceeds this bound.
+V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES = 64 * 1024 * 1024
 
 
 def slugify(text: str) -> str:
@@ -689,6 +693,8 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
         return False
     if not root.is_dir():
         return False
+    prepared = []
+    aggregate_size = 0
     for record in records:
         locator = record.get("locator")
         if not isinstance(locator, str) or not locator.strip():
@@ -707,6 +713,17 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
                 return False
             if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
                 return False
+            aggregate_size += candidate_info.st_size
+            if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                return False
+            prepared.append((record, relative, candidate))
+        except (OSError, ValueError):
+            return False
+
+    aggregate_opened_size = 0
+    aggregate_read = 0
+    for record, relative, candidate in prepared:
+        try:
             flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
             flags |= int(getattr(os, "O_NOFOLLOW", 0))
             flags |= int(getattr(os, "O_NONBLOCK", 0))
@@ -717,6 +734,9 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
                     return False
                 if opened.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
                     return False
+                aggregate_opened_size += opened.st_size
+                if aggregate_opened_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                    return False
                 digest = hashlib.sha256()
                 remaining = V2_LOCAL_EVIDENCE_MAX_BYTES + 1
                 total_read = 0
@@ -726,8 +746,11 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
                         if not chunk:
                             break
                         total_read += len(chunk)
+                        aggregate_read += len(chunk)
                         remaining -= len(chunk)
                         if total_read > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                            return False
+                        if aggregate_read > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
                             return False
                         digest.update(chunk)
             finally:

@@ -751,6 +751,33 @@ class PurposeContractV2Tests(_TempRepo):
                 candidate, evidence_root=self.root
             ))
 
+    def test_aggregate_local_evidence_budget_is_checked_before_open(self):
+        records = []
+        file_count = (
+            fp.V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES
+            // fp.V2_LOCAL_EVIDENCE_MAX_BYTES
+        ) + 1
+        for index in range(file_count):
+            source = Path(self.root) / f"large-evidence-{index}.bin"
+            with source.open("wb") as handle:
+                handle.truncate(fp.V2_LOCAL_EVIDENCE_MAX_BYTES)
+            records.append(self._evidence(
+                kind="runtime", locator=source.name, content_hash="0" * 64,
+            ))
+        candidate = self._contract(evidence=records)
+        for section in ("users", "outcomes", "workflows", "invariants"):
+            candidate[section][0]["evidence_refs"] = list(range(file_count))
+
+        with mock.patch.object(
+            fp.os, "open",
+            side_effect=AssertionError(
+                "aggregate-oversized evidence must not be opened"
+            ),
+        ):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
     @unittest.skipUnless(getattr(os, "O_NONBLOCK", 0), "O_NONBLOCK unavailable")
     def test_local_evidence_open_is_nonblocking(self):
         source = Path(self.root) / "evidence.txt"

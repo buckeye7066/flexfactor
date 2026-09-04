@@ -21041,7 +21041,10 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertGreater(len(patch), 180_000, "fixture patch must exceed the old cap")
         return d, g, base, final
 
-    def _repo_with_v2_contract(self):
+    def _repo_with_v2_contract(
+        self, target_rel="", *, evidence_bytes=b"owner evidence\n",
+        autocrlf=None,
+    ):
         d = _tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
 
@@ -21053,9 +21056,12 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
             )
 
         g("init", "-q", "-b", "main")
-        evidence_path = os.path.join(d, "evidence.txt")
-        with open(evidence_path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("owner evidence\n")
+        if autocrlf is not None:
+            g("config", "core.autocrlf", str(autocrlf).lower())
+        target = os.path.join(d, target_rel) if target_rel else d
+        os.makedirs(target, exist_ok=True)
+        evidence_path = os.path.join(target, "evidence.txt")
+        Path(evidence_path).write_bytes(evidence_bytes)
         digest = hashlib.sha256(Path(evidence_path).read_bytes()).hexdigest()
         claim = lambda claim_id, text: {
             "id": claim_id, "text": text, "confidence": "verified",
@@ -21078,7 +21084,7 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
             }],
         }
         with open(
-            os.path.join(d, ".flexfactor-purpose.json"), "w",
+            os.path.join(target, ".flexfactor-purpose.json"), "w",
             encoding="utf-8", newline="\n",
         ) as fh:
             json.dump(payload, fh, sort_keys=True)
@@ -21087,10 +21093,10 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         g("commit", "-q", "-m", "base authority")
         base = g("rev-parse", "HEAD").stdout.strip()
         import flexfactor_purpose as purpose_mod
-        contract = purpose_mod.contract_from_repo(d, "Fixture")
+        contract = purpose_mod.contract_from_repo(target, "Fixture")
         self.assertIsNotNone(contract)
         contract.confidence = "owner-authored"
-        return d, g, base, contract.to_dict()
+        return target, g, base, contract.to_dict()
 
     def test_every_chunk_is_reviewed_and_the_ledger_is_complete(self):
         d, g, base, final = self._repo_with_big_patch()
@@ -21173,6 +21179,181 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertEqual(rejected["verdict"], "reject")
         self.assertIn("purpose authority", rejected["reason"])
         self.assertEqual(rejected_reviewer.calls, [])
+
+    def test_nested_target_revalidates_against_enclosing_git_tree(self):
+        d, g, base, contract = self._repo_with_v2_contract("apps/nested")
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "nested candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_registry_local_path_identity_survives_final_reload(self):
+        d, g, _initial, _contract = self._repo_with_v2_contract()
+        authority_path = Path(d, ".flexfactor-purpose.json")
+        payload = json.loads(authority_path.read_text(encoding="utf-8"))
+        authority_path.unlink()
+        payload["local_path"] = d
+        registry = {"unrelated-registry-key": payload}
+        g("add", "-A")
+        g("commit", "-q", "-m", "use registry authority")
+        base = g("rev-parse", "HEAD").stdout.strip()
+
+        import flexfactor_purpose as purpose_mod
+        selected, rejected = purpose_mod.find_contract_with_status(
+            "Fixture", d, registry=registry
+        )
+        self.assertFalse(rejected)
+        self.assertIsNotNone(selected)
+        selected.confidence = "owner-authored"
+        contract = selected.to_dict()
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "registry candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        original_loader = purpose_mod._load_registry_with_status
+        purpose_mod._load_registry_with_status = lambda _path=None: (
+            registry, False
+        )
+        try:
+            result = ff._independent_final_review(
+                reviewer, d, base, final_sha,
+                {"purpose_contract": contract,
+                 "purpose_confidence": "owner-authored"},
+            )
+        finally:
+            purpose_mod._load_registry_with_status = original_loader
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_final_reload_preserves_original_autocrlf_checkout_bytes(self):
+        d, g, base, contract = self._repo_with_v2_contract(
+            evidence_bytes=b"owner evidence\r\n", autocrlf=True,
+        )
+        self.assertIn(b"\r\n", Path(d, "evidence.txt").read_bytes())
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "autocrlf candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_changed_checkout_attributes_revoke_unchanged_evidence(self):
+        d, g, base, contract = self._repo_with_v2_contract(
+            evidence_bytes=b"owner evidence\r\n", autocrlf=True,
+        )
+        Path(d, ".gitattributes").write_text(
+            "*.txt text eol=lf\n", encoding="utf-8"
+        )
+        g("add", "-A")
+        g("commit", "-q", "-m", "change evidence checkout semantics")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("checkout attributes", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
+    def test_pinned_submodule_evidence_revalidates_from_gitlink_objects(self):
+        container = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, container, True)
+        source = os.path.join(container, "submodule-source")
+        root = os.path.join(container, "superproject")
+        os.makedirs(source)
+        os.makedirs(root)
+
+        def run(repo, *args):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                errors="replace",
+            )
+
+        run(source, "init", "-q", "-b", "main")
+        Path(source, "evidence.txt").write_bytes(b"submodule evidence\n")
+        run(source, "add", "-A")
+        run(source, "commit", "-q", "-m", "submodule evidence")
+
+        run(root, "init", "-q", "-b", "main")
+        added = run(
+            root, "-c", "protocol.file.allow=always", "submodule", "add",
+            "-q", "--", source, "vendor/evidence",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        evidence_path = Path(root, "vendor", "evidence", "evidence.txt")
+        digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        claim = lambda claim_id, text: {
+            "id": claim_id, "text": text, "confidence": "verified",
+            "evidence_refs": [0],
+        }
+        payload = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Fixture",
+            "purpose": "Exercise pinned submodule authority.",
+            "users": [claim("u-1", "Owner")],
+            "outcomes": [claim("o-1", "Verified output")],
+            "workflows": [claim("w-1", "Run the workflow")],
+            "invariants": [claim("i-1", "Evidence remains bound")],
+            "acceptance_criteria": ["Evidence remains bound."],
+            "contradictions": [],
+            "evidence": [{
+                "kind": "source",
+                "locator": "vendor/evidence/evidence.txt",
+                "content_hash": digest,
+                "observed_at": "2026-09-04T00:00:00Z",
+            }],
+        }
+        Path(root, ".flexfactor-purpose.json").write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        run(root, "add", "-A")
+        run(root, "commit", "-q", "-m", "superproject authority")
+        base = run(root, "rev-parse", "HEAD").stdout.strip()
+        import flexfactor_purpose as purpose_mod
+        selected = purpose_mod.contract_from_repo(root, "Fixture")
+        self.assertIsNotNone(selected)
+        selected.confidence = "owner-authored"
+        contract = selected.to_dict()
+        Path(root, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        run(root, "add", "-A")
+        run(root, "commit", "-q", "-m", "superproject candidate")
+        final_sha = run(root, "rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, root, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
 
     def test_v2_contract_mutation_is_rejected_before_final_review(self):
         d, g, base, contract = self._repo_with_v2_contract()
