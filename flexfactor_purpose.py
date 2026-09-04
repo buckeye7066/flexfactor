@@ -353,9 +353,12 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
         an unavailable or malformed provider made the audit stop at "finding
         purpose" even though the owner had already supplied the answer.
 
-        Keep this conversion deliberately narrow: only strings and non-empty
-        ``text`` strings are claims.  IDs, confidence labels, and mapping keys
-        must never accidentally become purpose prose.
+        Keep this conversion deliberately narrow and atomic: only strings and
+        non-empty ``text`` strings are claims, and one malformed member rejects
+        the entire section.  A half-loaded user/workflow list is worse than an
+        explicitly incomplete contract because it can make the understanding
+        gate believe it has the owner's complete instruction.  IDs, confidence
+        labels, and mapping keys must never accidentally become purpose prose.
         """
         raw = entry.get(primary)
         if raw is None:
@@ -367,8 +370,9 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
             value = item if isinstance(item, str) else (
                 item.get("text") if isinstance(item, dict) else None
             )
-            if isinstance(value, str) and value.strip():
-                values.append(value.strip())
+            if not isinstance(value, str) or not value.strip():
+                return []
+            values.append(value.strip())
         return values
 
     return PurposeContract(

@@ -185,7 +185,7 @@ class PurposeContractV2Tests(_TempRepo):
             ["Upload an invoice and export its receipt."],
         )
 
-    def test_malformed_v2_records_do_not_turn_metadata_into_claims(self):
+    def test_one_malformed_v2_record_rejects_the_whole_section(self):
         contract = fp._contract_from_registry({
             "name": "Safe",
             "purpose": "Do the safe thing.",
@@ -193,8 +193,20 @@ class PurposeContractV2Tests(_TempRepo):
             "workflows": {"w-1": "Never use mapping keys as prose"},
         })
 
-        self.assertEqual(contract.primary_users, ["Operator"])
+        self.assertEqual(contract.primary_users, [])
         self.assertEqual(contract.core_journeys, [])
+
+    def test_blank_v2_text_rejects_the_whole_section(self):
+        contract = fp._contract_from_registry({
+            "name": "Safe",
+            "purpose": "Do the safe thing.",
+            "users": [
+                {"id": "u-1", "text": "Operator"},
+                {"id": "u-2", "text": "   "},
+            ],
+        })
+
+        self.assertEqual(contract.primary_users, [])
 
 
 class GatherEvidenceFullFixtureTests(_TempRepo):
