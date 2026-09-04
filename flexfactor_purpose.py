@@ -280,6 +280,16 @@ class PurposeContract:
                         f"  - [{claim['id']} | confidence={claim['confidence']} | "
                         f"evidence_refs={refs}] {claim['text']}"
                     )
+            resolved = self.structured_claims.get("resolved_contradictions") or []
+            if resolved:
+                lines += ["", "RESOLVED CONTRADICTIONS (authoritative decisions):"]
+                for claim in resolved:
+                    refs = ",".join(str(ref) for ref in claim["evidence_refs"])
+                    lines.append(
+                        f"  - [{claim['id']} | confidence={claim['confidence']} | "
+                        f"evidence_refs={refs}] {claim['text']} => "
+                        f"RESOLUTION: {claim['resolution']}"
+                    )
             if self.contract_evidence:
                 lines += ["", "CONTRACT EVIDENCE (indexes used above):"]
                 for index, record in enumerate(self.contract_evidence):
@@ -368,9 +378,17 @@ def find_contract(program_name: str, project_dir: str | None = None,
     Returns None when nothing authored is found; the caller then infers.
     """
     if project_dir:
-        in_repo = contract_from_repo(project_dir, program_name)
+        in_repo, authority_rejected = _contract_from_repo_lookup(
+            project_dir, program_name
+        )
         if in_repo is not None:
             return in_repo
+        if authority_rejected:
+            # A complete in-repo v2 contract is the highest-authority owner
+            # statement.  If it is structurally valid but cannot pass a
+            # mutation-authority gate, no lower-priority Markdown or registry
+            # record may silently replace that decision.
+            return None
 
     reg = load_registry() if registry is None else registry
     if not reg:
@@ -515,8 +533,8 @@ def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
     )
 
 
-def _v2_contract_is_authoritative(entry) -> bool:
-    """Validate the complete v2 contract before it can authorize mutation.
+def _v2_contract_is_valid(entry, *, authoritative: bool) -> bool:
+    """Validate a complete v2 contract, optionally for mutation authority.
 
     This intentionally implements the checked-in JSON Schema in stdlib code so
     loading contracts does not add a runtime dependency.  It also performs the
@@ -585,24 +603,46 @@ def _v2_contract_is_authoritative(entry) -> bool:
         if not isinstance(claims, list) \
                 or (section in _V2_REQUIRED_CLAIM_SECTIONS and not claims):
             return False
-        authoritative = section in _V2_REQUIRED_CLAIM_SECTIONS
+        claim_is_authoritative = (
+            authoritative and section in _V2_REQUIRED_CLAIM_SECTIONS
+        )
         if any(not _v2_claim_is_valid(
-                claim, evidence_count, authoritative=authoritative)
+                claim, evidence_count, authoritative=claim_is_authoritative)
                 for claim in claims):
             return False
     if "resolved_contradictions" in entry:
         resolved = entry["resolved_contradictions"]
         if not isinstance(resolved, list) or any(
-                not _v2_claim_is_valid(claim, evidence_count, resolved=True)
+                not _v2_claim_is_valid(
+                    claim,
+                    evidence_count,
+                    resolved=True,
+                    authoritative=authoritative,
+                )
                 for claim in resolved):
             return False
     # `contradictions` are unresolved by definition; their separate resolved
     # form records how a conflict was decided. Known unresolved owner claims
     # cannot coexist with mutation authority, even when every required claim
     # is independently well formed.
-    if entry.get("contradictions"):
+    if authoritative and entry.get("contradictions"):
         return False
     return True
+
+
+def _v2_contract_is_well_formed(entry) -> bool:
+    """Whether ``entry`` has the complete v2 evidence-bearing shape.
+
+    This deliberately does not grant mutation authority: uncertain required
+    claims, open contradictions, and uncertain resolutions remain valid
+    discovery records but fail the stricter authority validator below.
+    """
+    return _v2_contract_is_valid(entry, authoritative=False)
+
+
+def _v2_contract_is_authoritative(entry) -> bool:
+    """Whether a complete v2 contract may authorize repository mutation."""
+    return _v2_contract_is_valid(entry, authoritative=True)
 
 
 def _contract_from_registry(entry: dict) -> PurposeContract | None:
@@ -684,8 +724,10 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
     return contract
 
 
-def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContract | None:
-    """Read an authored contract that lives inside the audited repo."""
+def _contract_from_repo_lookup(
+    project_dir: str, program_name: str = ""
+) -> tuple[PurposeContract | None, bool]:
+    """Return an in-repo contract and whether its authority gate rejected it."""
     for rel in IN_REPO_CONTRACT_FILES:
         path = os.path.join(project_dir, rel)
         if not os.path.isfile(path):
@@ -704,6 +746,9 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
                 continue
             c = _contract_from_registry(data)
             if c is None:
+                if data.get("schema") == _V2_SCHEMA \
+                        and _v2_contract_is_well_formed(data):
+                    return None, True
                 continue
             # A CONTRACT WITH NO PURPOSE IS NOT AN AUTHORED CONTRACT. The
             # markdown branch below has always required a non-empty purpose;
@@ -721,7 +766,7 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
                 c.name = program_name or os.path.basename(project_dir)
                 c.slug = slugify(c.name)
             c.source = {"doc": rel, "authored_by": "repo"}
-            return c
+            return c, False
         parsed = parse_markdown_contract(body)
         if parsed and parsed.get("purpose"):
             return PurposeContract(
@@ -733,8 +778,13 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
                 false_substitutes=parsed.get("false_substitutes", []),
                 authored=True,
                 source={"doc": rel, "authored_by": "repo"},
-            )
-    return None
+            ), False
+    return None, False
+
+
+def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContract | None:
+    """Read an authored contract that lives inside the audited repo."""
+    return _contract_from_repo_lookup(project_dir, program_name)[0]
 
 
 _MD_HEADING = re.compile(r"^#{1,6}\s*(.+?)\s*$")

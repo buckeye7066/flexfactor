@@ -301,6 +301,74 @@ class PurposeContractV2Tests(_TempRepo):
         self.assertEqual(confidence, "unresolved")
         self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
 
+    def test_in_repo_authority_rejection_blocks_markdown_and_registry_fallback(self):
+        rejected_cases = (
+            self._contract(contradictions=[self._claim(
+                "x-policy", "Owner evidence records an unresolved policy conflict."
+            )]),
+            self._contract(purpose="x" * 12000),
+        )
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "A stale registry purpose that must not authorize mutation.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run the stale workflow"],
+            },
+        }
+        for rejected in rejected_cases:
+            with self.subTest(reason=(
+                    "contradiction" if rejected.get("contradictions") else "size")):
+                _w(self.root, ".flexfactor-purpose.json", json.dumps(rejected))
+                _w(
+                    self.root,
+                    "PURPOSE.md",
+                    "# Receipt Maker\n\n## Purpose\nUse a stale Markdown purpose.\n",
+                )
+
+                contract = fp.find_contract(
+                    "Receipt Maker", self.root, registry=registry
+                )
+
+                self.assertIsNone(contract)
+                confidence = fp.purpose_confidence(contract, {})
+                self.assertEqual(confidence, "unresolved")
+                self.assertFalse(
+                    fp.mutation_authorized_by_purpose(confidence)[0]
+                )
+
+    def test_resolved_contradiction_requires_authoritative_decision(self):
+        for confidence in ("inferred", "contradicted", "unknown"):
+            with self.subTest(confidence=confidence):
+                resolved = {
+                    **self._claim("x-1", "Policy sources disagree.", confidence),
+                    "resolution": "The signed owner policy controls.",
+                }
+                self.assertIsNone(fp._contract_from_registry(self._contract(
+                    resolved_contradictions=[resolved],
+                )))
+
+    def test_authoritative_resolved_contradiction_reaches_mutation_prompt(self):
+        for confidence in ("verified", "supported"):
+            with self.subTest(confidence=confidence):
+                resolved = {
+                    **self._claim("x-1", "Policy sources disagree.", confidence),
+                    "resolution": "The signed owner policy controls.",
+                }
+                contract = fp._contract_from_registry(self._contract(
+                    resolved_contradictions=[resolved],
+                ))
+
+                self.assertIsNotNone(contract)
+                prompt = contract.prompt_block()
+                self.assertIn("RESOLVED CONTRADICTIONS", prompt)
+                self.assertIn("confidence=" + confidence, prompt)
+                self.assertIn("evidence_refs=0", prompt)
+                self.assertIn("Policy sources disagree.", prompt)
+                self.assertIn(
+                    "RESOLUTION: The signed owner policy controls.", prompt
+                )
+
     def test_malformed_v2_claim_rejects_the_entire_contract(self):
         for unsafe in (
             7,
@@ -552,6 +620,10 @@ class PurposeContractV2Tests(_TempRepo):
                          ["evidence_refs"]["minItems"], 1)
         self.assertEqual(schema["$defs"]["resolved_claim"]["properties"]
                          ["evidence_refs"]["minItems"], 1)
+        self.assertEqual(
+            schema["$defs"]["resolved_claim"]["properties"]["confidence"]["enum"],
+            ["verified", "supported"],
+        )
 
     def test_legacy_lists_remain_supported_but_are_also_atomic(self):
         contract = fp._contract_from_registry({
