@@ -641,12 +641,59 @@ class PurposeContractV2Tests(_TempRepo):
             valid, evidence_root=self.root
         ))
 
-    def test_missing_bare_documentation_locator_is_not_treated_as_remote(self):
+    @unittest.skipUnless(GIT_AVAILABLE, "Git unavailable")
+    def test_markdown_evidence_checkout_stays_lf_with_windows_autocrlf(self):
+        canonical = b"# Purpose\n\nIssue owner-approved receipts.\n"
+        attributes = Path(fp.__file__).with_name(".gitattributes").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("*.md text eol=lf", attributes.splitlines())
+        Path(self.root, ".gitattributes").write_text(
+            attributes, encoding="utf-8", newline="\n"
+        )
+        documentation = Path(self.root) / "docs" / "PURPOSE.md"
+        documentation.parent.mkdir()
+        documentation.write_bytes(canonical)
+        self.assertEqual(_git(self.root, "init", "-q").returncode, 0)
+        self.assertEqual(
+            _git(self.root, "config", "core.autocrlf", "true").returncode, 0
+        )
+        self.assertEqual(_git(self.root, "add", "-A").returncode, 0)
+        documentation.unlink()
+        checkout = _git(self.root, "checkout-index", "--force", "--", "docs/PURPOSE.md")
+        self.assertEqual(checkout.returncode, 0, checkout.stderr)
+        self.assertEqual(documentation.read_bytes(), canonical)
+
+        digest = __import__("hashlib").sha256(canonical).hexdigest()
         candidate = self._contract(evidence=[self._evidence(
-            kind="documentation", locator="PURPOSE", content_hash="0" * 64,
+            kind="documentation", locator="docs/PURPOSE.md",
+            content_hash=digest,
         )])
-        self.assertIsNone(fp._contract_from_registry(
+        self.assertIsNotNone(fp._contract_from_registry(
             candidate, evidence_root=self.root
+        ))
+
+    def test_missing_bare_documentation_locator_is_not_treated_as_remote(self):
+        local_locators = (
+            "PURPOSE",
+            r"docs\PURPOSE",
+            r"C:\owner\evidence\PURPOSE",
+            r"\\server\share\PURPOSE",
+        )
+        for locator in local_locators:
+            with self.subTest(locator=locator):
+                record = self._evidence(
+                    kind="documentation", locator=locator,
+                    content_hash="0" * 64,
+                )
+                self.assertTrue(fp._v2_evidence_requires_local_hash(
+                    record, self.root
+                ))
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[record]), evidence_root=self.root
+                ))
+        self.assertFalse(fp._v2_evidence_requires_local_hash(
+            self._evidence(locator="https://example.invalid/PURPOSE"), self.root
         ))
 
     def test_local_evidence_descriptor_must_still_match_directory_entry(self):
@@ -688,6 +735,30 @@ class PurposeContractV2Tests(_TempRepo):
             self.assertIsNone(fp._contract_from_registry(
                 candidate, evidence_root=self.root
             ))
+
+    @unittest.skipUnless(getattr(os, "O_NONBLOCK", 0), "O_NONBLOCK unavailable")
+    def test_local_evidence_open_is_nonblocking(self):
+        source = Path(self.root) / "evidence.txt"
+        source.write_bytes(b"owner evidence\n")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="runtime", locator="evidence.txt", content_hash=digest,
+        )])
+        observed_flags = []
+        real_open = fp.os.open
+
+        def recording_open(path, flags, *args, **kwargs):
+            observed_flags.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(fp.os, "open", side_effect=recording_open):
+            self.assertIsNotNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+        self.assertTrue(observed_flags)
+        self.assertTrue(all(
+            flags & os.O_NONBLOCK for flags in observed_flags
+        ))
 
     def test_local_evidence_read_failure_rejects_authority(self):
         source = Path(self.root) / "src" / "receipt.py"
@@ -1010,6 +1081,41 @@ class PurposeContractV2Tests(_TempRepo):
             )
         self.assertIsNone(contract)
         self.assertTrue(rejected)
+
+    def test_in_repo_contract_reader_is_bounded_even_after_open(self):
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
+        requested_sizes = []
+        real_fdopen = fp.os.fdopen
+
+        class RecordingReader:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def read(self, size=-1):
+                requested_sizes.append(size)
+                return self.handle.read(size)
+
+        def recording_fdopen(descriptor, mode, *, closefd):
+            return RecordingReader(real_fdopen(
+                descriptor, mode, closefd=closefd
+            ))
+
+        with mock.patch.object(fp.os, "fdopen", side_effect=recording_fdopen):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNotNone(contract)
+        self.assertFalse(rejected)
+        self.assertEqual(
+            requested_sizes, [fp.IN_REPO_CONTRACT_MAX_BYTES + 1]
+        )
 
     def test_in_repo_contract_symlink_escape_is_an_authority_rejection(self):
         outside = Path(self.root).parent / (Path(self.root).name + "-purpose.json")

@@ -21174,6 +21174,30 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertIn("purpose authority", rejected["reason"])
         self.assertEqual(rejected_reviewer.calls, [])
 
+    def test_v2_contract_mutation_is_rejected_before_final_review(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        authority_path = os.path.join(d, ".flexfactor-purpose.json")
+        with open(authority_path, encoding="utf-8") as fh:
+            authority = json.load(fh)
+        authority["purpose"] = "Candidate replaced the authorizing purpose."
+        with open(authority_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(authority, fh, sort_keys=True)
+            fh.write("\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "mutate purpose authority")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("purpose authority", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
     def test_audit_final_review_summary_includes_the_authorizing_contract(self):
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn(
