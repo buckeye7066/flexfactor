@@ -1,3 +1,4 @@
+"""Regression coverage for FlexFactor runtime hardening and review findings."""
 from __future__ import annotations
 
 import os
@@ -118,7 +119,6 @@ class RuntimeHardeningTests(unittest.TestCase):
             self.assertIsNone(
                 directed.powershell_syntax_details(".", "repair.ps1", "Write-Output 'ok'\n", lambda *_a, **_k: None)
             )
-
 
     def test_direct_main_entry_arms_hardening_without_test_installer(self):
         import inspect
