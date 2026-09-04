@@ -376,7 +376,20 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 handle.write("installed after initial detection\n")
             stack = {"esbuild": None, "toolchains": []}
             ff._refresh_verification_status(project, stack)
+            with mock.patch.object(
+                    ff, "_run",
+                    return_value=ff.subprocess.CompletedProcess(
+                        [], 0, "const view = /* @__PURE__ */ React.createElement(\"div\");\n", "",
+                    ),
+            ) as parser:
+                ok, note = ff._prewrite_source_syntax_ok(
+                    project, "src/view.tsx",
+                    "const view = <div />;\n", stack,
+                )
         self.assertEqual(binary, stack["esbuild"])
+        self.assertIs(ok, True, note)
+        self.assertIn("esbuild", note)
+        self.assertEqual(binary, parser.call_args.args[0][0])
 
     def test_all_mutation_modes_use_the_shared_native_source_preflight(self):
         for function in (
