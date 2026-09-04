@@ -170,77 +170,203 @@ class PurposeContractV2Tests(_TempRepo):
             "evidence_refs": [0] if refs is None else refs,
         }
 
-    def test_structured_users_and_workflows_populate_runtime_contract(self):
-        _w(self.root, ".flexfactor-purpose.json", json.dumps({
+    @staticmethod
+    def _evidence(**overrides) -> dict:
+        record = {
+            "kind": "source",
+            "locator": "src/receipt.py",
+            "content_hash": "a" * 64,
+            "observed_at": "2026-09-04T02:03:04Z",
+        }
+        record.update(overrides)
+        return record
+
+    def _contract(self, **overrides) -> dict:
+        contract = {
             "schema": "flexfactor.purpose_contract.v2",
             "name": "Receipt Maker",
             "purpose": "Turn invoices into receipts.",
-            "users": [
-                self._claim("u-1", "Bookkeepers"),
-                self._claim("u-2", "Business owners", "supported"),
-            ],
+            "users": [self._claim("u-1", "Bookkeepers")],
+            "outcomes": [self._claim("o-1", "A valid receipt exists.")],
             "workflows": [
                 self._claim("w-1", "Upload an invoice and export its receipt."),
             ],
+            "invariants": [
+                self._claim("i-1", "Invoice totals remain unchanged."),
+            ],
             "acceptance_criteria": ["A receipt can be exported."],
-        }))
+            "evidence": [self._evidence()],
+        }
+        contract.update(overrides)
+        return contract
+
+    def test_structured_users_and_workflows_populate_runtime_contract(self):
+        contract_doc = self._contract(
+            users=[
+                self._claim("u-1", "Bookkeepers"),
+                self._claim("u-2", "Business owners", "supported"),
+            ],
+            workflows=[
+                self._claim("w-1", "Upload an invoice and export its receipt."),
+            ],
+        )
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
 
         contract = fp.find_contract("Receipt Maker", self.root, registry={})
 
         self.assertIsNotNone(contract)
+        self.assertTrue(contract.authored)
         self.assertEqual(contract.primary_users, ["Bookkeepers", "Business owners"])
         self.assertEqual(
             contract.core_journeys,
             ["Upload an invoice and export its receipt."],
         )
 
-    def test_one_malformed_v2_record_rejects_the_whole_section(self):
-        contract = fp._contract_from_registry({
-            "name": "Safe",
-            "purpose": "Do the safe thing.",
-            "users": [self._claim("u-1", "Operator"), 7],
-            "workflows": {"w-1": "Never use mapping keys as prose"},
-        })
-
-        self.assertEqual(contract.primary_users, [])
-        self.assertEqual(contract.core_journeys, [])
-
-    def test_blank_or_incomplete_v2_claim_rejects_the_whole_section(self):
+    def test_malformed_v2_claim_rejects_the_entire_contract(self):
         for unsafe in (
+            7,
             {"id": "u-2", "text": "   ", "confidence": "verified",
              "evidence_refs": [0]},
             {"id": "u-2", "text": "Operator", "confidence": "verified"},
             {"id": "", "text": "Operator", "confidence": "verified",
              "evidence_refs": [0]},
-            {"id": "u-2", "text": "Operator", "confidence": "verified",
-             "evidence_refs": [-1]},
+            {**self._claim("u-2", "Operator"), "unexpected": True},
         ):
             with self.subTest(unsafe=unsafe):
-                contract = fp._contract_from_registry({
-                    "name": "Safe",
-                    "purpose": "Do the safe thing.",
-                    "users": [self._claim("u-1", "Bookkeeper"), unsafe],
-                })
-                self.assertEqual(contract.primary_users, [])
+                contract = fp._contract_from_registry(self._contract(
+                    users=[self._claim("u-1", "Bookkeeper"), unsafe],
+                ))
+                self.assertIsNone(contract)
 
-    def test_non_authoritative_v2_claim_never_unlocks_an_authored_section(self):
-        for confidence in ("inferred", "contradicted", "unknown", "bogus"):
+    def test_claim_references_must_be_nonempty_and_resolve_to_evidence(self):
+        for unsafe_refs in ([], [-1], [1], [True], [0, 9]):
+            with self.subTest(evidence_refs=unsafe_refs):
+                contract = fp._contract_from_registry(self._contract(
+                    workflows=[self._claim(
+                        "w-1", "Run the complete flow", refs=unsafe_refs)],
+                ))
+                self.assertIsNone(contract)
+
+    def test_every_claim_section_is_reference_checked(self):
+        for section in (
+                "current_behavior", "aspirations", "users", "outcomes",
+                "workflows", "invariants", "contradictions", "gaps"):
+            with self.subTest(section=section):
+                contract = fp._contract_from_registry(self._contract(**{
+                    section: [self._claim("unsafe", "Unsupported", refs=[7])],
+                }))
+                self.assertIsNone(contract)
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            resolved_contradictions=[{
+                **self._claim("x-1", "Conflict", refs=[]),
+                "resolution": "Implementation is authoritative.",
+            }],
+        )))
+
+    def test_complete_v2_shape_is_required_before_it_is_authored(self):
+        for field in (
+                "schema", "name", "purpose", "users", "outcomes", "workflows",
+                "invariants", "acceptance_criteria", "evidence"):
+            with self.subTest(missing=field):
+                candidate = self._contract()
+                candidate.pop(field)
+                self.assertIsNone(fp._contract_from_registry(candidate))
+        for field in ("users", "outcomes", "workflows", "invariants",
+                      "acceptance_criteria", "evidence"):
+            with self.subTest(empty=field):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(**{field: []})))
+
+    def test_evidence_records_are_validated_before_claims_can_use_them(self):
+        unsafe_records = (
+            self._evidence(kind="opinion"),
+            self._evidence(locator=" "),
+            self._evidence(content_hash="ABC"),
+            self._evidence(observed_at="2026-09-04"),
+            self._evidence(observed_at="2026-02-30T02:03:04Z"),
+            {**self._evidence(), "unexpected": True},
+        )
+        for unsafe in unsafe_records:
+            with self.subTest(evidence=unsafe):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[unsafe])))
+
+    def test_optional_sections_and_additional_properties_are_fail_closed(self):
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            aspirations=[{"id": "asp-1"}],
+        )))
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            invented_authority=True,
+        )))
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            acceptance_criteria=["   "],
+        )))
+
+    def test_non_authoritative_required_claim_never_unlocks_contract(self):
+        for confidence in ("inferred", "contradicted", "unknown"):
             with self.subTest(confidence=confidence):
-                contract = fp._contract_from_registry({
-                    "name": "Safe",
-                    "purpose": "Do the safe thing.",
-                    "users": [self._claim("u-1", "Operator", confidence)],
-                })
-                self.assertEqual(contract.primary_users, [])
+                contract = fp._contract_from_registry(self._contract(
+                    outcomes=[self._claim(
+                        "o-1", "An uncertain outcome", confidence)],
+                ))
+                self.assertIsNone(contract)
+
+    def test_invalid_in_repo_v2_falls_through_to_valid_legacy_registry(self):
+        invalid = self._contract()
+        invalid.pop("invariants")
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(invalid))
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Use the owner registry purpose.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Complete the trusted flow"],
+                "acceptance_criteria": ["The trusted flow completes."],
+            },
+        }
+
+        contract = fp.find_contract("Receipt Maker", self.root, registry=registry)
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.purpose, "Use the owner registry purpose.")
+        self.assertEqual(contract.primary_users, ["Operators"])
+
+    def test_invalid_registry_v2_cannot_gain_authored_mutation_authority(self):
+        invalid = self._contract()
+        invalid["users"][0]["evidence_refs"] = []
+
+        contract = fp.find_contract(
+            "Receipt Maker", registry={"receipt-maker": invalid})
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_checked_in_contract_passes_runtime_validator(self):
+        with open(os.path.join(os.path.dirname(fp.__file__),
+                               ".flexfactor-purpose.json"), encoding="utf-8") as fh:
+            checked_in = json.load(fh)
+        self.assertTrue(fp._v2_contract_is_authoritative(checked_in))
+
+    def test_schema_requires_nonempty_evidence_references(self):
+        with open(os.path.join(os.path.dirname(fp.__file__), "docs",
+                               "purpose-contract.schema.json"),
+                  encoding="utf-8") as fh:
+            schema = json.load(fh)
+        self.assertEqual(schema["$defs"]["claim"]["properties"]
+                         ["evidence_refs"]["minItems"], 1)
+        self.assertEqual(schema["$defs"]["resolved_claim"]["properties"]
+                         ["evidence_refs"]["minItems"], 1)
 
     def test_legacy_lists_remain_supported_but_are_also_atomic(self):
         contract = fp._contract_from_registry({
             "name": "Legacy",
             "purpose": "Keep compatibility.",
             "primary_users": [" Operators ", "Owners"],
-            "users": [self._claim("u-1", "Ignored structured fallback")],
             "core_journeys": ["Run the complete flow"],
         })
+        self.assertIsNotNone(contract)
         self.assertEqual(contract.primary_users, ["Operators", "Owners"])
         self.assertEqual(contract.core_journeys, ["Run the complete flow"])
 
@@ -249,6 +375,7 @@ class PurposeContractV2Tests(_TempRepo):
             "purpose": "Keep compatibility.",
             "primary_users": ["Operator", 7],
         })
+        self.assertIsNotNone(malformed)
         self.assertEqual(malformed.primary_users, [])
 
 
