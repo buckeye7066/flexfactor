@@ -16813,6 +16813,67 @@ FINAL_REVIEW_SYSTEM = (
 )
 
 
+def _revalidate_final_purpose_authority(
+    project_dir: str,
+    final_sha: str,
+    supplied_contract: dict,
+    purpose_confidence: str,
+) -> tuple[bool, str]:
+    """Rebind a v2 authorizing contract to the exact final checkout.
+
+    A candidate may change the contract itself or any repository bytes cited by
+    its evidence ledger. The startup copy must not certify that different final
+    tree. Evidence-bearing v2 contracts are therefore loaded again at the final
+    SHA and must remain byte-for-byte equivalent after normalized serialization.
+    Legacy and inferred contracts carry no ``contract_evidence`` and retain
+    their existing final-review behavior.
+    """
+    contract_evidence = supplied_contract.get("contract_evidence")
+    if not contract_evidence:
+        return True, ""
+    if not isinstance(contract_evidence, list):
+        return False, "purpose contract evidence ledger was not a list"
+    same_head, head_reason = _ff_ledger.head_matches(
+        _git_argv, project_dir, final_sha
+    )
+    if not same_head:
+        return False, "final purpose authority is not at the reviewed SHA: " + str(
+            head_reason
+        )
+    purpose_mod = _purpose_module()
+    lookup = getattr(purpose_mod, "find_contract_with_status", None)
+    name = str(supplied_contract.get("name") or "").strip()
+    if not callable(lookup) or not name:
+        return False, "final purpose authority could not be reloaded"
+    try:
+        fresh, authority_rejected = lookup(name, project_dir)
+    except Exception as exc:
+        return False, (
+            "final purpose authority reload failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if authority_rejected or fresh is None:
+        return False, "final purpose authority or cited evidence was rejected"
+    fresh.confidence = purpose_confidence
+    try:
+        expected = json.dumps(
+            supplied_contract, sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        observed = json.dumps(
+            fresh.to_dict(), sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        return False, f"final purpose authority could not be compared: {exc}"
+    if observed != expected:
+        return False, (
+            "final purpose authority differs from the contract that authorized "
+            "the mutation"
+        )
+    return True, ""
+
+
 def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | None,
                               final_sha: str | None, evidence_summary: dict,
                               *, max_chunk_chars: int = 60_000) -> dict:
@@ -16855,6 +16916,15 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
             "verdict": "reject", "commit": final_sha, "findings": [],
             "evidence_consistent": False,
             "reason": "purpose confidence was not supplied or was invalid",
+        }
+    authority_ok, authority_reason = _revalidate_final_purpose_authority(
+        project_dir, final_sha, purpose_contract, purpose_confidence
+    )
+    if not authority_ok:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": authority_reason,
         }
     if baseline_sha and baseline_sha != final_sha:
         shown = _git(["diff", "--no-ext-diff", "--unified=20",

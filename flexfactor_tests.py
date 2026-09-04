@@ -21041,6 +21041,57 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertGreater(len(patch), 180_000, "fixture patch must exceed the old cap")
         return d, g, base, final
 
+    def _repo_with_v2_contract(self):
+        d = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+
+        def g(*a):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                cwd=d, capture_output=True, text=True, encoding="utf-8",
+                errors="replace",
+            )
+
+        g("init", "-q", "-b", "main")
+        evidence_path = os.path.join(d, "evidence.txt")
+        with open(evidence_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("owner evidence\n")
+        digest = hashlib.sha256(Path(evidence_path).read_bytes()).hexdigest()
+        claim = lambda claim_id, text: {
+            "id": claim_id, "text": text, "confidence": "verified",
+            "evidence_refs": [0],
+        }
+        payload = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Fixture",
+            "purpose": "Exercise final purpose authority.",
+            "users": [claim("u-1", "Owner")],
+            "outcomes": [claim("o-1", "Verified output")],
+            "workflows": [claim("w-1", "Run the workflow")],
+            "invariants": [claim("i-1", "Evidence remains bound")],
+            "acceptance_criteria": ["Evidence remains bound."],
+            "contradictions": [],
+            "evidence": [{
+                "kind": "source", "locator": "evidence.txt",
+                "content_hash": digest,
+                "observed_at": "2026-09-04T00:00:00Z",
+            }],
+        }
+        with open(
+            os.path.join(d, ".flexfactor-purpose.json"), "w",
+            encoding="utf-8", newline="\n",
+        ) as fh:
+            json.dump(payload, fh, sort_keys=True)
+            fh.write("\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "base authority")
+        base = g("rev-parse", "HEAD").stdout.strip()
+        import flexfactor_purpose as purpose_mod
+        contract = purpose_mod.contract_from_repo(d, "Fixture")
+        self.assertIsNotNone(contract)
+        contract.confidence = "owner-authored"
+        return d, g, base, contract.to_dict()
+
     def test_every_chunk_is_reviewed_and_the_ledger_is_complete(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer(final)
@@ -21092,6 +21143,36 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
             )
             self.assertIn("COMPLETE PURPOSE CONTRACT (never truncated)", prompt)
             self.assertIn(sentinel, prompt)
+
+    def test_v2_purpose_authority_is_revalidated_at_the_final_commit(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        with open(os.path.join(d, "unrelated.txt"), "w", encoding="utf-8") as fh:
+            fh.write("candidate\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "unrelated candidate")
+        unchanged_sha = g("rev-parse", "HEAD").stdout.strip()
+        accepted_reviewer = self._Reviewer(unchanged_sha)
+        accepted = ff._independent_final_review(
+            accepted_reviewer, d, base, unchanged_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+        self.assertEqual(accepted["verdict"], "approve", accepted["reason"])
+
+        with open(os.path.join(d, "evidence.txt"), "a", encoding="utf-8") as fh:
+            fh.write("changed after authorization\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "invalidate authority evidence")
+        stale_sha = g("rev-parse", "HEAD").stdout.strip()
+        rejected_reviewer = self._Reviewer(stale_sha)
+        rejected = ff._independent_final_review(
+            rejected_reviewer, d, unchanged_sha, stale_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+        self.assertEqual(rejected["verdict"], "reject")
+        self.assertIn("purpose authority", rejected["reason"])
+        self.assertEqual(rejected_reviewer.calls, [])
 
     def test_audit_final_review_summary_includes_the_authorizing_contract(self):
         source = inspect.getsource(ff.audit_one_program)

@@ -176,7 +176,7 @@ class PurposeContractV2Tests(_TempRepo):
     def _evidence(**overrides) -> dict:
         record = {
             "kind": "documentation",
-            "locator": "owner policy record",
+            "locator": "https://example.invalid/owner-policy-record",
             "content_hash": "a" * 64,
             "observed_at": "2026-09-04T02:03:04Z",
         }
@@ -641,6 +641,14 @@ class PurposeContractV2Tests(_TempRepo):
             valid, evidence_root=self.root
         ))
 
+    def test_missing_bare_documentation_locator_is_not_treated_as_remote(self):
+        candidate = self._contract(evidence=[self._evidence(
+            kind="documentation", locator="PURPOSE", content_hash="0" * 64,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            candidate, evidence_root=self.root
+        ))
+
     def test_local_evidence_descriptor_must_still_match_directory_entry(self):
         source = Path(self.root) / "src" / "receipt.py"
         source.parent.mkdir()
@@ -663,6 +671,20 @@ class PurposeContractV2Tests(_TempRepo):
             return observed
 
         with mock.patch.object(fp.os, "stat", side_effect=replaced):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
+    def test_special_evidence_file_is_rejected_before_open(self):
+        special = Path(self.root) / "PURPOSE"
+        os.mkfifo(special)
+        candidate = self._contract(evidence=[self._evidence(
+            kind="documentation", locator="PURPOSE", content_hash="0" * 64,
+        )])
+        with mock.patch.object(
+            fp.os, "open", side_effect=AssertionError("must not open a FIFO")
+        ):
             self.assertIsNone(fp._contract_from_registry(
                 candidate, evidence_root=self.root
             ))
@@ -969,6 +991,19 @@ class PurposeContractV2Tests(_TempRepo):
         _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
         with mock.patch.object(
             fp.os, "open", side_effect=PermissionError("owner contract unreadable")
+        ):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_oversized_in_repo_contract_is_rejected_before_read(self):
+        authority = Path(self.root) / ".flexfactor-purpose.json"
+        authority.write_bytes(b" " * (fp.IN_REPO_CONTRACT_MAX_BYTES + 1))
+        with mock.patch.object(
+            fp.os, "fdopen",
+            side_effect=AssertionError("oversized authority must not be read"),
         ):
             contract, rejected = fp.find_contract_with_status(
                 "Receipt Maker", self.root, registry={}

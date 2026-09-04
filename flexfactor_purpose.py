@@ -160,6 +160,10 @@ REQUIRED_V2_PROMPT_MAX_CHARS = 10000
 # ``purpose_contract`` is placed before later evidence in exact-commit review.
 # Keep its complete serialized form bounded well below that review envelope.
 REQUIRED_V2_SERIALIZED_MAX_CHARS = 40000
+# Authority files are target-controlled input. Bound bytes before decoding so
+# whitespace padding cannot turn a small serialized contract into an unbounded
+# allocation at the mutation gate.
+IN_REPO_CONTRACT_MAX_BYTES = 256 * 1024
 
 
 def slugify(text: str) -> str:
@@ -638,12 +642,11 @@ def _v2_evidence_requires_local_hash(
     """Whether a locator represents repository bytes that must be verified.
 
     Evidence ``kind`` describes why a record matters, not where its bytes
-    live.  Documentation, history, and runtime records can still point at a
-    repository file.  Treat every path-shaped locator as local, and also treat
-    an existing directory entry as local whenever a root is available; only
-    an explicit HTTP(S) locator is unambiguously remote. The source/test/
-    schema/route kinds remain local even when no root was supplied, so direct
-    callers cannot grant them authority without verifying their bytes.
+    live. Documentation, history, and runtime records can still point at a
+    repository file. Only an explicit HTTP(S) locator is unambiguously remote;
+    every other locator goes through the fail-closed local verifier. The
+    source/test/schema/route kinds remain local even if their locator looks
+    like a URL, so a mislabeled source cannot bypass byte verification.
     """
     if record.get("kind") in _V2_LOCAL_EVIDENCE_KINDS:
         return True
@@ -651,23 +654,9 @@ def _v2_evidence_requires_local_hash(
     if not isinstance(locator, str) or not locator.strip():
         return False
     value = locator.strip()
-    if re.fullmatch(r"https?://[^\s]+", value, flags=re.IGNORECASE):
-        return False
-    relative = Path(value)
-    if (relative.is_absolute() or relative.drive or "/" in value
-            or "\\" in value or bool(relative.suffix)):
-        return True
-    if not evidence_root:
-        return False
-    try:
-        os.lstat(Path(evidence_root).expanduser() / relative)
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        # An unreadable directory entry is not evidence that the locator is
-        # external to the repository; send it through the fail-closed verifier.
-        return True
+    return re.fullmatch(
+        r"https?://[^\s]+", value, flags=re.IGNORECASE
+    ) is None
 
 
 def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
@@ -705,8 +694,15 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
         try:
             candidate = (root / relative).resolve(strict=True)
             candidate.relative_to(root)
+            # Reject a FIFO/device/socket before a blocking open. O_NONBLOCK
+            # below also closes the lstat/open race if an attacker swaps a
+            # regular file for a FIFO after this check.
+            candidate_info = os.lstat(candidate)
+            if not stat.S_ISREG(candidate_info.st_mode):
+                return False
             flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
             flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            flags |= int(getattr(os, "O_NONBLOCK", 0))
             descriptor = os.open(candidate, flags)
             try:
                 opened = os.fstat(descriptor)
@@ -1034,18 +1030,25 @@ def _contract_from_repo_lookup(
             return None, True
         if not stat.S_ISREG(info.st_mode):
             return None, True
+        if info.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+            return None, True
         try:
             flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
             flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            flags |= int(getattr(os, "O_NONBLOCK", 0))
             descriptor = os.open(path, flags)
             try:
                 opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode):
+                if not stat.S_ISREG(opened.st_mode) \
+                        or opened.st_size > IN_REPO_CONTRACT_MAX_BYTES:
                     return None, True
                 with os.fdopen(
-                    descriptor, "r", encoding="utf-8", closefd=False
+                    descriptor, "rb", closefd=False
                 ) as fh:
-                    body = fh.read()
+                    raw = fh.read(IN_REPO_CONTRACT_MAX_BYTES + 1)
+                if len(raw) > IN_REPO_CONTRACT_MAX_BYTES:
+                    return None, True
+                body = raw.decode("utf-8")
             finally:
                 os.close(descriptor)
             current = unresolved.resolve(strict=True)
