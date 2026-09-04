@@ -16845,8 +16845,49 @@ def _revalidate_final_purpose_authority(
     name = str(supplied_contract.get("name") or "").strip()
     if not callable(lookup) or not name:
         return False, "final purpose authority could not be reloaded"
+    # Never reload from the caller's mutable working tree. HEAD can name the
+    # reviewed commit while unstaged/ignored files restore stale authority
+    # bytes on disk. A local shared clone materializes only final_sha's Git
+    # objects and does not mutate the source repository's worktree metadata.
     try:
-        fresh, authority_rejected = lookup(name, project_dir)
+        with tempfile.TemporaryDirectory(prefix="flexfactor-purpose-final-") as tmp:
+            exact_checkout = os.path.join(tmp, "candidate")
+            cloned = _git(
+                ["-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=",
+                 "-c", "filter.lfs.required=false", "clone", "--quiet",
+                 "--shared", "--no-checkout", "--", project_dir,
+                 exact_checkout],
+                project_dir,
+            )
+            if cloned.returncode != 0:
+                return False, (
+                    "final purpose authority exact-tree clone failed: "
+                    + _tail((cloned.stderr or cloned.stdout or ""), 4)
+                )
+            checked_out = _git(
+                ["-c", "core.autocrlf=false", "-c", "filter.lfs.smudge=",
+                 "-c", "filter.lfs.required=false", "checkout", "--quiet",
+                 "--detach", final_sha],
+                exact_checkout,
+            )
+            if checked_out.returncode != 0:
+                return False, (
+                    "final purpose authority exact-tree checkout failed: "
+                    + _tail((checked_out.stderr or checked_out.stdout or ""), 4)
+                )
+            exact_head = _git(["rev-parse", "HEAD"], exact_checkout)
+            exact_status = _git(
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                exact_checkout,
+            )
+            if (
+                exact_head.returncode != 0
+                or (exact_head.stdout or "").strip() != final_sha
+                or exact_status.returncode != 0
+                or bool(exact_status.stdout or "")
+            ):
+                return False, "final purpose authority exact-tree checkout was not clean"
+            fresh, authority_rejected = lookup(name, exact_checkout)
     except Exception as exc:
         return False, (
             "final purpose authority reload failed: "

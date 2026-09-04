@@ -164,6 +164,11 @@ REQUIRED_V2_SERIALIZED_MAX_CHARS = 40000
 # whitespace padding cannot turn a small serialized contract into an unbounded
 # allocation at the mutation gate.
 IN_REPO_CONTRACT_MAX_BYTES = 256 * 1024
+# Local evidence can legitimately be a generated source bundle larger than the
+# contract itself, but it must never trigger unbounded reads at the authority
+# gate. The checked-in FlexFactor evidence is below 2 MiB; 16 MiB leaves ample
+# headroom while rejecting databases, disk images, and huge sparse artifacts.
+V2_LOCAL_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def slugify(text: str) -> str:
@@ -700,6 +705,8 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
             candidate_info = os.lstat(candidate)
             if not stat.S_ISREG(candidate_info.st_mode):
                 return False
+            if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                return False
             flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
             flags |= int(getattr(os, "O_NOFOLLOW", 0))
             flags |= int(getattr(os, "O_NONBLOCK", 0))
@@ -708,12 +715,20 @@ def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
                 opened = os.fstat(descriptor)
                 if not stat.S_ISREG(opened.st_mode):
                     return False
+                if opened.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                    return False
                 digest = hashlib.sha256()
+                remaining = V2_LOCAL_EVIDENCE_MAX_BYTES + 1
+                total_read = 0
                 with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                    while True:
-                        chunk = handle.read(1024 * 1024)
+                    while remaining > 0:
+                        chunk = handle.read(min(1024 * 1024, remaining))
                         if not chunk:
                             break
+                        total_read += len(chunk)
+                        remaining -= len(chunk)
+                        if total_read > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                            return False
                         digest.update(chunk)
             finally:
                 os.close(descriptor)

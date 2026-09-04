@@ -21198,6 +21198,31 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertIn("purpose authority", result["reason"])
         self.assertEqual(reviewer.calls, [])
 
+    def test_final_authority_uses_commit_not_restored_worktree_bytes(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        evidence_path = Path(d) / "evidence.txt"
+        original = evidence_path.read_bytes()
+        evidence_path.write_bytes(b"candidate invalidated this evidence\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "invalidate committed evidence")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+
+        # Recreate the authorizing bytes only in the mutable checkout. HEAD is
+        # still final_sha, so a plain rev-parse guard cannot detect this bypass.
+        evidence_path.write_bytes(original)
+        self.assertTrue(g("status", "--porcelain").stdout)
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("purpose authority", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
     def test_audit_final_review_summary_includes_the_authorizing_contract(self):
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn(

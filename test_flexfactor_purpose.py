@@ -736,6 +736,21 @@ class PurposeContractV2Tests(_TempRepo):
                 candidate, evidence_root=self.root
             ))
 
+    def test_oversized_local_evidence_is_rejected_before_open(self):
+        source = Path(self.root) / "large-evidence.bin"
+        with source.open("wb") as handle:
+            handle.truncate(fp.V2_LOCAL_EVIDENCE_MAX_BYTES + 1)
+        candidate = self._contract(evidence=[self._evidence(
+            kind="runtime", locator=source.name, content_hash="0" * 64,
+        )])
+        with mock.patch.object(
+            fp.os, "open",
+            side_effect=AssertionError("oversized evidence must not be opened"),
+        ):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
     @unittest.skipUnless(getattr(os, "O_NONBLOCK", 0), "O_NONBLOCK unavailable")
     def test_local_evidence_open_is_nonblocking(self):
         source = Path(self.root) / "evidence.txt"
