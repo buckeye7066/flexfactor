@@ -22537,9 +22537,19 @@ def run_audit(args) -> int:
         stable_session_id = hashlib.sha256(
             identity.encode("utf-8")).hexdigest()[:32]
         if remaining_targets:
+            # The preview was routed against the full queue, whose aliases are
+            # required to distinguish work addressed to already-completed
+            # targets. Preserve that decision and discard completed routes;
+            # rerouting the original text against only the remaining target(s)
+            # could turn a completed target's explicit work into shared or
+            # single-target work for the wrong repository.
+            remaining_routing = {
+                **session_routing,
+                "routes": session_routing["routes"][orchestrator.next_index:],
+            }
             try:
-                receipt = _ff_steering.submit_session_prompt(
-                    session_prompt, remaining_targets, source="cli-session",
+                receipt = _ff_steering.submit_session_routing(
+                    remaining_routing, source="cli-session",
                     session_id=stable_session_id)
             except (OSError, ValueError) as exc:
                 print(f"session prompt was not saved: {exc}", file=sys.stderr)
