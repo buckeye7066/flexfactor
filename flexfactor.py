@@ -15103,8 +15103,9 @@ def _go_runnable_test_names(source: str) -> list[str]:
 
     The lexical projection removes comments and strings first, so braces and
     ``t.Skip`` text in examples cannot affect the scan. Any Skip/SkipNow call
-    on the test parameter is conservatively disqualifying; runtime-dependent
-    skips cannot establish that generated behavior executed.
+    on the test parameter, or on a nested ``*testing.T`` parameter used by a
+    subtest, is conservatively disqualifying; runtime-dependent skips cannot
+    establish that generated behavior executed.
     """
     projected = _go_code_projection(source)
     declaration = re.compile(
@@ -15123,10 +15124,20 @@ def _go_runnable_test_names(source: str) -> list[str]:
             cursor += 1
         if depth:
             continue
-        parameter = re.escape(match.group(2))
         body = projected[match.end():cursor - 1]
-        if re.search(
-                rf"\b{parameter}\s*\.\s*Skip(?:f|Now)?\s*\(", body):
+        # A successful top-level Test event does not prove that its subtests
+        # ran: Go reports a parent as passed when its only t.Run child skips.
+        # Include parameters from nested function literals so st.Skipf inside
+        # ``t.Run(..., func(st *testing.T) {...})`` cannot earn credit.
+        test_parameters = {match.group(2)}
+        test_parameters.update(re.findall(
+            r"\b([A-Za-z_]\w*)\s+\*\s*testing\s*\.\s*T\b", body,
+        ))
+        skip_call = re.compile(
+            rf"\b(?:{'|'.join(re.escape(name) for name in sorted(test_parameters))})"
+            r"\s*\.\s*Skip(?:f|Now)?\s*\(",
+        )
+        if skip_call.search(body):
             continue
         runnable.append(match.group(1))
     return runnable
@@ -15779,6 +15790,11 @@ def _run_generated_test_file(project_dir: str, entry: dict,
             if name in names and action == "pass":
                 passed.add(name)
             elif name in names and action == "skip":
+                skipped.add(name)
+            elif (isinstance(name, str) and action == "skip"
+                  and any(name.startswith(parent + "/") for parent in names)):
+                # Go emits a separate skip for a t.Run descendant, then may
+                # still emit pass for the selected top-level parent.
                 skipped.add(name)
         missing = sorted(set(names) - passed)
         if result.returncode != 0 or missing or skipped:

@@ -5174,6 +5174,51 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                     "generated_test.go", source,
                 ))
 
+    def test_go_nested_subtest_skips_never_receive_execution_credit(self):
+        for call in ("Skip", "Skipf", "SkipNow"):
+            source = (
+                "package x\nimport \"testing\"\n"
+                "func TestGenerated(t *testing.T) {\n"
+                "  t.Run(\"sub\", func(st *testing.T) { "
+                f"st.{call}(\"why\") }})\n"
+                "}\n"
+            )
+            with self.subTest(call=call):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+
+    def test_go_nested_parameter_text_in_literals_does_not_block_credit(self):
+        source = (
+            "package x\nimport \"testing\"\n"
+            "func TestGenerated(t *testing.T) {\n"
+            "  example := `func(st *testing.T) { st.Skipf(\"why\") }`\n"
+            "  _ = example\n"
+            "}\n"
+        )
+        self.assertTrue(ff._generated_test_source_has_case(
+            "generated_test.go", source,
+        ))
+
+    def test_go_runner_rejects_skipped_descendant_of_passed_parent(self):
+        source = (
+            "package x\nimport \"testing\"\n"
+            "func TestGenerated(t *testing.T) {}\n"
+        )
+        events = "\n".join(json.dumps(event) for event in (
+            {"Action": "skip", "Test": "TestGenerated/sub"},
+            {"Action": "pass", "Test": "TestGenerated"},
+        ))
+        result = mock.Mock(returncode=0, stdout=events, stderr="")
+        with mock.patch.object(ff, "_run", return_value=result):
+            ok, log = ff._run_generated_test_file(
+                ".",
+                {"path": "generated_test.go", "contents": source},
+                {"test_cmd": ["go", "test"]},
+            )
+        self.assertFalse(ok)
+        self.assertIn("TestGenerated/sub", log)
+
     def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
         cases = (
             "test.skip('skipped', () => {});\n",
