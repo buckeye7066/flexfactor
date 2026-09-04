@@ -6,10 +6,6 @@ ranking:
 context:
   max_tokens: 100000
 
-output:
-  format: markdown
-  copy_on_distill: false
-
 ignore:
   - .git/
   - .venv/
