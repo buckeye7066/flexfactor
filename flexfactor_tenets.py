@@ -26,6 +26,7 @@ import re
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -37,6 +38,8 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_TOP = 200
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
+MAX_RANKER_MEMORY_BYTES = 1024 * 1024 * 1024
+MAX_RANKER_PROCESSES = 64
 # Python sequences cannot contain more than sys.maxsize elements. Using
 # that interpreter bound neutralizes the caller's review quota without
 # imposing a smaller, arbitrary repository cutoff before prioritization.
@@ -56,7 +59,7 @@ _CAP_GLOBAL_NAMES = (
 _INSTALL_LOCK = threading.Lock()
 _ENUMERATION_LOCK = threading.RLock()
 _RESULT_CACHE_LOCK = threading.Lock()
-_RESULT_CACHE: dict[tuple[str, str, int, float], "TenetsContextResult"] = {}
+_RESULT_CACHE: dict[tuple[str, str, int, float, str], "TenetsContextResult"] = {}
 
 
 @dataclass(frozen=True)
@@ -138,12 +141,12 @@ def _safe_relative_path(project_root: Path, candidate: Any) -> str | None:
     raw = Path(candidate.strip())
     combined = raw if raw.is_absolute() else project_root / raw
     try:
-        resolved = combined.resolve(strict=False)
+        resolved = combined.resolve(strict=True)
         relative = resolved.relative_to(project_root)
     except (OSError, ValueError):
         return None
     normalized = relative.as_posix()
-    if normalized in ("", "."):
+    if normalized in ("", ".") or not resolved.is_file():
         return None
     return normalized
 
@@ -256,9 +259,54 @@ def _find_tenets_executable(
     return None
 
 
-def _tenets_distribution_version() -> str | None:
+def _trusted_tenets_metadata_directories() -> tuple[Path, ...]:
+    """Return only active-interpreter package roots, excluding cwd/user paths."""
+    directories: list[Path] = []
+    for name in ("purelib", "platlib"):
+        raw = sysconfig.get_path(name)
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser().resolve(strict=False)
+        if candidate not in directories:
+            directories.append(candidate)
+    return tuple(directories)
+
+
+def _tenets_distribution_version(
+    executable: str | os.PathLike[str] | None = None,
+) -> str | None:
+    """Return Tenets' version only when metadata owns the selected script.
+
+    With an executable, this binds the console script to one distribution in
+    the active interpreter's installation roots.  Ambient ``sys.path`` (and a
+    target checkout containing forged ``*.dist-info`` metadata) is never a
+    version oracle for the executable that will run.
+    """
     try:
-        return importlib_metadata.version("tenets")
+        if executable is None:
+            return importlib_metadata.version("tenets")
+        candidate = Path(executable).expanduser().resolve(strict=True)
+        if not _is_trusted_tenets_executable(candidate):
+            return None
+        matches: list[str] = []
+        roots = [str(path) for path in _trusted_tenets_metadata_directories()]
+        for distribution in importlib_metadata.distributions(path=roots):
+            name = str(distribution.metadata.get("Name") or "")
+            canonical_name = re.sub(r"[-_.]+", "-", name).casefold()
+            if canonical_name != "tenets":
+                continue
+            has_entry_point = any(
+                entry.group == "console_scripts" and entry.name == "tenets"
+                for entry in distribution.entry_points
+            )
+            owns_executable = any(
+                Path(distribution.locate_file(record)).resolve(strict=False)
+                == candidate
+                for record in (distribution.files or ())
+            )
+            if has_entry_point and owns_executable:
+                matches.append(str(distribution.version))
+        return matches[0] if len(matches) == 1 else None
     except Exception:
         # Distribution metadata is optional input.  A partially installed
         # package/backend can raise filesystem, decoding, archive, parser, or
@@ -266,6 +314,20 @@ def _tenets_distribution_version() -> str | None:
         # advisory ranker into a traceback that aborts the production audit.
         # BaseException subclasses still propagate, so interrupts are honored.
         return None
+
+
+def _windows_job_limit_policy() -> tuple[int, int, int]:
+    """Return Job Object flags, process cap, and aggregate memory cap."""
+    job_object_limit_active_process = 0x00000008
+    job_object_limit_job_memory = 0x00000200
+    job_object_limit_kill_on_job_close = 0x00002000
+    return (
+        job_object_limit_active_process
+        | job_object_limit_job_memory
+        | job_object_limit_kill_on_job_close,
+        MAX_RANKER_PROCESSES,
+        MAX_RANKER_MEMORY_BYTES,
+    )
 
 
 def _create_windows_kill_job(process: subprocess.Popen[bytes]) -> int:
@@ -328,7 +390,10 @@ def _create_windows_kill_job(process: subprocess.Popen[bytes]) -> int:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         info = _ExtendedLimitInformation()
-        info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+        limit_flags, process_limit, memory_limit = _windows_job_limit_policy()
+        info.BasicLimitInformation.LimitFlags = limit_flags
+        info.BasicLimitInformation.ActiveProcessLimit = process_limit
+        info.JobMemoryLimit = memory_limit
         if not kernel32.SetInformationJobObject(
             handle, 9, ctypes.byref(info), ctypes.sizeof(info)
         ):
@@ -465,6 +530,35 @@ def _enable_linux_child_subreaper() -> None:
         raise OSError(error, os.strerror(error))
 
 
+def _apply_linux_ranker_resource_limits() -> None:
+    """Apply inherited kernel limits before the optional ranker is launched."""
+    if not sys.platform.startswith("linux"):
+        raise OSError("Linux ranker resource limits are unavailable")
+    try:
+        import resource
+
+        policies = (
+            (resource.RLIMIT_AS, MAX_RANKER_MEMORY_BYTES),
+            (resource.RLIMIT_NPROC, MAX_RANKER_PROCESSES),
+            # Tenets currently writes JSON to stdout.  Keep a file-size limit
+            # as defense in depth for libraries or descendants that open files
+            # in the disposable isolation directory.
+            (resource.RLIMIT_FSIZE, MAX_STDOUT_BYTES),
+        )
+        for resource_id, requested in policies:
+            _soft, hard = resource.getrlimit(resource_id)
+            effective = (
+                requested
+                if hard == resource.RLIM_INFINITY
+                else min(requested, int(hard))
+            )
+            if effective < 1:
+                raise OSError("an inherited ranker resource limit is unusable")
+            resource.setrlimit(resource_id, (effective, effective))
+    except (AttributeError, ImportError, OSError, ValueError) as exc:
+        raise OSError(f"could not enforce Linux ranker resource limits: {exc}") from exc
+
+
 def _linux_direct_child_pids() -> tuple[int, ...]:
     """Return direct children of the single-threaded supervisor from procfs.
 
@@ -585,6 +679,10 @@ def _linux_supervise_command(command: Sequence[str]) -> int:
         # of the containment boundary.
         self_pidfd = os.pidfd_open(os.getpid())
         os.close(self_pidfd)
+        # Apply the limits in this short-lived supervisor. They are inherited
+        # by the ranker and every descendant without constraining FlexFactor's
+        # primary audit process.
+        _apply_linux_ranker_resource_limits()
     except OSError as exc:
         print(f"flexfactor Tenets containment unavailable: {exc}", file=sys.stderr)
         return 125
@@ -734,6 +832,26 @@ def _terminate_process_tree(
                 process.kill()
             except OSError:
                 pass
+    elif sys.platform.startswith("linux"):
+        # The child is FlexFactor's trusted subreaper supervisor. While it is
+        # unreaped its PID cannot be recycled, so signal that exact child and
+        # let it terminate adopted/session-escaped descendants via pidfds.
+        # Once it has exited it has already verified that no descendants
+        # remain; never signal its numeric process group after that boundary.
+        if process.poll() is not None:
+            return
+        try:
+            process.send_signal(signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        deadline = time.monotonic() + 3
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
     else:
         # The group can outlive its leader.  Address the retained PGID even
         # when Popen.poll() already reports that the direct process exited.
@@ -817,106 +935,141 @@ def _run_bounded_process(
         raise OSError(
             "strong Tenets descendant containment is unavailable on this platform"
         )
-    process = subprocess.Popen(
-        process_command,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        env=dict(env) if env is not None else None,
-        **process_group,
-    )
+    process: subprocess.Popen[bytes] | None = None
     windows_job: int | None = None
-    if os.name == "nt":
-        try:
-            windows_job = _contain_and_resume_windows_process(process)
-        except Exception as exc:
-            # Do not run an optional helper without the containment required
-            # to clean up descendants after the direct ranker exits.
-            _terminate_process_tree(process)
-            _close_process_pipes(process)
-            raise OSError(f"could not contain Tenets in a Windows Job Object: {exc}") from exc
-    assert process.stdout is not None
-    assert process.stderr is not None
-
-    stdout_chunks: list[bytes] = []
-    stderr_chunks: list[bytes] = []
-    overflow_event = threading.Event()
-    state: dict[str, str] = {}
-    state_lock = threading.Lock()
-    readers = (
-        threading.Thread(
-            target=_read_bounded_pipe,
-            kwargs={
-                "pipe": process.stdout,
-                "limit": stdout_limit,
-                "stream_name": "stdout",
-                "chunks": stdout_chunks,
-                "overflow_event": overflow_event,
-                "state": state,
-                "state_lock": state_lock,
-            },
-            name="tenets-stdout-reader",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_read_bounded_pipe,
-            kwargs={
-                "pipe": process.stderr,
-                "limit": stderr_limit,
-                "stream_name": "stderr",
-                "chunks": stderr_chunks,
-                "overflow_event": overflow_event,
-                "state": state,
-                "state_lock": state_lock,
-            },
-            name="tenets-stderr-reader",
-            daemon=True,
-        ),
-    )
-    for reader in readers:
-        reader.start()
-
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
     tree_closed = False
-    while process.poll() is None:
-        if overflow_event.wait(timeout=0.02):
-            _terminate_process_tree(process, windows_job=windows_job)
-            tree_closed = True
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            _terminate_process_tree(process, windows_job=windows_job)
-            tree_closed = True
-            break
-        try:
-            process.wait(timeout=min(0.05, remaining))
-        except subprocess.TimeoutExpired:
-            continue
+    started_readers: list[threading.Thread] = []
+    try:
+        process = subprocess.Popen(
+            process_command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            env=dict(env) if env is not None else None,
+            **process_group,
+        )
+        if os.name == "nt":
+            try:
+                windows_job = _contain_and_resume_windows_process(process)
+            except Exception as exc:
+                # Do not run an optional helper without the containment required
+                # to clean up descendants after the direct ranker exits.
+                _terminate_process_tree(process)
+                tree_closed = True
+                raise OSError(
+                    f"could not contain Tenets in a Windows Job Object: {exc}"
+                ) from exc
+        assert process.stdout is not None
+        assert process.stderr is not None
 
-    # Always close the containment boundary.  The direct process can exit zero
-    # while a descendant keeps inherited output pipes (or other work) alive.
-    # The retained POSIX PGID / Windows Job Object still identifies that tree.
-    if not tree_closed:
-        _terminate_process_tree(process, windows_job=windows_job)
-    reader_deadline = time.monotonic() + 3
-    for reader in readers:
-        reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
-    if any(reader.is_alive() for reader in readers):
-        with state_lock:
-            state.setdefault("read_error", "output reader did not terminate")
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        overflow_event = threading.Event()
+        state: dict[str, str] = {}
+        state_lock = threading.Lock()
+        readers = (
+            threading.Thread(
+                target=_read_bounded_pipe,
+                kwargs={
+                    "pipe": process.stdout,
+                    "limit": stdout_limit,
+                    "stream_name": "stdout",
+                    "chunks": stdout_chunks,
+                    "overflow_event": overflow_event,
+                    "state": state,
+                    "state_lock": state_lock,
+                },
+                name="tenets-stdout-reader",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_read_bounded_pipe,
+                kwargs={
+                    "pipe": process.stderr,
+                    "limit": stderr_limit,
+                    "stream_name": "stderr",
+                    "chunks": stderr_chunks,
+                    "overflow_event": overflow_event,
+                    "state": state,
+                    "state_lock": state_lock,
+                },
+                name="tenets-stderr-reader",
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
 
-    return _BoundedProcessResult(
-        returncode=int(process.returncode if process.returncode is not None else -1),
-        stdout=b"".join(stdout_chunks),
-        stderr=b"".join(stderr_chunks),
-        timed_out=timed_out,
-        overflow_stream=state.get("overflow_stream"),
-        read_error=state.get("read_error"),
-    )
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        while process.poll() is None:
+            if overflow_event.wait(timeout=0.02):
+                _terminate_process_tree(process, windows_job=windows_job)
+                tree_closed = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _terminate_process_tree(process, windows_job=windows_job)
+                tree_closed = True
+                break
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+
+        # A reaped Linux supervisor has already verified its adopted-child set
+        # is empty. Its numeric PID/PGID is now recyclable and must not be
+        # signalled. Windows Job Objects, by contrast, remain the authoritative
+        # descendant handle after their leader exits and must always be closed.
+        if not tree_closed:
+            if sys.platform.startswith("linux") and process.poll() is not None:
+                tree_closed = True
+            else:
+                _terminate_process_tree(process, windows_job=windows_job)
+                tree_closed = True
+        reader_deadline = time.monotonic() + 3
+        for reader in started_readers:
+            reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in started_readers):
+            with state_lock:
+                state.setdefault("read_error", "output reader did not terminate")
+
+        return _BoundedProcessResult(
+            returncode=int(
+                process.returncode if process.returncode is not None else -1
+            ),
+            stdout=b"".join(stdout_chunks),
+            stderr=b"".join(stderr_chunks),
+            timed_out=timed_out,
+            overflow_stream=state.get("overflow_stream"),
+            read_error=state.get("read_error"),
+        )
+    finally:
+        # Couple the optional ranker's lifetime to FlexFactor even when the
+        # caller is interrupted or an unexpected exception escapes polling.
+        if process is not None and not tree_closed:
+            try:
+                if not (
+                    sys.platform.startswith("linux")
+                    and process.poll() is not None
+                ):
+                    _terminate_process_tree(process, windows_job=windows_job)
+            except Exception:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+            tree_closed = True
+        if process is not None:
+            _close_process_pipes(process)
+        for reader in started_readers:
+            if reader.is_alive():
+                reader.join(timeout=1)
 
 
 def _isolated_tenets_environment(project_root: Path, isolation_root: Path) -> dict[str, str]:
@@ -1021,7 +1174,7 @@ def generate_tenets_context(
     explicit_untrusted = bool(executable and not _is_trusted_tenets_executable(executable))
     if explicit_untrusted:
         resolved_executable = None
-    installed_version = _tenets_distribution_version()
+    installed_version = _tenets_distribution_version(resolved_executable)
     if resolved_executable and installed_version != TENETS_VERSION:
         resolved_executable = None
     command: tuple[str, ...] = ()
@@ -1053,13 +1206,12 @@ def generate_tenets_context(
             "json",
         )
         temporary_output = None
+        cleanup_error: Exception | None = None
         try:
             temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
-            rank_output = Path(temporary_output.name) / "ranked-files.json"
-            invocation_command = command + ("--output", str(rank_output))
             isolation_root = Path(temporary_output.name)
             completed = _run_bounded_process(
-                invocation_command,
+                command,
                 # Never make an untrusted checkout the current directory of a
                 # process outside FlexFactor's execution broker.  In
                 # particular, Windows searches the current directory while
@@ -1099,13 +1251,6 @@ def generate_tenets_context(
                     )
                 else:
                     payload_bytes = stdout_bytes
-                    if rank_output.is_file():
-                        with rank_output.open("rb") as handle:
-                            payload_bytes = handle.read(MAX_STDOUT_BYTES + 1)
-                        if len(payload_bytes) > MAX_STDOUT_BYTES:
-                            raise ValueError(
-                                f"Tenets JSON output exceeded the {MAX_STDOUT_BYTES}-byte safety limit"
-                            )
                     payload_text = payload_bytes.decode("utf-8", errors="strict")
                     payload = json.loads(payload_text)
                     files = _parse_ranked_files(payload, root, top)
@@ -1123,7 +1268,15 @@ def generate_tenets_context(
             message = _bounded_text(f"Tenets could not start: {exc}")
         finally:
             if temporary_output is not None:
-                temporary_output.cleanup()
+                try:
+                    temporary_output.cleanup()
+                except Exception as exc:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            status = "degraded"
+            message = _bounded_text(
+                f"{message} Temporary isolation cleanup failed: {cleanup_error}"
+            )
 
     duration = round(max(0.0, time.monotonic() - started), 6)
     result = TenetsContextResult(
@@ -1146,10 +1299,63 @@ def generate_tenets_context(
         # Optional context ranking must not abort an audit because evidence storage failed.
         result = replace(
             result,
+            status="degraded",
             message=_bounded_text(f"{result.message} Evidence write failed: {exc}"),
             output_path="",
         )
     return result
+
+
+_CACHE_SKIP_DIRECTORIES = frozenset({
+    ".git", ".next", ".venv", "venv", "node_modules", "dist", "build",
+    "coverage", "__pycache__", ".pytest_cache", ".ruff_cache",
+})
+
+
+def _repository_state_fingerprint(project_root: Path) -> str:
+    """Fingerprint reviewable tree metadata so post-mutation rankings expire.
+
+    File size, nanosecond mtime/ctime, mode, and symlink destination make this
+    inexpensive compared with ranking while still changing for content edits,
+    creates, deletes, renames, and permission changes. Artifact/dependency
+    directories excluded by the canonical sweep are excluded here as well.
+    """
+    digest = hashlib.sha256()
+    pending = [project_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            relative = directory.relative_to(project_root).as_posix()
+            digest.update(f"!scan:{relative}:{type(exc).__name__}\n".encode())
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(project_root).as_posix()
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                digest.update(
+                    (
+                        f"{relative}\0{stat.st_mode}\0{stat.st_size}\0"
+                        f"{stat.st_mtime_ns}\0{stat.st_ctime_ns}\n"
+                    ).encode("utf-8", errors="surrogateescape")
+                )
+                if entry.is_symlink():
+                    digest.update(
+                        os.readlink(path).encode("utf-8", errors="surrogateescape")
+                    )
+                elif entry.is_dir(follow_symlinks=False) \
+                        and entry.name not in _CACHE_SKIP_DIRECTORIES:
+                    pending.append(path)
+            except OSError as exc:
+                digest.update(
+                    f"!stat:{relative}:{type(exc).__name__}\n".encode(
+                        "utf-8", errors="surrogateescape"
+                    )
+                )
+    return digest.hexdigest()
 
 
 def cached_tenets_context(
@@ -1161,7 +1367,8 @@ def cached_tenets_context(
 ) -> TenetsContextResult:
     root = Path(project).expanduser().resolve(strict=False)
     timeout = _validated_timeout(timeout_seconds)
-    key = (str(root), str(task).strip(), top, timeout)
+    fingerprint = _repository_state_fingerprint(root)
+    key = (str(root), str(task).strip(), top, timeout, fingerprint)
     with _RESULT_CACHE_LOCK:
         hit = _RESULT_CACHE.get(key)
     if hit is not None:
@@ -1281,6 +1488,10 @@ def _argv_task(
     programs = _argv_values(args, "--program")
 
     session_prompts = _argv_values(args, "--session-prompt")
+    if not session_prompts:
+        environment_session = os.environ.get("FLEXFACTOR_SESSION_PROMPT", "").strip()
+        if environment_session:
+            session_prompts = [environment_session]
     if session_prompts:
         if project is None or not programs:
             return session_prompts[0]
@@ -1288,6 +1499,10 @@ def _argv_task(
         return routed_task or _default_task(mode)
 
     guiding_prompts = _argv_values(args, "--guiding-prompt")
+    if not guiding_prompts:
+        environment_guidance = os.environ.get("FLEXFACTOR_GUIDING_PROMPT", "").strip()
+        if environment_guidance:
+            guiding_prompts = [environment_guidance]
     if guiding_prompts:
         if project is not None and programs:
             # Exact resolved paths are authoritative.  A basename/slug is only

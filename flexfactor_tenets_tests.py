@@ -140,16 +140,77 @@ class TenetsContextTests(unittest.TestCase):
         self.assertIn("env", runner.call_args.kwargs)
         self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 120.0)
 
-    def test_real_cli_output_file_is_used_instead_of_console_stdout(self) -> None:
+    def test_ranked_entries_must_resolve_to_existing_regular_files(self) -> None:
+        payload = {
+            "files": [
+                {"path": "src"},
+                {"path": "src/missing.py"},
+                {"path": "src/app.py"},
+            ]
+        }
+        completed = self._process(stdout=json.dumps(payload).encode())
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
+        ), mock.patch.object(ft, "_run_bounded_process", return_value=completed):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+
+    def test_selected_console_script_must_be_owned_by_validated_distribution(self) -> None:
+        executable = Path(self.temp.name) / "trusted" / "tenets"
+        executable.parent.mkdir()
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        entry_point = types.SimpleNamespace(group="console_scripts", name="tenets")
+
+        class Distribution:
+            metadata = {"Name": "tenets"}
+            entry_points = (entry_point,)
+            files = ("../../../bin/tenets",)
+            version = ft.TENETS_VERSION
+
+            def __init__(self, owned_path: Path):
+                self.owned_path = owned_path
+
+            def locate_file(self, _record):
+                return self.owned_path
+
+        self.version_patch.stop()
+        try:
+            with mock.patch.object(
+                ft, "_is_trusted_tenets_executable", return_value=True
+            ), mock.patch.object(
+                ft, "_trusted_tenets_metadata_directories",
+                return_value=(Path(self.temp.name) / "site-packages",),
+            ), mock.patch.object(
+                ft.importlib_metadata,
+                "distributions",
+                return_value=[Distribution(executable)],
+            ):
+                self.assertEqual(
+                    ft._tenets_distribution_version(executable), ft.TENETS_VERSION
+                )
+
+            forged_alias = executable.parent / "other-tenets"
+            with mock.patch.object(
+                ft, "_is_trusted_tenets_executable", return_value=True
+            ), mock.patch.object(
+                ft, "_trusted_tenets_metadata_directories",
+                return_value=(Path(self.temp.name) / "site-packages",),
+            ), mock.patch.object(
+                ft.importlib_metadata,
+                "distributions",
+                return_value=[Distribution(forged_alias)],
+            ):
+                self.assertIsNone(ft._tenets_distribution_version(executable))
+        finally:
+            self.version_patch.start()
+
+    def test_real_cli_json_uses_bounded_stdout_without_a_temp_output_file(self) -> None:
         payload = {"files": [{"path": "src/app.py", "score": 0.95}]}
-        written_path: list[Path] = []
 
         def runner(command, **_kwargs):
-            output_index = command.index("--output") + 1
-            output_path = Path(command[output_index])
-            output_path.write_text(json.dumps(payload), encoding="utf-8")
-            written_path.append(output_path)
-            return self._process(stdout=b"OK Saved ranking to temporary file\n")
+            self.assertNotIn("--output", command)
+            return self._process(stdout=json.dumps(payload).encode())
 
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
@@ -158,23 +219,16 @@ class TenetsContextTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         self.assertEqual([item.path for item in result.files], ["src/app.py"])
-        self.assertTrue(written_path)
-        self.assertFalse(written_path[0].exists())
 
-    def test_valid_output_file_ignores_non_utf8_console_status(self) -> None:
-        payload = {"files": [{"path": "src/app.py", "score": 0.97}]}
-
-        def runner(command, **_kwargs):
-            output_path = Path(command[command.index("--output") + 1])
-            output_path.write_text(json.dumps(payload), encoding="utf-8")
-            return self._process(stdout=b"status:\xff\xfe\n")
-
+    def test_non_utf8_bounded_json_stdout_is_degraded(self) -> None:
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
-        ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):
+        ), mock.patch.object(
+            ft, "_run_bounded_process", return_value=self._process(stdout=b"\xff\xfe")
+        ):
             result = ft.generate_tenets_context(self.root, "audit")
-        self.assertEqual(result.status, "ok")
-        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("unusable output", result.message)
 
     def test_empty_valid_result_is_degraded_not_success(self) -> None:
         completed = self._process(stdout=b'{"files": []}')
@@ -202,6 +256,26 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(result.status, "degraded")
         self.assertIn("timeout", result.message)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux supervisor lifecycle contract")
+    def test_interrupt_cleans_ranker_before_propagating(self) -> None:
+        survivor_file = Path(self.temp.name) / "interrupted-ranker-survived"
+        script = (
+            "import pathlib,sys,time; time.sleep(0.8); "
+            "pathlib.Path(sys.argv[1]).write_text('alive'); time.sleep(60)"
+        )
+        with mock.patch.object(
+            ft.threading.Event, "wait", side_effect=KeyboardInterrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                ft._run_bounded_process(
+                    (sys.executable, "-S", "-c", script, str(survivor_file)),
+                    cwd=self.root,
+                    timeout_seconds=10,
+                )
+        time.sleep(1)
+        self.assertFalse(survivor_file.exists())
+
     def test_oversized_output_is_terminated_and_bounded_for_both_streams(self) -> None:
         scripts = {
             "stdout": "import sys; sys.stdout.buffer.write(b'x' * 4096); sys.stdout.flush()",
@@ -221,8 +295,9 @@ class TenetsContextTests(unittest.TestCase):
                 self.assertLessEqual(len(result.stdout), 128)
                 self.assertLessEqual(len(result.stderr), 128)
 
-    @unittest.skipIf(os.name == "nt", "POSIX process-group contract")
-    def test_termination_escalates_across_the_isolated_process_group(self) -> None:
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux supervisor lifecycle contract")
+    def test_termination_signals_the_unreaped_supervisor_not_its_numeric_group(self) -> None:
         process = mock.Mock()
         process.poll.return_value = None
         process.pid = 424242
@@ -233,11 +308,20 @@ class TenetsContextTests(unittest.TestCase):
              mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 4.0]):
             ft._terminate_process_tree(process)
 
-        self.assertEqual(
-            kill_group.call_args_list,
-            [mock.call(424242, ft.signal.SIGTERM), mock.call(424242, ft.signal.SIGKILL)],
-        )
+        kill_group.assert_not_called()
+        process.send_signal.assert_called_once_with(ft.signal.SIGTERM)
         process.terminate.assert_not_called()
+        process.kill.assert_called_once_with()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux supervisor lifecycle contract")
+    def test_reaped_supervisor_is_never_signalled_by_pid_or_process_group(self) -> None:
+        process = mock.Mock(pid=424242)
+        process.poll.return_value = 0
+        with mock.patch.object(ft.os, "killpg") as kill_group:
+            ft._terminate_process_tree(process)
+        kill_group.assert_not_called()
+        process.send_signal.assert_not_called()
         process.kill.assert_not_called()
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
@@ -361,6 +445,33 @@ class TenetsContextTests(unittest.TestCase):
                 ft._contain_and_resume_windows_process(process)
         terminate_job.assert_called_once_with(9123)
 
+    def test_windows_job_policy_caps_aggregate_memory_and_process_count(self) -> None:
+        flags, process_limit, memory_limit = ft._windows_job_limit_policy()
+        self.assertEqual(flags & 0x00000008, 0x00000008)
+        self.assertEqual(flags & 0x00000200, 0x00000200)
+        self.assertEqual(flags & 0x00002000, 0x00002000)
+        self.assertEqual(process_limit, ft.MAX_RANKER_PROCESSES)
+        self.assertEqual(memory_limit, ft.MAX_RANKER_MEMORY_BYTES)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux resource-limit contract")
+    def test_linux_supervisor_applies_memory_process_and_file_limits(self) -> None:
+        fake_resource = types.SimpleNamespace(
+            RLIMIT_AS=1,
+            RLIMIT_NPROC=2,
+            RLIMIT_FSIZE=3,
+            RLIM_INFINITY=-1,
+            getrlimit=mock.Mock(return_value=(-1, -1)),
+            setrlimit=mock.Mock(),
+        )
+        with mock.patch.dict(sys.modules, {"resource": fake_resource}):
+            ft._apply_linux_ranker_resource_limits()
+        self.assertEqual(fake_resource.setrlimit.call_args_list, [
+            mock.call(1, (ft.MAX_RANKER_MEMORY_BYTES, ft.MAX_RANKER_MEMORY_BYTES)),
+            mock.call(2, (ft.MAX_RANKER_PROCESSES, ft.MAX_RANKER_PROCESSES)),
+            mock.call(3, (ft.MAX_STDOUT_BYTES, ft.MAX_STDOUT_BYTES)),
+        ])
+
     def test_ranker_never_runs_from_or_resolves_helpers_through_target(self) -> None:
         target_bin = self.root / "tools"
         target_bin.mkdir()
@@ -439,6 +550,26 @@ class TenetsContextTests(unittest.TestCase):
             code = ft.run_cli([str(self.root), "audit", "--strict"])
         self.assertEqual(code, 1)
 
+    def test_temporary_isolation_cleanup_failure_is_degraded(self) -> None:
+        isolation = Path(self.temp.name) / "isolation"
+        isolation.mkdir()
+
+        class BrokenTemporaryDirectory:
+            name = str(isolation)
+
+            def cleanup(self):
+                raise RuntimeError("cleanup denied")
+
+        completed = self._process(stdout=b'{"files":["src/app.py"]}')
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(
+            ft.tempfile, "TemporaryDirectory", return_value=BrokenTemporaryDirectory()
+        ), mock.patch.object(ft, "_run_bounded_process", return_value=completed):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("cleanup failed", result.message)
+
     def test_malformed_json_is_fail_open(self) -> None:
         completed = self._process(stdout=b"not-json")
         with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
@@ -491,6 +622,31 @@ class TenetsContextTests(unittest.TestCase):
         self.assertIs(first, second)
         generate.assert_called_once()
 
+    def test_repository_mutation_invalidates_cached_ranking(self) -> None:
+        result = ft.TenetsContextResult(
+            schema_version=1,
+            tool="tenets",
+            expected_version=ft.TENETS_VERSION,
+            adapter_version=2,
+            status="ok",
+            project_root=str(self.root),
+            task="audit",
+            files=(ft.RankedFile("src/app.py", 1.0),),
+            message="ok",
+            duration_seconds=0.0,
+            output_path=str(self.state / "context.json"),
+            command=("tenets",),
+        )
+        with mock.patch.object(
+            ft, "generate_tenets_context", return_value=result
+        ) as generate:
+            ft.cached_tenets_context(self.root, "audit")
+            (self.root / "src" / "app.py").write_text(
+                "print('mutated')\n", encoding="utf-8"
+            )
+            ft.cached_tenets_context(self.root, "audit")
+        self.assertEqual(generate.call_count, 2)
+
 
     def test_distribution_version_mismatch_disables_execution(self) -> None:
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
@@ -501,14 +657,14 @@ class TenetsContextTests(unittest.TestCase):
         self.assertIn("version mismatch", result.message)
         runner.assert_not_called()
 
-    def test_evidence_write_failure_preserves_safe_ranking(self) -> None:
+    def test_evidence_write_failure_degrades_safe_ranking(self) -> None:
         payload = {"files": [{"path": "src/app.py", "score": 1.0}]}
         completed = self._process(stdout=json.dumps(payload).encode())
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
              mock.patch.object(ft, "_run_bounded_process", return_value=completed), \
              mock.patch.object(ft, "_atomic_write_json", side_effect=OSError("read only")):
             result = ft.generate_tenets_context(self.root, "audit")
-        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.status, "degraded")
         self.assertEqual([item.path for item in result.files], ["src/app.py"])
         self.assertEqual(result.output_path, "")
         self.assertIn("Evidence write failed", result.message)
@@ -547,6 +703,37 @@ class TenetsContextTests(unittest.TestCase):
                 os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
             ):
                 self.assertEqual(ft._argv_task(argv), expected)
+
+    def test_environment_guiding_prompt_drives_context_task(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_TENETS_TASK": "",
+            "FLEXFACTOR_SESSION_PROMPT": "",
+            "FLEXFACTOR_GUIDING_PROMPT": "repair the mobile launch path",
+        }, clear=False):
+            self.assertEqual(
+                ft._argv_task(["prodready"], project=self.root),
+                "repair the mobile launch path",
+            )
+
+    def test_environment_session_prompt_routes_per_target_before_ranking(self) -> None:
+        first = self.root.parent / "GrantFlow"
+        second = self.root.parent / "purpose-foundry"
+        first.mkdir(exist_ok=True)
+        second.mkdir(exist_ok=True)
+        argv = ["audit", "--program", str(first), "--program", str(second)]
+        with mock.patch.dict(os.environ, {
+            "FLEXFACTOR_TENETS_TASK": "",
+            "FLEXFACTOR_SESSION_PROMPT": (
+                "GrantFlow: repair billing. Purpose Foundry: fix deck exports."
+            ),
+            "FLEXFACTOR_GUIDING_PROMPT": "",
+        }, clear=False):
+            first_task = ft._argv_task(argv, project=first)
+            second_task = ft._argv_task(argv, project=second)
+        self.assertIn("repair billing", first_task)
+        self.assertNotIn("deck exports", first_task)
+        self.assertIn("deck exports", second_task)
+        self.assertNotIn("repair billing", second_task)
 
     def test_multi_program_guiding_prompts_route_to_matching_project(self) -> None:
         first = self.root.parent / "GrantFlow"

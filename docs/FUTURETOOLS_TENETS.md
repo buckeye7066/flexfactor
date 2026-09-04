@@ -100,12 +100,17 @@ identity after the direct ranker exits, adopts orphan helpers even when they
 called `setsid()`, and terminates every adoptee before closing its output pipes.
 On Windows, the ranker starts suspended, is assigned to a kill-on-close Job
 Object, and only then resumes, so no helper can escape in the
-launch-to-containment interval. Other POSIX systems do not provide either
+launch-to-containment interval. The Linux supervisor applies inherited kernel
+address-space, process-count, and file-size limits before it launches Tenets;
+the Windows Job Object applies an aggregate memory limit and active-process
+limit. Other POSIX systems do not provide either
 boundary through Python's supported process API; FlexFactor therefore records
 Tenets as degraded and does not launch it there instead of claiming an
 escapable process group as containment. Timeouts must be positive finite
-numbers. The temporary JSON output is also bounded before parsing and is
-removed before the adapter returns.
+numbers. JSON is read only from the concurrently drained, size-bounded stdout
+pipe; no separately writable result file can fill temporary storage while the
+ranker runs. Temporary isolation cleanup or evidence persistence failures mark
+the result degraded.
 
 Automatic launcher integration can be disabled without uninstalling the tool:
 
@@ -128,9 +133,11 @@ behavior, idempotent runtime installation, the disable switch, parameter and
 global cap lifting, cap restoration, and the invariant that prioritization
 never enlarges a bounded review. Regression tests also prove that ranked files
 beyond 100,000 candidates remain selectable, that failed uncapped discovery
-falls back to the original capped order with degraded evidence, and that real
-CLI file output is consumed even when console stdout contains status text. The
-launcher tests also cover explicit argument forwarding, duplicate project
+falls back to the original capped order with degraded evidence, and that CLI
+JSON is consumed through bounded stdout without creating an unbounded result
+file. Rankings are cached only for an unchanged reviewable repository
+fingerprint, so a mutation cannot reuse stale priorities. The launcher tests
+also cover explicit argument and environment forwarding, duplicate project
 basenames, and routed multi-program session prompts so one program cannot
 inherit another program's ranking objective.
 
