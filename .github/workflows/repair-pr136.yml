@@ -1,0 +1,485 @@
+name: Repair PR 136 authority validation
+
+on:
+  push:
+    branches: [fix/purpose-v2-contract-loading]
+    paths:
+      - .github/workflows/repair-pr136.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/purpose-v2-contract-loading
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply guarded source and regression repairs
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          source_path = Path('flexfactor_purpose.py')
+          source = source_path.read_text(encoding='utf-8')
+
+          marker = 'def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:\n'
+          helpers = '''def _stable_handle_identity(value) -> tuple[int, int, int, int, int, int]:
+              """Identity fields compared only between live handles.
+
+              Windows may expose different device/inode values for pathname stat
+              and handle fstat on the same file.  Handle-to-handle identity remains
+              the cross-platform race detector; pathname metadata is compared only
+              by type and size.
+              """
+              return (
+                  int(stat.S_IFMT(value.st_mode)),
+                  int(value.st_dev),
+                  int(value.st_ino),
+                  int(value.st_size),
+                  int(value.st_mtime_ns),
+                  int(value.st_ctime_ns),
+              )
+
+
+          def _stable_path_handle_shape(value) -> tuple[int, int]:
+              return int(stat.S_IFMT(value.st_mode)), int(value.st_size)
+
+
+          def _contained_regular_entry(
+              root: Path, relative: Path,
+          ) -> tuple[Path, object] | None:
+              """Resolve one repository-relative regular path without symlinks.
+
+              Final review binds evidence to regular Git blobs.  Startup therefore
+              rejects a symlink in any locator component rather than accepting a
+              target that the immutable-tree verifier must later reject.
+              """
+              if relative.is_absolute() or relative.drive:
+                  return None
+              parts = relative.parts
+              if not parts or any(
+                  part in {"", ".", ".."} or "\\x00" in part for part in parts
+              ):
+                  return None
+              current = root
+              try:
+                  entry = None
+                  for index, part in enumerate(parts):
+                      current = current / part
+                      entry = os.lstat(current)
+                      if stat.S_ISLNK(entry.st_mode):
+                          return None
+                      if index < len(parts) - 1:
+                          if not stat.S_ISDIR(entry.st_mode):
+                              return None
+                      elif not stat.S_ISREG(entry.st_mode):
+                          return None
+                  resolved = current.resolve(strict=True)
+                  resolved.relative_to(root)
+              except (OSError, ValueError):
+                  return None
+              return resolved, entry
+
+
+          '''
+          source = replace_once(source, marker, helpers + marker, 'insert stable identity helpers')
+
+          old_prepare = '''        try:
+              candidate = (root / relative).resolve(strict=True)
+              candidate.relative_to(root)
+              # Reject a FIFO/device/socket before a blocking open. O_NONBLOCK
+              # below also closes the lstat/open race if an attacker swaps a
+              # regular file for a FIFO after this check.
+              candidate_info = os.lstat(candidate)
+              if not stat.S_ISREG(candidate_info.st_mode):
+                  return False
+              if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                  return False
+              aggregate_size += candidate_info.st_size
+              if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                  return False
+              prepared.append((record, relative, candidate))
+          except (OSError, ValueError):
+              return False
+          '''
+          new_prepare = '''        try:
+              prepared_entry = _contained_regular_entry(root, relative)
+              if prepared_entry is None:
+                  return False
+              candidate, candidate_info = prepared_entry
+              if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                  return False
+              aggregate_size += candidate_info.st_size
+              if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                  return False
+              prepared.append((record, relative, candidate, candidate_info))
+          except (OSError, ValueError):
+              return False
+          '''
+          source = replace_once(source, old_prepare, new_prepare, 'replace evidence preflight')
+
+          old_read = '''    for record, relative, candidate in prepared:
+              try:
+                  flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+                  flags |= int(getattr(os, "O_NOFOLLOW", 0))
+                  flags |= int(getattr(os, "O_NONBLOCK", 0))
+                  descriptor = os.open(candidate, flags)
+                  try:
+                      opened = os.fstat(descriptor)
+                      if not stat.S_ISREG(opened.st_mode):
+                          return False
+                      if opened.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                          return False
+                      aggregate_opened_size += opened.st_size
+                      if aggregate_opened_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                          return False
+                      digest = hashlib.sha256()
+                      remaining = V2_LOCAL_EVIDENCE_MAX_BYTES + 1
+                      total_read = 0
+                      with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                          while remaining > 0:
+                              chunk = handle.read(min(1024 * 1024, remaining))
+                              if not chunk:
+                                  break
+                              total_read += len(chunk)
+                              aggregate_read += len(chunk)
+                              remaining -= len(chunk)
+                              if total_read > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                                  return False
+                              if aggregate_read > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                                  return False
+                              digest.update(chunk)
+                  finally:
+                      os.close(descriptor)
+                  # Resolve again after reading so a concurrently replaced path cannot
+                  # turn an outside file into apparently contained evidence.  Also
+                  # compare the live directory entry to the descriptor that supplied
+                  # the bytes: resolving to the same lexical path is insufficient if
+                  # an attacker swaps and restores a parent symlink around open().
+                  current = (root / relative).resolve(strict=True)
+                  current_info = os.stat(candidate, follow_symlinks=False)
+                  if current != candidate or (
+                      current_info.st_dev,
+                      current_info.st_ino,
+                  ) != (
+                      opened.st_dev,
+                      opened.st_ino,
+                  ):
+                      return False
+              except (OSError, ValueError):
+                  return False
+              if digest.hexdigest() != record.get("content_hash"):
+                  return False
+          '''
+          new_read = '''    for record, relative, candidate, candidate_info in prepared:
+              try:
+                  flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+                  flags |= int(getattr(os, "O_NOFOLLOW", 0))
+                  flags |= int(getattr(os, "O_NONBLOCK", 0))
+                  descriptor = os.open(candidate, flags)
+                  try:
+                      opened_before = os.fstat(descriptor)
+                      if (not stat.S_ISREG(opened_before.st_mode)
+                              or _stable_path_handle_shape(opened_before)
+                              != _stable_path_handle_shape(candidate_info)):
+                          return False
+                      if opened_before.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                          return False
+                      aggregate_opened_size += opened_before.st_size
+                      if aggregate_opened_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                          return False
+                      digest = hashlib.sha256()
+                      remaining = V2_LOCAL_EVIDENCE_MAX_BYTES + 1
+                      total_read = 0
+                      with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                          while remaining > 0:
+                              chunk = handle.read(min(1024 * 1024, remaining))
+                              if not chunk:
+                                  break
+                              total_read += len(chunk)
+                              aggregate_read += len(chunk)
+                              remaining -= len(chunk)
+                              if total_read > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                                  return False
+                              if aggregate_read > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                                  return False
+                              digest.update(chunk)
+                      opened_after = os.fstat(descriptor)
+                  finally:
+                      os.close(descriptor)
+
+                  current_entry = _contained_regular_entry(root, relative)
+                  if current_entry is None:
+                      return False
+                  current, current_info = current_entry
+                  current_descriptor = os.open(root / relative, flags)
+                  try:
+                      current_opened = os.fstat(current_descriptor)
+                  finally:
+                      os.close(current_descriptor)
+                  latest_entry = _contained_regular_entry(root, relative)
+                  if latest_entry is None:
+                      return False
+                  latest, latest_info = latest_entry
+                  if (current != candidate or latest != candidate
+                          or not stat.S_ISREG(current_opened.st_mode)
+                          or _stable_handle_identity(opened_before)
+                          != _stable_handle_identity(opened_after)
+                          or _stable_handle_identity(opened_after)
+                          != _stable_handle_identity(current_opened)
+                          or _stable_path_handle_shape(current_info)
+                          != _stable_path_handle_shape(current_opened)
+                          or _stable_path_handle_shape(latest_info)
+                          != _stable_path_handle_shape(current_opened)):
+                      return False
+              except (OSError, ValueError):
+                  return False
+              if digest.hexdigest() != record.get("content_hash"):
+                  return False
+          '''
+          source = replace_once(source, old_read, new_read, 'replace evidence stable read')
+
+          old_probe = '''        try:
+              os.lstat(unresolved)
+          except FileNotFoundError:
+              continue
+          except OSError:
+              return None, True
+          try:
+              path = unresolved.resolve(strict=True)
+          except Exception:
+              return None, True
+          try:
+              path.relative_to(root)
+          except ValueError:
+              return None, True
+          try:
+              info = path.stat()
+          except Exception:
+              return None, True
+          if not stat.S_ISREG(info.st_mode):
+              return None, True
+          if info.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+              return None, True
+          '''
+          new_probe = '''        try:
+              authority_entry = os.lstat(unresolved)
+          except FileNotFoundError:
+              continue
+          except OSError:
+              return None, True
+          if not stat.S_ISREG(authority_entry.st_mode):
+              return None, True
+          prepared_contract = _contained_regular_entry(root, Path(rel))
+          if prepared_contract is None:
+              return None, True
+          path, info = prepared_contract
+          if (_stable_path_handle_shape(info)
+                  != _stable_path_handle_shape(authority_entry)):
+              return None, True
+          if info.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+              return None, True
+          '''
+          source = replace_once(source, old_probe, new_probe, 'replace contract preflight')
+
+          old_contract_read = '''        try:
+              flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+              flags |= int(getattr(os, "O_NOFOLLOW", 0))
+              flags |= int(getattr(os, "O_NONBLOCK", 0))
+              descriptor = os.open(path, flags)
+              try:
+                  opened = os.fstat(descriptor)
+                  if not stat.S_ISREG(opened.st_mode) \\
+                          or opened.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+                      return None, True
+                  with os.fdopen(
+                      descriptor, "rb", closefd=False
+                  ) as fh:
+                      raw = fh.read(IN_REPO_CONTRACT_MAX_BYTES + 1)
+                  if len(raw) > IN_REPO_CONTRACT_MAX_BYTES:
+                      return None, True
+                  body = raw.decode("utf-8")
+              finally:
+                  os.close(descriptor)
+              current = unresolved.resolve(strict=True)
+              current_info = os.stat(path, follow_symlinks=False)
+              if current != path or (
+                  current_info.st_dev,
+                  current_info.st_ino,
+              ) != (
+                  opened.st_dev,
+                  opened.st_ino,
+              ):
+                  return None, True
+          except Exception:
+              return None, True
+          '''
+          new_contract_read = '''        try:
+              flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+              flags |= int(getattr(os, "O_NOFOLLOW", 0))
+              flags |= int(getattr(os, "O_NONBLOCK", 0))
+              descriptor = os.open(path, flags)
+              try:
+                  opened_before = os.fstat(descriptor)
+                  if (not stat.S_ISREG(opened_before.st_mode)
+                          or opened_before.st_size > IN_REPO_CONTRACT_MAX_BYTES
+                          or _stable_path_handle_shape(opened_before)
+                          != _stable_path_handle_shape(info)):
+                      return None, True
+                  with os.fdopen(
+                      descriptor, "rb", closefd=False
+                  ) as fh:
+                      raw = fh.read(IN_REPO_CONTRACT_MAX_BYTES + 1)
+                  if len(raw) > IN_REPO_CONTRACT_MAX_BYTES:
+                      return None, True
+                  body = raw.decode("utf-8")
+                  opened_after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              current_entry = _contained_regular_entry(root, Path(rel))
+              if current_entry is None:
+                  return None, True
+              current, current_info = current_entry
+              current_descriptor = os.open(unresolved, flags)
+              try:
+                  current_opened = os.fstat(current_descriptor)
+              finally:
+                  os.close(current_descriptor)
+              latest_entry = _contained_regular_entry(root, Path(rel))
+              if latest_entry is None:
+                  return None, True
+              latest, latest_info = latest_entry
+              if (current != path or latest != path
+                      or not stat.S_ISREG(current_opened.st_mode)
+                      or _stable_handle_identity(opened_before)
+                      != _stable_handle_identity(opened_after)
+                      or _stable_handle_identity(opened_after)
+                      != _stable_handle_identity(current_opened)
+                      or _stable_path_handle_shape(current_info)
+                      != _stable_path_handle_shape(current_opened)
+                      or _stable_path_handle_shape(latest_info)
+                      != _stable_path_handle_shape(current_opened)):
+                  return None, True
+          except Exception:
+              return None, True
+          '''
+          source = replace_once(source, old_contract_read, new_contract_read, 'replace contract stable read')
+          source_path.write_text(source, encoding='utf-8', newline='\n')
+
+          test_path = Path('test_flexfactor_purpose.py')
+          tests = test_path.read_text(encoding='utf-8')
+          test_marker = '    def test_unhashable_enum_values_reject_instead_of_raising(self):\n'
+          additions = '''    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+              def test_local_evidence_symlink_is_rejected_consistently(self):
+                  target = Path(self.root) / "src" / "receipt.py"
+                  target.parent.mkdir()
+                  target.write_text("trusted\\n", encoding="utf-8")
+                  link = Path(self.root) / "receipt-evidence"
+                  try:
+                      link.symlink_to(target)
+                  except OSError as exc:
+                      self.skipTest(f"symlink unavailable: {exc}")
+                  digest = __import__("hashlib").sha256(target.read_bytes()).hexdigest()
+                  candidate = self._contract(evidence=[self._evidence(
+                      kind="source", locator="receipt-evidence", content_hash=digest,
+                  )])
+
+                  self.assertIsNone(fp._contract_from_registry(
+                      candidate, evidence_root=self.root
+                  ))
+
+              def test_path_handle_identity_differences_do_not_reject_regular_authority(self):
+                  source = Path(self.root) / "src" / "receipt.py"
+                  source.parent.mkdir()
+                  source.write_text("trusted\\n", encoding="utf-8")
+                  digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+                  contract_doc = self._contract(evidence=[self._evidence(
+                      kind="source", locator="src/receipt.py", content_hash=digest,
+                  )])
+                  _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+                  targets = {
+                      os.path.normcase(os.path.abspath(str(source))),
+                      os.path.normcase(os.path.abspath(
+                          os.path.join(self.root, ".flexfactor-purpose.json")
+                      )),
+                  }
+                  real_lstat = fp.os.lstat
+                  real_stat = fp.os.stat
+
+                  class DivergentPathStat:
+                      def __init__(self, original):
+                          self._original = original
+                          self.st_dev = int(original.st_dev) + 100003
+                          self.st_ino = int(original.st_ino) + 100019
+
+                      def __getattr__(self, name):
+                          return getattr(self._original, name)
+
+                      def __getitem__(self, index):
+                          return self._original[index]
+
+                      def __iter__(self):
+                          return iter(self._original)
+
+                      def __len__(self):
+                          return len(self._original)
+
+                  def is_target(path) -> bool:
+                      try:
+                          return os.path.normcase(os.path.abspath(os.fspath(path))) in targets
+                      except (TypeError, ValueError):
+                          return False
+
+                  def divergent_lstat(path, *args, **kwargs):
+                      value = real_lstat(path, *args, **kwargs)
+                      return DivergentPathStat(value) if is_target(path) else value
+
+                  def divergent_stat(path, *args, **kwargs):
+                      value = real_stat(path, *args, **kwargs)
+                      if kwargs.get("follow_symlinks") is False and is_target(path):
+                          return DivergentPathStat(value)
+                      return value
+
+                  with mock.patch.object(fp.os, "lstat", side_effect=divergent_lstat), \\
+                          mock.patch.object(fp.os, "stat", side_effect=divergent_stat):
+                      contract, rejected = fp.find_contract_with_status(
+                          "Receipt Maker", self.root, registry={}
+                      )
+
+                  self.assertFalse(rejected)
+                  self.assertIsNotNone(contract)
+
+          '''
+          tests = replace_once(tests, test_marker, additions + test_marker, 'insert authority regressions')
+          test_path.write_text(tests, encoding='utf-8', newline='\n')
+          PY
+      - name: Run focused purpose authority tests
+        run: |
+          python -m py_compile flexfactor_purpose.py test_flexfactor_purpose.py
+          python -m unittest -v test_flexfactor_purpose.PurposeContractV2Tests
+          git diff --check
+      - name: Commit repaired PR branch
+        shell: bash
+        run: |
+          if git diff --quiet -- flexfactor_purpose.py test_flexfactor_purpose.py; then
+            echo 'No repair diff produced.'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add flexfactor_purpose.py test_flexfactor_purpose.py
+          git commit -m 'fix: align purpose authority validation across platforms'
+          git push origin HEAD:fix/purpose-v2-contract-loading
