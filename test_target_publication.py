@@ -97,7 +97,7 @@ class IncrementalPublicationSafetyTests(unittest.TestCase):
 
     def test_independent_review_receives_only_publication_scoped_gates(self):
         full = _quality_rows()
-        scoped = ff._publication_review_quality_gates(full)
+        scoped = ff._publication_review_quality_gates(full, full)
         self.assertEqual("candidate-publication-safety", scoped["scope"])
         self.assertTrue(scoped["passed"])
         ids = {row["id"] for row in scoped["gates"]}
@@ -109,6 +109,80 @@ class IncrementalPublicationSafetyTests(unittest.TestCase):
             row["status"] for row in full["gates"]
             if row["id"] == "function-coverage"
         ))
+
+    def test_new_or_unproven_completeness_failure_stays_in_review(self):
+        final = _quality_rows({"function-coverage": "fail"})
+        baseline = _quality_rows({"function-coverage": "pass"})
+        scoped = ff._publication_review_quality_gates(final, baseline)
+        row = next(g for g in scoped["gates"] if g["id"] == "function-coverage")
+        self.assertEqual("fail", row["status"])
+        self.assertFalse(scoped["passed"])
+
+        unknown_baseline = ff._publication_review_quality_gates(final)
+        self.assertIn(
+            "function-coverage",
+            {g["id"] for g in unknown_baseline["gates"]},
+        )
+
+    def test_candidate_verification_does_not_require_whole_product_pass(self):
+        quality = _quality_rows()
+        scoped = ff._publication_review_quality_gates(quality, quality)
+        self.assertTrue(scoped["passed"])
+
+    def test_empty_competitor_result_vacuously_passes_fit_risk_review(self):
+        result = product_invariants.evaluate_product_invariants(
+            purpose_enabled=False,
+            purpose_contract={},
+            purpose_confidence=None,
+            purpose_before=None,
+            purpose_after=None,
+            purpose_errors=[],
+            competitors_enabled=True,
+            competitor_research={"competitors": []},
+            competitor_target=5,
+            applied_files=[],
+            test_files=[],
+            verification_passed=True,
+            license_compatible=lambda _license: True,
+        )
+        fit = next(
+            gate for gate in result["gates"]
+            if gate["id"] == "competitive-fit-risk-reviewed"
+        )
+        self.assertTrue(fit["passed"])
+
+    def test_final_review_can_cover_every_unpublished_commit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            _run("git", "init", "-q", "-b", "main", str(repo))
+            _run("git", "config", "user.name", "FlexFactor Test", cwd=repo)
+            _run("git", "config", "user.email", "test@example.invalid", cwd=repo)
+            (repo / "first.txt").write_text("baseline\n", encoding="utf-8")
+            _run("git", "add", ".", cwd=repo)
+            _run("git", "commit", "-qm", "baseline", cwd=repo)
+            baseline = _run("git", "rev-parse", "HEAD", cwd=repo)
+            (repo / "first.txt").write_text("checkpoint one\n", encoding="utf-8")
+            _run("git", "commit", "-qam", "checkpoint one", cwd=repo)
+            (repo / "second.txt").write_text("checkpoint two\n", encoding="utf-8")
+            _run("git", "add", ".", cwd=repo)
+            _run("git", "commit", "-qm", "checkpoint two", cwd=repo)
+            final = _run("git", "rev-parse", "HEAD", cwd=repo)
+            prompts = []
+
+            def approve(_provider, _system, prompt, _schema, max_tokens=8000):
+                prompts.append(prompt)
+                return {"verdict": "approve", "commit": final, "findings": [],
+                        "evidence_consistent": True, "reason": "complete"}
+
+            reviewer = types.SimpleNamespace(model="test-reviewer")
+            with mock.patch.object(ff, "_judge", side_effect=approve):
+                review = ff._independent_final_review(
+                    reviewer, str(repo), baseline, final, {}
+                )
+            self.assertEqual("approve", review["verdict"])
+            reviewed = "\n".join(prompts)
+            self.assertIn("checkpoint one", reviewed)
+            self.assertIn("checkpoint two", reviewed)
 
     def test_every_candidate_safety_gate_is_fail_closed(self):
         cases = [
