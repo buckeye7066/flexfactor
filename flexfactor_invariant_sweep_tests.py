@@ -1403,8 +1403,13 @@ class RepositoryGovernanceTests(unittest.TestCase):
 
     def test_codeowners_protects_workflows_templates_and_security_policy(self):
         codeowners = _read(os.path.join(_HERE, ".github", "CODEOWNERS"))
-        self.assertIn("/.github/ @buckeye7066", codeowners)
-        self.assertIn("/SECURITY.md @buckeye7066", codeowners)
+        for rule in (
+                "* @buckeye7066",
+                "/.github/workflows/ @buckeye7066",
+                "/.github/ISSUE_TEMPLATE/ @buckeye7066",
+                "/.github/CODEOWNERS @buckeye7066",
+                "/SECURITY.md @buckeye7066"):
+            self.assertIn(rule, codeowners)
 
     def test_pr_workflows_cancel_stale_heads_without_duplicate_branch_pushes(self):
         for name in self._WORKFLOWS:
