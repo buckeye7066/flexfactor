@@ -3897,6 +3897,26 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         self.assertIn("max 30", result.detail)
         forbidden.assert_not_called()
 
+    def test_scout_non_code_artifacts_do_not_require_a_source_parser(self):
+        import tempfile
+        import types
+
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=False, merge=False,
+            final_reviewer=None, isolate_verify=True,
+        )
+        for path in ("site.css", "index.html", "README.md", "config.yml"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as project:
+                result = ff.apply_integration(
+                    project, "candidate/repo",
+                    {"files": [{"path": path, "contents": "artifact content\n"}],
+                     "packages": []},
+                    opts,
+                )
+            # No verifier exists in the fixture, but preflight accepted the
+            # artifact and reached the later mandatory verification gate.
+            self.assertEqual("skipped-unverified", result.status)
+
 
 class GradePayloadValidationTests(unittest.TestCase):
     """Every reviewer route must satisfy the complete no-op authorization schema."""
@@ -4350,6 +4370,17 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
                 self.assertFalse(ff._generated_test_source_has_case(
                     "generated_test.go", source,
                 ))
+
+    def test_nested_go_subtest_skip_never_receives_execution_credit(self):
+        source = (
+            "package x\nimport \"testing\"\n"
+            "func TestGenerated(t *testing.T) {\n"
+            "  t.Run(\"child\", func(child *testing.T) { child.SkipNow() })\n"
+            "}\n"
+        )
+        self.assertFalse(ff._generated_test_source_has_case(
+            "generated_test.go", source,
+        ))
 
     def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
         cases = (
@@ -5109,6 +5140,22 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIsNone(status)
         self.assertIn("isolated checkout changed: app.py", refusal)
         self.assertEqual([rel], rollback_failed)
+
+    def test_local_virtualenv_is_omitted_from_execution_copy(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             _tempfile_ceiling.TemporaryDirectory() as parent:
+            with open(os.path.join(project, "app.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            bindir = os.path.join(project, ".venv", "bin")
+            os.makedirs(bindir)
+            try:
+                os.symlink(sys.executable, os.path.join(bindir, "python"))
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            destination = os.path.join(parent, "execution")
+            ff._copy_generated_test_checkout(project, destination)
+            self.assertTrue(os.path.isfile(os.path.join(destination, "app.py")))
+            self.assertFalse(os.path.lexists(os.path.join(destination, ".venv")))
 
     def test_external_symlink_is_refused_before_generated_test_execution(self):
         rel = "tests/test_generated.py"
