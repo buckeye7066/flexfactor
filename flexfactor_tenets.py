@@ -23,6 +23,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -305,21 +306,72 @@ def _read_bounded_pipe(
             pass
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Stop the ranker and every helper it created.
+
+    ``terminate()`` only addresses the direct child.  A helper that inherited
+    stdout/stderr can otherwise survive the timeout and keep both reader
+    threads blocked.  The child is always launched as a new POSIX session or
+    Windows process group by :func:`_run_bounded_process`.
+    """
     if process.poll() is not None:
         return
+
+    if os.name == "nt":
+        # Windows has no killpg equivalent.  taskkill's /T flag walks the
+        # descendant tree and /F prevents a console-less process from ignoring
+        # the request.  Use an absolute system path so neither the audited
+        # repository nor ambient PATH selects the executable.
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+        taskkill = (
+            Path(buffer.value) / "taskkill.exe"
+            if 0 < length < len(buffer)
+            else Path(r"C:\Windows\System32\taskkill.exe")
+        )
+        try:
+            subprocess.run(
+                (str(taskkill), "/PID", str(process.pid), "/T", "/F"),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+
     try:
-        process.terminate()
-        process.wait(timeout=2)
+        process.wait(timeout=1)
+        return
     except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    else:
         try:
             process.kill()
         except OSError:
             pass
-        try:
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def _run_bounded_process(
@@ -334,6 +386,13 @@ def _run_bounded_process(
     """Run a child while bounding both output streams during production."""
     if stdout_limit < 1 or stderr_limit < 1:
         raise ValueError("output limits must be positive")
+    process_group: dict[str, Any]
+    if os.name == "nt":
+        process_group = {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    else:
+        process_group = {"start_new_session": True}
     process = subprocess.Popen(
         tuple(command),
         cwd=cwd,
@@ -342,6 +401,7 @@ def _run_bounded_process(
         stderr=subprocess.PIPE,
         shell=False,
         env=dict(env) if env is not None else None,
+        **process_group,
     )
     assert process.stdout is not None
     assert process.stderr is not None
@@ -388,12 +448,12 @@ def _run_bounded_process(
     timed_out = False
     while process.poll() is None:
         if overflow_event.wait(timeout=0.02):
-            _terminate_process(process)
+            _terminate_process_tree(process)
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
-            _terminate_process(process)
+            _terminate_process_tree(process)
             break
         try:
             process.wait(timeout=min(0.05, remaining))
@@ -401,9 +461,10 @@ def _run_bounded_process(
             continue
 
     if process.poll() is None:
-        _terminate_process(process)
+        _terminate_process_tree(process)
+    reader_deadline = time.monotonic() + 3
     for reader in readers:
-        reader.join(timeout=3)
+        reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
     if any(reader.is_alive() for reader in readers):
         with state_lock:
             state.setdefault("read_error", "output reader did not terminate")
@@ -426,27 +487,54 @@ def _isolated_tenets_environment(project_root: Path, isolation_root: Path) -> di
     root nor one of its descendants may participate in executable lookup and
     Tenets receives private, disposable home/cache/config directories.
     """
-    environment = dict(os.environ)
-    safe_path: list[str] = []
-    for entry in environment.get("PATH", "").split(os.pathsep):
-        if not entry:
-            continue
-        try:
-            resolved = Path(entry).expanduser().resolve(strict=False)
-            resolved.relative_to(project_root)
-        except ValueError:
-            safe_path.append(entry)
-        except OSError:
-            # An entry that cannot be resolved is not safe enough for an
-            # optional ranking helper.
-            continue
-    environment["PATH"] = os.pathsep.join(safe_path)
+    # Start from a small OS/runtime allowlist rather than forwarding provider
+    # keys, GitHub tokens, proxies, or unrelated application secrets to an
+    # optional third-party process.
+    inherited = os.environ
+    environment = {
+        name: inherited[name]
+        for name in (
+            "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+            "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE",
+            "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+        )
+        if name in inherited
+    }
+    # The pinned console script is invoked by an absolute path and needs no
+    # executable lookup.  An empty PATH is materially safer than attempting to
+    # classify inherited entries: a lexical target path can be a junction or
+    # symlink whose resolved destination sits outside the target, and Git can
+    # execute repository-local helpers such as core.fsmonitor.  With no helper
+    # lookup, Tenets cannot execute either case.
+    environment["PATH"] = ""
+
+    # Do not let a target-controlled module shadow the pinned Tenets package or
+    # any of its dependencies.  Python has already resolved the absolute
+    # console-script interpreter before these variables matter.
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONSAFEPATH"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    # Tenets rank 0.13.3 does not require Git.  Make GitPython resolve a private
+    # nonexistent executable and suppress every ambient configuration tier.
+    # This prevents executable local config (notably core.fsmonitor) from
+    # running outside FlexFactor's command broker if Tenets probes the checkout.
+    environment["GIT_PYTHON_GIT_EXECUTABLE"] = str(isolation_root / "git-disabled")
+    environment["GIT_PYTHON_REFRESH"] = "quiet"
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     for name, relative in (
         ("HOME", "home"),
         ("USERPROFILE", "home"),
+        ("APPDATA", "config"),
+        ("LOCALAPPDATA", "cache"),
         ("XDG_CONFIG_HOME", "config"),
         ("XDG_CACHE_HOME", "cache"),
         ("XDG_DATA_HOME", "data"),
+        ("TMP", "tmp"),
+        ("TEMP", "tmp"),
+        ("TMPDIR", "tmp"),
     ):
         directory = isolation_root / relative
         directory.mkdir(parents=True, exist_ok=True)
@@ -518,6 +606,7 @@ def generate_tenets_context(
             "rank",
             task_text,
             str(root),
+            "--no-git",
             "--top",
             str(top),
             "--format",
@@ -692,6 +781,7 @@ def _argv_task(
             root = Path(project).expanduser().resolve(strict=False)
             root_full = os.path.normcase(str(root))
             root_identity = _program_identity(root.name)
+            candidates: list[tuple[int, str, str]] = []
             for index, program in enumerate(programs):
                 if index >= len(guiding_prompts):
                     break
@@ -700,11 +790,20 @@ def _argv_task(
                     candidate_full = os.path.normcase(str(candidate.resolve(strict=False)))
                 except OSError:
                     candidate_full = os.path.normcase(str(candidate.absolute()))
-                if (
-                    candidate_full == root_full
-                    or _program_identity(program) == root_identity
-                ):
+                candidates.append((index, candidate_full, _program_identity(program)))
+
+            # Exact resolved paths are authoritative.  A basename/slug is only
+            # a fallback when it identifies exactly one program; two checkouts
+            # named "app" must never receive each other's repair objective.
+            for index, candidate_full, _identity in candidates:
+                if candidate_full == root_full:
                     return guiding_prompts[index]
+            identity_matches = [
+                index for index, _candidate_full, identity in candidates
+                if identity and identity == root_identity
+            ]
+            if len(identity_matches) == 1:
+                return guiding_prompts[identity_matches[0]]
         if len(guiding_prompts) == 1:
             return guiding_prompts[0]
 
@@ -822,6 +921,10 @@ def _call_with_lifted_cap(
 def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | None = None) -> None:
     """Idempotently prioritize canonical audit candidates without changing membership."""
     with _INSTALL_LOCK:
+        # A long-lived embedder may call run_cli more than once.  Refresh the
+        # effective arguments even after the wrapper is installed so each run's
+        # explicit task, rather than the importing host's sys.argv, is used.
+        module_globals["_FLEXFACTOR_TENETS_ARGV"] = tuple(argv or ())
         if module_globals.get("_FLEXFACTOR_TENETS_INSTALLED"):
             return
         module_globals["_FLEXFACTOR_TENETS_INSTALLED"] = True
@@ -835,7 +938,9 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
             if not enabled():
                 return None
             try:
-                task = _argv_task(argv, project=root)
+                task = _argv_task(
+                    module_globals.get("_FLEXFACTOR_TENETS_ARGV"), project=root
+                )
                 result = cached_tenets_context(root, task)
             except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
