@@ -47,7 +47,7 @@ SOURCE_EXTENSIONS = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".java", ".kt", ".kts", ".go", ".rs", ".rb", ".php", ".cs",
     ".swift", ".dart", ".vue", ".svelte", ".c", ".cc", ".cpp",
-    ".h", ".hpp", ".sql", ".sh", ".ps1",
+    ".h", ".hpp", ".sql", ".sh", ".ps1", ".psm1", ".psd1",
 }
 TEXT_CONFIG_EXTENSIONS = {
     ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".xml",

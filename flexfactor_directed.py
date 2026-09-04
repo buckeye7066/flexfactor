@@ -89,11 +89,19 @@ def typo_resolve_local_project(name_hints, roots, slugify) -> str | None:
     visible checkouts over hidden config folders, and refuses ties.
     """
     hints: list[str] = []
+    generic_suffixes = {"repo", "repository", "project", "program", "app", "application"}
     for raw in name_hints or ():
         slug = slugify(str(raw or ""))
-        compact = slug.replace("-", "")
-        if len(compact) >= 5 and compact not in hints:
-            hints.append(compact)
+        variants = [slug]
+        parts = [part for part in slug.split("-") if part]
+        while parts and parts[-1] in generic_suffixes:
+            parts = parts[:-1]
+            if parts:
+                variants.append("-".join(parts))
+        for variant in variants:
+            compact = variant.replace("-", "")
+            if len(compact) >= 5 and compact not in hints:
+                hints.append(compact)
     if not hints:
         return None
 

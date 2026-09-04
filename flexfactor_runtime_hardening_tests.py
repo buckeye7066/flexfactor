@@ -9,6 +9,7 @@ from unittest import mock
 import flexfactor as ff
 import flexfactor_cmdpolicy as command_policy
 import flexfactor_directed as directed
+import flexfactor_evidence as evidence
 
 
 class RuntimeHardeningTests(unittest.TestCase):
@@ -117,6 +118,40 @@ class RuntimeHardeningTests(unittest.TestCase):
             self.assertIsNone(
                 directed.powershell_syntax_details(".", "repair.ps1", "Write-Output 'ok'\n", lambda *_a, **_k: None)
             )
+
+
+    def test_direct_main_entry_arms_hardening_without_test_installer(self):
+        import inspect
+        source = inspect.getsource(ff.main)
+        self.assertIn("_runtime_directed.install(globals())", source)
+
+    def test_all_powershell_extensions_are_evidence_sources(self):
+        self.assertTrue(directed._POWERSHELL_EXTS <= evidence.SOURCE_EXTENSIONS)
+
+    def test_generic_suffix_does_not_defeat_unique_typo_recovery(self):
+        original_roots = ff._PROJECT_ROOTS
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                wanted = os.path.join(root, "GrantFlow")
+                os.mkdir(wanted)
+                ff._PROJECT_ROOTS = [root]
+                for hint in ("GrantFlwo Repo", "GrantFlwo Project"):
+                    self.assertEqual(
+                        os.path.normcase(ff._find_local_project(hint)),
+                        os.path.normcase(wanted),
+                    )
+        finally:
+            ff._PROJECT_ROOTS = original_roots
+
+    def test_empty_powershell_whole_file_response_is_rejected_before_parser(self):
+        with mock.patch.object(directed, "powershell_syntax_details") as parser:
+            ok, note, parsed = ff._prewrite_source_syntax_details(
+                ".", "repair.ps1", "", [], allow_empty=False,
+            )
+        self.assertFalse(ok)
+        self.assertIn("empty whole-file response", note)
+        self.assertIsNone(parsed)
+        parser.assert_not_called()
 
 
 if __name__ == "__main__":
