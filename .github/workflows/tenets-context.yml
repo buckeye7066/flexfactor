@@ -76,11 +76,63 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import shutil
+          import subprocess
           import sys
 
           import flexfactor_tenets as ft
 
           root = Path(".").resolve()
+          trap_root = Path(os.environ["CONTEXT_OUTPUT"]).resolve().parent / "tenets-traps"
+          trap_root.mkdir(parents=True, exist_ok=True)
+          python_marker = trap_root / "python-shadow-ran"
+          git_marker = trap_root / "git-helper-ran"
+          fsmonitor_marker = trap_root / "git-fsmonitor-ran"
+
+          # A target-controlled import path must not shadow the pinned Tenets
+          # package in the child interpreter.
+          shadow_package = root / "tenets"
+          shadow_package.mkdir()
+          (shadow_package / "__init__.py").write_text(
+              "from pathlib import Path\nPath(" + repr(str(python_marker)) + ").touch()\n",
+              encoding="utf-8",
+          )
+          os.environ["PYTHONPATH"] = str(root)
+
+          # A repository-named helper path (including a symlink/junction case)
+          # must not survive in the child. The adapter invokes the console
+          # script absolutely, so it can safely give Tenets an empty PATH.
+          helper_target = trap_root / "helper-target"
+          helper_target.mkdir()
+          helper_link = root / ".tenets-helper-path"
+          try:
+              helper_link.symlink_to(helper_target, target_is_directory=True)
+          except OSError:
+              helper_link = helper_target
+          if os.name == "nt":
+              (helper_target / "git.cmd").write_text(
+                  "@type nul > " + str(git_marker) + "\r\n", encoding="utf-8"
+              )
+          else:
+              fake_git = helper_target / "git"
+              fake_git.write_text(
+                  "#!/bin/sh\n: > " + repr(str(git_marker)) + "\n", encoding="utf-8"
+              )
+              fake_git.chmod(0o755)
+
+              # Prove repository-local executable Git configuration is inert.
+              fsmonitor = trap_root / "fsmonitor.sh"
+              fsmonitor.write_text(
+                  "#!/bin/sh\n: > " + repr(str(fsmonitor_marker)) + "\n", encoding="utf-8"
+              )
+              fsmonitor.chmod(0o755)
+              trusted_git = shutil.which("git")
+              assert trusted_git
+              subprocess.run(
+                  [trusted_git, "config", "--local", "core.fsmonitor", str(fsmonitor)],
+                  check=True,
+              )
+
           interpreter_dir = Path(sys.executable).resolve().parent
           filtered = []
           for entry in os.environ.get("PATH", "").split(os.pathsep):
@@ -93,6 +145,7 @@ jobs:
                   pass
               filtered.append(entry)
           os.environ["PATH"] = os.pathsep.join(filtered)
+          os.environ["PATH"] = str(helper_link) + os.pathsep + os.environ["PATH"]
 
           executable = ft._find_tenets_executable()
           assert executable, "Tenets was not resolved from the active Python installation"
@@ -114,6 +167,9 @@ jobs:
               output=os.environ["CONTEXT_OUTPUT"],
           )
           assert result.status == "ok", result.to_dict()
+          assert not python_marker.exists(), "audited repo shadowed the Tenets package"
+          assert not git_marker.exists(), "audited repo supplied an executable helper"
+          assert not fsmonitor_marker.exists(), "repository-local core.fsmonitor executed"
 
           payload = json.loads(
               Path(os.environ["CONTEXT_OUTPUT"]).read_text(encoding="utf-8")
