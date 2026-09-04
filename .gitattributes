@@ -4,3 +4,11 @@
 # This repo is developed on Windows with core.autocrlf=true, so the guard is
 # not theoretical.
 *.sh text eol=lf
+
+# Purpose-contract evidence hashes bind to committed bytes. Keep evidence-bearing
+# text stable across Linux and Windows checkouts so core.autocrlf cannot rewrite
+# an authoritative file after its owner-observed SHA-256 was recorded.
+*.py text eol=lf
+*.js text eol=lf
+*.java text eol=lf
+*.json text eol=lf
