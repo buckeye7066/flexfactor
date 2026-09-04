@@ -343,34 +343,57 @@ def find_contract(program_name: str, project_dir: str | None = None,
 
 
 def _contract_from_registry(entry: dict) -> PurposeContract:
-    def _text_items(primary: str, structured: str) -> list[str]:
-        """Read both the original string-list fields and v2 evidence records.
-
-        Purpose contract v2 names the human-facing sections ``users`` and
-        ``workflows`` and stores each statement as an evidence-bearing object.
-        Treating those sections as absent forced an otherwise complete authored
-        contract through model inference at startup.  Besides wasting a call,
-        an unavailable or malformed provider made the audit stop at "finding
-        purpose" even though the owner had already supplied the answer.
-
-        Keep this conversion deliberately narrow and atomic: only strings and
-        non-empty ``text`` strings are claims, and one malformed member rejects
-        the entire section.  A half-loaded user/workflow list is worse than an
-        explicitly incomplete contract because it can make the understanding
-        gate believe it has the owner's complete instruction.  IDs, confidence
-        labels, and mapping keys must never accidentally become purpose prose.
-        """
-        raw = entry.get(primary)
+    def _legacy_text_items(field: str) -> list[str]:
+        """Return a complete legacy string list, never a partial section."""
+        raw = entry.get(field)
         if raw is None:
-            raw = entry.get(structured)
+            return []
         if not isinstance(raw, list):
             return []
         values: list[str] = []
         for item in raw:
-            value = item if isinstance(item, str) else (
-                item.get("text") if isinstance(item, dict) else None
-            )
+            if not isinstance(item, str) or not item.strip():
+                return []
+            values.append(item.strip())
+        return values
+
+    def _text_items(primary: str, structured: str) -> list[str]:
+        """Read legacy text lists or authoritative v2 evidence claims.
+
+        A v2 ``users``/``workflows`` section is evidence-bearing.  Loading its
+        mapping keys (or a contradicted/unknown/inferred claim) as prose would
+        turn an uncertain statement into an owner-authoritative purpose field,
+        which can authorize repository mutation.  Validate the complete claim
+        shape and reject the whole section on one unsafe member; the existing
+        understanding gate can then enrich the missing section without hiding
+        the uncertainty.
+        """
+        if entry.get(primary) is not None:
+            return _legacy_text_items(primary)
+
+        raw = entry.get(structured)
+        if not isinstance(raw, list):
+            return []
+        values: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                return []
+            claim_id = item.get("id")
+            value = item.get("text")
+            confidence = item.get("confidence")
+            evidence_refs = item.get("evidence_refs")
+            if not isinstance(claim_id, str) or not claim_id.strip():
+                return []
             if not isinstance(value, str) or not value.strip():
+                return []
+            # Only evidence-backed affirmative claims may satisfy a field that
+            # the runtime treats as authored.  Inferred, contradicted, and
+            # unknown claims remain inputs to later purpose discovery.
+            if confidence not in {"verified", "supported"}:
+                return []
+            if not isinstance(evidence_refs, list) or any(
+                    isinstance(ref, bool) or not isinstance(ref, int) or ref < 0
+                    for ref in evidence_refs):
                 return []
             values.append(value.strip())
         return values
