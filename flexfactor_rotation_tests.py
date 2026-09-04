@@ -711,6 +711,57 @@ class RotatingProviderTests(RotationTestCase):
         self.assertNotIn("route:a/top", cooldowns)
         self.assertNotIn("route:b/next", cooldowns)
 
+    def test_shape_cleanup_keeps_concurrently_replaced_serious_cooldown(self):
+        selected_route = route("a/only", "pool-a")
+        rot = self.rotator(catalog(selected_route))
+
+        malformed_until = rot.report(
+            selected_route, "malformed_output", now=1000.0)
+        self.assertEqual(malformed_until, 1000.0 + R.ROUTE_ERROR_COOLDOWN)
+
+        # Another worker can report a more serious route failure after this
+        # call's malformed-output cooldown was stored but before its cleanup.
+        rot.report(selected_route, "transport_dead",
+                   retry_after_seconds=999.0, now=1001.0)
+        serious_until = self.store.read()["cooldowns"]["route:a/only"]
+
+        rot.release_route_cooldown(selected_route, malformed_until)
+        self.assertEqual(
+            self.store.read()["cooldowns"]["route:a/only"], serious_until)
+
+    def test_shape_cleanup_supports_legacy_rotator_without_release_method(self):
+        class StructuredOutputShapeError(RuntimeError):
+            pass
+
+        selected_route = route("a/only", "pool-a")
+
+        class LegacyRotator:
+            def __init__(self):
+                self.catalog = catalog(selected_route)
+                self._selected = False
+
+            def next_route(self, tier, allow_paid):
+                if self._selected:
+                    raise R.RotationError("legacy rotator exhausted")
+                self._selected = True
+                return R.Selection(
+                    route=selected_route, pool=selected_route.pool,
+                    tier=selected_route.tier, requested_tier=tier)
+
+            def report(self, *_args, **_kwargs):
+                # Older injected rotators have no release helper and their
+                # report protocol did not return a temporary cooldown marker.
+                return None
+
+        provider = R.RotatingProvider(
+            LegacyRotator(), lambda selected: FakeProvider(selected))
+        with self.assertRaises(R.RotationError) as caught:
+            provider.structured_validated(
+                "system", "prompt", {"type": "object"},
+                validator=lambda _data: (_ for _ in ()).throw(
+                    StructuredOutputShapeError("shape mismatch")))
+        self.assertIn("StructuredOutputShapeError", str(caught.exception))
+
     def test_validated_shape_failure_preserves_single_route_for_correction(self):
         class StructuredOutputShapeError(RuntimeError):
             pass

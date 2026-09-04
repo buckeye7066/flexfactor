@@ -1148,7 +1148,7 @@ class Rotator:
                retry_after_seconds: Optional[float] = None,
                now: Optional[float] = None,
                scope: str = "pool",
-               reset_at: Optional[float] = None) -> None:
+               reset_at: Optional[float] = None) -> Optional[float]:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
@@ -1238,12 +1238,22 @@ class Rotator:
                 cooldowns[route.pool] = now + POOL_STRIKE_COOLDOWN
                 strikes.pop(route.id, None)
 
-        self.store.update(mutate)
+        written = self.store.update(mutate)
+        if outcome == "malformed_output":
+            until = written.get("cooldowns", {}).get(f"route:{route.id}")
+            return float(until) if isinstance(until, (int, float)) else None
+        return None
 
-    def release_route_cooldown(self, route: Route) -> None:
-        """Release a temporary route-only cooldown without erasing strikes."""
-        self.store.update(lambda data: data.setdefault("cooldowns", {}).pop(
-            f"route:{route.id}", None))
+    def release_route_cooldown(self, route: Route, expected_until: float) -> None:
+        """Release only the exact temporary cooldown installed by this attempt."""
+        key = f"route:{route.id}"
+
+        def mutate(data: Dict[str, Any]) -> None:
+            cooldowns = data.setdefault("cooldowns", {})
+            if cooldowns.get(key) == expected_until:
+                cooldowns.pop(key, None)
+
+        self.store.update(mutate)
 
     # -- diagnostics -------------------------------------------------------
     def _no_route_message(self, tier: str, allow_paid: bool,
@@ -1484,7 +1494,7 @@ class RotatingProvider:
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
-        shape_failed_routes: List[Route] = []
+        shape_failed_routes: List[Tuple[Route, Optional[float]]] = []
 
         def restore_corrective_retry_capacity() -> None:
             """Make malformed-output routes eligible for the corrected prompt.
@@ -1499,8 +1509,12 @@ class RotatingProvider:
             if (last_error is None
                     or type(last_error).__name__ != "StructuredOutputShapeError"):
                 return
-            for failed_route in shape_failed_routes:
-                self.rotator.release_route_cooldown(failed_route)
+            releaser = getattr(self.rotator, "release_route_cooldown", None)
+            if not callable(releaser):
+                return
+            for failed_route, expected_until in shape_failed_routes:
+                if expected_until is not None:
+                    releaser(failed_route, expected_until)
 
         allow_paid_for_call = self._allow_paid
         for attempt in range(attempts):
@@ -1577,13 +1591,18 @@ class RotatingProvider:
                 # case. The ledger hook still fires: not charging the route must
                 # never make the failure invisible.
                 payload_fault = is_payload_fault(exc)
+                malformed_cooldown: Optional[float] = None
                 if not payload_fault:
                     scope, reset_at = limit_scope(exc)
                     outcome = ("malformed_output"
                                if type(exc).__name__ == "StructuredOutputShapeError"
                                else _classify(exc))
-                    self.rotator.report(route, outcome, _retry_after(exc),
-                                        scope=scope, reset_at=reset_at)
+                    reported = self.rotator.report(
+                        route, outcome, _retry_after(exc),
+                        scope=scope, reset_at=reset_at)
+                    if (outcome == "malformed_output"
+                            and isinstance(reported, (int, float))):
+                        malformed_cooldown = float(reported)
                 if self._on_error is not None:
                     try:
                         self._on_error(route, exc)
@@ -1591,7 +1610,7 @@ class RotatingProvider:
                         pass
                 last_error = exc
                 if type(exc).__name__ == "StructuredOutputShapeError":
-                    shape_failed_routes.append(route)
+                    shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
                 continue
