@@ -40,15 +40,30 @@ new = '''    def test_local_evidence_descriptor_must_still_match_directory_entry
         real_fstat = fp.os.fstat
         calls = 0
 
+        class ChangedStat:
+            def __init__(self, original):
+                self._original = original
+                self.st_dev = original.st_dev
+                self.st_ino = original.st_ino + 1
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+            def __getitem__(self, index):
+                return self._original[index]
+
+            def __iter__(self):
+                return iter(self._original)
+
+            def __len__(self):
+                return len(self._original)
+
         def replaced(descriptor):
             nonlocal calls
             observed = real_fstat(descriptor)
             calls += 1
             if calls >= 3:
-                changed = mock.Mock(wraps=observed)
-                changed.st_dev = observed.st_dev
-                changed.st_ino = observed.st_ino + 1
-                return changed
+                return ChangedStat(observed)
             return observed
 
         # The pathname and handle metadata shapes legitimately differ on
