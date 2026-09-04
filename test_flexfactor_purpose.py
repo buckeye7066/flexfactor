@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -1233,6 +1234,33 @@ class PurposeContractV2Tests(_TempRepo):
             contract, rejected = fp.find_contract_with_status("Receipt Maker")
         self.assertIsNone(contract)
         self.assertTrue(rejected)
+
+    def test_registry_identity_tolerates_windows_path_handle_stat_shapes(self):
+        registry = Path(self.root) / "registry.json"
+        registry.write_text(
+            json.dumps({"programs": {"receipt-maker": self._contract()}}),
+            encoding="utf-8",
+        )
+        real_fstat = fp.os.fstat
+
+        def windows_style_fstat(descriptor):
+            observed = real_fstat(descriptor)
+            changed = mock.Mock()
+            for field in (
+                "st_mode", "st_dev", "st_ino", "st_size",
+                "st_mtime_ns", "st_ctime_ns",
+            ):
+                setattr(changed, field, getattr(observed, field))
+            changed.st_mode ^= stat.S_IWUSR
+            changed.st_dev += 101
+            changed.st_ino += 101
+            changed.st_ctime_ns += 1_000
+            return changed
+
+        with mock.patch.object(fp.os, "fstat", side_effect=windows_style_fstat):
+            programs, rejected = fp._load_registry_with_status(str(registry))
+        self.assertFalse(rejected)
+        self.assertIn("receipt-maker", programs)
 
     def test_dangling_or_raced_registry_entry_is_not_an_optional_miss(self):
         missing = Path(self.root) / "missing-registry.json"

@@ -395,9 +395,9 @@ def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:
         # are present authority entries we cannot bind to stable owner bytes.
         return {}, True
 
-    def _identity(value) -> tuple[int, int, int, int, int, int]:
+    def _handle_identity(value) -> tuple[int, int, int, int, int, int]:
         return (
-            int(value.st_mode),
+            int(stat.S_IFMT(value.st_mode)),
             int(value.st_dev),
             int(value.st_ino),
             int(value.st_size),
@@ -405,23 +405,40 @@ def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:
             int(value.st_ctime_ns),
         )
 
+    def _path_handle_shape(value) -> tuple[int, int]:
+        # Windows path-stat and handle-stat can disagree on permission bits,
+        # device, inode, and creation/metadata time for the same file. Compare
+        # only type/size across APIs, then compare two live handle identities.
+        return int(stat.S_IFMT(value.st_mode)), int(value.st_size)
+
     try:
         with open(p, encoding="utf-8") as fh:
             opened_before = os.fstat(fh.fileno())
             if (not stat.S_ISREG(opened_before.st_mode)
-                    or _identity(opened_before) != _identity(authority_entry)):
+                    or _path_handle_shape(opened_before)
+                    != _path_handle_shape(authority_entry)):
                 return {}, True
             doc = json.load(fh)
             opened_after = os.fstat(fh.fileno())
         current = os.lstat(p)
+        # Reopen the directory entry after parsing. Both identities now come
+        # from fstat on a live handle, which is stable across platforms and
+        # still catches swap/restore races.
+        with open(p, "rb") as current_fh:
+            current_opened = os.fstat(current_fh.fileno())
     except Exception:
         # Any ordinary backend/decoder/parser failure means authority could not
         # be established.  BaseException subclasses (interrupts/exits) still
         # propagate.
         return {}, True
     if (not stat.S_ISREG(current.st_mode)
-            or _identity(opened_before) != _identity(opened_after)
-            or _identity(opened_after) != _identity(current)):
+            or not stat.S_ISREG(current_opened.st_mode)
+            or _handle_identity(opened_before)
+            != _handle_identity(opened_after)
+            or _handle_identity(opened_after)
+            != _handle_identity(current_opened)
+            or _path_handle_shape(current)
+            != _path_handle_shape(current_opened)):
         return {}, True
     if not isinstance(doc, dict) or not isinstance(doc.get("programs"), dict):
         return {}, True

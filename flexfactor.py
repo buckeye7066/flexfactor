@@ -16818,18 +16818,18 @@ def _git_tree_entry_at(
 ) -> tuple[str, str, str] | None:
     """Return one literal tree entry without consulting checkout bytes."""
     listed = _git(
-        ["-c", "core.quotePath=false", "--literal-pathspecs", "ls-tree",
-         commit_sha, "--", repository_path],
+        ["--literal-pathspecs", "ls-tree", "-z", commit_sha, "--",
+         repository_path],
         repository_dir,
     )
     if listed.returncode != 0:
         raise OSError("Git tree lookup failed")
-    lines = (listed.stdout or "").splitlines()
-    if not lines:
+    records = [record for record in (listed.stdout or "").split("\0") if record]
+    if not records:
         return None
-    if len(lines) != 1 or "\t" not in lines[0]:
+    if len(records) != 1 or "\t" not in records[0]:
         raise OSError("Git tree lookup was ambiguous")
-    metadata, observed_path = lines[0].split("\t", 1)
+    metadata, observed_path = records[0].split("\t", 1)
     fields = metadata.split()
     if len(fields) != 3 or observed_path != repository_path:
         raise OSError("Git tree entry did not match the requested path")
@@ -16862,11 +16862,16 @@ def _git_repository_scope(project_dir: str) -> tuple[str, str]:
 def _authority_repository_path(target_prefix: str, locator: str) -> str:
     """Resolve one contract locator lexically beneath the audited target."""
     value = str(locator or "").strip()
-    if not value or "\x00" in value or "\\" in value \
-            or value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+    drive, _tail_path = os.path.splitdrive(value)
+    if not value or "\x00" in value or os.path.isabs(value) or drive:
         raise ValueError("authority locator was not safely repository-relative")
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError("authority locator contained a control character")
+    # Match the startup verifier's native Path semantics. On Windows both
+    # separators name path components; on POSIX a backslash remains a literal
+    # filename byte and the NUL-delimited tree lookup above handles it safely.
+    if os.sep == "\\":
+        value = value.replace("\\", "/")
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("authority locator escaped its target")

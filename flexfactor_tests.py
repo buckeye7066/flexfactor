@@ -21197,6 +21197,19 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "approve", result["reason"])
         self.assertTrue(reviewer.calls)
 
+    def test_authority_locator_preserves_native_windows_separators(self):
+        with mock.patch.object(ff.os, "sep", "\\"):
+            self.assertEqual(
+                ff._authority_repository_path(
+                    "apps/fixture", r"docs\PURPOSE"
+                ),
+                "apps/fixture/docs/PURPOSE",
+            )
+            for escaped in (r"..\PURPOSE", r"docs\..\PURPOSE", r"\share"):
+                with self.subTest(locator=escaped):
+                    with self.assertRaises(ValueError):
+                        ff._authority_repository_path("apps/fixture", escaped)
+
     def test_registry_local_path_identity_survives_final_reload(self):
         d, g, _initial, _contract = self._repo_with_v2_contract()
         authority_path = Path(d, ".flexfactor-purpose.json")
