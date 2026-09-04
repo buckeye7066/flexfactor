@@ -436,9 +436,12 @@ def generate_tenets_context(
             "--format",
             "json",
         )
+        temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
+        rank_output = Path(temporary_output.name) / "ranked-files.json"
+        invocation_command = command + ("--output", str(rank_output))
         try:
             completed = _run_bounded_process(
-                command,
+                invocation_command,
                 cwd=root,
                 timeout_seconds=timeout,
             )
@@ -472,7 +475,16 @@ def generate_tenets_context(
                         f"Tenets exited with status {completed.returncode}: {stderr or stdout}"
                     )
                 else:
-                    payload = json.loads(stdout)
+                    payload_bytes = stdout_bytes
+                    if rank_output.is_file():
+                        with rank_output.open("rb") as handle:
+                            payload_bytes = handle.read(MAX_STDOUT_BYTES + 1)
+                        if len(payload_bytes) > MAX_STDOUT_BYTES:
+                            raise ValueError(
+                                f"Tenets JSON output exceeded the {MAX_STDOUT_BYTES}-byte safety limit"
+                            )
+                    payload_text = payload_bytes.decode("utf-8", errors="strict")
+                    payload = json.loads(payload_text)
                     files = _parse_ranked_files(payload, root, top)
                     if files:
                         status = "ok"
@@ -486,6 +498,8 @@ def generate_tenets_context(
         except OSError as exc:
             status = "degraded"
             message = _bounded_text(f"Tenets could not start: {exc}")
+        finally:
+            temporary_output.cleanup()
 
     duration = round(max(0.0, time.monotonic() - started), 6)
     result = TenetsContextResult(

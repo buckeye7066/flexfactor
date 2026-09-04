@@ -107,6 +107,27 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(runner.call_args.kwargs["cwd"], self.root.resolve())
         self.assertEqual(runner.call_args.kwargs["timeout_seconds"], 120.0)
 
+    def test_real_cli_output_file_is_used_instead_of_console_stdout(self) -> None:
+        payload = {"files": [{"path": "src/app.py", "score": 0.95}]}
+        written_path: list[Path] = []
+
+        def runner(command, **_kwargs):
+            output_index = command.index("--output") + 1
+            output_path = Path(command[output_index])
+            output_path.write_text(json.dumps(payload), encoding="utf-8")
+            written_path.append(output_path)
+            return self._process(stdout=b"OK Saved ranking to temporary file\n")
+
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
+        ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):
+            result = ft.generate_tenets_context(self.root, "audit")
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+        self.assertTrue(written_path)
+        self.assertFalse(written_path[0].exists())
+
     def test_empty_valid_result_is_degraded_not_success(self) -> None:
         completed = self._process(stdout=b'{"files": []}')
         with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
