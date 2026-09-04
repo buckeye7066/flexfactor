@@ -549,9 +549,13 @@ def _terminate_linux_supervisor_children(timeout_seconds: float = 2.0) -> bool:
         )
         for child_pid in children:
             try:
-                os.kill(child_pid, chosen_signal)
+                pidfd = os.pidfd_open(child_pid)
             except ProcessLookupError:
-                pass
+                continue
+            try:
+                signal.pidfd_send_signal(pidfd, chosen_signal)
+            finally:
+                os.close(pidfd)
         time.sleep(0.01)
     _reap_linux_children()
     return not _linux_direct_child_pids()
@@ -571,6 +575,11 @@ def _linux_supervise_command(command: Sequence[str]) -> int:
         # Prove procfs inventory is available before any optional ranker code
         # executes. Without it the supervisor cannot safely enumerate adoptees.
         _linux_direct_child_pids()
+        # A pidfd makes cleanup immune to PID reuse between inventory and
+        # signalling. Refuse to launch if the running kernel lacks this piece
+        # of the containment boundary.
+        self_pidfd = os.pidfd_open(os.getpid())
+        os.close(self_pidfd)
     except OSError as exc:
         print(f"flexfactor Tenets containment unavailable: {exc}", file=sys.stderr)
         return 125
@@ -727,7 +736,10 @@ def _terminate_process_tree(
             os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
-        deadline = time.monotonic() + 1
+        # A Linux supervisor may first need to stop an escaped direct ranker,
+        # adopt its helpers, and then terminate those adoptees. Keep the
+        # retained group alive long enough for that two-stage cleanup.
+        deadline = time.monotonic() + (3 if sys.platform.startswith("linux") else 1)
         while _posix_process_group_alive(process.pid) and time.monotonic() < deadline:
             process.poll()  # Reap an exited leader; descendants retain the PGID.
             time.sleep(0.02)

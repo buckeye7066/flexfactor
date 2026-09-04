@@ -230,7 +230,7 @@ class TenetsContextTests(unittest.TestCase):
 
         with mock.patch.object(ft.os, "killpg") as kill_group, \
              mock.patch.object(ft, "_posix_process_group_alive", return_value=True), \
-             mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 2.0]):
+             mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 4.0]):
             ft._terminate_process_tree(process)
 
         self.assertEqual(
@@ -282,6 +282,31 @@ class TenetsContextTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.read_error)
+        self.assertLess(time.monotonic() - started, 4)
+        time.sleep(1.2)
+        self.assertFalse(survivor_file.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux child-subreaper containment contract")
+    def test_timeout_cleans_ranker_and_helper_that_both_escape_session(self) -> None:
+        survivor_file = Path(self.temp.name) / "timeout-setsid-survived"
+        script = (
+            "import os,signal,subprocess,sys,time; "
+            "os.setsid(); signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+            "subprocess.Popen([sys.executable,'-c',"
+            "'import pathlib,sys,time; time.sleep(2); pathlib.Path(sys.argv[1]).write_text(\"alive\"); time.sleep(60)',"
+            "sys.argv[1]],start_new_session=True); time.sleep(60)"
+        )
+        started = time.monotonic()
+
+        result = ft._run_bounded_process(
+            (sys.executable, "-S", "-c", script, str(survivor_file)),
+            cwd=self.root,
+            timeout_seconds=0.2,
+        )
+
+        self.assertTrue(result.timed_out)
         self.assertIsNone(result.read_error)
         self.assertLess(time.monotonic() - started, 4)
         time.sleep(1.2)
