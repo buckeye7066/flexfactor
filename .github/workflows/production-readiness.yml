@@ -148,6 +148,7 @@ jobs:
                    flexfactor_baseline_ledger_tests.py \
                    flexfactor_project_lookup_tests.py \
                    flexfactor_runtime_hardening_tests.py \
+                   flexfactor_tenets_tests.py \
                    flexfactor_wip_removal_guard_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \
