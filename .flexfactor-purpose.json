@@ -2,41 +2,41 @@
   "schema": "flexfactor.purpose_contract.v2",
   "name": "FlexFactor",
   "historical_purpose": "A local dual-provider refactorer that grew into a managed purpose-driven audit, repair, verification, and publication system.",
-  "purpose": "Improve an owner's software without turning generated code, partial execution, or a stranded branch into false success: understand why the target exists, account for the complete repository, run and attempt to break relevant behavior, retain only independently verified corrections, preserve owner work and sensitive source, and prove the exact reviewed revision on the authoritative remote default branch.",
+  "purpose": "Be a trustworthy local expert that audits or improves code without retaining unverified changes, leaking sensitive source, or executing untrusted dependencies outside containment, while producing reproducible evidence and deterministic rollback.",
   "current_behavior": [
     {
       "id": "cb-1",
-      "text": "One durable orchestrator accepts 1 through 30 targets and admits exactly one at a time.",
+      "text": "One durable orchestrator admits 1 through 30 targets sequentially.",
       "confidence": "verified",
       "evidence_refs": [0]
     },
     {
       "id": "cb-2",
-      "text": "Audit and Production Ready run at most six semantic passes: the whole repository first, a top-three competitor capability gate, then only the immediately preceding verified edit delta.",
+      "text": "Audit and Production Ready use at most six passes: the whole repository, a top-three competitor gate, then verified edit deltas.",
       "confidence": "verified",
       "evidence_refs": [0, 2]
     },
     {
       "id": "cb-3",
-      "text": "Every model call uses one strongest-paid-to-free availability ladder; legacy provider, paid/free, and economy flags cannot select another production path.",
+      "text": "Every model call uses one strongest-paid-to-free ladder; legacy flags cannot select another production path.",
       "confidence": "verified",
       "evidence_refs": [1, 2]
     },
     {
       "id": "cb-4",
-      "text": "All ladder instances in one run share author-family identity and reviewer calls fail closed unless a family that authored none of the candidate is available.",
+      "text": "One run shares author-family identity; final review requires a non-author family or fails closed.",
       "confidence": "verified",
       "evidence_refs": [1, 2]
     },
     {
       "id": "cb-5",
-      "text": "Intermediate checkpoints stay local; completion after a change requires green executable and evidence gates, complete exact-commit independent review, and remote-default ancestry proof for that SHA.",
+      "text": "Checkpoints stay local; changed-run completion requires green gates, exact-commit independent review, and remote-default ancestry proof.",
       "confidence": "verified",
       "evidence_refs": [2]
     },
     {
       "id": "cb-6",
-      "text": "Android persists a 30-target sequential queue; the cloud atomically claims each request UUID, recovers an existing GitHub workflow instead of duplicating dispatch after a crash, and removes phone-supplied secrets at terminal status.",
+      "text": "Android persists the queue; cloud claims request UUIDs atomically, recovers dispatch after crashes, and removes phone-supplied secrets at terminal status.",
       "confidence": "verified",
       "evidence_refs": [3, 4, 6]
     }
@@ -52,13 +52,13 @@
   "users": [
     {
       "id": "u-1",
-      "text": "Owners running Refactor, Scout, Audit, or Production Ready on their repositories from the signed Android app, desktop launchers, or CLI.",
+      "text": "Owners running Refactor, Scout, Audit, or Production Ready from Android, desktop launchers, or CLI.",
       "confidence": "verified",
       "evidence_refs": [0, 2, 3]
     },
     {
       "id": "u-2",
-      "text": "Supervisors consuming exit codes, queue receipts, run manifests, error ledgers, and evidence bundles.",
+      "text": "Supervisors consuming statuses, receipts, manifests, error ledgers, and evidence bundles.",
       "confidence": "verified",
       "evidence_refs": [0, 2]
     }
@@ -66,13 +66,13 @@
   "outcomes": [
     {
       "id": "o-1",
-      "text": "Verified corrections land on the authoritative remote default branch without force-push and owner WIP is restored by fingerprint.",
+      "text": "Verified corrections reach the authoritative default branch without force-push; owner WIP is restored by fingerprint.",
       "confidence": "verified",
       "evidence_refs": [2]
     },
     {
       "id": "o-2",
-      "text": "Every incomplete provider, verification, review, publication, or release condition remains visible as BLOCKED or IN PROGRESS.",
+      "text": "Incomplete provider, verification, review, publication, or release conditions stay BLOCKED or IN PROGRESS.",
       "confidence": "verified",
       "evidence_refs": [2, 7]
     }
@@ -80,25 +80,25 @@
   "workflows": [
     {
       "id": "w-1",
-      "text": "Audit: publication preflight, inventory and purpose, whole-repository pass 1, top-three competitor gate, exact-delta passes 2 through 6, native and browser verification, evidence, independent exact-commit review, publication, and remote-default proof.",
+      "text": "Audit inventories purpose and the repository, evaluates competitors, iterates verified deltas, then verifies, reviews, and publishes explicit-apply changes.",
       "confidence": "verified",
       "evidence_refs": [0, 2]
     },
     {
       "id": "w-2",
-      "text": "Production Ready executes the Audit workflow with its full readiness rubric and unattended production defaults.",
+      "text": "Production Ready adds the full readiness rubric to Audit.",
       "confidence": "verified",
       "evidence_refs": [2]
     },
     {
       "id": "w-3",
-      "text": "Scout profiles and researches improvements; mutation requires explicit Scout authorization and the same verification and publication contract.",
+      "text": "Scout researches improvements; mutation requires explicit authorization and normal verification and publication.",
       "confidence": "verified",
       "evidence_refs": [2]
     },
     {
       "id": "w-4",
-      "text": "Refactor rewrites selected files toward explicit goals and accepts no change until project verification, independent review, and publication prove it.",
+      "text": "Refactor changes selected files only after project verification, independent review, and publication proof.",
       "confidence": "verified",
       "evidence_refs": [2]
     }
@@ -106,15 +106,15 @@
   "invariants": [
     {
       "id": "i-1",
-      "text": "No review-only or dry-run escape exists in Audit or Production Ready.",
-      "confidence": "verified",
-      "evidence_refs": [2]
+      "text": "Report-only is the default; mutation requires explicit apply authorization.",
+      "confidence": "supported",
+      "evidence_refs": [5, 8]
     },
     {
       "id": "i-2",
-      "text": "A verifier outage leaves the target unchanged and creates no successful publication.",
+      "text": "Verifier outage restores exact pre-run bytes, fails the run, and creates no UNVERIFIED commit or success score.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [2, 8]
     },
     {
       "id": "i-3",
@@ -130,9 +130,9 @@
     },
     {
       "id": "i-5",
-      "text": "A host capability that is not enforced is named as best effort, never claimed as containment.",
-      "confidence": "verified",
-      "evidence_refs": [2]
+      "text": "Untrusted dependencies run only under enforced resource, network, path, process, and time containment on Windows and Linux; unavailable controls BLOCK.",
+      "confidence": "supported",
+      "evidence_refs": [2, 5, 8]
     },
     {
       "id": "i-6",
@@ -151,37 +151,80 @@
       "text": "No reviewer from any candidate author family can certify the final commit.",
       "confidence": "verified",
       "evidence_refs": [1, 2]
+    },
+    {
+      "id": "i-9",
+      "text": "Source is classified before cloud calls; sensitive repositories use local processing unless the owner explicitly approves an exception.",
+      "confidence": "supported",
+      "evidence_refs": [5, 8]
+    },
+    {
+      "id": "i-10",
+      "text": "Every modification binds to batch/project budgets, an immutable manifest, exact commands/evidence, tests, commit identity, and deterministic rollback.",
+      "confidence": "supported",
+      "evidence_refs": [5, 8]
     }
   ],
   "acceptance_criteria": [
-    "A. The ordered target queue contains at most 30 items and no two targets overlap.",
-    "B. Pass 1 covers the complete repository and passes 2 through 6 exactly equal the preceding verified edit delta.",
-    "C. The top three corroborated competitors are considered after pass 1 and before pass 2.",
-    "D. One best-available ladder consumes strongest paid or subscription capacity before lower paid and then free or local capacity.",
-    "E. Every target-controlled install, build, test, or server command crosses the execution broker.",
-    "F. Every tracked or relevant file is analyzed, analyzed in complete chunks, or blocked with a reason.",
-    "G. Purpose evidence cites sources, contradictions, unknowns, and confidence before purpose-driven mutation.",
-    "H. Partial or malformed structured output cannot authorize a clean or approval verdict.",
-    "I. Every retained correction passes the target's real build and strongest project suite.",
-    "J. Every model family that authored candidate content is excluded from final-review selection.",
-    "K. The independent final review accounts for the complete exact-commit patch in content-addressed chunks.",
-    "L. A HEAD movement after review revokes approval.",
-    "M. Changed-file rescan, blast radius, secret evidence, and direct behavior coverage are complete or named blockers.",
-    "N. Applicable live UI journeys account for roles, routes, controls, forms, accessibility, and performance.",
-    "O. Owner WIP is captured outside candidate ancestry and restored only on fingerprint equality.",
-    "P. Intermediate commits never push and FlexFactor never force-pushes.",
-    "Q. A protected branch uses a normal pull request and remains incomplete until merged.",
-    "R. A fresh fetch proves the exact reviewed SHA is reachable from the authoritative remote default branch.",
-    "S. The installed wheel, managed cloud, signed Android APK, and source runtime all identify the matching release.",
-    "T. Production readiness requires merged main, green exact-SHA CI, deployed cloud, published signed APK, and live end-to-end proof."
+    "A. Queue 1-30 targets sequentially; never overlap targets.",
+    "B. Pass 1 covers the repository; passes 2-6 equal the prior verified delta.",
+    "C. Evaluate three corroborated competitors between passes 1 and 2.",
+    "D. Use one strongest-paid-to-free/local model ladder.",
+    "E. Target-controlled commands cross the execution broker.",
+    "F. Analyze every relevant file completely or name the blocker.",
+    "G. Cite purpose sources, contradictions, unknowns, and confidence before mutation.",
+    "H. Partial or malformed output cannot authorize clean or approval.",
+    "I. Retained corrections pass the real build and strongest suite.",
+    "J. Final review excludes every candidate author family.",
+    "K. Independent review covers the exact-commit patch in addressed chunks.",
+    "L. HEAD movement after review revokes approval.",
+    "M. Rescan, blast radius, secrets, and direct coverage complete or BLOCK.",
+    "N. Live UI journeys cover roles, routes, controls, forms, accessibility, and performance.",
+    "O. Capture WIP outside candidate ancestry; restore only on matching fingerprint.",
+    "P. Default report-only; explicit apply precedes mutation; never push checkpoints or force-push.",
+    "Q. Protected branches use PRs and remain incomplete until merged.",
+    "R. Fresh fetch proves the reviewed SHA on the authoritative default branch.",
+    "S. Wheel, cloud, APK, and source identify the same release.",
+    "T. Production ready requires merged main, exact-SHA CI, deployed cloud, signed APK, and live proof.",
+    "U. Classify source before cloud calls; sensitive repos default local absent explicit approval.",
+    "V. Contain untrusted commands with enforced resource, network, path, process, and time limits on Windows/Linux.",
+    "W. Bind each modification to budgets, immutable manifest, exact commands/evidence, tests, commit, and rollback.",
+    "X. Windows/Linux outage, dirty-worktree, cancellation, timeout, partial-failure, and backward-compatibility tests pass."
   ],
   "contradictions": [],
+  "resolved_contradictions": [
+    {
+      "id": "rc-1",
+      "text": "An earlier contract required every Audit and Production Ready run to apply changes, while the owner directive requires report-only/apply-off by default.",
+      "resolution": "The current owner directive controls: report-only is default, apply requires explicit authorization, and mandatory-mutation behavior remains a gap.",
+      "confidence": "supported",
+      "evidence_refs": [2, 5, 8]
+    }
+  ],
   "gaps": [
     {
       "id": "g-1",
-      "text": "Windows raw-socket network isolation is best effort rather than OS enforced.",
+      "text": "Windows raw-socket isolation is best effort, so untrusted dependency execution cannot yet satisfy the containment requirement.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [2, 5, 8]
+    },
+    {
+      "id": "g-2",
+      "text": "Audit and Production Ready still mandate apply/publication instead of preserving report-only as the default.",
+      "confidence": "verified",
+      "evidence_refs": [2, 5, 8]
+    },
+    {
+      "id": "g-3",
+      "text": "Cloud-source classification and sensitive-repository local-default enforcement lack verified implementation evidence.",
+      "confidence": "unknown",
+      "evidence_refs": [2, 5, 8]
+    },
+    {
+      "id": "g-4",
+      "text": "The complete Windows/Linux dirty-worktree, cancellation, timeout, partial-failure, and backward-compatibility matrix is not yet evidenced.",
+      "confidence": "unknown",
+      "evidence_refs": [5, 8]
     }
   ],
   "evidence": [
@@ -190,66 +233,73 @@
       "locator": "flexfactor_execution.py",
       "content_hash": "b5c41193d1c8a6c507748c705c3e7943d28069d309901455daa9e90db2b238d0",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Durable 30-target, six-pass sequential orchestration contract."
+      "excerpt": "Sequential queue and six passes."
     },
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
       "content_hash": "2e96a251d9fde58d62aa4f90c379c3ee2d90e1241cb0e44092bbd8536a7ceea0",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Best-available ladder and shared strict author-family exclusion."
+      "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
       "content_hash": "c5bae3d4e113b0fc3e66482e648d337f3e12808182801751baf0786f0a69b687",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Four modes, mutation preflight, verification, review, and exact-default-branch publication."
+      "excerpt": "Modes, verification, review, publication."
     },
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MobileRunQueue.java",
       "content_hash": "db311304d8086c15a92b185f606906e8f39f6c55972956443c5f3c691dd0787c",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Durable native Android target queue."
+      "excerpt": "Android queue."
     },
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
       "content_hash": "a9f6d2bbf2611c21a664f3c4de85127c6eae80a99d7b77a5d2fb7c0eb114087f",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Managed OAuth, atomic idempotent dispatch, ephemeral provider-secret cleanup, artifacts, and steering."
+      "excerpt": "Cloud dispatch and secret cleanup."
     },
     {
       "kind": "documentation",
       "locator": "docs/PURPOSE.md",
-      "content_hash": "2f501c2f7cb869b0b2f562d5e2e4b7946f661f32fcdea8b591730d4e57c62732",
-      "observed_at": "2026-09-04T08:52:06Z",
-      "excerpt": "Governing purpose and production completion contract."
+      "content_hash": "46aeaff587bd92cdda8eba6a86db89454dfdcb8796ce4da2389d815102ac4e06",
+      "observed_at": "2026-09-04T09:27:51Z",
+      "excerpt": "Owner requirements and reconciliation."
     },
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
       "content_hash": "7f909b003acb9dd88426e5c0fc739048ceb3e21a20ced5f46c4ef658bbc14c8b",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Managed sign-in, sequential dispatch, crash recovery, and fail-closed durable queue advancement."
+      "excerpt": "Android dispatch recovery."
     },
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
       "content_hash": "7c762cdb76398a94d305eada94e0dfffbd855d51b668c180359b7a980aaf1a4e",
       "observed_at": "2026-09-04T08:21:24Z",
-      "excerpt": "Executable gate ledger in which unavailable and not-run gates cannot be counted as passes."
+      "excerpt": "Fail-closed gate ledger."
+    },
+    {
+      "kind": "documentation",
+      "locator": "docs/purpose-contract.md",
+      "content_hash": "40bca8c507fc73756e53dbb9b8ad80160ea007d6e8ab43e53901f5ddb26758b8",
+      "observed_at": "2026-09-04T09:27:51Z",
+      "excerpt": "Owner target and acceptance."
     }
   ],
   "false_substitutes": [
-    "A build passing without the strongest project suite.",
-    "An HTTP health response without authenticated workflow proof.",
-    "Tests existing without being executed on the exact candidate.",
-    "A commit or pull request existing without independent verification.",
-    "Module import being counted as direct function execution.",
-    "Partial or salvaged model output being treated as complete.",
-    "Best-effort environment poisoning being called OS containment.",
-    "A checkpoint existing without SHA and policy verification."
+    "Build pass without the strongest suite.",
+    "HTTP health without authenticated workflow proof.",
+    "Tests not run on the exact candidate.",
+    "Commit or PR without independent verification.",
+    "Module import counted as direct execution.",
+    "Partial output treated as complete.",
+    "Best-effort controls called containment.",
+    "Checkpoint without SHA and policy verification."
   ]
 }

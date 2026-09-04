@@ -649,11 +649,13 @@ class PurposeContractV2Tests(_TempRepo):
         candidate = self._contract(evidence=[self._evidence(
             kind="schema", locator="src/receipt.py", content_hash=digest,
         )])
+        resolved_source = source.resolve()
         real_stat = fp.os.stat
 
         def replaced(path, *args, **kwargs):
             observed = real_stat(path, *args, **kwargs)
-            if Path(path) == source and kwargs.get("follow_symlinks") is False:
+            if Path(path) == resolved_source \
+                    and kwargs.get("follow_symlinks") is False:
                 changed = mock.Mock(wraps=observed)
                 changed.st_dev = observed.st_dev
                 changed.st_ino = observed.st_ino + 1
@@ -946,6 +948,22 @@ class PurposeContractV2Tests(_TempRepo):
         self.assertTrue(fp._v2_contract_is_authoritative(
             checked_in, evidence_root=os.path.dirname(fp.__file__)
         ))
+        contract = fp._contract_from_registry(
+            checked_in, allow_registry_metadata=False,
+            evidence_root=os.path.dirname(fp.__file__),
+        )
+        self.assertIsNotNone(contract)
+        prompt = contract.prompt_block()
+        for requirement in (
+            "Report-only is the default",
+            "Source is classified before cloud calls",
+            "resource, network, path, process, and time containment",
+            "batch/project budgets",
+            "dirty-worktree, cancellation, timeout, partial-failure",
+            "RESOLVED CONTRADICTIONS",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, prompt)
 
     def test_in_repo_contract_read_failure_is_an_authority_rejection(self):
         _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
