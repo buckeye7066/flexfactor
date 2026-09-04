@@ -15769,6 +15769,10 @@ def _run_generated_test_file(project_dir: str, entry: dict,
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         passed: set[str] = set()
         skipped: set[str] = set()
+        # Track subtest outcomes per top-level test to prevent a parent "pass"
+        # from earning credit when every subtest was skipped.
+        sub_seen: dict[str, bool] = {name: False for name in names}
+        sub_non_skip: dict[str, bool] = {name: False for name in names}
         for line in output.splitlines():
             try:
                 event = json.loads(line)
@@ -15780,6 +15784,22 @@ def _run_generated_test_file(project_dir: str, entry: dict,
                 passed.add(name)
             elif name in names and action == "skip":
                 skipped.add(name)
+            # Go reports subtests as "Parent/Sub". If we observe ONLY "skip"
+            # actions for subtests (and no pass/fail), do not grant credit
+            # based solely on a parent "pass".
+            if isinstance(name, str):
+                for parent in names:
+                    prefix = parent + "/"
+                    if name.startswith(prefix):
+                        sub_seen[parent] = True
+                        if action in ("pass", "fail"):
+                            sub_non_skip[parent] = True
+                        break
+        # Any parent with subtests observed but none that passed/failed is
+        # treated as effectively skipped for credit purposes.
+        for parent in names:
+            if sub_seen.get(parent) and not sub_non_skip.get(parent):
+                skipped.add(parent)
         missing = sorted(set(names) - passed)
         if result.returncode != 0 or missing or skipped:
             detail = _tail(output, 20)
