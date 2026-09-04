@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import flexfactor_purpose as fp
 
@@ -173,8 +175,8 @@ class PurposeContractV2Tests(_TempRepo):
     @staticmethod
     def _evidence(**overrides) -> dict:
         record = {
-            "kind": "source",
-            "locator": "src/receipt.py",
+            "kind": "documentation",
+            "locator": "owner policy record",
             "content_hash": "a" * 64,
             "observed_at": "2026-09-04T02:03:04Z",
         }
@@ -401,6 +403,35 @@ class PurposeContractV2Tests(_TempRepo):
                 })
                 self.assertIsNone(fp._contract_from_registry(oversized))
 
+    def test_uncertain_optional_claims_never_enter_owner_mutation_context(self):
+        for section in ("current_behavior", "aspirations", "gaps"):
+            for confidence in ("inferred", "contradicted", "unknown"):
+                with self.subTest(section=section, confidence=confidence):
+                    candidate = self._contract(**{
+                        section: [self._claim(
+                            f"{section}-uncertain",
+                            "This discovery claim is not owner authority.",
+                            confidence,
+                        )],
+                    })
+                    self.assertTrue(fp._v2_contract_is_well_formed(candidate))
+                    contract = fp._contract_from_registry(candidate)
+                    self.assertIsNotNone(contract)
+                    self.assertEqual(
+                        contract.discovery_claims[section][0]["confidence"],
+                        confidence,
+                    )
+                    self.assertEqual(contract.structured_claims[section], [])
+                    self.assertEqual(
+                        contract.to_dict()["discovery_claims"][section],
+                        candidate[section],
+                    )
+                    prompt = contract.prompt_block()
+                    self.assertNotIn(
+                        "This discovery claim is not owner authority.", prompt
+                    )
+                    self.assertNotIn("NON-AUTHORITATIVE DISCOVERY CLAIMS", prompt)
+
     def test_non_ascii_expansion_uses_downstream_review_encoding_budget(self):
         # This fits the mutation prompt as Unicode characters, but the final
         # review's default JSON representation expands every emoji into a
@@ -534,6 +565,86 @@ class PurposeContractV2Tests(_TempRepo):
                 self.assertIsNone(fp._contract_from_registry(
                     self._contract(evidence=[unsafe])))
 
+    def test_local_evidence_hash_must_match_contained_repository_bytes(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("def receipt():\n    return 'valid'\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        valid = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+
+        self.assertIsNotNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
+        self.assertIsNone(fp._contract_from_registry(valid))
+        wrong = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash="0" * 64,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            wrong, evidence_root=self.root
+        ))
+        escaped = self._contract(evidence=[self._evidence(
+            kind="source", locator="../outside.py", content_hash=digest,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            escaped, evidence_root=self.root
+        ))
+
+        outside = Path(self.root).parent / (Path(self.root).name + "-outside.py")
+        outside.write_bytes(source.read_bytes())
+        link = Path(self.root) / "src" / "linked.py"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pass
+        else:
+            linked = self._contract(evidence=[self._evidence(
+                kind="source", locator="src/linked.py", content_hash=digest,
+            )])
+            self.assertIsNone(fp._contract_from_registry(
+                linked, evidence_root=self.root
+            ))
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_local_evidence_descriptor_must_still_match_directory_entry(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="schema", locator="src/receipt.py", content_hash=digest,
+        )])
+        real_stat = fp.os.stat
+
+        def replaced(path, *args, **kwargs):
+            observed = real_stat(path, *args, **kwargs)
+            if Path(path) == source and kwargs.get("follow_symlinks") is False:
+                changed = mock.Mock(wraps=observed)
+                changed.st_dev = observed.st_dev
+                changed.st_ino = observed.st_ino + 1
+                return changed
+            return observed
+
+        with mock.patch.object(fp.os, "stat", side_effect=replaced):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    def test_local_evidence_read_failure_rejects_authority(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="test", locator="src/receipt.py", content_hash=digest,
+        )])
+        with mock.patch.object(fp.os, "open", side_effect=PermissionError("denied")):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
     def test_unhashable_enum_values_reject_instead_of_raising(self):
         for confidence in ([], {}, ["verified"]):
             with self.subTest(confidence=confidence):
@@ -585,6 +696,81 @@ class PurposeContractV2Tests(_TempRepo):
         self.assertIsNotNone(contract)
         self.assertEqual(contract.purpose, "Use the owner registry purpose.")
         self.assertEqual(contract.primary_users, ["Operators"])
+
+    def test_stale_in_repo_evidence_blocks_all_lower_authority_fallbacks(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("owner-observed bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        contract_doc = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+        _w(
+            self.root,
+            "PURPOSE.md",
+            "# Receipt Maker\n\n## Purpose\nUse stale Markdown authority.\n",
+        )
+        source.write_text("bytes changed after owner observation\n", encoding="utf-8")
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Use stale registry authority.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run a stale workflow"],
+            },
+        }
+
+        contract, rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry=registry
+        )
+
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+        self.assertFalse(
+            fp.mutation_authorized_by_purpose(
+                fp.purpose_confidence(contract, {})
+            )[0]
+        )
+
+    def test_stale_registry_evidence_rejects_exact_and_alias_identity(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("owner-observed bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        exact = self._contract(evidence=[self._evidence(
+            kind="route", locator="src/receipt.py", content_hash=digest,
+        )])
+        alias = self._contract(
+            name="Receipt Maker Alias",
+            aliases=["receipt bus"],
+            evidence=[self._evidence(
+                kind="test", locator="src/receipt.py", content_hash=digest,
+            )],
+        )
+
+        valid_exact, exact_rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry={"receipt-maker": exact}
+        )
+        valid_alias, alias_rejected = fp.find_contract_with_status(
+            "Receipt Bus", self.root, registry={"receipt-maker": alias}
+        )
+        self.assertIsNotNone(valid_exact)
+        self.assertFalse(exact_rejected)
+        self.assertIsNotNone(valid_alias)
+        self.assertFalse(alias_rejected)
+
+        source.write_text("bytes changed after owner observation\n", encoding="utf-8")
+        stale_exact, exact_rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry={"receipt-maker": exact}
+        )
+        stale_alias, alias_rejected = fp.find_contract_with_status(
+            "Receipt Bus", self.root, registry={"receipt-maker": alias}
+        )
+        self.assertIsNone(stale_exact)
+        self.assertTrue(exact_rejected)
+        self.assertIsNone(stale_alias)
+        self.assertTrue(alias_rejected)
 
     def test_invalid_registry_v2_cannot_gain_authored_mutation_authority(self):
         invalid = self._contract()
@@ -724,7 +910,95 @@ class PurposeContractV2Tests(_TempRepo):
         with open(os.path.join(os.path.dirname(fp.__file__),
                                ".flexfactor-purpose.json"), encoding="utf-8") as fh:
             checked_in = json.load(fh)
-        self.assertTrue(fp._v2_contract_is_authoritative(checked_in))
+        self.assertTrue(fp._v2_contract_is_authoritative(
+            checked_in, evidence_root=os.path.dirname(fp.__file__)
+        ))
+
+    def test_in_repo_contract_read_failure_is_an_authority_rejection(self):
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
+        with mock.patch.object(
+            fp.os, "open", side_effect=PermissionError("owner contract unreadable")
+        ):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_in_repo_contract_symlink_escape_is_an_authority_rejection(self):
+        outside = Path(self.root).parent / (Path(self.root).name + "-purpose.json")
+        outside.write_text(json.dumps(self._contract()), encoding="utf-8")
+        contract_path = Path(self.root) / ".flexfactor-purpose.json"
+        try:
+            contract_path.symlink_to(outside)
+        except OSError as exc:
+            outside.unlink(missing_ok=True)
+            self.skipTest(f"file symlinks unavailable: {exc}")
+        try:
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker",
+                self.root,
+                registry={
+                    "receipt-maker": {
+                        "name": "Receipt Maker",
+                        "purpose": "Lower authority must not replace an escape.",
+                    },
+                },
+            )
+            self.assertIsNone(contract)
+            self.assertTrue(rejected)
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_malformed_in_repo_contract_is_an_authority_rejection(self):
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Lower-priority registry purpose.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run a lower-priority workflow"],
+            },
+        }
+        for body in ("{not-json", "[]"):
+            with self.subTest(body=body):
+                _w(self.root, ".flexfactor-purpose.json", body)
+                _w(
+                    self.root,
+                    "PURPOSE.md",
+                    "# Receipt Maker\n\n## Purpose\nLower-priority Markdown.\n",
+                )
+                contract, rejected = fp.find_contract_with_status(
+                    "Receipt Maker", self.root, registry=registry
+                )
+                self.assertIsNone(contract)
+                self.assertTrue(rejected)
+
+    def test_registry_parse_and_read_failures_are_authority_rejections(self):
+        registry = Path(self.root) / "registry.json"
+        registry.write_text("{not-json", encoding="utf-8")
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        registry.write_text(json.dumps({"programs": []}), encoding="utf-8")
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        real_open = open
+
+        def denied(path, *args, **kwargs):
+            if os.fspath(path) == str(registry):
+                raise PermissionError("owner registry unreadable")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)), \
+             mock.patch("builtins.open", side_effect=denied):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
 
     def test_schema_requires_nonempty_evidence_references(self):
         with open(os.path.join(os.path.dirname(fp.__file__), "docs",

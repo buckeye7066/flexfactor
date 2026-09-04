@@ -6969,6 +6969,10 @@ def _ensure_program_understanding(provider, display_name: str, project_dir: str,
         return (None, "unresolved", False,
                 "inferred program understanding cited no repository evidence")
     confidence, authorized, reason = _purpose_confidence_for(project_dir, contract)
+    # Keep the serialized contract self-describing at every downstream review
+    # boundary. The explicit summary field remains too, so reviewers never
+    # need to infer authority from authored/inferred prose.
+    contract.confidence = confidence
     return contract, confidence, authorized, reason
 
 
@@ -8905,6 +8909,12 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             "manifest": manifest,
             "verification": verify_receipts,
             "candidate_commit": candidate_sha,
+            "purpose_contract": getattr(
+                opts, "purpose_contract_for_review", None
+            ),
+            "purpose_confidence": getattr(
+                opts, "purpose_confidence_for_review", ""
+            ),
         }
         try:
             independent = _independent_final_review(
@@ -10339,6 +10349,12 @@ def _apply_phase(args, profile_name: str, profile: dict,
     # family when independent capacity exists; failure to obtain that review
     # blocks publication rather than silently accepting self-review.
     args.final_reviewer = provider
+    args.purpose_contract_for_review = dict(
+        profile.get("purpose_contract") or {}
+    )
+    args.purpose_confidence_for_review = str(
+        profile.get("purpose_confidence") or ""
+    )
 
     print("\n" + "=" * 70)
     print(f"  Scout apply phase for {project_dir}")
@@ -16813,6 +16829,33 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
         return {"verdict": "reject", "commit": "", "findings": [],
                 "evidence_consistent": False,
                 "reason": "target is not a Git commit; exact-commit review unavailable"}
+    if not isinstance(evidence_summary, dict):
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "final-review evidence summary was not a mapping",
+        }
+    purpose_contract = evidence_summary.get("purpose_contract")
+    purpose_confidence = str(
+        evidence_summary.get("purpose_confidence")
+        or (purpose_contract.get("confidence")
+            if isinstance(purpose_contract, dict) else "")
+        or ""
+    ).strip()
+    if not isinstance(purpose_contract, dict) or not purpose_contract:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "complete authorizing purpose contract was not supplied",
+        }
+    if purpose_confidence not in {
+        "owner-authored", "strongly-inferred", "weakly-inferred", "unresolved",
+    }:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "purpose confidence was not supplied or was invalid",
+        }
     if baseline_sha and baseline_sha != final_sha:
         shown = _git(["diff", "--no-ext-diff", "--unified=20",
                       f"{baseline_sha}..{final_sha}"], project_dir)
@@ -16830,7 +16873,20 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
                                        max_chars=max_chunk_chars)
     ledger = _ff_ledger.ReviewLedger(baseline_sha=baseline_sha or "", candidate_sha=final_sha,
                                      chunks=chunks)
-    ev_json = json.dumps(evidence_summary, sort_keys=True)
+    try:
+        purpose_contract_json = json.dumps(
+            purpose_contract, sort_keys=True, ensure_ascii=True
+        ) if purpose_contract is not None else "(not supplied for this mode)"
+        remaining_evidence = dict(evidence_summary)
+        remaining_evidence.pop("purpose_contract", None)
+        remaining_evidence.pop("purpose_confidence", None)
+        ev_json = json.dumps(remaining_evidence, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": f"final-review evidence could not be serialized: {exc}",
+        }
     evidence_truncated = len(ev_json) > 80_000
     ev_text = ev_json[:80_000]
     reviewer_model = (getattr(reviewer, "judge_model", None)
@@ -16848,7 +16904,11 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
             f"EVIDENCE TRUNCATED: {evidence_truncated}\n\n"
         )
         prompt = (header
-                  + "RAW EXECUTION EVIDENCE:\n" + _fence_untrusted("evidence", ev_text)
+                  + f"PURPOSE CONFIDENCE (never truncated): {purpose_confidence}\n\n"
+                  + "COMPLETE PURPOSE CONTRACT (never truncated):\n"
+                  + _fence_untrusted("purpose-contract", purpose_contract_json)
+                  + "\n\nRAW EXECUTION EVIDENCE:\n"
+                  + _fence_untrusted("evidence", ev_text)
                   + "\n\nEXACT CANDIDATE PATCH CHUNK:\n" + _fence_untrusted("patch", ch.text)
                   + "\n\nReview ONLY this chunk. Approve only if this chunk's changes are "
                     "correct and the executable evidence supports every claim they rely on. "
@@ -21702,6 +21762,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         k: v for k, v in coverage_evidence.items()
                         if k.endswith("_total") or k == "tests"},
                     "secret_findings": secret_evidence,
+                    # The final certifier must see the same complete contract
+                    # that authorized mutation, including all evidence-bearing
+                    # v2 claims and invariants.  _independent_final_review sends
+                    # this separately and never subjects it to evidence truncation.
+                    "purpose_contract": result.get("purpose_contract"),
+                    "purpose_confidence": result.get("purpose_confidence"),
                 }
                 try:
                     if infrastructure_abort:

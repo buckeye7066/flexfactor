@@ -40,11 +40,14 @@ flexfactor_prodready.py, so the tests can load it in isolation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from pathlib import Path
 
 SCHEMA = "flexfactor.purpose_contracts.v1"
 
@@ -219,6 +222,10 @@ class PurposeContract:
     #: than only projecting users/workflows to strings) preserves the claim
     #: identity, confidence, and evidence relationship at the mutation gate.
     structured_claims: dict[str, list[dict]] = field(default_factory=dict)
+    #: Optional v2 observations/aspirations/gaps whose confidence is inferred,
+    #: contradicted, or unknown. They remain visible in serialized discovery
+    #: and final-review evidence but never enter the mutation prompt.
+    discovery_claims: dict[str, list[dict]] = field(default_factory=dict)
     #: Complete top-level evidence records from a validated v2 owner contract.
     #: This is deliberately separate from ``evidence_ledger``, whose records
     #: use the discovery/inference ``path_or_ref`` shape.
@@ -286,8 +293,7 @@ class PurposeContract:
             ("gaps", "KNOWN PURPOSE GAPS"),
         )
         if self.structured_claims:
-            for key, heading in (*contextual_sections[:2], *required_sections,
-                                 contextual_sections[2]):
+            for key, heading in (*required_sections, *contextual_sections):
                 claims = self.structured_claims.get(key) or []
                 if not claims:
                     continue
@@ -356,18 +362,33 @@ def registry_path(base_dir: str | None = None) -> str:
     return os.path.join(base, REGISTRY_REL)
 
 
-def load_registry(path: str | None = None) -> dict:
-    """Load the seeded contract registry. Returns {} when absent or unreadable -
-    purpose awareness degrades to inference, it never breaks a run."""
+def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:
+    """Return registry programs and whether its authority probe failed.
+
+    A genuinely absent optional registry permits repository inference.  A
+    present-but-unreadable, malformed, or wrong-shaped owner registry does not:
+    treating corruption as absence would let lower-authority model prose
+    replace an owner record and unlock mutation.
+    """
     p = path or registry_path()
     try:
         with open(p, encoding="utf-8") as fh:
             doc = json.load(fh)
-    except (OSError, ValueError):
-        return {}
+    except FileNotFoundError:
+        return {}, False
+    except Exception:
+        # Any ordinary backend/decoder/parser failure means authority could not
+        # be established.  BaseException subclasses (interrupts/exits) still
+        # propagate.
+        return {}, True
     if not isinstance(doc, dict) or not isinstance(doc.get("programs"), dict):
-        return {}
-    return doc["programs"]
+        return {}, True
+    return doc["programs"], False
+
+
+def load_registry(path: str | None = None) -> dict:
+    """Load seeded programs; status-aware mutation lookup uses the helper above."""
+    return _load_registry_with_status(path)[0]
 
 
 def _match_keys(program_name: str, project_dir: str | None) -> list[str]:
@@ -413,7 +434,14 @@ def find_contract_with_status(
             # record may silently replace that decision.
             return None, True
 
-    reg = load_registry() if registry is None else registry
+    if registry is None:
+        reg, registry_probe_failed = _load_registry_with_status()
+        if registry_probe_failed:
+            return None, True
+    else:
+        if not isinstance(registry, dict):
+            return None, True
+        reg = registry
     if not reg:
         return None, False
     keys = _match_keys(program_name, project_dir)
@@ -425,7 +453,9 @@ def find_contract_with_status(
             # invalid.  Fail unresolved at that boundary; falling through to
             # another entry that merely claims this slug as an alias can load
             # an unrelated program's purpose and authorize the wrong mutation.
-            contract = _contract_from_registry(reg[k])
+            contract = _contract_from_registry(
+                reg[k], evidence_root=project_dir
+            )
             return contract, contract is None
     # Alias. Identity selectors are authoritative even when the selected
     # record is malformed. Multiple records claiming the same alias are also
@@ -447,7 +477,9 @@ def find_contract_with_status(
     if alias_matches:
         if len(alias_matches) != 1:
             return None, True
-        contract = _contract_from_registry(alias_matches[0])
+        contract = _contract_from_registry(
+            alias_matches[0], evidence_root=project_dir
+        )
         return contract, contract is None
     # Same checkout on disk.
     if project_dir:
@@ -463,7 +495,9 @@ def find_contract_with_status(
         if path_matches:
             if len(path_matches) != 1:
                 return None, True
-            contract = _contract_from_registry(path_matches[0])
+            contract = _contract_from_registry(
+                path_matches[0], evidence_root=project_dir
+            )
             return contract, contract is None
     return None, False
 
@@ -500,6 +534,7 @@ _V2_CONFIDENCE = frozenset({
     "verified", "supported", "inferred", "contradicted", "unknown",
 })
 _V2_AUTHORITY_CONFIDENCE = frozenset({"verified", "supported"})
+_V2_LOCAL_EVIDENCE_KINDS = frozenset({"source", "test", "schema", "route"})
 _V2_CLAIM_SECTIONS = (
     "current_behavior", "aspirations", "users", "outcomes", "workflows",
     "invariants", "contradictions", "gaps",
@@ -568,8 +603,81 @@ def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
     )
 
 
+def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
+    """Bind local evidence records to actual contained repository bytes.
+
+    A syntactically valid 64-character string is not evidence.  Before a v2
+    contract can authorize mutation, each local source/test/schema/route record
+    must name a regular file inside the audited checkout and its SHA-256 must
+    match the bytes read from that file.  Missing roots, traversal, symlink
+    escapes, races, and read errors all deny authority.
+    """
+    records = [
+        record for record in (entry.get("evidence") or [])
+        if isinstance(record, dict)
+        and record.get("kind") in _V2_LOCAL_EVIDENCE_KINDS
+    ]
+    if not records:
+        return True
+    if not evidence_root:
+        return False
+    try:
+        root = Path(evidence_root).expanduser().resolve(strict=True)
+    except (OSError, ValueError):
+        return False
+    if not root.is_dir():
+        return False
+    for record in records:
+        locator = record.get("locator")
+        if not isinstance(locator, str) or not locator.strip():
+            return False
+        relative = Path(locator.strip())
+        if relative.is_absolute() or relative.drive:
+            return False
+        try:
+            candidate = (root / relative).resolve(strict=True)
+            candidate.relative_to(root)
+            flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+            flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(candidate, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    return False
+                digest = hashlib.sha256()
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            finally:
+                os.close(descriptor)
+            # Resolve again after reading so a concurrently replaced path cannot
+            # turn an outside file into apparently contained evidence.  Also
+            # compare the live directory entry to the descriptor that supplied
+            # the bytes: resolving to the same lexical path is insufficient if
+            # an attacker swaps and restores a parent symlink around open().
+            current = (root / relative).resolve(strict=True)
+            current_info = os.stat(candidate, follow_symlinks=False)
+            if current != candidate or (
+                current_info.st_dev,
+                current_info.st_ino,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                return False
+        except (OSError, ValueError):
+            return False
+        if digest.hexdigest() != record.get("content_hash"):
+            return False
+    return True
+
+
 def _v2_contract_is_valid(
-    entry, *, authoritative: bool, allow_registry_metadata: bool
+    entry, *, authoritative: bool, allow_registry_metadata: bool,
+    evidence_root: str | None = None,
 ) -> bool:
     """Validate a complete v2 contract, optionally for mutation authority.
 
@@ -652,6 +760,10 @@ def _v2_contract_is_valid(
         if not isinstance(claims, list) \
                 or (section in _V2_REQUIRED_CLAIM_SECTIONS and not claims):
             return False
+        # Required claims become mutation authority and must be affirmative.
+        # Uncertain optional claims remain structurally valid discovery input;
+        # _contract_from_registry retains them only in serialized discovery and
+        # final-review evidence, outside PurposeContract.prompt_block().
         claim_is_authoritative = (
             authoritative and section in _V2_REQUIRED_CLAIM_SECTIONS
         )
@@ -676,6 +788,9 @@ def _v2_contract_is_valid(
     # is independently well formed.
     if authoritative and entry.get("contradictions"):
         return False
+    if authoritative and not _v2_local_evidence_hashes_match(
+            entry, evidence_root):
+        return False
     return True
 
 
@@ -696,18 +811,21 @@ def _v2_contract_is_well_formed(
 
 
 def _v2_contract_is_authoritative(
-    entry, *, allow_registry_metadata: bool = True
+    entry, *, allow_registry_metadata: bool = True,
+    evidence_root: str | None = None,
 ) -> bool:
     """Whether a complete v2 contract may authorize repository mutation."""
     return _v2_contract_is_valid(
         entry,
         authoritative=True,
         allow_registry_metadata=allow_registry_metadata,
+        evidence_root=evidence_root,
     )
 
 
 def _contract_from_registry(
-    entry: dict, *, allow_registry_metadata: bool = True
+    entry: dict, *, allow_registry_metadata: bool = True,
+    evidence_root: str | None = None,
 ) -> PurposeContract | None:
     if not isinstance(entry, dict):
         return None
@@ -718,7 +836,10 @@ def _contract_from_registry(
     # inference) instead of turning partial JSON into mutation authority.
     if (("schema" in entry or looks_structured) and not is_v2) \
             or (is_v2 and not _v2_contract_is_authoritative(
-                entry, allow_registry_metadata=allow_registry_metadata)):
+                entry,
+                allow_registry_metadata=allow_registry_metadata,
+                evidence_root=evidence_root,
+            )):
         return None
 
     def _legacy_text_items(field: str) -> list[str]:
@@ -771,9 +892,24 @@ def _contract_from_registry(
         source=entry.get("source") or {"doc": REGISTRY_REL, "authored_by": "owner"},
         evidence_refs=list(entry.get("evidence_refs") or []),
         structured_claims={
-            section: [dict(claim) for claim in entry.get(section, [])]
+            section: [
+                dict(claim) for claim in entry.get(section, [])
+                if (section in _V2_REQUIRED_CLAIM_SECTIONS
+                    or claim.get("confidence") in _V2_AUTHORITY_CONFIDENCE)
+            ]
             for section in (*_V2_CLAIM_SECTIONS, "resolved_contradictions")
             if is_v2 and section in entry
+        },
+        discovery_claims={
+            section: [
+                dict(claim) for claim in entry.get(section, [])
+                if claim.get("confidence") not in _V2_AUTHORITY_CONFIDENCE
+            ]
+            for section in ("current_behavior", "aspirations", "gaps")
+            if is_v2 and any(
+                claim.get("confidence") not in _V2_AUTHORITY_CONFIDENCE
+                for claim in entry.get(section, [])
+            )
         },
         contract_evidence=(
             [dict(record) for record in entry["evidence"]] if is_v2 else []
@@ -802,23 +938,75 @@ def _contract_from_repo_lookup(
     project_dir: str, program_name: str = ""
 ) -> tuple[PurposeContract | None, bool]:
     """Return an in-repo contract and whether its authority gate rejected it."""
+    try:
+        root = Path(project_dir).expanduser().resolve(strict=True)
+    except (OSError, ValueError):
+        return None, True
+    if not root.is_dir():
+        return None, True
     for rel in IN_REPO_CONTRACT_FILES:
-        path = os.path.join(project_dir, rel)
-        if not os.path.isfile(path):
-            continue
+        unresolved = root / rel
         try:
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-        except OSError:
+            os.lstat(unresolved)
+        except FileNotFoundError:
             continue
+        except OSError:
+            return None, True
+        try:
+            path = unresolved.resolve(strict=True)
+        except Exception:
+            return None, True
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return None, True
+        try:
+            info = path.stat()
+        except Exception:
+            return None, True
+        if not stat.S_ISREG(info.st_mode):
+            return None, True
+        try:
+            flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+            flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    return None, True
+                with os.fdopen(
+                    descriptor, "r", encoding="utf-8", closefd=False
+                ) as fh:
+                    body = fh.read()
+            finally:
+                os.close(descriptor)
+            current = unresolved.resolve(strict=True)
+            current_info = os.stat(path, follow_symlinks=False)
+            if current != path or (
+                current_info.st_dev,
+                current_info.st_ino,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                return None, True
+        except Exception:
+            return None, True
         if rel.endswith(".json"):
             try:
                 data = json.loads(body)
             except ValueError:
-                continue
+                # A present authority file that cannot be parsed is not an
+                # absence.  Falling through would let Markdown, the registry,
+                # or model inference replace an owner source we failed to read.
+                return None, True
             if not isinstance(data, dict):
-                continue
-            c = _contract_from_registry(data, allow_registry_metadata=False)
+                return None, True
+            c = _contract_from_registry(
+                data,
+                allow_registry_metadata=False,
+                evidence_root=str(root),
+            )
             if c is None:
                 if data.get("schema") == _V2_SCHEMA \
                         and _v2_contract_is_well_formed(

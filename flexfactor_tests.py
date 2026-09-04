@@ -20501,7 +20501,13 @@ class PartialOutputWiringTests(unittest.TestCase):
                             "commit", "-q", "--allow-empty", "-m", "base"], cwd=d, check=True)
             sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
                                  capture_output=True, text=True).stdout.strip()
-            data = ff._independent_final_review(prov, d, None, sha, {"x": 1})
+            data = ff._independent_final_review(prov, d, None, sha, {
+                "x": 1,
+                "purpose_contract": {
+                    "name": "Fixture", "confidence": "owner-authored",
+                },
+                "purpose_confidence": "owner-authored",
+            })
         self.assertEqual(data["verdict"], "reject")
         # Chunked review: a partial reviewer answer BLOCKS that chunk, and a
         # blocked chunk makes the ledger refuse any verdict synthesis.
@@ -21038,7 +21044,13 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
     def test_every_chunk_is_reviewed_and_the_ledger_is_complete(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer(final)
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "approve", data["reason"])
         self.assertFalse(data["patch_truncated"])
         self.assertGreater(data["chunk_count"], 3)
@@ -21050,10 +21062,77 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         # no patch text was lost: every chunk carries a hash and a line range
         self.assertTrue(all(c["sha256"] and c["line_end"] >= c["line_start"] for c in led["chunks"]))
 
+    def test_complete_purpose_contract_reaches_every_review_chunk_untruncated(self):
+        d, _g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final)
+        sentinel = "FINAL-INVARIANT-MUST-REACH-EVERY-REVIEW-CHUNK"
+        contract = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "purpose": "Exercise the complete owner contract.",
+            "confidence": "owner-authored",
+            "padding": "p" * 30000,
+            "z_final_invariant": sentinel,
+        }
+        data = ff._independent_final_review(
+            rv,
+            d,
+            base,
+            final,
+            {
+                "large_evidence_that_will_be_truncated": "e" * 100000,
+                "purpose_contract": contract,
+                "purpose_confidence": "owner-authored",
+            },
+        )
+        self.assertEqual(data["verdict"], "approve", data["reason"])
+        self.assertGreater(len(rv.calls), 1)
+        for prompt in rv.calls:
+            self.assertIn(
+                "PURPOSE CONFIDENCE (never truncated): owner-authored", prompt
+            )
+            self.assertIn("COMPLETE PURPOSE CONTRACT (never truncated)", prompt)
+            self.assertIn(sentinel, prompt)
+
+    def test_audit_final_review_summary_includes_the_authorizing_contract(self):
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn(
+            '"purpose_contract": result.get("purpose_contract")', source
+        )
+        self.assertIn(
+            '"purpose_confidence": result.get("purpose_confidence")', source
+        )
+        scout_apply = inspect.getsource(ff._apply_integration_impl)
+        self.assertIn('opts, "purpose_contract_for_review", None', scout_apply)
+        self.assertIn('opts, "purpose_confidence_for_review", ""', scout_apply)
+        scout_wiring = inspect.getsource(ff._apply_phase)
+        self.assertIn("args.purpose_contract_for_review", scout_wiring)
+        self.assertIn("args.purpose_confidence_for_review", scout_wiring)
+
+    def test_final_review_fails_closed_without_contract_or_confidence(self):
+        d, _g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final)
+        missing_contract = ff._independent_final_review(
+            rv, d, base, final, {"purpose_confidence": "owner-authored"}
+        )
+        missing_confidence = ff._independent_final_review(
+            rv, d, base, final, {"purpose_contract": {"name": "Fixture"}}
+        )
+        self.assertEqual(missing_contract["verdict"], "reject")
+        self.assertIn("purpose contract", missing_contract["reason"])
+        self.assertEqual(missing_confidence["verdict"], "reject")
+        self.assertIn("purpose confidence", missing_confidence["reason"])
+        self.assertEqual(rv.calls, [])
+
     def test_one_rejected_chunk_rejects_the_whole_commit(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer(final, reject_chunk=2)
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "reject")
         self.assertIn("1 chunk(s) rejected", data["reason"])
         self.assertTrue(any(f.get("title") == "bad hunk" for f in data["findings"]))
@@ -21061,7 +21140,13 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
     def test_a_reviewer_naming_another_commit_cannot_approve(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer("0000000000000000000000000000000000000000")
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "reject")
         self.assertIn("expected " + final, data["reason"])
 
