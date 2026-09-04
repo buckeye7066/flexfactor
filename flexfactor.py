@@ -6928,21 +6928,28 @@ def _ensure_program_understanding(provider, display_name: str, project_dir: str,
         return [field for field in required
                 if not getattr(value, field, None)]
 
-    # SECURITY: If an in-repo v2 contract exists but failed an authority gate,
-    # do NOT infer a new purpose. Treat as unresolved so mutation cannot be
-    # authorized without the owner's required claims/invariants.
     if contract is None and project_dir:
         fp = _purpose_module()
-        if fp is not None and hasattr(fp, "_contract_from_repo_lookup"):
+        lookup = getattr(fp, "find_contract_with_status", None) if fp else None
+        if callable(lookup):
             try:
-                _c, authority_rejected = fp._contract_from_repo_lookup(project_dir, display_name)
-                if authority_rejected:
-                    return (None, "unresolved", False,
-                            "owner v2 contract present but not authoritative")
-            except Exception:
-                # If the probe fails, fall through to the existing path; a probe
-                # error must not authorize mutation.
-                pass
+                candidate, authority_rejected = lookup(
+                    display_name, project_dir
+                )
+            except Exception as exc:
+                # A failed authority probe is not permission to synthesize a
+                # replacement contract that might unlock mutation.
+                return (None, "unresolved", False,
+                        f"owner purpose authority could not be verified: {exc}")
+            if authority_rejected:
+                return (None, "unresolved", False,
+                        "owner purpose contract was rejected at its "
+                        "authoritative identity boundary")
+            if candidate is not None:
+                # The owner registry may have appeared between the original
+                # best-effort load and this fail-closed status lookup. Prefer
+                # that authored record over synthesizing a competing purpose.
+                contract = candidate
 
     missing = _missing(contract) if contract is not None else list(required)
     if contract is None or missing:

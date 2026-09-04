@@ -184,8 +184,17 @@ def _alias_forms(program: str, project_dir: str) -> set[str]:
     return {form for form in forms if form}
 
 
+def _strip_list_marker(segment: str) -> str:
+    """Remove a real leading list marker while preserving item content."""
+    value = segment.strip()
+    # A marker is structural only when whitespace separates it from its text.
+    # Without that boundary, decimal/model numbers and negative values are
+    # legitimate content (for example, "3.5 ton" or "-20 degree").
+    return re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", value)
+
+
 def _mentions(segment: str, aliases: list[set[str]]) -> list[int]:
-    addressed = re.sub(r"^(?:[-*+]|\d+[.)])\s*", "", segment.strip())
+    addressed = _strip_list_marker(segment)
     colon = addressed.find(":")
     header = addressed[:colon] if 0 < colon <= 120 else ""
     if header:

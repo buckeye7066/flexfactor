@@ -183,6 +183,9 @@ class PurposeContract:
     name: str
     slug: str = ""
     purpose: str = ""
+    #: Owner-authored description of a superseded purpose.  This must remain
+    #: visible so repository history is not mistaken for a current requirement.
+    historical_purpose: str = ""
     #: Who receives the program's outcome.  Inferred contracts must populate
     #: this explicitly; otherwise a model can reduce "understand the app" to a
     #: one-line README paraphrase without identifying whose job is being done.
@@ -260,6 +263,12 @@ class PurposeContract:
             "PURPOSE (what this program was created to do):",
             self.purpose or "(not stated)",
         ]
+        if self.historical_purpose:
+            lines += [
+                "",
+                "HISTORICAL PURPOSE (OBSOLETE; NOT CURRENT):",
+                self.historical_purpose,
+            ]
         # Required v2 claims must appear before lower-authority/contextual
         # material so a prompt-size cap cannot silently discard the outcome or
         # a safety invariant while still labelling the contract owner-authored.
@@ -377,31 +386,36 @@ def _match_keys(program_name: str, project_dir: str | None) -> list[str]:
     return keys
 
 
-def find_contract(program_name: str, project_dir: str | None = None,
-                  registry: dict | None = None) -> PurposeContract | None:
-    """Look up an AUTHORED contract for this program.
+def find_contract_with_status(
+    program_name: str,
+    project_dir: str | None = None,
+    registry: dict | None = None,
+) -> tuple[PurposeContract | None, bool]:
+    """Look up an authored contract and report authoritative rejection.
 
     Resolution order, most authoritative first:
       1. a contract file inside the audited repo (the program speaks for itself)
       2. the owner's seeded registry, by slug, then by alias, then by local_path
-    Returns None when nothing authored is found; the caller then infers.
+    The boolean is true when an identity selector found an owner record but its
+    contract was invalid, ambiguous, or failed a v2 mutation-authority gate.
+    Callers must not replace that explicit rejection with model inference.
     """
     if project_dir:
         in_repo, authority_rejected = _contract_from_repo_lookup(
             project_dir, program_name
         )
         if in_repo is not None:
-            return in_repo
+            return in_repo, False
         if authority_rejected:
             # A complete in-repo v2 contract is the highest-authority owner
             # statement.  If it is structurally valid but cannot pass a
             # mutation-authority gate, no lower-priority Markdown or registry
             # record may silently replace that decision.
-            return None
+            return None, True
 
     reg = load_registry() if registry is None else registry
     if not reg:
-        return None
+        return None, False
     keys = _match_keys(program_name, project_dir)
 
     # Exact slug.
@@ -411,7 +425,8 @@ def find_contract(program_name: str, project_dir: str | None = None,
             # invalid.  Fail unresolved at that boundary; falling through to
             # another entry that merely claims this slug as an alias can load
             # an unrelated program's purpose and authorize the wrong mutation.
-            return _contract_from_registry(reg[k])
+            contract = _contract_from_registry(reg[k])
+            return contract, contract is None
     # Alias. Identity selectors are authoritative even when the selected
     # record is malformed. Multiple records claiming the same alias are also
     # ambiguous. In either case fail unresolved instead of continuing until an
@@ -431,8 +446,9 @@ def find_contract(program_name: str, project_dir: str | None = None,
             alias_matches.append(entry)
     if alias_matches:
         if len(alias_matches) != 1:
-            return None
-        return _contract_from_registry(alias_matches[0])
+            return None, True
+        contract = _contract_from_registry(alias_matches[0])
+        return contract, contract is None
     # Same checkout on disk.
     if project_dir:
         want = os.path.normcase(os.path.abspath(project_dir))
@@ -446,9 +462,16 @@ def find_contract(program_name: str, project_dir: str | None = None,
                 path_matches.append(entry)
         if path_matches:
             if len(path_matches) != 1:
-                return None
-            return _contract_from_registry(path_matches[0])
-    return None
+                return None, True
+            contract = _contract_from_registry(path_matches[0])
+            return contract, contract is None
+    return None, False
+
+
+def find_contract(program_name: str, project_dir: str | None = None,
+                  registry: dict | None = None) -> PurposeContract | None:
+    """Return the owner's authored contract, or ``None`` when unavailable."""
+    return find_contract_with_status(program_name, project_dir, registry)[0]
 
 
 _V2_SCHEMA = "flexfactor.purpose_contract.v2"
@@ -577,7 +600,6 @@ def _v2_contract_is_valid(
     for metadata_text in ("repo", "default_branch", "local_path", "locator"):
         if metadata_text in entry and not _nonblank_string(entry[metadata_text]):
             return False
-    # `slug` is optional, but when present it must be non-blank (not whitespace).
     if "slug" in entry and not _nonblank_string(entry["slug"]):
         return False
     if "source" in entry:
@@ -734,6 +756,7 @@ def _contract_from_registry(
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
         slug=entry.get("slug") or "",
         purpose=entry.get("purpose") or "",
+        historical_purpose=entry.get("historical_purpose") or "",
         primary_users=_text_items("primary_users", "users"),
         core_journeys=_text_items("core_journeys", "workflows"),
         acceptance_criteria=list(entry.get("acceptance_criteria") or []),
@@ -759,8 +782,12 @@ def _contract_from_registry(
     if is_v2:
         try:
             contract.prompt_block(max_chars=REQUIRED_V2_PROMPT_MAX_CHARS)
+            # _independent_final_review serializes its evidence with the JSON
+            # default (ensure_ascii=True).  Measure that exact representation:
+            # non-ASCII contract text can otherwise expand six- or twelve-fold
+            # downstream and silently push later evidence out of its envelope.
             serialized = json.dumps(
-                contract.to_dict(), sort_keys=True, ensure_ascii=False
+                contract.to_dict(), sort_keys=True, ensure_ascii=True
             )
         except ValueError:
             # A structurally valid contract that cannot expose every required

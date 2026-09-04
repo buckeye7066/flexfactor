@@ -15295,6 +15295,45 @@ class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
                          ["README.md:4", "tests/invoice.test.ts:8"])
         self.assertIn("README.md:4", provider.prompts[0][1])
 
+    def test_rejected_owner_contract_cannot_be_replaced_by_inference(self):
+        provider = self.Provider(["README.md:4"])
+        with _patched(
+            ff, "load_purpose_contract", lambda *_args, **_kwargs: None
+        ), _patched(
+            fp, "find_contract_with_status",
+            lambda *_args, **_kwargs: (None, True),
+        ):
+            contract, confidence, allowed, reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp
+                )
+
+        self.assertIsNone(contract)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("authoritative identity boundary", reason)
+        self.assertEqual(provider.prompts, [])
+
+    def test_failed_owner_authority_probe_cannot_authorize_inference(self):
+        provider = self.Provider(["README.md:4"])
+
+        def failed_probe(*_args, **_kwargs):
+            raise OSError("registry unreadable")
+
+        with _patched(
+            ff, "load_purpose_contract", lambda *_args, **_kwargs: None
+        ), _patched(fp, "find_contract_with_status", failed_probe):
+            contract, confidence, allowed, reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp
+                )
+
+        self.assertIsNone(contract)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("could not be verified", reason)
+        self.assertEqual(provider.prompts, [])
+
     def test_real_rotator_descends_after_bad_shape_before_outer_retry(self):
         import flexfactor_rotation as fr
 

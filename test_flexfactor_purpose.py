@@ -329,8 +329,13 @@ class PurposeContractV2Tests(_TempRepo):
                 contract = fp.find_contract(
                     "Receipt Maker", self.root, registry=registry
                 )
+                status_contract, rejected = fp.find_contract_with_status(
+                    "Receipt Maker", self.root, registry=registry
+                )
 
                 self.assertIsNone(contract)
+                self.assertIsNone(status_contract)
+                self.assertTrue(rejected)
                 confidence = fp.purpose_confidence(contract, {})
                 self.assertEqual(confidence, "unresolved")
                 self.assertFalse(
@@ -395,6 +400,33 @@ class PurposeContractV2Tests(_TempRepo):
                     section: [self._claim("huge", "x" * 100000)],
                 })
                 self.assertIsNone(fp._contract_from_registry(oversized))
+
+    def test_non_ascii_expansion_uses_downstream_review_encoding_budget(self):
+        # This fits the mutation prompt as Unicode characters, but the final
+        # review's default JSON representation expands every emoji into a
+        # surrogate pair.  It must be rejected before it can displace later
+        # evidence from that review envelope.
+        contract_doc = self._contract(
+            aspirations=[self._claim("a-emoji", "😀" * 8500)],
+        )
+
+        self.assertIsNone(fp._contract_from_registry(contract_doc))
+
+    def test_historical_purpose_is_retained_and_marked_obsolete(self):
+        historical = (
+            "Previously produced printable estimates; that behavior is obsolete."
+        )
+        contract = fp._contract_from_registry(self._contract(
+            historical_purpose=historical,
+        ))
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.historical_purpose, historical)
+        self.assertEqual(contract.to_dict()["historical_purpose"], historical)
+        prompt = contract.prompt_block()
+        self.assertIn("HISTORICAL PURPOSE", prompt)
+        self.assertIn("OBSOLETE; NOT CURRENT", prompt)
+        self.assertIn(historical, prompt)
 
     def test_v2_registry_envelope_metadata_is_preserved_after_validation(self):
         source = {
@@ -565,6 +597,25 @@ class PurposeContractV2Tests(_TempRepo):
         confidence = fp.purpose_confidence(contract, {})
         self.assertEqual(confidence, "unresolved")
         self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_blank_optional_slug_is_rejected_without_registry_source_metadata(self):
+        invalid = self._contract(slug="   ")
+
+        self.assertIsNone(fp._contract_from_registry(invalid))
+
+    def test_authority_status_distinguishes_rejection_from_no_contract(self):
+        invalid = self._contract(evidence=[])
+        contract, rejected = fp.find_contract_with_status(
+            "Receipt Maker", registry={"receipt-maker": invalid}
+        )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        missing, missing_rejected = fp.find_contract_with_status(
+            "Unknown Product", registry={"receipt-maker": invalid}
+        )
+        self.assertIsNone(missing)
+        self.assertFalse(missing_rejected)
 
     def test_invalid_exact_registry_record_blocks_unrelated_alias_fallback(self):
         invalid_exact = self._contract(name="Receipt Maker")
