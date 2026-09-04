@@ -1,0 +1,135 @@
+name: tenets-context
+
+on:
+  push:
+    branches: [main, "fix/tenets-context-integration"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}"
+  cancel-in-progress: true
+
+jobs:
+  adapter-tests:
+    name: adapter-tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Compile and run hermetic adapter tests
+        shell: bash
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: |
+          python -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          python flexfactor_tenets_tests.py
+      - name: Verify the packaged command without optional dependencies
+        shell: bash
+        run: |
+          python -m pip install .
+          python -m pip check
+          flexfactor-context --help > /dev/null
+
+  live-tenets:
+    name: live-tenets (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install FlexFactor with the pinned Tenets integration
+        shell: bash
+        run: |
+          python -m pip install ".[context]"
+          python -m pip check
+          python - <<'PY'
+          from importlib.metadata import version
+          assert version("tenets") == "0.13.3", version("tenets")
+          PY
+      - name: Prove trusted executable resolution and real ranking
+        shell: bash
+        env:
+          CONTEXT_OUTPUT: ${{ runner.temp }}/tenets-context.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          import flexfactor_tenets as ft
+
+          root = Path(".").resolve()
+          interpreter_dir = Path(sys.executable).resolve().parent
+          filtered = []
+          for entry in os.environ.get("PATH", "").split(os.pathsep):
+              if not entry:
+                  continue
+              try:
+                  if Path(entry).resolve() == interpreter_dir:
+                      continue
+              except OSError:
+                  pass
+              filtered.append(entry)
+          os.environ["PATH"] = os.pathsep.join(filtered)
+
+          executable = ft._find_tenets_executable()
+          assert executable, "Tenets was not resolved from the active Python installation"
+          trusted_dirs = {
+              interpreter_dir,
+              Path(sys.prefix).resolve() / ("Scripts" if os.name == "nt" else "bin"),
+          }
+          assert Path(executable).resolve().parent in trusted_dirs, (
+              executable,
+              sorted(str(path) for path in trusted_dirs),
+          )
+
+          result = ft.generate_tenets_context(
+              root,
+              "identify production-readiness defects, broken user journeys, "
+              "security risks, release blockers, and missing tests",
+              top=20,
+              timeout_seconds=180,
+              output=os.environ["CONTEXT_OUTPUT"],
+          )
+          assert result.status == "ok", result.to_dict()
+
+          payload = json.loads(
+              Path(os.environ["CONTEXT_OUTPUT"]).read_text(encoding="utf-8")
+          )
+          assert payload["status"] == "ok", payload
+          assert payload["expected_version"] == "0.13.3", payload
+          assert payload["adapter_version"] == 2, payload
+          assert payload["files"], payload
+          assert len(payload["files"]) <= 20, payload
+          for item in payload["files"]:
+              resolved = (root / item["path"]).resolve(strict=False)
+              resolved.relative_to(root)
+          print(
+              "validated",
+              len(payload["files"]),
+              "contained ranked files using",
+              executable,
+          )
+          PY
