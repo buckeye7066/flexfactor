@@ -44,6 +44,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 
 SCHEMA = "flexfactor.purpose_contracts.v1"
 
@@ -325,24 +326,219 @@ def find_contract(program_name: str, project_dir: str | None = None,
     # Exact slug.
     for k in keys:
         if k in reg:
-            return _contract_from_registry(reg[k])
+            contract = _contract_from_registry(reg[k])
+            if contract is not None:
+                return contract
     # Alias.
     for entry in reg.values():
+        if not isinstance(entry, dict):
+            continue
         alias_slugs = {slugify(a) for a in (entry.get("aliases") or [])}
         alias_slugs |= {s.replace("-", "") for s in list(alias_slugs)}
         if alias_slugs & set(keys):
-            return _contract_from_registry(entry)
+            contract = _contract_from_registry(entry)
+            if contract is not None:
+                return contract
     # Same checkout on disk.
     if project_dir:
         want = os.path.normcase(os.path.abspath(project_dir))
         for entry in reg.values():
+            if not isinstance(entry, dict):
+                continue
             lp = entry.get("local_path")
             if lp and os.path.normcase(os.path.abspath(lp)) == want:
-                return _contract_from_registry(entry)
+                contract = _contract_from_registry(entry)
+                if contract is not None:
+                    return contract
     return None
 
 
-def _contract_from_registry(entry: dict) -> PurposeContract:
+_V2_SCHEMA = "flexfactor.purpose_contract.v2"
+_V2_TOP_LEVEL_KEYS = frozenset({
+    "schema", "name", "historical_purpose", "purpose", "current_behavior",
+    "aspirations", "users", "outcomes", "workflows", "invariants",
+    "acceptance_criteria", "contradictions", "resolved_contradictions",
+    "gaps", "evidence", "false_substitutes", "slug", "aliases",
+})
+_V2_REQUIRED_KEYS = frozenset({
+    "schema", "name", "purpose", "users", "outcomes", "workflows",
+    "invariants", "acceptance_criteria", "evidence",
+})
+_V2_CLAIM_KEYS = frozenset({"id", "text", "confidence", "evidence_refs"})
+_V2_RESOLVED_CLAIM_KEYS = frozenset({
+    "id", "text", "resolution", "confidence", "evidence_refs",
+})
+_V2_EVIDENCE_KEYS = frozenset({
+    "kind", "locator", "content_hash", "observed_at", "excerpt",
+})
+_V2_EVIDENCE_KINDS = frozenset({
+    "source", "documentation", "history", "issue", "pull_request", "test",
+    "route", "schema", "runtime",
+})
+_V2_CONFIDENCE = frozenset({
+    "verified", "supported", "inferred", "contradicted", "unknown",
+})
+_V2_AUTHORITY_CONFIDENCE = frozenset({"verified", "supported"})
+_V2_CLAIM_SECTIONS = (
+    "current_behavior", "aspirations", "users", "outcomes", "workflows",
+    "invariants", "contradictions", "gaps",
+)
+_V2_REQUIRED_CLAIM_SECTIONS = frozenset({
+    "users", "outcomes", "workflows", "invariants",
+})
+_V2_STRUCTURED_MARKERS = frozenset({
+    "current_behavior", "aspirations", "users", "outcomes", "workflows",
+    "invariants", "contradictions", "resolved_contradictions", "gaps",
+    "evidence",
+})
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
+def _nonblank_string(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _rfc3339_datetime(value) -> bool:
+    """Validate the timezone-bearing subset required by JSON Schema date-time."""
+    if not isinstance(value, str) or not _RFC3339.fullmatch(value):
+        return False
+    normalized = value[:-1] + "+00:00" if value[-1:].lower() == "z" else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
+                       authoritative: bool = False) -> bool:
+    if not isinstance(item, dict):
+        return False
+    allowed = _V2_RESOLVED_CLAIM_KEYS if resolved else _V2_CLAIM_KEYS
+    if set(item) != allowed:
+        return False
+    if not _nonblank_string(item.get("id")) \
+            or not _nonblank_string(item.get("text")):
+        return False
+    if resolved and not _nonblank_string(item.get("resolution")):
+        return False
+    confidence = item.get("confidence")
+    if confidence not in _V2_CONFIDENCE:
+        return False
+    # Required purpose claims become mutation authority.  A structurally valid
+    # but disputed/inferred claim may remain useful discovery input, but it may
+    # not make the complete contract owner-authoritative.
+    if authoritative and confidence not in _V2_AUTHORITY_CONFIDENCE:
+        return False
+    refs = item.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return False
+    return all(
+        not isinstance(ref, bool)
+        and isinstance(ref, int)
+        and 0 <= ref < evidence_count
+        for ref in refs
+    )
+
+
+def _v2_contract_is_authoritative(entry) -> bool:
+    """Validate the complete v2 contract before it can authorize mutation.
+
+    This intentionally implements the checked-in JSON Schema in stdlib code so
+    loading contracts does not add a runtime dependency.  It also performs the
+    cross-record constraint JSON Schema cannot express here: every claim must
+    cite at least one existing top-level evidence record.  Required purpose
+    claims must be affirmative (verified/supported), not inferred or disputed.
+    """
+    if not isinstance(entry, dict):
+        return False
+    keys = set(entry)
+    if not _V2_REQUIRED_KEYS.issubset(keys) \
+            or not keys.issubset(_V2_TOP_LEVEL_KEYS):
+        return False
+    if entry.get("schema") != _V2_SCHEMA:
+        return False
+    if not _nonblank_string(entry.get("name")) \
+            or not _nonblank_string(entry.get("purpose")):
+        return False
+    for optional_text in ("historical_purpose", "slug"):
+        if optional_text in entry and not isinstance(entry[optional_text], str):
+            return False
+        if optional_text == "slug" and optional_text in entry \
+                and not _nonblank_string(entry[optional_text]):
+            return False
+    for string_list in ("acceptance_criteria", "false_substitutes", "aliases"):
+        if string_list not in entry:
+            if string_list == "acceptance_criteria":
+                return False
+            continue
+        values = entry[string_list]
+        if not isinstance(values, list) \
+                or (string_list == "acceptance_criteria" and not values) \
+                or any(not _nonblank_string(value) for value in values):
+            return False
+
+    evidence = entry.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    for record in evidence:
+        if not isinstance(record, dict):
+            return False
+        record_keys = set(record)
+        if not {"kind", "locator", "content_hash", "observed_at"}.issubset(
+                record_keys) or not record_keys.issubset(_V2_EVIDENCE_KEYS):
+            return False
+        if record.get("kind") not in _V2_EVIDENCE_KINDS \
+                or not _nonblank_string(record.get("locator")):
+            return False
+        content_hash = record.get("content_hash")
+        if not isinstance(content_hash, str) \
+                or re.fullmatch(r"[a-f0-9]{64}", content_hash) is None:
+            return False
+        if not _rfc3339_datetime(record.get("observed_at")):
+            return False
+        if "excerpt" in record and not isinstance(record["excerpt"], str):
+            return False
+
+    evidence_count = len(evidence)
+    for section in _V2_CLAIM_SECTIONS:
+        if section not in entry:
+            if section in _V2_REQUIRED_CLAIM_SECTIONS:
+                return False
+            continue
+        claims = entry[section]
+        if not isinstance(claims, list) \
+                or (section in _V2_REQUIRED_CLAIM_SECTIONS and not claims):
+            return False
+        authoritative = section in _V2_REQUIRED_CLAIM_SECTIONS
+        if any(not _v2_claim_is_valid(
+                claim, evidence_count, authoritative=authoritative)
+                for claim in claims):
+            return False
+    if "resolved_contradictions" in entry:
+        resolved = entry["resolved_contradictions"]
+        if not isinstance(resolved, list) or any(
+                not _v2_claim_is_valid(claim, evidence_count, resolved=True)
+                for claim in resolved):
+            return False
+    return True
+
+
+def _contract_from_registry(entry: dict) -> PurposeContract | None:
+    if not isinstance(entry, dict):
+        return None
+    is_v2 = entry.get("schema") == _V2_SCHEMA
+    looks_structured = bool(set(entry) & _V2_STRUCTURED_MARKERS)
+    # A versioned contract is all-or-nothing. Returning None lets an invalid
+    # in-repo file fall through to a valid owner registry contract (or honest
+    # inference) instead of turning partial JSON into mutation authority.
+    if (("schema" in entry or looks_structured) and not is_v2) \
+            or (is_v2 and not _v2_contract_is_authoritative(entry)):
+        return None
+
     def _legacy_text_items(field: str) -> list[str]:
         """Return a complete legacy string list, never a partial section."""
         raw = entry.get(field)
@@ -368,35 +564,11 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
         understanding gate can then enrich the missing section without hiding
         the uncertainty.
         """
-        if entry.get(primary) is not None:
+        if not is_v2:
             return _legacy_text_items(primary)
 
         raw = entry.get(structured)
-        if not isinstance(raw, list):
-            return []
-        values: list[str] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                return []
-            claim_id = item.get("id")
-            value = item.get("text")
-            confidence = item.get("confidence")
-            evidence_refs = item.get("evidence_refs")
-            if not isinstance(claim_id, str) or not claim_id.strip():
-                return []
-            if not isinstance(value, str) or not value.strip():
-                return []
-            # Only evidence-backed affirmative claims may satisfy a field that
-            # the runtime treats as authored.  Inferred, contradicted, and
-            # unknown claims remain inputs to later purpose discovery.
-            if confidence not in {"verified", "supported"}:
-                return []
-            if not isinstance(evidence_refs, list) or any(
-                    isinstance(ref, bool) or not isinstance(ref, int) or ref < 0
-                    for ref in evidence_refs):
-                return []
-            values.append(value.strip())
-        return values
+        return [item["text"].strip() for item in raw]
 
     return PurposeContract(
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
@@ -437,6 +609,8 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
             if not isinstance(data, dict):
                 continue
             c = _contract_from_registry(data)
+            if c is None:
+                continue
             # A CONTRACT WITH NO PURPOSE IS NOT AN AUTHORED CONTRACT. The
             # markdown branch below has always required a non-empty purpose;
             # this one accepted any JSON object. So a stub, a half-written
