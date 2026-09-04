@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import sysconfig
+import stat as _stat
 import tempfile
 import threading
 import time
@@ -537,10 +538,14 @@ def _apply_linux_ranker_resource_limits() -> None:
     try:
         import resource
 
+        # IMPORTANT: Do not set RLIMIT_NPROC here. On Linux this limit is
+        # enforced per real user ID across the whole host, not per supervised
+        # subprocess tree. Lowering it inside the short‑lived supervisor can
+        # make Popen fail with EAGAIN on developer machines that already have
+        # many processes/threads, degrading ranking without improving safety.
         policies = (
             (resource.RLIMIT_AS, MAX_RANKER_MEMORY_BYTES),
-            (resource.RLIMIT_NPROC, MAX_RANKER_PROCESSES),
-            # Tenets currently writes JSON to stdout.  Keep a file-size limit
+            # Tenets currently writes JSON to stdout. Keep a file-size limit
             # as defense in depth for libraries or descendants that open files
             # in the disposable isolation directory.
             (resource.RLIMIT_FSIZE, MAX_STDOUT_BYTES),
@@ -844,13 +849,21 @@ def _terminate_process_tree(
             process.send_signal(signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 5
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         if process.poll() is None:
             try:
                 process.kill()
             except OSError:
+                pass
+        # If the supervisor was force‑killed or exited before completing its
+        # pidfd‑based cleanup, there may still be retained process‑group
+        # members. Best‑effort: kill the group if it remains.
+        if _posix_process_group_alive(process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
                 pass
     else:
         # The group can outlive its leader.  Address the retained PGID even
@@ -1026,11 +1039,8 @@ def _run_bounded_process(
         # signalled. Windows Job Objects, by contrast, remain the authoritative
         # descendant handle after their leader exits and must always be closed.
         if not tree_closed:
-            if sys.platform.startswith("linux") and process.poll() is not None:
-                tree_closed = True
-            else:
-                _terminate_process_tree(process, windows_job=windows_job)
-                tree_closed = True
+            _terminate_process_tree(process, windows_job=windows_job)
+            tree_closed = True
         reader_deadline = time.monotonic() + 3
         for reader in started_readers:
             reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
@@ -1335,19 +1345,26 @@ def _repository_state_fingerprint(project_root: Path) -> str:
             path = Path(entry.path)
             relative = path.relative_to(project_root).as_posix()
             try:
-                stat = entry.stat(follow_symlinks=False)
+                st = entry.stat(follow_symlinks=False)
                 digest.update(
                     (
-                        f"{relative}\0{stat.st_mode}\0{stat.st_size}\0"
-                        f"{stat.st_mtime_ns}\0{stat.st_ctime_ns}\n"
+                        f"{relative}\0{st.st_mode}\0{st.st_size}\0"
+                        f"{st.st_mtime_ns}\0{st.st_ctime_ns}\n"
                     ).encode("utf-8", errors="surrogateescape")
                 )
                 if entry.is_symlink():
                     digest.update(
                         os.readlink(path).encode("utf-8", errors="surrogateescape")
                     )
-                elif entry.is_dir(follow_symlinks=False) \
-                        and entry.name not in _CACHE_SKIP_DIRECTORIES:
+                elif entry.is_dir(follow_symlinks=False) and entry.name not in _CACHE_SKIP_DIRECTORIES:
+                    # On Windows, directory junctions (reparse-point directories)
+                    # are not reported as symlinks; treat them as non-traversable
+                    # to prevent the walk from leaving the repository root.
+                    if os.name == "nt":
+                        attrs = getattr(st, "st_file_attributes", 0)
+                        reparse = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+                        if attrs & reparse:
+                            continue
                     pending.append(path)
             except OSError as exc:
                 digest.update(
