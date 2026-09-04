@@ -715,8 +715,10 @@ class RotatingProviderTests(RotationTestCase):
         selected_route = route("a/only", "pool-a")
         rot = self.rotator(catalog(selected_route))
 
-        malformed_until = rot.report(
+        malformed_cooldown = rot.report(
             selected_route, "malformed_output", now=1000.0)
+        self.assertIsNotNone(malformed_cooldown)
+        malformed_until, _marker = malformed_cooldown
         self.assertEqual(malformed_until, 1000.0 + R.ROUTE_ERROR_COOLDOWN)
 
         # Another worker can report a more serious route failure after this
@@ -725,7 +727,7 @@ class RotatingProviderTests(RotationTestCase):
                    retry_after_seconds=999.0, now=1001.0)
         serious_until = self.store.read()["cooldowns"]["route:a/only"]
 
-        rot.release_route_cooldown(selected_route, malformed_until)
+        rot.release_route_cooldown(selected_route, malformed_cooldown)
         self.assertEqual(
             self.store.read()["cooldowns"]["route:a/only"], serious_until)
 

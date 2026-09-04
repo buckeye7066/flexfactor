@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import secrets
 import re
 import sys
 import tempfile
@@ -1148,7 +1149,7 @@ class Rotator:
                retry_after_seconds: Optional[float] = None,
                now: Optional[float] = None,
                scope: str = "pool",
-               reset_at: Optional[float] = None) -> Optional[float]:
+               reset_at: Optional[float] = None) -> Optional[Tuple[float, str]]:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
@@ -1167,17 +1168,29 @@ class Rotator:
             if not has_strikes and not has_cooldown:
                 return
 
+        route_key = f"route:{route.id}"
+        marker_box: List[Optional[str]] = [None]
+
         def mutate(data: Dict[str, Any]) -> None:
             pools = data.setdefault("pools", {})
             cooldowns = data.setdefault("cooldowns", {})
             strikes = data.setdefault("strikes", {})
+            markers = data.get("malformed_cooldown_markers")
+            if not isinstance(markers, dict):
+                markers = None
             entry = pools.setdefault(route.pool, {"calls": 0, "last_used_at": 0.0})
 
             if outcome == "ok":
                 entry["last_used_at"] = now
                 strikes.pop(route.id, None)
-                cooldowns.pop(f"route:{route.id}", None)
+                cooldowns.pop(route_key, None)
+                if markers is not None:
+                    markers.pop(route_key, None)
                 return
+
+            if outcome != "malformed_output" and markers is not None:
+                # A later route result replaces this call's temporary marker.
+                markers.pop(route_key, None)
 
             if outcome in ("rate_limited", "quota_exhausted"):
                 if outcome == "rate_limited":
@@ -1224,8 +1237,15 @@ class Rotator:
             if outcome == "malformed_output":
                 # Keep this route out of the remainder of the current ladder,
                 # without turning a model-formatting miss into evidence that
-                # its pool or transport is unhealthy.
-                cooldowns[f"route:{route.id}"] = now + ROUTE_ERROR_COOLDOWN
+                # its pool or transport is unhealthy. The marker gives this
+                # specific attempt a durable identity for guarded cleanup.
+                cooldowns[route_key] = now + ROUTE_ERROR_COOLDOWN
+                marker = secrets.token_hex(16)
+                if markers is None:
+                    markers = {}
+                    data["malformed_cooldown_markers"] = markers
+                markers[route_key] = marker
+                marker_box[0] = marker
                 return
 
             # Plain error: blame the route first. Only after it keeps failing do
@@ -1240,18 +1260,26 @@ class Rotator:
 
         written = self.store.update(mutate)
         if outcome == "malformed_output":
-            until = written.get("cooldowns", {}).get(f"route:{route.id}")
-            return float(until) if isinstance(until, (int, float)) else None
+            until = written.get("cooldowns", {}).get(route_key)
+            marker = marker_box[0]
+            if isinstance(until, (int, float)) and marker is not None:
+                return float(until), marker
         return None
 
-    def release_route_cooldown(self, route: Route, expected_until: float) -> None:
+    def release_route_cooldown(self, route: Route,
+                               expected: Tuple[float, str]) -> None:
         """Release only the exact temporary cooldown installed by this attempt."""
+        expected_until, expected_marker = expected
         key = f"route:{route.id}"
 
         def mutate(data: Dict[str, Any]) -> None:
             cooldowns = data.setdefault("cooldowns", {})
-            if cooldowns.get(key) == expected_until:
+            markers = data.get("malformed_cooldown_markers")
+            if (isinstance(markers, dict)
+                    and cooldowns.get(key) == expected_until
+                    and markers.get(key) == expected_marker):
                 cooldowns.pop(key, None)
+                markers.pop(key, None)
 
         self.store.update(mutate)
 
@@ -1494,7 +1522,8 @@ class RotatingProvider:
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
-        shape_failed_routes: List[Tuple[Route, Optional[float]]] = []
+        shape_failed_routes: List[
+            Tuple[Route, Optional[Tuple[float, str]]]] = []
 
         def restore_corrective_retry_capacity() -> None:
             """Make malformed-output routes eligible for the corrected prompt.
@@ -1591,7 +1620,7 @@ class RotatingProvider:
                 # case. The ledger hook still fires: not charging the route must
                 # never make the failure invisible.
                 payload_fault = is_payload_fault(exc)
-                malformed_cooldown: Optional[float] = None
+                malformed_cooldown: Optional[Tuple[float, str]] = None
                 if not payload_fault:
                     scope, reset_at = limit_scope(exc)
                     outcome = ("malformed_output"
@@ -1601,8 +1630,11 @@ class RotatingProvider:
                         route, outcome, _retry_after(exc),
                         scope=scope, reset_at=reset_at)
                     if (outcome == "malformed_output"
-                            and isinstance(reported, (int, float))):
-                        malformed_cooldown = float(reported)
+                            and isinstance(reported, tuple)
+                            and len(reported) == 2
+                            and isinstance(reported[0], (int, float))
+                            and isinstance(reported[1], str)):
+                        malformed_cooldown = (float(reported[0]), reported[1])
                 if self._on_error is not None:
                     try:
                         self._on_error(route, exc)
