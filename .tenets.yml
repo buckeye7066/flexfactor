@@ -1,7 +1,7 @@
 ranking:
   algorithm: balanced
   threshold: 0.1
-  use_git: true
+  use_git: false
 
 context:
   max_tokens: 100000
