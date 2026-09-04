@@ -35,13 +35,13 @@ jobs:
           python flexfactor_tenets_tests.py
           python flexfactor_invariant_sweep_tests.py
           git diff --check
-      - name: Commit permanent fixes
+      - name: Commit permanent core fixes
         shell: bash
         run: |
           set -e
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add flexfactor.py flexfactor_tenets.py flexfactor_tenets_tests.py flexfactor_invariant_sweep_tests.py .github/workflows/production-readiness.yml .github/workflows/tenets-context.yml
-          git diff --cached --quiet && { echo 'No hardening diff'; exit 1; }
+          git add flexfactor.py flexfactor_tenets.py flexfactor_tenets_tests.py flexfactor_invariant_sweep_tests.py
+          git diff --cached --quiet && { echo 'No core hardening diff'; exit 1; }
           git commit -m 'Close Tenets integration review gaps'
           git push origin HEAD:fix/tenets-context-integration
