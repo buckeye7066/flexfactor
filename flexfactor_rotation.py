@@ -1152,7 +1152,7 @@ class Rotator:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
-                 transport_dead | error
+                 transport_dead | malformed_output | error
         """
         now = time.time() if now is None else now
 
@@ -1221,6 +1221,13 @@ class Rotator:
                 strikes.pop(route.id, None)
                 return
 
+            if outcome == "malformed_output":
+                # Keep this route out of the remainder of the current ladder,
+                # without turning a model-formatting miss into evidence that
+                # its pool or transport is unhealthy.
+                cooldowns[f"route:{route.id}"] = now + ROUTE_ERROR_COOLDOWN
+                return
+
             # Plain error: blame the route first. Only after it keeps failing do
             # we assume the whole pool is sick -- one bad model id must not take
             # a healthy provider out of rotation.
@@ -1232,6 +1239,11 @@ class Rotator:
                 strikes.pop(route.id, None)
 
         self.store.update(mutate)
+
+    def release_route_cooldown(self, route: Route) -> None:
+        """Release a temporary route-only cooldown without erasing strikes."""
+        self.store.update(lambda data: data.setdefault("cooldowns", {}).pop(
+            f"route:{route.id}", None))
 
     # -- diagnostics -------------------------------------------------------
     def _no_route_message(self, tier: str, allow_paid: bool,
@@ -1472,6 +1484,24 @@ class RotatingProvider:
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
         attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
         last_error: Optional[BaseException] = None
+        shape_failed_routes: List[Route] = []
+
+        def restore_corrective_retry_capacity() -> None:
+            """Make malformed-output routes eligible for the corrected prompt.
+
+            A shape failure must temporarily exclude a route so this call can
+            walk the rest of the ladder.  If the whole ladder returns malformed
+            output, however, those ordinary error cooldowns would also starve
+            the caller's bounded corrective retry.  Clear only the routes
+            rejected by this call, and only when malformed output is the final
+            failure; the error hook has already retained the provider failure.
+            """
+            if (last_error is None
+                    or type(last_error).__name__ != "StructuredOutputShapeError"):
+                return
+            for failed_route in shape_failed_routes:
+                self.rotator.release_route_cooldown(failed_route)
+
         allow_paid_for_call = self._allow_paid
         for attempt in range(attempts):
             # Only name the optional kwargs when they apply: test doubles and
@@ -1506,6 +1536,7 @@ class RotatingProvider:
             except RotationError as exc:
                 if last_error is None:
                     raise
+                restore_corrective_retry_capacity()
                 # Rotation ran dry AFTER a real provider failure: a bare
                 # "no route available" here would DISCARD last_error and hand
                 # the caller a confidently wrong diagnosis. Same class so a
@@ -1548,7 +1579,10 @@ class RotatingProvider:
                 payload_fault = is_payload_fault(exc)
                 if not payload_fault:
                     scope, reset_at = limit_scope(exc)
-                    self.rotator.report(route, _classify(exc), _retry_after(exc),
+                    outcome = ("malformed_output"
+                               if type(exc).__name__ == "StructuredOutputShapeError"
+                               else _classify(exc))
+                    self.rotator.report(route, outcome, _retry_after(exc),
                                         scope=scope, reset_at=reset_at)
                 if self._on_error is not None:
                     try:
@@ -1556,6 +1590,8 @@ class RotatingProvider:
                     except Exception:  # noqa: BLE001 - a ledger must never break a call
                         pass
                 last_error = exc
+                if type(exc).__name__ == "StructuredOutputShapeError":
+                    shape_failed_routes.append(route)
                 if payload_fault or not _is_retryable(exc):
                     raise
                 continue
@@ -1568,6 +1604,7 @@ class RotatingProvider:
                     if intent.role == ROLE_AUTHOR:
                         self._author_families.add(family)
             return result
+        restore_corrective_retry_capacity()
         raise RotationError(
             f"every {tier} pool failed this call; last error was "
             f"{type(last_error).__name__}: {last_error}") from last_error

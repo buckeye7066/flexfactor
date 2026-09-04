@@ -707,6 +707,34 @@ class RotatingProviderTests(RotationTestCase):
                 "system", "prompt", {"type": "object"}, validator=reject)
         self.assertEqual(attempted, ["a/top", "b/next"])
         self.assertIn("required array was an object", str(caught.exception))
+        cooldowns = self.store.read().get("cooldowns", {})
+        self.assertNotIn("route:a/top", cooldowns)
+        self.assertNotIn("route:b/next", cooldowns)
+
+    def test_validated_shape_failure_preserves_single_route_for_correction(self):
+        class StructuredOutputShapeError(RuntimeError):
+            pass
+
+        calls = []
+        prov = self._provider(catalog(route("a/only", "pool-a")),
+                              allow_paid=True, paid_first=True)
+
+        def reject_first(data):
+            calls.append(data["by"])
+            if len(calls) == 1:
+                raise StructuredOutputShapeError("required array was an object")
+            return data
+
+        with self.assertRaises(R.RotationError):
+            prov.structured_validated(
+                "system", "initial", {"type": "object"},
+                validator=reject_first)
+
+        result = prov.structured_validated(
+            "system", "corrected", {"type": "object"},
+            validator=reject_first)
+        self.assertEqual(result["by"], "a/only")
+        self.assertEqual(calls, ["a/only", "a/only"])
 
     def test_legacy_signature_fallback_cannot_drop_strict_family_policy(self):
         class LegacyRotator:
