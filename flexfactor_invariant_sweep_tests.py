@@ -523,11 +523,17 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "flexfactor_tenets.py::_terminate_process_tree": (
+        "Windows has no os.killpg equivalent, so timeout cleanup invokes only "
+        "the absolute System32 taskkill.exe path with /T /F; POSIX cleanup uses "
+        "os.killpg and never launches another process."
+    ),
     "flexfactor_tenets.py::_run_bounded_process": (
         "Optional local Tenets 0.13.3 context ranker launches only the exact "
         "console script resolved from the active Python installation after exact "
-        "distribution-version validation; ambient PATH and target-controlled "
-        "executables are rejected, shell=False, and time/output are bounded."
+        "distribution-version validation; the child gets an empty PATH and "
+        "disabled GitPython executable, shell=False, a new process group, and "
+        "bounded time/output."
     ),
     "obsidian_memory.py::run_aibus": (
         "Optional owner-memory bridge, independent of the audited target: "
