@@ -535,6 +535,13 @@ _PROCESS_LAUNCH_SITES = {
         "disabled GitPython executable, shell=False, a new process group, and "
         "bounded time/output."
     ),
+    "flexfactor_tenets.py::_linux_supervise_command": (
+        "Dedicated -I/-S Linux supervisor launch boundary. The parent has "
+        "already resolved and version-validated the exact Tenets executable, "
+        "supplied the isolated environment and cwd, and bounded time/output. "
+        "Before shell=False Popen, this process enables child-subreaper mode "
+        "and proves procfs inventory so setsid descendants remain owned."
+    ),
     "obsidian_memory.py::run_aibus": (
         "Optional owner-memory bridge, independent of the audited target: "
         "it launches only the owner-configured Python interpreter and AI Bus "
