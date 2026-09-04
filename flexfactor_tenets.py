@@ -43,6 +43,7 @@ MAX_STDERR_BYTES = 256 * 1024
 MAX_RANKER_MEMORY_BYTES = 1024 * 1024 * 1024
 MAX_RANKER_PROCESSES = 64
 LINUX_CGROUP_ROOT_ENV = "FLEXFACTOR_TENETS_CGROUP_ROOT"
+_LINUX_SUPERVISOR_HANDOFF = ".flexfactor-supervisors"
 # Python sequences cannot contain more than sys.maxsize elements. Using
 # that interpreter bound neutralizes the caller's review quota without
 # imposing a smaller, arbitrary repository cutoff before prioritization.
@@ -62,7 +63,7 @@ _CAP_GLOBAL_NAMES = (
 _INSTALL_LOCK = threading.Lock()
 _ENUMERATION_LOCK = threading.RLock()
 _RESULT_CACHE_LOCK = threading.Lock()
-_RESULT_CACHE: dict[tuple[str, str, int, float, str], "TenetsContextResult"] = {}
+_RESULT_CACHE: dict[tuple[Any, ...], "TenetsContextResult"] = {}
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class _BoundedProcessResult:
     timed_out: bool = False
     overflow_stream: str | None = None
     read_error: str | None = None
+    containment_error: str | None = None
 
 
 def enabled() -> bool:
@@ -195,33 +197,101 @@ def _state_root() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".flexfactor"
 
 
-def _default_output_path(project_root: Path) -> Path:
+def _containing_git_worktree(path: Path) -> Path | None:
+    """Return the enclosing Git worktree without invoking repository code.
+
+    Evidence for repository A must not be written into repository B.  Looking
+    only for containment by A misses a relative or overridden state directory
+    nested in another selected checkout.  A ``.git`` file counts too because
+    linked worktrees use that form.  Probe errors fail closed: an unreadable
+    boundary is not proof that the destination is external to every checkout.
+    """
+    for directory in path.parents:
+        marker = directory / ".git"
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                "Tenets evidence destination could not be proven outside Git"
+            ) from exc
+        return directory
+    return None
+
+
+def _normalized_protected_roots(
+    project_root: Path,
+    protected_roots: Sequence[str | os.PathLike[str]],
+) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for raw in (project_root, *protected_roots):
+        resolved = Path(raw).expanduser().resolve(strict=False)
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _validate_external_evidence_path(
+    project_root: Path,
+    candidate: Path,
+    *,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
+) -> Path:
+    for protected in _normalized_protected_roots(project_root, protected_roots):
+        try:
+            candidate.relative_to(protected)
+        except ValueError:
+            continue
+        if protected == project_root:
+            raise ValueError(
+                "FlexFactor state/evidence must be outside the audited repository"
+            )
+        raise ValueError(
+            "FlexFactor state/evidence must be outside every selected repository "
+            f"(destination is inside {protected})"
+        )
+    enclosing = _containing_git_worktree(candidate)
+    if enclosing is not None:
+        raise ValueError(
+            "FlexFactor state/evidence must be outside every Git repository "
+            f"(destination is inside {enclosing})"
+        )
+    return candidate
+
+
+def _default_output_path(
+    project_root: Path,
+    *,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
+) -> Path:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", project_root.name).strip("-._") or "project"
     identity = hashlib.sha256(str(project_root).encode("utf-8")).hexdigest()[:12]
     candidate = (
         _state_root() / "context" / f"{slug}-{identity}" / "tenets-context.json"
     ).resolve(strict=False)
-    try:
-        candidate.relative_to(project_root)
-    except ValueError:
-        return candidate
-    raise ValueError(
-        "FlexFactor state/evidence must be outside the audited repository"
+    return _validate_external_evidence_path(
+        project_root, candidate, protected_roots=protected_roots
     )
 
 
-def _resolve_output_path(project_root: Path, output: str | os.PathLike[str] | None) -> Path:
+def _resolve_output_path(
+    project_root: Path,
+    output: str | os.PathLike[str] | None,
+    *,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
+) -> Path:
     if output is None:
-        return _default_output_path(project_root)
+        return _default_output_path(
+            project_root, protected_roots=protected_roots
+        )
     candidate = Path(output).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(project_root)
-    except ValueError:
-        return resolved
-    raise ValueError("Tenets evidence output must be outside the audited repository")
+    return _validate_external_evidence_path(
+        project_root, resolved, protected_roots=protected_roots
+    )
 
 
 def _trusted_tenets_directories(
@@ -637,9 +707,39 @@ def _write_cgroup_control(path: Path, value: str) -> None:
         raise OSError(f"cgroup control {path.name} did not retain its limit")
 
 
+def _prepare_linux_supervisor_handoff(parent: Path) -> Path:
+    """Create/verify the shared trusted leaf used while a job is reclaimed.
+
+    A cgroup cannot be removed while its supervisor is still a member.  The
+    delegated parent has domain controllers enabled and therefore cannot
+    accept the process itself, so supervisors briefly move to this leaf after
+    all optional code has stopped.  It is shared and intentionally persistent;
+    per-invocation ``rank-*`` groups are still removed on every verified path.
+    """
+    handoff = parent / _LINUX_SUPERVISOR_HANDOFF
+    try:
+        handoff.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise OSError("could not create the Tenets supervisor handoff") from exc
+    try:
+        resolved_parent = parent.resolve(strict=True)
+        resolved_handoff = handoff.resolve(strict=True)
+    except OSError as exc:
+        raise OSError("the Tenets supervisor handoff cannot be verified") from exc
+    if (resolved_handoff.parent != resolved_parent or not handoff.is_dir()
+            or handoff.is_symlink()
+            or not (handoff / "cgroup.procs").is_file()
+            or not (handoff / "cgroup.events").is_file()):
+        raise OSError("the Tenets supervisor handoff is not a cgroup leaf")
+    return handoff
+
+
 def _prepare_linux_ranker_cgroup() -> Path:
     """Create one empty, aggregate-limited cgroup for one ranker invocation."""
     parent = _linux_cgroup_root()
+    _prepare_linux_supervisor_handoff(parent)
     for _attempt in range(8):
         boundary = parent / (
             f"rank-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
@@ -687,6 +787,24 @@ def _join_linux_ranker_cgroup(boundary: Path) -> None:
         raise OSError("the Tenets cgroup membership cannot be verified") from exc
     if str(os.getpid()) not in members:
         raise OSError("the Tenets supervisor did not enter its cgroup")
+
+
+def _leave_linux_ranker_cgroup(boundary: Path) -> None:
+    """Move the trusted supervisor out, proving the job no longer contains it."""
+    handoff = _prepare_linux_supervisor_handoff(boundary.parent)
+    pid = str(os.getpid())
+    try:
+        (handoff / "cgroup.procs").write_text(f"{pid}\n", encoding="ascii")
+        destination_members = set(
+            (handoff / "cgroup.procs").read_text(encoding="ascii").split()
+        )
+        source_members = set(
+            (boundary / "cgroup.procs").read_text(encoding="ascii").split()
+        )
+    except OSError as exc:
+        raise OSError("the Tenets supervisor handoff cannot be verified") from exc
+    if pid not in destination_members or pid in source_members:
+        raise OSError("the Tenets supervisor did not leave its invocation cgroup")
 
 
 def _kill_linux_ranker_cgroup(boundary: Path) -> None:
@@ -752,6 +870,53 @@ def _finalize_linux_ranker_cgroup(boundary: Path) -> None:
         if populated:
             _kill_linux_ranker_cgroup(boundary)
     _cleanup_linux_ranker_cgroup(boundary)
+
+
+def _reclaim_linux_supervisor_boundary(
+    boundary: Path, *, descendants_verified: bool
+) -> bool:
+    """Reclaim a ranker's cgroup from inside its trusted supervisor.
+
+    This is deliberately supervisor-side.  If FlexFactor is SIGKILLed, no
+    parent ``finally`` remains to kill escaped descendants or remove the
+    invocation cgroup.  Move only the trusted supervisor to the persistent
+    handoff leaf, atomically kill the job whenever procfs cleanup was not
+    proven, then wait for and remove the empty ``rank-*`` boundary.
+    """
+    try:
+        _leave_linux_ranker_cgroup(boundary)
+    except OSError as exc:
+        print(f"flexfactor could not leave the Tenets cgroup: {exc}",
+              file=sys.stderr)
+        # We may still be inside the boundary.  Killing the whole cgroup also
+        # kills this supervisor, but it is safer than returning while optional
+        # descendants remain alive.  A live parent retains the cleanup handle.
+        try:
+            _kill_linux_ranker_cgroup(boundary)
+        except OSError as kill_exc:
+            print(f"flexfactor could not atomically kill Tenets: {kill_exc}",
+                  file=sys.stderr)
+        return False
+
+    try:
+        if not descendants_verified:
+            _kill_linux_ranker_cgroup(boundary)
+        _cleanup_linux_ranker_cgroup(boundary)
+        return True
+    except OSError as exc:
+        # Membership/inventory errors are never evidence of emptiness.  Retry
+        # toward atomic containment now that the supervisor is outside the job.
+        try:
+            _kill_linux_ranker_cgroup(boundary)
+            _cleanup_linux_ranker_cgroup(boundary)
+            return True
+        except OSError as final_exc:
+            print(
+                "flexfactor could not reclaim the Tenets cgroup: "
+                f"{exc}; final containment attempt: {final_exc}",
+                file=sys.stderr,
+            )
+            return False
 
 
 def _linux_direct_child_pids() -> tuple[int, ...]:
@@ -896,13 +1061,22 @@ def _linux_supervise_command(
         _apply_linux_ranker_file_limit()
     except OSError as exc:
         print(f"flexfactor Tenets containment unavailable: {exc}", file=sys.stderr)
+        _reclaim_linux_supervisor_boundary(
+            cgroup_boundary, descendants_verified=True
+        )
         return 125
     if received_signal[0] is not None:
+        _reclaim_linux_supervisor_boundary(
+            cgroup_boundary, descendants_verified=True
+        )
         return 128 + received_signal[0]
     try:
         child = subprocess.Popen(tuple(command), shell=False)
     except OSError as exc:
         print(f"flexfactor could not start Tenets: {exc}", file=sys.stderr)
+        _reclaim_linux_supervisor_boundary(
+            cgroup_boundary, descendants_verified=True
+        )
         return 125
 
     stop_started: float | None = None
@@ -941,13 +1115,19 @@ def _linux_supervise_command(
     if not cleaned:
         print("flexfactor could not terminate every Tenets descendant",
               file=sys.stderr)
-    elif deadline_expired:
+    reclaimed = _reclaim_linux_supervisor_boundary(
+        cgroup_boundary, descendants_verified=cleaned
+    )
+    if not reclaimed:
+        print("flexfactor could not verify Tenets invocation cleanup",
+              file=sys.stderr)
+    elif cleaned and deadline_expired:
         result = 124
-    elif received_signal[0] is not None:
+    elif cleaned and received_signal[0] is not None:
         result = 128 + received_signal[0]
-    elif returncode < 0:
+    elif cleaned and returncode < 0:
         result = 128 + abs(returncode)
-    else:
+    elif cleaned:
         result = min(returncode, 255)
     return result
 
@@ -1166,6 +1346,7 @@ def _run_bounded_process(
     windows_job: int | None = None
     tree_closed = False
     started_readers: list[threading.Thread] = []
+    completed_result: _BoundedProcessResult | None = None
     try:
         process = subprocess.Popen(
             process_command,
@@ -1275,7 +1456,7 @@ def _run_bounded_process(
             with state_lock:
                 state.setdefault("read_error", "output reader did not terminate")
 
-        return _BoundedProcessResult(
+        completed_result = _BoundedProcessResult(
             returncode=int(
                 process.returncode if process.returncode is not None else -1
             ),
@@ -1320,9 +1501,23 @@ def _run_bounded_process(
             # empty (or atomically kill it) before releasing that handle.
             try:
                 _finalize_linux_ranker_cgroup(linux_cgroup)
-            except OSError:
-                # Cleanup failure must not replace a successful result or mask an interrupt.
-                pass
+            except OSError as exc:
+                # A cleanup failure must not replace KeyboardInterrupt (or any
+                # other exception already propagating), but a nominal process
+                # result cannot be reported as safely contained either.  Carry
+                # the diagnostic in the completed result so optional ranking
+                # degrades while the canonical audit order continues.
+                diagnostic = _bounded_text(
+                    f"Tenets containment cleanup failed: {exc}"
+                )
+                print(f"flexfactor {diagnostic}", file=sys.stderr)
+                if completed_result is not None:
+                    completed_result = replace(
+                        completed_result, containment_error=diagnostic
+                    )
+    if completed_result is None:
+        raise OSError("Tenets process ended without a bounded result")
+    return completed_result
 
 
 def _isolated_tenets_environment(project_root: Path, isolation_root: Path) -> dict[str, str]:
@@ -1405,6 +1600,7 @@ def generate_tenets_context(
     top: int = DEFAULT_TOP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     executable: str | None = None,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
 ) -> TenetsContextResult:
     """Run ``tenets rank`` and persist a safe, bounded context manifest.
 
@@ -1421,7 +1617,12 @@ def generate_tenets_context(
         raise ValueError(f"top must be an integer between 1 and {MAX_TOP}")
     timeout = _validated_timeout(timeout_seconds)
 
-    output_path = _resolve_output_path(root, output)
+    normalized_protected_roots = _normalized_protected_roots(
+        root, protected_roots
+    )
+    output_path = _resolve_output_path(
+        root, output, protected_roots=normalized_protected_roots
+    )
     started = time.monotonic()
     resolved_executable = executable or _find_tenets_executable()
     explicit_untrusted = bool(executable and not _is_trusted_tenets_executable(executable))
@@ -1475,7 +1676,10 @@ def generate_tenets_context(
             )
             stdout_bytes = completed.stdout
             stderr_bytes = completed.stderr
-            if completed.timed_out:
+            if completed.containment_error:
+                status = "degraded"
+                message = completed.containment_error
+            elif completed.timed_out:
                 status = "degraded"
                 message = f"Tenets exceeded the {timeout:g}-second timeout."
             elif completed.overflow_stream:
@@ -1631,16 +1835,29 @@ def cached_tenets_context(
     *,
     top: int = DEFAULT_TOP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
 ) -> TenetsContextResult:
     root = Path(project).expanduser().resolve(strict=False)
     timeout = _validated_timeout(timeout_seconds)
     fingerprint = _repository_state_fingerprint(root)
-    key = (str(root), str(task).strip(), top, timeout, fingerprint)
+    normalized_protected_roots = _normalized_protected_roots(
+        root, protected_roots
+    )
+    key = (
+        str(root), str(task).strip(), top, timeout, fingerprint,
+        tuple(str(path) for path in normalized_protected_roots),
+    )
     with _RESULT_CACHE_LOCK:
         hit = _RESULT_CACHE.get(key)
     if hit is not None:
         return hit
-    result = generate_tenets_context(root, task, top=top, timeout_seconds=timeout)
+    result = generate_tenets_context(
+        root,
+        task,
+        top=top,
+        timeout_seconds=timeout,
+        protected_roots=normalized_protected_roots,
+    )
     with _RESULT_CACHE_LOCK:
         return _RESULT_CACHE.setdefault(key, result)
 
@@ -1750,26 +1967,41 @@ def _routed_session_task(
     if selected is None:
         return None
     candidates = _program_candidates(programs)
-    # Build targets safely:
-    # - Exclude unresolved entries (empty project_dir) so one bad alias does not
-    #   cause routing to reject the entire set.
-    # - If the selected match was identity-only with no resolved path, substitute
-    #   the actual current project's directory so routing can still target it.
-    project_full = os.path.normcase(str(Path(project).expanduser().resolve(strict=False)))
+    root = Path(project).expanduser().resolve(strict=False)
+    root_full = os.path.normcase(str(root))
     targets: list[tuple[str, str]] = []
+    selected_full = ""
     for index, program, full, _identity in candidates:
-        effective_full = project_full if (index == selected and not full) else full
-        if effective_full:
-            targets.append((program, effective_full))
+        if index == selected:
+            # A unique fuzzy display name can identify the current checkout even
+            # though the CLI resolver has no path.  Route it using the path the
+            # caller already proved, not an empty target that rejects the whole
+            # owner prompt.
+            effective_full = full or root_full
+            selected_full = effective_full
+        elif full:
+            effective_full = full
+        else:
+            # Keep unresolved labels in the routing population so work named for
+            # one of them is quarantined there instead of becoming an unscoped
+            # clause that leaks into a valid repository.  This path is route-only
+            # and is never used for filesystem access.
+            digest = hashlib.sha256(
+                f"{index}\0{program}".encode("utf-8", errors="surrogateescape")
+            ).hexdigest()[:24]
+            effective_full = str(
+                Path(tempfile.gettempdir())
+                / "flexfactor-unresolved-session-targets"
+                / digest
+            )
+        targets.append((program, effective_full))
     try:
         import flexfactor_steering
 
         routed = flexfactor_steering.route_session_prompt(prompt, targets)
     except (ImportError, OSError, ValueError):
         return None
-    _index, selected_program, selected_full, _identity = candidates[selected]
-    if not selected_full:
-        selected_full = project_full
+    _index, selected_program, _candidate_full, _identity = candidates[selected]
     for route in routed.get("routes", ()):
         if not isinstance(route, Mapping):
             continue
@@ -1793,10 +2025,10 @@ def _durable_guidance_task(project: str | os.PathLike[str]) -> str | None:
     """Load exact-project standing owner guidance before using generic scope."""
     try:
         import flexfactor_steering
-        # Use the same identity as guidance storage (abspath + normcase) so
-        # symlink/junction checkouts find their saved record.
-        canonical = os.path.normcase(os.path.abspath(str(Path(project).expanduser())))
-        guidance = flexfactor_steering.get_guidance_for_project(canonical)
+
+        guidance = flexfactor_steering.get_guidance_for_project(
+            str(Path(project).expanduser().resolve(strict=True))
+        )
     except (ImportError, OSError, TypeError, ValueError):
         return None
     if not isinstance(guidance, Mapping):
@@ -1979,10 +2211,20 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
             if not enabled():
                 return None
             try:
-                task = _argv_task(
-                    module_globals.get("_FLEXFACTOR_TENETS_ARGV"), project=root
+                effective_argv = tuple(
+                    module_globals.get("_FLEXFACTOR_TENETS_ARGV") or ()
                 )
-                result = cached_tenets_context(root, task)
+                task = _argv_task(effective_argv, project=root)
+                programs = _argv_values(effective_argv, "--program")
+                selected_roots = tuple(
+                    full
+                    for _index, _program, full, _identity
+                    in _program_candidates(programs)
+                    if full
+                )
+                result = cached_tenets_context(
+                    root, task, protected_roots=selected_roots
+                )
             except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
                 return None

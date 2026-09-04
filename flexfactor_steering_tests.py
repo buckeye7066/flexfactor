@@ -7,6 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 import flexfactor as ff
 import flexfactor_tests as ft
@@ -214,6 +215,152 @@ class SteeringTests(unittest.TestCase):
         cleared, _, _ = fs.refresh_context(second, "Target", self.project, "run-3",
                                            root=self.root)
         self.assertNotIn(fs._GUIDANCE_BEGIN, cleared)
+
+    def test_guidance_uses_one_physical_identity_across_symlink_aliases(self):
+        alias = os.path.join(self.root, "Target Alias")
+        try:
+            os.symlink(self.project, alias, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        saved = fs.set_guidance(
+            "Target", alias, "Preserve the physical checkout workflow.",
+            root=self.root,
+        )
+        loaded = fs.get_guidance("Target", self.project, root=self.root)
+        discovered = fs.get_guidance_for_project(self.project, root=self.root)
+        self.assertEqual(saved["project_dir"], fs._canonical(self.project))
+        self.assertEqual(loaded["prompt"], saved["prompt"])
+        self.assertEqual(discovered["prompt"], saved["prompt"])
+        self.assertTrue(fs.clear_guidance(
+            "Target", self.project, root=self.root
+        ))
+
+    def test_legacy_alias_guidance_is_validated_migrated_and_clearable(self):
+        alias = os.path.join(self.root, "Legacy Target Alias")
+        try:
+            os.symlink(self.project, alias, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        legacy_path = os.path.join(
+            self.root,
+            "guidance",
+            fs._legacy_key("Target", alias) + ".json",
+        )
+        current_path = fs.guidance_path("Target", self.project, self.root)
+        self.assertNotEqual(legacy_path, current_path)
+        fs._replace_json(legacy_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "prompt": "Keep the authenticated legacy owner workflow.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        })
+
+        loaded = fs.get_guidance("Target", self.project, root=self.root)
+
+        self.assertEqual(
+            loaded["prompt"], "Keep the authenticated legacy owner workflow."
+        )
+        self.assertEqual(loaded["project_dir"], fs._canonical(self.project))
+        self.assertTrue(os.path.isfile(current_path))
+        self.assertFalse(os.path.exists(legacy_path))
+        self.assertTrue(fs.clear_guidance(
+            "Target", alias, root=self.root
+        ))
+        self.assertIsNone(fs.get_guidance(
+            "Target", self.project, root=self.root
+        ))
+
+    def test_clear_guidance_removes_valid_legacy_alias_without_loading_it(self):
+        alias = os.path.join(self.root, "Legacy Clear Alias")
+        try:
+            os.symlink(self.project, alias, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        legacy_path = os.path.join(
+            self.root,
+            "guidance",
+            fs._legacy_key("Target", alias) + ".json",
+        )
+        fs._replace_json(legacy_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "prompt": "Legacy prompt to clear.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        })
+
+        self.assertTrue(fs.clear_guidance(
+            "Target", self.project, root=self.root
+        ))
+        self.assertFalse(os.path.exists(legacy_path))
+        self.assertIsNone(fs.get_guidance(
+            "Target", self.project, root=self.root
+        ))
+
+    def test_legacy_alias_journal_keeps_pending_and_terminal_receipts(self):
+        alias = os.path.join(self.root, "Legacy Journal Alias")
+        try:
+            os.symlink(self.project, alias, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        legacy_path = os.path.join(
+            self.root,
+            fs._legacy_key("Target", alias) + ".jsonl",
+        )
+        fs._append(legacy_path, {
+            "kind": "submission",
+            "id": "legacy-steering-id",
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "comment": "Preserve this queued owner instruction.",
+            "source": "dashboard",
+            "created_at": "2026-09-04T00:00:00+00:00",
+        })
+
+        pending = fs.list_comments(
+            "Target", self.project, root=self.root
+        )
+        self.assertEqual(["legacy-steering-id"], [row["id"] for row in pending])
+        self.assertEqual("pending", pending[0]["status"])
+        _items, claimed = fs.claim(
+            "Target", self.project, "new-run", root=self.root
+        )
+        self.assertEqual(["legacy-steering-id"], claimed)
+        self.assertEqual(
+            "active",
+            fs.list_comments("Target", alias, root=self.root)[0]["status"],
+        )
+        fs.finish(
+            "Target",
+            self.project,
+            "new-run",
+            ["legacy-steering-id"],
+            completed=True,
+            root=self.root,
+        )
+        self.assertEqual(
+            "completed",
+            fs.list_comments("Target", alias, root=self.root)[0]["status"],
+        )
+
+    def test_guidance_canonicalization_resolves_windows_junction_identity(self):
+        real = os.path.abspath(self.project)
+        alias = os.path.join(self.root, "Target Junction")
+        original_realpath = fs.os.path.realpath
+
+        def fake_realpath(path):
+            absolute = os.path.abspath(path)
+            return real if absolute == os.path.abspath(alias) else original_realpath(path)
+
+        with mock.patch.object(fs.os.path, "realpath", side_effect=fake_realpath):
+            self.assertEqual(fs._canonical(alias), fs._canonical(real))
+            self.assertEqual(
+                fs.guidance_path("Target", alias, self.root),
+                fs.guidance_path("Target", real, self.root),
+            )
 
     def test_dashboard_guidance_helpers_persist_and_clear(self):
         original = fs.DEFAULT_ROOT

@@ -60,6 +60,7 @@ class TenetsContextTests(unittest.TestCase):
         timed_out: bool = False,
         overflow_stream: str | None = None,
         read_error: str | None = None,
+        containment_error: str | None = None,
     ) -> ft._BoundedProcessResult:
         return ft._BoundedProcessResult(
             returncode=returncode,
@@ -68,6 +69,7 @@ class TenetsContextTests(unittest.TestCase):
             timed_out=timed_out,
             overflow_stream=overflow_stream,
             read_error=read_error,
+            containment_error=containment_error,
         )
 
     def test_missing_tenets_is_fail_open_and_writes_external_evidence(self) -> None:
@@ -97,6 +99,37 @@ class TenetsContextTests(unittest.TestCase):
                 self.root, "audit", output=self.root / "tenets-context.json"
             )
         self.assertFalse(unsafe_state.exists())
+
+    def test_evidence_paths_inside_another_selected_repository_are_rejected(self) -> None:
+        other = Path(self.temp.name) / "other-selected-repository"
+        other.mkdir()
+        (other / ".git").mkdir()
+        unsafe_state = other / ".flexfactor-state"
+        with mock.patch.dict(
+            os.environ, {"FLEXFACTOR_STATE_DIR": str(unsafe_state)}, clear=False
+        ), mock.patch.object(ft, "_find_tenets_executable") as finder:
+            with self.assertRaisesRegex(ValueError, "every selected repository"):
+                ft.generate_tenets_context(
+                    self.root, "audit", protected_roots=(other,)
+                )
+        finder.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "every selected repository"):
+            ft.generate_tenets_context(
+                self.root,
+                "audit",
+                output=other / "tenets-context.json",
+                protected_roots=(other,),
+            )
+        self.assertFalse(unsafe_state.exists())
+
+    def test_direct_api_never_writes_evidence_inside_any_git_worktree(self) -> None:
+        other = Path(self.temp.name) / "unselected-but-real-worktree"
+        other.mkdir()
+        (other / ".git").write_text("gitdir: /tmp/example\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "outside every Git repository"):
+            ft.generate_tenets_context(
+                self.root, "audit", output=other / "context.json"
+            )
 
     def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
         failures = (
@@ -586,6 +619,102 @@ class TenetsContextTests(unittest.TestCase):
                 descendant.wait(timeout=2)
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux supervisor cleanup contract")
+    def test_supervisor_atomically_kills_and_reclaims_unverified_descendants(self) -> None:
+        child = mock.Mock(returncode=0)
+        child.wait.return_value = 0
+        boundary = Path("/delegated/rank-test")
+        for cleanup_result in (False, OSError("procfs inventory failed")):
+            events: list[str] = []
+            terminate = (
+                mock.Mock(side_effect=cleanup_result)
+                if isinstance(cleanup_result, Exception)
+                else mock.Mock(return_value=cleanup_result)
+            )
+            with self.subTest(cleanup_result=repr(cleanup_result)), \
+                 mock.patch.object(ft.signal, "signal"), \
+                 mock.patch.object(ft, "_enable_linux_parent_death_signal"), \
+                 mock.patch.object(ft, "_join_linux_ranker_cgroup"), \
+                 mock.patch.object(ft, "_enable_linux_child_subreaper"), \
+                 mock.patch.object(ft, "_linux_direct_child_pids", return_value=()), \
+                 mock.patch.object(ft, "_terminate_linux_supervisor_children", terminate), \
+                 mock.patch.object(ft, "_apply_linux_ranker_file_limit"), \
+                 mock.patch.object(ft.os, "pidfd_open", return_value=12345), \
+                 mock.patch.object(ft.os, "close"), \
+                 mock.patch.object(ft.subprocess, "Popen", return_value=child), \
+                 mock.patch.object(
+                     ft, "_leave_linux_ranker_cgroup",
+                     side_effect=lambda _path: events.append("handoff"),
+                 ), mock.patch.object(
+                     ft, "_kill_linux_ranker_cgroup",
+                     side_effect=lambda _path: events.append("kill"),
+                 ) as kill_cgroup, mock.patch.object(
+                     ft, "_cleanup_linux_ranker_cgroup",
+                     side_effect=lambda _path: events.append("remove"),
+                 ) as cleanup_cgroup:
+                result = ft._linux_supervise_command(
+                    (sys.executable, "-S", "-c", "pass"),
+                    cgroup_boundary=boundary,
+                    expected_parent_pid=4242,
+                    max_runtime_seconds=5,
+                )
+            self.assertEqual(result, 125)
+            self.assertEqual(events, ["handoff", "kill", "remove"])
+            kill_cgroup.assert_called_once_with(boundary)
+            cleanup_cgroup.assert_called_once_with(boundary)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux parent finalizer contract")
+    def test_parent_finalizer_failure_degrades_a_successful_result(self) -> None:
+        process = mock.Mock(pid=417, returncode=0)
+        process.poll.return_value = 0
+        process.stdout = io.BytesIO(b'{"files":[]}')
+        process.stderr = io.BytesIO(b"")
+        boundary = Path("/delegated/rank-test")
+        with mock.patch.object(
+            ft, "_prepare_linux_ranker_cgroup", return_value=boundary
+        ), mock.patch.object(
+            ft.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            ft, "_finalize_linux_ranker_cgroup",
+            side_effect=OSError("cgroup events unreadable"),
+        ):
+            result = ft._run_bounded_process(
+                (sys.executable, "-S", "-c", "pass"),
+                cwd=self.root,
+                timeout_seconds=1,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("containment cleanup failed", result.containment_error or "")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux parent finalizer contract")
+    def test_parent_finalizer_failure_never_masks_keyboard_interrupt(self) -> None:
+        process = mock.Mock(pid=417, returncode=None)
+        process.poll.return_value = None
+        process.stdout = io.BytesIO(b"")
+        process.stderr = io.BytesIO(b"")
+        boundary = Path("/delegated/rank-test")
+        with mock.patch.object(
+            ft, "_prepare_linux_ranker_cgroup", return_value=boundary
+        ), mock.patch.object(
+            ft.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            ft.threading.Event, "wait", side_effect=KeyboardInterrupt
+        ), mock.patch.object(
+            ft, "_terminate_process_tree"
+        ), mock.patch.object(
+            ft, "_finalize_linux_ranker_cgroup",
+            side_effect=OSError("cgroup events unreadable"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                ft._run_bounded_process(
+                    (sys.executable, "-S", "-c", "pass"),
+                    cwd=self.root,
+                    timeout_seconds=1,
+                )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
                          "Linux supervisor deadline contract")
     def test_linux_supervisor_has_an_independent_absolute_deadline(self) -> None:
         class DeadlineChild:
@@ -617,6 +746,8 @@ class TenetsContextTests(unittest.TestCase):
              mock.patch.object(ft, "_enable_linux_child_subreaper"), \
              mock.patch.object(ft, "_linux_direct_child_pids", return_value=()), \
              mock.patch.object(ft, "_terminate_linux_supervisor_children", return_value=True), \
+             mock.patch.object(ft, "_leave_linux_ranker_cgroup"), \
+             mock.patch.object(ft, "_cleanup_linux_ranker_cgroup"), \
              mock.patch.object(ft, "_apply_linux_ranker_file_limit"), \
              mock.patch.object(ft.os, "pidfd_open", return_value=12345), \
              mock.patch.object(ft.os, "close"), \
@@ -665,6 +796,8 @@ class TenetsContextTests(unittest.TestCase):
             "sys.path.insert(0, sys.argv[1])\n"
             "import flexfactor_tenets as ft\n"
             "ft._join_linux_ranker_cgroup=lambda _path: None\n"
+            "ft._leave_linux_ranker_cgroup=lambda _path: None\n"
+            "ft._cleanup_linux_ranker_cgroup=lambda _path: None\n"
             "ft._apply_linux_ranker_file_limit=lambda: None\n"
             "raise SystemExit(ft._linux_supervise_command(\n"
             " [sys.executable,sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6]],\n"
@@ -710,6 +843,110 @@ class TenetsContextTests(unittest.TestCase):
             for pid in tracked_pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux")
+        and bool(os.environ.get(ft.LINUX_CGROUP_ROOT_ENV, "").strip()),
+        "live delegated Linux cgroup required",
+    )
+    def test_parent_sigkill_reclaims_live_cgroup_and_setsid_descendant(self) -> None:
+        scripts = Path(self.temp.name) / "live-parent-death"
+        scripts.mkdir()
+        ready = scripts / "ranker-ready"
+        helper_pid_file = scripts / "helper.pid"
+        survivor = scripts / "helper-survived"
+        helper = scripts / "helper.py"
+        helper.write_text(
+            "import os,pathlib,sys,time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "time.sleep(2)\n"
+            "pathlib.Path(sys.argv[2]).write_text('alive')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        ranker = scripts / "ranker.py"
+        ranker.write_text(
+            "import pathlib,signal,subprocess,sys,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "subprocess.Popen([sys.executable,sys.argv[4],sys.argv[2],sys.argv[3]], "
+            "start_new_session=True)\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        adapter = scripts / "adapter.py"
+        adapter.write_text(
+            "import pathlib,sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import flexfactor_tenets as ft\n"
+            "root=pathlib.Path(sys.argv[2])\n"
+            "ft._run_bounded_process(\n"
+            " [sys.executable,sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6],sys.argv[7]],\n"
+            " cwd=root, timeout_seconds=30)\n",
+            encoding="utf-8",
+        )
+        module_root = str(Path(ft.__file__).resolve().parent)
+        delegated_root = ft._linux_cgroup_root()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(adapter),
+                module_root,
+                str(scripts),
+                str(ranker),
+                str(ready),
+                str(helper_pid_file),
+                str(survivor),
+                str(helper),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        invocation_pattern = f"rank-{process.pid}-*"
+        helper_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                (not ready.exists() or not helper_pid_file.exists()
+                 or not tuple(delegated_root.glob(invocation_pattern)))
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertIsNone(process.poll(), "adapter exited before live containment")
+            self.assertTrue(ready.exists(), "ranker never reached live containment")
+            self.assertTrue(helper_pid_file.exists(), "setsid helper never started")
+            self.assertTrue(
+                tuple(delegated_root.glob(invocation_pattern)),
+                "invocation cgroup was never created",
+            )
+            helper_pid = int(helper_pid_file.read_text(encoding="utf-8"))
+
+            process.kill()
+            process.wait(timeout=2)
+            cleanup_deadline = time.monotonic() + 10
+            while (tuple(delegated_root.glob(invocation_pattern))
+                   and time.monotonic() < cleanup_deadline):
+                time.sleep(0.02)
+            self.assertFalse(
+                tuple(delegated_root.glob(invocation_pattern)),
+                "supervisor left its invocation cgroup after abrupt parent death",
+            )
+            time.sleep(2.2)
+            self.assertFalse(
+                survivor.exists(),
+                "setsid descendant survived abrupt FlexFactor parent death",
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if helper_pid is not None:
+                try:
+                    os.kill(helper_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 
@@ -1119,6 +1356,35 @@ class TenetsContextTests(unittest.TestCase):
             task = ft._argv_task(argv, project=target)
         self.assertNotIn("unrelated repository prompt", task)
         self.assertIn("production readiness", task)
+
+    def test_unresolved_programs_do_not_drop_or_cross_route_valid_owner_work(self) -> None:
+        target = self.root.parent / "GrantFlow"
+        target.mkdir()
+        invalid_url = "https://github.com/untrusted/bad-repo"
+        fuzzy = "Mystery Tool"
+        argv = [
+            "audit",
+            "--program", str(target),
+            "--program", invalid_url,
+            "--program", fuzzy,
+            "--session-prompt",
+            "GrantFlow: repair billing. Bad Repo: delete unrelated data. "
+            "Mystery Tool: replace its launcher.",
+        ]
+        import flexfactor
+
+        def resolve(raw, _hint):
+            return str(target) if raw == str(target) else None
+
+        with mock.patch.object(
+            flexfactor, "resolve_project_dir", side_effect=resolve
+        ), mock.patch.dict(
+            os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
+        ):
+            task = ft._argv_task(argv, project=target)
+        self.assertIn("repair billing", task)
+        self.assertNotIn("delete unrelated data", task)
+        self.assertNotIn("replace its launcher", task)
 
     def test_ambiguous_program_basename_does_not_guess_a_prompt(self) -> None:
         first = self.root.parent / "one" / "app"
