@@ -1392,5 +1392,37 @@ class SweepIsWiredIntoCITests(unittest.TestCase):
         self.assertEqual(stale, [], f"_NOT_IN_CI names modules that are gone: {stale}")
 
 
+class RepositoryGovernanceTests(unittest.TestCase):
+    """Production controls must not rely on an unwritten review convention."""
+
+    _WORKFLOWS = (
+        "production-readiness.yml",
+        "rotation.yml",
+        "tenets-context.yml",
+    )
+
+    def test_codeowners_protects_workflows_templates_and_security_policy(self):
+        codeowners = _read(os.path.join(_HERE, ".github", "CODEOWNERS"))
+        self.assertIn("/.github/ @buckeye7066", codeowners)
+        self.assertIn("/SECURITY.md @buckeye7066", codeowners)
+
+    def test_pr_workflows_cancel_stale_heads_without_duplicate_branch_pushes(self):
+        for name in self._WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = _read(os.path.join(
+                    _HERE, ".github", "workflows", name))
+                self.assertIn("branches: [main]", workflow)
+                self.assertIn("github.event.pull_request.number || github.ref", workflow)
+                self.assertIn("cancel-in-progress: true", workflow)
+                for obsolete in (
+                        "cursor/production-ready/**",
+                        "production-ready/**",
+                        "fix/provider-capacity-orchestration",
+                        "feature/rotation-cursor-competitors",
+                        "copilot/**",
+                        "fix/tenets-context-integration"):
+                    self.assertNotIn(obsolete, workflow)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
