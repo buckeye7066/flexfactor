@@ -25,8 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40,<1.0"]
 openai = ["openai>=2,<3"]
-# Everything needed to run BOTH providers plus the test/dev workflow.
-all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2"]
+# Local, privacy-preserving code-context ranking selected from FutureTools.
+context = ["tenets==0.13.3"]
+# Everything needed to run both providers, local context ranking, and the
+# complete desktop/test workflow.
+all = ["anthropic>=0.40,<1.0", "openai>=2,<3", "socksio>=1,<2", "tenets==0.13.3"]
 dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 
 [project.scripts]
@@ -35,6 +38,7 @@ dev = ["anthropic>=0.40,<1.0", "openai>=2,<3"]
 # monolith bypassed the route filters, capacity guard, skip-dir guard and the
 # PowerShell/project-name protections installed by flexfactor_directed.
 flexfactor = "flexfactor_run:run_cli"
+flexfactor-context = "flexfactor_tenets:run_cli"
 
 [tool.setuptools]
 py-modules = [
@@ -71,6 +75,7 @@ py-modules = [
   "flexfactor_steering",
   "flexfactor_sandbox",
   "flexfactor_scout_contract",
+  "flexfactor_tenets",
   "flexfactor_trust",
   "flexfactor_web",
   "flexfactor_wip",
