@@ -452,6 +452,32 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("RuntimeError: first target broke",
                       snapshot["items"][0]["note"])
 
+    def test_queue_runner_reuses_a_preloaded_orchestrator(self):
+        coordinator = self._coordinator(("one",))
+
+        def runner(_target, _index, _total, active):
+            self.assertIs(active, coordinator)
+            active.begin_pass(1, ["one.py"], whole_repository=True)
+            active.finish_pass(1, [], reviewed_files=["one.py"])
+            active.record_competitor_gate(
+                attempted=True, implemented_files=[], verified=3)
+            self._finalize(active)
+            return 0
+
+        code, returned = execution.run_sequential_queue(
+            "audit", ["one"], runner, orchestrator=coordinator)
+        self.assertEqual(0, code)
+        self.assertIs(coordinator, returned)
+        self.assertEqual("completed", returned.snapshot()["status"])
+
+    def test_queue_runner_rejects_a_mismatched_preloaded_orchestrator(self):
+        coordinator = self._coordinator(("one",))
+        with self.assertRaisesRegex(
+                execution.ExecutionContractError, "does not match"):
+            execution.run_sequential_queue(
+                "audit", ["different"], lambda *_args: 0,
+                orchestrator=coordinator)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
