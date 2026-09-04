@@ -1,0 +1,275 @@
+name: One-shot Tenets hardening
+
+on:
+  push:
+    branches: [fix/tenets-context-integration]
+    paths: [.github/workflows/one-shot-tenets-hardening.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/tenets-context-integration
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Apply review and CI hardening
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+          import re
+
+          def read(path):
+              return Path(path).read_text(encoding='utf-8')
+          def write(path, text):
+              Path(path).write_text(text, encoding='utf-8', newline='\n')
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              assert count == 1, f'{label}: expected one anchor, found {count}'
+              return text.replace(old, new, 1)
+
+          # flexfactor_tenets.py: trusted executable identity, exact package version,
+          # nonblocking bounded reads, evidence fail-open, operator task parsing, and
+          # manifest ordering used by audit/prodready.
+          p = Path('flexfactor_tenets.py')
+          s = read(p)
+          s = replace_once(s, 'from dataclasses import asdict, dataclass\n',
+                           'from dataclasses import asdict, dataclass, replace\nfrom importlib import metadata as importlib_metadata\n',
+                           'tenets imports')
+          s = s.replace('import shutil\n', '')
+
+          start = s.index('def _find_tenets_executable(')
+          end = s.index('\ndef _read_bounded_pipe(', start)
+          resolver = '''def _trusted_tenets_directories(\n    *, interpreter: str | os.PathLike[str] | None = None, platform_name: str | None = None\n) -> tuple[Path, ...]:\n    interpreter_path = Path(interpreter or sys.executable).expanduser().resolve(strict=False)\n    windows = (platform_name or os.name) == "nt"\n    candidates = [interpreter_path.parent]\n    prefix_scripts = Path(sys.prefix).expanduser().resolve(strict=False) / ("Scripts" if windows else "bin")\n    if prefix_scripts not in candidates:\n        candidates.append(prefix_scripts)\n    return tuple(candidates)\n\n\ndef _is_trusted_tenets_executable(\n    executable: str | os.PathLike[str],\n    *,\n    interpreter: str | os.PathLike[str] | None = None,\n    platform_name: str | None = None,\n) -> bool:\n    windows = (platform_name or os.name) == "nt"\n    expected_names = {"tenets.exe", "tenets"} if windows else {"tenets"}\n    candidate = Path(executable).expanduser().resolve(strict=False)\n    if candidate.name.lower() not in {name.lower() for name in expected_names}:\n        return False\n    if candidate.parent not in _trusted_tenets_directories(\n        interpreter=interpreter, platform_name=platform_name\n    ):\n        return False\n    return candidate.is_file() and (windows or os.access(candidate, os.X_OK))\n\n\ndef _find_tenets_executable(\n    *,\n    interpreter: str | os.PathLike[str] | None = None,\n    platform_name: str | None = None,\n    path_value: str | None = None,\n) -> str | None:\n    """Resolve Tenets only from the active Python installation, never PATH."""\n    del path_value  # retained for API compatibility; ambient PATH is intentionally ignored.\n    windows = (platform_name or os.name) == "nt"\n    executable_names = ("tenets.exe", "tenets") if windows else ("tenets",)\n    for directory in _trusted_tenets_directories(\n        interpreter=interpreter, platform_name=platform_name\n    ):\n        for name in executable_names:\n            candidate = directory / name\n            if _is_trusted_tenets_executable(\n                candidate, interpreter=interpreter, platform_name=platform_name\n            ):\n                return str(candidate.resolve(strict=False))\n    return None\n\n\ndef _tenets_distribution_version() -> str | None:\n    try:\n        return importlib_metadata.version("tenets")\n    except importlib_metadata.PackageNotFoundError:\n        return None\n'''
+          s = s[:start] + resolver + s[end:]
+
+          s = replace_once(
+              s,
+              '            chunk = pipe.read(64 * 1024)\n',
+              '            read1 = getattr(pipe, "read1", None)\n'
+              '            if callable(read1):\n'
+              '                chunk = read1(64 * 1024)\n'
+              '            else:\n'
+              '                try:\n'
+              '                    chunk = os.read(pipe.fileno(), 64 * 1024)\n'
+              '                except (AttributeError, OSError, ValueError):\n'
+              '                    chunk = pipe.read(64 * 1024)\n',
+              'available-byte pipe read')
+
+          old = '    resolved_executable = executable or _find_tenets_executable()\n    command: tuple[str, ...] = ()\n'
+          new = '''    resolved_executable = executable or _find_tenets_executable()\n    if executable and not _is_trusted_tenets_executable(executable):\n        resolved_executable = None\n    installed_version = _tenets_distribution_version()\n    if resolved_executable and installed_version != TENETS_VERSION:\n        resolved_executable = None\n    command: tuple[str, ...] = ()\n'''
+          s = replace_once(s, old, new, 'version/trust gate')
+          old = '''    message = (\n        f"Tenets {TENETS_VERSION} is not installed; install FlexFactor with "\n        "the context extra (or the all extra) to enable local file ranking."\n    )\n'''
+          new = '''    if installed_version and installed_version != TENETS_VERSION:\n        message = (\n            f"Tenets version mismatch: expected {TENETS_VERSION}, found {installed_version}; "\n            "ranking disabled so an untested tool cannot influence audit order."\n        )\n    elif executable and not _is_trusted_tenets_executable(executable):\n        message = "Tenets executable is outside the active Python installation; ranking disabled."\n    else:\n        message = (\n            f"Tenets {TENETS_VERSION} is not installed; install FlexFactor with "\n            "the context extra (or the all extra) to enable local file ranking."\n        )\n'''
+          s = replace_once(s, old, new, 'unavailable message')
+
+          old = '''    _atomic_write_json(output_path, result.to_dict())\n    return result\n'''
+          new = '''    try:\n        _atomic_write_json(output_path, result.to_dict())\n    except OSError as exc:\n        # Context ranking is optional. Evidence storage must never abort the audit\n        # or throw away a ranking that was already safely produced.\n        result = replace(\n            result,\n            message=_bounded_text(f"{result.message} Evidence write failed: {exc}"),\n            output_path="",\n        )\n    return result\n'''
+          s = replace_once(s, old, new, 'evidence fail-open')
+
+          old = '''    for index, item in enumerate(args):\n        if item == "--goal" and index + 1 < len(args) and args[index + 1].strip():\n            return args[index + 1].strip()\n        if item.startswith("--goal=") and item.partition("=")[2].strip():\n            return item.partition("=")[2].strip()\n'''
+          new = '''    task_flags = ("--session-prompt", "--guiding-prompt", "--goal")\n    for flag in task_flags:\n        for index, item in enumerate(args):\n            if item == flag and index + 1 < len(args) and args[index + 1].strip():\n                return args[index + 1].strip()\n            prefix = flag + "="\n            if item.startswith(prefix) and item.partition("=")[2].strip():\n                return item.partition("=")[2].strip()\n'''
+          s = replace_once(s, old, new, 'audit task flags')
+
+          install_start = s.index('def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | None = None) -> None:')
+          install_end = s.index('\ndef build_parser()', install_start)
+          install_impl = '''def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | None = None) -> None:\n    """Idempotently prioritize canonical audit candidates without changing membership."""\n    with _INSTALL_LOCK:\n        if module_globals.get("_FLEXFACTOR_TENETS_INSTALLED"):\n            return\n        module_globals["_FLEXFACTOR_TENETS_INSTALLED"] = True\n        prior_enum = module_globals.get("_enumerate_source_files")\n        prior_manifest = module_globals.get("_repository_review_manifest")\n        if not callable(prior_enum) and not callable(prior_manifest):\n            return\n        task = _argv_task(argv)\n        canonicalize = module_globals.get("_canon_rel")\n\n        def context_for(root: Path) -> TenetsContextResult | None:\n            if not enabled():\n                return None\n            try:\n                result = cached_tenets_context(root, task)\n            except Exception as exc:\n                module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))\n                return None\n            module_globals["_TENETS_CONTEXT_LAST"] = result.to_dict()\n            return result if result.status == "ok" else None\n\n        if callable(prior_enum):\n            def enumerate_source_files(*args: Any, **kwargs: Any) -> Any:\n                root = _infer_project_root(args, kwargs)\n                if root is None:\n                    return prior_enum(*args, **kwargs)\n                result = context_for(root)\n                if result is None:\n                    return prior_enum(*args, **kwargs)\n                try:\n                    source_files, cap = _call_with_lifted_cap(\n                        prior_enum, module_globals, args, kwargs\n                    )\n                except Exception as exc:\n                    message = _bounded_text(\n                        f"uncapped enumeration failed; original order preserved: {exc}"\n                    )\n                    degraded = result.to_dict()\n                    degraded["status"] = "degraded"\n                    degraded["message"] = message\n                    module_globals["_TENETS_CONTEXT_LAST"] = degraded\n                    module_globals["_TENETS_CONTEXT_LAST_ERROR"] = message\n                    return prior_enum(*args, **kwargs)\n                prioritized = _prioritize_paths(source_files, result.files, canonicalize)\n                return _limit_paths(prioritized, cap)\n\n            enumerate_source_files._tenets_wrapped = True  # type: ignore[attr-defined]\n            module_globals["_enumerate_source_files"] = enumerate_source_files\n\n        if callable(prior_manifest):\n            def repository_review_manifest(*args: Any, **kwargs: Any) -> Any:\n                manifest = prior_manifest(*args, **kwargs)\n                if not isinstance(manifest, Mapping):\n                    return manifest\n                root = _infer_project_root(args, kwargs)\n                if root is None:\n                    return manifest\n                result = context_for(root)\n                if result is None:\n                    return manifest\n                reviewable = manifest.get("reviewable_files")\n                prioritized = _prioritize_paths(reviewable, result.files, canonicalize)\n                if prioritized is reviewable:\n                    return manifest\n                updated = dict(manifest)\n                updated["reviewable_files"] = prioritized\n                return updated\n\n            repository_review_manifest._tenets_wrapped = True  # type: ignore[attr-defined]\n            module_globals["_repository_review_manifest"] = repository_review_manifest\n'''
+          s = s[:install_start] + install_impl + s[install_end:]
+          write(p, s)
+
+          # Shared direct CLI entrypoint, including `python flexfactor.py`.
+          p = Path('flexfactor.py')
+          s = read(p)
+          tree = ast.parse(s)
+          fn = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == 'run_cli')
+          lines = s.splitlines(keepends=True)
+          assert any(a.arg == 'argv' for a in fn.args.args), 'run_cli argv argument not found'
+          if not any('_runtime_tenets.install(globals()' in lines[i] for i in range(fn.lineno - 1, fn.end_lineno or fn.lineno)):
+              anchor = None
+              for i in range(fn.lineno - 1, fn.end_lineno or fn.lineno):
+                  if '_ff_directed.install(globals())' in lines[i]:
+                      anchor = i
+                      break
+              assert anchor is not None, 'directed run_cli install anchor not found'
+              indent = lines[anchor][:len(lines[anchor]) - len(lines[anchor].lstrip())]
+              insertion = [
+                  indent + 'import sys as _runtime_sys\n',
+                  indent + 'import flexfactor_tenets as _runtime_tenets\n',
+                  indent + '_runtime_tenets.install(globals(), argv=(argv if argv is not None else _runtime_sys.argv[1:]))\n',
+              ]
+              lines[anchor + 1:anchor + 1] = insertion
+              s = ''.join(lines)
+          ast.parse(s)
+          write(p, s)
+
+          # Mechanical process-launch exemption after resolver/version hardening.
+          p = Path('flexfactor_invariant_sweep_tests.py')
+          s = read(p)
+          anchor = '''_PROCESS_LAUNCH_SITES = {\n'''
+          entry = '''_PROCESS_LAUNCH_SITES = {\n    "flexfactor_tenets.py::_run_bounded_process": (\n        "Optional local Tenets 0.13.3 context ranker launches only the exact "\n        "console script resolved from the active Python installation after exact "\n        "distribution-version validation; ambient PATH and target-controlled "\n        "executables are rejected, shell=False, and time/output are bounded."\n    ),\n'''
+          s = replace_once(s, anchor, entry, 'process launch registry')
+          write(p, s)
+
+          # The general invariant requires every test module in required CI.
+          p = Path('.github/workflows/production-readiness.yml')
+          s = read(p)
+          s = replace_once(s,
+              '                   flexfactor_runtime_hardening_tests.py \\\n',
+              '                   flexfactor_runtime_hardening_tests.py \\\n                   flexfactor_tenets_tests.py \\\n',
+              'production test list')
+          write(p, s)
+
+          # Windows setup-python legitimately places console scripts in Scripts.
+          p = Path('.github/workflows/tenets-context.yml')
+          s = read(p)
+          old = '''          assert Path(executable).resolve().parent == interpreter_dir, (\n              executable,\n              interpreter_dir,\n          )\n'''
+          new = '''          trusted_dirs = {\n              interpreter_dir,\n              (Path(sys.prefix).resolve() / ("Scripts" if os.name == "nt" else "bin")),\n          }\n          assert Path(executable).resolve().parent in trusted_dirs, (\n              executable,\n              sorted(str(path) for path in trusted_dirs),\n          )\n'''
+          s = replace_once(s, old, new, 'windows scripts assertion')
+          write(p, s)
+
+          # Hermetic regressions for every review finding and shared entrypoint.
+          p = Path('flexfactor_tenets_tests.py')
+          s = read(p)
+          s = replace_once(s,
+              '        self.state_patch.start()\n        with ft._RESULT_CACHE_LOCK:\n',
+              '        self.state_patch.start()\n        self.version_patch = mock.patch.object(ft, "_tenets_distribution_version", return_value=ft.TENETS_VERSION)\n        self.version_patch.start()\n        with ft._RESULT_CACHE_LOCK:\n',
+              'test version setup')
+          s = replace_once(s,
+              '        self.state_patch.stop()\n        self.temp.cleanup()\n',
+              '        self.version_patch.stop()\n        self.state_patch.stop()\n        self.temp.cleanup()\n',
+              'test version teardown')
+
+          pattern = re.compile(r'    def test_virtualenv_sibling_executable_precedes_ambient_path\(self\) -> None:\n.*?(?=    def test_success_keeps_only_safe_unique_repository_paths)', re.S)
+          replacement = '''    def test_trusted_interpreter_install_resolution_ignores_ambient_path(self) -> None:\n        scripts = Path(self.temp.name) / "venv" / "Scripts"\n        scripts.mkdir(parents=True)\n        interpreter = scripts / "python.exe"\n        interpreter.write_bytes(b"")\n        tenets = scripts / "tenets.exe"\n        tenets.write_bytes(b"")\n        with mock.patch.object(ft.sys, "prefix", str(Path(self.temp.name) / "other-prefix")):\n            found = ft._find_tenets_executable(\n                interpreter=interpreter, platform_name="nt", path_value=str(self.root)\n            )\n        self.assertEqual(Path(found or ""), tenets.resolve())\n\n    def test_ambient_path_tenets_is_never_executed(self) -> None:\n        fake = self.root / ("tenets.exe" if os.name == "nt" else "tenets")\n        fake.write_bytes(b"MZ" if os.name == "nt" else b"#!/bin/sh\\nexit 0\\n")\n        if os.name != "nt":\n            fake.chmod(0o755)\n        with mock.patch.object(ft.sys, "prefix", str(Path(self.temp.name) / "empty-prefix")):\n            found = ft._find_tenets_executable(\n                interpreter=Path(self.temp.name) / "python", path_value=str(self.root)\n            )\n        self.assertIsNone(found)\n\n'''
+          s, n = pattern.subn(replacement, s, count=1)
+          assert n == 1, f'resolver test replacement count={n}'
+
+          marker = '\n\nclass TenetsInstallTests(unittest.TestCase):\n'
+          extra_context = r'''
+    def test_distribution_version_mismatch_disables_execution(self) -> None:
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
+             mock.patch.object(ft, "_tenets_distribution_version", return_value="0.13.2"), \
+             mock.patch.object(ft, "_run_bounded_process") as runner:
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("version mismatch", result.message)
+        runner.assert_not_called()
+
+    def test_evidence_write_failure_preserves_safe_ranking(self) -> None:
+        payload = {"files": [{"path": "src/app.py", "score": 1.0}]}
+        completed = self._process(stdout=json.dumps(payload).encode())
+        with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
+             mock.patch.object(ft, "_run_bounded_process", return_value=completed), \
+             mock.patch.object(ft, "_atomic_write_json", side_effect=OSError("read only")):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([item.path for item in result.files], ["src/app.py"])
+        self.assertEqual(result.output_path, "")
+        self.assertIn("Evidence write failed", result.message)
+
+    def test_reader_prefers_available_byte_read1(self) -> None:
+        class Pipe:
+            def __init__(self):
+                self.calls = 0
+            def read1(self, _size):
+                self.calls += 1
+                return b"abcdef" if self.calls == 1 else b""
+            def read(self, _size):
+                raise AssertionError("blocking read must not be used when read1 exists")
+            def close(self):
+                pass
+        chunks = []
+        overflow = __import__("threading").Event()
+        state = {}
+        lock = __import__("threading").Lock()
+        ft._read_bounded_pipe(Pipe(), limit=3, stream_name="stdout", chunks=chunks,
+                              overflow_event=overflow, state=state, state_lock=lock)
+        self.assertTrue(overflow.is_set())
+        self.assertEqual(b"".join(chunks), b"abc")
+        self.assertEqual(state.get("overflow_stream"), "stdout")
+
+    def test_audit_prompt_spellings_drive_context_task(self) -> None:
+        for argv, expected in (
+            (["audit", "--session-prompt", "repair billing"], "repair billing"),
+            (["prodready", "--session-prompt=repair auth"], "repair auth"),
+            (["audit", "--guiding-prompt", "repair queue"], "repair queue"),
+            (["audit", "--guiding-prompt=repair launch"], "repair launch"),
+        ):
+            with self.subTest(argv=argv), mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+                self.assertEqual(ft._argv_task(argv), expected)
+'''
+          assert marker in s
+          s = s.replace(marker, '\n' + extra_context + marker, 1)
+
+          end_marker = '\n\nif __name__ == "__main__":\n'
+          extra_install = r'''
+
+class TenetsManifestAndEntryTests(unittest.TestCase):
+    def test_manifest_reviewable_files_are_ranked_without_dropping_members(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            original = ["src/first.py", "src/second.py", "src/target.py"]
+            def manifest(project_dir):
+                return {"reviewable_files": list(original), "binary_files": ["asset.bin"], "count": 4}
+            runtime = {
+                "_repository_review_manifest": manifest,
+                "_canon_rel": lambda value: value.replace("\\", "/").removeprefix("./"),
+            }
+            ranked = ft.TenetsContextResult(
+                schema_version=1, tool="tenets", expected_version=ft.TENETS_VERSION,
+                adapter_version=2, status="ok", project_root=str(root), task="audit",
+                files=(ft.RankedFile("src/target.py", 1.0),), message="ok",
+                duration_seconds=0.0, output_path="", command=("tenets",),
+            )
+            with mock.patch.object(ft, "cached_tenets_context", return_value=ranked):
+                ft.install(runtime, argv=["audit", "--session-prompt", "target task"])
+                first = runtime["_repository_review_manifest"](str(root))
+                second = runtime["_repository_review_manifest"](str(root))
+            self.assertEqual(first["reviewable_files"], ["src/target.py", "src/first.py", "src/second.py"])
+            self.assertCountEqual(first["reviewable_files"], original)
+            self.assertEqual(second["reviewable_files"], first["reviewable_files"])
+            self.assertEqual(first["binary_files"], ["asset.bin"])
+
+    def test_shared_run_cli_arms_tenets_for_direct_entrypoints(self) -> None:
+        import inspect
+        import flexfactor as ff
+        source = inspect.getsource(ff.run_cli)
+        self.assertIn("_runtime_tenets.install(globals()", source)
+'''
+          assert end_marker in s
+          s = s.replace(end_marker, extra_install + end_marker, 1)
+          write(p, s)
+
+          for path in ('flexfactor.py', 'flexfactor_tenets.py', 'flexfactor_tenets_tests.py', 'flexfactor_invariant_sweep_tests.py'):
+              ast.parse(read(path), filename=path)
+          print('Tenets hardening patch applied')
+          PY
+      - name: Install test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+      - name: Verify hardening
+        shell: bash
+        run: |
+          set -e
+          python -m py_compile flexfactor.py flexfactor_tenets.py flexfactor_tenets_tests.py flexfactor_invariant_sweep_tests.py
+          python flexfactor_tenets_tests.py
+          python flexfactor_invariant_sweep_tests.py
+          git diff --check
+      - name: Commit permanent fixes
+        shell: bash
+        run: |
+          set -e
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add flexfactor.py flexfactor_tenets.py flexfactor_tenets_tests.py flexfactor_invariant_sweep_tests.py .github/workflows/production-readiness.yml .github/workflows/tenets-context.yml
+          git diff --cached --quiet && { echo 'No hardening diff'; exit 1; }
+          git commit -m 'Close Tenets integration review gaps'
+          git push origin HEAD:fix/tenets-context-integration
