@@ -154,6 +154,9 @@ EVIDENCE_STATES = ("pass", "fail", "na", "unknown")
 # least this much room. A v2 contract may not authorize mutation unless its
 # purpose, required claims, and complete referenced evidence fit this budget.
 REQUIRED_V2_PROMPT_MAX_CHARS = 10000
+# ``purpose_contract`` is placed before later evidence in exact-commit review.
+# Keep its complete serialized form bounded well below that review envelope.
+REQUIRED_V2_SERIALIZED_MAX_CHARS = 40000
 
 
 def slugify(text: str) -> str:
@@ -268,8 +271,14 @@ class PurposeContract:
             ("workflows", "CORE END-TO-END JOURNEYS"),
             ("invariants", "MUTATION INVARIANTS"),
         )
+        contextual_sections = (
+            ("current_behavior", "CURRENT OBSERVED BEHAVIOR"),
+            ("aspirations", "OWNER ASPIRATIONS"),
+            ("gaps", "KNOWN PURPOSE GAPS"),
+        )
         if self.structured_claims:
-            for key, heading in required_sections:
+            for key, heading in (*contextual_sections[:2], *required_sections,
+                                 contextual_sections[2]):
                 claims = self.structured_claims.get(key) or []
                 if not claims:
                     continue
@@ -480,6 +489,9 @@ _V2_STRUCTURED_MARKERS = frozenset({
     "invariants", "contradictions", "resolved_contradictions", "gaps",
     "evidence",
 })
+_V2_REGISTRY_METADATA_KEYS = frozenset({
+    "repo", "default_branch", "local_path", "locator", "source",
+})
 _RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
@@ -533,7 +545,9 @@ def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
     )
 
 
-def _v2_contract_is_valid(entry, *, authoritative: bool) -> bool:
+def _v2_contract_is_valid(
+    entry, *, authoritative: bool, allow_registry_metadata: bool
+) -> bool:
     """Validate a complete v2 contract, optionally for mutation authority.
 
     This intentionally implements the checked-in JSON Schema in stdlib code so
@@ -545,8 +559,12 @@ def _v2_contract_is_valid(entry, *, authoritative: bool) -> bool:
     if not isinstance(entry, dict):
         return False
     keys = set(entry)
-    if not _V2_REQUIRED_KEYS.issubset(keys) \
-            or not keys.issubset(_V2_TOP_LEVEL_KEYS):
+    metadata_keys = keys & _V2_REGISTRY_METADATA_KEYS
+    if metadata_keys and not allow_registry_metadata:
+        return False
+    payload_keys = keys - metadata_keys
+    if not _V2_REQUIRED_KEYS.issubset(payload_keys) \
+            or not payload_keys.issubset(_V2_TOP_LEVEL_KEYS):
         return False
     if entry.get("schema") != _V2_SCHEMA:
         return False
@@ -555,6 +573,15 @@ def _v2_contract_is_valid(entry, *, authoritative: bool) -> bool:
         return False
     for optional_text in ("historical_purpose", "slug"):
         if optional_text in entry and not isinstance(entry[optional_text], str):
+            return False
+    for metadata_text in ("repo", "default_branch", "local_path", "locator"):
+        if metadata_text in entry and not _nonblank_string(entry[metadata_text]):
+            return False
+    if "source" in entry:
+        source = entry["source"]
+        if not isinstance(source, dict) or not source or any(
+                not _nonblank_string(key) or not _nonblank_string(value)
+                for key, value in source.items()):
             return False
         if optional_text == "slug" and optional_text in entry \
                 and not _nonblank_string(entry[optional_text]):
@@ -630,22 +657,36 @@ def _v2_contract_is_valid(entry, *, authoritative: bool) -> bool:
     return True
 
 
-def _v2_contract_is_well_formed(entry) -> bool:
+def _v2_contract_is_well_formed(
+    entry, *, allow_registry_metadata: bool = True
+) -> bool:
     """Whether ``entry`` has the complete v2 evidence-bearing shape.
 
     This deliberately does not grant mutation authority: uncertain required
     claims, open contradictions, and uncertain resolutions remain valid
     discovery records but fail the stricter authority validator below.
     """
-    return _v2_contract_is_valid(entry, authoritative=False)
+    return _v2_contract_is_valid(
+        entry,
+        authoritative=False,
+        allow_registry_metadata=allow_registry_metadata,
+    )
 
 
-def _v2_contract_is_authoritative(entry) -> bool:
+def _v2_contract_is_authoritative(
+    entry, *, allow_registry_metadata: bool = True
+) -> bool:
     """Whether a complete v2 contract may authorize repository mutation."""
-    return _v2_contract_is_valid(entry, authoritative=True)
+    return _v2_contract_is_valid(
+        entry,
+        authoritative=True,
+        allow_registry_metadata=allow_registry_metadata,
+    )
 
 
-def _contract_from_registry(entry: dict) -> PurposeContract | None:
+def _contract_from_registry(
+    entry: dict, *, allow_registry_metadata: bool = True
+) -> PurposeContract | None:
     if not isinstance(entry, dict):
         return None
     is_v2 = entry.get("schema") == _V2_SCHEMA
@@ -654,7 +695,8 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
     # in-repo file fall through to a valid owner registry contract (or honest
     # inference) instead of turning partial JSON into mutation authority.
     if (("schema" in entry or looks_structured) and not is_v2) \
-            or (is_v2 and not _v2_contract_is_authoritative(entry)):
+            or (is_v2 and not _v2_contract_is_authoritative(
+                entry, allow_registry_metadata=allow_registry_metadata)):
         return None
 
     def _legacy_text_items(field: str) -> list[str]:
@@ -717,9 +759,14 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
     if is_v2:
         try:
             contract.prompt_block(max_chars=REQUIRED_V2_PROMPT_MAX_CHARS)
+            serialized = json.dumps(
+                contract.to_dict(), sort_keys=True, ensure_ascii=False
+            )
         except ValueError:
             # A structurally valid contract that cannot expose every required
             # constraint inside the mutation context must remain unresolved.
+            return None
+        if len(serialized) > REQUIRED_V2_SERIALIZED_MAX_CHARS:
             return None
     return contract
 
@@ -744,10 +791,11 @@ def _contract_from_repo_lookup(
                 continue
             if not isinstance(data, dict):
                 continue
-            c = _contract_from_registry(data)
+            c = _contract_from_registry(data, allow_registry_metadata=False)
             if c is None:
                 if data.get("schema") == _V2_SCHEMA \
-                        and _v2_contract_is_well_formed(data):
+                        and _v2_contract_is_well_formed(
+                            data, allow_registry_metadata=False):
                     return None, True
                 continue
             # A CONTRACT WITH NO PURPOSE IS NOT AN AUTHORED CONTRACT. The

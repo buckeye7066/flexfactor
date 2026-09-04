@@ -369,6 +369,70 @@ class PurposeContractV2Tests(_TempRepo):
                     "RESOLUTION: The signed owner policy controls.", prompt
                 )
 
+    def test_optional_claims_are_visible_and_bounded_before_authority(self):
+        contract_doc = self._contract(
+            current_behavior=[self._claim(
+                "c-1", "Receipts currently require a manual export."
+            )],
+            aspirations=[self._claim(
+                "a-1", "Owners want a verified automatic export.", "supported"
+            )],
+            gaps=[self._claim(
+                "g-1", "Automatic export is not implemented."
+            )],
+        )
+        contract = fp._contract_from_registry(contract_doc)
+        self.assertIsNotNone(contract)
+        prompt = contract.prompt_block()
+        self.assertIn("CURRENT OBSERVED BEHAVIOR", prompt)
+        self.assertIn("Receipts currently require a manual export.", prompt)
+        self.assertIn("OWNER ASPIRATIONS", prompt)
+        self.assertIn("KNOWN PURPOSE GAPS", prompt)
+
+        for section in ("current_behavior", "aspirations", "gaps"):
+            with self.subTest(section=section):
+                oversized = self._contract(**{
+                    section: [self._claim("huge", "x" * 100000)],
+                })
+                self.assertIsNone(fp._contract_from_registry(oversized))
+
+    def test_v2_registry_envelope_metadata_is_preserved_after_validation(self):
+        source = {
+            "doc": "memory/purpose_contracts.json",
+            "section": "Receipt Maker",
+            "authored_by": "owner",
+        }
+        entry = self._contract(
+            repo="buckeye7066/receipt-maker",
+            default_branch="main",
+            local_path=self.root,
+            locator="owner registry",
+            source=source,
+        )
+
+        contract = fp.find_contract(
+            "Unmatched Program", self.root, registry={"receipt-maker": entry}
+        )
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.repo, "buckeye7066/receipt-maker")
+        self.assertEqual(contract.default_branch, "main")
+        self.assertEqual(contract.local_path, self.root)
+        self.assertEqual(contract.locator, "owner registry")
+        self.assertEqual(contract.source, source)
+
+    def test_v2_registry_envelope_rejects_malformed_metadata(self):
+        for field, value in (
+            ("local_path", []),
+            ("repo", "   "),
+            ("source", {}),
+            ("source", {"doc": 7}),
+        ):
+            with self.subTest(field=field, value=value):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(**{field: value})
+                ))
+
     def test_malformed_v2_claim_rejects_the_entire_contract(self):
         for unsafe in (
             7,
