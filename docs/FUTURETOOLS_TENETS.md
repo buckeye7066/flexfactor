@@ -61,10 +61,14 @@ pinned Tenets CLI in the execution path.
 
 The Tenets process also starts in that temporary directory rather than in the
 audited checkout. Its home, configuration, cache, and data directories are
-disposable, and target-repository entries are removed from its `PATH`. This
-prevents an untrusted checkout from supplying a `git` executable or directing
-Tenets state writes through repository or user configuration. The absolute
-project argument remains read-only ranking input.
+disposable. The child receives a minimal OS-variable allowlist rather than
+provider keys, repository credentials, proxies, or unrelated application
+secrets. Its inherited Python import overrides are removed, its `PATH` is empty,
+Git ranking is disabled, and GitPython is pointed at a private nonexistent
+executable. This prevents an untrusted checkout from shadowing the pinned
+package, supplying a helper executable, or triggering executable local Git
+configuration such as `core.fsmonitor`. The absolute project argument remains
+read-only ranking input.
 
 Writing outside the target repository is deliberate: generating context must
 not make a clean repository dirty and trip FlexFactor's own dirty-tree gate.
@@ -88,9 +92,11 @@ verification.
 
 Stdout and stderr are consumed concurrently with hard limits while the process
 is running. FlexFactor terminates the child as soon as either stream exceeds its
-limit, preventing a noisy or defective subprocess from exhausting memory.
-Timeouts must be positive finite numbers. The temporary JSON output is also
-bounded before parsing and is removed before the adapter returns.
+limit, preventing a noisy or defective subprocess from exhausting memory. The
+ranker starts in an isolated POSIX session or Windows process group, and timeout
+cleanup terminates the complete descendant tree rather than only the direct
+child. Timeouts must be positive finite numbers. The temporary JSON output is
+also bounded before parsing and is removed before the adapter returns.
 
 Automatic launcher integration can be disabled without uninstalling the tool:
 
@@ -107,13 +113,16 @@ repeated review passes do not rerun the ranker.
 `flexfactor_tenets_tests.py` is hermetic and covers path containment, duplicate
 removal, virtual-environment executable discovery, finite timeout validation,
 bounded stdout and stderr, isolated process state and helper lookup,
+Python-path and Git isolation, process-tree termination,
 timeout/non-zero/malformed-output degradation, cache
 behavior, idempotent runtime installation, the disable switch, parameter and
 global cap lifting, cap restoration, and the invariant that prioritization
 never enlarges a bounded review. Regression tests also prove that ranked files
 beyond 100,000 candidates remain selectable, that failed uncapped discovery
 falls back to the original capped order with degraded evidence, and that real
-CLI file output is consumed even when console stdout contains status text.
+CLI file output is consumed even when console stdout contains status text. The
+launcher tests also cover explicit argument forwarding and duplicate project
+basenames so one program cannot inherit another program's ranking objective.
 
 The `tenets-context` GitHub Actions workflow runs those tests on Windows and
 Linux. Separate live jobs on both operating systems install the exact pinned
