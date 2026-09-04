@@ -7639,7 +7639,6 @@ _PUBLICATION_EVIDENCE_GATE_IDS = frozenset({
 })
 _PUBLICATION_PRODUCT_GATE_IDS = frozenset({
     "competitive-provenance",
-    "competitive-fit-risk-reviewed",
     "no-blind-competitor-copying",
     "selected-capabilities-delivered",
 })
