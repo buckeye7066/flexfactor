@@ -259,8 +259,189 @@ def _find_tenets_executable(
 def _tenets_distribution_version() -> str | None:
     try:
         return importlib_metadata.version("tenets")
-    except importlib_metadata.PackageNotFoundError:
+    except Exception:
+        # Distribution metadata is optional input.  A partially installed
+        # package/backend can raise filesystem, decoding, archive, parser, or
+        # other ordinary metadata errors here; none may turn an unavailable
+        # advisory ranker into a traceback that aborts the production audit.
+        # BaseException subclasses still propagate, so interrupts are honored.
         return None
+
+
+def _create_windows_kill_job(process: subprocess.Popen[bytes]) -> int:
+    """Put ``process`` in a kill-on-close Windows Job Object.
+
+    A console process group is not a containment boundary after its leader
+    exits: ``taskkill /T`` can no longer discover an orphaned descendant from
+    that exited PID.  A Job Object retains the descendant set independently of
+    the leader, so closing/terminating it remains effective for that case.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        )
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = tuple(
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )
+        )
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = _ExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process_handle = wintypes.HANDLE(int(getattr(process, "_handle")))
+        if not kernel32.AssignProcessToJobObject(handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        value = handle if isinstance(handle, int) else handle.value
+        if not value:
+            raise OSError("Windows Job Object returned an invalid handle")
+        return int(value)
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _resume_windows_process(process_id: int) -> None:
+    """Resume the primary thread of a process created with CREATE_SUSPENDED."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32))
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = (wintypes.HANDLE,)
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # SNAPTHREAD
+    invalid_handle = ctypes.c_void_p(-1).value
+    snapshot_value = snapshot if isinstance(snapshot, int) else snapshot.value
+    if not snapshot or snapshot_value == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    resumed = 0
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        available = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+        while available:
+            if int(entry.th32OwnerProcessID) == int(process_id):
+                thread = kernel32.OpenThread(
+                    0x0002, False, entry.th32ThreadID  # THREAD_SUSPEND_RESUME
+                )
+                if thread:
+                    try:
+                        previous = kernel32.ResumeThread(thread)
+                        if previous != 0xFFFFFFFF:
+                            resumed += 1
+                    finally:
+                        kernel32.CloseHandle(thread)
+            available = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if resumed < 1:
+        raise OSError("could not resume the suspended Tenets process")
+
+
+def _contain_and_resume_windows_process(process: subprocess.Popen[bytes]) -> int:
+    """Atomically establish descendant containment before Tenets can execute."""
+    job = _create_windows_kill_job(process)
+    try:
+        _resume_windows_process(process.pid)
+    except Exception:
+        _terminate_windows_kill_job(job)
+        raise
+    return job
+
+
+def _terminate_windows_kill_job(handle: int) -> None:
+    """Terminate every member of a Windows Job Object and release it."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    job = wintypes.HANDLE(handle)
+    try:
+        kernel32.TerminateJobObject(job, 1)
+    finally:
+        kernel32.CloseHandle(job)
+
+
+def _posix_process_group_alive(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 def _read_bounded_pipe(
     pipe: BinaryIO,
@@ -306,7 +487,9 @@ def _read_bounded_pipe(
             pass
 
 
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes], *, windows_job: int | None = None
+) -> None:
     """Stop the ranker and every helper it created.
 
     ``terminate()`` only addresses the direct child.  A helper that inherited
@@ -314,10 +497,16 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
     threads blocked.  The child is always launched as a new POSIX session or
     Windows process group by :func:`_run_bounded_process`.
     """
-    if process.poll() is not None:
-        return
-
     if os.name == "nt":
+        if windows_job is not None:
+            _terminate_windows_kill_job(windows_job)
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return
+        if process.poll() is not None:
+            return
         # Windows has no killpg equivalent.  taskkill's /T flag walks the
         # descendant tree and /F prevents a console-less process from ignoring
         # the request.  Use an absolute system path so neither the audited
@@ -347,31 +536,39 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
             except OSError:
                 pass
     else:
+        # The group can outlive its leader.  Address the retained PGID even
+        # when Popen.poll() already reports that the direct process exited.
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+        deadline = time.monotonic() + 1
+        while _posix_process_group_alive(process.pid) and time.monotonic() < deadline:
+            process.poll()  # Reap an exited leader; descendants retain the PGID.
+            time.sleep(0.02)
+        if _posix_process_group_alive(process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
 
     try:
         process.wait(timeout=1)
-        return
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        if os.name == "nt":
+            try:
+                process.kill()
+            except OSError:
+                pass
 
-    if os.name != "nt":
+
+def _close_process_pipes(process: subprocess.Popen[bytes]) -> None:
+    for pipe in (process.stdout, process.stderr):
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-    else:
-        try:
-            process.kill()
+            if pipe is not None:
+                pipe.close()
         except OSError:
             pass
-    try:
-        process.wait(timeout=1)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
 
 
 def _run_bounded_process(
@@ -389,7 +586,12 @@ def _run_bounded_process(
     process_group: dict[str, Any]
     if os.name == "nt":
         process_group = {
-            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            # CREATE_SUSPENDED closes the launch/assignment race: no ranker or
+            # helper instruction runs until the kill-on-close Job Object owns
+            # the process.  The primary thread is resumed immediately after.
+            "creationflags": (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | 0x00000004
+            ),
         }
     else:
         process_group = {"start_new_session": True}
@@ -403,6 +605,16 @@ def _run_bounded_process(
         env=dict(env) if env is not None else None,
         **process_group,
     )
+    windows_job: int | None = None
+    if os.name == "nt":
+        try:
+            windows_job = _contain_and_resume_windows_process(process)
+        except Exception as exc:
+            # Do not run an optional helper without the containment required
+            # to clean up descendants after the direct ranker exits.
+            _terminate_process_tree(process)
+            _close_process_pipes(process)
+            raise OSError(f"could not contain Tenets in a Windows Job Object: {exc}") from exc
     assert process.stdout is not None
     assert process.stderr is not None
 
@@ -446,22 +658,28 @@ def _run_bounded_process(
 
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
+    tree_closed = False
     while process.poll() is None:
         if overflow_event.wait(timeout=0.02):
-            _terminate_process_tree(process)
+            _terminate_process_tree(process, windows_job=windows_job)
+            tree_closed = True
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
-            _terminate_process_tree(process)
+            _terminate_process_tree(process, windows_job=windows_job)
+            tree_closed = True
             break
         try:
             process.wait(timeout=min(0.05, remaining))
         except subprocess.TimeoutExpired:
             continue
 
-    if process.poll() is None:
-        _terminate_process_tree(process)
+    # Always close the containment boundary.  The direct process can exit zero
+    # while a descendant keeps inherited output pipes (or other work) alive.
+    # The retained POSIX PGID / Windows Job Object still identifies that tree.
+    if not tree_closed:
+        _terminate_process_tree(process, windows_job=windows_job)
     reader_deadline = time.monotonic() + 3
     for reader in readers:
         reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
@@ -756,6 +974,75 @@ def _program_identity(value: str | os.PathLike[str]) -> str:
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
+def _program_candidates(programs: Sequence[str]) -> list[tuple[int, str, str, str]]:
+    candidates: list[tuple[int, str, str, str]] = []
+    for index, program in enumerate(programs):
+        candidate = Path(program).expanduser()
+        try:
+            candidate_full = os.path.normcase(str(candidate.resolve(strict=False)))
+        except OSError:
+            candidate_full = os.path.normcase(str(candidate.absolute()))
+        candidates.append(
+            (index, program, candidate_full, _program_identity(program))
+        )
+    return candidates
+
+
+def _matching_program_index(
+    programs: Sequence[str], project: str | os.PathLike[str]
+) -> int | None:
+    root = Path(project).expanduser().resolve(strict=False)
+    root_full = os.path.normcase(str(root))
+    candidates = _program_candidates(programs)
+    exact = [index for index, _program, full, _identity in candidates
+             if full == root_full]
+    if exact:
+        return exact[0]
+    root_identity = _program_identity(root.name)
+    identity_matches = [
+        index for index, _program, _full, identity in candidates
+        if identity and identity == root_identity
+    ]
+    return identity_matches[0] if len(identity_matches) == 1 else None
+
+
+def _routed_session_task(
+    prompt: str,
+    programs: Sequence[str],
+    project: str | os.PathLike[str],
+) -> str | None:
+    """Return only the session instruction routed to this exact target."""
+    selected = _matching_program_index(programs, project)
+    if selected is None:
+        return None
+    candidates = _program_candidates(programs)
+    targets = [(program, full) for _index, program, full, _identity in candidates]
+    try:
+        import flexfactor_steering
+
+        routed = flexfactor_steering.route_session_prompt(prompt, targets)
+    except (ImportError, OSError, ValueError):
+        return None
+    _index, selected_program, selected_full, _identity = candidates[selected]
+    for route in routed.get("routes", ()):
+        if not isinstance(route, Mapping):
+            continue
+        if str(route.get("program") or "").casefold() != selected_program.casefold():
+            continue
+        if os.path.normcase(str(route.get("project_dir") or "")) != selected_full:
+            continue
+        instruction = str(route.get("instruction") or "").strip()
+        return instruction or None
+    return None
+
+
+def _default_task(mode: str) -> str:
+    return (
+        f"{mode} this application for production readiness: prioritize broken user journeys, "
+        "security and privacy defects, release blockers, failure handling, and missing tests"
+    )
+
+
 def _argv_task(
     argv: Sequence[str] | None,
     *,
@@ -769,51 +1056,31 @@ def _argv_task(
         (item for item in args if item in {"refactor", "scout", "audit", "prodready"}),
         "audit",
     )
+    programs = _argv_values(args, "--program")
 
     session_prompts = _argv_values(args, "--session-prompt")
     if session_prompts:
-        return session_prompts[0]
+        if project is None or not programs:
+            return session_prompts[0]
+        routed_task = _routed_session_task(session_prompts[0], programs, project)
+        return routed_task or _default_task(mode)
 
     guiding_prompts = _argv_values(args, "--guiding-prompt")
-    programs = _argv_values(args, "--program")
     if guiding_prompts:
         if project is not None and programs:
-            root = Path(project).expanduser().resolve(strict=False)
-            root_full = os.path.normcase(str(root))
-            root_identity = _program_identity(root.name)
-            candidates: list[tuple[int, str, str]] = []
-            for index, program in enumerate(programs):
-                if index >= len(guiding_prompts):
-                    break
-                candidate = Path(program).expanduser()
-                try:
-                    candidate_full = os.path.normcase(str(candidate.resolve(strict=False)))
-                except OSError:
-                    candidate_full = os.path.normcase(str(candidate.absolute()))
-                candidates.append((index, candidate_full, _program_identity(program)))
-
             # Exact resolved paths are authoritative.  A basename/slug is only
             # a fallback when it identifies exactly one program; two checkouts
             # named "app" must never receive each other's repair objective.
-            for index, candidate_full, _identity in candidates:
-                if candidate_full == root_full:
-                    return guiding_prompts[index]
-            identity_matches = [
-                index for index, _candidate_full, identity in candidates
-                if identity and identity == root_identity
-            ]
-            if len(identity_matches) == 1:
-                return guiding_prompts[identity_matches[0]]
+            selected = _matching_program_index(programs, project)
+            if selected is not None and selected < len(guiding_prompts):
+                return guiding_prompts[selected]
         if len(guiding_prompts) == 1:
             return guiding_prompts[0]
 
     goals = _argv_values(args, "--goal")
     if goals:
         return goals[0]
-    return (
-        f"{mode} this application for production readiness: prioritize broken user journeys, "
-        "security and privacy defects, release blockers, failure handling, and missing tests"
-    )
+    return _default_task(mode)
 
 def _infer_project_root(args: Sequence[Any], kwargs: Mapping[str, Any]) -> Path | None:
     for key in ("project_dir", "project", "root", "program"):

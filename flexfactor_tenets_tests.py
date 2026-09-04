@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -72,6 +73,23 @@ class TenetsContextTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "tenets")
         self.assertEqual(payload["expected_version"], "0.13.3")
         self.assertEqual(payload["adapter_version"], 2)
+
+    def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
+        failures = (
+            PermissionError("metadata is unreadable"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid metadata"),
+            ValueError("malformed metadata"),
+            RuntimeError("unexpected metadata backend failure"),
+        )
+        self.version_patch.stop()
+        try:
+            for failure in failures:
+                with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                    ft.importlib_metadata, "version", side_effect=failure
+                ):
+                    self.assertIsNone(ft._tenets_distribution_version())
+        finally:
+            self.version_patch.start()
 
     def test_trusted_interpreter_install_resolution_ignores_ambient_path(self) -> None:
         scripts = Path(self.temp.name) / "venv" / "Scripts"
@@ -208,9 +226,11 @@ class TenetsContextTests(unittest.TestCase):
         process = mock.Mock()
         process.poll.return_value = None
         process.pid = 424242
-        process.wait.side_effect = [subprocess.TimeoutExpired("tenets", 2), None]
+        process.wait.side_effect = subprocess.TimeoutExpired("tenets", 2)
 
-        with mock.patch.object(ft.os, "killpg") as kill_group:
+        with mock.patch.object(ft.os, "killpg") as kill_group, \
+             mock.patch.object(ft, "_posix_process_group_alive", return_value=True), \
+             mock.patch.object(ft.time, "monotonic", side_effect=[0.0, 2.0]):
             ft._terminate_process_tree(process)
 
         self.assertEqual(
@@ -219,6 +239,63 @@ class TenetsContextTests(unittest.TestCase):
         )
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descendant lifecycle contract")
+    def test_descendant_is_killed_when_the_direct_ranker_exits_zero(self) -> None:
+        survivor_file = Path(self.temp.name) / "descendant-survived"
+        script = (
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c',"
+            "'import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text(\"alive\"); time.sleep(60)',"
+            "sys.argv[1]])"
+        )
+        started = time.monotonic()
+
+        result = ft._run_bounded_process(
+            (sys.executable, "-S", "-c", script, str(survivor_file)),
+            cwd=self.root,
+            timeout_seconds=10,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.read_error)
+        self.assertLess(time.monotonic() - started, 4)
+        time.sleep(1.2)
+        self.assertFalse(survivor_file.exists())
+
+    def test_windows_job_cleanup_survives_an_exited_direct_parent(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = 0
+        with mock.patch.object(ft.os, "name", "nt"), mock.patch.object(
+            ft, "_terminate_windows_kill_job"
+        ) as terminate_job:
+            ft._terminate_process_tree(process, windows_job=9123)
+        terminate_job.assert_called_once_with(9123)
+
+    def test_windows_process_is_contained_before_it_is_resumed(self) -> None:
+        process = mock.Mock(pid=417)
+        order: list[str] = []
+        with mock.patch.object(
+            ft, "_create_windows_kill_job",
+            side_effect=lambda _process: order.append("contain") or 9123,
+        ), mock.patch.object(
+            ft, "_resume_windows_process",
+            side_effect=lambda _pid: order.append("resume"),
+        ):
+            job = ft._contain_and_resume_windows_process(process)
+        self.assertEqual(job, 9123)
+        self.assertEqual(order, ["contain", "resume"])
+
+    def test_windows_resume_failure_closes_the_containment_job(self) -> None:
+        process = mock.Mock(pid=417)
+        with mock.patch.object(
+            ft, "_create_windows_kill_job", return_value=9123
+        ), mock.patch.object(
+            ft, "_resume_windows_process", side_effect=OSError("resume failed")
+        ), mock.patch.object(ft, "_terminate_windows_kill_job") as terminate_job:
+            with self.assertRaisesRegex(OSError, "resume failed"):
+                ft._contain_and_resume_windows_process(process)
+        terminate_job.assert_called_once_with(9123)
 
     def test_ranker_never_runs_from_or_resolves_helpers_through_target(self) -> None:
         target_bin = self.root / "tools"
@@ -422,6 +499,43 @@ class TenetsContextTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
             self.assertEqual(ft._argv_task(argv, project=first), "repair grant matching")
             self.assertEqual(ft._argv_task(argv, project=second), "repair family workflow")
+
+    def test_multi_program_session_prompt_is_routed_before_ranking(self) -> None:
+        first = self.root.parent / "GrantFlow"
+        second = self.root.parent / "purpose-foundry"
+        first.mkdir(exist_ok=True)
+        second.mkdir(exist_ok=True)
+        argv = [
+            "audit",
+            "--program", str(first),
+            "--program", str(second),
+            "--session-prompt",
+            "GrantFlow: repair billing. Purpose Foundry: fix deck exports. "
+            "All programs must verify the release.",
+        ]
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            first_task = ft._argv_task(argv, project=first)
+            second_task = ft._argv_task(argv, project=second)
+        self.assertIn("repair billing", first_task)
+        self.assertNotIn("deck exports", first_task)
+        self.assertIn("deck exports", second_task)
+        self.assertNotIn("repair billing", second_task)
+        self.assertIn("verify the release", first_task)
+        self.assertIn("verify the release", second_task)
+
+    def test_unassigned_session_work_never_leaks_to_another_program(self) -> None:
+        first = self.root.parent / "GrantFlow"
+        second = self.root.parent / "purpose-foundry"
+        first.mkdir(exist_ok=True)
+        second.mkdir(exist_ok=True)
+        argv = [
+            "audit", "--program", str(first), "--program", str(second),
+            "--session-prompt", "GrantFlow: repair billing.",
+        ]
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            second_task = ft._argv_task(argv, project=second)
+        self.assertNotIn("repair billing", second_task)
+        self.assertIn("production readiness", second_task)
 
     def test_same_named_programs_prefer_the_exact_resolved_path(self) -> None:
         first = self.root.parent / "one" / "app"
