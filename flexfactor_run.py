@@ -20,8 +20,13 @@ import flexfactor_directed as _directed  # noqa: E402
 import flexfactor_tenets as _tenets  # noqa: E402
 
 _directed.install(vars(_flexfactor))
-_tenets.install(vars(_flexfactor), argv=sys.argv[1:])
-run_cli = _flexfactor.run_cli
+
+
+def run_cli(argv=None):
+    """Arm task ranking with this invocation's arguments, then run FlexFactor."""
+    effective_argv = sys.argv[1:] if argv is None else argv
+    _tenets.install(vars(_flexfactor), argv=effective_argv)
+    return _flexfactor.run_cli(argv)
 
 if __name__ == "__main__":
     # Executable recall prevents a fresh audit from re-discovering known defects.
