@@ -14,7 +14,6 @@ from __future__ import annotations
 import functools
 import os
 import re
-import shutil
 import tempfile
 import threading
 
@@ -141,14 +140,53 @@ def typo_resolve_local_project(name_hints, roots, slugify) -> str | None:
     return None
 
 
-def _powershell_parser_executable() -> str | None:
-    """Prefer Windows PowerShell 5.1 where present, then PowerShell Core."""
-    names = (("powershell.exe", "powershell", "pwsh.exe", "pwsh")
-             if os.name == "nt" else ("pwsh", "powershell"))
-    for name in names:
-        hit = shutil.which(name)
-        if hit:
-            return hit
+def _powershell_parser_executable(
+    *, platform_name: str | None = None, environ=None,
+) -> str | None:
+    """Resolve PowerShell only from trusted OS installation directories.
+
+    Never consult PATH or the current working directory: a target repository is
+    untrusted input and may contain an attacker-controlled ``powershell.exe``.
+    When no trusted installation is present, callers safely fall back to the
+    bundled Tree-sitter parser instead of executing an arbitrary binary.
+    """
+    platform = os.name if platform_name is None else str(platform_name)
+    env = os.environ if environ is None else environ
+    candidates: list[str] = []
+    if platform == "nt":
+        windows_root = str(env.get("SystemRoot") or env.get("WINDIR") or "").strip()
+        if windows_root:
+            candidates.append(os.path.join(
+                windows_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+            ))
+        for key in ("ProgramW6432", "ProgramFiles"):
+            program_files = str(env.get(key) or "").strip()
+            if program_files:
+                candidates.append(os.path.join(program_files, "PowerShell", "7", "pwsh.exe"))
+    else:
+        candidates.extend((
+            "/usr/bin/pwsh",
+            "/usr/local/bin/pwsh",
+            "/opt/microsoft/powershell/7/pwsh",
+            "/usr/bin/powershell",
+            "/usr/local/bin/powershell",
+        ))
+
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            candidate = os.path.realpath(os.path.abspath(raw))
+        except (OSError, TypeError, ValueError):
+            continue
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
     return None
 
 
