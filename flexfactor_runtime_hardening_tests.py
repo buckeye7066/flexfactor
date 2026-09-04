@@ -154,5 +154,28 @@ class RuntimeHardeningTests(unittest.TestCase):
         parser.assert_not_called()
 
 
+    def test_canonical_generic_suffixes_survive_typo_recovery(self):
+        original_roots = ff._PROJECT_ROOTS
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                wanted = os.path.join(root, "GrantFlow")
+                os.mkdir(wanted)
+                ff._PROJECT_ROOTS = [root]
+                for suffix in ("Source", "Src", "Main", "Master", "Dev", "Prod", "Code", "Github"):
+                    self.assertEqual(
+                        os.path.normcase(ff._find_local_project(f"GrantFlwo {suffix}")),
+                        os.path.normcase(wanted),
+                        suffix,
+                    )
+        finally:
+            ff._PROJECT_ROOTS = original_roots
+
+    def test_publication_failure_regex_recognizes_every_powershell_source_type(self):
+        for extension in directed._POWERSHELL_EXTS:
+            match = ff._FAILURE_SOURCE_RE.search(f"FAILED src/repair{extension}:12: parser failure")
+            self.assertIsNotNone(match, extension)
+            self.assertTrue(match.group("path").endswith(extension), (extension, match.group("path")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -81,7 +81,7 @@ def _bounded_damerau_levenshtein(left: str, right: str, limit: int) -> int | Non
     return distance if distance <= limit else None
 
 
-def typo_resolve_local_project(name_hints, roots, slugify) -> str | None:
+def typo_resolve_local_project(name_hints, roots, slugify, generic_tokens=None) -> str | None:
     """Resolve only a unique, near-exact project-name typo.
 
     Exact/prefix lookup remains the caller's first choice. This recovery stage
@@ -89,7 +89,7 @@ def typo_resolve_local_project(name_hints, roots, slugify) -> str | None:
     visible checkouts over hidden config folders, and refuses ties.
     """
     hints: list[str] = []
-    generic_suffixes = {"repo", "repository", "project", "program", "app", "application"}
+    generic_suffixes = set(generic_tokens or {"repo", "repository", "project", "program", "app", "application", "source", "src", "main", "master", "dev", "prod", "code", "github"})
     for raw in name_hints or ():
         slug = slugify(str(raw or ""))
         variants = [slug]
@@ -360,6 +360,7 @@ def install(module_globals: dict) -> None:
             return typo_resolve_local_project(
                 name_hints, module_globals.get("_PROJECT_ROOTS", ()),
                 module_globals.get("_slugify", lambda value: str(value).lower()),
+                module_globals.get("_GENERIC_NAME_TOKENS", ()),
             )
         _find_local_project._typo_hardened = True
         module_globals["_find_local_project"] = _find_local_project

@@ -14803,7 +14803,7 @@ _FAILURE_SOURCE_RE = re.compile(
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
     # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and
     # silently discarded because that non-existent path could not be opened.
-    r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h))"
+    r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h|ps1|psm1|psd1))"
     # The boundary must cover how each runner DELIMITS a path, not just how
     # Vitest does. Measured 2026-08-19 (live IPlay audit): a Python traceback
     # prints `File "C:\...\test_motionsync.py", line 81` and pytest prints
