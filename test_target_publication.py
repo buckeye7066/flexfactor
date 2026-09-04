@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import flexfactor as ff
+import flexfactor_product_invariants as product_invariants
 
 
 def _run(*argv: str, cwd: Path | None = None) -> str:
@@ -49,6 +50,8 @@ def _quality_rows(overrides: dict[str, str] | None = None) -> dict:
 
 def _product_rows(overrides: dict[str, str] | None = None) -> dict:
     states = {
+        "competitive-provenance": "pass",
+        "competitive-fit-risk-reviewed": "pass",
         "no-blind-competitor-copying": "pass",
         "selected-capabilities-delivered": "pass",
         # Remaining purpose work must not strand a safe repair.
@@ -72,6 +75,40 @@ class IncrementalPublicationSafetyTests(unittest.TestCase):
         )
         self.assertTrue(ready, reason)
         self.assertIn("completeness gaps may remain", reason)
+
+    def test_runtime_product_gate_schema_uses_passed_boolean(self):
+        product = {
+            "gates": [
+                product_invariants._gate(gate_id, True, "verified", "fix it")
+                for gate_id in ff._PUBLICATION_PRODUCT_GATE_IDS
+            ]
+        }
+        self.assertTrue(all("status" not in row for row in product["gates"]))
+        ready, reason = ff._publication_safety_ready(_quality_rows(), product)
+        self.assertTrue(ready, reason)
+
+    def test_provenance_and_risk_review_are_publication_requirements(self):
+        for gate_id in ("competitive-provenance", "competitive-fit-risk-reviewed"):
+            with self.subTest(gate_id=gate_id):
+                product = _product_rows({gate_id: "fail"})
+                ready, reason = ff._publication_safety_ready(_quality_rows(), product)
+                self.assertFalse(ready)
+                self.assertIn(gate_id, reason)
+
+    def test_independent_review_receives_only_publication_scoped_gates(self):
+        full = _quality_rows()
+        scoped = ff._publication_review_quality_gates(full)
+        self.assertEqual("candidate-publication-safety", scoped["scope"])
+        self.assertTrue(scoped["passed"])
+        ids = {row["id"] for row in scoped["gates"]}
+        self.assertNotIn("function-coverage", ids)
+        self.assertNotIn("behavior", ids)
+        self.assertNotIn("build", ids)
+        self.assertNotIn("independent-final-review", ids)
+        self.assertEqual("fail", next(
+            row["status"] for row in full["gates"]
+            if row["id"] == "function-coverage"
+        ))
 
     def test_every_candidate_safety_gate_is_fail_closed(self):
         cases = [
