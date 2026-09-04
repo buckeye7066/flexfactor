@@ -82,9 +82,10 @@ directly without activating it.
 ## Failure and resource contract
 
 Tenets is an enhancement, not a release authority. If the executable is absent,
-times out, exits non-zero, emits malformed JSON, exceeds either output safety
-limit, or returns no safe paths, the adapter records `unavailable` or `degraded`
-evidence and preserves FlexFactor's original file order and cap. If
+its installed-package metadata is unreadable, it times out, exits non-zero,
+emits malformed JSON, exceeds either output safety limit, or returns no safe
+paths, the adapter records `unavailable` or `degraded` evidence and preserves
+FlexFactor's original file order and cap. If
 uncapped candidate discovery cannot complete, the adapter records degraded
 evidence and reruns the original capped enumerator unchanged.
 `flexfactor-context --strict` returns non-zero in those cases for CI or operator
@@ -93,10 +94,13 @@ verification.
 Stdout and stderr are consumed concurrently with hard limits while the process
 is running. FlexFactor terminates the child as soon as either stream exceeds its
 limit, preventing a noisy or defective subprocess from exhausting memory. The
-ranker starts in an isolated POSIX session or Windows process group, and timeout
-cleanup terminates the complete descendant tree rather than only the direct
-child. Timeouts must be positive finite numbers. The temporary JSON output is
-also bounded before parsing and is removed before the adapter returns.
+ranker starts in an isolated POSIX session. On Windows it starts suspended, is
+assigned to a kill-on-close Job Object, and only then resumes, so no helper can
+escape in the launch-to-containment interval. FlexFactor closes the retained
+process group or Job Object after timeout, overflow, or normal leader exit;
+descendants therefore cannot survive by inheriting the output pipes. Timeouts
+must be positive finite numbers. The temporary JSON output is also bounded
+before parsing and is removed before the adapter returns.
 
 Automatic launcher integration can be disabled without uninstalling the tool:
 
@@ -121,8 +125,9 @@ never enlarges a bounded review. Regression tests also prove that ranked files
 beyond 100,000 candidates remain selectable, that failed uncapped discovery
 falls back to the original capped order with degraded evidence, and that real
 CLI file output is consumed even when console stdout contains status text. The
-launcher tests also cover explicit argument forwarding and duplicate project
-basenames so one program cannot inherit another program's ranking objective.
+launcher tests also cover explicit argument forwarding, duplicate project
+basenames, and routed multi-program session prompts so one program cannot
+inherit another program's ranking objective.
 
 The `tenets-context` GitHub Actions workflow runs those tests on Windows and
 Linux. Separate live jobs on both operating systems install the exact pinned
