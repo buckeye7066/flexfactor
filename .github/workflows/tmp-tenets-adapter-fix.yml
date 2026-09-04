@@ -1,0 +1,64 @@
+name: one-time-tenets-adapter-fix
+
+on:
+  push:
+    branches: ["fix/tenets-context-integration"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/tenets-context-integration
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - name: Patch adapter and regression test
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('flexfactor_tenets.py')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''    if resolved_executable:\n        command = (\n            str(resolved_executable),\n            "rank",\n            task_text,\n            str(root),\n            "--top",\n            str(top),\n            "--format",\n            "json",\n        )\n        try:\n            completed = _run_bounded_process(\n                command,\n                cwd=root,\n                timeout_seconds=timeout,\n            )\n            stdout_bytes = completed.stdout\n            stderr_bytes = completed.stderr\n'''
+          new = '''    if resolved_executable:\n        command = (\n            str(resolved_executable),\n            "rank",\n            task_text,\n            str(root),\n            "--top",\n            str(top),\n            "--format",\n            "json",\n        )\n        temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")\n        rank_output = Path(temporary_output.name) / "ranked-files.json"\n        invocation_command = command + ("--output", str(rank_output))\n        try:\n            completed = _run_bounded_process(\n                invocation_command,\n                cwd=root,\n                timeout_seconds=timeout,\n            )\n            stdout_bytes = completed.stdout\n            stderr_bytes = completed.stderr\n'''
+          if old not in text:
+              raise SystemExit('expected generate_tenets_context command block not found')
+          text = text.replace(old, new, 1)
+
+          old = '''            else:\n                stdout = stdout_bytes.decode("utf-8", errors="strict")\n                stderr = stderr_bytes.decode("utf-8", errors="replace")\n                if completed.returncode != 0:\n                    status = "degraded"\n                    message = _bounded_text(\n                        f"Tenets exited with status {completed.returncode}: {stderr or stdout}"\n                    )\n                else:\n                    payload = json.loads(stdout)\n                    files = _parse_ranked_files(payload, root, top)\n                    if files:\n                        status = "ok"\n                        message = f"Tenets ranked {len(files)} safe in-repository file(s)."\n                    else:\n                        status = "degraded"\n                        message = "Tenets returned no safe in-repository file paths."\n        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:\n            status = "degraded"\n            message = _bounded_text(f"Tenets returned unusable output: {exc}")\n        except OSError as exc:\n            status = "degraded"\n            message = _bounded_text(f"Tenets could not start: {exc}")\n'''
+          new = '''            else:\n                stdout = stdout_bytes.decode("utf-8", errors="strict")\n                stderr = stderr_bytes.decode("utf-8", errors="replace")\n                if completed.returncode != 0:\n                    status = "degraded"\n                    message = _bounded_text(\n                        f"Tenets exited with status {completed.returncode}: {stderr or stdout}"\n                    )\n                else:\n                    payload_bytes = stdout_bytes\n                    if rank_output.is_file():\n                        with rank_output.open("rb") as handle:\n                            payload_bytes = handle.read(MAX_STDOUT_BYTES + 1)\n                        if len(payload_bytes) > MAX_STDOUT_BYTES:\n                            raise ValueError(\n                                f"Tenets JSON output exceeded the {MAX_STDOUT_BYTES}-byte safety limit"\n                            )\n                    payload_text = payload_bytes.decode("utf-8", errors="strict")\n                    payload = json.loads(payload_text)\n                    files = _parse_ranked_files(payload, root, top)\n                    if files:\n                        status = "ok"\n                        message = f"Tenets ranked {len(files)} safe in-repository file(s)."\n                    else:\n                        status = "degraded"\n                        message = "Tenets returned no safe in-repository file paths."\n        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:\n            status = "degraded"\n            message = _bounded_text(f"Tenets returned unusable output: {exc}")\n        except OSError as exc:\n            status = "degraded"\n            message = _bounded_text(f"Tenets could not start: {exc}")\n        finally:\n            temporary_output.cleanup()\n'''
+          if old not in text:
+              raise SystemExit('expected parse block not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          tests = Path('flexfactor_tenets_tests.py')
+          t = tests.read_text(encoding='utf-8')
+          marker = '''    def test_empty_valid_result_is_degraded_not_success(self) -> None:\n'''
+          regression = '''    def test_real_cli_output_file_is_used_instead_of_console_stdout(self) -> None:\n        payload = {"files": [{"path": "src/app.py", "score": 0.95}]}\n        written_path: list[Path] = []\n\n        def runner(command, **_kwargs):\n            output_index = command.index("--output") + 1\n            output_path = Path(command[output_index])\n            output_path.write_text(json.dumps(payload), encoding="utf-8")\n            written_path.append(output_path)\n            return self._process(stdout=b"OK Saved ranking to temporary file\\n")\n\n        with mock.patch.object(\n            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"\n        ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):\n            result = ft.generate_tenets_context(self.root, "audit")\n\n        self.assertEqual(result.status, "ok")\n        self.assertEqual([item.path for item in result.files], ["src/app.py"])\n        self.assertTrue(written_path)\n        self.assertFalse(written_path[0].exists())\n\n'''
+          if marker not in t:
+              raise SystemExit('test insertion marker not found')
+          if 'test_real_cli_output_file_is_used_instead_of_console_stdout' not in t:
+              t = t.replace(marker, regression + marker, 1)
+          tests.write_text(t, encoding='utf-8', newline='\n')
+          PY
+          python -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          python flexfactor_tenets_tests.py
+      - name: Commit verified repair and remove executor
+        shell: bash
+        run: |
+          rm -f .github/workflows/tmp-tenets-adapter-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add flexfactor_tenets.py flexfactor_tenets_tests.py .github/workflows/tmp-tenets-adapter-fix.yml
+          git commit -m 'Make Tenets JSON ranking reliable across CI runners'
+          git push origin HEAD:fix/tenets-context-integration
