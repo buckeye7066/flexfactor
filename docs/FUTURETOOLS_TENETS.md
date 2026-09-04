@@ -54,6 +54,11 @@ and writes a deterministic JSON manifest under:
 ~/.flexfactor/context/<project>-<path-hash>/tenets-context.json
 ```
 
+For machine-readable ranking, the adapter gives Tenets an isolated temporary
+`--output` file and reads that bounded JSON file after the CLI exits. This avoids
+TTY/console-output differences across Windows and Linux while keeping the real
+pinned Tenets CLI in the execution path.
+
 Writing outside the target repository is deliberate: generating context must
 not make a clean repository dirty and trip FlexFactor's own dirty-tree gate.
 Use `--output` to select another evidence path.
@@ -77,7 +82,8 @@ verification.
 Stdout and stderr are consumed concurrently with hard limits while the process
 is running. FlexFactor terminates the child as soon as either stream exceeds its
 limit, preventing a noisy or defective subprocess from exhausting memory.
-Timeouts must be positive finite numbers.
+Timeouts must be positive finite numbers. The temporary JSON output is also
+bounded before parsing and is removed before the adapter returns.
 
 Automatic launcher integration can be disabled without uninstalling the tool:
 
@@ -97,8 +103,9 @@ bounded stdout and stderr, timeout/non-zero/malformed-output degradation, cache
 behavior, idempotent runtime installation, the disable switch, parameter and
 global cap lifting, cap restoration, and the invariant that prioritization
 never enlarges a bounded review. Regression tests also prove that ranked files
-beyond 100,000 candidates remain selectable and that failed uncapped discovery
-falls back to the original capped order with degraded evidence.
+beyond 100,000 candidates remain selectable, that failed uncapped discovery
+falls back to the original capped order with degraded evidence, and that real
+CLI file output is consumed even when console stdout contains status text.
 
 The `tenets-context` GitHub Actions workflow runs those tests on Windows and
 Linux. Separate live jobs on both operating systems install the exact pinned
