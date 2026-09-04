@@ -22979,38 +22979,49 @@ def run_audit(args) -> int:
               "or spent.", file=sys.stderr)
         return 2
 
+    # Load (or create) the durable queue before journaling a session prompt.
+    # On resume, next_index is the authority for which targets can still claim
+    # new work; completed targets must not receive comments that this queue can
+    # never consume.
+    queue_mode = "prodready" if getattr(args, "readiness", False) else "audit"
+    queue_state_path = os.environ.get("FLEXFACTOR_QUEUE_STATE") or None
+    queue_id = os.environ.get("FLEXFACTOR_QUEUE_ID") or None
+    try:
+        orchestrator = _ff_execution.SequentialOrchestrator(
+            queue_mode, programs, state_path=queue_state_path, queue_id=queue_id)
+    except _ff_execution.ExecutionContractError as exc:
+        print(f"audit target queue rejected: {exc}", file=sys.stderr)
+        return 2
+    remaining_targets = resolved_targets[orchestrator.next_index:]
+
     if session_routing is not None:
-        queue_hint = str(
-            os.environ.get("FLEXFACTOR_QUEUE_ID") or
-            os.environ.get("FLEXFACTOR_QUEUE_STATE") or ""
-        ).strip()
-        stable_session_id = ""
-        if queue_hint:
-            identity = queue_hint + "\n" + session_prompt + "\n" + "\n".join(
-                f"{name}\t{os.path.normcase(os.path.abspath(path))}"
-                for name, path in resolved_targets)
-            stable_session_id = hashlib.sha256(
-                identity.encode("utf-8")).hexdigest()[:32]
-        try:
-            receipt = _ff_steering.submit_session_prompt(
-                session_prompt, resolved_targets, source="cli-session",
-                session_id=stable_session_id)
-        except (OSError, ValueError) as exc:
-            print(f"session prompt was not saved: {exc}", file=sys.stderr)
-            return 2
-        print(f"[session {receipt['session_id'][:8]}] routed guidance queued.")
+        identity = orchestrator.queue_id + "\n" + session_prompt + "\n" + "\n".join(
+            f"{name}\t{os.path.normcase(os.path.abspath(path))}"
+            for name, path in resolved_targets)
+        stable_session_id = hashlib.sha256(
+            identity.encode("utf-8")).hexdigest()[:32]
+        if remaining_targets:
+            try:
+                receipt = _ff_steering.submit_session_prompt(
+                    session_prompt, remaining_targets, source="cli-session",
+                    session_id=stable_session_id)
+            except (OSError, ValueError) as exc:
+                print(f"session prompt was not saved: {exc}", file=sys.stderr)
+                return 2
+            print(f"[session {receipt['session_id'][:8]}] routed guidance queued.")
+        else:
+            print("[session] queue is already complete; no guidance was queued.")
 
     # Start fresh dashboard state and (optionally) launch the live graph window.
     _PROGRESS.reset()
     for position, (display_name, project_dir) in enumerate(
-            resolved_targets, start=1):
+            remaining_targets, start=orchestrator.next_index + 1):
         _PROGRESS.update(position, name=display_name, dir=project_dir,
                          phase="queued", done=False)
     if getattr(args, "dashboard", True):
         _launch_dashboard(total)
 
     # 2. Audit each program in full isolation under the durable coordinator.
-    queue_mode = "prodready" if getattr(args, "readiness", False) else "audit"
     results: list[dict] = []
 
     def _run_target(program, position, queue_total, orchestrator):
@@ -23026,8 +23037,8 @@ def run_audit(args) -> int:
 
     queue_code, orchestrator = _ff_execution.run_sequential_queue(
         queue_mode, programs, _run_target,
-        state_path=os.environ.get("FLEXFACTOR_QUEUE_STATE") or None,
-        queue_id=os.environ.get("FLEXFACTOR_QUEUE_ID") or None,
+        state_path=queue_state_path, queue_id=queue_id,
+        orchestrator=orchestrator,
     )
     print(f"[orchestrator] queue {orchestrator.queue_id}: {total} target(s), "
           f"strictly sequential; receipt {orchestrator.state_path}; "
