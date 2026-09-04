@@ -70,6 +70,28 @@ jobs:
           assert not bad, bad
           print("imported", len(mods), "modules")
           PY
+      - name: Windows PowerShell 5.1 parse gate for every tracked script
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(git ls-files '*.ps1' '*.psm1' '*.psd1')
+          if ($files.Count -eq 0) { throw 'No tracked PowerShell files found; parser gate is not exercising the launcher surface.' }
+          $failures = @()
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            $resolved = (Resolve-Path -LiteralPath $file).Path
+            [System.Management.Automation.Language.Parser]::ParseFile($resolved, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($parseError in @($errors)) {
+              $failures += "${file}:$($parseError.Extent.StartLineNumber):$($parseError.Extent.StartColumnNumber): $($parseError.Message)"
+            }
+          }
+          if ($failures.Count -gt 0) {
+            $failures | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+          Write-Host "Parsed $($files.Count) tracked PowerShell files with Windows PowerShell $($PSVersionTable.PSVersion)."
       - name: Install Playwright package for the real browser journeys
         shell: bash
         run: |
@@ -125,6 +147,7 @@ jobs:
                    flexfactor_route_fault_tests.py \
                    flexfactor_baseline_ledger_tests.py \
                    flexfactor_project_lookup_tests.py \
+                   flexfactor_runtime_hardening_tests.py \
                    flexfactor_wip_removal_guard_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \
@@ -199,6 +222,12 @@ jobs:
         run: python -m pip wheel . --no-deps --wheel-dir dist
       - name: Installed-wheel smoke OUTSIDE the checkout (functional parity)
         run: |
+          module_list="$(python - <<'PY'
+          import json, tomllib
+          mods = tomllib.load(open('pyproject.toml', 'rb'))['tool']['setuptools']['py-modules']
+          print(json.dumps(mods, separators=(',', ':')))
+          PY
+          )"
           python -m venv /tmp/ffvenv
           /tmp/ffvenv/bin/python -m pip install -q dist/*.whl
           /tmp/ffvenv/bin/python -m pip check
@@ -216,12 +245,33 @@ jobs:
           assert "site-packages" in inst["module_file"], inst["module_file"]
           print("installed runtime == source runtime:", inst["module_file"])
           PY
+          /tmp/ffvenv/bin/python - "$module_list" <<'PY'
+          import importlib, json, sys
+          modules = json.loads(sys.argv[1])
+          failures = []
+          for module in modules:
+              try:
+                  importlib.import_module(module)
+              except Exception as exc:
+                  failures.append((module, repr(exc)))
+          assert not failures, failures
+          print("installed wheel imported every declared runtime module:", len(modules))
+          PY
+          /tmp/ffvenv/bin/python - <<'PY'
+          from importlib.resources import files
+          profile = files("competitors").joinpath("default_profiles.json")
+          assert profile.is_file(), profile
+          print("installed wheel includes competitor profiles:", profile)
+          PY
           for mode in refactor scout audit prodready policy; do
             /tmp/ffvenv/bin/flexfactor "$mode" --help > /dev/null
           done
           /tmp/ffvenv/bin/python - <<'PY'
           import flexfactor as ff
+          import flexfactor_directed as directed
+          directed.install(vars(ff))
           assert ff._CODE_EXTS == set(ff._TREE_SITTER_LANGUAGE_BY_EXT)
+          assert directed._POWERSHELL_EXTS <= ff._CODE_EXTS
           failures = {}
           for extension in sorted(ff._CODE_EXTS):
               ok, note = ff._tree_sitter_source_syntax_ok(extension, b"")

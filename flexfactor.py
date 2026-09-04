@@ -14803,7 +14803,7 @@ _FAILURE_SOURCE_RE = re.compile(
     # ``tsx`` before ``ts``), then require a runner/path boundary.  Without
     # this, Vitest's ``Home.test.jsx`` was truncated to ``Home.test.js`` and
     # silently discarded because that non-existent path could not be opened.
-    r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h))"
+    r"\.(?:java|mjs|cjs|jsx|tsx|php|cpp|py|js|ts|go|rs|rb|kt|cs|cc|c|h|ps1|psm1|psd1))"
     # The boundary must cover how each runner DELIMITS a path, not just how
     # Vitest does. Measured 2026-08-19 (live IPlay audit): a Python traceback
     # prints `File "C:\...\test_motionsync.py", line 81` and pytest prints
@@ -23710,6 +23710,9 @@ def _mark_run_finished() -> None:
 
 
 def main(argv=None) -> int:
+    # Arm canonical runtime hardening for direct callers too.
+    import flexfactor_directed as _runtime_directed
+    _runtime_directed.install(globals())
     _configure_utf8_stdio()
     argv = list(sys.argv[1:] if argv is None else argv)
     # Top-level --help/-h: list ALL modes. Without this, the implicit-refactor
@@ -24359,6 +24362,9 @@ def run_cli(argv=None) -> int:
     # successful DONE, and --parallel N stampeded one shared free allowance with
     # no admission control. It is idempotent (_FLEXFACTOR_DIRECTED_INSTALLED), so
     # the shim calling it first stays harmless.
+    # Arm canonical runtime hardening for direct callers too.
+    import flexfactor_directed as _runtime_directed
+    _runtime_directed.install(globals())
     _ff_directed.install(globals())
     if argv is not None and len(argv) == 1 and argv[0] == "--runtime-manifest":
         print(json.dumps(runtime_manifest(), indent=2, sort_keys=True))

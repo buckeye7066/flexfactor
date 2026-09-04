@@ -12,7 +12,9 @@ namespace.
 from __future__ import annotations
 
 import functools
+import os
 import re
+import tempfile
 import threading
 
 _UNFIT_CODE_PATTERNS = (
@@ -36,6 +38,216 @@ _DEFAULT_SKIP_DIRS = {
 
 _CAPACITY_LOCK = threading.Lock()
 _CAPACITY_INSTALLED = False
+
+
+_POWERSHELL_EXTS = frozenset({".ps1", ".psm1", ".psd1"})
+
+
+def _bounded_damerau_levenshtein(left: str, right: str, limit: int) -> int | None:
+    """Return edit distance up to ``limit`` (adjacent transposes cost one).
+
+    This is deliberately bounded: project-name recovery only needs to recognize
+    one or two obvious typing errors. Anything farther away is not safe to guess.
+    """
+    a, b = str(left or ""), str(right or "")
+    if abs(len(a) - len(b)) > limit:
+        return None
+    if a == b:
+        return 0
+    if not a or not b:
+        distance = max(len(a), len(b))
+        return distance if distance <= limit else None
+    previous_previous: list[int] | None = None
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        row_min = i
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            value = min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + cost,
+            )
+            if (previous_previous is not None and i > 1 and j > 1
+                    and ca == b[j - 2] and a[i - 2] == cb):
+                value = min(value, previous_previous[j - 2] + 1)
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return None
+        previous_previous, previous = previous, current
+    distance = previous[-1]
+    return distance if distance <= limit else None
+
+
+def typo_resolve_local_project(name_hints, roots, slugify, generic_tokens=None) -> str | None:
+    """Resolve only a unique, near-exact project-name typo.
+
+    Exact/prefix lookup remains the caller's first choice. This recovery stage
+    allows at most one edit for medium names and two for long names, prefers
+    visible checkouts over hidden config folders, and refuses ties.
+    """
+    hints: list[str] = []
+    generic_suffixes = set(generic_tokens or {"repo", "repository", "project", "program", "app", "application", "source", "src", "main", "master", "dev", "prod", "code", "github"})
+    for raw in name_hints or ():
+        slug = slugify(str(raw or ""))
+        variants = [slug]
+        parts = [part for part in slug.split("-") if part]
+        while parts and parts[-1] in generic_suffixes:
+            parts = parts[:-1]
+            if parts:
+                variants.append("-".join(parts))
+        for variant in variants:
+            compact = variant.replace("-", "")
+            if len(compact) >= 5 and compact not in hints:
+                hints.append(compact)
+    if not hints:
+        return None
+
+    directories: list[str] = []
+    seen: set[str] = set()
+    for root in roots or ():
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            full = os.path.join(root, entry)
+            if not os.path.isdir(full):
+                continue
+            key = os.path.normcase(os.path.abspath(full))
+            if key in seen:
+                continue
+            seen.add(key)
+            directories.append(full)
+
+    visible = [p for p in directories if not os.path.basename(p).startswith(".")]
+    hidden = [p for p in directories if os.path.basename(p).startswith(".")]
+    for tier in (visible, hidden):
+        scored: list[tuple[int, str]] = []
+        for path in tier:
+            candidate = slugify(os.path.basename(path)).replace("-", "")
+            if len(candidate) < 5:
+                continue
+            best: int | None = None
+            for hint in hints:
+                limit = 2 if max(len(hint), len(candidate)) >= 10 else 1
+                distance = _bounded_damerau_levenshtein(hint, candidate, limit)
+                if distance is not None and distance > 0:
+                    best = distance if best is None else min(best, distance)
+            if best is not None:
+                scored.append((best, path))
+        if not scored:
+            continue
+        minimum = min(score for score, _path in scored)
+        winners = [path for score, path in scored if score == minimum]
+        return winners[0] if len(winners) == 1 else None
+    return None
+
+
+def _powershell_parser_executable(
+    *, platform_name: str | None = None, environ=None,
+) -> str | None:
+    """Resolve PowerShell only from trusted OS installation directories.
+
+    Never consult PATH or the current working directory: a target repository is
+    untrusted input and may contain an attacker-controlled ``powershell.exe``.
+    When no trusted installation is present, callers safely fall back to the
+    bundled Tree-sitter parser instead of executing an arbitrary binary.
+    """
+    platform = os.name if platform_name is None else str(platform_name)
+    env = os.environ if environ is None else environ
+    candidates: list[str] = []
+    if platform == "nt":
+        windows_root = str(env.get("SystemRoot") or env.get("WINDIR") or "").strip()
+        if windows_root:
+            candidates.append(os.path.join(
+                windows_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+            ))
+        for key in ("ProgramW6432", "ProgramFiles"):
+            program_files = str(env.get(key) or "").strip()
+            if program_files:
+                candidates.append(os.path.join(program_files, "PowerShell", "7", "pwsh.exe"))
+    else:
+        candidates.extend((
+            "/usr/bin/pwsh",
+            "/usr/local/bin/pwsh",
+            "/opt/microsoft/powershell/7/pwsh",
+            "/usr/bin/powershell",
+            "/usr/local/bin/powershell",
+        ))
+
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            candidate = os.path.realpath(os.path.abspath(raw))
+        except (OSError, TypeError, ValueError):
+            continue
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def powershell_syntax_details(project_dir: str, path: str, source: str, run):
+    """Parse PowerShell source without executing it.
+
+    The parser driver is owner-authored and is invoked through ``-File`` rather
+    than ``-Command`` so the subprocess policy cannot be bypassed by inline shell
+    text. The candidate is only passed to PowerShell's AST parser.
+    """
+    executable = _powershell_parser_executable()
+    if not executable:
+        return None
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext not in _POWERSHELL_EXTS:
+        return None
+    try:
+        encoded = str(source).encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        return False, f"source is not UTF-8 encodable: {exc}", None
+    driver_source = r'''param([Parameter(Mandatory=$true)][string]$Candidate)
+$tokens = $null
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile($Candidate, [ref]$tokens, [ref]$errors) | Out-Null
+if ($null -ne $errors -and $errors.Count -gt 0) {
+    foreach ($parseError in $errors) {
+        [Console]::Error.WriteLine($parseError.Message)
+    }
+    exit 1
+}
+exit 0
+'''
+    try:
+        with tempfile.TemporaryDirectory(prefix="flexfactor-ps-parse-") as temp_dir:
+            candidate = os.path.join(temp_dir, "candidate" + ext)
+            driver = os.path.join(temp_dir, "parse-only.ps1")
+            with open(candidate, "wb") as fh:
+                fh.write(encoded)
+            with open(driver, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(driver_source)
+            result = run(
+                [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass",
+                 "-File", driver, candidate],
+                project_dir, timeout=60,
+            )
+    except OSError as exc:
+        return None, f"PowerShell syntax preflight could not start: {exc}", None
+    if getattr(result, "flexfactor_launch_error", False):
+        return None
+    ok = getattr(result, "returncode", 1) == 0
+    output = str(getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    return (ok, output or "PowerShell AST parse", source if ok else None)
 
 
 def _ensure_capacity_runtime():
@@ -104,6 +316,80 @@ def install(module_globals: dict) -> None:
     if module_globals.get("_FLEXFACTOR_DIRECTED_INSTALLED"):
         return
     module_globals["_FLEXFACTOR_DIRECTED_INSTALLED"] = True
+
+    # Source-type parity: PowerShell launchers are first-class code, not opaque
+    # text. Tree-sitter provides the cross-platform fallback; Windows also gets
+    # the native 5.1 parser through the pre-write hook below.
+    code_exts = module_globals.get("_CODE_EXTS")
+    tree_languages = module_globals.get("_TREE_SITTER_LANGUAGE_BY_EXT")
+    if isinstance(code_exts, set) and isinstance(tree_languages, dict):
+        for extension in _POWERSHELL_EXTS:
+            code_exts.add(extension)
+            tree_languages[extension] = "powershell"
+
+    # tree-sitter-language-pack's PowerShell grammar emits an ERROR node for an
+    # empty file even though an empty .ps1/.psm1/.psd1 is valid PowerShell. Keep
+    # the bundled parser for real source, but normalize that grammar edge case so
+    # the syntax contract matches the language rather than the parser quirk.
+    prior_tree_sitter = module_globals.get("_tree_sitter_source_syntax_ok")
+    if (callable(prior_tree_sitter)
+            and not getattr(prior_tree_sitter, "_powershell_empty_hardened", False)):
+        @functools.wraps(prior_tree_sitter)
+        def _tree_sitter_source_syntax_ok(extension, source):
+            ext = str(extension or "").lower()
+            if ext in _POWERSHELL_EXTS:
+                try:
+                    empty = not source or not source.strip()
+                except (AttributeError, TypeError):
+                    empty = False
+                if empty:
+                    return True, "Tree-sitter powershell: empty source is syntactically valid"
+            return prior_tree_sitter(extension, source)
+        _tree_sitter_source_syntax_ok._powershell_empty_hardened = True
+        module_globals["_tree_sitter_source_syntax_ok"] = _tree_sitter_source_syntax_ok
+
+    # Preserve precise local checkout matching, then recover only a unique
+    # one/two-edit typo. Ambiguous names still fail closed.
+    prior_find_project = module_globals.get("_find_local_project")
+    if callable(prior_find_project) and not getattr(prior_find_project, "_typo_hardened", False):
+        @functools.wraps(prior_find_project)
+        def _find_local_project(*name_hints):
+            exact_or_prefix = prior_find_project(*name_hints)
+            if exact_or_prefix:
+                return exact_or_prefix
+            return typo_resolve_local_project(
+                name_hints, module_globals.get("_PROJECT_ROOTS", ()),
+                module_globals.get("_slugify", lambda value: str(value).lower()),
+                module_globals.get("_GENERIC_NAME_TOKENS", ()),
+            )
+        _find_local_project._typo_hardened = True
+        module_globals["_find_local_project"] = _find_local_project
+
+    # PowerShell model edits get the native AST parser when available before
+    # the generic Tree-sitter gate. `$code:`-style Windows PowerShell 5.1 parser
+    # failures are therefore rejected before owner files are touched.
+    prior_prewrite = module_globals.get("_prewrite_source_syntax_details")
+    run = module_globals.get("_run")
+    if (callable(prior_prewrite) and callable(run)
+            and not getattr(prior_prewrite, "_powershell_hardened", False)):
+        @functools.wraps(prior_prewrite)
+        def _prewrite_source_syntax_details(project_dir, path, source, stack, *, allow_empty=False):
+            ext = os.path.splitext(str(path or ""))[1].lower()
+            if ext in _POWERSHELL_EXTS:
+                # Preserve the shared empty-source refusal that the generic prewrite
+                # gate enforces for every language when allow_empty is False.
+                text = str(source or "")
+                if not allow_empty and not text.strip():
+                    return False, "empty whole-file response", None
+                native = powershell_syntax_details(project_dir, path, source, run)
+                if native is not None:
+                    return native
+            return prior_prewrite(
+                project_dir, path, source, stack, allow_empty=allow_empty,
+            )
+        _prewrite_source_syntax_details._powershell_hardened = True
+        module_globals["_prewrite_source_syntax_details"] = _prewrite_source_syntax_details
+
     capacity = _ensure_capacity_runtime()
     existing_unfit = module_globals.get("_unfit_for_code_reason")
     live_unfit = existing_unfit if callable(existing_unfit) else None
