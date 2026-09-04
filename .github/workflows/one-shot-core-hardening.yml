@@ -1,0 +1,157 @@
+name: one-shot-core-hardening
+
+on:
+  push:
+    branches: [fix/predictable-runtime-failures]
+    paths: [.github/workflows/one-shot-core-hardening.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/predictable-runtime-failures
+          fetch-depth: 0
+      - name: Patch core entrypoints, source inventory, typo recovery, and regressions
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import ast
+          from pathlib import Path
+
+          # 1. A direct `import flexfactor; flexfactor.main(...)` must arm the
+          # same runtime hardening as the supported wrapper/installed CLI.
+          core_path = Path('flexfactor.py')
+          core = core_path.read_text(encoding='utf-8')
+          tree = ast.parse(core)
+          lines = core.splitlines(keepends=True)
+          targets = []
+          for node in tree.body:
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {'main', 'run_cli'}:
+                  segment = ast.get_source_segment(core, node) or ''
+                  if '_runtime_directed.install(globals())' in segment:
+                      continue
+                  body_index = 0
+                  if (node.body and isinstance(node.body[0], ast.Expr)
+                          and isinstance(getattr(node.body[0], 'value', None), ast.Constant)
+                          and isinstance(node.body[0].value.value, str)):
+                      body_index = 1
+                  if body_index < len(node.body):
+                      insert_before = node.body[body_index].lineno - 1
+                  else:
+                      insert_before = node.end_lineno
+                  indent = ' ' * (node.col_offset + 4)
+                  payload = (
+                      indent + '# Arm canonical hardening for direct programmatic callers too.\n'
+                      + indent + 'import flexfactor_directed as _runtime_directed\n'
+                      + indent + '_runtime_directed.install(globals())\n'
+                  )
+                  targets.append((insert_before, node.name, payload))
+          names = {name for _line, name, _payload in targets}
+          if 'main' not in names and '_runtime_directed.install(globals())' not in core:
+              raise SystemExit('Could not locate an unhardened top-level flexfactor.main')
+          for insert_before, _name, payload in sorted(targets, reverse=True):
+              lines.insert(insert_before, payload)
+          patched_core = ''.join(lines)
+          ast.parse(patched_core)
+          core_path.write_text(patched_core, encoding='utf-8', newline='\n')
+
+          # 2. Evidence inventory must classify every supported PowerShell source
+          # type as source rather than as a generic asset.
+          evidence_path = Path('flexfactor_evidence.py')
+          evidence = evidence_path.read_text(encoding='utf-8')
+          old = '".h", ".hpp", ".sql", ".sh", ".ps1",\n'
+          new = '".h", ".hpp", ".sql", ".sh", ".ps1", ".psm1", ".psd1",\n'
+          if old in evidence:
+              if evidence.count(old) != 1:
+                  raise SystemExit('PowerShell SOURCE_EXTENSIONS anchor is ambiguous')
+              evidence = evidence.replace(old, new, 1)
+          elif '".ps1", ".psm1", ".psd1"' not in evidence:
+              raise SystemExit('PowerShell SOURCE_EXTENSIONS anchor was not found')
+          evidence_path.write_text(evidence, encoding='utf-8', newline='\n')
+
+          # 3. Typo recovery must retain safe generic-suffix normalization. A
+          # misspelled product name followed by "Repo" or "Project" should not
+          # be pushed outside the bounded edit-distance window.
+          directed_path = Path('flexfactor_directed.py')
+          directed = directed_path.read_text(encoding='utf-8')
+          old = '''    hints: list[str] = []\n    for raw in name_hints or ():\n        slug = slugify(str(raw or ""))\n        compact = slug.replace("-", "")\n        if len(compact) >= 5 and compact not in hints:\n            hints.append(compact)\n'''
+          new = '''    hints: list[str] = []\n    generic_suffixes = {"repo", "repository", "project", "program", "app", "application"}\n    for raw in name_hints or ():\n        slug = slugify(str(raw or ""))\n        variants = [slug]\n        parts = [part for part in slug.split("-") if part]\n        while parts and parts[-1] in generic_suffixes:\n            parts = parts[:-1]\n            if parts:\n                variants.append("-".join(parts))\n        for variant in variants:\n            compact = variant.replace("-", "")\n            if len(compact) >= 5 and compact not in hints:\n                hints.append(compact)\n'''
+          if old in directed:
+              if directed.count(old) != 1:
+                  raise SystemExit('typo hint anchor is ambiguous')
+              directed = directed.replace(old, new, 1)
+          elif 'generic_suffixes = {"repo", "repository", "project"' not in directed:
+              raise SystemExit('typo hint anchor was not found')
+          directed_path.write_text(directed, encoding='utf-8', newline='\n')
+
+          # 4. Add regressions that exercise the reviewer findings through the
+          # public core module, without manually installing hardening in-test.
+          test_path = Path('flexfactor_runtime_hardening_tests.py')
+          tests = test_path.read_text(encoding='utf-8')
+          if 'import flexfactor_evidence as evidence' not in tests:
+              tests = tests.replace('import flexfactor_directed as directed\n',
+                                    'import flexfactor_directed as directed\nimport flexfactor_evidence as evidence\n', 1)
+          marker = '\n\nif __name__ == "__main__":\n'
+          addition = r'''
+    def test_direct_main_entry_arms_hardening_without_test_installer(self):
+        # The implementation itself contains the install call; the test suite's
+        # setUpClass call must not be the only thing making direct callers safe.
+        import inspect
+        source = inspect.getsource(ff.main)
+        self.assertIn("_runtime_directed.install(globals())", source)
+
+    def test_all_powershell_extensions_are_evidence_sources(self):
+        self.assertTrue(directed._POWERSHELL_EXTS <= evidence.SOURCE_EXTENSIONS)
+
+    def test_generic_suffix_does_not_defeat_unique_typo_recovery(self):
+        original_roots = ff._PROJECT_ROOTS
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                wanted = os.path.join(root, "GrantFlow")
+                os.mkdir(wanted)
+                ff._PROJECT_ROOTS = [root]
+                for hint in ("GrantFlwo Repo", "GrantFlwo Project"):
+                    self.assertEqual(
+                        os.path.normcase(ff._find_local_project(hint)),
+                        os.path.normcase(wanted),
+                    )
+        finally:
+            ff._PROJECT_ROOTS = original_roots
+
+    def test_empty_powershell_whole_file_response_is_rejected_before_parser(self):
+        with mock.patch.object(directed, "powershell_syntax_details") as parser:
+            ok, note, parsed = ff._prewrite_source_syntax_details(
+                ".", "repair.ps1", "", [], allow_empty=False,
+            )
+        self.assertFalse(ok)
+        self.assertIn("empty whole-file response", note)
+        self.assertIsNone(parsed)
+        parser.assert_not_called()
+'''
+          if 'test_direct_main_entry_arms_hardening_without_test_installer' not in tests:
+              if marker not in tests:
+                  raise SystemExit('runtime hardening test insertion anchor missing')
+              tests = tests.replace(marker, '\n' + addition + marker, 1)
+          test_path.write_text(tests, encoding='utf-8', newline='\n')
+          PY
+          python -m compileall -q flexfactor.py flexfactor_directed.py flexfactor_evidence.py flexfactor_runtime_hardening_tests.py
+          python flexfactor_runtime_hardening_tests.py
+          git diff --check
+      - name: Commit patch to PR branch
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add flexfactor.py flexfactor_directed.py flexfactor_evidence.py flexfactor_runtime_hardening_tests.py
+          if git diff --cached --quiet; then
+            echo 'No patch required.'
+            exit 0
+          fi
+          git commit -m 'Close runtime hardening review gaps'
+          git push origin HEAD:fix/predictable-runtime-failures
