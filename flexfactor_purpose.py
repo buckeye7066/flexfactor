@@ -577,14 +577,14 @@ def _v2_contract_is_valid(
     for metadata_text in ("repo", "default_branch", "local_path", "locator"):
         if metadata_text in entry and not _nonblank_string(entry[metadata_text]):
             return False
+    # `slug` is optional, but when present it must be non-blank (not whitespace).
+    if "slug" in entry and not _nonblank_string(entry["slug"]):
+        return False
     if "source" in entry:
         source = entry["source"]
         if not isinstance(source, dict) or not source or any(
                 not _nonblank_string(key) or not _nonblank_string(value)
                 for key, value in source.items()):
-            return False
-        if optional_text == "slug" and optional_text in entry \
-                and not _nonblank_string(entry[optional_text]):
             return False
     for string_list in ("acceptance_criteria", "false_substitutes", "aliases"):
         if string_list not in entry:

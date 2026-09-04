@@ -6928,6 +6928,22 @@ def _ensure_program_understanding(provider, display_name: str, project_dir: str,
         return [field for field in required
                 if not getattr(value, field, None)]
 
+    # SECURITY: If an in-repo v2 contract exists but failed an authority gate,
+    # do NOT infer a new purpose. Treat as unresolved so mutation cannot be
+    # authorized without the owner's required claims/invariants.
+    if contract is None and project_dir:
+        fp = _purpose_module()
+        if fp is not None and hasattr(fp, "_contract_from_repo_lookup"):
+            try:
+                _c, authority_rejected = fp._contract_from_repo_lookup(project_dir, display_name)
+                if authority_rejected:
+                    return (None, "unresolved", False,
+                            "owner v2 contract present but not authoritative")
+            except Exception:
+                # If the probe fails, fall through to the existing path; a probe
+                # error must not authorize mutation.
+                pass
+
     missing = _missing(contract) if contract is not None else list(required)
     if contract is None or missing:
         contract, error = _infer_purpose_contract(
