@@ -443,6 +443,189 @@ def _posix_process_group_alive(process_group_id: int) -> bool:
     except OSError:
         return False
 
+
+def _enable_linux_child_subreaper() -> None:
+    """Make this process the reparenting boundary for orphan descendants."""
+    if not sys.platform.startswith("linux"):
+        raise OSError("Linux child-subreaper containment is unavailable")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _linux_direct_child_pids() -> tuple[int, ...]:
+    """Return direct children of the single-threaded supervisor from procfs.
+
+    Some hardened kernels omit ``task/<tid>/children``. Scanning status files
+    also lets the supervisor translate a host-mounted procfs PID to the PID in
+    its own namespace before signalling it.
+    """
+    def _status_ids(path: Path) -> tuple[int, tuple[int, ...]]:
+        parent_pid: int | None = None
+        namespace_pids: tuple[int, ...] = ()
+        for line in path.read_text(encoding="ascii").splitlines():
+            if line.startswith("PPid:"):
+                parent_pid = int(line.split(":", 1)[1].strip())
+            elif line.startswith("NSpid:"):
+                namespace_pids = tuple(
+                    int(value) for value in line.split(":", 1)[1].split()
+                )
+        if parent_pid is None:
+            raise ValueError("missing PPid")
+        return parent_pid, namespace_pids
+
+    try:
+        _self_parent, self_namespace_pids = _status_ids(Path("/proc/self/status"))
+        procfs_self_pid = (
+            self_namespace_pids[0]
+            if self_namespace_pids
+            else int(os.readlink("/proc/self"))
+        )
+        namespace_depth = max(0, len(self_namespace_pids) - 1)
+        children: list[int] = []
+        for candidate in Path("/proc").iterdir():
+            if not candidate.name.isdigit():
+                continue
+            try:
+                parent_pid, candidate_namespace_pids = _status_ids(
+                    candidate / "status"
+                )
+            except (OSError, ValueError):
+                # Processes can exit between directory enumeration and read.
+                continue
+            if parent_pid != procfs_self_pid:
+                continue
+            if candidate_namespace_pids:
+                if len(candidate_namespace_pids) <= namespace_depth:
+                    raise OSError("procfs child is outside the supervisor namespace")
+                children.append(candidate_namespace_pids[namespace_depth])
+            else:
+                # Without NSpid, this is safe only when procfs and the process
+                # agree on the current namespace's PID numbering.
+                if procfs_self_pid != os.getpid():
+                    raise OSError("procfs PID namespace mapping is unavailable")
+                children.append(int(candidate.name))
+        return tuple(children)
+    except (OSError, ValueError) as exc:
+        raise OSError("Linux procfs child inventory is unavailable") from exc
+
+
+def _reap_linux_children() -> None:
+    while True:
+        try:
+            child_pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except OSError:
+            return
+        if child_pid <= 0:
+            return
+
+
+def _terminate_linux_supervisor_children(timeout_seconds: float = 2.0) -> bool:
+    """Kill every adopted child, including helpers that created a new session."""
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    escalation = started + min(0.5, timeout_seconds / 2)
+    while time.monotonic() < deadline:
+        _reap_linux_children()
+        children = _linux_direct_child_pids()
+        if not children:
+            return True
+        chosen_signal = (
+            signal.SIGTERM if time.monotonic() < escalation else signal.SIGKILL
+        )
+        for child_pid in children:
+            try:
+                os.kill(child_pid, chosen_signal)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.01)
+    _reap_linux_children()
+    return not _linux_direct_child_pids()
+
+
+def _linux_supervise_command(command: Sequence[str]) -> int:
+    """Run one command behind a subreaper that owns orphaned descendants.
+
+    This function executes only in the isolated supervisor subprocess started
+    below. Keeping the subreaper out of the long-lived FlexFactor process
+    avoids adopting or signalling unrelated concurrent tools.
+    """
+    if not command:
+        return 125
+    try:
+        _enable_linux_child_subreaper()
+        # Prove procfs inventory is available before any optional ranker code
+        # executes. Without it the supervisor cannot safely enumerate adoptees.
+        _linux_direct_child_pids()
+    except OSError as exc:
+        print(f"flexfactor Tenets containment unavailable: {exc}", file=sys.stderr)
+        return 125
+
+    received_signal: list[int | None] = [None]
+
+    def _request_stop(signum, _frame) -> None:
+        received_signal[0] = int(signum)
+
+    for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(handled, _request_stop)
+    try:
+        child = subprocess.Popen(tuple(command), shell=False)
+    except OSError as exc:
+        print(f"flexfactor could not start Tenets: {exc}", file=sys.stderr)
+        return 125
+
+    stop_started: float | None = None
+    while True:
+        requested = received_signal[0]
+        if requested is not None:
+            if stop_started is None:
+                stop_started = time.monotonic()
+                try:
+                    child.send_signal(requested)
+                except ProcessLookupError:
+                    pass
+            elif time.monotonic() - stop_started >= 0.5:
+                try:
+                    child.kill()
+                except ProcessLookupError:
+                    pass
+        try:
+            returncode = child.wait(timeout=0.02)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    try:
+        cleaned = _terminate_linux_supervisor_children()
+    except OSError as exc:
+        print(f"flexfactor could not verify Tenets descendant cleanup: {exc}",
+              file=sys.stderr)
+        return 125
+    if not cleaned:
+        print("flexfactor could not terminate every Tenets descendant",
+              file=sys.stderr)
+        return 125
+    if received_signal[0] is not None:
+        return 128 + received_signal[0]
+    if returncode < 0:
+        return 128 + abs(returncode)
+    return min(returncode, 255)
+
+
 def _read_bounded_pipe(
     pipe: BinaryIO,
     *,
@@ -492,10 +675,12 @@ def _terminate_process_tree(
 ) -> None:
     """Stop the ranker and every helper it created.
 
-    ``terminate()`` only addresses the direct child.  A helper that inherited
+    ``terminate()`` only addresses the direct child. A helper that inherited
     stdout/stderr can otherwise survive the timeout and keep both reader
-    threads blocked.  The child is always launched as a new POSIX session or
-    Windows process group by :func:`_run_bounded_process`.
+    threads blocked. On Linux, the retained process-group leader is a trusted
+    subreaper supervisor, so a helper that calls ``setsid()`` is adopted and
+    terminated before that leader exits. Windows uses a kill-on-close Job
+    Object. Other POSIX systems fail closed before optional Tenets is launched.
     """
     if os.name == "nt":
         if windows_job is not None:
@@ -584,6 +769,7 @@ def _run_bounded_process(
     if stdout_limit < 1 or stderr_limit < 1:
         raise ValueError("output limits must be positive")
     process_group: dict[str, Any]
+    process_command = tuple(str(part) for part in command)
     if os.name == "nt":
         process_group = {
             # CREATE_SUSPENDED closes the launch/assignment race: no ranker or
@@ -593,10 +779,29 @@ def _run_bounded_process(
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | 0x00000004
             ),
         }
-    else:
+    elif sys.platform.startswith("linux"):
         process_group = {"start_new_session": True}
+        # The target shares this new session, but cannot escape cleanup by
+        # creating another one: after it exits, the dedicated Linux subreaper
+        # adopts every orphan and kills all adoptees before closing its pipes.
+        process_command = (
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve(strict=True)),
+            "--_linux-subprocess-supervisor",
+            "--",
+            *process_command,
+        )
+    else:
+        # POSIX process groups are escapable via setsid(). Tenets is advisory,
+        # so preserve the primary audit path instead of launching it without a
+        # containment primitive that survives direct-parent exit.
+        raise OSError(
+            "strong Tenets descendant containment is unavailable on this platform"
+        )
     process = subprocess.Popen(
-        tuple(command),
+        process_command,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1305,4 +1510,6 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:3] == ["--_linux-subprocess-supervisor", "--"]:
+        raise SystemExit(_linux_supervise_command(sys.argv[3:]))
     raise SystemExit(run_cli())

@@ -263,6 +263,44 @@ class TenetsContextTests(unittest.TestCase):
         time.sleep(1.2)
         self.assertFalse(survivor_file.exists())
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux child-subreaper containment contract")
+    def test_setsid_descendant_cannot_escape_after_ranker_exits_zero(self) -> None:
+        survivor_file = Path(self.temp.name) / "setsid-descendant-survived"
+        script = (
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c',"
+            "'import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text(\"alive\"); time.sleep(60)',"
+            "sys.argv[1]],start_new_session=True)"
+        )
+        started = time.monotonic()
+
+        result = ft._run_bounded_process(
+            (sys.executable, "-S", "-c", script, str(survivor_file)),
+            cwd=self.root,
+            timeout_seconds=10,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.read_error)
+        self.assertLess(time.monotonic() - started, 4)
+        time.sleep(1.2)
+        self.assertFalse(survivor_file.exists())
+
+    def test_other_posix_platform_fails_before_launch_without_containment(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows has Job Object containment")
+        with mock.patch.object(ft.sys, "platform", "darwin"), mock.patch.object(
+            ft.subprocess, "Popen"
+        ) as popen:
+            with self.assertRaisesRegex(OSError, "containment is unavailable"):
+                ft._run_bounded_process(
+                    (sys.executable, "-c", "print('must not run')"),
+                    cwd=self.root,
+                    timeout_seconds=10,
+                )
+        popen.assert_not_called()
+
     def test_windows_job_cleanup_survives_an_exited_direct_parent(self) -> None:
         process = mock.Mock()
         process.poll.return_value = 0

@@ -93,14 +93,19 @@ verification.
 
 Stdout and stderr are consumed concurrently with hard limits while the process
 is running. FlexFactor terminates the child as soon as either stream exceeds its
-limit, preventing a noisy or defective subprocess from exhausting memory. The
-ranker starts in an isolated POSIX session. On Windows it starts suspended, is
-assigned to a kill-on-close Job Object, and only then resumes, so no helper can
-escape in the launch-to-containment interval. FlexFactor closes the retained
-process group or Job Object after timeout, overflow, or normal leader exit;
-descendants therefore cannot survive by inheriting the output pipes. Timeouts
-must be positive finite numbers. The temporary JSON output is also bounded
-before parsing and is removed before the adapter returns.
+limit, preventing a noisy or defective subprocess from exhausting memory. On
+Linux, a dedicated process starts as the isolated session leader and enables
+the kernel child-subreaper contract before it launches Tenets. It retains that
+identity after the direct ranker exits, adopts orphan helpers even when they
+called `setsid()`, and terminates every adoptee before closing its output pipes.
+On Windows, the ranker starts suspended, is assigned to a kill-on-close Job
+Object, and only then resumes, so no helper can escape in the
+launch-to-containment interval. Other POSIX systems do not provide either
+boundary through Python's supported process API; FlexFactor therefore records
+Tenets as degraded and does not launch it there instead of claiming an
+escapable process group as containment. Timeouts must be positive finite
+numbers. The temporary JSON output is also bounded before parsing and is
+removed before the adapter returns.
 
 Automatic launcher integration can be disabled without uninstalling the tool:
 
