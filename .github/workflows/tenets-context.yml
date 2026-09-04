@@ -2,7 +2,7 @@ name: tenets-context
 
 on:
   push:
-    branches: [main, "ai/futuretools-tenets-context"]
+    branches: [main, "fix/tenets-context-integration"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -22,6 +22,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
+    env:
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
