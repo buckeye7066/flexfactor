@@ -5,6 +5,8 @@ on:
     branches: [fix/purpose-v2-contract-loading]
     paths:
       - .github/workflows/repair-pr136.yml
+      - scripts/repair_pr136.py
+      - scripts/repair_pr136_tests.py
 
 permissions:
   contents: write
@@ -21,7 +23,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply guarded authority repairs
-        run: python scripts/repair_pr136.py
+        run: |
+          python scripts/repair_pr136.py
+          python scripts/repair_pr136_tests.py
       - name: Run focused authority regressions
         run: |
           python -m py_compile flexfactor_purpose.py test_flexfactor_purpose.py
