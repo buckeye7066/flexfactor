@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -200,21 +203,69 @@ class TenetsContextTests(unittest.TestCase):
                 self.assertLessEqual(len(result.stdout), 128)
                 self.assertLessEqual(len(result.stderr), 128)
 
+    @unittest.skipIf(os.name == "nt", "POSIX process-group contract")
+    def test_termination_escalates_across_the_isolated_process_group(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.pid = 424242
+        process.wait.side_effect = [subprocess.TimeoutExpired("tenets", 2), None]
+
+        with mock.patch.object(ft.os, "killpg") as kill_group:
+            ft._terminate_process_tree(process)
+
+        self.assertEqual(
+            kill_group.call_args_list,
+            [mock.call(424242, ft.signal.SIGTERM), mock.call(424242, ft.signal.SIGKILL)],
+        )
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
     def test_ranker_never_runs_from_or_resolves_helpers_through_target(self) -> None:
         target_bin = self.root / "tools"
         target_bin.mkdir()
         completed = self._process(stdout=b'{"files":["src/app.py"]}')
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
              mock.patch.object(ft, "_run_bounded_process", return_value=completed) as runner, \
-             mock.patch.dict(os.environ, {"PATH": os.pathsep.join((str(target_bin), "/safe/bin"))}):
+             mock.patch.dict(os.environ, {
+                 "PATH": os.pathsep.join((str(target_bin), "/safe/bin")),
+                 "PYTHONPATH": str(self.root),
+                 "PYTHONHOME": str(self.root / "python-home"),
+                 "OPENAI_API_KEY": "must-not-reach-ranker",
+                 "GITHUB_TOKEN": "must-not-reach-ranker",
+             }):
             result = ft.generate_tenets_context(self.root, "audit")
 
         self.assertEqual(result.status, "ok")
         call = runner.call_args
         self.assertFalse(Path(call.kwargs["cwd"]).is_relative_to(self.root))
         child_env = call.kwargs["env"]
-        self.assertEqual(child_env["PATH"], "/safe/bin")
+        self.assertEqual(child_env["PATH"], "")
         self.assertFalse(Path(child_env["HOME"]).is_relative_to(self.root))
+        self.assertNotIn("PYTHONPATH", child_env)
+        self.assertNotIn("PYTHONHOME", child_env)
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("GITHUB_TOKEN", child_env)
+        self.assertEqual(child_env["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(child_env["PYTHONSAFEPATH"], "1")
+        self.assertEqual(child_env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(child_env["GIT_TERMINAL_PROMPT"], "0")
+        disabled_git = Path(child_env["GIT_PYTHON_GIT_EXECUTABLE"])
+        self.assertTrue(disabled_git.is_relative_to(call.kwargs["cwd"]))
+        self.assertFalse(disabled_git.exists())
+
+    def test_repo_named_symlink_or_junction_never_survives_helper_lookup(self) -> None:
+        outside = Path(self.temp.name) / "outside-bin"
+        outside.mkdir()
+        target_link = self.root / "linked-bin"
+        try:
+            target_link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("directory symlinks are unavailable")
+        isolation = Path(self.temp.name) / "isolation"
+        isolation.mkdir()
+        with mock.patch.dict(os.environ, {"PATH": str(target_link)}, clear=False):
+            environment = ft._isolated_tenets_environment(self.root.resolve(), isolation)
+        self.assertEqual(environment["PATH"], "")
 
     def test_generator_reports_stream_limit_without_parsing_partial_json(self) -> None:
         completed = self._process(
@@ -371,6 +422,42 @@ class TenetsContextTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
             self.assertEqual(ft._argv_task(argv, project=first), "repair grant matching")
             self.assertEqual(ft._argv_task(argv, project=second), "repair family workflow")
+
+    def test_same_named_programs_prefer_the_exact_resolved_path(self) -> None:
+        first = self.root.parent / "one" / "app"
+        second = self.root.parent / "two" / "app"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        argv = [
+            "audit",
+            "--program", str(first),
+            "--guiding-prompt", "repair first checkout",
+            "--program", str(second),
+            "--guiding-prompt", "repair second checkout",
+        ]
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            self.assertEqual(
+                ft._argv_task(argv, project=second),
+                "repair second checkout",
+            )
+
+    def test_ambiguous_program_basename_does_not_guess_a_prompt(self) -> None:
+        first = self.root.parent / "one" / "app"
+        second = self.root.parent / "two" / "app"
+        unmatched = self.root.parent / "three" / "app"
+        for path in (first, second, unmatched):
+            path.mkdir(parents=True)
+        argv = [
+            "audit",
+            "--program", str(first),
+            "--guiding-prompt", "repair first checkout",
+            "--program", str(second),
+            "--guiding-prompt", "repair second checkout",
+        ]
+        with mock.patch.dict(os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False):
+            task = ft._argv_task(argv, project=unmatched)
+        self.assertNotIn(task, {"repair first checkout", "repair second checkout"})
+        self.assertIn("production readiness", task)
 
 class TenetsInstallTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -616,7 +703,62 @@ class TenetsManifestAndEntryTests(unittest.TestCase):
         import inspect
         import flexfactor as ff
         source = inspect.getsource(ff.run_cli)
-        self.assertIn("_runtime_tenets.install(globals()", source)
+        self.assertIn("_runtime_tenets.install(", source)
+        self.assertIn("globals(), argv=", source)
+
+    def test_launcher_import_defers_install_and_forwards_explicit_argv(self) -> None:
+        fake_flexfactor = types.ModuleType("flexfactor")
+        fake_flexfactor.run_cli = mock.Mock(return_value=7)
+        fake_memory = types.ModuleType("obsidian_memory")
+        fake_memory.recall = mock.Mock()
+        fake_memory.remember = mock.Mock()
+        fake_directed = types.ModuleType("flexfactor_directed")
+        fake_directed.install = mock.Mock()
+        fake_tenets = types.ModuleType("flexfactor_tenets")
+        fake_tenets.install = mock.Mock()
+        modules = {
+            "flexfactor": fake_flexfactor,
+            "obsidian_memory": fake_memory,
+            "flexfactor_directed": fake_directed,
+            "flexfactor_tenets": fake_tenets,
+        }
+        path = Path(__file__).with_name("flexfactor_run.py")
+        spec = importlib.util.spec_from_file_location("_flexfactor_run_test", path)
+        assert spec is not None and spec.loader is not None
+        shim = importlib.util.module_from_spec(spec)
+
+        with mock.patch.dict(sys.modules, modules, clear=False):
+            spec.loader.exec_module(shim)
+        fake_tenets.install.assert_not_called()
+
+        argv = ["audit", "--session-prompt", "repair the actual run"]
+        self.assertEqual(shim.run_cli(argv), 7)
+        fake_tenets.install.assert_called_once_with(
+            vars(fake_flexfactor), argv=argv
+        )
+        fake_flexfactor.run_cli.assert_called_once_with(argv)
+
+    def test_reinstall_refreshes_arguments_for_long_lived_embedders(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = {"_enumerate_source_files": lambda project: ["app.py"]}
+            observed_tasks: list[str] = []
+
+            def context(project, task, **_kwargs):
+                observed_tasks.append(task)
+                return ft.TenetsContextResult(
+                    schema_version=1, tool="tenets", expected_version=ft.TENETS_VERSION,
+                    adapter_version=2, status="degraded", project_root=str(project),
+                    task=task, files=(), message="test", duration_seconds=0,
+                    output_path="", command=(),
+                )
+
+            with mock.patch.object(ft, "cached_tenets_context", side_effect=context):
+                ft.install(runtime, argv=["audit", "--session-prompt", "first task"])
+                runtime["_enumerate_source_files"](str(root))
+                ft.install(runtime, argv=["audit", "--session-prompt", "second task"])
+                runtime["_enumerate_source_files"](str(root))
+        self.assertEqual(observed_tasks, ["first task", "second task"])
 
 
 if __name__ == "__main__":
