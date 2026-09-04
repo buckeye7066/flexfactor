@@ -78,6 +78,9 @@ jobs:
           fi
           rollout_engine=""
           if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
+            # During a tag-first rollout the deployed cloud still advertises
+            # declared_engine. The marker authorizes the Android tag named by
+            # android_engine without weakening the gate for unrelated refs.
             pending_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
             if [ "$pending_engine" != "$android_engine" ]; then
               echo "The staged rollout marker does not name $android_engine" >&2
