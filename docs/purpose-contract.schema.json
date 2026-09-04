@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://flexfactor.local/schemas/purpose-contract.v2.json",
   "title": "FlexFactor Purpose Contract",
+  "$comment": "Before a v2 contract can authorize mutation, runtime validation additionally requires every claim evidence_refs index to resolve to top-level evidence, every required users/outcomes/workflows/invariants claim and every resolved-contradiction decision to be verified or supported, no unresolved contradictions, and the complete mutation-authoritative context to fit the 10000-character prompt budget.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "name", "purpose", "users", "outcomes", "workflows", "invariants", "acceptance_criteria", "evidence"],
@@ -48,7 +49,8 @@
         "id": { "type": "string", "minLength": 1 },
         "text": { "type": "string", "minLength": 1 },
         "confidence": { "enum": ["verified", "supported", "inferred", "contradicted", "unknown"] },
-        "evidence_refs": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+        "evidence_refs": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 },
+                           "$comment": "Runtime validation also requires every index to resolve to this contract's top-level evidence array." }
       }
     },
     "resolved_claim": {
@@ -60,8 +62,9 @@
         "text": { "type": "string", "minLength": 1 },
         "resolution": { "type": "string", "minLength": 1,
                         "description": "Which side was correct - the DOCUMENTED behaviour or the IMPLEMENTED behaviour - and why. A contradiction is not closed by deleting it; the reader must be able to audit the decision." },
-        "confidence": { "enum": ["verified", "supported", "inferred", "contradicted", "unknown"] },
-        "evidence_refs": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+        "confidence": { "enum": ["verified", "supported"] },
+        "evidence_refs": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 },
+                           "$comment": "Runtime validation also requires every index to resolve to this contract's top-level evidence array." }
       }
     }
   }

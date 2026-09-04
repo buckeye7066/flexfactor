@@ -40,10 +40,14 @@ flexfactor_prodready.py, so the tests can load it in isolation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
 
 SCHEMA = "flexfactor.purpose_contracts.v1"
 
@@ -149,6 +153,27 @@ PRODUCTION_READY_CONDITIONS = (
 #: Evidence values a condition may carry. Mirrors prodready's four-valued gates.
 EVIDENCE_STATES = ("pass", "fail", "na", "unknown")
 
+# Every caller that can place an owner contract in a model context provides at
+# least this much room. A v2 contract may not authorize mutation unless its
+# purpose, required claims, and complete referenced evidence fit this budget.
+REQUIRED_V2_PROMPT_MAX_CHARS = 10000
+# ``purpose_contract`` is placed before later evidence in exact-commit review.
+# Keep its complete serialized form bounded well below that review envelope.
+REQUIRED_V2_SERIALIZED_MAX_CHARS = 40000
+# Authority files are target-controlled input. Bound bytes before decoding so
+# whitespace padding cannot turn a small serialized contract into an unbounded
+# allocation at the mutation gate.
+IN_REPO_CONTRACT_MAX_BYTES = 256 * 1024
+# Local evidence can legitimately be a generated source bundle larger than the
+# contract itself, but it must never trigger unbounded reads at the authority
+# gate. The checked-in FlexFactor evidence is below 2 MiB; 16 MiB leaves ample
+# headroom while rejecting databases, disk images, and huge sparse artifacts.
+V2_LOCAL_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024
+# A per-record ceiling is insufficient when a small contract cites many large
+# sparse files.  Preflight every local record and reject the whole ledger
+# before opening anything if their aggregate declared size exceeds this bound.
+V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES = 64 * 1024 * 1024
+
 
 def slugify(text: str) -> str:
     """Lowercase hyphen slug. Matches flexfactor._slugify's behavior so contract
@@ -174,6 +199,9 @@ class PurposeContract:
     name: str
     slug: str = ""
     purpose: str = ""
+    #: Owner-authored description of a superseded purpose.  This must remain
+    #: visible so repository history is not mistaken for a current requirement.
+    historical_purpose: str = ""
     #: Who receives the program's outcome.  Inferred contracts must populate
     #: this explicitly; otherwise a model can reduce "understand the app" to a
     #: one-line README paraphrase without identifying whose job is being done.
@@ -202,6 +230,19 @@ class PurposeContract:
     #: evidence that was merely available from evidence the model actually
     #: relied on.
     evidence_refs: list[str] = field(default_factory=list)
+    #: Complete evidence-bearing claim records from a validated v2 owner
+    #: contract, keyed by their schema section.  Keeping the records (rather
+    #: than only projecting users/workflows to strings) preserves the claim
+    #: identity, confidence, and evidence relationship at the mutation gate.
+    structured_claims: dict[str, list[dict]] = field(default_factory=dict)
+    #: Optional v2 observations/aspirations/gaps whose confidence is inferred,
+    #: contradicted, or unknown. They remain visible in serialized discovery
+    #: and final-review evidence but never enter the mutation prompt.
+    discovery_claims: dict[str, list[dict]] = field(default_factory=dict)
+    #: Complete top-level evidence records from a validated v2 owner contract.
+    #: This is deliberately separate from ``evidence_ledger``, whose records
+    #: use the discovery/inference ``path_or_ref`` shape.
+    contract_evidence: list[dict] = field(default_factory=list)
     contradictions: list[dict] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
     #: One of PURPOSE_CONFIDENCE_LEVELS. "owner-authored" for authored contracts.
@@ -214,7 +255,7 @@ class PurposeContract:
     def to_dict(self) -> dict:
         return asdict(self)
 
-    def prompt_block(self, max_chars: int = 6000) -> str:
+    def prompt_block(self, max_chars: int = REQUIRED_V2_PROMPT_MAX_CHARS) -> str:
         """Render the contract for a model prompt.
 
         Numbered acceptance criteria matter: the gap assessor is required to cite
@@ -242,16 +283,73 @@ class PurposeContract:
             "PURPOSE (what this program was created to do):",
             self.purpose or "(not stated)",
         ]
+        if self.historical_purpose:
+            lines += [
+                "",
+                "HISTORICAL PURPOSE (OBSOLETE; NOT CURRENT):",
+                self.historical_purpose,
+            ]
+        # Required v2 claims must appear before lower-authority/contextual
+        # material so a prompt-size cap cannot silently discard the outcome or
+        # a safety invariant while still labelling the contract owner-authored.
+        # The compact record form retains the exact confidence and evidence
+        # linkage the validator used when it granted mutation authority.
+        required_sections = (
+            ("users", "PRIMARY USERS"),
+            ("outcomes", "REQUIRED OUTCOMES"),
+            ("workflows", "CORE END-TO-END JOURNEYS"),
+            ("invariants", "MUTATION INVARIANTS"),
+        )
+        contextual_sections = (
+            ("current_behavior", "CURRENT OBSERVED BEHAVIOR"),
+            ("aspirations", "OWNER ASPIRATIONS"),
+            ("gaps", "KNOWN PURPOSE GAPS"),
+        )
+        if self.structured_claims:
+            for key, heading in (*required_sections, *contextual_sections):
+                claims = self.structured_claims.get(key) or []
+                if not claims:
+                    continue
+                lines += ["", f"{heading}:"]
+                for claim in claims:
+                    refs = ",".join(str(ref) for ref in claim["evidence_refs"])
+                    lines.append(
+                        f"  - [{claim['id']} | confidence={claim['confidence']} | "
+                        f"evidence_refs={refs}] {claim['text']}"
+                    )
+            resolved = self.structured_claims.get("resolved_contradictions") or []
+            if resolved:
+                lines += ["", "RESOLVED CONTRADICTIONS (authoritative decisions):"]
+                for claim in resolved:
+                    refs = ",".join(str(ref) for ref in claim["evidence_refs"])
+                    lines.append(
+                        f"  - [{claim['id']} | confidence={claim['confidence']} | "
+                        f"evidence_refs={refs}] {claim['text']} => "
+                        f"RESOLUTION: {claim['resolution']}"
+                    )
+            if self.contract_evidence:
+                lines += ["", "CONTRACT EVIDENCE (indexes used above):"]
+                for index, record in enumerate(self.contract_evidence):
+                    evidence_line = (
+                        f"  - [{index}] kind={record['kind']}; "
+                        f"locator={record['locator']}; "
+                        f"content_hash={record['content_hash']}; "
+                        f"observed_at={record['observed_at']}"
+                    )
+                    if record.get("excerpt"):
+                        evidence_line += f"; excerpt={record['excerpt']}"
+                    lines.append(evidence_line)
+        else:
+            if self.primary_users:
+                lines += ["", "PRIMARY USERS:"]
+                lines += [f"  - {user}" for user in self.primary_users]
+            if self.core_journeys:
+                lines += ["", "CORE END-TO-END JOURNEYS:"]
+                lines += [f"  - {journey}" for journey in self.core_journeys]
         if self.acceptance_criteria:
             lines += ["", "ACCEPTANCE CRITERIA (the program is not finished until "
                           "every one of these is true):"]
             lines += [f"  {i}. {c}" for i, c in enumerate(self.acceptance_criteria, 1)]
-        if self.primary_users:
-            lines += ["", "PRIMARY USERS:"]
-            lines += [f"  - {user}" for user in self.primary_users]
-        if self.core_journeys:
-            lines += ["", "CORE END-TO-END JOURNEYS:"]
-            lines += [f"  - {journey}" for journey in self.core_journeys]
         if self.evidence_refs:
             lines += ["", "EVIDENCE ACTUALLY CITED FOR THIS INFERENCE:"]
             lines += [f"  - {ref}" for ref in self.evidence_refs]
@@ -261,6 +359,10 @@ class PurposeContract:
         if self.false_substitutes:
             lines += ["", "THESE DO NOT COUNT AS FULFILLING THE PURPOSE:"]
             lines += [f"  - {d}" for d in self.false_substitutes]
+        if self.structured_claims and len("\n".join(lines)) > max_chars:
+            raise ValueError(
+                "required v2 purpose context exceeds the available prompt context"
+            )
         return "\n".join(lines)[:max_chars]
 
 
@@ -273,18 +375,79 @@ def registry_path(base_dir: str | None = None) -> str:
     return os.path.join(base, REGISTRY_REL)
 
 
-def load_registry(path: str | None = None) -> dict:
-    """Load the seeded contract registry. Returns {} when absent or unreadable -
-    purpose awareness degrades to inference, it never breaks a run."""
+def _load_registry_with_status(path: str | None = None) -> tuple[dict, bool]:
+    """Return registry programs and whether its authority probe failed.
+
+    A genuinely absent optional registry permits repository inference.  A
+    present-but-unreadable, malformed, or wrong-shaped owner registry does not:
+    treating corruption as absence would let lower-authority model prose
+    replace an owner record and unlock mutation.
+    """
     p = path or registry_path()
     try:
+        authority_entry = os.lstat(p)
+    except FileNotFoundError:
+        return {}, False
+    except OSError:
+        return {}, True
+    if not stat.S_ISREG(authority_entry.st_mode):
+        # Symlinks (including dangling ones), directories, and special files
+        # are present authority entries we cannot bind to stable owner bytes.
+        return {}, True
+
+    def _handle_identity(value) -> tuple[int, int, int, int, int, int]:
+        return (
+            int(stat.S_IFMT(value.st_mode)),
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            int(value.st_ctime_ns),
+        )
+
+    def _path_handle_shape(value) -> tuple[int, int]:
+        # Windows path-stat and handle-stat can disagree on permission bits,
+        # device, inode, and creation/metadata time for the same file. Compare
+        # only type/size across APIs, then compare two live handle identities.
+        return int(stat.S_IFMT(value.st_mode)), int(value.st_size)
+
+    try:
         with open(p, encoding="utf-8") as fh:
+            opened_before = os.fstat(fh.fileno())
+            if (not stat.S_ISREG(opened_before.st_mode)
+                    or _path_handle_shape(opened_before)
+                    != _path_handle_shape(authority_entry)):
+                return {}, True
             doc = json.load(fh)
-    except (OSError, ValueError):
-        return {}
+            opened_after = os.fstat(fh.fileno())
+        current = os.lstat(p)
+        # Reopen the directory entry after parsing. Both identities now come
+        # from fstat on a live handle, which is stable across platforms and
+        # still catches swap/restore races.
+        with open(p, "rb") as current_fh:
+            current_opened = os.fstat(current_fh.fileno())
+    except Exception:
+        # Any ordinary backend/decoder/parser failure means authority could not
+        # be established.  BaseException subclasses (interrupts/exits) still
+        # propagate.
+        return {}, True
+    if (not stat.S_ISREG(current.st_mode)
+            or not stat.S_ISREG(current_opened.st_mode)
+            or _handle_identity(opened_before)
+            != _handle_identity(opened_after)
+            or _handle_identity(opened_after)
+            != _handle_identity(current_opened)
+            or _path_handle_shape(current)
+            != _path_handle_shape(current_opened)):
+        return {}, True
     if not isinstance(doc, dict) or not isinstance(doc.get("programs"), dict):
-        return {}
-    return doc["programs"]
+        return {}, True
+    return doc["programs"], False
+
+
+def load_registry(path: str | None = None) -> dict:
+    """Load seeded programs; status-aware mutation lookup uses the helper above."""
+    return _load_registry_with_status(path)[0]
 
 
 def _match_keys(program_name: str, project_dir: str | None) -> list[str]:
@@ -303,52 +466,589 @@ def _match_keys(program_name: str, project_dir: str | None) -> list[str]:
     return keys
 
 
-def find_contract(program_name: str, project_dir: str | None = None,
-                  registry: dict | None = None) -> PurposeContract | None:
-    """Look up an AUTHORED contract for this program.
+def find_contract_with_status(
+    program_name: str,
+    project_dir: str | None = None,
+    registry: dict | None = None,
+) -> tuple[PurposeContract | None, bool]:
+    """Look up an authored contract and report authoritative rejection.
 
     Resolution order, most authoritative first:
       1. a contract file inside the audited repo (the program speaks for itself)
       2. the owner's seeded registry, by slug, then by alias, then by local_path
-    Returns None when nothing authored is found; the caller then infers.
+    The boolean is true when an identity selector found an owner record but its
+    contract was invalid, ambiguous, or failed a v2 mutation-authority gate.
+    Callers must not replace that explicit rejection with model inference.
     """
     if project_dir:
-        in_repo = contract_from_repo(project_dir, program_name)
+        in_repo, authority_rejected = _contract_from_repo_lookup(
+            project_dir, program_name
+        )
         if in_repo is not None:
-            return in_repo
+            return in_repo, False
+        if authority_rejected:
+            # A complete in-repo v2 contract is the highest-authority owner
+            # statement.  If it is structurally valid but cannot pass a
+            # mutation-authority gate, no lower-priority Markdown or registry
+            # record may silently replace that decision.
+            return None, True
 
-    reg = load_registry() if registry is None else registry
+    if registry is None:
+        reg, registry_probe_failed = _load_registry_with_status()
+        if registry_probe_failed:
+            return None, True
+    else:
+        if not isinstance(registry, dict):
+            return None, True
+        reg = registry
     if not reg:
-        return None
+        return None, False
     keys = _match_keys(program_name, project_dir)
 
     # Exact slug.
     for k in keys:
         if k in reg:
-            return _contract_from_registry(reg[k])
-    # Alias.
+            # An exact owner-registry record is authoritative even when it is
+            # invalid.  Fail unresolved at that boundary; falling through to
+            # another entry that merely claims this slug as an alias can load
+            # an unrelated program's purpose and authorize the wrong mutation.
+            contract = _contract_from_registry(
+                reg[k], evidence_root=project_dir
+            )
+            return contract, contract is None
+    # Alias. Identity selectors are authoritative even when the selected
+    # record is malformed. Multiple records claiming the same alias are also
+    # ambiguous. In either case fail unresolved instead of continuing until an
+    # unrelated parseable record happens to grant mutation authority.
+    alias_matches = []
     for entry in reg.values():
-        alias_slugs = {slugify(a) for a in (entry.get("aliases") or [])}
+        if not isinstance(entry, dict):
+            continue
+        raw_aliases = entry.get("aliases") or []
+        if not isinstance(raw_aliases, list):
+            continue
+        alias_slugs = {
+            slugify(alias) for alias in raw_aliases if isinstance(alias, str)
+        }
         alias_slugs |= {s.replace("-", "") for s in list(alias_slugs)}
         if alias_slugs & set(keys):
-            return _contract_from_registry(entry)
+            alias_matches.append(entry)
+    if alias_matches:
+        if len(alias_matches) != 1:
+            return None, True
+        contract = _contract_from_registry(
+            alias_matches[0], evidence_root=project_dir
+        )
+        return contract, contract is None
     # Same checkout on disk.
     if project_dir:
         want = os.path.normcase(os.path.abspath(project_dir))
+        path_matches = []
         for entry in reg.values():
+            if not isinstance(entry, dict):
+                continue
             lp = entry.get("local_path")
-            if lp and os.path.normcase(os.path.abspath(lp)) == want:
-                return _contract_from_registry(entry)
-    return None
+            if isinstance(lp, str) and lp \
+                    and os.path.normcase(os.path.abspath(lp)) == want:
+                path_matches.append(entry)
+        if path_matches:
+            if len(path_matches) != 1:
+                return None, True
+            contract = _contract_from_registry(
+                path_matches[0], evidence_root=project_dir
+            )
+            return contract, contract is None
+    return None, False
 
 
-def _contract_from_registry(entry: dict) -> PurposeContract:
-    return PurposeContract(
+def find_contract(program_name: str, project_dir: str | None = None,
+                  registry: dict | None = None) -> PurposeContract | None:
+    """Return the owner's authored contract, or ``None`` when unavailable."""
+    return find_contract_with_status(program_name, project_dir, registry)[0]
+
+
+_V2_SCHEMA = "flexfactor.purpose_contract.v2"
+_V2_TOP_LEVEL_KEYS = frozenset({
+    "schema", "name", "historical_purpose", "purpose", "current_behavior",
+    "aspirations", "users", "outcomes", "workflows", "invariants",
+    "acceptance_criteria", "contradictions", "resolved_contradictions",
+    "gaps", "evidence", "false_substitutes", "slug", "aliases",
+})
+_V2_REQUIRED_KEYS = frozenset({
+    "schema", "name", "purpose", "users", "outcomes", "workflows",
+    "invariants", "acceptance_criteria", "evidence",
+})
+_V2_CLAIM_KEYS = frozenset({"id", "text", "confidence", "evidence_refs"})
+_V2_RESOLVED_CLAIM_KEYS = frozenset({
+    "id", "text", "resolution", "confidence", "evidence_refs",
+})
+_V2_EVIDENCE_KEYS = frozenset({
+    "kind", "locator", "content_hash", "observed_at", "excerpt",
+})
+_V2_EVIDENCE_KINDS = frozenset({
+    "source", "documentation", "history", "issue", "pull_request", "test",
+    "route", "schema", "runtime",
+})
+_V2_CONFIDENCE = frozenset({
+    "verified", "supported", "inferred", "contradicted", "unknown",
+})
+_V2_AUTHORITY_CONFIDENCE = frozenset({"verified", "supported"})
+_V2_LOCAL_EVIDENCE_KINDS = frozenset({"source", "test", "schema", "route"})
+_V2_CLAIM_SECTIONS = (
+    "current_behavior", "aspirations", "users", "outcomes", "workflows",
+    "invariants", "contradictions", "gaps",
+)
+_V2_REQUIRED_CLAIM_SECTIONS = frozenset({
+    "users", "outcomes", "workflows", "invariants",
+})
+_V2_STRUCTURED_MARKERS = frozenset({
+    "current_behavior", "aspirations", "users", "outcomes", "workflows",
+    "invariants", "contradictions", "resolved_contradictions", "gaps",
+    "evidence",
+})
+_V2_REGISTRY_METADATA_KEYS = frozenset({
+    "repo", "default_branch", "local_path", "locator", "source",
+})
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
+
+
+def _nonblank_string(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _rfc3339_datetime(value) -> bool:
+    """Validate the timezone-bearing subset required by JSON Schema date-time."""
+    if not isinstance(value, str) or not _RFC3339.fullmatch(value):
+        return False
+    normalized = value[:-1] + "+00:00" if value[-1:].lower() == "z" else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
+                       authoritative: bool = False) -> bool:
+    if not isinstance(item, dict):
+        return False
+    allowed = _V2_RESOLVED_CLAIM_KEYS if resolved else _V2_CLAIM_KEYS
+    if set(item) != allowed:
+        return False
+    if not _nonblank_string(item.get("id")) \
+            or not _nonblank_string(item.get("text")):
+        return False
+    if resolved and not _nonblank_string(item.get("resolution")):
+        return False
+    confidence = item.get("confidence")
+    if not isinstance(confidence, str) or confidence not in _V2_CONFIDENCE:
+        return False
+    # Required purpose claims become mutation authority.  A structurally valid
+    # but disputed/inferred claim may remain useful discovery input, but it may
+    # not make the complete contract owner-authoritative.
+    if authoritative and confidence not in _V2_AUTHORITY_CONFIDENCE:
+        return False
+    refs = item.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return False
+    return all(
+        not isinstance(ref, bool)
+        and isinstance(ref, int)
+        and 0 <= ref < evidence_count
+        for ref in refs
+    )
+
+
+def _v2_evidence_requires_local_hash(
+    record: dict, evidence_root: str | None
+) -> bool:
+    """Whether a locator represents repository bytes that must be verified.
+
+    Evidence ``kind`` describes why a record matters, not where its bytes
+    live. Documentation, history, and runtime records can still point at a
+    repository file. Only an explicit HTTP(S) locator is unambiguously remote;
+    every other locator goes through the fail-closed local verifier. The
+    source/test/schema/route kinds remain local even if their locator looks
+    like a URL, so a mislabeled source cannot bypass byte verification.
+    """
+    if record.get("kind") in _V2_LOCAL_EVIDENCE_KINDS:
+        return True
+    locator = record.get("locator")
+    if not isinstance(locator, str) or not locator.strip():
+        return False
+    value = locator.strip()
+    return re.fullmatch(
+        r"https?://[^\s]+", value, flags=re.IGNORECASE
+    ) is None
+
+
+def _stable_handle_identity(value) -> tuple[int, int, int, int, int, int]:
+    """Return identity fields that are comparable across live handles."""
+    return (
+        int(stat.S_IFMT(value.st_mode)),
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _stable_path_handle_shape(value) -> tuple[int, int]:
+    """Compare pathname metadata to handle metadata without inode assumptions."""
+    return int(stat.S_IFMT(value.st_mode)), int(value.st_size)
+
+
+def _contained_regular_entry(
+    root: Path, relative: Path,
+) -> tuple[Path, object] | None:
+    """Resolve one contained regular file while rejecting every symlink component."""
+    if relative.is_absolute() or relative.drive:
+        return None
+    parts = relative.parts
+    if not parts or any(
+        part in {"", ".", ".."} or "\x00" in part for part in parts
+    ):
+        return None
+    current = root
+    try:
+        entry = None
+        for index, part in enumerate(parts):
+            current = current / part
+            entry = os.lstat(current)
+            if stat.S_ISLNK(entry.st_mode):
+                return None
+            if index < len(parts) - 1:
+                if not stat.S_ISDIR(entry.st_mode):
+                    return None
+            elif not stat.S_ISREG(entry.st_mode):
+                return None
+        resolved = current.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved, entry
+
+
+def _v2_local_evidence_hashes_match(entry, evidence_root: str | None) -> bool:
+    """Bind local evidence records to stable, contained regular-file bytes."""
+    records = [
+        record for record in (entry.get("evidence") or [])
+        if isinstance(record, dict)
+        and _v2_evidence_requires_local_hash(record, evidence_root)
+    ]
+    if not records:
+        return True
+    if not evidence_root:
+        return False
+    try:
+        root = Path(evidence_root).expanduser().resolve(strict=True)
+    except (OSError, ValueError):
+        return False
+    if not root.is_dir():
+        return False
+
+    prepared = []
+    aggregate_size = 0
+    for record in records:
+        locator = record.get("locator")
+        if not isinstance(locator, str) or not locator.strip():
+            return False
+        relative = Path(locator.strip())
+        prepared_entry = _contained_regular_entry(root, relative)
+        if prepared_entry is None:
+            return False
+        candidate, candidate_info = prepared_entry
+        if candidate_info.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+            return False
+        aggregate_size += candidate_info.st_size
+        if aggregate_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+            return False
+        prepared.append((record, relative, candidate, candidate_info))
+
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    flags |= int(getattr(os, "O_NONBLOCK", 0))
+    aggregate_opened_size = 0
+    aggregate_read = 0
+    for record, relative, candidate, candidate_info in prepared:
+        try:
+            descriptor = os.open(root / relative, flags)
+            try:
+                opened_before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_before.st_mode)
+                    or _stable_path_handle_shape(opened_before)
+                    != _stable_path_handle_shape(candidate_info)
+                ):
+                    return False
+                if opened_before.st_size > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                    return False
+                aggregate_opened_size += opened_before.st_size
+                if aggregate_opened_size > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                    return False
+                digest = hashlib.sha256()
+                remaining = V2_LOCAL_EVIDENCE_MAX_BYTES + 1
+                total_read = 0
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    while remaining > 0:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        total_read += len(chunk)
+                        aggregate_read += len(chunk)
+                        remaining -= len(chunk)
+                        if total_read > V2_LOCAL_EVIDENCE_MAX_BYTES:
+                            return False
+                        if aggregate_read > V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES:
+                            return False
+                        digest.update(chunk)
+                opened_after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+            current_entry = _contained_regular_entry(root, relative)
+            if current_entry is None:
+                return False
+            current, current_info = current_entry
+            current_descriptor = os.open(root / relative, flags)
+            try:
+                current_opened = os.fstat(current_descriptor)
+            finally:
+                os.close(current_descriptor)
+            latest_entry = _contained_regular_entry(root, relative)
+            if latest_entry is None:
+                return False
+            latest, latest_info = latest_entry
+            if (
+                current != candidate
+                or latest != candidate
+                or not stat.S_ISREG(current_opened.st_mode)
+                or _stable_handle_identity(opened_before)
+                != _stable_handle_identity(opened_after)
+                or _stable_handle_identity(opened_after)
+                != _stable_handle_identity(current_opened)
+                or _stable_path_handle_shape(current_info)
+                != _stable_path_handle_shape(current_opened)
+                or _stable_path_handle_shape(latest_info)
+                != _stable_path_handle_shape(current_opened)
+            ):
+                return False
+        except (OSError, ValueError):
+            return False
+        if digest.hexdigest() != record.get("content_hash"):
+            return False
+    return True
+
+
+def _v2_contract_is_valid(
+    entry, *, authoritative: bool, allow_registry_metadata: bool,
+    evidence_root: str | None = None,
+) -> bool:
+    """Validate a complete v2 contract, optionally for mutation authority.
+
+    This intentionally implements the checked-in JSON Schema in stdlib code so
+    loading contracts does not add a runtime dependency.  It also performs the
+    cross-record constraint JSON Schema cannot express here: every claim must
+    cite at least one existing top-level evidence record.  Required purpose
+    claims must be affirmative (verified/supported), not inferred or disputed.
+    """
+    if not isinstance(entry, dict):
+        return False
+    keys = set(entry)
+    metadata_keys = keys & _V2_REGISTRY_METADATA_KEYS
+    if metadata_keys and not allow_registry_metadata:
+        return False
+    payload_keys = keys - metadata_keys
+    if not _V2_REQUIRED_KEYS.issubset(payload_keys) \
+            or not payload_keys.issubset(_V2_TOP_LEVEL_KEYS):
+        return False
+    if entry.get("schema") != _V2_SCHEMA:
+        return False
+    if not _nonblank_string(entry.get("name")) \
+            or not _nonblank_string(entry.get("purpose")):
+        return False
+    for optional_text in ("historical_purpose", "slug"):
+        if optional_text in entry and not isinstance(entry[optional_text], str):
+            return False
+    for metadata_text in ("repo", "default_branch", "local_path", "locator"):
+        if metadata_text in entry and not _nonblank_string(entry[metadata_text]):
+            return False
+    if "slug" in entry and not _nonblank_string(entry["slug"]):
+        return False
+    if "source" in entry:
+        source = entry["source"]
+        if not isinstance(source, dict) or not source or any(
+                not _nonblank_string(key) or not _nonblank_string(value)
+                for key, value in source.items()):
+            return False
+    for string_list in ("acceptance_criteria", "false_substitutes", "aliases"):
+        if string_list not in entry:
+            if string_list == "acceptance_criteria":
+                return False
+            continue
+        values = entry[string_list]
+        if not isinstance(values, list) \
+                or (string_list == "acceptance_criteria" and not values) \
+                or any(not _nonblank_string(value) for value in values):
+            return False
+
+    evidence = entry.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    for record in evidence:
+        if not isinstance(record, dict):
+            return False
+        record_keys = set(record)
+        if not {"kind", "locator", "content_hash", "observed_at"}.issubset(
+                record_keys) or not record_keys.issubset(_V2_EVIDENCE_KEYS):
+            return False
+        kind = record.get("kind")
+        if not isinstance(kind, str) or kind not in _V2_EVIDENCE_KINDS \
+                or not _nonblank_string(record.get("locator")):
+            return False
+        content_hash = record.get("content_hash")
+        if not isinstance(content_hash, str) \
+                or re.fullmatch(r"[a-f0-9]{64}", content_hash) is None:
+            return False
+        if not _rfc3339_datetime(record.get("observed_at")):
+            return False
+        if "excerpt" in record and not isinstance(record["excerpt"], str):
+            return False
+
+    evidence_count = len(evidence)
+    for section in _V2_CLAIM_SECTIONS:
+        if section not in entry:
+            if section in _V2_REQUIRED_CLAIM_SECTIONS:
+                return False
+            continue
+        claims = entry[section]
+        if not isinstance(claims, list) \
+                or (section in _V2_REQUIRED_CLAIM_SECTIONS and not claims):
+            return False
+        # Required claims become mutation authority and must be affirmative.
+        # Uncertain optional claims remain structurally valid discovery input;
+        # _contract_from_registry retains them only in serialized discovery and
+        # final-review evidence, outside PurposeContract.prompt_block().
+        claim_is_authoritative = (
+            authoritative and section in _V2_REQUIRED_CLAIM_SECTIONS
+        )
+        if any(not _v2_claim_is_valid(
+                claim, evidence_count, authoritative=claim_is_authoritative)
+                for claim in claims):
+            return False
+    if "resolved_contradictions" in entry:
+        resolved = entry["resolved_contradictions"]
+        if not isinstance(resolved, list) or any(
+                not _v2_claim_is_valid(
+                    claim,
+                    evidence_count,
+                    resolved=True,
+                    authoritative=authoritative,
+                )
+                for claim in resolved):
+            return False
+    # `contradictions` are unresolved by definition; their separate resolved
+    # form records how a conflict was decided. Known unresolved owner claims
+    # cannot coexist with mutation authority, even when every required claim
+    # is independently well formed.
+    if authoritative and entry.get("contradictions"):
+        return False
+    if authoritative and not _v2_local_evidence_hashes_match(
+            entry, evidence_root):
+        return False
+    return True
+
+
+def _v2_contract_is_well_formed(
+    entry, *, allow_registry_metadata: bool = True
+) -> bool:
+    """Whether ``entry`` has the complete v2 evidence-bearing shape.
+
+    This deliberately does not grant mutation authority: uncertain required
+    claims, open contradictions, and uncertain resolutions remain valid
+    discovery records but fail the stricter authority validator below.
+    """
+    return _v2_contract_is_valid(
+        entry,
+        authoritative=False,
+        allow_registry_metadata=allow_registry_metadata,
+    )
+
+
+def _v2_contract_is_authoritative(
+    entry, *, allow_registry_metadata: bool = True,
+    evidence_root: str | None = None,
+) -> bool:
+    """Whether a complete v2 contract may authorize repository mutation."""
+    return _v2_contract_is_valid(
+        entry,
+        authoritative=True,
+        allow_registry_metadata=allow_registry_metadata,
+        evidence_root=evidence_root,
+    )
+
+
+def _contract_from_registry(
+    entry: dict, *, allow_registry_metadata: bool = True,
+    evidence_root: str | None = None,
+) -> PurposeContract | None:
+    if not isinstance(entry, dict):
+        return None
+    is_v2 = entry.get("schema") == _V2_SCHEMA
+    looks_structured = bool(set(entry) & _V2_STRUCTURED_MARKERS)
+    # A versioned contract is all-or-nothing. Returning None lets an invalid
+    # in-repo file fall through to a valid owner registry contract (or honest
+    # inference) instead of turning partial JSON into mutation authority.
+    if (("schema" in entry or looks_structured) and not is_v2) \
+            or (is_v2 and not _v2_contract_is_authoritative(
+                entry,
+                allow_registry_metadata=allow_registry_metadata,
+                evidence_root=evidence_root,
+            )):
+        return None
+
+    def _legacy_text_items(field: str) -> list[str]:
+        """Return a complete legacy string list, never a partial section."""
+        raw = entry.get(field)
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            return []
+        values: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                return []
+            values.append(item.strip())
+        return values
+
+    def _text_items(primary: str, structured: str) -> list[str]:
+        """Read legacy text lists or authoritative v2 evidence claims.
+
+        A v2 ``users``/``workflows`` section is evidence-bearing.  Loading its
+        mapping keys (or a contradicted/unknown/inferred claim) as prose would
+        turn an uncertain statement into an owner-authoritative purpose field,
+        which can authorize repository mutation.  Validate the complete claim
+        shape and reject the whole section on one unsafe member; the existing
+        understanding gate can then enrich the missing section without hiding
+        the uncertainty.
+        """
+        if not is_v2:
+            return _legacy_text_items(primary)
+
+        raw = entry.get(structured)
+        return [item["text"].strip() for item in raw]
+
+    contract = PurposeContract(
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
         slug=entry.get("slug") or "",
         purpose=entry.get("purpose") or "",
-        primary_users=list(entry.get("primary_users") or []),
-        core_journeys=list(entry.get("core_journeys") or []),
+        historical_purpose=entry.get("historical_purpose") or "",
+        primary_users=_text_items("primary_users", "users"),
+        core_journeys=_text_items("core_journeys", "workflows"),
         acceptance_criteria=list(entry.get("acceptance_criteria") or []),
         aliases=list(entry.get("aliases") or []),
         repo=entry.get("repo"),
@@ -360,28 +1060,154 @@ def _contract_from_registry(entry: dict) -> PurposeContract:
         authored=True,
         source=entry.get("source") or {"doc": REGISTRY_REL, "authored_by": "owner"},
         evidence_refs=list(entry.get("evidence_refs") or []),
+        structured_claims={
+            section: [
+                dict(claim) for claim in entry.get(section, [])
+                if (section in _V2_REQUIRED_CLAIM_SECTIONS
+                    or claim.get("confidence") in _V2_AUTHORITY_CONFIDENCE)
+            ]
+            for section in (*_V2_CLAIM_SECTIONS, "resolved_contradictions")
+            if is_v2 and section in entry
+        },
+        discovery_claims={
+            section: [
+                dict(claim) for claim in entry.get(section, [])
+                if claim.get("confidence") not in _V2_AUTHORITY_CONFIDENCE
+            ]
+            for section in ("current_behavior", "aspirations", "gaps")
+            if is_v2 and any(
+                claim.get("confidence") not in _V2_AUTHORITY_CONFIDENCE
+                for claim in entry.get(section, [])
+            )
+        },
+        contract_evidence=(
+            [dict(record) for record in entry["evidence"]] if is_v2 else []
+        ),
     )
-
-
-def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContract | None:
-    """Read an authored contract that lives inside the audited repo."""
-    for rel in IN_REPO_CONTRACT_FILES:
-        path = os.path.join(project_dir, rel)
-        if not os.path.isfile(path):
-            continue
+    if is_v2:
         try:
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-        except OSError:
+            contract.prompt_block(max_chars=REQUIRED_V2_PROMPT_MAX_CHARS)
+            # _independent_final_review serializes its evidence with the JSON
+            # default (ensure_ascii=True).  Measure that exact representation:
+            # non-ASCII contract text can otherwise expand six- or twelve-fold
+            # downstream and silently push later evidence out of its envelope.
+            serialized = json.dumps(
+                contract.to_dict(), sort_keys=True, ensure_ascii=True
+            )
+        except ValueError:
+            # A structurally valid contract that cannot expose every required
+            # constraint inside the mutation context must remain unresolved.
+            return None
+        if len(serialized) > REQUIRED_V2_SERIALIZED_MAX_CHARS:
+            return None
+    return contract
+
+
+def _contract_from_repo_lookup(
+    project_dir: str, program_name: str = ""
+) -> tuple[PurposeContract | None, bool]:
+    """Return an in-repo contract and whether its authority gate rejected it."""
+    try:
+        root = Path(project_dir).expanduser().resolve(strict=True)
+    except (OSError, ValueError):
+        return None, True
+    if not root.is_dir():
+        return None, True
+    for rel in IN_REPO_CONTRACT_FILES:
+        unresolved = root / rel
+        try:
+            authority_entry = os.lstat(unresolved)
+        except FileNotFoundError:
             continue
+        except OSError:
+            return None, True
+        if not stat.S_ISREG(authority_entry.st_mode):
+            return None, True
+        prepared_contract = _contained_regular_entry(root, Path(rel))
+        if prepared_contract is None:
+            return None, True
+        path, info = prepared_contract
+        if (
+            _stable_path_handle_shape(info)
+            != _stable_path_handle_shape(authority_entry)
+        ):
+            return None, True
+        if info.st_size > IN_REPO_CONTRACT_MAX_BYTES:
+            return None, True
+
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        flags |= int(getattr(os, "O_NONBLOCK", 0))
+        try:
+            descriptor = os.open(unresolved, flags)
+            try:
+                opened_before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_before.st_mode)
+                    or opened_before.st_size > IN_REPO_CONTRACT_MAX_BYTES
+                    or _stable_path_handle_shape(opened_before)
+                    != _stable_path_handle_shape(info)
+                ):
+                    return None, True
+                with os.fdopen(descriptor, "rb", closefd=False) as fh:
+                    raw = fh.read(IN_REPO_CONTRACT_MAX_BYTES + 1)
+                if len(raw) > IN_REPO_CONTRACT_MAX_BYTES:
+                    return None, True
+                body = raw.decode("utf-8")
+                opened_after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+            current_entry = _contained_regular_entry(root, Path(rel))
+            if current_entry is None:
+                return None, True
+            current, current_info = current_entry
+            current_descriptor = os.open(unresolved, flags)
+            try:
+                current_opened = os.fstat(current_descriptor)
+            finally:
+                os.close(current_descriptor)
+            latest_entry = _contained_regular_entry(root, Path(rel))
+            if latest_entry is None:
+                return None, True
+            latest, latest_info = latest_entry
+            if (
+                current != path
+                or latest != path
+                or not stat.S_ISREG(current_opened.st_mode)
+                or _stable_handle_identity(opened_before)
+                != _stable_handle_identity(opened_after)
+                or _stable_handle_identity(opened_after)
+                != _stable_handle_identity(current_opened)
+                or _stable_path_handle_shape(current_info)
+                != _stable_path_handle_shape(current_opened)
+                or _stable_path_handle_shape(latest_info)
+                != _stable_path_handle_shape(current_opened)
+            ):
+                return None, True
+        except Exception:
+            return None, True
         if rel.endswith(".json"):
             try:
                 data = json.loads(body)
             except ValueError:
-                continue
+                # A present authority file that cannot be parsed is not an
+                # absence.  Falling through would let Markdown, the registry,
+                # or model inference replace an owner source we failed to read.
+                return None, True
             if not isinstance(data, dict):
+                return None, True
+            c = _contract_from_registry(
+                data,
+                allow_registry_metadata=False,
+                evidence_root=str(root),
+            )
+            if c is None:
+                if data.get("schema") == _V2_SCHEMA \
+                        and _v2_contract_is_well_formed(
+                            data, allow_registry_metadata=False):
+                    return None, True
                 continue
-            c = _contract_from_registry(data)
             # A CONTRACT WITH NO PURPOSE IS NOT AN AUTHORED CONTRACT. The
             # markdown branch below has always required a non-empty purpose;
             # this one accepted any JSON object. So a stub, a half-written
@@ -398,7 +1224,7 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
                 c.name = program_name or os.path.basename(project_dir)
                 c.slug = slugify(c.name)
             c.source = {"doc": rel, "authored_by": "repo"}
-            return c
+            return c, False
         parsed = parse_markdown_contract(body)
         if parsed and parsed.get("purpose"):
             return PurposeContract(
@@ -410,8 +1236,13 @@ def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContr
                 false_substitutes=parsed.get("false_substitutes", []),
                 authored=True,
                 source={"doc": rel, "authored_by": "repo"},
-            )
-    return None
+            ), False
+    return None, False
+
+
+def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContract | None:
+    """Read an authored contract that lives inside the audited repo."""
+    return _contract_from_repo_lookup(project_dir, program_name)[0]
 
 
 _MD_HEADING = re.compile(r"^#{1,6}\s*(.+?)\s*$")

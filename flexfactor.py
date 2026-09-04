@@ -6928,6 +6928,29 @@ def _ensure_program_understanding(provider, display_name: str, project_dir: str,
         return [field for field in required
                 if not getattr(value, field, None)]
 
+    if contract is None and project_dir:
+        fp = _purpose_module()
+        lookup = getattr(fp, "find_contract_with_status", None) if fp else None
+        if callable(lookup):
+            try:
+                candidate, authority_rejected = lookup(
+                    display_name, project_dir
+                )
+            except Exception as exc:
+                # A failed authority probe is not permission to synthesize a
+                # replacement contract that might unlock mutation.
+                return (None, "unresolved", False,
+                        f"owner purpose authority could not be verified: {exc}")
+            if authority_rejected:
+                return (None, "unresolved", False,
+                        "owner purpose contract was rejected at its "
+                        "authoritative identity boundary")
+            if candidate is not None:
+                # The owner registry may have appeared between the original
+                # best-effort load and this fail-closed status lookup. Prefer
+                # that authored record over synthesizing a competing purpose.
+                contract = candidate
+
     missing = _missing(contract) if contract is not None else list(required)
     if contract is None or missing:
         contract, error = _infer_purpose_contract(
@@ -6946,6 +6969,10 @@ def _ensure_program_understanding(provider, display_name: str, project_dir: str,
         return (None, "unresolved", False,
                 "inferred program understanding cited no repository evidence")
     confidence, authorized, reason = _purpose_confidence_for(project_dir, contract)
+    # Keep the serialized contract self-describing at every downstream review
+    # boundary. The explicit summary field remains too, so reviewers never
+    # need to infer authority from authored/inferred prose.
+    contract.confidence = confidence
     return contract, confidence, authorized, reason
 
 
@@ -8882,6 +8909,12 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
             "manifest": manifest,
             "verification": verify_receipts,
             "candidate_commit": candidate_sha,
+            "purpose_contract": getattr(
+                opts, "purpose_contract_for_review", None
+            ),
+            "purpose_confidence": getattr(
+                opts, "purpose_confidence_for_review", ""
+            ),
         }
         try:
             independent = _independent_final_review(
@@ -10316,6 +10349,12 @@ def _apply_phase(args, profile_name: str, profile: dict,
     # family when independent capacity exists; failure to obtain that review
     # blocks publication rather than silently accepting self-review.
     args.final_reviewer = provider
+    args.purpose_contract_for_review = dict(
+        profile.get("purpose_contract") or {}
+    )
+    args.purpose_confidence_for_review = str(
+        profile.get("purpose_confidence") or ""
+    )
 
     print("\n" + "=" * 70)
     print(f"  Scout apply phase for {project_dir}")
@@ -16774,6 +16813,287 @@ FINAL_REVIEW_SYSTEM = (
 )
 
 
+def _git_tree_entry_at(
+    repository_dir: str, commit_sha: str, repository_path: str,
+) -> tuple[str, str, str] | None:
+    """Return one literal tree entry without consulting checkout bytes."""
+    listed = _git(
+        ["--literal-pathspecs", "ls-tree", "-z", commit_sha, "--",
+         repository_path],
+        repository_dir,
+    )
+    if listed.returncode != 0:
+        raise OSError("Git tree lookup failed")
+    records = [record for record in (listed.stdout or "").split("\0") if record]
+    if not records:
+        return None
+    if len(records) != 1 or "\t" not in records[0]:
+        raise OSError("Git tree lookup was ambiguous")
+    metadata, observed_path = records[0].split("\t", 1)
+    fields = metadata.split()
+    if len(fields) != 3 or observed_path != repository_path:
+        raise OSError("Git tree entry did not match the requested path")
+    mode, object_type, object_id = fields
+    if re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None:
+        raise OSError("Git tree entry had an invalid object id")
+    return mode, object_type, object_id
+
+
+def _git_repository_scope(project_dir: str) -> tuple[str, str]:
+    """Return the enclosing Git root and the target's path beneath it."""
+    target = os.path.realpath(os.path.abspath(project_dir))
+    top = _git(["rev-parse", "--show-toplevel"], project_dir)
+    if top.returncode != 0 or not (top.stdout or "").strip():
+        raise OSError("target Git root could not be resolved")
+    root = os.path.realpath(os.path.abspath((top.stdout or "").strip()))
+    try:
+        common = os.path.commonpath([root, target])
+    except ValueError:
+        raise OSError("target was not contained by its Git root") from None
+    if os.path.normcase(common) != os.path.normcase(root):
+        raise OSError("target was not contained by its Git root")
+    relative = os.path.relpath(target, root)
+    prefix = "" if relative == "." else relative.replace(os.sep, "/")
+    if prefix.startswith("../") or prefix == "..":
+        raise OSError("target path escaped its Git root")
+    return root, prefix
+
+
+def _authority_repository_path(target_prefix: str, locator: str) -> str:
+    """Resolve one contract locator lexically beneath the audited target."""
+    value = str(locator or "").strip()
+    drive, _tail_path = os.path.splitdrive(value)
+    if not value or "\x00" in value or os.path.isabs(value) or drive:
+        raise ValueError("authority locator was not safely repository-relative")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("authority locator contained a control character")
+    # Match the startup verifier's native Path semantics. On Windows both
+    # separators name path components; on POSIX a backslash remains a literal
+    # filename byte and the NUL-delimited tree lookup above handles it safely.
+    if os.sep == "\\":
+        value = value.replace("\\", "/")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("authority locator escaped its target")
+    return "/".join(([target_prefix] if target_prefix else []) + parts)
+
+
+def _git_attribute_paths(repository_path: str) -> list[str]:
+    """Committed attribute files that can transform one checkout path."""
+    parts = repository_path.split("/")
+    return [
+        "/".join(parts[:depth] + [".gitattributes"])
+        for depth in range(len(parts))
+    ]
+
+
+def _git_path_identity(
+    repository_dir: str, commit_sha: str, repository_path: str,
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Bind a path to immutable objects, traversing initialized submodules.
+
+    A superproject tree stops at a ``160000`` gitlink.  When cited evidence is
+    below that boundary, continue in the original initialized submodule's
+    object database at the pinned commit.  Working-tree contents are never
+    used for the identity comparison.
+    """
+    parts = repository_path.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Git identity path was not safely relative")
+    chain: list[tuple[str, str, str]] = []
+    current_repository = repository_dir
+    current_commit = commit_sha
+    remaining = parts
+    while remaining:
+        crossed_submodule = False
+        for index in range(1, len(remaining) + 1):
+            prefix = "/".join(remaining[:index])
+            entry = _git_tree_entry_at(
+                current_repository, current_commit, prefix
+            )
+            if entry is None:
+                return None
+            mode, object_type, object_id = entry
+            if index == len(remaining):
+                chain.append(entry)
+                return tuple(chain)
+            if mode == "040000" and object_type == "tree":
+                continue
+            if mode == "160000" and object_type == "commit":
+                chain.append(entry)
+                submodule_dir = os.path.join(
+                    current_repository, *remaining[:index]
+                )
+                probe = _git(["rev-parse", "--git-dir"], submodule_dir)
+                if probe.returncode != 0:
+                    raise OSError(
+                        "cited pinned submodule was not initialized locally"
+                    )
+                current_repository = submodule_dir
+                current_commit = object_id
+                remaining = remaining[index:]
+                crossed_submodule = True
+                break
+            raise OSError("authority path crossed a non-directory Git object")
+        if not crossed_submodule:
+            break
+    raise OSError("authority Git object identity was incomplete")
+
+
+def _identity_is_regular_blob(
+    identity: tuple[tuple[str, str, str], ...] | None,
+) -> bool:
+    return bool(
+        identity
+        and identity[-1][0] in {"100644", "100755"}
+        and identity[-1][1] == "blob"
+    )
+
+
+def _revalidate_final_purpose_authority(
+    project_dir: str,
+    baseline_sha: str | None,
+    final_sha: str,
+    supplied_contract: dict,
+    purpose_confidence: str,
+) -> tuple[bool, str]:
+    """Rebind a v2 authorizing contract to immutable candidate objects.
+
+    A candidate may change the contract itself or any repository bytes cited by
+    its evidence ledger. The startup copy must not certify that different final
+    tree. Evidence-bearing v2 contracts are therefore reloaded from the original
+    checkout only after Git proves that the selected contract and every cited
+    local evidence path have identical object identities at baseline and final
+    SHA. This preserves checkout-specific EOL/filter semantics while preventing
+    dirty bytes from standing in for a changed commit. Gitlink traversal binds
+    evidence inside initialized submodules to the pinned submodule objects.
+    Legacy and inferred contracts carry no ``contract_evidence`` and retain
+    their existing final-review behavior.
+    """
+    contract_evidence = supplied_contract.get("contract_evidence")
+    if not contract_evidence:
+        return True, ""
+    if not isinstance(contract_evidence, list):
+        return False, "purpose contract evidence ledger was not a list"
+    if not baseline_sha:
+        return False, "final purpose authority baseline commit was unavailable"
+    same_head, head_reason = _ff_ledger.head_matches(
+        _git_argv, project_dir, final_sha
+    )
+    if not same_head:
+        return False, "final purpose authority is not at the reviewed SHA: " + str(
+            head_reason
+        )
+    purpose_mod = _purpose_module()
+    lookup = getattr(purpose_mod, "find_contract_with_status", None)
+    name = str(supplied_contract.get("name") or "").strip()
+    if not callable(lookup) or not name:
+        return False, "final purpose authority could not be reloaded"
+    try:
+        repository_root, target_prefix = _git_repository_scope(project_dir)
+        contract_files = [
+            str(path).replace("\\", "/")
+            for path in getattr(purpose_mod, "IN_REPO_CONTRACT_FILES", ())
+        ]
+        source = supplied_contract.get("source")
+        source_doc = str(
+            source.get("doc") if isinstance(source, dict) else ""
+        ).replace("\\", "/")
+        if source_doc in contract_files:
+            contract_files = contract_files[:contract_files.index(source_doc) + 1]
+
+        authority_paths: list[tuple[str, str]] = []
+        compared_attribute_paths: set[str] = set()
+
+        def add_authority_path(kind: str, repository_path: str) -> None:
+            for attribute_path in _git_attribute_paths(repository_path):
+                if attribute_path not in compared_attribute_paths:
+                    authority_paths.append((
+                        "purpose checkout attributes", attribute_path
+                    ))
+                    compared_attribute_paths.add(attribute_path)
+            authority_paths.append((kind, repository_path))
+
+        for relative in contract_files:
+            add_authority_path(
+                "purpose contract",
+                _authority_repository_path(target_prefix, relative),
+            )
+        local_classifier = getattr(
+            purpose_mod, "_v2_evidence_requires_local_hash", None
+        )
+        if not callable(local_classifier):
+            raise RuntimeError("purpose evidence classifier was unavailable")
+        for record in contract_evidence:
+            if not isinstance(record, dict):
+                raise ValueError("purpose evidence record was not a mapping")
+            if not local_classifier(record, project_dir):
+                continue
+            add_authority_path(
+                "cited purpose evidence",
+                _authority_repository_path(
+                    target_prefix, str(record.get("locator") or "")
+                ),
+            )
+
+        selected_contract_path = (
+            _authority_repository_path(target_prefix, source_doc)
+            if source_doc in contract_files else None
+        )
+        for kind, repository_path in authority_paths:
+            before = _git_path_identity(
+                repository_root, baseline_sha, repository_path
+            )
+            after = _git_path_identity(
+                repository_root, final_sha, repository_path
+            )
+            if before != after:
+                return False, (
+                    f"final purpose authority changed {kind}: "
+                    + repository_path
+                )
+            if kind == "cited purpose evidence" \
+                    and not _identity_is_regular_blob(after):
+                return False, (
+                    "final purpose authority could not bind cited evidence: "
+                    + repository_path
+                )
+            if repository_path == selected_contract_path \
+                    and not _identity_is_regular_blob(after):
+                return False, "final purpose authority contract was not committed"
+
+        # Use the original target path for identity selectors (notably registry
+        # ``local_path``) and for its existing checkout conversion semantics.
+        # The immutable object comparison above is what prevents dirty restored
+        # bytes from hiding a contract/evidence mutation in final_sha.
+        fresh, authority_rejected = lookup(name, project_dir)
+    except Exception as exc:
+        return False, (
+            "final purpose authority reload failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if authority_rejected or fresh is None:
+        return False, "final purpose authority or cited evidence was rejected"
+    fresh.confidence = purpose_confidence
+    try:
+        expected = json.dumps(
+            supplied_contract, sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        observed = json.dumps(
+            fresh.to_dict(), sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        return False, f"final purpose authority could not be compared: {exc}"
+    if observed != expected:
+        return False, (
+            "final purpose authority differs from the contract that authorized "
+            "the mutation"
+        )
+    return True, ""
+
+
 def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | None,
                               final_sha: str | None, evidence_summary: dict,
                               *, max_chunk_chars: int = 60_000) -> dict:
@@ -16790,6 +17110,43 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
         return {"verdict": "reject", "commit": "", "findings": [],
                 "evidence_consistent": False,
                 "reason": "target is not a Git commit; exact-commit review unavailable"}
+    if not isinstance(evidence_summary, dict):
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "final-review evidence summary was not a mapping",
+        }
+    purpose_contract = evidence_summary.get("purpose_contract")
+    purpose_confidence = str(
+        evidence_summary.get("purpose_confidence")
+        or (purpose_contract.get("confidence")
+            if isinstance(purpose_contract, dict) else "")
+        or ""
+    ).strip()
+    if not isinstance(purpose_contract, dict) or not purpose_contract:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "complete authorizing purpose contract was not supplied",
+        }
+    if purpose_confidence not in {
+        "owner-authored", "strongly-inferred", "weakly-inferred", "unresolved",
+    }:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": "purpose confidence was not supplied or was invalid",
+        }
+    authority_ok, authority_reason = _revalidate_final_purpose_authority(
+        project_dir, baseline_sha, final_sha,
+        purpose_contract, purpose_confidence,
+    )
+    if not authority_ok:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": authority_reason,
+        }
     if baseline_sha and baseline_sha != final_sha:
         shown = _git(["diff", "--no-ext-diff", "--unified=20",
                       f"{baseline_sha}..{final_sha}"], project_dir)
@@ -16807,7 +17164,20 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
                                        max_chars=max_chunk_chars)
     ledger = _ff_ledger.ReviewLedger(baseline_sha=baseline_sha or "", candidate_sha=final_sha,
                                      chunks=chunks)
-    ev_json = json.dumps(evidence_summary, sort_keys=True)
+    try:
+        purpose_contract_json = json.dumps(
+            purpose_contract, sort_keys=True, ensure_ascii=True
+        ) if purpose_contract is not None else "(not supplied for this mode)"
+        remaining_evidence = dict(evidence_summary)
+        remaining_evidence.pop("purpose_contract", None)
+        remaining_evidence.pop("purpose_confidence", None)
+        ev_json = json.dumps(remaining_evidence, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        return {
+            "verdict": "reject", "commit": final_sha, "findings": [],
+            "evidence_consistent": False,
+            "reason": f"final-review evidence could not be serialized: {exc}",
+        }
     evidence_truncated = len(ev_json) > 80_000
     ev_text = ev_json[:80_000]
     reviewer_model = (getattr(reviewer, "judge_model", None)
@@ -16825,7 +17195,11 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
             f"EVIDENCE TRUNCATED: {evidence_truncated}\n\n"
         )
         prompt = (header
-                  + "RAW EXECUTION EVIDENCE:\n" + _fence_untrusted("evidence", ev_text)
+                  + f"PURPOSE CONFIDENCE (never truncated): {purpose_confidence}\n\n"
+                  + "COMPLETE PURPOSE CONTRACT (never truncated):\n"
+                  + _fence_untrusted("purpose-contract", purpose_contract_json)
+                  + "\n\nRAW EXECUTION EVIDENCE:\n"
+                  + _fence_untrusted("evidence", ev_text)
                   + "\n\nEXACT CANDIDATE PATCH CHUNK:\n" + _fence_untrusted("patch", ch.text)
                   + "\n\nReview ONLY this chunk. Approve only if this chunk's changes are "
                     "correct and the executable evidence supports every claim they rely on. "
@@ -21679,6 +22053,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         k: v for k, v in coverage_evidence.items()
                         if k.endswith("_total") or k == "tests"},
                     "secret_findings": secret_evidence,
+                    # The final certifier must see the same complete contract
+                    # that authorized mutation, including all evidence-bearing
+                    # v2 claims and invariants.  _independent_final_review sends
+                    # this separately and never subjects it to evidence truncation.
+                    "purpose_contract": result.get("purpose_contract"),
+                    "purpose_confidence": result.get("purpose_confidence"),
                 }
                 try:
                     if infrastructure_abort:

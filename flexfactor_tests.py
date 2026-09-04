@@ -15295,6 +15295,45 @@ class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
                          ["README.md:4", "tests/invoice.test.ts:8"])
         self.assertIn("README.md:4", provider.prompts[0][1])
 
+    def test_rejected_owner_contract_cannot_be_replaced_by_inference(self):
+        provider = self.Provider(["README.md:4"])
+        with _patched(
+            ff, "load_purpose_contract", lambda *_args, **_kwargs: None
+        ), _patched(
+            fp, "find_contract_with_status",
+            lambda *_args, **_kwargs: (None, True),
+        ):
+            contract, confidence, allowed, reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp
+                )
+
+        self.assertIsNone(contract)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("authoritative identity boundary", reason)
+        self.assertEqual(provider.prompts, [])
+
+    def test_failed_owner_authority_probe_cannot_authorize_inference(self):
+        provider = self.Provider(["README.md:4"])
+
+        def failed_probe(*_args, **_kwargs):
+            raise OSError("registry unreadable")
+
+        with _patched(
+            ff, "load_purpose_contract", lambda *_args, **_kwargs: None
+        ), _patched(fp, "find_contract_with_status", failed_probe):
+            contract, confidence, allowed, reason = \
+                ff._ensure_program_understanding(
+                    provider, "Invoicer", self.tmp
+                )
+
+        self.assertIsNone(contract)
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(allowed)
+        self.assertIn("could not be verified", reason)
+        self.assertEqual(provider.prompts, [])
+
     def test_real_rotator_descends_after_bad_shape_before_outer_retry(self):
         import flexfactor_rotation as fr
 
@@ -20462,7 +20501,13 @@ class PartialOutputWiringTests(unittest.TestCase):
                             "commit", "-q", "--allow-empty", "-m", "base"], cwd=d, check=True)
             sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
                                  capture_output=True, text=True).stdout.strip()
-            data = ff._independent_final_review(prov, d, None, sha, {"x": 1})
+            data = ff._independent_final_review(prov, d, None, sha, {
+                "x": 1,
+                "purpose_contract": {
+                    "name": "Fixture", "confidence": "owner-authored",
+                },
+                "purpose_confidence": "owner-authored",
+            })
         self.assertEqual(data["verdict"], "reject")
         # Chunked review: a partial reviewer answer BLOCKS that chunk, and a
         # blocked chunk makes the ledger refuse any verdict synthesis.
@@ -20996,10 +21041,73 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         self.assertGreater(len(patch), 180_000, "fixture patch must exceed the old cap")
         return d, g, base, final
 
+    def _repo_with_v2_contract(
+        self, target_rel="", *, evidence_bytes=b"owner evidence\n",
+        autocrlf=None,
+    ):
+        d = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+
+        def g(*a):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                cwd=d, capture_output=True, text=True, encoding="utf-8",
+                errors="replace",
+            )
+
+        g("init", "-q", "-b", "main")
+        if autocrlf is not None:
+            g("config", "core.autocrlf", str(autocrlf).lower())
+        target = os.path.join(d, target_rel) if target_rel else d
+        os.makedirs(target, exist_ok=True)
+        evidence_path = os.path.join(target, "evidence.txt")
+        Path(evidence_path).write_bytes(evidence_bytes)
+        digest = hashlib.sha256(Path(evidence_path).read_bytes()).hexdigest()
+        claim = lambda claim_id, text: {
+            "id": claim_id, "text": text, "confidence": "verified",
+            "evidence_refs": [0],
+        }
+        payload = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Fixture",
+            "purpose": "Exercise final purpose authority.",
+            "users": [claim("u-1", "Owner")],
+            "outcomes": [claim("o-1", "Verified output")],
+            "workflows": [claim("w-1", "Run the workflow")],
+            "invariants": [claim("i-1", "Evidence remains bound")],
+            "acceptance_criteria": ["Evidence remains bound."],
+            "contradictions": [],
+            "evidence": [{
+                "kind": "source", "locator": "evidence.txt",
+                "content_hash": digest,
+                "observed_at": "2026-09-04T00:00:00Z",
+            }],
+        }
+        with open(
+            os.path.join(target, ".flexfactor-purpose.json"), "w",
+            encoding="utf-8", newline="\n",
+        ) as fh:
+            json.dump(payload, fh, sort_keys=True)
+            fh.write("\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "base authority")
+        base = g("rev-parse", "HEAD").stdout.strip()
+        import flexfactor_purpose as purpose_mod
+        contract = purpose_mod.contract_from_repo(target, "Fixture")
+        self.assertIsNotNone(contract)
+        contract.confidence = "owner-authored"
+        return target, g, base, contract.to_dict()
+
     def test_every_chunk_is_reviewed_and_the_ledger_is_complete(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer(final)
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "approve", data["reason"])
         self.assertFalse(data["patch_truncated"])
         self.assertGreater(data["chunk_count"], 3)
@@ -21011,10 +21119,344 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
         # no patch text was lost: every chunk carries a hash and a line range
         self.assertTrue(all(c["sha256"] and c["line_end"] >= c["line_start"] for c in led["chunks"]))
 
+    def test_complete_purpose_contract_reaches_every_review_chunk_untruncated(self):
+        d, _g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final)
+        sentinel = "FINAL-INVARIANT-MUST-REACH-EVERY-REVIEW-CHUNK"
+        contract = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "purpose": "Exercise the complete owner contract.",
+            "confidence": "owner-authored",
+            "padding": "p" * 30000,
+            "z_final_invariant": sentinel,
+        }
+        data = ff._independent_final_review(
+            rv,
+            d,
+            base,
+            final,
+            {
+                "large_evidence_that_will_be_truncated": "e" * 100000,
+                "purpose_contract": contract,
+                "purpose_confidence": "owner-authored",
+            },
+        )
+        self.assertEqual(data["verdict"], "approve", data["reason"])
+        self.assertGreater(len(rv.calls), 1)
+        for prompt in rv.calls:
+            self.assertIn(
+                "PURPOSE CONFIDENCE (never truncated): owner-authored", prompt
+            )
+            self.assertIn("COMPLETE PURPOSE CONTRACT (never truncated)", prompt)
+            self.assertIn(sentinel, prompt)
+
+    def test_v2_purpose_authority_is_revalidated_at_the_final_commit(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        with open(os.path.join(d, "unrelated.txt"), "w", encoding="utf-8") as fh:
+            fh.write("candidate\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "unrelated candidate")
+        unchanged_sha = g("rev-parse", "HEAD").stdout.strip()
+        accepted_reviewer = self._Reviewer(unchanged_sha)
+        accepted = ff._independent_final_review(
+            accepted_reviewer, d, base, unchanged_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+        self.assertEqual(accepted["verdict"], "approve", accepted["reason"])
+
+        with open(os.path.join(d, "evidence.txt"), "a", encoding="utf-8") as fh:
+            fh.write("changed after authorization\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "invalidate authority evidence")
+        stale_sha = g("rev-parse", "HEAD").stdout.strip()
+        rejected_reviewer = self._Reviewer(stale_sha)
+        rejected = ff._independent_final_review(
+            rejected_reviewer, d, unchanged_sha, stale_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+        self.assertEqual(rejected["verdict"], "reject")
+        self.assertIn("purpose authority", rejected["reason"])
+        self.assertEqual(rejected_reviewer.calls, [])
+
+    def test_nested_target_revalidates_against_enclosing_git_tree(self):
+        d, g, base, contract = self._repo_with_v2_contract("apps/nested")
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "nested candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_authority_locator_preserves_native_windows_separators(self):
+        with mock.patch.object(ff.os, "sep", "\\"):
+            self.assertEqual(
+                ff._authority_repository_path(
+                    "apps/fixture", r"docs\PURPOSE"
+                ),
+                "apps/fixture/docs/PURPOSE",
+            )
+            for escaped in (r"..\PURPOSE", r"docs\..\PURPOSE", r"\share"):
+                with self.subTest(locator=escaped):
+                    with self.assertRaises(ValueError):
+                        ff._authority_repository_path("apps/fixture", escaped)
+
+    def test_registry_local_path_identity_survives_final_reload(self):
+        d, g, _initial, _contract = self._repo_with_v2_contract()
+        authority_path = Path(d, ".flexfactor-purpose.json")
+        payload = json.loads(authority_path.read_text(encoding="utf-8"))
+        authority_path.unlink()
+        payload["local_path"] = d
+        registry = {"unrelated-registry-key": payload}
+        g("add", "-A")
+        g("commit", "-q", "-m", "use registry authority")
+        base = g("rev-parse", "HEAD").stdout.strip()
+
+        import flexfactor_purpose as purpose_mod
+        selected, rejected = purpose_mod.find_contract_with_status(
+            "Fixture", d, registry=registry
+        )
+        self.assertFalse(rejected)
+        self.assertIsNotNone(selected)
+        selected.confidence = "owner-authored"
+        contract = selected.to_dict()
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "registry candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        original_loader = purpose_mod._load_registry_with_status
+        purpose_mod._load_registry_with_status = lambda _path=None: (
+            registry, False
+        )
+        try:
+            result = ff._independent_final_review(
+                reviewer, d, base, final_sha,
+                {"purpose_contract": contract,
+                 "purpose_confidence": "owner-authored"},
+            )
+        finally:
+            purpose_mod._load_registry_with_status = original_loader
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_final_reload_preserves_original_autocrlf_checkout_bytes(self):
+        d, g, base, contract = self._repo_with_v2_contract(
+            evidence_bytes=b"owner evidence\r\n", autocrlf=True,
+        )
+        self.assertIn(b"\r\n", Path(d, "evidence.txt").read_bytes())
+        Path(d, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        g("add", "-A")
+        g("commit", "-q", "-m", "autocrlf candidate")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_changed_checkout_attributes_revoke_unchanged_evidence(self):
+        d, g, base, contract = self._repo_with_v2_contract(
+            evidence_bytes=b"owner evidence\r\n", autocrlf=True,
+        )
+        Path(d, ".gitattributes").write_text(
+            "*.txt text eol=lf\n", encoding="utf-8"
+        )
+        g("add", "-A")
+        g("commit", "-q", "-m", "change evidence checkout semantics")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("checkout attributes", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
+    def test_pinned_submodule_evidence_revalidates_from_gitlink_objects(self):
+        container = _tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, container, True)
+        source = os.path.join(container, "submodule-source")
+        root = os.path.join(container, "superproject")
+        os.makedirs(source)
+        os.makedirs(root)
+
+        def run(repo, *args):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                errors="replace",
+            )
+
+        run(source, "init", "-q", "-b", "main")
+        Path(source, "evidence.txt").write_bytes(b"submodule evidence\n")
+        run(source, "add", "-A")
+        run(source, "commit", "-q", "-m", "submodule evidence")
+
+        run(root, "init", "-q", "-b", "main")
+        added = run(
+            root, "-c", "protocol.file.allow=always", "submodule", "add",
+            "-q", "--", source, "vendor/evidence",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        evidence_path = Path(root, "vendor", "evidence", "evidence.txt")
+        digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        claim = lambda claim_id, text: {
+            "id": claim_id, "text": text, "confidence": "verified",
+            "evidence_refs": [0],
+        }
+        payload = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Fixture",
+            "purpose": "Exercise pinned submodule authority.",
+            "users": [claim("u-1", "Owner")],
+            "outcomes": [claim("o-1", "Verified output")],
+            "workflows": [claim("w-1", "Run the workflow")],
+            "invariants": [claim("i-1", "Evidence remains bound")],
+            "acceptance_criteria": ["Evidence remains bound."],
+            "contradictions": [],
+            "evidence": [{
+                "kind": "source",
+                "locator": "vendor/evidence/evidence.txt",
+                "content_hash": digest,
+                "observed_at": "2026-09-04T00:00:00Z",
+            }],
+        }
+        Path(root, ".flexfactor-purpose.json").write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        run(root, "add", "-A")
+        run(root, "commit", "-q", "-m", "superproject authority")
+        base = run(root, "rev-parse", "HEAD").stdout.strip()
+        import flexfactor_purpose as purpose_mod
+        selected = purpose_mod.contract_from_repo(root, "Fixture")
+        self.assertIsNotNone(selected)
+        selected.confidence = "owner-authored"
+        contract = selected.to_dict()
+        Path(root, "unrelated.txt").write_text("candidate\n", encoding="utf-8")
+        run(root, "add", "-A")
+        run(root, "commit", "-q", "-m", "superproject candidate")
+        final_sha = run(root, "rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, root, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "approve", result["reason"])
+        self.assertTrue(reviewer.calls)
+
+    def test_v2_contract_mutation_is_rejected_before_final_review(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        authority_path = os.path.join(d, ".flexfactor-purpose.json")
+        with open(authority_path, encoding="utf-8") as fh:
+            authority = json.load(fh)
+        authority["purpose"] = "Candidate replaced the authorizing purpose."
+        with open(authority_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(authority, fh, sort_keys=True)
+            fh.write("\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "mutate purpose authority")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("purpose authority", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
+    def test_final_authority_uses_commit_not_restored_worktree_bytes(self):
+        d, g, base, contract = self._repo_with_v2_contract()
+        evidence_path = Path(d) / "evidence.txt"
+        original = evidence_path.read_bytes()
+        evidence_path.write_bytes(b"candidate invalidated this evidence\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "invalidate committed evidence")
+        final_sha = g("rev-parse", "HEAD").stdout.strip()
+
+        # Recreate the authorizing bytes only in the mutable checkout. HEAD is
+        # still final_sha, so a plain rev-parse guard cannot detect this bypass.
+        evidence_path.write_bytes(original)
+        self.assertTrue(g("status", "--porcelain").stdout)
+        reviewer = self._Reviewer(final_sha)
+
+        result = ff._independent_final_review(
+            reviewer, d, base, final_sha,
+            {"purpose_contract": contract,
+             "purpose_confidence": "owner-authored"},
+        )
+
+        self.assertEqual(result["verdict"], "reject")
+        self.assertIn("purpose authority", result["reason"])
+        self.assertEqual(reviewer.calls, [])
+
+    def test_audit_final_review_summary_includes_the_authorizing_contract(self):
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn(
+            '"purpose_contract": result.get("purpose_contract")', source
+        )
+        self.assertIn(
+            '"purpose_confidence": result.get("purpose_confidence")', source
+        )
+        scout_apply = inspect.getsource(ff._apply_integration_impl)
+        self.assertIn('opts, "purpose_contract_for_review", None', scout_apply)
+        self.assertIn('opts, "purpose_confidence_for_review", ""', scout_apply)
+        scout_wiring = inspect.getsource(ff._apply_phase)
+        self.assertIn("args.purpose_contract_for_review", scout_wiring)
+        self.assertIn("args.purpose_confidence_for_review", scout_wiring)
+
+    def test_final_review_fails_closed_without_contract_or_confidence(self):
+        d, _g, base, final = self._repo_with_big_patch()
+        rv = self._Reviewer(final)
+        missing_contract = ff._independent_final_review(
+            rv, d, base, final, {"purpose_confidence": "owner-authored"}
+        )
+        missing_confidence = ff._independent_final_review(
+            rv, d, base, final, {"purpose_contract": {"name": "Fixture"}}
+        )
+        self.assertEqual(missing_contract["verdict"], "reject")
+        self.assertIn("purpose contract", missing_contract["reason"])
+        self.assertEqual(missing_confidence["verdict"], "reject")
+        self.assertIn("purpose confidence", missing_confidence["reason"])
+        self.assertEqual(rv.calls, [])
+
     def test_one_rejected_chunk_rejects_the_whole_commit(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer(final, reject_chunk=2)
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "reject")
         self.assertIn("1 chunk(s) rejected", data["reason"])
         self.assertTrue(any(f.get("title") == "bad hunk" for f in data["findings"]))
@@ -21022,7 +21464,13 @@ class LargePatchChunkedFinalReviewTests(unittest.TestCase):
     def test_a_reviewer_naming_another_commit_cannot_approve(self):
         d, g, base, final = self._repo_with_big_patch()
         rv = self._Reviewer("0000000000000000000000000000000000000000")
-        data = ff._independent_final_review(rv, d, base, final, {"x": 1})
+        data = ff._independent_final_review(rv, d, base, final, {
+            "x": 1,
+            "purpose_contract": {
+                "name": "Fixture", "confidence": "owner-authored",
+            },
+            "purpose_confidence": "owner-authored",
+        })
         self.assertEqual(data["verdict"], "reject")
         self.assertIn("expected " + final, data["reason"])
 
