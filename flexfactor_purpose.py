@@ -150,6 +150,11 @@ PRODUCTION_READY_CONDITIONS = (
 #: Evidence values a condition may carry. Mirrors prodready's four-valued gates.
 EVIDENCE_STATES = ("pass", "fail", "na", "unknown")
 
+# Every caller that can place an owner contract in a model context provides at
+# least this much room. A v2 contract may not authorize mutation unless its
+# purpose, required claims, and complete referenced evidence fit this budget.
+REQUIRED_V2_PROMPT_MAX_CHARS = 10000
+
 
 def slugify(text: str) -> str:
     """Lowercase hyphen slug. Matches flexfactor._slugify's behavior so contract
@@ -224,7 +229,7 @@ class PurposeContract:
     def to_dict(self) -> dict:
         return asdict(self)
 
-    def prompt_block(self, max_chars: int = 6000) -> str:
+    def prompt_block(self, max_chars: int = REQUIRED_V2_PROMPT_MAX_CHARS) -> str:
         """Render the contract for a model prompt.
 
         Numbered acceptance criteria matter: the gap assessor is required to cite
@@ -307,6 +312,10 @@ class PurposeContract:
         if self.false_substitutes:
             lines += ["", "THESE DO NOT COUNT AS FULFILLING THE PURPOSE:"]
             lines += [f"  - {d}" for d in self.false_substitutes]
+        if self.structured_claims and len("\n".join(lines)) > max_chars:
+            raise ValueError(
+                "required v2 purpose context exceeds the available prompt context"
+            )
         return "\n".join(lines)[:max_chars]
 
 
@@ -587,6 +596,12 @@ def _v2_contract_is_authoritative(entry) -> bool:
                 not _v2_claim_is_valid(claim, evidence_count, resolved=True)
                 for claim in resolved):
             return False
+    # `contradictions` are unresolved by definition; their separate resolved
+    # form records how a conflict was decided. Known unresolved owner claims
+    # cannot coexist with mutation authority, even when every required claim
+    # is independently well formed.
+    if entry.get("contradictions"):
+        return False
     return True
 
 
@@ -633,7 +648,7 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
         raw = entry.get(structured)
         return [item["text"].strip() for item in raw]
 
-    return PurposeContract(
+    contract = PurposeContract(
         name=entry.get("name") or entry.get("slug") or "(unnamed)",
         slug=entry.get("slug") or "",
         purpose=entry.get("purpose") or "",
@@ -659,6 +674,14 @@ def _contract_from_registry(entry: dict) -> PurposeContract | None:
             [dict(record) for record in entry["evidence"]] if is_v2 else []
         ),
     )
+    if is_v2:
+        try:
+            contract.prompt_block(max_chars=REQUIRED_V2_PROMPT_MAX_CHARS)
+        except ValueError:
+            # A structurally valid contract that cannot expose every required
+            # constraint inside the mutation context must remain unresolved.
+            return None
+    return contract
 
 
 def contract_from_repo(project_dir: str, program_name: str = "") -> PurposeContract | None:

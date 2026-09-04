@@ -237,7 +237,6 @@ class PurposeContractV2Tests(_TempRepo):
                 observed_at="2026-09-04T05:06:07+00:00",
                 excerpt="Owner approval and immutable totals are required.",
             )],
-            acceptance_criteria=["A" * 9000],
         )
 
         contract = fp._contract_from_registry(contract_doc)
@@ -259,15 +258,48 @@ class PurposeContractV2Tests(_TempRepo):
         self.assertIn("content_hash=" + "b" * 64, prompt)
         self.assertIn("observed_at=2026-09-04T05:06:07+00:00", prompt)
         self.assertIn("excerpt=Owner approval", prompt)
-        capped_prompt = contract.prompt_block()
-        self.assertEqual(len(capped_prompt), 6000)
-        self.assertIn("Never change an invoice total.", capped_prompt)
-        self.assertIn("locator=policy/receipt-safety.md", capped_prompt)
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            contract.prompt_block(max_chars=200)
         serialized = contract.to_dict()
         self.assertEqual(serialized["structured_claims"]["outcomes"],
                          contract_doc["outcomes"])
         self.assertEqual(serialized["contract_evidence"],
                          contract_doc["evidence"])
+
+    def test_oversized_required_context_never_gains_mutation_authority(self):
+        oversized_cases = (
+            {"purpose": "x" * 12000},
+            {"users": [self._claim("u-huge", "x" * 12000)]},
+            {"acceptance_criteria": ["x" * 12000]},
+        )
+        for oversized in oversized_cases:
+            with self.subTest(field=next(iter(oversized))):
+                contract = fp.find_contract("Receipt Maker", registry={
+                    "receipt-maker": self._contract(**oversized),
+                })
+
+                self.assertIsNone(contract)
+                confidence = fp.purpose_confidence(contract, {})
+                self.assertEqual(confidence, "unresolved")
+                self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_unresolved_contradiction_blocks_owner_authority(self):
+        contradiction = self._claim(
+            "x-delete", "Owner policy forbids deleting receipt records.",
+        )
+        contract = fp.find_contract("Receipt Maker", registry={
+            "receipt-maker": self._contract(
+                outcomes=[self._claim(
+                    "o-delete", "Old receipt records are deleted.",
+                )],
+                contradictions=[contradiction],
+            ),
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
 
     def test_malformed_v2_claim_rejects_the_entire_contract(self):
         for unsafe in (
