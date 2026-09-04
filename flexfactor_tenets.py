@@ -553,7 +553,12 @@ def _terminate_linux_supervisor_children(timeout_seconds: float = 2.0) -> bool:
             except ProcessLookupError:
                 continue
             try:
-                signal.pidfd_send_signal(pidfd, chosen_signal)
+                try:
+                    signal.pidfd_send_signal(pidfd, chosen_signal)
+                except ProcessLookupError:
+                    # The pidfd prevents reuse; ESRCH here means this exact
+                    # child finished between inventory and signalling.
+                    pass
             finally:
                 os.close(pidfd)
         time.sleep(0.01)

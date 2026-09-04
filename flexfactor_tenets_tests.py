@@ -240,7 +240,8 @@ class TenetsContextTests(unittest.TestCase):
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
 
-    @unittest.skipIf(os.name == "nt", "POSIX descendant lifecycle contract")
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "Linux descendant lifecycle contract")
     def test_descendant_is_killed_when_the_direct_ranker_exits_zero(self) -> None:
         survivor_file = Path(self.temp.name) / "descendant-survived"
         script = (
