@@ -291,6 +291,18 @@ class PurposeContractV2Tests(_TempRepo):
                 self.assertIsNone(fp._contract_from_registry(
                     self._contract(evidence=[unsafe])))
 
+    def test_unhashable_enum_values_reject_instead_of_raising(self):
+        for confidence in ([], {}, ["verified"]):
+            with self.subTest(confidence=confidence):
+                unsafe_claim = self._claim("u-1", "Bookkeeper")
+                unsafe_claim["confidence"] = confidence
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(users=[unsafe_claim])))
+        for kind in ([], {}, ["source"]):
+            with self.subTest(kind=kind):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[self._evidence(kind=kind)])))
+
     def test_optional_sections_and_additional_properties_are_fail_closed(self):
         self.assertIsNone(fp._contract_from_registry(self._contract(
             aspirations=[{"id": "asp-1"}],
@@ -337,6 +349,27 @@ class PurposeContractV2Tests(_TempRepo):
 
         contract = fp.find_contract(
             "Receipt Maker", registry={"receipt-maker": invalid})
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_invalid_exact_registry_record_blocks_unrelated_alias_fallback(self):
+        invalid_exact = self._contract(name="Receipt Maker")
+        invalid_exact["evidence"] = []
+        unrelated_alias = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "aliases": ["receipt-maker"],
+        }
+
+        contract = fp.find_contract("Receipt Maker", registry={
+            "receipt-maker": invalid_exact,
+            "another-product": unrelated_alias,
+        })
 
         self.assertIsNone(contract)
         confidence = fp.purpose_confidence(contract, {})

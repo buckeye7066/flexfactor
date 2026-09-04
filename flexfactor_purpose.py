@@ -326,9 +326,11 @@ def find_contract(program_name: str, project_dir: str | None = None,
     # Exact slug.
     for k in keys:
         if k in reg:
-            contract = _contract_from_registry(reg[k])
-            if contract is not None:
-                return contract
+            # An exact owner-registry record is authoritative even when it is
+            # invalid.  Fail unresolved at that boundary; falling through to
+            # another entry that merely claims this slug as an alias can load
+            # an unrelated program's purpose and authorize the wrong mutation.
+            return _contract_from_registry(reg[k])
     # Alias.
     for entry in reg.values():
         if not isinstance(entry, dict):
@@ -426,7 +428,7 @@ def _v2_claim_is_valid(item, evidence_count: int, *, resolved: bool = False,
     if resolved and not _nonblank_string(item.get("resolution")):
         return False
     confidence = item.get("confidence")
-    if confidence not in _V2_CONFIDENCE:
+    if not isinstance(confidence, str) or confidence not in _V2_CONFIDENCE:
         return False
     # Required purpose claims become mutation authority.  A structurally valid
     # but disputed/inferred claim may remain useful discovery input, but it may
@@ -491,7 +493,8 @@ def _v2_contract_is_authoritative(entry) -> bool:
         if not {"kind", "locator", "content_hash", "observed_at"}.issubset(
                 record_keys) or not record_keys.issubset(_V2_EVIDENCE_KEYS):
             return False
-        if record.get("kind") not in _V2_EVIDENCE_KINDS \
+        kind = record.get("kind")
+        if not isinstance(kind, str) or kind not in _V2_EVIDENCE_KINDS \
                 or not _nonblank_string(record.get("locator")):
             return False
         content_hash = record.get("content_hash")
