@@ -47,6 +47,31 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertEqual(directed._bounded_damerau_levenshtein("stewarship", "stewardship", 2), 1)
         self.assertIsNone(directed._bounded_damerau_levenshtein("steward", "stewardship", 2))
 
+    def test_powershell_resolver_never_uses_path_or_checkout_binary(self):
+        with tempfile.TemporaryDirectory() as checkout:
+            malicious = os.path.join(checkout, "powershell.exe")
+            with open(malicious, "wb") as fh:
+                fh.write(b"MZ")
+            with mock.patch.dict(os.environ, {"PATH": checkout}, clear=False):
+                resolved = directed._powershell_parser_executable(
+                    platform_name="nt",
+                    environ={"PATH": checkout, "SystemRoot": os.path.join(checkout, "missing")},
+                )
+        self.assertIsNone(resolved)
+
+    def test_powershell_resolver_accepts_trusted_windows_system_location(self):
+        with tempfile.TemporaryDirectory() as root:
+            trusted = os.path.join(
+                root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+            )
+            os.makedirs(os.path.dirname(trusted), exist_ok=True)
+            with open(trusted, "wb") as fh:
+                fh.write(b"MZ")
+            resolved = directed._powershell_parser_executable(
+                platform_name="nt", environ={"SystemRoot": root}
+            )
+        self.assertEqual(os.path.normcase(resolved or ""), os.path.normcase(os.path.realpath(trusted)))
+
     def test_powershell_parser_uses_parse_only_file_invocation(self):
         captured = {}
 
