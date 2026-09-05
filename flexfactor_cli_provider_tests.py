@@ -14,6 +14,26 @@ time, burns a cooldown" failure the filter exists to stop.
 So the load-bearing property is not "the provider works". It is: an adapter
 that cannot be imported must be EXCLUDED WITH A REASON, and must never take
 the rest of the catalog down with it.
+
+THIS SUITE USED TO SPEND REAL MONEY (issue #161)
+------------------------------------------------
+Every `codex-cli` provider below was built by `CliProvider.__init__`, which
+loaded the host's exportable ChatGPT OAuth credential and constructed a live
+`ChatGPTSubscriptionClient`. `_complete` then took the subscription branch over
+HTTPS and NEVER REACHED `subprocess`, so the `_run_process_tree` doubles here -
+all of them at the subprocess seam - intercepted a path the call did not use.
+Measured at `e4ef8b6` with a fake OAuth file in a temporary CODEX_HOME: four
+live requests to chatgpt.com, and the suite still printed `OK`. CI was green
+only because the runner has no OAuth file.
+
+Two things now make that structurally impossible, and BOTH are load-bearing:
+
+  * every codex-cli provider here passes `subscription=...` EXPLICITLY, so the
+    test states which transport it is exercising instead of inheriting it from
+    whether this machine is signed in to ChatGPT; and
+  * `flexfactor_no_live_calls` is installed for the whole module, so any future
+    test that forgets fails LOUDLY - naming the leaking line - rather than
+    quietly billing. `TheGuardItselfMustFireTests` proves it still fires.
 """
 from __future__ import annotations
 
@@ -23,6 +43,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,8 +56,23 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import flexfactor as ff
+import flexfactor_no_live_calls as nolive
 from providers import cli_provider as cp
 from providers import chatgpt_subscription as cs
+
+
+def setUpModule():
+    """Refuse remote sockets and host-credential reads for this whole module.
+
+    Fail-closed on purpose: the guard raises a BaseException so no `except
+    Exception` between here and the socket can turn a billable call into a
+    quietly-passing test. See flexfactor_no_live_calls.
+    """
+    nolive.install()
+
+
+def tearDownModule():
+    nolive.uninstall()
 
 
 class Route:
@@ -262,7 +298,11 @@ class CliProviderBehaviourTests(unittest.TestCase):
         real = cp._run_process_tree
         cp._run_process_tree = fake_run
         try:
-            out = cp.CliProvider("codex-cli", "m", "codex").structured(
+            # subscription=None: this test is about the CLI transport, so the
+            # provider must not hold a paid HTTPS route. Without it the call
+            # went to chatgpt.com and this double guarded nothing (#161).
+            out = cp.CliProvider(
+                "codex-cli", "m", "codex", subscription=None).structured(
                 "SYSTEM RULE", "make the fix", {"type": "object"},
                 max_tokens=123, model="ignored", salvage_truncated=True)
         finally:
@@ -288,7 +328,8 @@ class CliProviderBehaviourTests(unittest.TestCase):
         real = cp._run_process_tree
         cp._run_process_tree = fake_run
         try:
-            result = cp.CliProvider("codex-cli", "gpt-5.6", "codex").grade(
+            result = cp.CliProvider(
+                "codex-cli", "gpt-5.6", "codex", subscription=None).grade(
                 "grade this candidate"
             )
         finally:
@@ -318,7 +359,8 @@ class CliProviderBehaviourTests(unittest.TestCase):
 
         cp._run_process_tree = fake_run
         try:
-            cp.CliProvider("codex-cli", "m", "codex").complete("p", system="THEME_MARKER")
+            cp.CliProvider("codex-cli", "m", "codex", subscription=None).complete(
+                "p", system="THEME_MARKER")
         finally:
             cp._run_process_tree = real
         # codex exec takes no --append-system-prompt, so it must ride the prompt.
@@ -377,7 +419,8 @@ class CliProviderBehaviourTests(unittest.TestCase):
         cp._run_process_tree = fake_run
         try:
             self.assertTrue(cp.CliProvider(
-                "codex-cli", "codex", "codex", timeout=600).ping())
+                "codex-cli", "codex", "codex", timeout=600,
+                subscription=None).ping())
         finally:
             cp._run_process_tree = real
         self.assertNotIn("--version", seen["argv"])
@@ -387,7 +430,13 @@ class CliProviderBehaviourTests(unittest.TestCase):
         self.assertLessEqual(seen["timeout"], 60)
 
     def test_billing_label_marks_these_flat_rate(self):
-        self.assertIn("subscription", cp.CliProvider("codex-cli", "m", "codex").cost_label)
+        # This one never called `_complete`, so it made no request - but
+        # building the provider still read the HOST's real OAuth token into
+        # memory. Declare the transport here too.
+        self.assertIn(
+            "subscription",
+            cp.CliProvider("codex-cli", "m", "codex",
+                           subscription=None).cost_label)
 
 
 class _FakeHttpResponse:
@@ -792,6 +841,100 @@ class CliTimeoutIsActuallyBoundedTests(unittest.TestCase):
         else:
             self.assertTrue(captured.get("start_new_session"),
                             "the CLI was not given its own session")
+
+
+class TheGuardItselfMustFireTests(unittest.TestCase):
+    """Prove the tripwire by EXERCISING the failure mode, not by its absence.
+
+    "No calls happened on a machine with no OAuth file" proves nothing - that
+    is exactly the reasoning that kept issue #161 invisible for as long as it
+    was. Each test here deliberately bypasses one layer of the fix and asserts
+    that the run dies loudly instead of reaching chatgpt.com.
+    """
+
+    def test_a_forgotten_double_cannot_read_the_hosts_real_credential(self):
+        """The exact regression: a codex-cli provider built with no declared
+        transport used to silently load the owner's live OAuth token."""
+        with self.assertRaises(nolive.LiveProviderCallBlocked) as raised:
+            cp.CliProvider("codex-cli", "m", "codex")
+        message = str(raised.exception)
+        self.assertIn("real ChatGPT OAuth credential", message)
+        # It must name the line that leaked, or the failure is a riddle.
+        self.assertIn("flexfactor_cli_provider_tests.py:", message)
+
+    def test_an_outbound_call_is_blocked_even_when_the_credential_seam_is_bypassed(self):
+        """Defence in depth. Hand the provider a REAL, network-capable client
+        built from a fabricated credential - the state the suite was actually
+        in - and the call must still not leave this machine."""
+        client = cs.ChatGPTSubscriptionClient(
+            cs.CodexOAuth("FABRICATED-NOT-A-REAL-TOKEN", "acct-fixture", "test"),
+            model="gpt-5.6-sol",
+            binary=os.path.join(os.sep, "nonexistent", "codex"),
+            timeout=5)
+        provider = cp.CliProvider("codex-cli", "gpt-5.6-sol", "codex",
+                                  subscription=client)
+        with self.assertRaises(nolive.LiveProviderCallBlocked) as raised:
+            provider.complete("PROMPT")
+        self.assertIn("chatgpt.com", str(raised.exception))
+
+    def test_the_guard_is_not_swallowed_by_the_providers_own_error_handling(self):
+        """The reason it is a BaseException.
+
+        `chatgpt_subscription._open` catches (URLError, TimeoutError, OSError)
+        and `_complete` folds the result into CliUnavailable. An ordinary
+        Exception here would therefore be converted into a routine "route
+        unavailable" and the suite would pass having merely FAILED to bill -
+        the silent-no-op class, which is worse than the bug.
+        """
+        self.assertTrue(issubclass(nolive.LiveProviderCallBlocked, BaseException))
+        self.assertFalse(issubclass(nolive.LiveProviderCallBlocked, Exception))
+
+    def test_loopback_is_still_allowed_so_local_suites_keep_working(self):
+        server = socket.socket()
+        try:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            client = socket.create_connection(server.getsockname(), timeout=5)
+            client.close()
+        finally:
+            server.close()
+
+    def test_the_subscription_client_has_exactly_one_construction_site(self):
+        """`CliProvider.__init__` must delegate, or the seam moves back inside
+        the constructor where no double can reach it."""
+        calls = []
+        real = cp.build_subscription_client
+        try:
+            cp.build_subscription_client = lambda *a, **k: calls.append(a) or None
+            cp.CliProvider("codex-cli", "m", "codex")
+        finally:
+            cp.build_subscription_client = real
+        self.assertEqual(len(calls), 1, "__init__ did not go through the seam")
+        self.assertEqual(calls[0][0], "codex-cli")
+
+    def test_a_declared_transport_is_used_verbatim_for_both_answers(self):
+        """`subscription=None` must mean the CLI path; a client must mean HTTP.
+        Neither may be overridden by what this machine is signed in to."""
+        class FakeClient:
+            model = "gpt-5.6-sol"
+
+            def complete(self, prompt, **kwargs):
+                return "FROM-SUBSCRIPTION"
+
+        with mock.patch.object(cp, "_run_process_tree") as run:
+            answer = cp.CliProvider("codex-cli", "m", "codex",
+                                    subscription=FakeClient()).complete("x")
+        self.assertEqual(answer, "FROM-SUBSCRIPTION")
+        run.assert_not_called()
+
+        with mock.patch.object(
+                cp, "_run_process_tree",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout="FROM-CLI", stderr="")) as run:
+            answer = cp.CliProvider("codex-cli", "m", "codex",
+                                    subscription=None).complete("x")
+        self.assertEqual(answer, "FROM-CLI")
+        run.assert_called_once()
 
 
 if __name__ == "__main__":

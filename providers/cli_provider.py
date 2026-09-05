@@ -360,28 +360,65 @@ def _extract_json(text: str) -> Any:
     raise CliUnavailable("CLI output contained no parseable JSON")
 
 
+#: Sentinel distinguishing "build the default transport" from an injected
+#: ``subscription=None`` that deliberately means "no subscription route".
+_DEFAULT_SUBSCRIPTION = object()
+
+
+def build_subscription_client(api: str, model: str, binary: str,
+                              timeout: float) -> Optional[Any]:
+    """The ONE place a network-capable ChatGPT client is constructed.
+
+    WHY THIS IS A NAMED, SEPARATE FUNCTION
+    --------------------------------------
+    It used to be four inline statements in ``CliProvider.__init__``, and that
+    is precisely how ``flexfactor_cli_provider_tests.py`` came to make real
+    authenticated calls to chatgpt.com on any host with an exportable OAuth
+    file: constructing the provider AT ALL loaded the owner's live credential,
+    ``_complete`` then took the subscription branch, and the suite's
+    ``_run_process_tree`` doubles - patched at ``subprocess`` - guarded nothing
+    because that path was never reached (issue #161).
+
+    A seam a test can intercept has to be reachable by name and injectable by
+    argument, the same discipline ``gather_purpose_evidence``'s required
+    ``git_runner``/``gh_runner`` and the injected ``_run`` in
+    ``flexfactor_prodready`` already use. Returns ``None`` when this api has no
+    subscription transport or the host has no exportable credential.
+    """
+    if str(api or "").lower() != "codex-cli":
+        return None
+    # Lazy import keeps the other CLI adapters dependency-free and preserves
+    # their original startup behavior.
+    from providers.chatgpt_subscription import (
+        ChatGPTSubscriptionClient, load_exportable_oauth,
+    )
+    oauth = load_exportable_oauth()
+    if oauth is None:
+        return None
+    return ChatGPTSubscriptionClient(
+        oauth, model=model, binary=binary, timeout=float(timeout))
+
+
 class CliProvider:
     """Provider adapter backed by a local, flat-rate CLI."""
 
     def __init__(self, api: str, model: str, binary: str,
                  judge_model: Optional[str] = None,
-                 timeout: float = DEFAULT_TIMEOUT_S) -> None:
+                 timeout: float = DEFAULT_TIMEOUT_S,
+                 subscription: Any = _DEFAULT_SUBSCRIPTION) -> None:
         self.api = api
         self.model = model
         self.judge_model = judge_model or model
         self._binary = binary
         self._timeout = float(timeout or DEFAULT_TIMEOUT_S)
-        self._subscription = None
-        if str(api or "").lower() == "codex-cli":
-            # Lazy import keeps the other CLI adapters dependency-free and
-            # preserves their original startup behavior.
-            from providers.chatgpt_subscription import (
-                ChatGPTSubscriptionClient, load_exportable_oauth,
-            )
-            oauth = load_exportable_oauth()
-            if oauth is not None:
-                self._subscription = ChatGPTSubscriptionClient(
-                    oauth, model=model, binary=binary, timeout=self._timeout)
+        # `subscription` is the injection seam. Passing it explicitly - most
+        # importantly `subscription=None` - is how a caller (a test above all)
+        # states that this provider must NOT hold a live paid transport,
+        # instead of that being decided by whether the machine happens to be
+        # signed in to ChatGPT. See build_subscription_client and issue #161.
+        self._subscription = (
+            build_subscription_client(api, model, binary, self._timeout)
+            if subscription is _DEFAULT_SUBSCRIPTION else subscription)
 
     def _complete(self, prompt: str, *, system: Optional[str],
                   max_tokens: int, timeout: Optional[float] = None) -> str:
