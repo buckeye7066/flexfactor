@@ -772,7 +772,8 @@ class Rotator:
             )
             if resolved_pin:
                 outcome["selection"] = self._resolve_pin(
-                    resolved_pin, state, now, pin_strict, tier, allow_paid, reasons)
+                    resolved_pin, state, now, pin_strict, tier, allow_paid,
+                    reasons, intent)
                 if outcome.get("selection") is not None:
                     self._stamp(state, outcome["selection"], now)
                 return
@@ -843,7 +844,8 @@ class Rotator:
     # -- pin ---------------------------------------------------------------
     def _resolve_pin(self, pin: str, state: Dict[str, Any], now: float,
                      strict: bool, tier: str, allow_paid: bool,
-                     reasons: Dict[str, str]) -> Optional[Selection]:
+                     reasons: Dict[str, str],
+                     intent: Optional[CallIntent] = None) -> Optional[Selection]:
         """Runs INSIDE the state lock, so it must never call back into
         next_route -- that would re-enter the lock and deadlock. The non-strict
         fallback therefore inlines a tier walk instead of recursing."""
@@ -862,6 +864,13 @@ class Rotator:
         # re-selected an exhausted daily allowance on every call.
         usable = [r for r in matches if r.enabled
                   and (allow_paid or r.is_free)
+                  and not (intent is not None and intent.avoid_families
+                           and route_model_family(r) in (
+                               set(intent.avoid_families)
+                               | set(_OPAQUE_MODEL_FAMILIES)))
+                  and not (intent is not None and intent.needs and r.capabilities
+                           and any(need not in r.capabilities
+                                   for need in intent.needs))
                   and not _cooling(state, r.pool, now)
                   and not _cooling(state, f"route:{r.id}", now)
                   and not _cooling(state, f"credential:{credential_key(r)}", now)
@@ -873,6 +882,11 @@ class Rotator:
                         return r.disabled_reason or "disabled"
                     if not allow_paid and not r.is_free:
                         return "paid-metered, and allow_paid is off"
+                    if (intent is not None and intent.avoid_families
+                            and route_model_family(r) in (
+                                set(intent.avoid_families)
+                                | set(_OPAQUE_MODEL_FAMILIES))):
+                        return "excluded reviewer model family"
                     if _cooling(state, f"allowance:{allowance_key(r)}", now):
                         return (f"{allowance_key(r)} allowance exhausted "
                                 "(account-wide)")
@@ -886,7 +900,7 @@ class Rotator:
             start = TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT)
             for candidate_tier in TIER_CHAIN[start:]:
                 fallback = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons)
+                    candidate_tier, allow_paid, state, now, reasons, intent)
                 if fallback is not None:
                     fallback.catalog_stale = self.catalog.is_stale
                     return fallback
@@ -1485,20 +1499,40 @@ class RotatingProvider:
         self._last_selection = self.role_coordinator.last_selection
         self._author_families = self.role_coordinator.author_families
         self._family_lock = self.role_coordinator.lock
+        # WHOSE WORK IS BEING GRADED. `_last_selection` is SHARED on purpose -
+        # a reviewer must avoid the family that authored last, across providers
+        # and across threads. Quality attribution needs the opposite property:
+        # `report_quality("reviewer", "rejected")` is a verdict on the call THIS
+        # thread just made, and semantic review runs its units concurrently over
+        # one provider. Read from the shared map, worker A's verdict lands on
+        # whichever route worker B selected in between - so a route is cooled
+        # for work it never produced, and the rotator's yield learning is
+        # trained on noise. Per-thread, per-role, and deliberately NOT shared.
+        self._tls = threading.local()
 
     def set_purpose(self, purpose: str, needs: Sequence[str] = ()) -> None:
         self._purpose = str(purpose or "")[:80]
         self._purpose_needs = tuple(dict.fromkeys(str(n) for n in needs if n))
 
     def report_quality(self, role: str, signal: str) -> Optional[str]:
-        """Attribute a work result to the route that last served `role`.
+        """Attribute a work result to the route THIS THREAD used for `role`.
 
         Callers know whether a fix landed, was rejected, was a no-op, or broke
         the build; they do not know which route authored it. This provider
         does. Returns the cooldown note when one was triggered, else None.
+
+        The per-thread record wins because the verdict describes one call. The
+        shared map remains the fallback for a caller reporting from a different
+        thread than the one that made the call (the fix loop hands work between
+        threads), which is the behaviour this method has always had - so the
+        change can only ever make an attribution MORE precise, never blank one
+        that used to work.
         """
-        with self._family_lock:
-            sel = self._last_selection.get(role)
+        mine = getattr(self._tls, "last_selection", None)
+        sel = mine.get(role) if mine else None
+        if sel is None:
+            with self._family_lock:
+                sel = self._last_selection.get(role)
         if sel is None:
             return None
         return self.rotator.report_quality(sel.route, signal, sel.purpose)
@@ -1723,6 +1757,12 @@ class RotatingProvider:
             self.rotator.report(route, "ok")
             if intent is not None and intent.role:
                 family = route_model_family(route)
+                # This thread's own record first: no lock needed (nothing else
+                # can see it) and it cannot be overwritten by a sibling worker.
+                mine = getattr(self._tls, "last_selection", None)
+                if mine is None:
+                    mine = self._tls.last_selection = {}
+                mine[intent.role] = selection
                 with self._family_lock:
                     self._last_family[intent.role] = family
                     self._last_selection[intent.role] = selection

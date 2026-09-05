@@ -653,12 +653,20 @@ class SequentialOrchestrator:
 def run_sequential_queue(mode: str, targets: Iterable[object],
                          runner: Callable[[str, int, int, SequentialOrchestrator], int],
                          *, state_path: str | None = None,
-                         queue_id: str | None = None) -> tuple[int, SequentialOrchestrator]:
+                         queue_id: str | None = None,
+                         orchestrator: SequentialOrchestrator | None = None
+                         ) -> tuple[int, SequentialOrchestrator]:
     """Run every target in order, continuing after a target-level failure."""
 
-    orchestrator = SequentialOrchestrator(
-        mode, targets, state_path=state_path, queue_id=queue_id
-    )
+    requested_targets = target_queue(targets)
+    if orchestrator is None:
+        orchestrator = SequentialOrchestrator(
+            mode, requested_targets, state_path=state_path, queue_id=queue_id
+        )
+    elif orchestrator.mode != str(mode or "").strip().lower() \
+            or orchestrator.targets != requested_targets:
+        raise ExecutionContractError(
+            "provided orchestrator does not match the requested queue")
     snapshot = orchestrator.snapshot()
     results: list[int] = [int(row.get("exit_code") or 0)
                           for row in snapshot["items"][:orchestrator.next_index]]

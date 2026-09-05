@@ -190,6 +190,21 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(1, len(fs.list_comments("Target", self.project,
                                                 root=self.root)))
 
+    def test_resumed_session_can_submit_filtered_full_queue_routing(self):
+        other = os.path.join(self.root, "Other")
+        os.makedirs(other)
+        routed = fs.route_session_prompt(
+            "Target: change authentication.",
+            [("Target", self.project), ("Other", other)],
+        )
+        routed["routes"] = routed["routes"][1:]
+
+        receipt = fs.submit_session_routing(routed, root=self.root)
+
+        self.assertEqual([], receipt["submission_ids"])
+        self.assertEqual([], fs.list_comments("Target", self.project, root=self.root))
+        self.assertEqual([], fs.list_comments("Other", other, root=self.root))
+
     def test_guidance_is_program_scoped_durable_and_injected_each_run(self):
         saved = fs.set_guidance(
             "Target", self.project,

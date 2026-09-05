@@ -318,36 +318,36 @@
     {
       "kind": "source",
       "locator": "flexfactor_execution.py",
-      "content_hash": "ad939107e722cf3426173335261a6202bc1c8fb63810e7b4e2395b98582908d8",
-      "observed_at": "2026-09-05T07:02:50Z",
+      "content_hash": "d7c5133e2acffbf449565584354cde7fe20d51f27c35630d1770ffb427de0205",
+      "observed_at": "2026-09-05T12:57:54Z",
       "excerpt": "Sequential queue and six passes."
     },
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "7f2d803999b0a70d76fe6d6769ceacc9fd5ec18f60502cb828694aed9bd7e734",
-      "observed_at": "2026-09-05T11:55:00Z",
+      "content_hash": "4db8410d76d6269106578b1c673c5da0be57569e04cc634afed72765d7cd5a0c",
+      "observed_at": "2026-09-05T14:20:00Z",
       "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "87e5eb938a7f91ceca9924873ccdda4673cb77a3c5052b33c062038b3ee85cf9",
-      "observed_at": "2026-09-05T13:03:47Z",
+      "content_hash": "10a6e51b978115a14c8921e8d725430c34db2f2938c81c32a88fbe3eb42a002e",
+      "observed_at": "2026-09-05T14:52:42Z",
       "excerpt": "Modes, verification, review, publication."
     },
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MobileRunQueue.java",
       "content_hash": "db311304d8086c15a92b185f606906e8f39f6c55972956443c5f3c691dd0787c",
-      "observed_at": "2026-09-05T13:09:55Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Android queue."
     },
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
       "content_hash": "a9f6d2bbf2611c21a664f3c4de85127c6eae80a99d7b77a5d2fb7c0eb114087f",
-      "observed_at": "2026-09-05T13:09:55Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Cloud dispatch and secret cleanup."
     },
     {
@@ -361,14 +361,14 @@
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
       "content_hash": "7f909b003acb9dd88426e5c0fc739048ceb3e21a20ced5f46c4ef658bbc14c8b",
-      "observed_at": "2026-09-05T13:09:55Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Android dispatch recovery."
     },
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
       "content_hash": "7c762cdb76398a94d305eada94e0dfffbd855d51b668c180359b7a980aaf1a4e",
-      "observed_at": "2026-09-05T13:09:55Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Fail-closed gate ledger."
     },
     {

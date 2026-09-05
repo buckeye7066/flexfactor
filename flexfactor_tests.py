@@ -257,7 +257,9 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
         )
         self.assertIs(ok, False)
         self.assertIn("encoding must be UTF-8", reason)
-        for cookie in ("utf-8", "UTF_8", "utf8"):
+        # PEP 263 aliases that still describe the exact bytes written by the
+        # UTF-8 persistence path remain valid, including UTF-8-with-signature.
+        for cookie in ("utf-8", "UTF_8", "utf8", "utf-8-sig", "UTF_8_SIG"):
             accepted, note = ff._inproc_source_syntax_ok(
                 "encoded.py", f"# coding: {cookie}\nVALUE = 'é'\n",
             )
@@ -376,7 +378,20 @@ class RefactorResponseNormalizationTests(unittest.TestCase):
                 handle.write("installed after initial detection\n")
             stack = {"esbuild": None, "toolchains": []}
             ff._refresh_verification_status(project, stack)
+            with mock.patch.object(
+                    ff, "_run",
+                    return_value=ff.subprocess.CompletedProcess(
+                        [], 0, "const view = /* @__PURE__ */ React.createElement(\"div\");\n", "",
+                    ),
+            ) as parser:
+                ok, note = ff._prewrite_source_syntax_ok(
+                    project, "src/view.tsx",
+                    "const view = <div />;\n", stack,
+                )
         self.assertEqual(binary, stack["esbuild"])
+        self.assertIs(ok, True, note)
+        self.assertIn("esbuild", note)
+        self.assertEqual(binary, parser.call_args.args[0][0])
 
     def test_all_mutation_modes_use_the_shared_native_source_preflight(self):
         for function in (
@@ -3895,6 +3910,26 @@ class ScoutSourcePreflightTests(unittest.TestCase):
         self.assertIn("max 30", result.detail)
         forbidden.assert_not_called()
 
+    def test_scout_non_code_artifacts_do_not_require_a_source_parser(self):
+        import tempfile
+        import types
+
+        opts = types.SimpleNamespace(
+            allow_dirty=True, verify=True, push=False, merge=False,
+            final_reviewer=None, isolate_verify=True,
+        )
+        for path in ("site.css", "index.html", "README.md", "config.yml"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as project:
+                result = ff.apply_integration(
+                    project, "candidate/repo",
+                    {"files": [{"path": path, "contents": "artifact content\n"}],
+                     "packages": []},
+                    opts,
+                )
+            # No verifier exists in the fixture, but preflight accepted the
+            # artifact and reached the later mandatory verification gate.
+            self.assertEqual("skipped-unverified", result.status)
+
 
 class GradePayloadValidationTests(unittest.TestCase):
     """Every reviewer route must satisfy the complete no-op authorization schema."""
@@ -4343,6 +4378,33 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             source = (
                 "package x\nimport \"testing\"\n"
                 f"func TestGenerated(t *testing.T) {{ t.{call}() }}\n"
+            )
+            with self.subTest(call=call):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+
+    def test_nested_go_subtest_skip_never_receives_execution_credit(self):
+        source = (
+            "package x\nimport \"testing\"\n"
+            "func TestGenerated(t *testing.T) {\n"
+            "  t.Run(\"child\", func(child *testing.T) { child.SkipNow() })\n"
+            "}\n"
+        )
+        self.assertFalse(ff._generated_test_source_has_case(
+            "generated_test.go", source,
+        ))
+
+    def test_go_nested_subtest_skips_never_receive_execution_credit(self):
+        # From PR #145: every skip spelling on a nested ``*testing.T``
+        # parameter must be disqualifying, not just SkipNow.
+        for call in ("Skip", "Skipf", "SkipNow"):
+            source = (
+                "package x\nimport \"testing\"\n"
+                "func TestGenerated(t *testing.T) {\n"
+                "  t.Run(\"sub\", func(st *testing.T) { "
+                f"st.{call}(\"why\") }})\n"
+                "}\n"
             )
             with self.subTest(call=call):
                 self.assertFalse(ff._generated_test_source_has_case(
@@ -5107,6 +5169,22 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
         self.assertIsNone(status)
         self.assertIn("isolated checkout changed: app.py", refusal)
         self.assertEqual([rel], rollback_failed)
+
+    def test_local_virtualenv_is_omitted_from_execution_copy(self):
+        with _tempfile_ceiling.TemporaryDirectory() as project, \
+             _tempfile_ceiling.TemporaryDirectory() as parent:
+            with open(os.path.join(project, "app.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            bindir = os.path.join(project, ".venv", "bin")
+            os.makedirs(bindir)
+            try:
+                os.symlink(sys.executable, os.path.join(bindir, "python"))
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            destination = os.path.join(parent, "execution")
+            ff._copy_generated_test_checkout(project, destination)
+            self.assertTrue(os.path.isfile(os.path.join(destination, "app.py")))
+            self.assertFalse(os.path.lexists(os.path.join(destination, ".venv")))
 
     def test_external_symlink_is_refused_before_generated_test_execution(self):
         rel = "tests/test_generated.py"
@@ -8961,7 +9039,18 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         def git(*a, **k):
             argv = list(a[0]) if a else []
             git_calls.append(argv)
-            stdout = "a" * 40 + "\n" if argv == ["rev-parse", "HEAD"] else ""
+            # A real checkout resolves BOTH the run-start HEAD and the remote
+            # publication boundary (refs/remotes/origin/<default>); the audit
+            # pre-flight refuses to run without the latter, because the
+            # independent final review has to cover every commit that is not
+            # yet on origin - not merely those made after the run started.
+            if argv == ["rev-parse", "HEAD"]:
+                stdout = "a" * 40 + "\n"
+            elif argv[:1] == ["rev-parse"] and argv[-1].startswith(
+                    "refs/remotes/origin/"):
+                stdout = "b" * 40 + "\n"
+            else:
+                stdout = ""
             return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
         class _P:  # stub provider
