@@ -11,10 +11,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import textwrap
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import flexfactor_purpose as fp
 
@@ -157,6 +160,1288 @@ class _TempRepo(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+class PurposeContractV2Tests(_TempRepo):
+    @staticmethod
+    def _claim(claim_id: str, text: str, confidence: str = "verified",
+               refs: list[int] | None = None) -> dict:
+        return {
+            "id": claim_id,
+            "text": text,
+            "confidence": confidence,
+            "evidence_refs": [0] if refs is None else refs,
+        }
+
+    @staticmethod
+    def _evidence(**overrides) -> dict:
+        record = {
+            "kind": "documentation",
+            "locator": "https://example.invalid/owner-policy-record",
+            "content_hash": "a" * 64,
+            "observed_at": "2026-09-04T02:03:04Z",
+        }
+        record.update(overrides)
+        return record
+
+    def _contract(self, **overrides) -> dict:
+        contract = {
+            "schema": "flexfactor.purpose_contract.v2",
+            "name": "Receipt Maker",
+            "purpose": "Turn invoices into receipts.",
+            "users": [self._claim("u-1", "Bookkeepers")],
+            "outcomes": [self._claim("o-1", "A valid receipt exists.")],
+            "workflows": [
+                self._claim("w-1", "Upload an invoice and export its receipt."),
+            ],
+            "invariants": [
+                self._claim("i-1", "Invoice totals remain unchanged."),
+            ],
+            "acceptance_criteria": ["A receipt can be exported."],
+            "evidence": [self._evidence()],
+        }
+        contract.update(overrides)
+        return contract
+
+    def test_structured_users_and_workflows_populate_runtime_contract(self):
+        contract_doc = self._contract(
+            users=[
+                self._claim("u-1", "Bookkeepers"),
+                self._claim("u-2", "Business owners", "supported"),
+            ],
+            workflows=[
+                self._claim("w-1", "Upload an invoice and export its receipt."),
+            ],
+        )
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+
+        contract = fp.find_contract("Receipt Maker", self.root, registry={})
+
+        self.assertIsNotNone(contract)
+        self.assertTrue(contract.authored)
+        self.assertEqual(contract.primary_users, ["Bookkeepers", "Business owners"])
+        self.assertEqual(
+            contract.core_journeys,
+            ["Upload an invoice and export its receipt."],
+        )
+
+    def test_required_v2_claims_and_evidence_reach_mutation_prompt(self):
+        contract_doc = self._contract(
+            outcomes=[self._claim(
+                "o-safety", "Only an owner-approved receipt is published.",
+                "supported",
+            )],
+            invariants=[self._claim(
+                "i-safety", "Never change an invoice total.",
+            )],
+            evidence=[self._evidence(
+                locator="https://example.invalid/policy/receipt-safety",
+                content_hash="b" * 64,
+                observed_at="2026-09-04T05:06:07+00:00",
+                excerpt="Owner approval and immutable totals are required.",
+            )],
+        )
+
+        contract = fp._contract_from_registry(contract_doc)
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.structured_claims["outcomes"],
+                         contract_doc["outcomes"])
+        self.assertEqual(contract.structured_claims["invariants"],
+                         contract_doc["invariants"])
+        self.assertEqual(contract.contract_evidence, contract_doc["evidence"])
+        prompt = contract.prompt_block(max_chars=10000)
+        self.assertIn("REQUIRED OUTCOMES", prompt)
+        self.assertIn("Only an owner-approved receipt is published.", prompt)
+        self.assertIn("confidence=supported", prompt)
+        self.assertIn("MUTATION INVARIANTS", prompt)
+        self.assertIn("Never change an invoice total.", prompt)
+        self.assertIn("evidence_refs=0", prompt)
+        self.assertIn(
+            "locator=https://example.invalid/policy/receipt-safety", prompt
+        )
+        self.assertIn("content_hash=" + "b" * 64, prompt)
+        self.assertIn("observed_at=2026-09-04T05:06:07+00:00", prompt)
+        self.assertIn("excerpt=Owner approval", prompt)
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            contract.prompt_block(max_chars=200)
+        serialized = contract.to_dict()
+        self.assertEqual(serialized["structured_claims"]["outcomes"],
+                         contract_doc["outcomes"])
+        self.assertEqual(serialized["contract_evidence"],
+                         contract_doc["evidence"])
+
+    def test_oversized_required_context_never_gains_mutation_authority(self):
+        oversized_cases = (
+            {"purpose": "x" * 12000},
+            {"users": [self._claim("u-huge", "x" * 12000)]},
+            {"acceptance_criteria": ["x" * 12000]},
+        )
+        for oversized in oversized_cases:
+            with self.subTest(field=next(iter(oversized))):
+                contract = fp.find_contract("Receipt Maker", registry={
+                    "receipt-maker": self._contract(**oversized),
+                })
+
+                self.assertIsNone(contract)
+                confidence = fp.purpose_confidence(contract, {})
+                self.assertEqual(confidence, "unresolved")
+                self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_unresolved_contradiction_blocks_owner_authority(self):
+        contradiction = self._claim(
+            "x-delete", "Owner policy forbids deleting receipt records.",
+        )
+        contract = fp.find_contract("Receipt Maker", registry={
+            "receipt-maker": self._contract(
+                outcomes=[self._claim(
+                    "o-delete", "Old receipt records are deleted.",
+                )],
+                contradictions=[contradiction],
+            ),
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_in_repo_authority_rejection_blocks_markdown_and_registry_fallback(self):
+        rejected_cases = (
+            self._contract(contradictions=[self._claim(
+                "x-policy", "Owner evidence records an unresolved policy conflict."
+            )]),
+            self._contract(purpose="x" * 12000),
+        )
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "A stale registry purpose that must not authorize mutation.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run the stale workflow"],
+            },
+        }
+        for rejected in rejected_cases:
+            with self.subTest(reason=(
+                    "contradiction" if rejected.get("contradictions") else "size")):
+                _w(self.root, ".flexfactor-purpose.json", json.dumps(rejected))
+                _w(
+                    self.root,
+                    "PURPOSE.md",
+                    "# Receipt Maker\n\n## Purpose\nUse a stale Markdown purpose.\n",
+                )
+
+                contract = fp.find_contract(
+                    "Receipt Maker", self.root, registry=registry
+                )
+                status_contract, rejected = fp.find_contract_with_status(
+                    "Receipt Maker", self.root, registry=registry
+                )
+
+                self.assertIsNone(contract)
+                self.assertIsNone(status_contract)
+                self.assertTrue(rejected)
+                confidence = fp.purpose_confidence(contract, {})
+                self.assertEqual(confidence, "unresolved")
+                self.assertFalse(
+                    fp.mutation_authorized_by_purpose(confidence)[0]
+                )
+
+    def test_resolved_contradiction_requires_authoritative_decision(self):
+        for confidence in ("inferred", "contradicted", "unknown"):
+            with self.subTest(confidence=confidence):
+                resolved = {
+                    **self._claim("x-1", "Policy sources disagree.", confidence),
+                    "resolution": "The signed owner policy controls.",
+                }
+                self.assertIsNone(fp._contract_from_registry(self._contract(
+                    resolved_contradictions=[resolved],
+                )))
+
+    def test_authoritative_resolved_contradiction_reaches_mutation_prompt(self):
+        for confidence in ("verified", "supported"):
+            with self.subTest(confidence=confidence):
+                resolved = {
+                    **self._claim("x-1", "Policy sources disagree.", confidence),
+                    "resolution": "The signed owner policy controls.",
+                }
+                contract = fp._contract_from_registry(self._contract(
+                    resolved_contradictions=[resolved],
+                ))
+
+                self.assertIsNotNone(contract)
+                prompt = contract.prompt_block()
+                self.assertIn("RESOLVED CONTRADICTIONS", prompt)
+                self.assertIn("confidence=" + confidence, prompt)
+                self.assertIn("evidence_refs=0", prompt)
+                self.assertIn("Policy sources disagree.", prompt)
+                self.assertIn(
+                    "RESOLUTION: The signed owner policy controls.", prompt
+                )
+
+    def test_optional_claims_are_visible_and_bounded_before_authority(self):
+        contract_doc = self._contract(
+            current_behavior=[self._claim(
+                "c-1", "Receipts currently require a manual export."
+            )],
+            aspirations=[self._claim(
+                "a-1", "Owners want a verified automatic export.", "supported"
+            )],
+            gaps=[self._claim(
+                "g-1", "Automatic export is not implemented."
+            )],
+        )
+        contract = fp._contract_from_registry(contract_doc)
+        self.assertIsNotNone(contract)
+        prompt = contract.prompt_block()
+        self.assertIn("CURRENT OBSERVED BEHAVIOR", prompt)
+        self.assertIn("Receipts currently require a manual export.", prompt)
+        self.assertIn("OWNER ASPIRATIONS", prompt)
+        self.assertIn("KNOWN PURPOSE GAPS", prompt)
+
+        for section in ("current_behavior", "aspirations", "gaps"):
+            with self.subTest(section=section):
+                oversized = self._contract(**{
+                    section: [self._claim("huge", "x" * 100000)],
+                })
+                self.assertIsNone(fp._contract_from_registry(oversized))
+
+    def test_uncertain_optional_claims_never_enter_owner_mutation_context(self):
+        for section in ("current_behavior", "aspirations", "gaps"):
+            for confidence in ("inferred", "contradicted", "unknown"):
+                with self.subTest(section=section, confidence=confidence):
+                    candidate = self._contract(**{
+                        section: [self._claim(
+                            f"{section}-uncertain",
+                            "This discovery claim is not owner authority.",
+                            confidence,
+                        )],
+                    })
+                    self.assertTrue(fp._v2_contract_is_well_formed(candidate))
+                    contract = fp._contract_from_registry(candidate)
+                    self.assertIsNotNone(contract)
+                    self.assertEqual(
+                        contract.discovery_claims[section][0]["confidence"],
+                        confidence,
+                    )
+                    self.assertEqual(contract.structured_claims[section], [])
+                    self.assertEqual(
+                        contract.to_dict()["discovery_claims"][section],
+                        candidate[section],
+                    )
+                    prompt = contract.prompt_block()
+                    self.assertNotIn(
+                        "This discovery claim is not owner authority.", prompt
+                    )
+                    self.assertNotIn("NON-AUTHORITATIVE DISCOVERY CLAIMS", prompt)
+
+    def test_non_ascii_expansion_uses_downstream_review_encoding_budget(self):
+        # This fits the mutation prompt as Unicode characters, but the final
+        # review's default JSON representation expands every emoji into a
+        # surrogate pair.  It must be rejected before it can displace later
+        # evidence from that review envelope.
+        contract_doc = self._contract(
+            aspirations=[self._claim("a-emoji", "😀" * 8500)],
+        )
+
+        self.assertIsNone(fp._contract_from_registry(contract_doc))
+
+    def test_historical_purpose_is_retained_and_marked_obsolete(self):
+        historical = (
+            "Previously produced printable estimates; that behavior is obsolete."
+        )
+        contract = fp._contract_from_registry(self._contract(
+            historical_purpose=historical,
+        ))
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.historical_purpose, historical)
+        self.assertEqual(contract.to_dict()["historical_purpose"], historical)
+        prompt = contract.prompt_block()
+        self.assertIn("HISTORICAL PURPOSE", prompt)
+        self.assertIn("OBSOLETE; NOT CURRENT", prompt)
+        self.assertIn(historical, prompt)
+
+    def test_v2_registry_envelope_metadata_is_preserved_after_validation(self):
+        source = {
+            "doc": "memory/purpose_contracts.json",
+            "section": "Receipt Maker",
+            "authored_by": "owner",
+        }
+        entry = self._contract(
+            repo="buckeye7066/receipt-maker",
+            default_branch="main",
+            local_path=self.root,
+            locator="owner registry",
+            source=source,
+        )
+
+        contract = fp.find_contract(
+            "Unmatched Program", self.root, registry={"receipt-maker": entry}
+        )
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.repo, "buckeye7066/receipt-maker")
+        self.assertEqual(contract.default_branch, "main")
+        self.assertEqual(contract.local_path, self.root)
+        self.assertEqual(contract.locator, "owner registry")
+        self.assertEqual(contract.source, source)
+
+    def test_v2_registry_envelope_rejects_malformed_metadata(self):
+        for field, value in (
+            ("local_path", []),
+            ("repo", "   "),
+            ("source", {}),
+            ("source", {"doc": 7}),
+        ):
+            with self.subTest(field=field, value=value):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(**{field: value})
+                ))
+
+    def test_malformed_v2_claim_rejects_the_entire_contract(self):
+        for unsafe in (
+            7,
+            {"id": "u-2", "text": "   ", "confidence": "verified",
+             "evidence_refs": [0]},
+            {"id": "u-2", "text": "Operator", "confidence": "verified"},
+            {"id": "", "text": "Operator", "confidence": "verified",
+             "evidence_refs": [0]},
+            {**self._claim("u-2", "Operator"), "unexpected": True},
+        ):
+            with self.subTest(unsafe=unsafe):
+                contract = fp._contract_from_registry(self._contract(
+                    users=[self._claim("u-1", "Bookkeeper"), unsafe],
+                ))
+                self.assertIsNone(contract)
+
+    def test_claim_references_must_be_nonempty_and_resolve_to_evidence(self):
+        for unsafe_refs in ([], [-1], [1], [True], [0, 9]):
+            with self.subTest(evidence_refs=unsafe_refs):
+                contract = fp._contract_from_registry(self._contract(
+                    workflows=[self._claim(
+                        "w-1", "Run the complete flow", refs=unsafe_refs)],
+                ))
+                self.assertIsNone(contract)
+
+    def test_every_claim_section_is_reference_checked(self):
+        for section in (
+                "current_behavior", "aspirations", "users", "outcomes",
+                "workflows", "invariants", "contradictions", "gaps"):
+            with self.subTest(section=section):
+                contract = fp._contract_from_registry(self._contract(**{
+                    section: [self._claim("unsafe", "Unsupported", refs=[7])],
+                }))
+                self.assertIsNone(contract)
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            resolved_contradictions=[{
+                **self._claim("x-1", "Conflict", refs=[]),
+                "resolution": "Implementation is authoritative.",
+            }],
+        )))
+
+    def test_complete_v2_shape_is_required_before_it_is_authored(self):
+        for field in (
+                "schema", "name", "purpose", "users", "outcomes", "workflows",
+                "invariants", "acceptance_criteria", "evidence"):
+            with self.subTest(missing=field):
+                candidate = self._contract()
+                candidate.pop(field)
+                self.assertIsNone(fp._contract_from_registry(candidate))
+        for field in ("users", "outcomes", "workflows", "invariants",
+                      "acceptance_criteria", "evidence"):
+            with self.subTest(empty=field):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(**{field: []})))
+
+    def test_evidence_records_are_validated_before_claims_can_use_them(self):
+        unsafe_records = (
+            self._evidence(kind="opinion"),
+            self._evidence(locator=" "),
+            self._evidence(content_hash="ABC"),
+            self._evidence(observed_at="2026-09-04"),
+            self._evidence(observed_at="2026-02-30T02:03:04Z"),
+            {**self._evidence(), "unexpected": True},
+        )
+        for unsafe in unsafe_records:
+            with self.subTest(evidence=unsafe):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[unsafe])))
+
+    def test_local_evidence_hash_must_match_contained_repository_bytes(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("def receipt():\n    return 'valid'\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        valid = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+
+        self.assertIsNotNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
+        self.assertIsNone(fp._contract_from_registry(valid))
+        wrong = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash="0" * 64,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            wrong, evidence_root=self.root
+        ))
+        escaped = self._contract(evidence=[self._evidence(
+            kind="source", locator="../outside.py", content_hash=digest,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            escaped, evidence_root=self.root
+        ))
+
+        outside = Path(self.root).parent / (Path(self.root).name + "-outside.py")
+        outside.write_bytes(source.read_bytes())
+        link = Path(self.root) / "src" / "linked.py"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pass
+        else:
+            linked = self._contract(evidence=[self._evidence(
+                kind="source", locator="src/linked.py", content_hash=digest,
+            )])
+            self.assertIsNone(fp._contract_from_registry(
+                linked, evidence_root=self.root
+            ))
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_path_shaped_documentation_evidence_is_hashed_as_repository_bytes(self):
+        documentation = Path(self.root) / "docs" / "PURPOSE.md"
+        documentation.parent.mkdir()
+        documentation.write_text(
+            "# Purpose\n\nIssue owner-approved receipts.\n", encoding="utf-8"
+        )
+        digest = __import__("hashlib").sha256(
+            documentation.read_bytes()
+        ).hexdigest()
+        valid = self._contract(evidence=[self._evidence(
+            kind="documentation",
+            locator="docs/PURPOSE.md",
+            content_hash=digest,
+        )])
+
+        self.assertIsNotNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
+        stale = self._contract(evidence=[self._evidence(
+            kind="documentation",
+            locator="docs/PURPOSE.md",
+            content_hash="0" * 64,
+        )])
+        self.assertIsNone(fp._contract_from_registry(
+            stale, evidence_root=self.root
+        ))
+        documentation.unlink()
+        self.assertIsNone(fp._contract_from_registry(
+            valid, evidence_root=self.root
+        ))
+
+    @unittest.skipUnless(GIT_AVAILABLE, "Git unavailable")
+    def test_markdown_evidence_checkout_stays_lf_with_windows_autocrlf(self):
+        canonical = b"# Purpose\n\nIssue owner-approved receipts.\n"
+        attributes = Path(fp.__file__).with_name(".gitattributes").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("*.md text eol=lf", attributes.splitlines())
+        Path(self.root, ".gitattributes").write_text(
+            attributes, encoding="utf-8", newline="\n"
+        )
+        documentation = Path(self.root) / "docs" / "PURPOSE.md"
+        documentation.parent.mkdir()
+        documentation.write_bytes(canonical)
+        self.assertEqual(_git(self.root, "init", "-q").returncode, 0)
+        self.assertEqual(
+            _git(self.root, "config", "core.autocrlf", "true").returncode, 0
+        )
+        self.assertEqual(_git(self.root, "add", "-A").returncode, 0)
+        documentation.unlink()
+        checkout = _git(self.root, "checkout-index", "--force", "--", "docs/PURPOSE.md")
+        self.assertEqual(checkout.returncode, 0, checkout.stderr)
+        self.assertEqual(documentation.read_bytes(), canonical)
+
+        digest = __import__("hashlib").sha256(canonical).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="documentation", locator="docs/PURPOSE.md",
+            content_hash=digest,
+        )])
+        self.assertIsNotNone(fp._contract_from_registry(
+            candidate, evidence_root=self.root
+        ))
+
+    def test_missing_bare_documentation_locator_is_not_treated_as_remote(self):
+        local_locators = (
+            "PURPOSE",
+            r"docs\PURPOSE",
+            r"C:\owner\evidence\PURPOSE",
+            r"\\server\share\PURPOSE",
+        )
+        for locator in local_locators:
+            with self.subTest(locator=locator):
+                record = self._evidence(
+                    kind="documentation", locator=locator,
+                    content_hash="0" * 64,
+                )
+                self.assertTrue(fp._v2_evidence_requires_local_hash(
+                    record, self.root
+                ))
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[record]), evidence_root=self.root
+                ))
+        self.assertFalse(fp._v2_evidence_requires_local_hash(
+            self._evidence(locator="https://example.invalid/PURPOSE"), self.root
+        ))
+
+    def test_local_evidence_descriptor_must_still_match_directory_entry(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="schema", locator="src/receipt.py", content_hash=digest,
+        )])
+        real_fstat = fp.os.fstat
+        calls = 0
+
+        class ChangedStat:
+            def __init__(self, original):
+                self._original = original
+                self.st_dev = original.st_dev
+                self.st_ino = original.st_ino + 1
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+            def __getitem__(self, index):
+                return self._original[index]
+
+            def __iter__(self):
+                return iter(self._original)
+
+            def __len__(self):
+                return len(self._original)
+
+        def replaced(descriptor):
+            nonlocal calls
+            observed = real_fstat(descriptor)
+            calls += 1
+            if calls >= 3:
+                return ChangedStat(observed)
+            return observed
+
+        # The pathname and handle metadata shapes legitimately differ on
+        # Windows. Simulate an actual directory-entry replacement instead by
+        # changing the identity seen through the independently opened handle.
+        with mock.patch.object(fp.os, "fstat", side_effect=replaced):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unavailable")
+    def test_special_evidence_file_is_rejected_before_open(self):
+        special = Path(self.root) / "PURPOSE"
+        os.mkfifo(special)
+        candidate = self._contract(evidence=[self._evidence(
+            kind="documentation", locator="PURPOSE", content_hash="0" * 64,
+        )])
+        with mock.patch.object(
+            fp.os, "open", side_effect=AssertionError("must not open a FIFO")
+        ):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    def test_oversized_local_evidence_is_rejected_before_open(self):
+        source = Path(self.root) / "large-evidence.bin"
+        with source.open("wb") as handle:
+            handle.truncate(fp.V2_LOCAL_EVIDENCE_MAX_BYTES + 1)
+        candidate = self._contract(evidence=[self._evidence(
+            kind="runtime", locator=source.name, content_hash="0" * 64,
+        )])
+        with mock.patch.object(
+            fp.os, "open",
+            side_effect=AssertionError("oversized evidence must not be opened"),
+        ):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    def test_aggregate_local_evidence_budget_is_checked_before_open(self):
+        records = []
+        file_count = (
+            fp.V2_LOCAL_EVIDENCE_TOTAL_MAX_BYTES
+            // fp.V2_LOCAL_EVIDENCE_MAX_BYTES
+        ) + 1
+        for index in range(file_count):
+            source = Path(self.root) / f"large-evidence-{index}.bin"
+            with source.open("wb") as handle:
+                handle.truncate(fp.V2_LOCAL_EVIDENCE_MAX_BYTES)
+            records.append(self._evidence(
+                kind="runtime", locator=source.name, content_hash="0" * 64,
+            ))
+        candidate = self._contract(evidence=records)
+        for section in ("users", "outcomes", "workflows", "invariants"):
+            candidate[section][0]["evidence_refs"] = list(range(file_count))
+
+        with mock.patch.object(
+            fp.os, "open",
+            side_effect=AssertionError(
+                "aggregate-oversized evidence must not be opened"
+            ),
+        ):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    @unittest.skipUnless(getattr(os, "O_NONBLOCK", 0), "O_NONBLOCK unavailable")
+    def test_local_evidence_open_is_nonblocking(self):
+        source = Path(self.root) / "evidence.txt"
+        source.write_bytes(b"owner evidence\n")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="runtime", locator="evidence.txt", content_hash=digest,
+        )])
+        observed_flags = []
+        real_open = fp.os.open
+
+        def recording_open(path, flags, *args, **kwargs):
+            observed_flags.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(fp.os, "open", side_effect=recording_open):
+            self.assertIsNotNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+        self.assertTrue(observed_flags)
+        self.assertTrue(all(
+            flags & os.O_NONBLOCK for flags in observed_flags
+        ))
+
+    def test_local_evidence_read_failure_rejects_authority(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="test", locator="src/receipt.py", content_hash=digest,
+        )])
+        with mock.patch.object(fp.os, "open", side_effect=PermissionError("denied")):
+            self.assertIsNone(fp._contract_from_registry(
+                candidate, evidence_root=self.root
+            ))
+
+    def test_unhashable_enum_values_reject_instead_of_raising(self):
+        for confidence in ([], {}, ["verified"]):
+            with self.subTest(confidence=confidence):
+                unsafe_claim = self._claim("u-1", "Bookkeeper")
+                unsafe_claim["confidence"] = confidence
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(users=[unsafe_claim])))
+        for kind in ([], {}, ["source"]):
+            with self.subTest(kind=kind):
+                self.assertIsNone(fp._contract_from_registry(
+                    self._contract(evidence=[self._evidence(kind=kind)])))
+
+    def test_optional_sections_and_additional_properties_are_fail_closed(self):
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            aspirations=[{"id": "asp-1"}],
+        )))
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            invented_authority=True,
+        )))
+        self.assertIsNone(fp._contract_from_registry(self._contract(
+            acceptance_criteria=["   "],
+        )))
+
+    def test_non_authoritative_required_claim_never_unlocks_contract(self):
+        for confidence in ("inferred", "contradicted", "unknown"):
+            with self.subTest(confidence=confidence):
+                contract = fp._contract_from_registry(self._contract(
+                    outcomes=[self._claim(
+                        "o-1", "An uncertain outcome", confidence)],
+                ))
+                self.assertIsNone(contract)
+
+    def test_invalid_in_repo_v2_falls_through_to_valid_legacy_registry(self):
+        invalid = self._contract()
+        invalid.pop("invariants")
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(invalid))
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Use the owner registry purpose.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Complete the trusted flow"],
+                "acceptance_criteria": ["The trusted flow completes."],
+            },
+        }
+
+        contract = fp.find_contract("Receipt Maker", self.root, registry=registry)
+
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.purpose, "Use the owner registry purpose.")
+        self.assertEqual(contract.primary_users, ["Operators"])
+
+    def test_stale_in_repo_evidence_blocks_all_lower_authority_fallbacks(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("owner-observed bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        contract_doc = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+        _w(
+            self.root,
+            "PURPOSE.md",
+            "# Receipt Maker\n\n## Purpose\nUse stale Markdown authority.\n",
+        )
+        source.write_text("bytes changed after owner observation\n", encoding="utf-8")
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Use stale registry authority.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run a stale workflow"],
+            },
+        }
+
+        contract, rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry=registry
+        )
+
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+        self.assertFalse(
+            fp.mutation_authorized_by_purpose(
+                fp.purpose_confidence(contract, {})
+            )[0]
+        )
+
+    def test_stale_registry_evidence_rejects_exact_and_alias_identity(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("owner-observed bytes\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        exact = self._contract(evidence=[self._evidence(
+            kind="route", locator="src/receipt.py", content_hash=digest,
+        )])
+        alias = self._contract(
+            name="Receipt Maker Alias",
+            aliases=["receipt bus"],
+            evidence=[self._evidence(
+                kind="test", locator="src/receipt.py", content_hash=digest,
+            )],
+        )
+
+        valid_exact, exact_rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry={"receipt-maker": exact}
+        )
+        valid_alias, alias_rejected = fp.find_contract_with_status(
+            "Receipt Bus", self.root, registry={"receipt-maker": alias}
+        )
+        self.assertIsNotNone(valid_exact)
+        self.assertFalse(exact_rejected)
+        self.assertIsNotNone(valid_alias)
+        self.assertFalse(alias_rejected)
+
+        source.write_text("bytes changed after owner observation\n", encoding="utf-8")
+        stale_exact, exact_rejected = fp.find_contract_with_status(
+            "Receipt Maker", self.root, registry={"receipt-maker": exact}
+        )
+        stale_alias, alias_rejected = fp.find_contract_with_status(
+            "Receipt Bus", self.root, registry={"receipt-maker": alias}
+        )
+        self.assertIsNone(stale_exact)
+        self.assertTrue(exact_rejected)
+        self.assertIsNone(stale_alias)
+        self.assertTrue(alias_rejected)
+
+    def test_invalid_registry_v2_cannot_gain_authored_mutation_authority(self):
+        invalid = self._contract()
+        invalid["users"][0]["evidence_refs"] = []
+
+        contract = fp.find_contract(
+            "Receipt Maker", registry={"receipt-maker": invalid})
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_blank_optional_slug_is_rejected_without_registry_source_metadata(self):
+        invalid = self._contract(slug="   ")
+
+        self.assertIsNone(fp._contract_from_registry(invalid))
+
+    def test_authority_status_distinguishes_rejection_from_no_contract(self):
+        invalid = self._contract(evidence=[])
+        contract, rejected = fp.find_contract_with_status(
+            "Receipt Maker", registry={"receipt-maker": invalid}
+        )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        missing, missing_rejected = fp.find_contract_with_status(
+            "Unknown Product", registry={"receipt-maker": invalid}
+        )
+        self.assertIsNone(missing)
+        self.assertFalse(missing_rejected)
+
+    def test_invalid_exact_registry_record_blocks_unrelated_alias_fallback(self):
+        invalid_exact = self._contract(name="Receipt Maker")
+        invalid_exact["evidence"] = []
+        unrelated_alias = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "aliases": ["receipt-maker"],
+        }
+
+        contract = fp.find_contract("Receipt Maker", registry={
+            "receipt-maker": invalid_exact,
+            "another-product": unrelated_alias,
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_invalid_alias_match_blocks_later_valid_alias(self):
+        invalid_alias = self._contract(
+            name="Damaged Receipt Contract",
+            aliases=["receipt bus"],
+            evidence=[],
+        )
+        unrelated_valid_alias = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "aliases": ["receipt-bus"],
+        }
+
+        contract = fp.find_contract("Receipt Bus", registry={
+            "damaged-contract": invalid_alias,
+            "another-product": unrelated_valid_alias,
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_duplicate_valid_alias_is_ambiguous_and_unresolved(self):
+        contract = fp.find_contract("Receipt Bus", registry={
+            "first-product": {
+                "name": "First Product",
+                "purpose": "First purpose.",
+                "aliases": ["receipt-bus"],
+            },
+            "second-product": {
+                "name": "Second Product",
+                "purpose": "Second purpose.",
+                "aliases": ["receipt bus"],
+            },
+        })
+
+        self.assertIsNone(contract)
+
+    def test_invalid_path_match_blocks_later_valid_path(self):
+        invalid_path = self._contract(
+            name="Damaged Path Contract",
+            evidence=[],
+            local_path=self.root,
+        )
+        unrelated_valid_path = {
+            "name": "Another Product",
+            "purpose": "Perform unrelated owner work.",
+            "primary_users": ["Other users"],
+            "core_journeys": ["Run another workflow"],
+            "local_path": self.root,
+        }
+
+        contract = fp.find_contract("Unmatched Name", self.root, registry={
+            "damaged-contract": invalid_path,
+            "another-product": unrelated_valid_path,
+        })
+
+        self.assertIsNone(contract)
+        confidence = fp.purpose_confidence(contract, {})
+        self.assertEqual(confidence, "unresolved")
+        self.assertFalse(fp.mutation_authorized_by_purpose(confidence)[0])
+
+    def test_one_valid_alias_or_path_match_still_resolves(self):
+        valid = {
+            "name": "Receipt Maker",
+            "purpose": "Create the requested receipt.",
+            "primary_users": ["Bookkeepers"],
+            "core_journeys": ["Export one receipt"],
+            "aliases": ["receipt-bus"],
+            "local_path": self.root,
+        }
+
+        alias_contract = fp.find_contract(
+            "Receipt Bus", registry={"receipt-maker": valid})
+        path_contract = fp.find_contract(
+            "Unmatched Name", self.root, registry={"receipt-maker": valid})
+
+        self.assertEqual(alias_contract.purpose, "Create the requested receipt.")
+        self.assertEqual(path_contract.purpose, "Create the requested receipt.")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_local_evidence_symlink_is_rejected_consistently(self):
+        target = Path(self.root) / "src" / "receipt.py"
+        target.parent.mkdir()
+        target.write_text("trusted\n", encoding="utf-8")
+        link = Path(self.root) / "receipt-evidence"
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlink unavailable: {exc}")
+        digest = __import__("hashlib").sha256(target.read_bytes()).hexdigest()
+        candidate = self._contract(evidence=[self._evidence(
+            kind="source", locator="receipt-evidence", content_hash=digest,
+        )])
+
+        self.assertIsNone(fp._contract_from_registry(
+            candidate, evidence_root=self.root
+        ))
+
+    def test_path_handle_identity_differences_do_not_reject_regular_authority(self):
+        source = Path(self.root) / "src" / "receipt.py"
+        source.parent.mkdir()
+        source.write_text("trusted\n", encoding="utf-8")
+        digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        contract_doc = self._contract(evidence=[self._evidence(
+            kind="source", locator="src/receipt.py", content_hash=digest,
+        )])
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(contract_doc))
+        targets = {
+            os.path.normcase(os.path.abspath(str(source))),
+            os.path.normcase(os.path.abspath(
+                os.path.join(self.root, ".flexfactor-purpose.json")
+            )),
+        }
+        real_lstat = fp.os.lstat
+
+        class DivergentPathStat:
+            def __init__(self, original):
+                self._original = original
+                self.st_dev = int(original.st_dev) + 100003
+                self.st_ino = int(original.st_ino) + 100019
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+            def __getitem__(self, index):
+                return self._original[index]
+
+            def __iter__(self):
+                return iter(self._original)
+
+            def __len__(self):
+                return len(self._original)
+
+        def is_target(path) -> bool:
+            try:
+                return os.path.normcase(
+                    os.path.abspath(os.fspath(path))
+                ) in targets
+            except (TypeError, ValueError):
+                return False
+
+        def divergent_lstat(path, *args, **kwargs):
+            value = real_lstat(path, *args, **kwargs)
+            return DivergentPathStat(value) if is_target(path) else value
+
+        with mock.patch.object(fp.os, "lstat", side_effect=divergent_lstat):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+
+        self.assertFalse(rejected)
+        self.assertIsNotNone(contract)
+
+    def test_checked_in_contract_passes_runtime_validator(self):
+        with open(os.path.join(os.path.dirname(fp.__file__),
+                               ".flexfactor-purpose.json"), encoding="utf-8") as fh:
+            checked_in = json.load(fh)
+        self.assertTrue(fp._v2_contract_is_authoritative(
+            checked_in, evidence_root=os.path.dirname(fp.__file__)
+        ))
+        contract = fp._contract_from_registry(
+            checked_in, allow_registry_metadata=False,
+            evidence_root=os.path.dirname(fp.__file__),
+        )
+        self.assertIsNotNone(contract)
+        prompt = contract.prompt_block()
+        for requirement in (
+            "Report-only is the default",
+            "Source is classified before cloud calls",
+            "resource, network, path, process, and time containment",
+            "batch/project budgets",
+            "dirty-worktree, cancellation, timeout, partial-failure",
+            "RESOLVED CONTRADICTIONS",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, prompt)
+
+    def test_in_repo_contract_read_failure_is_an_authority_rejection(self):
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
+        with mock.patch.object(
+            fp.os, "open", side_effect=PermissionError("owner contract unreadable")
+        ):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_oversized_in_repo_contract_is_rejected_before_read(self):
+        authority = Path(self.root) / ".flexfactor-purpose.json"
+        authority.write_bytes(b" " * (fp.IN_REPO_CONTRACT_MAX_BYTES + 1))
+        with mock.patch.object(
+            fp.os, "fdopen",
+            side_effect=AssertionError("oversized authority must not be read"),
+        ):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_in_repo_contract_reader_is_bounded_even_after_open(self):
+        _w(self.root, ".flexfactor-purpose.json", json.dumps(self._contract()))
+        requested_sizes = []
+        real_fdopen = fp.os.fdopen
+
+        class RecordingReader:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                self.handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.handle.__exit__(*args)
+
+            def read(self, size=-1):
+                requested_sizes.append(size)
+                return self.handle.read(size)
+
+        def recording_fdopen(descriptor, mode, *, closefd):
+            return RecordingReader(real_fdopen(
+                descriptor, mode, closefd=closefd
+            ))
+
+        with mock.patch.object(fp.os, "fdopen", side_effect=recording_fdopen):
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker", self.root, registry={}
+            )
+        self.assertIsNotNone(contract)
+        self.assertFalse(rejected)
+        self.assertEqual(
+            requested_sizes, [fp.IN_REPO_CONTRACT_MAX_BYTES + 1]
+        )
+
+    def test_in_repo_contract_symlink_escape_is_an_authority_rejection(self):
+        outside = Path(self.root).parent / (Path(self.root).name + "-purpose.json")
+        outside.write_text(json.dumps(self._contract()), encoding="utf-8")
+        contract_path = Path(self.root) / ".flexfactor-purpose.json"
+        try:
+            contract_path.symlink_to(outside)
+        except OSError as exc:
+            outside.unlink(missing_ok=True)
+            self.skipTest(f"file symlinks unavailable: {exc}")
+        try:
+            contract, rejected = fp.find_contract_with_status(
+                "Receipt Maker",
+                self.root,
+                registry={
+                    "receipt-maker": {
+                        "name": "Receipt Maker",
+                        "purpose": "Lower authority must not replace an escape.",
+                    },
+                },
+            )
+            self.assertIsNone(contract)
+            self.assertTrue(rejected)
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_malformed_in_repo_contract_is_an_authority_rejection(self):
+        registry = {
+            "receipt-maker": {
+                "name": "Receipt Maker",
+                "purpose": "Lower-priority registry purpose.",
+                "primary_users": ["Operators"],
+                "core_journeys": ["Run a lower-priority workflow"],
+            },
+        }
+        for body in ("{not-json", "[]"):
+            with self.subTest(body=body):
+                _w(self.root, ".flexfactor-purpose.json", body)
+                _w(
+                    self.root,
+                    "PURPOSE.md",
+                    "# Receipt Maker\n\n## Purpose\nLower-priority Markdown.\n",
+                )
+                contract, rejected = fp.find_contract_with_status(
+                    "Receipt Maker", self.root, registry=registry
+                )
+                self.assertIsNone(contract)
+                self.assertTrue(rejected)
+
+    def test_registry_parse_and_read_failures_are_authority_rejections(self):
+        registry = Path(self.root) / "registry.json"
+        registry.write_text("{not-json", encoding="utf-8")
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        registry.write_text(json.dumps({"programs": []}), encoding="utf-8")
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+        real_open = open
+
+        def denied(path, *args, **kwargs):
+            if os.fspath(path) == str(registry):
+                raise PermissionError("owner registry unreadable")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(fp, "registry_path", return_value=str(registry)), \
+             mock.patch("builtins.open", side_effect=denied):
+            contract, rejected = fp.find_contract_with_status("Receipt Maker")
+        self.assertIsNone(contract)
+        self.assertTrue(rejected)
+
+    def test_registry_identity_tolerates_windows_path_handle_stat_shapes(self):
+        registry = Path(self.root) / "registry.json"
+        registry.write_text(
+            json.dumps({"programs": {"receipt-maker": self._contract()}}),
+            encoding="utf-8",
+        )
+        real_fstat = fp.os.fstat
+
+        def windows_style_fstat(descriptor):
+            observed = real_fstat(descriptor)
+            changed = mock.Mock()
+            for field in (
+                "st_mode", "st_dev", "st_ino", "st_size",
+                "st_mtime_ns", "st_ctime_ns",
+            ):
+                setattr(changed, field, getattr(observed, field))
+            changed.st_mode ^= stat.S_IWUSR
+            changed.st_dev += 101
+            changed.st_ino += 101
+            changed.st_ctime_ns += 1_000
+            return changed
+
+        with mock.patch.object(fp.os, "fstat", side_effect=windows_style_fstat):
+            programs, rejected = fp._load_registry_with_status(str(registry))
+        self.assertFalse(rejected)
+        self.assertIn("receipt-maker", programs)
+
+    def test_dangling_or_raced_registry_entry_is_not_an_optional_miss(self):
+        missing = Path(self.root) / "missing-registry.json"
+        programs, rejected = fp._load_registry_with_status(str(missing))
+        self.assertEqual(programs, {})
+        self.assertFalse(rejected)
+
+        dangling = Path(self.root) / "dangling-registry.json"
+        try:
+            dangling.symlink_to(missing)
+        except OSError:
+            pass
+        else:
+            programs, rejected = fp._load_registry_with_status(str(dangling))
+            self.assertEqual(programs, {})
+            self.assertTrue(rejected)
+
+        present = Path(self.root) / "raced-registry.json"
+        present.write_text('{"programs": {}}', encoding="utf-8")
+        real_open = open
+
+        def vanished(path, *args, **kwargs):
+            if os.fspath(path) == str(present):
+                raise FileNotFoundError("registry target vanished")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=vanished):
+            programs, rejected = fp._load_registry_with_status(str(present))
+        self.assertEqual(programs, {})
+        self.assertTrue(rejected)
+
+        fstat_calls = 0
+        real_fstat = fp.os.fstat
+
+        def changed_while_reading(descriptor):
+            nonlocal fstat_calls
+            observed = real_fstat(descriptor)
+            fstat_calls += 1
+            if fstat_calls == 2:
+                changed = mock.Mock()
+                for field in (
+                    "st_mode", "st_dev", "st_ino", "st_size",
+                    "st_mtime_ns", "st_ctime_ns",
+                ):
+                    setattr(changed, field, getattr(observed, field))
+                changed.st_mtime_ns += 1
+                return changed
+            return observed
+
+        with mock.patch.object(
+            fp.os, "fstat", side_effect=changed_while_reading
+        ):
+            programs, rejected = fp._load_registry_with_status(str(present))
+        self.assertEqual(programs, {})
+        self.assertTrue(rejected)
+
+    def test_schema_requires_nonempty_evidence_references(self):
+        with open(os.path.join(os.path.dirname(fp.__file__), "docs",
+                               "purpose-contract.schema.json"),
+                  encoding="utf-8") as fh:
+            schema = json.load(fh)
+        self.assertEqual(schema["$defs"]["claim"]["properties"]
+                         ["evidence_refs"]["minItems"], 1)
+        self.assertEqual(schema["$defs"]["resolved_claim"]["properties"]
+                         ["evidence_refs"]["minItems"], 1)
+        self.assertEqual(
+            schema["$defs"]["resolved_claim"]["properties"]["confidence"]["enum"],
+            ["verified", "supported"],
+        )
+
+    def test_legacy_lists_remain_supported_but_are_also_atomic(self):
+        contract = fp._contract_from_registry({
+            "name": "Legacy",
+            "purpose": "Keep compatibility.",
+            "primary_users": [" Operators ", "Owners"],
+            "core_journeys": ["Run the complete flow"],
+        })
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.primary_users, ["Operators", "Owners"])
+        self.assertEqual(contract.core_journeys, ["Run the complete flow"])
+
+        malformed = fp._contract_from_registry({
+            "name": "Legacy",
+            "purpose": "Keep compatibility.",
+            "primary_users": ["Operator", 7],
+        })
+        self.assertIsNotNone(malformed)
+        self.assertEqual(malformed.primary_users, [])
 
 
 class GatherEvidenceFullFixtureTests(_TempRepo):

@@ -9,6 +9,11 @@ survive executable verification and independent review, preserves owner work,
 protects sensitive source, and produces reproducible evidence tied to one exact
 revision.
 
+The owner-defined destination is a trustworthy local expert tool: it never
+retains unverified changes, sends sensitive source to a cloud model by default,
+or executes untrusted dependencies outside enforced containment, and it always
+provides reproducible evidence and deterministic rollback.
+
 ## Non-negotiable product invariants
 
 1. One request contains at most 30 targets and one orchestrator runs them in
@@ -28,8 +33,10 @@ revision.
 5. Model selection is one strongest-to-weakest ladder: paid/subscription
    capacity first while available, then lower paid tiers, then free/local.
    Workers cannot select paid/free/provider side paths.
-6. No production mutation starts without Git, `origin`, a named branch, a
-   resolvable authoritative default branch, and mandatory push/merge.
+6. Report-only is the default. Mutation requires explicit apply authorization,
+   Git, `origin`, a named branch, and a resolvable authoritative default branch.
+   Once apply is authorized, publication proof is mandatory; a local-only
+   change is not success.
 7. Model output is untrusted. A candidate must pass the target's real build and
    strongest suite; an absent gate is not a pass.
 8. The complete candidate patch is reviewed in content-addressed chunks against
@@ -55,11 +62,16 @@ whole-repository/delta contract applies to the repository repair loop in Audit
 and Production Ready; Refactor's bounded reps stay scoped to its selected file,
 and Scout stays a discovery/proposal flow until apply is authorized.
 
+Audit must therefore have a real report-only journey, and every applying mode
+must make the transition from report to mutation explicit and auditable.
+
 ## Completion evidence
 
 A complete changed run must provide:
 
 - baseline and final commit SHAs;
+- batch-level and project-level budgets plus an immutable run manifest;
+- every exact command, result, and evidence record needed to reproduce the run;
 - a balanced inventory and file-review ledger;
 - purpose evidence, confidence, contradictions, and acceptance criteria;
 - build and strongest-suite output from the exact candidate;
@@ -70,7 +82,8 @@ A complete changed run must provide:
 - a complete independent-review chunk ledger naming the final SHA;
 - a clean-HEAD race check after review;
 - a publication record naming the remote default branch and fetched tip;
-- proof that the reviewed SHA is reachable from that remote branch.
+- proof that the reviewed SHA is reachable from that remote branch;
+- a deterministic rollback path tied to the same manifest and commit.
 
 No prose substitute—“tests passed locally,” “PR opened,” “APK built,” or
 “health returned 200”—satisfies a missing item.
@@ -93,13 +106,33 @@ Only these owner-facing states are valid:
 
 - Target repository content, issues, competitor pages, and model replies are
   untrusted data and are fenced from instructions.
-- Install/build/test execution crosses the command and containment broker.
+- Source is classified before every cloud-bound model call. Sensitive
+  repositories use local processing by default; a cloud exception requires
+  explicit owner approval.
+- Repository-supplied installs, builds, tests, and scripts execute only inside
+  enforced resource, network, path, process, and time limits. This requirement
+  applies on Windows and Linux; if the host cannot enforce it, untrusted
+  execution is BLOCKED.
 - Cloud payloads cross the secret/PII egress scanner.
 - Dirty owner work is captured under an orphan ref and restored by fingerprint.
 - Sealed mobile provider credentials are decrypted only by GitHub for the
   selected repository; FlexFactor Cloud stores no bearer or provider secrets.
-- When the host cannot enforce a property, the evidence names the limitation
-  instead of claiming containment.
+- A best-effort control is named as a limitation and never counted as
+  containment.
+
+## Owner-authority reconciliation
+
+An earlier checked-in contract reversed the owner requirement by requiring a
+real apply journey for every Audit and Production Ready invocation and denying
+a report-only path. The current owner directive controls: report-only/apply-off
+is the default, and mutation requires explicit apply authorization. Existing
+mandatory-mutation behavior is an implementation gap, not a product
+requirement; the contradiction remains recorded in the structured contract.
+
+The required compatibility matrix is also explicit: Windows and Linux must
+cover verifier outage, dirty worktrees, cancellation, timeout, partial failure,
+and backward compatibility. A verifier outage must restore the exact pre-run
+bytes and create neither an `UNVERIFIED` commit nor a success score.
 
 ## Release meaning
 

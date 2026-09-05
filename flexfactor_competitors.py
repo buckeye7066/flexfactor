@@ -66,11 +66,22 @@ __all__ = [
     "coverage_note", "web_search", "scout_url_search", "github_repo_search",
     "fetch_evidence_document",
     "research_competitors", "competitor_findings", "report_lines",
-    "DEFAULT_TARGET", "DEFAULT_FIX_STREAM_CAP",
+    "DEFAULT_TARGET", "DEFAULT_FIX_STREAM_CAP", "DEFAULT_SCOUT_OPPORTUNITY_CAP",
 ]
 
-DEFAULT_TARGET = 5
-DEFAULT_FIX_STREAM_CAP = 5
+# RAISED 5 -> 25 on 2026-09-04 by owner order (see flexfactor_execution.py
+# TOP_COMPETITORS for the verbatim instruction). Scout must be able to fully
+# reproduce a competitor's capability, not a token sample of it. Both remain
+# env-tunable so a single run can still be narrowed deliberately, and a
+# fix-stream cap of 0 is still an explicit OFF rather than a silent no-op.
+DEFAULT_TARGET = max(0, int(os.environ.get("FLEXFACTOR_COMPETITOR_TARGET", "25") or 25))
+DEFAULT_FIX_STREAM_CAP = max(0, int(os.environ.get("FLEXFACTOR_COMPETITOR_FIXES", "25") or 25))
+# How many Scout-identified opportunities are consumed per research pass. This
+# was a bare `[:6]` slice inline, which silently discarded everything Scout
+# found beyond the sixth — the same top-N truncation the fix-stream ledger
+# exists to make impossible, one stage earlier in the pipeline.
+DEFAULT_SCOUT_OPPORTUNITY_CAP = max(
+    1, int(os.environ.get("FLEXFACTOR_SCOUT_OPPORTUNITIES", "25") or 25))
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlexFactor-competitor-research"
 _HTTP_TIMEOUT = 25.0
 _FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
@@ -1047,7 +1058,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     scout_opportunities: list[dict] = []
     seen_url_queries: set[str] = set()
     seen_repo_queries: set[str] = set()
-    for raw in ((scout_profile or {}).get("opportunities") or [])[:6]:
+    for raw in ((scout_profile or {}).get("opportunities") or [])[:DEFAULT_SCOUT_OPPORTUNITY_CAP]:
         if not isinstance(raw, dict):
             continue
         need = " ".join(str(raw.get("need") or "").split())[:600]

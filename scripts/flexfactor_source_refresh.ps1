@@ -33,6 +33,19 @@ function Invoke-FlexFactorSourceRefresh {
         [object[]]$ForwardedArgs = @()
     )
 
+    # Git writes ordinary WARNINGS to stderr, and under the launcher's
+    # $ErrorActionPreference = "Stop" a native command that writes ANY stderr
+    # raises a terminating NativeCommandError -- even when the call is
+    # redirected with *> $null. Measured: one untracked CRLF file (routine on
+    # a core.autocrlf=true checkout) made `git stash push` warn, which killed
+    # the launcher AFTER the stash had already moved the owner's uncommitted
+    # work off disk -- so the work silently vanished, the "Preserved local
+    # edits" disclosure never printed, and no program opened. This function
+    # checks every exit status explicitly and never relies on Stop, so the
+    # preference is narrowed here. The assignment is function-scoped and does
+    # not change the launcher's own preference after the refresh returns.
+    $ErrorActionPreference = "Continue"
+
     if ($env:FLEXFACTOR_SKIP_SOURCE_REFRESH -eq "1") { return }
     if (-not (Test-Path (Join-Path $Repository ".git"))) {
         Stop-FlexFactorSourceRefresh "The desktop launcher is not inside a Git checkout: $Repository"
@@ -43,8 +56,15 @@ function Invoke-FlexFactorSourceRefresh {
         Stop-FlexFactorSourceRefresh "Git is unavailable, so current origin/main cannot be verified."
     }
 
-    $origin = (& $git.Source -C $Repository remote get-url origin 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) {
+    # Capture native output in full BEFORE narrowing it. `Select-Object -First`
+    # tears the pipeline down as soon as it has its item, which kills git
+    # mid-flight and leaves $LASTEXITCODE at -1 instead of git's real exit
+    # status. Checking that -1 rejected a checkout that was already on clean
+    # main, so the desktop shortcuts could not open FlexFactor at all.
+    $originLines = @(& $git.Source -C $Repository remote get-url origin 2>$null)
+    $originExit = $LASTEXITCODE
+    $origin = $originLines | Select-Object -First 1
+    if ($originExit -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) {
         Stop-FlexFactorSourceRefresh "The checkout has no readable origin remote."
     }
     $normalizedOrigin = "$origin".Trim().TrimEnd("/").ToLowerInvariant()
@@ -59,8 +79,10 @@ function Invoke-FlexFactorSourceRefresh {
         Stop-FlexFactorSourceRefresh "This desktop checkout is not bound to buckeye7066/flexfactor origin."
     }
 
-    $branch = (& $git.Source -C $Repository branch --show-current 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or "$branch".Trim() -ne "main") {
+    $branchLines = @(& $git.Source -C $Repository branch --show-current 2>$null)
+    $branchExit = $LASTEXITCODE
+    $branch = $branchLines | Select-Object -First 1
+    if ($branchExit -ne 0 -or "$branch".Trim() -ne "main") {
         Stop-FlexFactorSourceRefresh "The desktop checkout must be on main before it can run. Current branch: $branch"
     }
 
@@ -73,6 +95,8 @@ function Invoke-FlexFactorSourceRefresh {
         $quotedRepo = '"' + $Repository.Replace('"', '\"') + '[all]"'
         $install = Start-Process -FilePath $venvPython -NoNewWindow -PassThru `
             -ArgumentList @("-m", "pip", "install", "--disable-pip-version-check", "-e", $quotedRepo)
+        # Retain the handle first, or the exit code below degrades to $null.
+        $null = $install.Handle
         if (-not $install.WaitForExit(600000)) {
             Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
             Stop-FlexFactorSourceRefresh "Dependency reconciliation timed out after 10 minutes." 4
@@ -86,6 +110,12 @@ function Invoke-FlexFactorSourceRefresh {
     $quotedRepository = '"' + $Repository.Replace('"', '\"') + '"'
     $fetch = Start-Process -FilePath $git.Source -NoNewWindow -PassThru `
         -ArgumentList @("-C", $quotedRepository, "fetch", "--quiet", "--no-tags", "origin", "main")
+    # Retaining the process handle is load-bearing. Start-Process -PassThru
+    # hands back a Process object that has not cached the native handle, so
+    # once the child exits the runtime cannot read it and the exit code
+    # degrades to $null -- and $null -ne 0 is TRUE, so a healthy fetch read
+    # as a failure and the desktop shortcut refused to launch.
+    $null = $fetch.Handle
     if (-not $fetch.WaitForExit(30000)) {
         Stop-Process -Id $fetch.Id -Force -ErrorAction SilentlyContinue
         Stop-FlexFactorSourceRefresh "GitHub update check timed out after 30 seconds."
@@ -94,9 +124,13 @@ function Invoke-FlexFactorSourceRefresh {
         Stop-FlexFactorSourceRefresh "Could not verify GitHub origin/main."
     }
 
-    $head = (& $git.Source -C $Repository rev-parse HEAD 2>$null | Select-Object -First 1)
-    $upstream = (& $git.Source -C $Repository rev-parse origin/main 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($head) -or
+    $headLines = @(& $git.Source -C $Repository rev-parse HEAD 2>$null)
+    $headExit = $LASTEXITCODE
+    $head = $headLines | Select-Object -First 1
+    $upstreamLines = @(& $git.Source -C $Repository rev-parse origin/main 2>$null)
+    $upstreamExit = $LASTEXITCODE
+    $upstream = $upstreamLines | Select-Object -First 1
+    if ($headExit -ne 0 -or $upstreamExit -ne 0 -or [string]::IsNullOrWhiteSpace($head) -or
         [string]::IsNullOrWhiteSpace($upstream)) {
         Stop-FlexFactorSourceRefresh "Could not resolve local HEAD and origin/main."
     }
@@ -185,9 +219,11 @@ function Invoke-FlexFactorSourceRefresh {
         }
     }
 
-    $finalHead = (& $git.Source -C $Repository rev-parse HEAD 2>$null | Select-Object -First 1)
+    $finalHeadLines = @(& $git.Source -C $Repository rev-parse HEAD 2>$null)
+    $finalHeadExit = $LASTEXITCODE
+    $finalHead = $finalHeadLines | Select-Object -First 1
     $finalStatus = @(& $git.Source -C $Repository status --porcelain --untracked-files=all 2>$null)
-    if ($LASTEXITCODE -ne 0 -or "$finalHead".Trim() -ne $upstream -or $finalStatus.Count -gt 0) {
+    if ($finalHeadExit -ne 0 -or $LASTEXITCODE -ne 0 -or "$finalHead".Trim() -ne $upstream -or $finalStatus.Count -gt 0) {
         Stop-FlexFactorSourceRefresh "Post-refresh verification failed; executable source is not an exact clean origin/main tree."
     }
 

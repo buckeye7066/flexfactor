@@ -39,6 +39,11 @@ _ALLOW: dict[str, tuple[tuple[re.Pattern[str], int], ...]] = {
         (re.compile(r"^POSIX dir_fd path uses a handle, not the stat re-check$"), 1),
         (re.compile(r"^no live catalog at .*AITime[\\/]+routes\.json$"), 1),
         (re.compile(r"^BLOCKED: Windows-only assertion on this host "), 1),
+        # The desktop launcher runs Windows PowerShell 5.1, and the
+        # NativeCommandError-on-native-stderr behaviour it guards against is
+        # specific to 5.1 (pwsh 7.6 does not do it). Both arms of that probe
+        # therefore skip here rather than silently measuring the wrong host.
+        (re.compile(r"^BLOCKED: needs Windows PowerShell 5\.1 "), 2),
         (re.compile(r"^BLOCKED: no OS network isolation on this host "), 1),
         (re.compile(r"^BLOCKED: no sufficient OS sandbox "), 1),
     ),
