@@ -1499,20 +1499,40 @@ class RotatingProvider:
         self._last_selection = self.role_coordinator.last_selection
         self._author_families = self.role_coordinator.author_families
         self._family_lock = self.role_coordinator.lock
+        # WHOSE WORK IS BEING GRADED. `_last_selection` is SHARED on purpose -
+        # a reviewer must avoid the family that authored last, across providers
+        # and across threads. Quality attribution needs the opposite property:
+        # `report_quality("reviewer", "rejected")` is a verdict on the call THIS
+        # thread just made, and semantic review runs its units concurrently over
+        # one provider. Read from the shared map, worker A's verdict lands on
+        # whichever route worker B selected in between - so a route is cooled
+        # for work it never produced, and the rotator's yield learning is
+        # trained on noise. Per-thread, per-role, and deliberately NOT shared.
+        self._tls = threading.local()
 
     def set_purpose(self, purpose: str, needs: Sequence[str] = ()) -> None:
         self._purpose = str(purpose or "")[:80]
         self._purpose_needs = tuple(dict.fromkeys(str(n) for n in needs if n))
 
     def report_quality(self, role: str, signal: str) -> Optional[str]:
-        """Attribute a work result to the route that last served `role`.
+        """Attribute a work result to the route THIS THREAD used for `role`.
 
         Callers know whether a fix landed, was rejected, was a no-op, or broke
         the build; they do not know which route authored it. This provider
         does. Returns the cooldown note when one was triggered, else None.
+
+        The per-thread record wins because the verdict describes one call. The
+        shared map remains the fallback for a caller reporting from a different
+        thread than the one that made the call (the fix loop hands work between
+        threads), which is the behaviour this method has always had - so the
+        change can only ever make an attribution MORE precise, never blank one
+        that used to work.
         """
-        with self._family_lock:
-            sel = self._last_selection.get(role)
+        mine = getattr(self._tls, "last_selection", None)
+        sel = mine.get(role) if mine else None
+        if sel is None:
+            with self._family_lock:
+                sel = self._last_selection.get(role)
         if sel is None:
             return None
         return self.rotator.report_quality(sel.route, signal, sel.purpose)
@@ -1737,6 +1757,12 @@ class RotatingProvider:
             self.rotator.report(route, "ok")
             if intent is not None and intent.role:
                 family = route_model_family(route)
+                # This thread's own record first: no lock needed (nothing else
+                # can see it) and it cannot be overwritten by a sibling worker.
+                mine = getattr(self._tls, "last_selection", None)
+                if mine is None:
+                    mine = self._tls.last_selection = {}
+                mine[intent.role] = selection
                 with self._family_lock:
                     self._last_family[intent.role] = family
                     self._last_selection[intent.role] = selection
