@@ -1442,5 +1442,170 @@ class RouteRefusal403Tests(unittest.TestCase):
         self.assertEqual(R._classify(exc), "auth_failed")
 
 
+# --------------------------------------------------------------------------- #
+# A route failure must name the route that ACTUALLY failed, and a model the
+# provider has retired must leave the rotation.
+#
+# Both defects were found by running FlexFactor against FreeAndClean on
+# 2026-09-05. The log said:
+#
+#   [failover] semantic review batch failed via deepseek-ai/deepseek-v4-flash
+#              (404 ... 'models/gemini-2.5-pro is no longer available' ...)
+#
+# deepseek never saw that payload. `RotatingProvider.model` is the LAST route
+# any thread selected, and semantic review fans its units across a thread pool
+# sharing one provider, so the handler printed a sibling thread's route. The
+# same run then lost 2 of 8 files to the retired gemini route, which kept being
+# re-drawn because a 404 classified as a generic "error".
+# --------------------------------------------------------------------------- #
+
+RETIRED_404 = (
+    "Error code: 404 - [{'error': {'code': 404, 'message': 'This model "
+    "models/gemini-2.5-pro is no longer available to new users. Please update "
+    "your code to use models/gemini-3.1-pro-preview for the latest features "
+    "and improvements.', 'status': 'NOT_FOUND'}}]"
+)
+
+
+class _ApiError(Exception):
+    def __init__(self, message: str, status: int = 404) -> None:
+        super().__init__(message)
+        self.status_code = status
+
+
+class RouteErrorAttributionTests(unittest.TestCase):
+    def test_stamp_survives_another_thread_moving_provider_model(self):
+        """The exact live failure, reproduced without a network.
+
+        A stamped exception is thread-confined; `.model` is not. Mutating
+        `.model` between the raise and the report -- which is all a sibling
+        review worker does -- must not change who gets blamed.
+        """
+        exc = _ApiError(RETIRED_404)
+        R.stamp_route_model(exc, "gemini-2.5-pro")
+
+        moved = threading.Event()
+
+        def sibling_worker():
+            # Stands in for another review unit selecting its own route on the
+            # SAME shared provider object.
+            provider_model["value"] = "deepseek-ai/deepseek-v4-flash-0731"
+            moved.set()
+
+        provider_model = {"value": "gemini-2.5-pro"}
+        t = threading.Thread(target=sibling_worker)
+        t.start()
+        t.join()
+        self.assertTrue(moved.is_set())
+
+        self.assertEqual(provider_model["value"],
+                         "deepseek-ai/deepseek-v4-flash-0731",
+                         "precondition: the shared attribute really did move")
+        self.assertEqual(
+            R.route_model_of(exc), "gemini-2.5-pro",
+            "the failure was re-attributed to a route that never saw it")
+
+    def test_first_stamp_wins_as_the_exception_travels_outward(self):
+        """The innermost stamp names the route that made the failing call."""
+        exc = _ApiError(RETIRED_404)
+        R.stamp_route_model(exc, "gemini-2.5-pro")
+        R.stamp_route_model(exc, "some/outer-wrapper-route")
+        self.assertEqual(R.route_model_of(exc), "gemini-2.5-pro")
+
+    def test_a_wrapped_error_still_names_the_provider_that_broke(self):
+        """RotationError wraps the last provider error; the name must survive."""
+        inner = _ApiError(RETIRED_404)
+        R.stamp_route_model(inner, "gemini-2.5-pro")
+        try:
+            try:
+                raise inner
+            except _ApiError as cause:
+                raise R.RotationError("every frontier pool failed") from cause
+        except R.RotationError as outer:
+            self.assertEqual(R.route_model_of(outer), "gemini-2.5-pro")
+
+    def test_unstamped_exception_falls_back_to_the_caller_default(self):
+        self.assertEqual(R.route_model_of(ValueError("x"), "fallback"),
+                         "fallback")
+
+    def test_stamping_never_raises_when_the_exception_refuses_attributes(self):
+        """Diagnostics must never become a second failure.
+
+        Some exception objects reject attribute writes (a C-implemented type,
+        or one with a defensive __setattr__). Stamping such an exception has
+        to be a silent no-op: the route label is a nicety, while the original
+        provider error is the thing the caller must still receive intact.
+        """
+        class Unstampable(Exception):
+            def __setattr__(self, name, value):
+                raise AttributeError(f"{name} is read-only")
+
+        exc = Unstampable()
+        R.stamp_route_model(exc, "some/route")   # must not raise
+        self.assertEqual(R.route_model_of(exc, "unknown"), "unknown")
+
+    def test_an_ordinary_exception_accepts_the_stamp(self):
+        """Guards the negative test above from silently proving nothing."""
+        exc = _ApiError(RETIRED_404)
+        R.stamp_route_model(exc, "some/route")
+        self.assertEqual(R.route_model_of(exc, "unknown"), "some/route")
+
+
+class RetiredModelClassificationTests(RotationTestCase):
+    def test_a_retired_model_404_is_not_a_generic_error(self):
+        self.assertTrue(R.is_model_retired_error(_ApiError(RETIRED_404)))
+        self.assertEqual(R._classify(_ApiError(RETIRED_404)), "model_retired")
+
+    def test_a_bare_404_is_left_alone(self):
+        """A 404 that does not name the MODEL may be a path or entitlement
+        problem, and benching a route for a day on that evidence would be a
+        worse defect than the one being fixed."""
+        self.assertFalse(R.is_model_retired_error(_ApiError("Not Found")))
+        self.assertNotEqual(R._classify(_ApiError("Not Found")), "model_retired")
+
+    def test_other_statuses_are_never_read_as_retirement(self):
+        for status in (429, 500, 503):
+            exc = _ApiError("the model is no longer available", status=status)
+            self.assertFalse(
+                R.is_model_retired_error(exc),
+                f"status {status} must not be read as a model retirement")
+
+    def test_retirement_benches_the_route_and_spares_its_siblings(self):
+        """A retirement is a verdict about ONE model id.
+
+        The pool and the credential keep working -- that is exactly what makes
+        it different from a quota or an auth failure -- but the dead route must
+        not be re-drawn for the rest of the run.
+        """
+        dead = route("gemini/gemini-2.5-pro", "gemini:free")
+        alive = route("gemini/gemini-3.1-pro", "gemini:free")
+        rot = self.rotator(catalog(dead, alive))
+
+        rot.report(dead, "model_retired")
+
+        state = self.store.read()
+        cooldowns = state.get("cooldowns") or {}
+        self.assertIn(f"route:{dead.id}", cooldowns,
+                      "the retired route was not benched at all")
+        self.assertGreater(
+            cooldowns[f"route:{dead.id}"] - time.time(),
+            3600.0,
+            "benched no longer than a transient fault; it will be re-drawn "
+            "inside a single audit and cost another review batch")
+        self.assertNotIn(alive.pool, cooldowns,
+                         "a retired model id took its whole pool down with it")
+        self.assertNotIn(dead.id, state.get("strikes") or {},
+                         "a retirement is not evidence the provider is sick")
+
+    def test_the_surviving_sibling_is_still_selectable(self):
+        """The point of the bench: work continues on the same backend."""
+        dead = route("gemini/gemini-2.5-pro", "gemini:free")
+        alive = route("gemini/gemini-3.1-pro", "gemini:free")
+        rot = self.rotator(catalog(dead, alive))
+        rot.report(dead, "model_retired")
+        picked = {rot.next_route().route.id for _ in range(4)}
+        self.assertEqual(picked, {alive.id},
+                         "rotation kept drawing a model the provider retired")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
