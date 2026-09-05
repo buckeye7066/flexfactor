@@ -1,6 +1,6 @@
 # Purpose & Acceptance Contract — FlexFactor
 
-**Version:** 0.3
+**Version:** 0.4
 **Application:** FlexFactor  
 **Executor:** Cursor  
 **Repository:** buckeye7066/flexfactor (default `main`)  
@@ -30,6 +30,15 @@ evidence and deterministic rollback.
 6. Audit and apply are unambiguous, and every modification is tied to its
    manifest, test evidence, budget, commit, and rollback path.
 7. Artifact files never enter integration commits.
+
+## Competitive research contract
+
+Audit, Production Ready, and Scout research use a configurable competitor
+target with a default of 25. Explicit per-run limits are honored rather than
+silently overwritten. Scout may carry every accepted, verified capability up to
+the configured fix-stream limit so it can fully reproduce a capability instead
+of stopping at a three-item sample. Evidence, purpose fit, licensing, build,
+test, and publication gates remain mandatory.
 
 ## Resolved authority conflict
 

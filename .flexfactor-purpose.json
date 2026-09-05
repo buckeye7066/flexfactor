@@ -8,37 +8,54 @@
       "id": "cb-1",
       "text": "One durable orchestrator admits 1 through 30 targets sequentially.",
       "confidence": "verified",
-      "evidence_refs": [0]
+      "evidence_refs": [
+        0
+      ]
     },
     {
       "id": "cb-2",
-      "text": "Audit and Production Ready use at most six passes: the whole repository, a top-three competitor gate, then verified edit deltas.",
+      "text": "Audit and Production Ready use at most six passes: the whole repository, a configurable competitor gate defaulting to 25, then verified edit deltas.",
       "confidence": "verified",
-      "evidence_refs": [0, 2]
+      "evidence_refs": [
+        0,
+        2
+      ]
     },
     {
       "id": "cb-3",
       "text": "Every model call uses one strongest-paid-to-free ladder; legacy flags cannot select another production path.",
       "confidence": "verified",
-      "evidence_refs": [1, 2]
+      "evidence_refs": [
+        1,
+        2
+      ]
     },
     {
       "id": "cb-4",
       "text": "One run shares author-family identity; final review requires a non-author family or fails closed.",
       "confidence": "verified",
-      "evidence_refs": [1, 2]
+      "evidence_refs": [
+        1,
+        2
+      ]
     },
     {
       "id": "cb-5",
       "text": "Checkpoints stay local; changed-run completion requires green gates, exact-commit independent review, and remote-default ancestry proof.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "cb-6",
       "text": "Android persists the queue; cloud claims request UUIDs atomically, recovers dispatch after crashes, and removes phone-supplied secrets at terminal status.",
       "confidence": "verified",
-      "evidence_refs": [3, 4, 6]
+      "evidence_refs": [
+        3,
+        4,
+        6
+      ]
     }
   ],
   "aspirations": [
@@ -46,7 +63,9 @@
       "id": "asp-1",
       "text": "OS-enforced Windows network isolation in addition to current process-tree and resource controls.",
       "confidence": "unknown",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     }
   ],
   "users": [
@@ -54,13 +73,20 @@
       "id": "u-1",
       "text": "Owners running Refactor, Scout, Audit, or Production Ready from Android, desktop launchers, or CLI.",
       "confidence": "verified",
-      "evidence_refs": [0, 2, 3]
+      "evidence_refs": [
+        0,
+        2,
+        3
+      ]
     },
     {
       "id": "u-2",
       "text": "Supervisors consuming statuses, receipts, manifests, error ledgers, and evidence bundles.",
       "confidence": "verified",
-      "evidence_refs": [0, 2]
+      "evidence_refs": [
+        0,
+        2
+      ]
     }
   ],
   "outcomes": [
@@ -68,13 +94,18 @@
       "id": "o-1",
       "text": "Verified corrections reach the authoritative default branch without force-push; owner WIP is restored by fingerprint.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "o-2",
       "text": "Incomplete provider, verification, review, publication, or release conditions stay BLOCKED or IN PROGRESS.",
       "confidence": "verified",
-      "evidence_refs": [2, 7]
+      "evidence_refs": [
+        2,
+        7
+      ]
     }
   ],
   "workflows": [
@@ -82,25 +113,34 @@
       "id": "w-1",
       "text": "Audit inventories purpose and the repository, evaluates competitors, iterates verified deltas, then verifies, reviews, and publishes explicit-apply changes.",
       "confidence": "verified",
-      "evidence_refs": [0, 2]
+      "evidence_refs": [
+        0,
+        2
+      ]
     },
     {
       "id": "w-2",
       "text": "Production Ready adds the full readiness rubric to Audit.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "w-3",
       "text": "Scout researches improvements; mutation requires explicit authorization and normal verification and publication.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "w-4",
       "text": "Refactor changes selected files only after project verification, independent review, and publication proof.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     }
   ],
   "invariants": [
@@ -108,67 +148,95 @@
       "id": "i-1",
       "text": "Report-only is the default; mutation requires explicit apply authorization.",
       "confidence": "supported",
-      "evidence_refs": [5, 8]
+      "evidence_refs": [
+        5,
+        8
+      ]
     },
     {
       "id": "i-2",
       "text": "Verifier outage restores exact pre-run bytes, fails the run, and creates no UNVERIFIED commit or success score.",
       "confidence": "verified",
-      "evidence_refs": [2, 8]
+      "evidence_refs": [
+        2,
+        8
+      ]
     },
     {
       "id": "i-3",
       "text": "Owner WIP never becomes an ancestor of a FlexFactor-published branch.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "i-4",
       "text": "Partial output never authorizes clean, ready, approval, commit publication, or merge.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "i-5",
       "text": "Untrusted dependencies run only under enforced resource, network, path, process, and time containment on Windows and Linux; unavailable controls BLOCK.",
       "confidence": "supported",
-      "evidence_refs": [2, 5, 8]
+      "evidence_refs": [
+        2,
+        5,
+        8
+      ]
     },
     {
       "id": "i-6",
       "text": "Every claimed gate must have run; unknown and unavailable are not passes.",
       "confidence": "verified",
-      "evidence_refs": [2, 7]
+      "evidence_refs": [
+        2,
+        7
+      ]
     },
     {
       "id": "i-7",
       "text": "A changed run cannot exit successfully until the exact reviewed SHA is proven on the authoritative remote default branch.",
       "confidence": "verified",
-      "evidence_refs": [2]
+      "evidence_refs": [
+        2
+      ]
     },
     {
       "id": "i-8",
       "text": "No reviewer from any candidate author family can certify the final commit.",
       "confidence": "verified",
-      "evidence_refs": [1, 2]
+      "evidence_refs": [
+        1,
+        2
+      ]
     },
     {
       "id": "i-9",
       "text": "Source is classified before cloud calls; sensitive repositories use local processing unless the owner explicitly approves an exception.",
       "confidence": "supported",
-      "evidence_refs": [5, 8]
+      "evidence_refs": [
+        5,
+        8
+      ]
     },
     {
       "id": "i-10",
       "text": "Every modification binds to batch/project budgets, an immutable manifest, exact commands/evidence, tests, commit identity, and deterministic rollback.",
       "confidence": "supported",
-      "evidence_refs": [5, 8]
+      "evidence_refs": [
+        5,
+        8
+      ]
     }
   ],
   "acceptance_criteria": [
     "A. Queue 1-30 targets sequentially; never overlap targets.",
     "B. Pass 1 covers the repository; passes 2-6 equal the prior verified delta.",
-    "C. Evaluate three corroborated competitors between passes 1 and 2.",
+    "C. Evaluate the configured corroborated-competitor target between passes 1 and 2; the default is 25 and explicit run limits are honored.",
     "D. Use one strongest-paid-to-free/local model ladder.",
     "E. Target-controlled commands cross the execution broker.",
     "F. Analyze every relevant file completely or name the blocker.",
@@ -198,7 +266,11 @@
       "text": "An earlier contract required every Audit and Production Ready run to apply changes, while the owner directive requires report-only/apply-off by default.",
       "resolution": "The current owner directive controls: report-only is default, apply requires explicit authorization, and mandatory-mutation behavior remains a gap.",
       "confidence": "supported",
-      "evidence_refs": [2, 5, 8]
+      "evidence_refs": [
+        2,
+        5,
+        8
+      ]
     }
   ],
   "gaps": [
@@ -206,89 +278,104 @@
       "id": "g-1",
       "text": "Windows raw-socket isolation is best effort, so untrusted dependency execution cannot yet satisfy the containment requirement.",
       "confidence": "verified",
-      "evidence_refs": [2, 5, 8]
+      "evidence_refs": [
+        2,
+        5,
+        8
+      ]
     },
     {
       "id": "g-2",
       "text": "Audit and Production Ready still mandate apply/publication instead of preserving report-only as the default.",
       "confidence": "verified",
-      "evidence_refs": [2, 5, 8]
+      "evidence_refs": [
+        2,
+        5,
+        8
+      ]
     },
     {
       "id": "g-3",
       "text": "Cloud-source classification and sensitive-repository local-default enforcement lack verified implementation evidence.",
       "confidence": "unknown",
-      "evidence_refs": [2, 5, 8]
+      "evidence_refs": [
+        2,
+        5,
+        8
+      ]
     },
     {
       "id": "g-4",
       "text": "The complete Windows/Linux dirty-worktree, cancellation, timeout, partial-failure, and backward-compatibility matrix is not yet evidenced.",
       "confidence": "unknown",
-      "evidence_refs": [5, 8]
+      "evidence_refs": [
+        5,
+        8
+      ]
     }
   ],
   "evidence": [
     {
       "kind": "source",
       "locator": "flexfactor_execution.py",
-      "content_hash": "b5c41193d1c8a6c507748c705c3e7943d28069d309901455daa9e90db2b238d0",
-      "observed_at": "2026-09-04T08:21:24Z",
+      "content_hash": "ad939107e722cf3426173335261a6202bc1c8fb63810e7b4e2395b98582908d8",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Sequential queue and six passes."
     },
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
       "content_hash": "68f7134e508445a34166bd83fad18d274624a21d4a42ddcfcb4b573a65d13501",
-      "observed_at": "2026-09-04T09:53:26Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "a9c51e80aa9015993fddbb6e2b4c91b7770857ecaca4e9a841656537f15f55e8",
-      "observed_at": "2026-09-04T11:05:59Z",
+      "content_hash": "fe51867b42e65b08693854858cdfb75e6b1f7bd8813f0e73863eac62c4ad75ee",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Modes, verification, review, publication."
     },
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MobileRunQueue.java",
       "content_hash": "db311304d8086c15a92b185f606906e8f39f6c55972956443c5f3c691dd0787c",
-      "observed_at": "2026-09-04T08:21:24Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Android queue."
     },
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
       "content_hash": "a9f6d2bbf2611c21a664f3c4de85127c6eae80a99d7b77a5d2fb7c0eb114087f",
-      "observed_at": "2026-09-04T08:21:24Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Cloud dispatch and secret cleanup."
     },
     {
       "kind": "documentation",
       "locator": "docs/PURPOSE.md",
       "content_hash": "46aeaff587bd92cdda8eba6a86db89454dfdcb8796ce4da2389d815102ac4e06",
-      "observed_at": "2026-09-04T09:27:51Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Owner requirements and reconciliation."
     },
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
       "content_hash": "7f909b003acb9dd88426e5c0fc739048ceb3e21a20ced5f46c4ef658bbc14c8b",
-      "observed_at": "2026-09-04T08:21:24Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Android dispatch recovery."
     },
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
       "content_hash": "7c762cdb76398a94d305eada94e0dfffbd855d51b668c180359b7a980aaf1a4e",
-      "observed_at": "2026-09-04T08:21:24Z",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Fail-closed gate ledger."
     },
     {
       "kind": "documentation",
       "locator": "docs/purpose-contract.md",
-      "content_hash": "40bca8c507fc73756e53dbb9b8ad80160ea007d6e8ab43e53901f5ddb26758b8",
-      "observed_at": "2026-09-04T09:27:51Z",
+      "content_hash": "e26f23317f3e19404bc55424a8633e2a76c43c61df9e0eb00c23bb5f519db76e",
+      "observed_at": "2026-09-05T07:02:50Z",
       "excerpt": "Owner target and acceptance."
     }
   ],
