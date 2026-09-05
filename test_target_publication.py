@@ -497,6 +497,47 @@ class PublicationBoundaryBaselineTests(unittest.TestCase):
             self.assertEqual([], baseline["gates"])
             self.assertNotIn("index_root", module.seen)
 
+    def test_boundary_run_trust_mirrors_the_target_and_is_revoked(self):
+        # The boundary tree is the SAME repository at an ancestor commit, in a
+        # temporary path no `trusted_repos` rule names. Without propagating the
+        # target's own authorization the boundary coverage run is refused as
+        # untrusted third-party code and this gate can never produce evidence.
+        # The grant must MIRROR the target - never create trust - and must not
+        # outlive the evaluation.
+        with tempfile.TemporaryDirectory() as temporary:
+            target, boundary = self._repo(Path(temporary))
+            candidate = _quality_rows({"function-coverage": "fail"})
+            seen: dict[str, object] = {}
+
+            def record(project_dir, stack, index, pfx=""):
+                seen["allowed"] = ff._run_trust_allowed(project_dir)
+                seen["cwd"] = project_dir
+                return _coverage_run(parsed=True)
+
+            module = _fake_evidence_module({"function-coverage": "fail"})
+            with mock.patch.object(
+                ff, "_execution_authorization",
+                return_value=({"basis": "trusted-repo"}, ""),
+            ), mock.patch.object(ff, "_direct_coverage_evidence", record):
+                ff._boundary_completeness_gates(
+                    str(target), boundary, {}, module, "run-1", candidate,
+                    baseline_ok=None, baseline_measured_boundary=False,
+                    candidate_e2e_ran=False)
+            self.assertIs(True, seen.get("allowed"))
+            self.assertFalse(ff._run_trust_allowed(str(seen["cwd"])))
+
+            # An UNAUTHORIZED target grants nothing.
+            seen.clear()
+            with mock.patch.object(
+                ff, "_execution_authorization",
+                return_value=(None, "not a trusted repository"),
+            ), mock.patch.object(ff, "_direct_coverage_evidence", record):
+                ff._boundary_completeness_gates(
+                    str(target), boundary, {}, module, "run-1", candidate,
+                    baseline_ok=None, baseline_measured_boundary=False,
+                    candidate_e2e_ran=False)
+            self.assertIs(False, seen.get("allowed"))
+
     def test_the_build_row_is_only_claimed_for_the_boundary_commit(self):
         # `baseline_ok` measures the PRE-MUTATION head. It describes origin's
         # tree only when the run started there; otherwise it says nothing about

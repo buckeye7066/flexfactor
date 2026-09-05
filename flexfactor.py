@@ -7884,6 +7884,7 @@ def _boundary_tree_gates(project_dir: str, boundary_sha: str, stack: dict,
     """
     holder = None
     work = None
+    trust_key = None
     try:
         holder = tempfile.mkdtemp(prefix="flexfactor-boundary-")
         work = os.path.join(holder, "tree")
@@ -7894,6 +7895,17 @@ def _boundary_tree_gates(project_dir: str, boundary_sha: str, stack: dict,
                   f"({_tail(added.stderr or '', 2)}); completeness gates stay "
                   "in candidate review")
             return []
+        # The boundary tree is THE SAME repository at an ancestor commit, which
+        # WE checked out into a temporary path. Trust is a property of the
+        # repository the owner named, not of the directory it happens to sit
+        # in - so without propagating it the boundary coverage run would be
+        # refused as untrusted third-party code and this gate could never
+        # produce evidence at all. The grant only ever MIRRORS an authorization
+        # the target already has (an unauthorized target grants nothing, and
+        # the refused run then leaves the row in candidate review), it is
+        # reference-counted, and it is revoked in `finally`.
+        if _execution_authorization(project_dir)[0] is not None:
+            trust_key = _grant_run_trust(work)
         index = evidence_mod.build_repository_index(work, f"{run_id}-boundary")
         coverage = evidence_mod.coverage_ledger(
             index, run_id=f"{run_id}-boundary",
@@ -7964,6 +7976,7 @@ def _boundary_tree_gates(project_dir: str, boundary_sha: str, stack: dict,
               "candidate review")
         return []
     finally:
+        _revoke_run_trust(trust_key)
         if work:
             _git(["worktree", "remove", "--force", work], project_dir)
             _git(["worktree", "prune"], project_dir)
