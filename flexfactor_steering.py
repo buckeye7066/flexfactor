@@ -347,6 +347,14 @@ def submit_session_prompt(prompt: str, targets: list[tuple[str, str]], *,
                           session_id: str = "") -> dict:
     """Durably queue every routed portion for its target's next checkpoint."""
     routed = route_session_prompt(prompt, targets)
+    return submit_session_routing(
+        routed, source=source, root=root, session_id=session_id)
+
+
+def submit_session_routing(routed: dict, *, source: str = "session",
+                           root: str | None = None,
+                           session_id: str = "") -> dict:
+    """Durably queue an already-routed session without changing its scope."""
     session_id = str(session_id or uuid.uuid4().hex).strip()[:64]
     if not session_id or not all(ch.isalnum() or ch in "-_" for ch in session_id):
         raise ValueError("session identifier contains unsafe characters")

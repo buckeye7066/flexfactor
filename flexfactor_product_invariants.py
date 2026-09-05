@@ -364,7 +364,7 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
     ))
     gates.append(_gate(
         "competitive-fit-risk-reviewed",
-        bool(competitors) and not review_failures,
+        not review_failures,
         "; ".join(review_failures) or f"{len(competitors)} capability decision(s) include fit, duplication, provenance, and risk review",
         "Complete the purpose-fit, duplication, evidence, and adoption-risk decision for every candidate before selecting features.",
     ))

@@ -292,6 +292,25 @@ class PinTests(RotationTestCase):
         pick = rot.next_route(pin="pinned/dead", pin_strict=False)
         self.assertEqual(pick.route.id, "healthy/alive")
 
+    def test_reviewer_family_exclusion_applies_to_strict_pin(self):
+        rot = self.rotator(catalog(
+            route("author/gpt", "pool-author", model="gpt-5.6-sol"),
+            route("reviewer/claude", "pool-reviewer", model="claude-sonnet-5")))
+        intent = R.CallIntent(R.ROLE_REVIEWER, avoid_families=("openai",))
+        with self.assertRaisesRegex(R.PinUnavailable, "excluded reviewer"):
+            rot.next_route(pin="author/gpt", intent=intent)
+
+    def test_reviewer_family_exclusion_makes_non_strict_pin_fall_through(self):
+        rot = self.rotator(catalog(
+            route("author/gpt", "pool-author", model="gpt-5.6-sol"),
+            route("reviewer/claude", "pool-reviewer", model="claude-sonnet-5")))
+        intent = R.CallIntent(R.ROLE_REVIEWER, avoid_families=("openai",))
+        pick = rot.next_route(
+            pin="author/gpt", pin_strict=False, intent=intent,
+        )
+        self.assertEqual("reviewer/claude", pick.route.id)
+        self.assertFalse(pick.pinned)
+
 
 # --------------------------------------------------------------------------- #
 # Feedback
