@@ -1273,9 +1273,11 @@ class TenetsContextTests(unittest.TestCase):
 
     def test_evidence_write_failure_degrades_safe_ranking(self) -> None:
         payload = {"files": [{"path": "src/app.py", "score": 1.0}]}
-        completed = self._process(stdout=json.dumps(payload).encode())
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
-             mock.patch.object(ft, "_run_bounded_process", return_value=completed), \
+             mock.patch.object(
+                 ft, "_run_bounded_process",
+                 side_effect=self._ranker(json.dumps(payload).encode()),
+             ), \
              mock.patch.object(ft, "_atomic_write_json", side_effect=OSError("read only")):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
