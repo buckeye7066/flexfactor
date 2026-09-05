@@ -107,14 +107,14 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         # turn this into a check that cannot fail.
         powershell = shutil.which("powershell")
         if not powershell or not shutil.which("git"):
-            self.skipTest("needs Windows PowerShell and git")
+            self.skipTest("BLOCKED: needs Windows PowerShell 5.1 and git on this host")
         probe_version = subprocess.run(
             [powershell, "-NoProfile", "-Command",
              "$PSVersionTable.PSVersion.Major"],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=120)
         if probe_version.stdout.strip() != "5":
-            self.skipTest("needs Windows PowerShell 5.1, got %r"
+            self.skipTest("BLOCKED: needs Windows PowerShell 5.1 on this host, got %r"
                           % probe_version.stdout.strip())
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,10 +168,6 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         5.1 ever stops doing this, this test fails and the narrowing can be
         reconsidered rather than cargo-culted.
         """
-        # PowerShell 7 (pwsh) does not raise NativeCommandError for native stderr
-        # under Stop; this assertion is specific to Windows PowerShell 5.1.
-        if not shutil.which("powershell"):
-            self.skipTest("BLOCKED: Windows-only assertion on this host (requires Windows PowerShell 5.1)")
         done = self._stash_probe(narrow=False)
         self.assertNotIn("SURVIVED", done.stdout)
         self.assertIn("NativeCommandError", done.stdout + done.stderr)
