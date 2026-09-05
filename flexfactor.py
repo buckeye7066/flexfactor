@@ -23108,6 +23108,61 @@ def review_ledger_lines(ledger: dict | None) -> list[str]:
     return lines
 
 
+def _incomplete_reason(r: dict) -> str | None:
+    """Why this program did not reach a verified complete state, or None.
+
+    THE one definition. `_audit_exit_code` decides the process exit code from
+    it and `_print_batch_summary` decides what it calls OK, so the console
+    cannot contradict the verdict printed three lines above it -- which it did:
+    a live FreeAndClean run that aborted on a route fault, reviewed 9 of 81
+    files and fixed 0 of 19 defects printed `FAILED: 1 program(s) ... did not
+    reach a verified complete state` and then `totals: 1/1 program(s) OK`.
+    """
+    if r.get("converged") is False:
+        return "review did not converge"
+    if r.get("suite_status") is False:
+        return "project test suite RED"
+    if r.get("readiness_ready") is False:
+        return "production readiness FAILED"
+    if r.get("quality_gate_passed") is False:
+        return "quality gate FAILED"
+    if r.get("product_invariants_ready") is False:
+        return "product invariants OPEN"
+    if (r.get("publication_required") is True
+            and r.get("publication_complete") is not True):
+        return "main-branch publication INCOMPLETE"
+    return None
+
+
+def _unreviewed_reason(r: dict) -> str | None:
+    """Set when the accounting identity says nothing was examined."""
+    ledger = r.get("review_ledger") or {}
+    if (ledger.get("candidates") or 0) > 0 and not ledger.get("acted_on"):
+        return f"reviewed ZERO of {ledger.get('candidates')} candidate file(s)"
+    return None
+
+
+def _barren_reason(r: dict) -> str | None:
+    """Set when apply mode fixed nothing despite having something to fix."""
+    if r.get("fixed"):
+        return None
+    if (r.get("defects") or 0) > 0 or (r.get("review_incomplete") or 0) > 0:
+        return "fixed NOTHING despite findings"
+    return None
+
+
+def _program_failure_reasons(r: dict, *, apply_requested: bool) -> list[str]:
+    """Every named reason this program is not a success. Empty == OK."""
+    if r.get("error"):
+        return [f"ERROR: {r['error']}"]
+    reasons = [x for x in (_incomplete_reason(r), _unreviewed_reason(r)) if x]
+    if apply_requested:
+        barren = _barren_reason(r)
+        if barren:
+            reasons.append(barren)
+    return reasons
+
+
 def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     """0 only when every program succeeded AND apply mode actually applied.
 
@@ -23123,14 +23178,7 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     # *something*. Explicitly partial review, a red repository suite, or a
     # failed readiness verdict must remain visible to supervisors as failure.
     # Before this check, FCC could have fixed>0, suite_status=False, and exit 0.
-    incomplete = [r for r in results
-                  if r.get("converged") is False
-                  or r.get("suite_status") is False
-                  or r.get("readiness_ready") is False
-                  or r.get("quality_gate_passed") is False
-                  or r.get("product_invariants_ready") is False
-                  or (r.get("publication_required") is True
-                      and r.get("publication_complete") is not True)]
+    incomplete = [r for r in results if _incomplete_reason(r) is not None]
     if incomplete:
         names = ", ".join(str(r.get("name")) for r in incomplete)
         print(f"\nFAILED: {len(incomplete)} program(s) ({names}) did not reach a "
@@ -23145,11 +23193,7 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     # because the old barren test keys on DEFECTS, and a repo nobody looked at
     # has no defects to report. `candidates > 0 and acted_on == 0` is the
     # accounting identity's own verdict, so it cannot be argued with.
-    unreviewed = []
-    for r in results:
-        ledger = r.get("review_ledger") or {}
-        if (ledger.get("candidates") or 0) > 0 and not ledger.get("acted_on"):
-            unreviewed.append(r)
+    unreviewed = [r for r in results if _unreviewed_reason(r) is not None]
     if unreviewed:
         names = ", ".join(str(r.get("name")) for r in unreviewed)
         print(f"\nFAILED: {len(unreviewed)} program(s) ({names}) reviewed ZERO of "
@@ -23161,10 +23205,7 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
         return 0
     # "Applied nothing" means no file fixed AND no defects were found to fix.
     # A genuinely clean repo (0 defects) legitimately applies nothing.
-    barren = [r for r in results
-              if not r.get("fixed")
-              and ((r.get("defects") or 0) > 0
-                   or (r.get("review_incomplete") or 0) > 0)]
+    barren = [r for r in results if _barren_reason(r) is not None]
     if barren:
         names = ", ".join(str(r.get("name")) for r in barren)
         print(f"\nFAILED: apply mode fixed NOTHING in {len(barren)} program(s) "
@@ -23175,11 +23216,13 @@ def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
     return 0
 
 
-def _print_batch_summary(results: list[dict]) -> None:
+def _print_batch_summary(results: list[dict], *,
+                        apply_requested: bool = True) -> None:
     print("\n" + "=" * 70)
     print("  BATCH SUMMARY")
     print("=" * 70)
     tot_def = tot_fix = 0
+    ok = 0
     for r in results:
         if r.get("error"):
             print(f"  {r['name']}: ERROR — {r['error']}")
@@ -23189,7 +23232,14 @@ def _print_batch_summary(results: list[dict]) -> None:
         ts = "pass" if r["test_status"] else "fail" if r["test_status"] is False else "n/a"
         print(f"  {r['name']} | defects {r['defects']} | fixed {r['fixed']} | "
               f"tests {ts} | e2e {r['e2e_status']} | git {r['commit_status']}")
-    ok = sum(1 for r in results if r.get("error") is None)
+        # "OK" has to mean what the exit code means. Counting "raised no
+        # exception" let an aborted, 11%-reviewed, zero-fixed run print
+        # `1/1 program(s) OK` directly beneath its own FAILED verdict.
+        reasons = _program_failure_reasons(r, apply_requested=apply_requested)
+        if reasons:
+            print(f"      NOT OK: {'; '.join(reasons)}")
+        else:
+            ok += 1
     print("  ----")
     print(f"  totals: {ok}/{len(results)} program(s) OK | "
           f"{tot_def} defect(s) found | {tot_fix} file(s) fixed")

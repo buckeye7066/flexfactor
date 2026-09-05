@@ -1,0 +1,26 @@
+{
+  "active_index": null,
+  "competitor_target": 25,
+  "created_at": 1788610811.4932873,
+  "items": [
+    {
+      "exit_code": 2,
+      "finished_at": 1788610811.505342,
+      "index": 0,
+      "note": "",
+      "passes": [],
+      "started_at": 1788610811.4994118,
+      "status": "failed",
+      "target": "C:/private/project"
+    }
+  ],
+  "mode": "scout",
+  "next_index": 1,
+  "pass_limit": 6,
+  "policy": "best-available",
+  "queue_id": "01d9e6f9-87a8-4c19-9e75-13429aec26e9",
+  "schema": 2,
+  "status": "failed",
+  "target_limit": 30,
+  "updated_at": 1788610811.506785
+}
