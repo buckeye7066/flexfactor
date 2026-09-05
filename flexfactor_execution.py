@@ -30,7 +30,23 @@ from typing import Callable
 
 MAX_TARGETS = 30
 MAX_PASSES = 6
-TOP_COMPETITORS = 3
+
+# RAISED 3 -> 25 on 2026-09-04 by owner order: "program scout's code currently
+# limits how much of the 'copycat' code he can produce on the new branch in his
+# repo which sets him up for failure. He needs to be able to fully reproduce the
+# code."
+#
+# This one constant was BOTH the research target (how many competitors get
+# studied) and the fix-stream cap (how many of their ideas may become code), so
+# Scout could reproduce at most THREE things per run no matter how much the
+# research found. flexfactor_competitors.competitor_findings deliberately
+# documented that as "a bounded number of changes and never a rewrite spree" —
+# a design opinion the owner has now overridden for this tool.
+#
+# Tunable so a run can still be narrowed without editing source. 0 remains an
+# explicit OFF for the fix stream (see competitor_findings); it is not a
+# silent no-op.
+TOP_COMPETITORS = max(0, int(os.environ.get("FLEXFACTOR_TOP_COMPETITORS", "25") or 25))
 MODEL_POLICY = "best-available"
 
 FIRST_PASS_SCOPE = {

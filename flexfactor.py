@@ -5112,7 +5112,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             stack.get("ecosystems") or [],
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-            target=_ff_execution.TOP_COMPETITORS,
+            target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                       or _ff_execution.TOP_COMPETITORS),
             file_list=_tracked_repository_scope(project_dir, rel),
             author=lambda system, prompt, schema: provider.structured(
                 system, prompt, schema, max_tokens=8000,
@@ -5136,7 +5137,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
                   f"{idea.get('idea_title', '(no supported idea)')}")
         pairs = module.competitor_findings(
             research,
-            max_findings=_ff_execution.TOP_COMPETITORS,
+            max_findings=int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                             or 0),
             file_exists=lambda path: path.replace("\\", "/") == rel,
             acceptance_total=len(
                 getattr(purpose_contract, "acceptance_criteria", []) or []
@@ -5169,7 +5171,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
         "title": row.get("title"),
         "problem": row.get("problem"),
         "implementation": row.get("fix"),
-    } for row in relevant[:_ff_execution.TOP_COMPETITORS]]
+    } for row in relevant[:int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                               or 0)]]
     instruction = (
         purpose + f"\n\nGOAL: {args.goal}\n\n"
         "CURRENT FILE:\n" + _fence_untrusted("source", current) + "\n\n"
@@ -9909,7 +9912,8 @@ def _run_scout_impl(args) -> int:
                 profile.get("stack") or [],
                 rr_search=rr_fn,
                 rr_endpoint=(base_url or f"unavailable ({rr_note})"),
-                target=_ff_execution.TOP_COMPETITORS,
+                target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                           or _ff_execution.TOP_COMPETITORS),
                 file_list=(scope if apply_dir else []),
                 author=lambda system, prompt, schema: provider.structured(
                     system, prompt, schema, max_tokens=8000,
@@ -9924,7 +9928,8 @@ def _run_scout_impl(args) -> int:
         except Exception as exc:
             competitor_research = {
                 "competitors": [], "verified": 0,
-                "target": _ff_execution.TOP_COMPETITORS,
+                "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                              or _ff_execution.TOP_COMPETITORS),
                 "sources_used": [],
                 "sources_skipped": {
                     "research": f"{type(exc).__name__}: {exc}"
@@ -9935,7 +9940,8 @@ def _run_scout_impl(args) -> int:
     else:
         competitor_research = {
             "competitors": [], "verified": 0,
-            "target": _ff_execution.TOP_COMPETITORS,
+            "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                          or _ff_execution.TOP_COMPETITORS),
             "sources_used": [],
             "sources_skipped": {"module": "competitor module unavailable"},
             "coverage_note": "direct competitor research could not run",
@@ -10067,9 +10073,11 @@ def _run_scout_impl(args) -> int:
         execution_orchestrator.record_competitor_gate(
             attempted=True,
             implemented_files=implemented_files,
-            verified=min(max(verified, int(
-                (competitor_research or {}).get("verified") or 0)),
-                         _ff_execution.TOP_COMPETITORS),
+            verified=min(
+                max(verified, int((competitor_research or {}).get("verified") or 0)),
+                int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                    or _ff_execution.TOP_COMPETITORS)
+            ),
             note=(f"directly researched "
                   f"{len((competitor_research or {}).get('competitors') or [])} "
                   f"competitor(s) and evaluated {len(evaluations)} repository "
@@ -13174,7 +13182,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
     if module is None:
         outcome["research"] = {
             "competitors": [], "sources_used": [],
-            "target": _ff_execution.TOP_COMPETITORS,
+            "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                          or _ff_execution.TOP_COMPETITORS),
             "sources_skipped": {
                 "module": "flexfactor_competitors could not be imported"
             },
@@ -13215,7 +13224,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
             source_inspector=inspect_public_competitor_source,
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-            target=_ff_execution.TOP_COMPETITORS,
+            target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                       or _ff_execution.TOP_COMPETITORS),
             allow_credentialed_firecrawl=True,
             log=lambda message: print(f"{pfx}{message}"),
             file_list=all_files,
@@ -13247,7 +13257,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
 
     pairs = module.competitor_findings(
         research,
-        max_findings=_ff_execution.TOP_COMPETITORS,
+        max_findings=int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                         or 0),
         file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
         acceptance_total=(
             len(getattr(purpose_contract, "acceptance_criteria", []) or [])
@@ -24407,10 +24418,17 @@ def main(argv=None) -> int:
         parser.add_argument("--no-competitors", action="store_false", dest="competitors",
                             help="Compatibility argument; the inter-pass top-three competitor "
                                  "gate remains mandatory in audit/prodready.")
-        parser.add_argument("--competitor-count", type=int, default=3,
+        # Defaults RAISED 3 -> _ff_execution.TOP_COMPETITORS (25) on 2026-09-04
+        # by owner order: Scout must be able to FULLY reproduce a competitor's
+        # capability on its branch, not a three-item sample of it. These two
+        # CLI defaults were tighter than the module defaults they fed, so the
+        # live cap was 3 regardless of what flexfactor_competitors declared.
+        parser.add_argument("--competitor-count", type=int,
+                            default=_ff_execution.TOP_COMPETITORS,
                             dest="competitor_count",
                             help=argparse.SUPPRESS)
-        parser.add_argument("--competitor-fixes", type=int, default=3,
+        parser.add_argument("--competitor-fixes", type=int,
+                            default=_ff_execution.TOP_COMPETITORS,
                             dest="competitor_fixes",
                             help=argparse.SUPPRESS)
         parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
@@ -24538,11 +24556,19 @@ def main(argv=None) -> int:
         # invocation (exit 2) before anything runs or spends.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
-        # One product contract: the competitor gate is mandatory and fixed at
-        # the top three, whatever a retired saved invocation requested.
+        # The competitor gate stays MANDATORY — that half of the product
+        # contract is unchanged and the flag remains inert on purpose.
         args.competitors = True
-        args.competitor_count = _ff_execution.TOP_COMPETITORS
-        args.competitor_fixes = _ff_execution.TOP_COMPETITORS
+        # The COUNTS are no longer forced. They were overwritten with
+        # TOP_COMPETITORS unconditionally, so `--competitor-count 7
+        # --competitor-fixes 1` was accepted by argparse and then silently
+        # discarded — an explicitly-passed flag that does nothing is the
+        # silent-no-op defect this codebase names everywhere else. Both
+        # argparse defaults ARE TOP_COMPETITORS, so an unflagged run behaves
+        # exactly as before while a deliberate value is now honoured. Raised
+        # 3 -> 25 on 2026-09-04 by owner order: Scout must be able to FULLY
+        # reproduce a competitor's capability on its branch, not a sample of
+        # it.
         if args.max_files != 0 or args.include or args.exclude:
             parser.error(
                 "audit/prodready always review the complete Git-visible text "
