@@ -4395,6 +4395,22 @@ class GeneratedTestSourcePreflightTests(unittest.TestCase):
             "generated_test.go", source,
         ))
 
+    def test_go_nested_subtest_skips_never_receive_execution_credit(self):
+        # From PR #145: every skip spelling on a nested ``*testing.T``
+        # parameter must be disqualifying, not just SkipNow.
+        for call in ("Skip", "Skipf", "SkipNow"):
+            source = (
+                "package x\nimport \"testing\"\n"
+                "func TestGenerated(t *testing.T) {\n"
+                "  t.Run(\"sub\", func(st *testing.T) { "
+                f"st.{call}(\"why\") }})\n"
+                "}\n"
+            )
+            with self.subTest(call=call):
+                self.assertFalse(ff._generated_test_source_has_case(
+                    "generated_test.go", source,
+                ))
+
     def test_skipped_and_todo_javascript_never_receive_execution_credit(self):
         cases = (
             "test.skip('skipped', () => {});\n",
