@@ -120,7 +120,24 @@ class CapacityManager:
         c=str(getattr(route,"cost_class","")); return 1 if c in ("free-tier","subscription") else (2 if c=="local-unlimited" else 4)
     def _cleanup(self,d,now):
         for i,row in list(d.setdefault("leases",{}).items()):
-            if float(row.get("expires_at") or 0)<=now: d["leases"].pop(i,None)
+            # TTL, or a PROVABLY dead owner. The waiter queue already refuses to
+            # line up behind a dead same-host pid; leases had no such belt, so a
+            # killed or crashed run held its allowance for the FULL LEASE_TTL_S
+            # (15 minutes) and every later run queued behind a process that
+            # could never renew. Measured 2026-09-05: a taskkill'd prodready
+            # left `anthropic_sub:subscription` leased with 891s still to run,
+            # and limit() is 1 for that cost class, so the next run was blocked
+            # outright.
+            #
+            # SAFE BY CONSTRUCTION: `_pid_alive` fails toward ALIVE on any
+            # ambiguity, and the host must match -- pids are not comparable
+            # across machines, and a legacy row carries no host, so it keeps
+            # the old TTL-only behaviour rather than being reaped on a pid
+            # that means nothing here.
+            if float(row.get("expires_at") or 0)<=now:
+                d["leases"].pop(i,None); continue
+            if row.get("host")==_HOST and row.get("pid") and not _pid_alive(row.get("pid")):
+                d["leases"].pop(i,None)
         for i,row in list(d.setdefault("waiters",{}).items()):
             # Heartbeat TTL, not creation TTL: legacy rows without seen_at fall
             # back to created_at so a pre-upgrade dead row is reaped too.
@@ -147,7 +164,7 @@ class CapacityManager:
                     ahead=[x for wid,x in w.items() if wid!=ident and x.get("allowance")==allowance and int(x.get("ticket") or 0)<ticket
                            and not (x.get("host")==_HOST and not _pid_alive(x.get("pid")))]
                     if len(active)<self.limit(route) and not ahead:
-                        d["leases"][ident]={"allowance":allowance,"app":app,"pid":os.getpid(),"thread":threading.get_ident(),"started_at":now,"expires_at":now+LEASE_TTL_S}; w.pop(ident,None); out["granted"]=True; d["runtime"]={"state":"running","detail":"provider capacity granted","updated_at":now}
+                        d["leases"][ident]={"allowance":allowance,"app":app,"pid":os.getpid(),"host":_HOST,"thread":threading.get_ident(),"started_at":now,"expires_at":now+LEASE_TTL_S}; w.pop(ident,None); out["granted"]=True; d["runtime"]={"state":"running","detail":"provider capacity granted","updated_at":now}
                     else: d["runtime"]={"state":"waiting-for-provider","detail":f"{app} queued for shared allowance {allowance}","updated_at":now}
                 self.store.update(mutate)
                 if out["granted"]: return Lease(ident,allowance,app)
