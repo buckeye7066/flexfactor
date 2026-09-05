@@ -98,9 +98,24 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         Returns the probe's stdout, with the preference either left at Stop
         (``narrow`` False) or narrowed the way the refresh narrows it.
         """
-        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        # Windows PowerShell 5.1 ONLY, deliberately. This behaviour was
+        # measured to differ by host: 5.1 raises NativeCommandError on
+        # native stderr, pwsh 7.6 does not. The desktop shortcuts run
+        # System32\\WindowsPowerShell\\v1.0\\powershell.exe, so 5.1 is the
+        # runtime whose behaviour decides whether the launcher opens.
+        # Falling back to pwsh here would quietly test the wrong host and
+        # turn this into a check that cannot fail.
+        powershell = shutil.which("powershell")
         if not powershell or not shutil.which("git"):
-            self.skipTest("needs powershell and git")
+            self.skipTest("needs Windows PowerShell and git")
+        probe_version = subprocess.run(
+            [powershell, "-NoProfile", "-Command",
+             "$PSVersionTable.PSVersion.Major"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120)
+        if probe_version.stdout.strip() != "5":
+            self.skipTest("needs Windows PowerShell 5.1, got %r"
+                          % probe_version.stdout.strip())
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -148,8 +163,10 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         vanished, the "Preserved local edits" line never printed, and no
         program opened.
 
-        If PowerShell ever stops doing this, this test fails and the
-        narrowing in the refresh can be reconsidered rather than cargo-culted.
+        Measured per host: Windows PowerShell 5.1 raises, pwsh 7.6 does
+        not. The shortcuts run 5.1, so 5.1 is the host that decides. If
+        5.1 ever stops doing this, this test fails and the narrowing can be
+        reconsidered rather than cargo-culted.
         """
         # PowerShell 7 (pwsh) does not raise NativeCommandError for native stderr
         # under Stop; this assertion is specific to Windows PowerShell 5.1.
