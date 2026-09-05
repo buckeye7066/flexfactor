@@ -17379,13 +17379,37 @@ class CompetitorBridgeLedgerTests(unittest.TestCase):
         self.assertTrue(any("cap" in r for r in ledger["dropped"]),
                         "over-the-cap candidates must be named, not vanish")
 
-    def test_default_fix_stream_cap_is_five(self):
-        research = {"competitors": [self._comp(f"c{i}") for i in range(6)]}
+    def test_default_fix_stream_cap_is_the_module_default(self):
+        # RAISED 5 -> 25 on 2026-09-04 by owner order: "program scout's code
+        # currently limits how much of the 'copycat' code he can produce on the
+        # new branch in his repo which sets him up for failure. He needs to be
+        # able to fully reproduce the code."
+        #
+        # This asserts against the CONSTANT rather than a literal, so the cap
+        # can be retuned (or set via FLEXFACTOR_COMPETITOR_FIXES) without the
+        # test going stale — but the OVER-CAP ACCOUNTING below is the part that
+        # must never regress: reaching the cap has to name every idea it did
+        # not bridge, because a silent top-N truncation is the same dishonesty
+        # as a silent filter.
+        cap = fc.DEFAULT_FIX_STREAM_CAP
+        research = {"competitors": [self._comp(f"c{i}") for i in range(cap + 1)]}
         out = fc.competitor_findings(research, file_exists=lambda r: True)
         ledger = research["bridge_ledger"]
-        self.assertEqual(len(out), 5)
-        self.assertEqual(ledger["bridged"], 5)
-        self.assertTrue(any("cap of 5" in r for r in ledger["dropped"]))
+        self.assertEqual(len(out), cap)
+        self.assertEqual(ledger["bridged"], cap)
+        self.assertTrue(any(f"cap of {cap}" in r for r in ledger["dropped"]))
+        # The ledger still balances at the new cap.
+        self.assertTrue(ledger["accounted"])
+
+    def test_the_raised_cap_lets_scout_reproduce_far_more_than_the_old_five(self):
+        # The defect in one assertion: under the old cap a research pass that
+        # found twelve bridgeable competitor ideas produced FIVE, and the other
+        # seven were dropped as "over the cap" — Scout could never fully
+        # reproduce a capability no matter how good the research was.
+        research = {"competitors": [self._comp(f"c{i}") for i in range(12)]}
+        out = fc.competitor_findings(research, file_exists=lambda r: True)
+        self.assertEqual(len(out), 12, "all twelve bridgeable ideas must reach the fix stream")
+        self.assertEqual(research["bridge_ledger"]["dropped_total"], 0)
 
     def test_cap_zero_records_every_candidate_as_disabled_not_dropped_silently(self):
         research = {"competitors": [self._comp("a"), self._comp("b")]}
@@ -18467,15 +18491,22 @@ class CompetitorAuditWiringTests(unittest.TestCase):
     def test_audit_parser_accepts_the_competitor_flags(self):
         a = self._audit_args(["audit", "--program", "x"])
         self.assertTrue(a.competitors, "competitor research must default ON")
-        self.assertEqual(a.competitor_count, 3)
-        self.assertEqual(a.competitor_fixes, 3)
+        # Defaults RAISED 3 -> TOP_COMPETITORS (25) on 2026-09-04 by owner
+        # order so Scout can FULLY reproduce a competitor's capability.
+        self.assertEqual(a.competitor_count, ff._ff_execution.TOP_COMPETITORS)
+        self.assertEqual(a.competitor_fixes, ff._ff_execution.TOP_COMPETITORS)
         self.assertFalse(a.no_remote_repo_rewards)
         b = self._audit_args(["audit", "--program", "x", "--no-competitors",
                               "--competitor-count", "7", "--competitor-fixes", "1",
                               "--no-remote-repo-rewards"])
+        # The competitor GATE stays mandatory (--no-competitors is inert)...
         self.assertTrue(b.competitors)
-        self.assertEqual(b.competitor_count, 3)
-        self.assertEqual(b.competitor_fixes, 3)
+        # ...but the COUNTS are no longer silently overwritten. These two used
+        # to assert 3 while 7 and 1 were passed on the command line: argparse
+        # accepted the flags and the parser then discarded them, which is the
+        # silent-no-op defect this codebase forbids everywhere else.
+        self.assertEqual(b.competitor_count, 7)
+        self.assertEqual(b.competitor_fixes, 1)
         self.assertTrue(b.no_remote_repo_rewards)
 
     def test_prodready_gets_competitor_research_by_default_too(self):

@@ -62,7 +62,11 @@ class ProductDefaultsTests(unittest.TestCase):
     def test_fixed_product_constants(self):
         self.assertEqual(execution.MAX_TARGETS, 30)
         self.assertEqual(execution.MAX_PASSES, 6)
-        self.assertEqual(execution.TOP_COMPETITORS, 3)
+        # RAISED 3 -> 25 on 2026-09-04 by owner order: this one constant was
+        # BOTH the research target and the fix-stream cap, so Scout could
+        # reproduce at most three things per run regardless of what the
+        # research found. Env-tunable via FLEXFACTOR_TOP_COMPETITORS.
+        self.assertEqual(execution.TOP_COMPETITORS, 25)
         self.assertEqual(execution.MODEL_POLICY, "best-available")
 
 

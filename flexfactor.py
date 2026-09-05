@@ -24407,10 +24407,17 @@ def main(argv=None) -> int:
         parser.add_argument("--no-competitors", action="store_false", dest="competitors",
                             help="Compatibility argument; the inter-pass top-three competitor "
                                  "gate remains mandatory in audit/prodready.")
-        parser.add_argument("--competitor-count", type=int, default=3,
+        # Defaults RAISED 3 -> _ff_execution.TOP_COMPETITORS (25) on 2026-09-04
+        # by owner order: Scout must be able to FULLY reproduce a competitor's
+        # capability on its branch, not a three-item sample of it. These two
+        # CLI defaults were tighter than the module defaults they fed, so the
+        # live cap was 3 regardless of what flexfactor_competitors declared.
+        parser.add_argument("--competitor-count", type=int,
+                            default=_ff_execution.TOP_COMPETITORS,
                             dest="competitor_count",
                             help=argparse.SUPPRESS)
-        parser.add_argument("--competitor-fixes", type=int, default=3,
+        parser.add_argument("--competitor-fixes", type=int,
+                            default=_ff_execution.TOP_COMPETITORS,
                             dest="competitor_fixes",
                             help=argparse.SUPPRESS)
         parser.add_argument("--repo-rewards-url", default=DEFAULT_REPO_REWARDS_URL,
@@ -24538,11 +24545,19 @@ def main(argv=None) -> int:
         # invocation (exit 2) before anything runs or spends.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
-        # One product contract: the competitor gate is mandatory and fixed at
-        # the top three, whatever a retired saved invocation requested.
+        # The competitor gate stays MANDATORY — that half of the product
+        # contract is unchanged and the flag remains inert on purpose.
         args.competitors = True
-        args.competitor_count = _ff_execution.TOP_COMPETITORS
-        args.competitor_fixes = _ff_execution.TOP_COMPETITORS
+        # The COUNTS are no longer forced. They were overwritten with
+        # TOP_COMPETITORS unconditionally, so `--competitor-count 7
+        # --competitor-fixes 1` was accepted by argparse and then silently
+        # discarded — an explicitly-passed flag that does nothing is the
+        # silent-no-op defect this codebase names everywhere else. Both
+        # argparse defaults ARE TOP_COMPETITORS, so an unflagged run behaves
+        # exactly as before while a deliberate value is now honoured. Raised
+        # 3 -> 25 on 2026-09-04 by owner order: Scout must be able to FULLY
+        # reproduce a competitor's capability on its branch, not a sample of
+        # it.
         if args.max_files != 0 or args.include or args.exclude:
             parser.error(
                 "audit/prodready always review the complete Git-visible text "
