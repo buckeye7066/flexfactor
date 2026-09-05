@@ -49,6 +49,20 @@ jobs:
             "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
           printf '+memory\n+pids\n' \
             > "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
+          # cgroup-v2 delegation: a process may only be migrated when the
+          # writer has write access to the COMMON ANCESTOR of the source and
+          # destination cgroups. The runner's own cgroup is root-owned and its
+          # common ancestor with our delegated root is /sys/fs/cgroup, so every
+          # later move the adapter makes (supervisor -> rank-*, rank-* ->
+          # handoff) is EPERM until the supervisor itself lives inside the
+          # delegated subtree. Create the handoff leaf up front and hand it to
+          # the runner; the test step moves its own shell in with sudo, after
+          # which the common ancestor is our delegated root.
+          sudo mkdir "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors"
+          sudo chown "$(id -u):$(id -g)" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.events"
       - name: Compile and run hermetic adapter tests
         shell: bash
         env:
@@ -56,6 +70,15 @@ jobs:
           TEMP: ${{ runner.temp }}
         run: |
           python -m py_compile flexfactor_tenets.py flexfactor_tenets_tests.py
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Same shell, so python inherits the membership. See the cgroup
+            # delegation note in the setup step above.
+            echo $$ | sudo tee \
+              "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs" \
+              > /dev/null
+            grep -qx "$$" \
+              "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs"
+          fi
           python flexfactor_tenets_tests.py
       - name: Verify the packaged command without optional dependencies
         shell: bash
@@ -98,6 +121,20 @@ jobs:
             "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
           printf '+memory\n+pids\n' \
             > "$FLEXFACTOR_TENETS_CGROUP_ROOT/cgroup.subtree_control"
+          # cgroup-v2 delegation: a process may only be migrated when the
+          # writer has write access to the COMMON ANCESTOR of the source and
+          # destination cgroups. The runner's own cgroup is root-owned and its
+          # common ancestor with our delegated root is /sys/fs/cgroup, so every
+          # later move the adapter makes (supervisor -> rank-*, rank-* ->
+          # handoff) is EPERM until the supervisor itself lives inside the
+          # delegated subtree. Create the handoff leaf up front and hand it to
+          # the runner; the test step moves its own shell in with sudo, after
+          # which the common ancestor is our delegated root.
+          sudo mkdir "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors"
+          sudo chown "$(id -u):$(id -g)" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs" \
+            "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.events"
       - name: Install FlexFactor with the pinned Tenets integration
         shell: bash
         run: |
@@ -112,6 +149,15 @@ jobs:
         env:
           CONTEXT_OUTPUT: ${{ runner.temp }}/tenets-context.json
         run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Same shell, so python inherits the membership. See the cgroup
+            # delegation note in the setup step above.
+            echo $$ | sudo tee \
+              "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs" \
+              > /dev/null
+            grep -qx "$$" \
+              "$FLEXFACTOR_TENETS_CGROUP_ROOT/.flexfactor-supervisors/cgroup.procs"
+          fi
           python - <<'PY'
           import json
           import os
