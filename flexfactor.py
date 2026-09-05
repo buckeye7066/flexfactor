@@ -5112,7 +5112,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             stack.get("ecosystems") or [],
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-            target=_ff_execution.TOP_COMPETITORS,
+            target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                       or _ff_execution.TOP_COMPETITORS),
             file_list=_tracked_repository_scope(project_dir, rel),
             author=lambda system, prompt, schema: provider.structured(
                 system, prompt, schema, max_tokens=8000,
@@ -5136,7 +5137,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
                   f"{idea.get('idea_title', '(no supported idea)')}")
         pairs = module.competitor_findings(
             research,
-            max_findings=_ff_execution.TOP_COMPETITORS,
+            max_findings=int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                             or 0),
             file_exists=lambda path: path.replace("\\", "/") == rel,
             acceptance_total=len(
                 getattr(purpose_contract, "acceptance_criteria", []) or []
@@ -5169,7 +5171,8 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
         "title": row.get("title"),
         "problem": row.get("problem"),
         "implementation": row.get("fix"),
-    } for row in relevant[:_ff_execution.TOP_COMPETITORS]]
+    } for row in relevant[:int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                               or 0)]]
     instruction = (
         purpose + f"\n\nGOAL: {args.goal}\n\n"
         "CURRENT FILE:\n" + _fence_untrusted("source", current) + "\n\n"
@@ -9909,7 +9912,8 @@ def _run_scout_impl(args) -> int:
                 profile.get("stack") or [],
                 rr_search=rr_fn,
                 rr_endpoint=(base_url or f"unavailable ({rr_note})"),
-                target=_ff_execution.TOP_COMPETITORS,
+                target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                           or _ff_execution.TOP_COMPETITORS),
                 file_list=(scope if apply_dir else []),
                 author=lambda system, prompt, schema: provider.structured(
                     system, prompt, schema, max_tokens=8000,
@@ -9924,7 +9928,8 @@ def _run_scout_impl(args) -> int:
         except Exception as exc:
             competitor_research = {
                 "competitors": [], "verified": 0,
-                "target": _ff_execution.TOP_COMPETITORS,
+                "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                              or _ff_execution.TOP_COMPETITORS),
                 "sources_used": [],
                 "sources_skipped": {
                     "research": f"{type(exc).__name__}: {exc}"
@@ -9935,7 +9940,8 @@ def _run_scout_impl(args) -> int:
     else:
         competitor_research = {
             "competitors": [], "verified": 0,
-            "target": _ff_execution.TOP_COMPETITORS,
+            "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                          or _ff_execution.TOP_COMPETITORS),
             "sources_used": [],
             "sources_skipped": {"module": "competitor module unavailable"},
             "coverage_note": "direct competitor research could not run",
@@ -10067,9 +10073,11 @@ def _run_scout_impl(args) -> int:
         execution_orchestrator.record_competitor_gate(
             attempted=True,
             implemented_files=implemented_files,
-            verified=min(max(verified, int(
-                (competitor_research or {}).get("verified") or 0)),
-                         _ff_execution.TOP_COMPETITORS),
+            verified=min(
+                max(verified, int((competitor_research or {}).get("verified") or 0)),
+                int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                    or _ff_execution.TOP_COMPETITORS)
+            ),
             note=(f"directly researched "
                   f"{len((competitor_research or {}).get('competitors') or [])} "
                   f"competitor(s) and evaluated {len(evaluations)} repository "
@@ -13174,7 +13182,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
     if module is None:
         outcome["research"] = {
             "competitors": [], "sources_used": [],
-            "target": _ff_execution.TOP_COMPETITORS,
+            "target": int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                          or _ff_execution.TOP_COMPETITORS),
             "sources_skipped": {
                 "module": "flexfactor_competitors could not be imported"
             },
@@ -13215,7 +13224,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
             source_inspector=inspect_public_competitor_source,
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-            target=_ff_execution.TOP_COMPETITORS,
+            target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                       or _ff_execution.TOP_COMPETITORS),
             allow_credentialed_firecrawl=True,
             log=lambda message: print(f"{pfx}{message}"),
             file_list=all_files,
@@ -13247,7 +13257,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
 
     pairs = module.competitor_findings(
         research,
-        max_findings=_ff_execution.TOP_COMPETITORS,
+        max_findings=int(getattr(args, "competitor_fixes", _ff_execution.TOP_COMPETITORS)
+                         or 0),
         file_exists=lambda rel: _read_text_and_sha(project_dir, rel) is not None,
         acceptance_total=(
             len(getattr(purpose_contract, "acceptance_criteria", []) or [])
