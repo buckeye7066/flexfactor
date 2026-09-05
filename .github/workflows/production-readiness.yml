@@ -128,6 +128,7 @@ jobs:
                    flexfactor_batch_summary_tests.py \
                    flexfactor_quality_attribution_tests.py \
                    test_flexfactor_capacity.py \
+                   flexfactor_lease_reaping_tests.py \
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
                    flexfactor_autoclean_preverify_tests.py \
