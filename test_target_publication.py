@@ -177,7 +177,15 @@ class IncrementalPublicationSafetyTests(unittest.TestCase):
             reviewer = types.SimpleNamespace(model="test-reviewer")
             with mock.patch.object(ff, "_judge", side_effect=approve):
                 review = ff._independent_final_review(
-                    reviewer, str(repo), baseline, final, {}
+                    reviewer, str(repo), baseline, final,
+                    # Current main refuses an exact-head review that is not
+                    # bound to a complete authorizing purpose contract. This
+                    # test is about the review RANGE, so supply the minimum
+                    # authority the reviewer now requires and keep asserting
+                    # the thing it was written to assert.
+                    {"purpose_contract": {
+                        "name": "Fixture", "confidence": "owner-authored"},
+                     "purpose_confidence": "owner-authored"},
                 )
             self.assertEqual("approve", review["verdict"])
             reviewed = "\n".join(prompts)

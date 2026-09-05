@@ -9039,7 +9039,18 @@ class AuditDirtyAbortCommitGuardTests(unittest.TestCase):
         def git(*a, **k):
             argv = list(a[0]) if a else []
             git_calls.append(argv)
-            stdout = "a" * 40 + "\n" if argv == ["rev-parse", "HEAD"] else ""
+            # A real checkout resolves BOTH the run-start HEAD and the remote
+            # publication boundary (refs/remotes/origin/<default>); the audit
+            # pre-flight refuses to run without the latter, because the
+            # independent final review has to cover every commit that is not
+            # yet on origin - not merely those made after the run started.
+            if argv == ["rev-parse", "HEAD"]:
+                stdout = "a" * 40 + "\n"
+            elif argv[:1] == ["rev-parse"] and argv[-1].startswith(
+                    "refs/remotes/origin/"):
+                stdout = "b" * 40 + "\n"
+            else:
+                stdout = ""
             return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
         class _P:  # stub provider
