@@ -4097,7 +4097,7 @@ def _rotation_route_provider(route):
             prov.meter = None      # RotatingProvider attaches the shared meter
             prov.client = anthropic.Anthropic(
                 base_url=route.base_url or None,
-                api_key=(os.environ.get(route.auth_env) if route.auth_env else "")
+                api_key=_route_credential(route.auth_env)
                         or os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY")
                         or os.environ.get("ANTHROPIC_API_KEY") or "")
             # __init__ is bypassed, so the lazy-rescue slots it would have
@@ -4413,6 +4413,36 @@ def model_mode_refusal(route, model_mode: str) -> str:
     return ""
 
 
+def _route_credential(auth_env: str) -> str:
+    """The credential this route will ACTUALLY be constructed with.
+
+    `_auto_activate_fcc_proxy` does not DELETE a real `ANTHROPIC_API_KEY` when
+    it turns on the free proxy -- it MOVES it to
+    `FLEXFACTOR_FALLBACK_ANTHROPIC_KEY` and blanks the original, and its own
+    docstring calls that "a strict improvement, not a loss of capability".
+    The Anthropic client construction has always honoured that move.
+
+    The usability FILTER did not. It read `os.environ.get(route.auth_env)`,
+    saw the blanked string, and excluded every real pay-as-you-go Anthropic
+    route as credential-less -- measured live 2026-09-05 on a
+    `--model-mode paid` run: `11x missing ANTHROPIC_API_KEY`, which is the
+    whole `anthropic_api` backend. Paid mode was then left with the FCC
+    subscription routes alone, all of which share ONE capacity allowance whose
+    limit is 1, so the run the owner asked to be FAST serialized instead.
+
+    Two halves of one decision disagreeing is the defect. This is the single
+    answer both now use, so they cannot drift apart again.
+    """
+    if not auth_env:
+        return ""
+    value = (os.environ.get(auth_env) or "").strip()
+    if value:
+        return value
+    if auth_env == "ANTHROPIC_API_KEY":
+        return (os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY") or "").strip()
+    return ""
+
+
 def _route_unusable_reason(route, model_mode: str) -> str:
     """Why this catalog route cannot be served here, or '' when it can.
 
@@ -4467,7 +4497,7 @@ def _route_unusable_reason(route, model_mode: str) -> str:
         healthy, reason = _ollama_route_health(route)
         if not healthy:
             return reason
-    if route.auth_env and not os.environ.get(route.auth_env):
+    if route.auth_env and not _route_credential(route.auth_env):
         return f"missing {route.auth_env}"
     if route.api == "anthropic" and not _provider_key_present("anthropic"):
         return "no anthropic credential in this environment"
