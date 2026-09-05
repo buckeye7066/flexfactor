@@ -1658,22 +1658,34 @@ def generate_tenets_context(
     files: tuple[RankedFile, ...] = ()
 
     if resolved_executable:
-        command = (
-            str(resolved_executable),
-            "rank",
-            task_text,
-            str(root),
-            "--no-git",
-            "--top",
-            str(top),
-            "--format",
-            "json",
-        )
         temporary_output = None
         cleanup_error: Exception | None = None
+        ranked_output: Path | None = None
         try:
             temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
             isolation_root = Path(temporary_output.name)
+            # STDOUT IS NOT A JSON CHANNEL. Tenets 0.13.3 writes its own
+            # rich-formatted INFO log to stdout ("Initializing Tenets ...",
+            # "Discovered N files ...") REGARDLESS of --format, so parsing
+            # stdout produced "Expecting value: line 1 column 1 (char 0)" on
+            # Linux and, on Windows, the run exited 1 while emitting that log.
+            # `--output` writes the payload to a file instead; the file lives
+            # inside the throwaway isolation root, which is also the child's
+            # cwd, so nothing is written into the audited checkout.
+            ranked_output = isolation_root / "tenets-rank.json"
+            command = (
+                str(resolved_executable),
+                "rank",
+                task_text,
+                str(root),
+                "--no-git",
+                "--top",
+                str(top),
+                "--format",
+                "json",
+                "--output",
+                str(ranked_output),
+            )
             completed = _run_bounded_process(
                 command,
                 # Never make an untrusted checkout the current directory of a
@@ -1716,8 +1728,19 @@ def generate_tenets_context(
                     message = _bounded_text(
                         f"Tenets exited with status {completed.returncode}: {stderr or stdout_diagnostic}"
                     )
+                elif ranked_output is None or not ranked_output.is_file():
+                    status = "degraded"
+                    message = (
+                        "Tenets exited 0 but wrote no ranking file; its stdout "
+                        "carries only its own log."
+                    )
                 else:
-                    payload_bytes = stdout_bytes
+                    payload_bytes = ranked_output.read_bytes()
+                    if len(payload_bytes) > MAX_STDOUT_BYTES:
+                        raise ValueError(
+                            f"ranking file exceeded the {MAX_STDOUT_BYTES}-byte "
+                            "safety limit"
+                        )
                     payload_text = payload_bytes.decode("utf-8", errors="strict")
                     payload = json.loads(payload_text)
                     files = _parse_ranked_files(payload, root, top)

@@ -7,6 +7,7 @@ import io
 import inspect
 import os
 from pathlib import Path
+import pathlib
 import select
 import signal
 import subprocess
@@ -72,6 +73,25 @@ class TenetsContextTests(unittest.TestCase):
             read_error=read_error,
             containment_error=containment_error,
         )
+
+    @classmethod
+    def _ranker(cls, ranking: bytes | None, **process_kwargs):
+        """A `_run_bounded_process` double that answers where Tenets answers.
+
+        Tenets 0.13.3 writes its own rich-formatted INFO log to STDOUT
+        regardless of `--format`, so stdout is not a JSON channel and the
+        adapter passes `--output <file>` and reads that file. A stdout-only
+        double would therefore exercise a path production never takes.
+        """
+
+        def _run(command, **_kwargs):
+            argv = list(command)
+            if ranking is not None and "--output" in argv:
+                pathlib.Path(argv[argv.index("--output") + 1]).write_bytes(ranking)
+            return cls._process(**process_kwargs)
+
+        return _run
+
 
     def test_missing_tenets_is_fail_open_and_writes_external_evidence(self) -> None:
         with mock.patch.object(ft, "_find_tenets_executable", return_value=None):
@@ -198,10 +218,12 @@ class TenetsContextTests(unittest.TestCase):
                 {"path": str(outside), "score": 1.0},
             ]
         }
-        completed = self._process(stdout=json.dumps(payload).encode())
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
-        ), mock.patch.object(ft, "_run_bounded_process", return_value=completed) as runner:
+        ), mock.patch.object(
+            ft, "_run_bounded_process",
+            side_effect=self._ranker(json.dumps(payload).encode()),
+        ) as runner:
             result = ft.generate_tenets_context(self.root, "fix auth", top=10)
         self.assertEqual(result.status, "ok")
         self.assertEqual([item.path for item in result.files], ["src/app.py", "README.md"])
@@ -220,10 +242,12 @@ class TenetsContextTests(unittest.TestCase):
                 {"path": "src/app.py"},
             ]
         }
-        completed = self._process(stdout=json.dumps(payload).encode())
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
-        ), mock.patch.object(ft, "_run_bounded_process", return_value=completed):
+        ), mock.patch.object(
+            ft, "_run_bounded_process",
+            side_effect=self._ranker(json.dumps(payload).encode()),
+        ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "ok")
         self.assertEqual([item.path for item in result.files], ["src/app.py"])
@@ -277,35 +301,71 @@ class TenetsContextTests(unittest.TestCase):
         finally:
             self.version_patch.start()
 
-    def test_real_cli_json_uses_bounded_stdout_without_a_temp_output_file(self) -> None:
-        payload = {"files": [{"path": "src/app.py", "score": 0.95}]}
+    def test_real_cli_json_comes_from_the_isolated_output_file_not_stdout(self) -> None:
+        """MEASURED against the pinned Tenets 0.13.3, not assumed.
 
-        def runner(command, **_kwargs):
-            self.assertNotIn("--output", command)
-            return self._process(stdout=json.dumps(payload).encode())
+        `tenets rank --format json` writes its own rich-formatted INFO log to
+        STDOUT ("Initializing Tenets v0.13.3", "Discovered N files ...") and
+        the JSON after it, so stdout is not a JSON channel: parsing it gave
+        `Expecting value: line 1 column 1 (char 0)` on Linux, and on Windows
+        the run exited 1 while emitting that log. `--output` writes the payload
+        to a file instead. The file must live inside the throwaway isolation
+        root (which is also the child's cwd) so nothing is written into the
+        audited checkout, and stdout stays bounded because the log still
+        arrives there.
+        """
+        payload = {"files": [{"path": "src/app.py", "score": 0.95}]}
+        seen: dict[str, object] = {}
+
+        def runner(command, **kwargs):
+            argv = list(command)
+            self.assertIn("--output", argv)
+            destination = pathlib.Path(argv[argv.index("--output") + 1])
+            seen["destination"] = destination
+            seen["cwd"] = pathlib.Path(kwargs["cwd"])
+            destination.write_bytes(json.dumps(payload).encode())
+            # Exactly what the real tool does to stdout.
+            return self._process(stdout=b"INFO  Initializing Tenets v0.13.3\n")
 
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
         ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):
             result = ft.generate_tenets_context(self.root, "audit")
 
-        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.status, "ok", result.message)
         self.assertEqual([item.path for item in result.files], ["src/app.py"])
+        destination = seen["destination"]
+        self.assertTrue(destination.is_relative_to(seen["cwd"]))
+        self.assertFalse(destination.is_relative_to(self.root.resolve()))
+        # The isolation root is removed with the run, so the ranking file
+        # cannot outlive it.
+        self.assertFalse(destination.exists())
+
+    def test_a_zero_exit_that_wrote_no_ranking_file_is_degraded(self) -> None:
+        """Tenets' log on stdout must never be mistaken for a ranking."""
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
+        ), mock.patch.object(
+            ft, "_run_bounded_process",
+            side_effect=self._ranker(None, stdout=b"INFO  Initializing Tenets\n"),
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("wrote no ranking file", result.message)
 
     def test_non_utf8_bounded_json_stdout_is_degraded(self) -> None:
         with mock.patch.object(
             ft, "_find_tenets_executable", return_value="/usr/bin/tenets"
         ), mock.patch.object(
-            ft, "_run_bounded_process", return_value=self._process(stdout=b"\xff\xfe")
+            ft, "_run_bounded_process", side_effect=self._ranker(b"\xff\xfe")
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
         self.assertIn("unusable output", result.message)
 
     def test_empty_valid_result_is_degraded_not_success(self) -> None:
-        completed = self._process(stdout=b'{"files": []}')
         with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
-            ft, "_run_bounded_process", return_value=completed
+            ft, "_run_bounded_process", side_effect=self._ranker(b'{"files": []}')
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
@@ -1018,9 +1078,11 @@ class TenetsContextTests(unittest.TestCase):
     def test_ranker_never_runs_from_or_resolves_helpers_through_target(self) -> None:
         target_bin = self.root / "tools"
         target_bin.mkdir()
-        completed = self._process(stdout=b'{"files":["src/app.py"]}')
         with mock.patch.object(ft, "_find_tenets_executable", return_value="/trusted/tenets"), \
-             mock.patch.object(ft, "_run_bounded_process", return_value=completed) as runner, \
+             mock.patch.object(
+                 ft, "_run_bounded_process",
+                 side_effect=self._ranker(b'{"files":["src/app.py"]}'),
+             ) as runner, \
              mock.patch.dict(os.environ, {
                  "PATH": os.pathsep.join((str(target_bin), "/safe/bin")),
                  "PYTHONPATH": str(self.root),
@@ -1114,9 +1176,8 @@ class TenetsContextTests(unittest.TestCase):
         self.assertIn("cleanup failed", result.message)
 
     def test_malformed_json_is_fail_open(self) -> None:
-        completed = self._process(stdout=b"not-json")
         with mock.patch.object(ft, "_find_tenets_executable", return_value="tenets"), mock.patch.object(
-            ft, "_run_bounded_process", return_value=completed
+            ft, "_run_bounded_process", side_effect=self._ranker(b"not-json")
         ):
             result = ft.generate_tenets_context(self.root, "audit")
         self.assertEqual(result.status, "degraded")
