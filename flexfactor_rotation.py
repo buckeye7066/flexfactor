@@ -74,6 +74,13 @@ AUTH_FAILURE_COOLDOWN = 3600.0
 # burning its full 600-second deadline. At ROUTE_ERROR_COOLDOWN that route is
 # back in the draw half a minute later; that run reviewed 2 of 287 files.
 TRANSPORT_DEAD_COOLDOWN = 3600.0
+# A model the PROVIDER has retired never comes back within a run, and the
+# catalog that still lists it is refreshed on its own schedule. An hour --
+# the transport-dead span -- would re-draw a permanently dead endpoint
+# several times in a long audit, and each re-draw costs a whole review
+# batch (measured 2026-09-05: a retired gemini-2.5-pro took 2 of 8 files
+# out of a FreeAndClean cycle's semantic review). A day outlives any run.
+MODEL_RETIRED_COOLDOWN = 86400.0
 
 # A catalog older than this is stale. Consumers warn and fall back rather than
 # blocking a build on a refresh -- a 4-hour-old catalog is still overwhelmingly
@@ -1153,7 +1160,7 @@ class Rotator:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
-                 transport_dead | malformed_output | error
+                 transport_dead | model_retired | malformed_output | error
         """
         now = time.time() if now is None else now
 
@@ -1220,6 +1227,20 @@ class Rotator:
                 # route, not evidence that its provider is sick.
                 cooldowns[f"route:{route.id}"] = now + float(
                     retry_after_seconds or TRANSPORT_DEAD_COOLDOWN)
+                strikes.pop(route.id, None)
+                return
+
+            if outcome == "model_retired":
+                # BENCH THE ROUTE FOR LONGER THAN THE RUN. The provider has
+                # withdrawn this model id; no cooldown length makes it answer
+                # again, and every re-draw costs a real call. Pool and
+                # credential are untouched -- sibling models on the same key
+                # are unaffected, which is precisely what a retirement means.
+                # Strikes are cleared for the same reason transport_dead
+                # clears them: this is a verdict about one route, not evidence
+                # that its provider is sick.
+                cooldowns[f"route:{route.id}"] = now + float(
+                    retry_after_seconds or MODEL_RETIRED_COOLDOWN)
                 strikes.pop(route.id, None)
                 return
 
@@ -1353,6 +1374,54 @@ def build_rotator(app: str = "flexfactor",
 # unambiguous — a mutating judge sentinel could collide with a real model id.
 ROTATING_MODEL = "rotating"
 ROTATING_JUDGE_MODEL = "rotating-judge"
+
+# Name of the attribute stamped onto an exception by the route attempt that
+# raised it. `RotatingProvider.model` CANNOT answer "which route failed?": it
+# holds the LAST route *any* thread selected, and semantic review runs its
+# units concurrently over one shared client. A handler that printed
+# `client.model` therefore named whichever route a sibling thread happened to
+# be starting -- observed 2026-09-05 on a live FreeAndClean run, where a dead
+# `gemini-2.5-pro` 404 was reported against `deepseek-v4-flash`, an entirely
+# healthy route that had never seen the payload. The exception object is
+# per-call and crosses no thread, so it is the only correct carrier.
+ROUTE_MODEL_ATTR = "flexfactor_route_model"
+
+
+def stamp_route_model(exc: BaseException, model: str) -> None:
+    """Record on *exc* the model of the route whose call raised it.
+
+    FIRST WRITER WINS. An exception travels outward through wrappers and
+    retry layers; the innermost stamp is the one that names the route that
+    actually made the failing call. Never raises -- a BaseException subclass
+    with __slots__ or a read-only __dict__ simply carries no stamp, and the
+    reader falls back to the caller's own label.
+    """
+    if not model:
+        return
+    try:
+        if getattr(exc, ROUTE_MODEL_ATTR, None):
+            return
+        setattr(exc, ROUTE_MODEL_ATTR, str(model))
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+        pass
+
+
+def route_model_of(exc: BaseException, default: str = "") -> str:
+    """The model stamped by the route attempt that raised *exc*.
+
+    Falls back through `__cause__`/`__context__` so a wrapped error (e.g. the
+    RotationError raised when every pool has failed) still names the provider
+    that actually broke, then to *default*.
+    """
+    seen = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        found = getattr(cur, ROUTE_MODEL_ATTR, None)
+        if found:
+            return str(found)
+        cur = cur.__cause__ or cur.__context__
+    return default
 
 
 class RotatingProvider:
@@ -1602,6 +1671,11 @@ class RotatingProvider:
                     # later in its caller.
                     result = result_validator(result)
             except BaseException as exc:  # noqa: BLE001 - classified, then re-raised
+                # Bind the failure to THIS route before any classification,
+                # continue or re-raise can carry it away. `self.model` is
+                # shared mutable state (see ROUTE_MODEL_ATTR); the exception
+                # is not.
+                stamp_route_model(exc, getattr(route, "model", ""))
                 # The shared USD meter can refuse a paid route after the call was
                 # selected. That is a policy boundary, not a provider failure.
                 # Continue the SAME call on genuinely free/local capacity when
@@ -1861,6 +1935,38 @@ def is_transport_dead_error(exc: BaseException) -> bool:
     return type(exc).__name__ in _TRANSPORT_FAULT_TYPES
 
 
+# Provider wordings for "this model id is gone", all seen on a real 404 body.
+# Deliberately narrow: a 404 alone is NOT enough (a mistyped URL path or a
+# per-account entitlement gap also 404s), so the status must be accompanied by
+# the provider naming the MODEL as retired/absent.
+_MODEL_RETIRED_MARKERS = (
+    "no longer available",
+    "model not found",
+    "model_not_found",
+    "does not exist",
+    "has been deprecated",
+    "decommissioned",
+    "is retired",
+    "no longer supported",
+)
+
+
+def is_model_retired_error(exc: BaseException) -> bool:
+    """True when the provider says THIS MODEL ID is gone for good.
+
+    A retired model is not a transient fault and not a sick backend: every
+    other route on the same credential keeps working. Re-drawing it burns a
+    whole call (and, for semantic review, a whole file batch) to relearn the
+    same permanent answer, so it earns a route-scoped bench that outlives the
+    run rather than the generic error strike it used to get.
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    blob = f"{type(exc).__name__} {exc}".lower()
+    if status not in (404, "404") and "404" not in blob:
+        return False
+    return any(m in blob for m in _MODEL_RETIRED_MARKERS)
+
+
 def is_payload_fault(exc: BaseException) -> bool:
     """True when the request BODY was refused before any backend saw it.
 
@@ -1904,6 +2010,11 @@ def _classify(exc: BaseException) -> str:
     # here, which a 30-second route cooldown does not describe.
     if is_transport_dead_error(exc):
         return "transport_dead"
+    # Checked last among the specific outcomes: the branches above describe an
+    # allowance or a credential, which a retired model id is not. Reaching here
+    # with a 404 that names the model means the endpoint is permanently gone.
+    if is_model_retired_error(exc):
+        return "model_retired"
     return "error"
 
 

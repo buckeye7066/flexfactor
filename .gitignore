@@ -59,3 +59,7 @@ venv/
 # Managed mobile control-plane local dependencies and Vercel project metadata.
 node_modules/
 .vercel/
+
+# Test debris: a literal "~" directory appears when a path with a tilde is
+# used without expanduser. It is never legitimate repo content.
+/~/

@@ -133,6 +133,7 @@ jobs:
                    flexfactor_node_lock_tests.py \
                    flexfactor_prodready_persistence_tests.py \
                    flexfactor_rotation_tests.py \
+                   flexfactor_batch_summary_tests.py \
                    test_flexfactor_capacity.py \
                    flexfactor_locate_tests.py \
                    flexfactor_autoclean_tests.py \
