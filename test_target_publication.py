@@ -110,6 +110,40 @@ class IncrementalPublicationSafetyTests(unittest.TestCase):
             if row["id"] == "function-coverage"
         ))
 
+    def test_a_retained_PASSING_completeness_row_does_not_fail_the_scope(self):
+        # Reported on PR #153: a green candidate-safety snapshot read as a
+        # FAILURE because the scoped check demanded the surviving gate ids be
+        # EQUAL to the candidate-safety set. `build` passes in both snapshots,
+        # so the baseline filter (which only drops rows that were ALREADY
+        # fail/blocked) rightly keeps it - and the equality then turned that
+        # retained green row into a failure, `_verification_passed` stayed
+        # false, and `selected-capabilities-delivered` blocked publication
+        # after a successful suite.
+        final = _quality_rows({"build": "pass"})
+        baseline = _quality_rows({"build": "pass"})
+        scoped = ff._publication_review_quality_gates(final, baseline)
+        self.assertIn("build", {row["id"] for row in scoped["gates"]})
+        self.assertTrue(scoped["passed"])
+
+    def test_a_retained_FAILING_completeness_row_still_fails_the_scope(self):
+        # The other half, and the reason non-candidate rows are retained at
+        # all: a candidate that turns `behavior` red must not read green just
+        # because every candidate-safety gate passes.
+        final = _quality_rows({"behavior": "fail"})
+        baseline = _quality_rows({"behavior": "pass"})
+        scoped = ff._publication_review_quality_gates(final, baseline)
+        self.assertIn("behavior", {row["id"] for row in scoped["gates"]})
+        self.assertFalse(scoped["passed"])
+
+    def test_a_missing_candidate_safety_gate_is_never_a_pass(self):
+        final = _quality_rows()
+        final["gates"] = [
+            row for row in final["gates"] if row["id"] != "tests"
+        ]
+        scoped = ff._publication_review_quality_gates(final, final)
+        self.assertNotIn("tests", {row["id"] for row in scoped["gates"]})
+        self.assertFalse(scoped["passed"])
+
     def test_new_or_unproven_completeness_failure_stays_in_review(self):
         final = _quality_rows({"function-coverage": "fail"})
         baseline = _quality_rows({"function-coverage": "pass"})

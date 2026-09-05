@@ -7748,12 +7748,26 @@ def _publication_review_quality_gates(
         "fail": sum(row.get("status") == "fail" for row in gates),
         "blocked": sum(row.get("status") == "blocked" for row in gates),
     }
-    required = (_PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}) | {
-        str(row.get("id") or "") for row in gates
-        if str(row.get("status") or "").lower() != "pass"
-    }
+    # TWO conditions, and they are deliberately different shapes.
+    #
+    # (a) Every candidate-safety gate must be PRESENT. Missing evidence is not
+    #     a pass; a bundle that simply omits `tests` must never read green.
+    # (b) Every row that survived the baseline filter must PASS - not merely
+    #     the required ones. That is what keeps a newly-red completeness gate
+    #     (a candidate that deleted tests, so `function-coverage` or `behavior`
+    #     turns red only in this snapshot) blocking, which is the whole reason
+    #     non-candidate rows are retained rather than filtered out.
+    #
+    # It is NOT `present == required`. A completeness row that is PASSING is
+    # retained by the baseline filter on purpose, and an equality test turned
+    # that retained green row into a failure: a candidate-safety snapshot with
+    # every gate green reported `passed=False`, `_verification_passed` stayed
+    # false, and `selected-capabilities-delivered` then blocked publication
+    # after a successful suite. Extra PASSING rows must not fail this; extra
+    # FAILING rows still must.
+    required = _PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}
     present = {str(row.get("id") or "") for row in gates}
-    scoped["passed"] = present == required and all(
+    scoped["passed"] = required <= present and all(
         row.get("status") == "pass" for row in gates
     )
     return scoped
