@@ -3901,6 +3901,34 @@ def _reasoning_kwargs(provider) -> dict:
     return {"extra_body": body} if body else {}
 
 
+def _failed_route_name(exc: BaseException, provider) -> str:
+    """Name the route that ACTUALLY raised *exc*, not the one selected since.
+
+    A rotating provider's `.model` is the last route ANY thread selected, and
+    semantic review fans its units across a thread pool sharing one client, so
+    reading `.model` in an error handler names a route chosen by a sibling
+    thread. That is not a cosmetic mislabel: it sends the operator to delist a
+    healthy provider while the genuinely dead one keeps its share of the
+    rotation. The rotator stamps the failing route onto the exception itself,
+    which is per-call and thread-confined; fall back to the provider label only
+    when nothing stamped it (a fixed, non-rotating provider).
+    """
+    try:
+        import flexfactor_rotation as _fr
+        stamped = _fr.route_model_of(exc)
+    except Exception:  # noqa: BLE001 - diagnostics never mask the error
+        stamped = ""
+    if stamped:
+        return stamped
+    # Nothing stamped it. A rotating client's `.model` here would be the very
+    # shared value this function exists to avoid, and its "rotating" sentinel
+    # is not a provider name either, so neither is worth printing.
+    model = getattr(provider, "model", None)
+    if model and str(model) not in ("rotating", "rotating-judge"):
+        return str(model)
+    return type(provider).__name__
+
+
 def _report_route_quality(provider, role: str, signal: str, pfx: str = "  ") -> None:
     """Tell the rotator whether the work a route produced HELPED.
 
@@ -17850,7 +17878,7 @@ def _review_all(reviewers: list, project_dir: str,
                     if any(not getattr(r, "_flexfactor_semantic_unhealthy", False)
                            for r in reviewers[ridx + 1:]):
                         print(f"  [failover] semantic review batch failed via "
-                              f"{getattr(reviewer, 'model', type(reviewer).__name__)} "
+                              f"{_failed_route_name(ex, reviewer)} "
                               f"({ex}); retrying the same bytes on the next provider")
             names = ", ".join(rel for rel, _text, _sha in unit)
             if last_error is None:
