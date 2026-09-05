@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 import flexfactor as ff
@@ -18,6 +21,14 @@ import flexfactor_rotation as rotation
 
 ROOT = Path(__file__).resolve().parent
 REFRESH = ROOT / "scripts" / "flexfactor_source_refresh.ps1"
+LF = bytes([10])
+CRLF = bytes([13, 10])
+PS_NL = chr(13) + chr(10)
+
+
+def _ps_quote(value: str) -> str:
+    """Quote a path for PowerShell without relying on escape processing."""
+    return '"' + value.replace('"', '`"') + '"'
 
 
 class StaleRuntimeRecurrenceTests(unittest.TestCase):
@@ -80,6 +91,83 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
             self.assertIn(retain, source)
             self.assertLess(source.index(retain),
                             source.index("${0}.ExitCode".format(name)))
+
+    def _stash_probe(self, narrow: bool):
+        """Run `git stash push` on a warning-producing repo under Stop.
+
+        Returns the probe's stdout, with the preference either left at Stop
+        (``narrow`` False) or narrowed the way the refresh narrows it.
+        """
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell or not shutil.which("git"):
+            self.skipTest("needs powershell and git")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+
+            def git(*args):
+                subprocess.run(("git", "-C", str(repo)) + args,
+                               check=True, capture_output=True)
+
+            git("init", "-q")
+            git("config", "core.autocrlf", "true")
+            git("config", "user.email", "t@example.invalid")
+            git("config", "user.name", "t")
+            (repo / ".gitattributes").write_bytes(b"*.json text eol=lf" + LF)
+            git("add", "-A")
+            git("commit", "-qm", "seed")
+            # The exact live trigger: untracked CRLF content git warns about.
+            (repo / "dirty.json").write_bytes(b"a" + CRLF + b"b" + CRLF)
+
+            lines = ['$ErrorActionPreference = "Stop"']
+            if narrow:
+                lines.append('$ErrorActionPreference = "Continue"')
+            lines.append('& git -C ' + _ps_quote(str(repo))
+                         + ' stash push --include-untracked -m probe *> $null')
+            lines.append('Write-Host "SURVIVED"')
+
+            probe = Path(tmp) / "probe.ps1"
+            probe.write_text(PS_NL.join(lines), encoding="ascii")
+            done = subprocess.run(
+                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(probe)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=180)
+        return done
+
+    def test_a_routine_git_WARNING_is_fatal_under_the_launchers_Stop(self):
+        """The hazard the refresh narrows the preference to survive.
+
+        Under $ErrorActionPreference = "Stop" a native command that writes
+        ANYTHING to stderr raises a terminating NativeCommandError, and
+        redirecting with *> $null does not prevent it. Measured live: one
+        untracked CRLF file on a core.autocrlf=true checkout made `git stash
+        push` warn, which killed the desktop launcher AFTER the stash had
+        already moved the owner's uncommitted work off disk -- the work
+        vanished, the "Preserved local edits" line never printed, and no
+        program opened.
+
+        If PowerShell ever stops doing this, this test fails and the
+        narrowing in the refresh can be reconsidered rather than cargo-culted.
+        """
+        done = self._stash_probe(narrow=False)
+        self.assertNotIn("SURVIVED", done.stdout)
+        self.assertIn("NativeCommandError", done.stdout + done.stderr)
+
+    def test_narrowing_the_preference_survives_that_same_warning(self):
+        """The remedy, driven through a real powershell and a real git."""
+        done = self._stash_probe(narrow=True)
+        self.assertIn("SURVIVED", done.stdout,
+                      "narrowing did not help:\n%s\n%s"
+                      % (done.stdout, done.stderr))
+
+    def test_the_refresh_narrows_the_preference_before_it_runs_any_git(self):
+        """Narrowing after the first git call would be decorative."""
+        source = REFRESH.read_text(encoding="ascii")
+        narrowed = source.index('$ErrorActionPreference = "Continue"')
+        first_git = source.index("Get-Command git")
+        self.assertLess(narrowed, first_git)
 
     def test_program_understanding_shape_failure_still_rotates_inside_same_call(self):
         inference = inspect.getsource(ff._infer_purpose_contract)
