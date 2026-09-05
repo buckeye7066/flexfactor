@@ -614,10 +614,18 @@ _PROCESS_LAUNCH_SITES = {
         "The contained launch for long-lived processes (dev servers) - what "
         "`_spawn` hands target-controlled code to."
     ),
-    "providers/cli_provider.py::_run_cli": (
-        "FlexFactor's own AI provider layer invoking a coding CLI. argv is "
+    "providers/cli_provider.py::_run_process_tree": (
+        "FlexFactor's own AI provider layer invoking a coding CLI, moved off "
+        "`subprocess.run` because that call does not bound its own timeout "
+        "when the CLI leaves a descendant holding the captured pipes. argv is "
         "FlexFactor-authored, the prompt travels on STDIN and never in argv, "
         "and a recursion guard refuses a nested agent."
+    ),
+    "providers/cli_provider.py::_terminate_process_tree": (
+        "Teardown for the launch above, not a new capability: a fixed "
+        "`taskkill /PID <pid> /T /F` argv carrying no repository input, "
+        "bounded at ten seconds, reaching only the process tree FlexFactor "
+        "itself started and is already entitled to kill."
     ),
     "providers/chatgpt_subscription.py::_codex_version": (
         "Reads only the installed Codex client's version before an HTTPS "

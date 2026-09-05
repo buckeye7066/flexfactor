@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -155,6 +156,124 @@ def _argv_for(api: str, binary: str, system: Optional[str],
     raise CliUnavailable(f"no CLI argv defined for api '{api}'")
 
 
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the CLI *and* every descendant that inherited its captured pipes.
+
+    ``Popen.kill()`` reaches only the direct child.  Agent CLIs routinely spawn
+    a worker that keeps the inherited stdout/stderr write handles open, and a
+    surviving holder is precisely what makes the advertised timeout escapable
+    (see ``_run_process_tree``).  Each CLI is therefore started in its own
+    process group so the whole group can be terminated in one call.
+    """
+    if os.name == "nt":
+        # ``taskkill /T`` walks the parent-PID tree, which is what actually
+        # reaches a worker the CLI spawned. Bounded, and failure is not fatal:
+        # the direct-child kill below is the fallback.
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                subprocess.run(
+                    [taskkill, "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=10, check=False, shell=False,
+                )
+            except Exception:                                 # pragma: no cover
+                pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):  # pragma: no cover
+            pass
+
+
+def _run_process_tree(argv: list, **kwargs: Any) -> subprocess.CompletedProcess:
+    """``subprocess.run`` with a timeout that is actually enforced.
+
+    WHY THIS EXISTS - measured 2026-09-05 on Windows 11 / CPython 3.14.6.
+    ``subprocess.run(..., timeout=N)`` does not bound anything when the child
+    leaves a descendant holding the captured pipes.  On expiry ``run`` kills
+    only the direct child and then calls ``process.communicate()`` a second
+    time *with no timeout*; on Windows that joins the daemon reader threads,
+    which block until EOF, which never arrives while a grandchild holds the
+    write handle.  Confirmed directly: with no timeout at all, ``run`` returns
+    only after the GRANDCHILD exits and captures what the grandchild wrote,
+    long after the child itself is gone.
+
+    THE OVERRUN IS INTERMITTENT, and that is the important part.  Whether the
+    worker wins the race to inherit the handle before the child exits is not
+    deterministic.  Measured over a 12-run sweep at ``timeout=3`` against a
+    worker living 20s: 2 runs raised after 24.0s and 25.7s - an 8x overrun -
+    and 10 returned in ~3.3s.  So the failure is real, rare per call, and
+    certain to recur across the thousands of calls an audit makes.  This is
+    the shape behind ``cli/claude-code: exceeded 600s and was killed`` taking
+    far longer than 600s to say so, and it is also why the regression tests
+    for this function assert on cleanup BEHAVIOUR rather than on elapsed time
+    (a wall-clock assertion would pass against the unpatched code ~80% of the
+    time - a tripwire that mostly does not trip is worse than none).
+
+    On expiry: terminate the entire process group, reap the direct child, and
+    re-raise.  Deliberately NOT done afterwards - both of these reintroduce the
+    unbounded wait this function exists to remove:
+
+      * a second ``communicate()``, even with a timeout, re-joins the same
+        blocked reader threads;
+      * ``stream.close()`` from this thread blocks on the ``BufferedReader``
+        lock that the still-reading daemon thread holds.
+
+    The cost is a deliberately leaked daemon reader thread per timed-out call,
+    holding one pipe handle and whatever the descendant writes.  It is bounded
+    and self-clearing: CPython's ``_readerthread`` closes the handle itself and
+    exits as soon as the descendant does, and it owns the only strong reference
+    to that handle in the meantime, so nothing else can close it early.  At a
+    600s per-call ceiling these are rare, and one parked thread is strictly
+    cheaper than an unbounded hang in the rotation ladder.
+
+    The return value and every raised exception keep ``subprocess.run``'s
+    shapes so callers need no change: ``CompletedProcess(args, returncode,
+    stdout, stderr)``, ``FileNotFoundError`` from spawn, ``TimeoutExpired`` on
+    expiry, and a killed tree on ``KeyboardInterrupt``.
+    """
+    input_data = kwargs.pop("input", None)
+    timeout = kwargs.pop("timeout", None)
+    capture_output = bool(kwargs.pop("capture_output", False))
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used "
+                             "with capture_output")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if input_data is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used.")
+        kwargs["stdin"] = subprocess.PIPE
+    if os.name == "nt":
+        kwargs["creationflags"] = int(kwargs.get("creationflags") or 0) | int(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):           # pragma: no cover
+            pass
+        raise
+    except BaseException:
+        # Same contract as subprocess.run, KeyboardInterrupt included: never
+        # leave the tree running behind a propagating exception.
+        _terminate_process_tree(proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
              timeout: float, model: Optional[str] = None) -> str:
     if os.environ.get(_RECURSION_MARKER):
@@ -168,7 +287,7 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
     body = prompt if (api not in ("codex-cli", "copilot-cli") or not system) \
         else f"{system}\n\n{prompt}"
     try:
-        proc = subprocess.run(
+        proc = _run_process_tree(
             argv,
             input=body,
             capture_output=True,
