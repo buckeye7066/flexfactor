@@ -7748,19 +7748,14 @@ def _publication_review_quality_gates(
         "fail": sum(row.get("status") == "fail" for row in gates),
         "blocked": sum(row.get("status") == "blocked" for row in gates),
     }
-    # Candidate-publication pass: require ONLY the candidate-safety gates to be
-    # present and passing. Extra passing completeness rows (e.g. build) must not
-    # cause failure, and unknown-baseline completeness failures remain visible
-    # to the certifier without gating this scoped "passed".
-    required_ids = _PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}
-    present_ids = {str(row.get("id") or "") for row in gates}
-    missing_required = required_ids - present_ids
-    candidate_gates_pass = all(
-        (row.get("status") == "pass")
-        for row in gates
-        if str(row.get("id") or "") in required_ids
+    required = (_PUBLICATION_EVIDENCE_GATE_IDS - {"independent-final-review"}) | {
+        str(row.get("id") or "") for row in gates
+        if str(row.get("status") or "").lower() != "pass"
+    }
+    present = {str(row.get("id") or "") for row in gates}
+    scoped["passed"] = present == required and all(
+        row.get("status") == "pass" for row in gates
     )
-    scoped["passed"] = (not missing_required) and candidate_gates_pass
     return scoped
 
 
@@ -22220,9 +22215,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "review_scope": "candidate-publication-safety",
                     "quality_gates": _publication_review_quality_gates(
                         gates_evidence,
-                        # Use the full snapshot as the comparison so non-candidate
-                        # completeness rows are excluded from the provided scope.
-                        gates_evidence,
+                        {"gates": [{
+                            "id": "build",
+                            "status": (
+                                "pass" if baseline_ok is True else
+                                "fail" if baseline_ok is False else "blocked"
+                            ),
+                        }]},
                     ),
                     "changed_file_rescan": rescan_evidence,
                     "blast_radius": blast_evidence,
