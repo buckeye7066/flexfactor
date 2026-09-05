@@ -18415,6 +18415,27 @@ def _fixtrace(event: str, rel: str = "", **kw) -> None:
 # rather than being guessed into either bucket.
 _NOOP_REJECTED_PATTERNS = (
     r"already\s+(been\s+)?(fixed|correct|handled|resolved|addressed|applied)",
+    # THE SAME TRAP THIS TABLE ALREADY FELL INTO ONCE (2026-08-23, when
+    # _NOOP_NO_FIX_PATTERNS did not match the canonical wording its own schema
+    # asks for). Every rejection pattern above requires the literal word
+    # "already", and the author model does not always use it. Measured live
+    # 2026-09-05 on a FreeAndClean run, verbatim and unmatched:
+    #
+    #   "All three audited defects are fixed in this file. The pull validation
+    #    rejects any enumerated path segment containing traversal components
+    #    ... before any copy or destination path is constructed."
+    #
+    # That is an unmistakable rejection -- the author inspected the file and
+    # refused to change working code -- and it scored None, so the run's
+    # REVIEW PRECISION signal (the number that says whether review is helping
+    # or manufacturing work that would damage the program) was thrown away.
+    #
+    # Safe in THIS context specifically: `_classify_noop` is only ever reached
+    # when the model returned NO CHANGE, so "the defects are fixed in this
+    # file" can only mean "they were already fixed before I looked".
+    r"\b(defect|issue|finding|problem|item)s?\b[^.]{0,60}?\b(are|is|were|was)\s+"
+    r"(all\s+)?(already\s+)?(fixed|addressed|resolved|corrected|handled)\b",
+    r"\b(are|is)\s+(all\s+)?fixed\s+in\s+this\s+file\b",
     r"already\s+(syntactically\s+)?correct",
     r"no\s+(code\s+|in-file\s+)?(change|edit|fix)\s*(is|was|were)?\s*"
     r"(required|needed|necessary)",

@@ -8327,6 +8327,17 @@ class NoopSplitTests(unittest.TestCase):
             "No in-file fix was needed; nothing was changed.",
             "The two setStatus calls are in separate component scopes, so this "
             "is not a real defect.",
+            # LIVE 2026-09-05, FreeAndClean run, verbatim. Scored None before
+            # this corpus grew: every rejection pattern required the literal
+            # word "already", and the author model did not use it. The run's
+            # REVIEW PRECISION signal was thrown away for a rejection this
+            # plain.
+            "All three audited defects are fixed in this file. The pull "
+            "validation rejects any enumerated path segment containing "
+            "traversal components (\\, /, ., .., empty, NUL) before any copy "
+            "or destination path is constructed.",
+            "The issues are already addressed in this revision.",
+            "Both findings are resolved in the file as supplied.",
         ):
             self.assertEqual(ff._classify_noop(note), "rejected", note[:50])
 
@@ -8343,7 +8354,18 @@ class NoopSplitTests(unittest.TestCase):
         # The brief is explicit: where the note is unclear, fall back rather
         # than guess. Silence and self-contradiction both land here.
         for note in ("", "[]", "()", None, "no change",
-                     "already fixed, but I was also unable to determine the fix"):
+                     "already fixed, but I was also unable to determine the fix",
+                     # LIVE 2026-09-05, same run. The model DESCRIBES fixes it
+                     # believes it made while returning no diff. That is not a
+                     # rejection ("this code is fine") and not a capability
+                     # failure ("I cannot fix it") -- it is self-contradictory,
+                     # and guessing either way would corrupt the very precision
+                     # signal the split exists to measure.
+                     "Fixed destination-copy removal to count records that "
+                     "were skipped due to writability failures (they still "
+                     "need the copy), and fixed directory destinations to be "
+                     "classified as collision_mismatch instead of being "
+                     "hashed as files."):
             self.assertIsNone(ff._classify_noop(note), repr(note))
 
     def _run_noop(self, note):
