@@ -33,6 +33,19 @@ function Invoke-FlexFactorSourceRefresh {
         [object[]]$ForwardedArgs = @()
     )
 
+    # Git writes ordinary WARNINGS to stderr, and under the launcher's
+    # $ErrorActionPreference = "Stop" a native command that writes ANY stderr
+    # raises a terminating NativeCommandError -- even when the call is
+    # redirected with *> $null. Measured: one untracked CRLF file (routine on
+    # a core.autocrlf=true checkout) made `git stash push` warn, which killed
+    # the launcher AFTER the stash had already moved the owner's uncommitted
+    # work off disk -- so the work silently vanished, the "Preserved local
+    # edits" disclosure never printed, and no program opened. This function
+    # checks every exit status explicitly and never relies on Stop, so the
+    # preference is narrowed here. The assignment is function-scoped and does
+    # not change the launcher's own preference after the refresh returns.
+    $ErrorActionPreference = "Continue"
+
     if ($env:FLEXFACTOR_SKIP_SOURCE_REFRESH -eq "1") { return }
     if (-not (Test-Path (Join-Path $Repository ".git"))) {
         Stop-FlexFactorSourceRefresh "The desktop launcher is not inside a Git checkout: $Repository"
