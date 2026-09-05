@@ -151,6 +151,10 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         If PowerShell ever stops doing this, this test fails and the
         narrowing in the refresh can be reconsidered rather than cargo-culted.
         """
+        # PowerShell 7 (pwsh) does not raise NativeCommandError for native stderr
+        # under Stop; this assertion is specific to Windows PowerShell 5.1.
+        if not shutil.which("powershell"):
+            self.skipTest("BLOCKED: Windows-only assertion on this host (requires Windows PowerShell 5.1)")
         done = self._stash_probe(narrow=False)
         self.assertNotIn("SURVIVED", done.stdout)
         self.assertIn("NativeCommandError", done.stdout + done.stderr)
