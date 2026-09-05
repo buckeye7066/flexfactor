@@ -19443,6 +19443,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     program can never abort the batch."""
     # Console prefix so interleaved parallel output stays attributable.
     pfx = f"[{index}/{total} ?] "
+    # Publish WHICH queue entry is running so optional Tenets ranking can
+    # tell two aliases of one physical checkout apart. target_queue keeps
+    # duplicate targets deliberately, and both aliases resolve to the same
+    # path, so without this the ranker rejected every match and fell back to
+    # the generic task for each alias.
+    globals()["_FLEXFACTOR_TENETS_PROGRAM"] = str(program_arg or "")
     result = {"name": str(program_arg), "dir": None, "branch": None, "defects": 0,
               "fixed": 0, "unverified": 0, "test_status": None, "e2e_status": "skipped",
               "commit_status": "n/a", "report_path": None, "cycles": 0, "error": None}

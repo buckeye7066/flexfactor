@@ -62,7 +62,6 @@ class TenetsContextTests(unittest.TestCase):
         timed_out: bool = False,
         overflow_stream: str | None = None,
         read_error: str | None = None,
-        containment_error: str | None = None,
     ) -> ft._BoundedProcessResult:
         return ft._BoundedProcessResult(
             returncode=returncode,
@@ -71,7 +70,6 @@ class TenetsContextTests(unittest.TestCase):
             timed_out=timed_out,
             overflow_stream=overflow_stream,
             read_error=read_error,
-            containment_error=containment_error,
         )
 
     @classmethod
@@ -120,6 +118,45 @@ class TenetsContextTests(unittest.TestCase):
                 self.root, "audit", output=self.root / "tenets-context.json"
             )
         self.assertFalse(unsafe_state.exists())
+
+    def test_default_state_root_inside_a_repository_is_still_refused(self) -> None:
+        """The default ~/.flexfactor path gets NO carve-out from the Git gate.
+
+        A carve-out that allowed the built-in state root whenever the enclosing
+        worktree was an ancestor of it (the "$HOME is a dotfiles repo" case) put
+        ranker-written evidence back inside a repository that a later auto-clean
+        phase can commit as owner work.  Both halves are pinned here: the
+        default destination is refused, and so is an explicit one.
+        """
+        host = Path(self.temp.name) / "host-repository"
+        (host / ".git").mkdir(parents=True)
+        default_state = host / ".flexfactor"
+        environment = dict(os.environ)
+        environment.pop("FLEXFACTOR_STATE_DIR", None)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(ft, "_state_root", return_value=default_state), \
+                mock.patch.object(ft, "_find_tenets_executable") as finder:
+            with self.assertRaisesRegex(ValueError, "every Git repository"):
+                ft.generate_tenets_context(self.root, "audit")
+            with self.assertRaisesRegex(ValueError, "every Git repository"):
+                ft.generate_tenets_context(
+                    self.root, "audit",
+                    output=default_state / "context" / "tenets-context.json",
+                )
+        finder.assert_not_called()
+
+    def test_default_state_root_inside_the_audited_tree_is_refused(self) -> None:
+        """No carve-out may swallow a state root inside the target itself."""
+        default_state = self.root / ".flexfactor"
+        environment = dict(os.environ)
+        environment.pop("FLEXFACTOR_STATE_DIR", None)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(ft, "_state_root", return_value=default_state), \
+                mock.patch.object(ft, "_find_tenets_executable") as finder:
+            with self.assertRaisesRegex(ValueError, "outside the audited repository"):
+                ft.generate_tenets_context(self.root, "audit")
+        finder.assert_not_called()
+        self.assertFalse(default_state.exists())
 
     def test_evidence_paths_inside_another_selected_repository_are_rejected(self) -> None:
         other = Path(self.temp.name) / "other-selected-repository"
@@ -778,7 +815,13 @@ class TenetsContextTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "Linux parent finalizer contract")
-    def test_parent_finalizer_failure_degrades_a_successful_result(self) -> None:
+    def test_parent_finalizer_failure_is_fatal_for_a_successful_result(self) -> None:
+        """Rejecting the ranking does not close the process boundary.
+
+        A surviving same-UID descendant keeps this account's filesystem and
+        network authority, so a nominal process result whose containment
+        cannot be proven must abort the run instead of degrading beside it.
+        """
         process = mock.Mock(pid=417, returncode=0)
         process.poll.return_value = 0
         process.stdout = io.BytesIO(b'{"files":[]}')
@@ -792,13 +835,13 @@ class TenetsContextTests(unittest.TestCase):
             ft, "_finalize_linux_ranker_cgroup",
             side_effect=OSError("cgroup events unreadable"),
         ):
-            result = ft._run_bounded_process(
-                (sys.executable, "-S", "-c", "pass"),
-                cwd=self.root,
-                timeout_seconds=1,
-            )
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("containment cleanup failed", result.containment_error or "")
+            with self.assertRaises(ft.TenetsContainmentError) as caught:
+                ft._run_bounded_process(
+                    (sys.executable, "-S", "-c", "pass"),
+                    cwd=self.root,
+                    timeout_seconds=1,
+                )
+        self.assertIn("containment cleanup failed", str(caught.exception))
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "Linux parent finalizer contract")
@@ -1220,7 +1263,11 @@ class TenetsContextTests(unittest.TestCase):
             output_path=str(self.state / "context.json"),
             command=(),
         )
-        with mock.patch.object(ft, "generate_tenets_context", return_value=unavailable) as generate:
+        with mock.patch.object(
+            ft, "_ranker_launch_is_possible", return_value=True
+        ), mock.patch.object(
+            ft, "generate_tenets_context", return_value=unavailable
+        ) as generate:
             first = ft.cached_tenets_context(self.root, "audit")
             second = ft.cached_tenets_context(self.root, "audit")
         self.assertIs(first, second)
@@ -1242,6 +1289,8 @@ class TenetsContextTests(unittest.TestCase):
             command=("tenets",),
         )
         with mock.patch.object(
+            ft, "_ranker_launch_is_possible", return_value=True
+        ), mock.patch.object(
             ft, "generate_tenets_context", return_value=result
         ) as generate:
             ft.cached_tenets_context(self.root, "audit")
@@ -1250,6 +1299,207 @@ class TenetsContextTests(unittest.TestCase):
             )
             ft.cached_tenets_context(self.root, "audit")
         self.assertEqual(generate.call_count, 2)
+
+    def test_fingerprint_ignores_directory_timestamp_drift(self) -> None:
+        """A real directory's own timestamps must not enter the fingerprint.
+
+        Windows updates a directory's last-write time in its PARENT's index
+        lazily, so two consecutive scandir passes over an unchanged tree can
+        disagree.  That made ``cached_tenets_context`` miss its own cache and
+        re-run the ranker (measured 11 failures in 25 runs of
+        ``test_cache_runs_ranker_once_per_project_task``).
+        """
+        before = ft._repository_state_fingerprint(self.root)
+        stamp = (self.root / "src").stat()
+        os.utime(
+            self.root / "src",
+            ns=(stamp.st_atime_ns + 5_000_000_000,
+                stamp.st_mtime_ns + 5_000_000_000),
+        )
+        self.assertEqual(ft._repository_state_fingerprint(self.root), before)
+
+    def test_fingerprint_still_changes_for_directory_membership(self) -> None:
+        """Dropping directory timestamps must not blind the fingerprint."""
+        before = ft._repository_state_fingerprint(self.root)
+        (self.root / "src" / "added.py").write_text(
+            "x" + chr(10), encoding="utf-8")
+        after_create = ft._repository_state_fingerprint(self.root)
+        self.assertNotEqual(after_create, before)
+        (self.root / "src" / "added.py").unlink()
+        self.assertEqual(ft._repository_state_fingerprint(self.root), before)
+        (self.root / "src").rename(self.root / "src2")
+        self.assertNotEqual(ft._repository_state_fingerprint(self.root), before)
+
+    def test_cache_does_not_walk_the_target_when_no_ranking_can_start(self) -> None:
+        """An untrusted checkout must not impose a walk for a key nobody uses."""
+        with mock.patch.object(
+            ft, "_ranker_launch_is_possible", return_value=False
+        ), mock.patch.object(
+            ft, "_repository_state_fingerprint"
+        ) as fingerprint, mock.patch.object(
+            ft, "_find_tenets_executable", return_value=None
+        ):
+            result = ft.cached_tenets_context(self.root, "audit")
+        fingerprint.assert_not_called()
+        self.assertEqual(result.status, "unavailable")
+
+    def test_launchability_probe_rejects_a_missing_or_mismatched_tool(self) -> None:
+        with mock.patch.object(ft, "_find_tenets_executable", return_value=None):
+            self.assertFalse(ft._ranker_launch_is_possible())
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(
+            ft, "_tenets_distribution_version", return_value="0.13.2"
+        ):
+            self.assertFalse(ft._ranker_launch_is_possible())
+
+    def test_isolation_root_rejects_a_target_contained_temporary_root(self) -> None:
+        """TMP/TEMP/TMPDIR inside the audited checkout must not host the ranker."""
+        contained = self.root / "tmp"
+        contained.mkdir()
+        with mock.patch.object(
+            ft.tempfile, "gettempdir", return_value=str(contained)
+        ):
+            parent = ft._isolation_parent_directory(self.root)
+        self.assertFalse(parent.is_relative_to(self.root.resolve()))
+        self.assertTrue(parent.is_relative_to(self.state.resolve()))
+
+    def test_isolation_root_rejects_other_selected_repositories(self) -> None:
+        sibling = self.root.parent / "sibling"
+        contained = sibling / "tmp"
+        contained.mkdir(parents=True)
+        with mock.patch.object(
+            ft.tempfile, "gettempdir", return_value=str(contained)
+        ):
+            parent = ft._isolation_parent_directory(
+                self.root, protected_roots=(sibling,)
+            )
+        self.assertFalse(parent.is_relative_to(sibling.resolve()))
+
+    def test_ranker_never_runs_inside_the_audited_checkout(self) -> None:
+        contained = self.root / "tmp"
+        contained.mkdir()
+        seen: dict[str, Path] = {}
+
+        def runner(command, **kwargs):
+            seen["cwd"] = Path(kwargs["cwd"])
+            argv = list(command)
+            if "--output" in argv:
+                pathlib.Path(argv[argv.index("--output") + 1]).write_bytes(
+                    b'{"files": []}'
+                )
+            return self._process(returncode=0)
+
+        with mock.patch.object(
+            ft.tempfile, "gettempdir", return_value=str(contained)
+        ), mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(ft, "_run_bounded_process", side_effect=runner):
+            ft.generate_tenets_context(self.root, "audit")
+        self.assertIn("cwd", seen)
+        self.assertFalse(seen["cwd"].is_relative_to(self.root.resolve()))
+
+    def test_recursive_ranking_json_degrades_with_evidence(self) -> None:
+        """RecursionError is neither ValueError nor OSError: it escaped both."""
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value="/trusted/tenets"
+        ), mock.patch.object(
+            ft, "_run_bounded_process",
+            side_effect=self._ranker(b'{"files": []}'),
+        ), mock.patch.object(
+            ft.json, "loads", side_effect=RecursionError("maximum recursion depth")
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("unusable output", result.message)
+        self.assertTrue(Path(result.output_path).is_file())
+
+    def test_unicode_evidence_failure_degrades_instead_of_raising(self) -> None:
+        """A surrogate in a valid POSIX path must not look like invalid input."""
+        failure = UnicodeEncodeError(
+            "utf-8", "x", 0, 1, "surrogates not allowed")
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value=None
+        ), mock.patch.object(
+            ft, "_atomic_write_json", side_effect=failure
+        ):
+            result = ft.generate_tenets_context(self.root, "audit")
+        self.assertEqual(result.status, "degraded")
+        self.assertIn("Evidence write failed", result.message)
+        self.assertEqual(result.output_path, "")
+
+    def test_cli_reports_a_degraded_manifest_for_a_unicode_write_failure(self) -> None:
+        failure = UnicodeEncodeError(
+            "utf-8", "x", 0, 1, "surrogates not allowed")
+        with mock.patch.object(
+            ft, "_find_tenets_executable", return_value=None
+        ), mock.patch.object(
+            ft, "_atomic_write_json", side_effect=failure
+        ), mock.patch("builtins.print") as printed:
+            code = ft.run_cli([str(self.root), "audit"])
+        self.assertEqual(code, 0)
+        payload = json.loads(printed.call_args_list[-1].args[0])
+        self.assertEqual(payload["status"], "degraded")
+
+    def test_unassigned_session_target_keeps_its_standing_guidance(self) -> None:
+        """Ranking B for the generic task contradicts the guidance B receives."""
+        argv = [
+            "audit", "--program", str(self.root),
+            "--session-prompt", "Other Repo: repair billing",
+        ]
+        with mock.patch.object(
+            ft, "_routed_session_task", return_value=None
+        ), mock.patch.object(
+            ft, "_durable_guidance_task", return_value="finish the payout ledger"
+        ), mock.patch.dict(
+            os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
+        ):
+            task = ft._argv_task(argv, project=self.root)
+        self.assertEqual(task, "finish the payout ledger")
+
+    def test_duplicate_aliases_of_one_checkout_are_disambiguated(self) -> None:
+        """target_queue keeps duplicate targets; ranking must not reject both."""
+        resolved = self.root.resolve()
+        programs = ("alias-one", "alias-two")
+        with mock.patch.object(
+            ft, "_resolved_cli_program_dir", return_value=resolved
+        ):
+            self.assertIsNone(
+                ft._matching_program_index(programs, self.root))
+            self.assertEqual(
+                ft._matching_program_index(
+                    programs, self.root, program="alias-two"),
+                1,
+            )
+            self.assertIsNone(
+                ft._matching_program_index(
+                    programs, self.root, program="alias-three"))
+            self.assertIsNone(
+                ft._matching_program_index(
+                    ("same", "same"), self.root, program="same"))
+
+    def test_guiding_prompt_reaches_the_second_alias_of_one_checkout(self) -> None:
+        resolved = self.root.resolve()
+        argv = [
+            "audit",
+            "--program", "alias-one",
+            "--guiding-prompt", "repair the first alias",
+            "--program", "alias-two",
+            "--guiding-prompt", "repair the second alias",
+        ]
+        with mock.patch.object(
+            ft, "_resolved_cli_program_dir", return_value=resolved
+        ), mock.patch.dict(
+            os.environ, {"FLEXFACTOR_TENETS_TASK": ""}, clear=False
+        ):
+            self.assertEqual(
+                ft._argv_task(argv, project=self.root, program="alias-two"),
+                "repair the second alias",
+            )
+            self.assertIn(
+                "production readiness",
+                ft._argv_task(argv, project=self.root),
+            )
 
     def test_windows_reparse_directory_is_a_fingerprint_walk_boundary(self) -> None:
         entry = mock.Mock()

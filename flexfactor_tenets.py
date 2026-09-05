@@ -66,6 +66,17 @@ _RESULT_CACHE_LOCK = threading.Lock()
 _RESULT_CACHE: dict[tuple[Any, ...], "TenetsContextResult"] = {}
 
 
+class TenetsContainmentError(RuntimeError):
+    """The optional ranker's process boundary could not be proven closed.
+
+    Rejecting a ranking does not terminate a surviving descendant.  That
+    process runs as the same user and keeps this account's filesystem and
+    network authority for as long as it lives, so an unverified post-launch
+    containment failure is FATAL for the run rather than a degraded advisory
+    result that lets the canonical audit continue beside it.
+    """
+
+
 @dataclass(frozen=True)
 class RankedFile:
     path: str
@@ -102,7 +113,6 @@ class _BoundedProcessResult:
     timed_out: bool = False
     overflow_stream: str | None = None
     read_error: str | None = None
-    containment_error: str | None = None
 
 
 def enabled() -> bool:
@@ -291,6 +301,62 @@ def _resolve_output_path(
     resolved = candidate.resolve(strict=False)
     return _validate_external_evidence_path(
         project_root, resolved, protected_roots=protected_roots
+    )
+
+
+def _isolation_parent_directory(
+    project_root: Path,
+    *,
+    protected_roots: Sequence[str | os.PathLike[str]] = (),
+) -> Path:
+    """Return a temporary root proven to sit outside every audited checkout.
+
+    ``tempfile`` honours TMP/TEMP/TMPDIR from the PARENT environment.  When
+    those point inside the audited checkout, the ranker's working directory
+    and disposable home are created THERE, without the evidence-path
+    containment checks: an interrupted run or a handled cleanup failure then
+    leaves ranker-generated files in the target, where the later auto-clean
+    phase can mistake them for owner work and commit them.  It also breaks
+    the claim that the optional process never uses an untrusted checkout as
+    its own working directory.  Reject a target-contained temporary root and
+    allocate isolation under FlexFactor's trusted external state root.
+    """
+    roots = _normalized_protected_roots(project_root, protected_roots)
+    failures: list[str] = []
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(tempfile.gettempdir()))
+    except (OSError, ValueError) as exc:  # pragma: no cover - platform edge
+        failures.append(f"the system temporary directory is unusable: {exc}")
+    candidates.append(_state_root() / "tenets-isolation")
+    for raw in candidates:
+        try:
+            candidate = Path(raw).expanduser().resolve(strict=False)
+        except (OSError, ValueError) as exc:
+            failures.append(f"{raw} could not be resolved: {exc}")
+            continue
+        contained = next(
+            (
+                protected
+                for protected in roots
+                if candidate == protected or candidate.is_relative_to(protected)
+            ),
+            None,
+        )
+        if contained is not None:
+            failures.append(
+                f"{candidate} is inside the audited repository {contained}"
+            )
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            failures.append(f"{candidate} could not be created: {exc}")
+            continue
+        return candidate
+    raise ValueError(
+        "no Tenets isolation root outside the audited repositories: "
+        + "; ".join(failures)
     )
 
 
@@ -1512,19 +1578,20 @@ def _run_bounded_process(
             try:
                 _finalize_linux_ranker_cgroup(linux_cgroup)
             except OSError as exc:
-                # A cleanup failure must not replace KeyboardInterrupt (or any
-                # other exception already propagating), but a nominal process
-                # result cannot be reported as safely contained either.  Carry
-                # the diagnostic in the completed result so optional ranking
-                # degrades while the canonical audit order continues.
+                # Rejecting the ranking does NOT close the process boundary:
+                # a surviving same-UID descendant keeps this account's
+                # filesystem and network authority.  An unverified
+                # post-launch containment failure is therefore fatal, never
+                # a degraded result the canonical audit continues beside.
+                # ``completed_result`` is None exactly when an exception is
+                # already propagating (KeyboardInterrupt included); that one
+                # still wins, because nothing nominal is returned either way.
                 diagnostic = _bounded_text(
                     f"Tenets containment cleanup failed: {exc}"
                 )
                 print(f"flexfactor {diagnostic}", file=sys.stderr)
                 if completed_result is not None:
-                    completed_result = replace(
-                        completed_result, containment_error=diagnostic
-                    )
+                    raise TenetsContainmentError(diagnostic) from exc
     if completed_result is None:
         raise OSError("Tenets process ended without a bounded result")
     return completed_result
@@ -1657,12 +1724,26 @@ def generate_tenets_context(
         )
     files: tuple[RankedFile, ...] = ()
 
+    isolation_parent: Path | None = None
+    if resolved_executable:
+        try:
+            isolation_parent = _isolation_parent_directory(
+                root, protected_roots=normalized_protected_roots
+            )
+        except (OSError, ValueError) as exc:
+            resolved_executable = None
+            status = "unavailable"
+            message = _bounded_text(f"Tenets ranking disabled: {exc}")
+
     if resolved_executable:
         temporary_output = None
         cleanup_error: Exception | None = None
         ranked_output: Path | None = None
         try:
-            temporary_output = tempfile.TemporaryDirectory(prefix="flexfactor-tenets-rank-")
+            temporary_output = tempfile.TemporaryDirectory(
+                prefix="flexfactor-tenets-rank-",
+                dir=str(isolation_parent),
+            )
             isolation_root = Path(temporary_output.name)
             # STDOUT IS NOT A JSON CHANNEL. Tenets 0.13.3 writes its own
             # rich-formatted INFO log to stdout ("Initializing Tenets ...",
@@ -1698,10 +1779,7 @@ def generate_tenets_context(
             )
             stdout_bytes = completed.stdout
             stderr_bytes = completed.stderr
-            if completed.containment_error:
-                status = "degraded"
-                message = completed.containment_error
-            elif completed.timed_out:
+            if completed.timed_out:
                 status = "degraded"
                 message = f"Tenets exceeded the {timeout:g}-second timeout."
             elif completed.overflow_stream:
@@ -1750,7 +1828,15 @@ def generate_tenets_context(
                     else:
                         status = "degraded"
                         message = "Tenets returned no safe in-repository file paths."
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
+                RecursionError, MemoryError) as exc:
+            # Deeply nested JSON inside the size limit makes ``json.loads``
+            # raise RecursionError, which is neither a ValueError nor an
+            # OSError: the CLI exited with a traceback and wrote no degraded
+            # evidence at all.  Parser resource exhaustion is unusable output.
+            # KeyboardInterrupt and TenetsContainmentError deliberately are
+            # not listed, so an interrupt and an unclosed process boundary
+            # still propagate.
             status = "degraded"
             message = _bounded_text(f"Tenets returned unusable output: {exc}")
         except OSError as exc:
@@ -1785,8 +1871,14 @@ def generate_tenets_context(
     )
     try:
         _atomic_write_json(output_path, result.to_dict())
-    except OSError as exc:
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
         # Optional context ranking must not abort an audit because evidence storage failed.
+        # A POSIX path may carry an undecodable byte, which arrives here as a
+        # lone surrogate: serializing it with ensure_ascii=False raises
+        # UnicodeEncodeError (a ValueError).  Catching only OSError made the
+        # direct API violate its operational-failure contract and made the
+        # CLI exit as though a valid project were invalid input, writing no
+        # degraded manifest at all.
         result = replace(
             result,
             status="degraded",
@@ -1813,6 +1905,36 @@ def _entry_is_traversal_boundary(entry: os.DirEntry[str], stat_result: os.stat_r
     return bool(callable(is_junction) and is_junction())
 
 
+_FINGERPRINT_ENTRY_BUDGET = 200_000
+
+
+def _ranker_launch_is_possible() -> bool:
+    """Cheap, side-effect-free proof that a ranking run could actually start.
+
+    The fingerprint below walks the audited checkout, and that checkout is
+    untrusted input.  Computing it before discovering that Tenets (or, on
+    Linux, the delegated cgroup) is unavailable let a default-enabled hook
+    pay an attacker-chosen traversal cost for a ranker that was never going
+    to launch.  Prove launchability first; every probe here reads existing
+    state only.
+    """
+    if os.name != "nt" and not sys.platform.startswith("linux"):
+        # _run_bounded_process refuses to launch without a containment
+        # primitive that survives direct-parent exit.
+        return False
+    try:
+        executable = _find_tenets_executable()
+        if not executable:
+            return False
+        if _tenets_distribution_version(executable) != TENETS_VERSION:
+            return False
+        if sys.platform.startswith("linux"):
+            _linux_cgroup_root()
+    except OSError:
+        return False
+    return True
+
+
 def _repository_state_fingerprint(project_root: Path) -> str:
     """Fingerprint reviewable tree metadata so post-mutation rankings expire.
 
@@ -1820,10 +1942,26 @@ def _repository_state_fingerprint(project_root: Path) -> str:
     inexpensive compared with ranking while still changing for content edits,
     creates, deletes, renames, and permission changes. Artifact/dependency
     directories excluded by the canonical sweep are excluded here as well.
+
+    A walked directory contributes its name and mode ONLY.  Windows publishes a
+    directory's last-write time into its parent's directory index lazily, so
+    two consecutive scans of an unchanged tree disagreed and this fingerprint
+    -- the ranking cache key -- changed on its own (measured: 11 failures in 25
+    runs of the cache test).  Directory timestamps are redundant regardless:
+    every create, delete, or rename inside a walked directory already reaches
+    the digest through the entry it produces.
     """
     digest = hashlib.sha256()
     pending = [project_root]
+    examined = 0
     while pending:
+        if examined >= _FINGERPRINT_ENTRY_BUDGET:
+            # A hostile checkout must not be able to impose an unbounded
+            # walk.  The order is deterministic, so everything already
+            # digested still invalidates normally; only the untraversed tail
+            # of a pathological tree stops contributing.
+            digest.update(f"!budget:{examined}\n".encode("ascii"))
+            break
         directory = pending.pop()
         try:
             with os.scandir(directory) as iterator:
@@ -1832,27 +1970,34 @@ def _repository_state_fingerprint(project_root: Path) -> str:
             relative = directory.relative_to(project_root).as_posix()
             digest.update(f"!scan:{relative}:{type(exc).__name__}\n".encode())
             continue
+        examined += len(entries)
         for entry in entries:
             path = Path(entry.path)
             relative = path.relative_to(project_root).as_posix()
             try:
                 stat = entry.stat(follow_symlinks=False)
+                boundary = _entry_is_traversal_boundary(entry, stat)
+                if not boundary and entry.is_dir(follow_symlinks=False):
+                    digest.update(
+                        f"{relative}\0{stat.st_mode}\0dir\n".encode(
+                            "utf-8", errors="surrogateescape")
+                    )
+                    if entry.name not in _CACHE_SKIP_DIRECTORIES:
+                        pending.append(path)
+                    continue
                 digest.update(
                     (
                         f"{relative}\0{stat.st_mode}\0{stat.st_size}\0"
                         f"{stat.st_mtime_ns}\0{stat.st_ctime_ns}\n"
                     ).encode("utf-8", errors="surrogateescape")
                 )
-                if _entry_is_traversal_boundary(entry, stat):
+                if boundary:
                     try:
                         target = os.readlink(path)
                     except OSError:
                         target = "[reparse-boundary]"
                     digest.update(target.encode(
                         "utf-8", errors="surrogateescape"))
-                elif entry.is_dir(follow_symlinks=False) \
-                        and entry.name not in _CACHE_SKIP_DIRECTORIES:
-                    pending.append(path)
             except OSError as exc:
                 digest.update(
                     f"!stat:{relative}:{type(exc).__name__}\n".encode(
@@ -1872,10 +2017,20 @@ def cached_tenets_context(
 ) -> TenetsContextResult:
     root = Path(project).expanduser().resolve(strict=False)
     timeout = _validated_timeout(timeout_seconds)
-    fingerprint = _repository_state_fingerprint(root)
     normalized_protected_roots = _normalized_protected_roots(
         root, protected_roots
     )
+    if not _ranker_launch_is_possible():
+        # Never walk an untrusted checkout for a cache key that no ranking
+        # run will ever consume.
+        return generate_tenets_context(
+            root,
+            task,
+            top=top,
+            timeout_seconds=timeout,
+            protected_roots=normalized_protected_roots,
+        )
+    fingerprint = _repository_state_fingerprint(root)
     key = (
         str(root), str(task).strip(), top, timeout, fingerprint,
         tuple(str(path) for path in normalized_protected_roots),
@@ -1971,7 +2126,10 @@ def _program_candidates(programs: Sequence[str]) -> list[tuple[int, str, str, st
 
 
 def _matching_program_index(
-    programs: Sequence[str], project: str | os.PathLike[str]
+    programs: Sequence[str],
+    project: str | os.PathLike[str],
+    *,
+    program: str = "",
 ) -> int | None:
     root = Path(project).expanduser().resolve(strict=False)
     root_full = os.path.normcase(str(root))
@@ -1981,6 +2139,20 @@ def _matching_program_index(
     if len(exact) == 1:
         return exact[0]
     if exact:
+        # Duplicate targets are retained deliberately by
+        # flexfactor_execution.target_queue, and the audit routes those
+        # aliases as distinct program names.  Rejecting every multiple exact
+        # match sent each alias of one checkout to the generic task.  The
+        # audit tells us which alias is running; use it, and still fail
+        # closed when it is unknown or itself ambiguous.
+        wanted = str(program or "").strip().casefold()
+        if wanted:
+            named = [
+                index for index in exact
+                if str(programs[index] or "").strip().casefold() == wanted
+            ]
+            if len(named) == 1:
+                return named[0]
         return None
     root_identity = _program_identity(root.name)
     identity_matches = [
@@ -1994,9 +2166,11 @@ def _routed_session_task(
     prompt: str,
     programs: Sequence[str],
     project: str | os.PathLike[str],
+    *,
+    program: str = "",
 ) -> str | None:
     """Return only the session instruction routed to this exact target."""
-    selected = _matching_program_index(programs, project)
+    selected = _matching_program_index(programs, project, program=program)
     if selected is None:
         return None
     candidates = _program_candidates(programs)
@@ -2074,6 +2248,7 @@ def _argv_task(
     argv: Sequence[str] | None,
     *,
     project: str | os.PathLike[str] | None = None,
+    program: str = "",
 ) -> str:
     override = os.environ.get("FLEXFACTOR_TENETS_TASK", "").strip()
     if override:
@@ -2093,8 +2268,19 @@ def _argv_task(
     if session_prompts:
         if project is None or not programs:
             return session_prompts[0]
-        routed_task = _routed_session_task(session_prompts[0], programs, project)
-        return routed_task or _default_task(mode)
+        routed_task = _routed_session_task(
+            session_prompts[0], programs, project, program=program
+        )
+        if routed_task:
+            return routed_task
+        # A multi-program session that assigns work only to repo A leaves
+        # repo B unrouted.  The main audit still injects B's saved standing
+        # guidance through refresh_context, so ranking B for the generic task
+        # ranked it against a different objective than the review it feeds.
+        durable = _durable_guidance_task(project)
+        if durable:
+            return durable
+        return _default_task(mode)
 
     guiding_prompts = _argv_values(args, "--guiding-prompt")
     if not guiding_prompts:
@@ -2106,7 +2292,9 @@ def _argv_task(
             # Exact resolved paths are authoritative.  A basename/slug is only
             # a fallback when it identifies exactly one program; two checkouts
             # named "app" must never receive each other's repair objective.
-            selected = _matching_program_index(programs, project)
+            selected = _matching_program_index(
+                programs, project, program=program
+            )
             if selected is not None and selected < len(guiding_prompts):
                 return guiding_prompts[selected]
         elif len(guiding_prompts) == 1:
@@ -2247,7 +2435,12 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
                 effective_argv = tuple(
                     module_globals.get("_FLEXFACTOR_TENETS_ARGV") or ()
                 )
-                task = _argv_task(effective_argv, project=root)
+                current_program = str(
+                    module_globals.get("_FLEXFACTOR_TENETS_PROGRAM") or ""
+                ).strip()
+                task = _argv_task(
+                    effective_argv, project=root, program=current_program
+                )
                 programs = _argv_values(effective_argv, "--program")
                 selected_roots = tuple(
                     full
@@ -2258,6 +2451,10 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
                 result = cached_tenets_context(
                     root, task, protected_roots=selected_roots
                 )
+            except TenetsContainmentError:
+                # Optional ranking degrades; an unclosed process boundary
+                # does not.  Let it abort the run.
+                raise
             except Exception as exc:
                 module_globals["_TENETS_CONTEXT_LAST_ERROR"] = _bounded_text(str(exc))
                 return None
@@ -2346,6 +2543,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             top=args.top,
             timeout_seconds=args.timeout,
         )
+    except TenetsContainmentError as exc:
+        print(f"flexfactor-context: {exc}", file=sys.stderr)
+        return 3
     except ValueError as exc:
         print(f"flexfactor-context: {exc}", file=sys.stderr)
         return 2

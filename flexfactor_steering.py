@@ -6,12 +6,15 @@ active run and receives a terminal receipt, while guidance remains in force for
 future audit/prodready runs until the owner replaces or clears it.
 """
 from __future__ import annotations
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
+import stat as stat_module
 import threading
+import time
 import uuid
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".flexfactor", "steering")
@@ -25,6 +28,11 @@ _END = "<<< END FLEXFACTOR OPERATOR STEERING >>>"
 _GUIDANCE_BEGIN = "<<< FLEXFACTOR PROGRAM GUIDANCE >>>"
 _GUIDANCE_END = "<<< END FLEXFACTOR PROGRAM GUIDANCE >>>"
 _LOCAL_LOCK = threading.Lock()
+# Guidance selection, legacy migration and legacy deletion are ONE
+# transaction, and owner saves/clears join it.  See _guidance_transaction.
+_GUIDANCE_TXN_LOCK = threading.RLock()
+_TXN_WAIT_SECONDS = 10.0
+_TXN_STALE_SECONDS = 30.0
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 def _now() -> str:
@@ -46,6 +54,121 @@ def _legacy_canonical(project_dir: str) -> str:
     if not raw:
         raise ValueError("project_dir is required")
     return os.path.normcase(os.path.abspath(raw))
+
+def _is_retargetable_alias(path: str) -> bool:
+    """Whether ONE directory entry is a link that can be pointed elsewhere.
+
+    8.3 short names and case-only differences are lexical spellings of the
+    same physical directory and cannot be retargeted, so they are not
+    aliases in this sense.  POSIX symlinks, Windows symlinks and Windows
+    junctions are.  A missing entry cannot be resolved to anything else
+    either; an entry that cannot be inspected fails closed.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    if stat_module.S_ISLNK(info.st_mode):
+        return True
+    tag = int(getattr(info, "st_reparse_tag", 0) or 0)
+    return tag in {
+        int(getattr(stat_module, "IO_REPARSE_TAG_SYMLINK", -1)),
+        int(getattr(stat_module, "IO_REPARSE_TAG_MOUNT_POINT", -2)),
+    }
+
+
+def _identity_is_unprovable(project_dir: str) -> bool:
+    """Reject a stored spelling whose physical target can have moved.
+
+    Records written before physical canonicalization stored the exact
+    spelling the owner used.  ``_canonical`` resolves that spelling at READ
+    time, so if the link is later retargeted from repository A to
+    repository B, A's standing guidance and A's pending steering comments
+    are accepted for B.  These records authorize autonomous work, so a
+    legacy path that is -- or passes through -- a link today cannot prove
+    the physical checkout it identified when it was written and is refused
+    rather than resolved.  Current records always store a fully resolved
+    physical path and never reach this check.
+    """
+    raw = str(project_dir or "").strip()
+    if not raw:
+        return True
+    try:
+        current = os.path.abspath(raw)
+    except (OSError, ValueError):
+        return True
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        if _is_retargetable_alias(current):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return False
+
+
+@contextlib.contextmanager
+def _guidance_transaction(root: str | None):
+    """Serialize guidance selection, migration and deletion between processes.
+
+    The one-time legacy migration picked a candidate BEFORE ``_replace_json``
+    and the only lock covered that single write and was process-local, so a
+    dashboard save landing in between was silently overwritten and cleared
+    guidance could be recreated.  One transaction now spans selection,
+    migration and legacy deletion, and ``set_guidance``/``clear_guidance``
+    take it too.  Yields whether the transaction was actually acquired;
+    a reader that did not acquire it must not migrate.
+    """
+    path = os.path.join(root or DEFAULT_ROOT, "guidance", ".transaction.lock")
+    with _GUIDANCE_TXN_LOCK:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError:
+            yield False
+            return
+        handle = -1
+        acquired = False
+        deadline = time.monotonic() + _TXN_WAIT_SECONDS
+        while True:
+            try:
+                handle = os.open(
+                    path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    stale = (time.time() - os.stat(path).st_mtime
+                             > _TXN_STALE_SECONDS)
+                except OSError:
+                    stale = False
+                if stale:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            except OSError:
+                break
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
 
 def _identity_key(program: str, canonical_project: str) -> str:
     identity = str(program or "").strip().casefold() + "\n" + canonical_project
@@ -194,6 +317,9 @@ def _legacy_journal_paths(
                     and _canonical(stored_project) == _canonical(project_dir)
                     and entry.name
                     == _legacy_key(stored_program, stored_project) + ".jsonl"
+                    # A stored spelling that is a link TODAY cannot prove
+                    # which checkout it named when the comment was queued.
+                    and not _identity_is_unprovable(stored_project)
                 )
             except (OSError, ValueError):
                 same_identity = False
@@ -485,14 +611,20 @@ def set_guidance(program: str, project_dir: str, prompt: str, *,
         "source": str(source or "dashboard")[:40],
         "updated_at": _now(),
     }
-    _replace_json(guidance_path(program_s, project_dir, root), row)
+    with _guidance_transaction(root):
+        _replace_json(guidance_path(program_s, project_dir, root), row)
     return dict(row)
 
 
 def _validated_guidance_row(
-    row, program: str, project_dir: str
+    row, program: str, project_dir: str, *, legacy: bool = False
 ) -> dict | None:
-    """Validate one record and bind it to the requested physical checkout."""
+    """Validate one record and bind it to the requested physical checkout.
+
+    ``legacy`` marks a record found under a pre-physical-identity filename.
+    Only those can carry an unresolved, retargetable spelling, and only
+    those pay for the extra link probe.
+    """
     if not isinstance(row, dict) or row.get("schema") != 1:
         return None
     stored_program = str(row.get("program") or "").strip()
@@ -506,6 +638,8 @@ def _validated_guidance_row(
             return None
         prompt = _clean_guidance(row.get("prompt") or "")
     except (OSError, ValueError):
+        return None
+    if legacy and _identity_is_unprovable(stored_project):
         return None
     return {
         "schema": 1,
@@ -550,7 +684,9 @@ def _legacy_guidance_matches(
             continue
         if entry.name != expected_name:
             continue
-        validated = _validated_guidance_row(raw, program, project_dir)
+        validated = _validated_guidance_row(
+            raw, program, project_dir, legacy=True
+        )
         if validated is not None:
             matches.append((entry.path, validated))
     return matches
@@ -560,54 +696,63 @@ def get_guidance(program: str, project_dir: str, *,
                  root: str | None = None) -> dict | None:
     """Read validated standing guidance, never letting a bad local file stop a run."""
     path = guidance_path(program, project_dir, root)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            row = json.load(fh)
-    except (OSError, TypeError, ValueError):
-        row = None
-    validated = _validated_guidance_row(row, program, project_dir)
-
-    # Version 1 records written before physical canonicalization were keyed by
-    # the exact symlink/junction spelling used at save time.  Validate both the
-    # old filename and the stored physical target before migrating, so an
-    # upgrade never drops authenticated owner direction or accepts a renamed
-    # file as authority.  Always compare those records with the current-key
-    # record: an owner may have updated guidance through an alias immediately
-    # before upgrading, and the newest valid direction must win regardless of
-    # which spelling produced its filename.
-    candidates = _legacy_guidance_matches(
-        program, project_dir, root=root
-    )
-    if validated is not None:
-        candidates.append((path, validated))
-    if not candidates:
-        return None
-    by_path: dict[str, tuple[str, dict]] = {}
-    for candidate_path, candidate_row in candidates:
-        normalized_path = os.path.normcase(os.path.abspath(candidate_path))
-        existing = by_path.get(normalized_path)
-        if existing is None or (
-            candidate_row.get("updated_at", ""), candidate_row["program"]
-        ) > (
-            existing[1].get("updated_at", ""), existing[1]["program"]
-        ):
-            by_path[normalized_path] = (candidate_path, candidate_row)
-    candidates = list(by_path.values())
-    candidates.sort(key=lambda item: (
-        item[1].get("updated_at", ""), item[1]["program"], item[0]
-    ))
-    selected_path, selected = candidates[-1]
-    current_path = os.path.normcase(os.path.abspath(path))
-    if (os.path.normcase(os.path.abspath(selected_path)) != current_path
-            or validated != selected):
+    # ONE transaction spans reading the current record, selecting a winner,
+    # migrating it and deleting the legacy copies.  Selecting outside the lock
+    # let a concurrent dashboard save be overwritten by an older migrated
+    # record, and let a concurrent clear be undone.
+    with _guidance_transaction(root) as owned:
         try:
-            _replace_json(path, selected)
-        except (OSError, ValueError):
+            with open(path, "r", encoding="utf-8") as fh:
+                row = json.load(fh)
+        except (OSError, TypeError, ValueError):
+            row = None
+        validated = _validated_guidance_row(row, program, project_dir)
+
+        # Version 1 records written before physical canonicalization were keyed
+        # by the exact spelling used at save time.  Validate both the old
+        # filename and the stored physical target before migrating, so an
+        # upgrade never drops authenticated owner direction or accepts a
+        # renamed file as authority.  Always compare those records with the
+        # current-key record: an owner may have updated guidance through a
+        # different spelling immediately before upgrading, and the newest valid
+        # direction must win regardless of which spelling produced its
+        # filename.
+        candidates = _legacy_guidance_matches(
+            program, project_dir, root=root
+        )
+        if validated is not None:
+            candidates.append((path, validated))
+        if not candidates:
+            return None
+        by_path: dict[str, tuple[str, dict]] = {}
+        for candidate_path, candidate_row in candidates:
+            normalized_path = os.path.normcase(os.path.abspath(candidate_path))
+            existing = by_path.get(normalized_path)
+            if existing is None or (
+                candidate_row.get("updated_at", ""), candidate_row["program"]
+            ) > (
+                existing[1].get("updated_at", ""), existing[1]["program"]
+            ):
+                by_path[normalized_path] = (candidate_path, candidate_row)
+        candidates = list(by_path.values())
+        candidates.sort(key=lambda item: (
+            item[1].get("updated_at", ""), item[1]["program"], item[0]
+        ))
+        selected_path, selected = candidates[-1]
+        current_path = os.path.normcase(os.path.abspath(path))
+        if not owned:
+            # Without the interprocess transaction a migration could overwrite
+            # an owner save or resurrect cleared guidance.  Serve the validated
+            # direction read-only and migrate on a later, serialized call.
             return selected
-    with _LOCAL_LOCK:
+        if (os.path.normcase(os.path.abspath(selected_path)) != current_path
+                or validated != selected):
+            try:
+                _replace_json(path, selected)
+            except (OSError, ValueError):
+                return selected
         for old_path, _row in candidates:
-            if os.path.normcase(os.path.abspath(old_path)) == \
-                    current_path:
+            if os.path.normcase(os.path.abspath(old_path)) == current_path:
                 continue
             try:
                 os.remove(old_path)
@@ -617,7 +762,7 @@ def get_guidance(program: str, project_dir: str, *,
                 # The new physical-key record is already durable; retaining a
                 # redundant validated legacy copy cannot broaden its authority.
                 pass
-    return selected
+        return selected
 
 
 def get_guidance_for_project(project_dir: str, *,
@@ -636,7 +781,13 @@ def get_guidance_for_project(project_dir: str, *,
         entries = sorted(os.scandir(guidance_root), key=lambda item: item.name)
     except OSError:
         return None
-    matches: list[dict] = []
+    # ONE validated pass.  Calling get_guidance per candidate re-scanned and
+    # re-parsed this whole directory every time, because get_guidance itself
+    # scans it for legacy records: the supported 5,000-record bound therefore
+    # cost ~25 million file inspections on every durable-task lookup.  Select
+    # from this snapshot and route only the winner back through get_guidance,
+    # which applies the identical validation plus the serialized migration.
+    best: tuple[str, str] | None = None
     for entry in entries[:5000]:
         if not re.fullmatch(r"[0-9a-f]{32}\.json", entry.name):
             continue
@@ -665,22 +816,28 @@ def get_guidance_for_project(project_dir: str, *,
         actual_path = os.path.normcase(os.path.abspath(entry.path))
         if actual_path not in {expected_path, legacy_path}:
             continue
-        validated = get_guidance(program, project_dir, root=root)
-        if validated is not None:
-            matches.append(validated)
-    if not matches:
+        validated = _validated_guidance_row(
+            raw, program, project_dir,
+            legacy=actual_path != expected_path,
+        )
+        if validated is None:
+            continue
+        key = (validated.get("updated_at", ""), validated["program"])
+        if best is None or key > best:
+            best = key
+    if best is None:
         return None
-    return max(matches, key=lambda row: (row.get("updated_at", ""), row["program"]))
+    return get_guidance(best[1], project_dir, root=root)
 
 
 def clear_guidance(program: str, project_dir: str, *, root: str | None = None) -> bool:
     """Remove only this program's saved guidance.  Missing guidance is already clear."""
-    paths = [guidance_path(program, project_dir, root)]
-    paths.extend(path for path, _row in _legacy_guidance_matches(
-        program, project_dir, root=root
-    ))
     removed = False
-    with _LOCAL_LOCK:
+    with _guidance_transaction(root):
+        paths = [guidance_path(program, project_dir, root)]
+        paths.extend(path for path, _row in _legacy_guidance_matches(
+            program, project_dir, root=root
+        ))
         for path in dict.fromkeys(paths):
             try:
                 os.remove(path)

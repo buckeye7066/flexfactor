@@ -250,121 +250,84 @@ class SteeringTests(unittest.TestCase):
             "Target", self.project, root=self.root
         ))
 
-    def test_legacy_alias_guidance_is_validated_migrated_and_clearable(self):
-        alias = os.path.join(self.root, "Legacy Target Alias")
+    def _alias(self, name, target=None):
+        alias = os.path.join(self.root, name)
         try:
-            os.symlink(self.project, alias, target_is_directory=True)
+            os.symlink(target or self.project, alias, target_is_directory=True)
         except (NotImplementedError, OSError) as exc:
             self.skipTest(f"directory symlinks unavailable: {exc}")
+        return alias
+
+    def _legacy_guidance(self, alias, prompt,
+                         updated_at="2026-09-04T00:00:00+00:00"):
         legacy_path = os.path.join(
-            self.root,
-            "guidance",
-            fs._legacy_key("Target", alias) + ".json",
-        )
+            self.root, "guidance", fs._legacy_key("Target", alias) + ".json")
+        fs._replace_json(legacy_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "prompt": prompt,
+            "source": "dashboard",
+            "updated_at": updated_at,
+        })
+        return legacy_path
+
+    def test_retargeted_alias_cannot_hand_one_repo_another_repos_guidance(self):
+        """A pre-upgrade record keyed by a link cannot prove its own history.
+
+        ``_canonical`` resolves the STORED spelling at read time, so retargeting
+        the link from repo A to repo B accepted A's standing guidance for B.
+        These records authorize autonomous work, so they fail closed.
+        """
+        other = os.path.join(self.root, "Other App")
+        os.makedirs(other)
+        alias = self._alias("Retargeted Alias")
+        self._legacy_guidance(alias, "Ship the Target App billing repair.")
+        os.remove(alias)
+        os.symlink(other, alias, target_is_directory=True)
+
+        self.assertIsNone(fs.get_guidance("Target", other, root=self.root))
+        self.assertIsNone(fs.get_guidance_for_project(other, root=self.root))
+
+    def test_retargeted_alias_cannot_hand_one_repo_another_repos_comments(self):
+        other = os.path.join(self.root, "Other Comment App")
+        os.makedirs(other)
+        alias = self._alias("Retargeted Journal Alias")
+        legacy_path = os.path.join(
+            self.root, fs._legacy_key("Target", alias) + ".jsonl")
+        fs._append(legacy_path, {
+            "kind": "submission",
+            "id": "legacy-steering-id",
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(alias),
+            "comment": "Delete the Target App staging data.",
+            "source": "dashboard",
+            "created_at": "2026-09-04T00:00:00+00:00",
+        })
+        os.remove(alias)
+        os.symlink(other, alias, target_is_directory=True)
+
+        self.assertEqual([], fs.list_comments("Target", other, root=self.root))
+        _items, claimed = fs.claim("Target", other, "new-run", root=self.root)
+        self.assertEqual([], claimed)
+
+    def test_legacy_alias_guidance_is_refused_and_never_promoted(self):
+        alias = self._alias("Legacy Target Alias")
+        legacy_path = self._legacy_guidance(
+            alias, "Keep the authenticated legacy owner workflow.")
         current_path = fs.guidance_path("Target", self.project, self.root)
         self.assertNotEqual(legacy_path, current_path)
-        fs._replace_json(legacy_path, {
-            "schema": 1,
-            "program": "Target",
-            "project_dir": fs._legacy_canonical(alias),
-            "prompt": "Keep the authenticated legacy owner workflow.",
-            "source": "dashboard",
-            "updated_at": "2026-09-04T00:00:00+00:00",
-        })
 
-        loaded = fs.get_guidance("Target", self.project, root=self.root)
+        self.assertIsNone(fs.get_guidance("Target", self.project, root=self.root))
+        # Refused, not migrated: an unprovable record never becomes authority
+        # under the physical key, and it is left inert rather than deleted.
+        self.assertFalse(os.path.exists(current_path))
+        self.assertTrue(os.path.isfile(legacy_path))
 
-        self.assertEqual(
-            loaded["prompt"], "Keep the authenticated legacy owner workflow."
-        )
-        self.assertEqual(loaded["project_dir"], fs._canonical(self.project))
-        self.assertTrue(os.path.isfile(current_path))
-        self.assertFalse(os.path.exists(legacy_path))
-        self.assertTrue(fs.clear_guidance(
-            "Target", alias, root=self.root
-        ))
-        self.assertIsNone(fs.get_guidance(
-            "Target", self.project, root=self.root
-        ))
-
-    def test_newer_legacy_alias_guidance_wins_over_current_physical_key(self):
-        alias = os.path.join(self.root, "Newer Legacy Target Alias")
-        try:
-            os.symlink(self.project, alias, target_is_directory=True)
-        except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"directory symlinks unavailable: {exc}")
-        current_path = fs.guidance_path("Target", self.project, self.root)
+    def test_legacy_alias_journal_is_not_served_for_a_resolved_checkout(self):
+        alias = self._alias("Legacy Journal Alias")
         legacy_path = os.path.join(
-            self.root,
-            "guidance",
-            fs._legacy_key("Target", alias) + ".json",
-        )
-        fs._replace_json(current_path, {
-            "schema": 1,
-            "program": "Target",
-            "project_dir": fs._canonical(self.project),
-            "prompt": "Older physical-key guidance.",
-            "source": "dashboard",
-            "updated_at": "2026-09-04T00:00:00+00:00",
-        })
-        fs._replace_json(legacy_path, {
-            "schema": 1,
-            "program": "Target",
-            "project_dir": fs._legacy_canonical(alias),
-            "prompt": "Newest authenticated alias guidance.",
-            "source": "dashboard",
-            "updated_at": "2026-09-04T01:00:00+00:00",
-        })
-
-        loaded = fs.get_guidance("Target", self.project, root=self.root)
-
-        self.assertEqual(
-            loaded["prompt"], "Newest authenticated alias guidance."
-        )
-        self.assertFalse(os.path.exists(legacy_path))
-        self.assertEqual(
-            fs.get_guidance("Target", self.project, root=self.root)["prompt"],
-            "Newest authenticated alias guidance.",
-        )
-
-    def test_clear_guidance_removes_valid_legacy_alias_without_loading_it(self):
-        alias = os.path.join(self.root, "Legacy Clear Alias")
-        try:
-            os.symlink(self.project, alias, target_is_directory=True)
-        except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"directory symlinks unavailable: {exc}")
-        legacy_path = os.path.join(
-            self.root,
-            "guidance",
-            fs._legacy_key("Target", alias) + ".json",
-        )
-        fs._replace_json(legacy_path, {
-            "schema": 1,
-            "program": "Target",
-            "project_dir": fs._legacy_canonical(alias),
-            "prompt": "Legacy prompt to clear.",
-            "source": "dashboard",
-            "updated_at": "2026-09-04T00:00:00+00:00",
-        })
-
-        self.assertTrue(fs.clear_guidance(
-            "Target", self.project, root=self.root
-        ))
-        self.assertFalse(os.path.exists(legacy_path))
-        self.assertIsNone(fs.get_guidance(
-            "Target", self.project, root=self.root
-        ))
-
-    def test_legacy_alias_journal_keeps_pending_and_terminal_receipts(self):
-        alias = os.path.join(self.root, "Legacy Journal Alias")
-        try:
-            os.symlink(self.project, alias, target_is_directory=True)
-        except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"directory symlinks unavailable: {exc}")
-        legacy_path = os.path.join(
-            self.root,
-            fs._legacy_key("Target", alias) + ".jsonl",
-        )
+            self.root, fs._legacy_key("Target", alias) + ".jsonl")
         fs._append(legacy_path, {
             "kind": "submission",
             "id": "legacy-steering-id",
@@ -375,31 +338,150 @@ class SteeringTests(unittest.TestCase):
             "created_at": "2026-09-04T00:00:00+00:00",
         })
 
-        pending = fs.list_comments(
-            "Target", self.project, root=self.root
-        )
-        self.assertEqual(["legacy-steering-id"], [row["id"] for row in pending])
-        self.assertEqual("pending", pending[0]["status"])
+        self.assertEqual(
+            [], fs.list_comments("Target", self.project, root=self.root))
         _items, claimed = fs.claim(
-            "Target", self.project, "new-run", root=self.root
-        )
-        self.assertEqual(["legacy-steering-id"], claimed)
+            "Target", self.project, "new-run", root=self.root)
+        self.assertEqual([], claimed)
+
+    def test_current_physical_key_wins_over_an_unprovable_legacy_alias(self):
+        alias = self._alias("Newer Legacy Target Alias")
+        current_path = fs.guidance_path("Target", self.project, self.root)
+        fs._replace_json(current_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._canonical(self.project),
+            "prompt": "Physical-key guidance.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        })
+        legacy_path = self._legacy_guidance(
+            alias, "Newer alias guidance.",
+            updated_at="2026-09-04T01:00:00+00:00")
+
+        loaded = fs.get_guidance("Target", self.project, root=self.root)
+
+        self.assertEqual(loaded["prompt"], "Physical-key guidance.")
+        self.assertTrue(os.path.isfile(legacy_path))
+
+    def test_clear_guidance_leaves_an_unprovable_legacy_alias_untouched(self):
+        alias = self._alias("Legacy Clear Alias")
+        legacy_path = self._legacy_guidance(alias, "Legacy prompt to clear.")
+
+        self.assertFalse(fs.clear_guidance(
+            "Target", self.project, root=self.root))
+        self.assertTrue(os.path.exists(legacy_path))
+        self.assertIsNone(fs.get_guidance(
+            "Target", self.project, root=self.root))
+
+    def test_case_only_legacy_spelling_still_migrates(self):
+        """Fail-closed must reject retargetable links, not lexical spellings.
+
+        A short-name/case spelling names the same physical directory and cannot
+        be pointed anywhere else, so a legacy record written through one is
+        still authenticated and still migrates.
+        """
+        real = os.path.realpath(os.path.abspath(self.project))
+        spelling = os.path.join(self.root, "Target App Spelling")
+        original_realpath = fs.os.path.realpath
+
+        def fake_realpath(path):
+            absolute = os.path.normcase(os.path.abspath(path))
+            wanted = os.path.normcase(os.path.abspath(spelling))
+            return real if absolute == wanted else original_realpath(path)
+
+        legacy_path = os.path.join(
+            self.root, "guidance", fs._legacy_key("Target", spelling) + ".json")
+        fs._replace_json(legacy_path, {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._legacy_canonical(spelling),
+            "prompt": "Keep the authenticated legacy owner workflow.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        })
+        with mock.patch.object(
+            fs.os.path, "realpath", side_effect=fake_realpath
+        ):
+            loaded = fs.get_guidance("Target", self.project, root=self.root)
+            self.assertEqual(
+                loaded["prompt"], "Keep the authenticated legacy owner workflow.")
+            self.assertTrue(os.path.isfile(
+                fs.guidance_path("Target", self.project, self.root)))
+        self.assertFalse(os.path.exists(legacy_path))
+
+    def test_legacy_migration_cannot_overwrite_a_concurrent_owner_save(self):
+        """Selection, migration and legacy deletion are ONE transaction.
+
+        The candidate used to be chosen before ``_replace_json``, whose lock
+        covered only that write and was process-local, so a dashboard save that
+        landed in between was silently replaced by an older migrated record.
+        """
+        legacy_path = os.path.join(self.root, "guidance", "legacy-double.json")
+        legacy_row = {
+            "schema": 1,
+            "program": "Target",
+            "project_dir": fs._canonical(self.project),
+            "prompt": "Stale legacy direction.",
+            "source": "dashboard",
+            "updated_at": "2026-09-04T00:00:00+00:00",
+        }
+        fs._replace_json(legacy_path, dict(legacy_row))
+        holding = threading.Event()
+        release = threading.Event()
+
+        def slow_matches(program, project_dir, *, root=None):
+            holding.set()
+            release.wait(10)
+            return [(legacy_path, dict(legacy_row))]
+
+        saved = threading.Event()
+
+        def save():
+            fs.set_guidance("Target", self.project, "Owner's newest direction.",
+                            root=self.root)
+            saved.set()
+
+        with mock.patch.object(
+            fs, "_legacy_guidance_matches", side_effect=slow_matches
+        ):
+            migrator = threading.Thread(
+                target=fs.get_guidance, args=("Target", self.project),
+                kwargs={"root": self.root})
+            migrator.start()
+            self.assertTrue(holding.wait(10))
+            saver = threading.Thread(target=save)
+            saver.start()
+            try:
+                # The owner save must not slip between selection and migration.
+                self.assertFalse(saved.wait(0.4))
+            finally:
+                release.set()
+            migrator.join(10)
+            saver.join(10)
+
         self.assertEqual(
-            "active",
-            fs.list_comments("Target", alias, root=self.root)[0]["status"],
+            fs.get_guidance("Target", self.project, root=self.root)["prompt"],
+            "Owner's newest direction.",
         )
-        fs.finish(
-            "Target",
-            self.project,
-            "new-run",
-            ["legacy-steering-id"],
-            completed=True,
-            root=self.root,
-        )
-        self.assertEqual(
-            "completed",
-            fs.list_comments("Target", alias, root=self.root)[0]["status"],
-        )
+
+    def test_project_guidance_lookup_does_one_validated_pass(self):
+        """get_guidance per candidate re-scanned the whole directory each time."""
+        for index in range(12):
+            fs.set_guidance(f"Program {index:02d}", self.project,
+                            f"prompt {index:02d}", root=self.root)
+        calls = []
+        real_get_guidance = fs.get_guidance
+
+        def counting(*args, **kwargs):
+            calls.append(args[:2])
+            return real_get_guidance(*args, **kwargs)
+
+        with mock.patch.object(fs, "get_guidance", side_effect=counting):
+            found = fs.get_guidance_for_project(self.project, root=self.root)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(found["prompt"], "prompt 11")
 
     def test_guidance_canonicalization_resolves_windows_junction_identity(self):
         # ``self.project`` can live under an 8.3 SHORT path: the GitHub Windows
