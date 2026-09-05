@@ -1,6 +1,6 @@
 """Shared provider-capacity orchestration for concurrent FlexFactor runs."""
 from __future__ import annotations
-import contextlib, json, os, random, socket, tempfile, threading, time, uuid
+import contextlib, functools, json, os, random, socket, tempfile, threading, time, uuid
 from dataclasses import dataclass
 
 SCHEMA=1
@@ -294,6 +294,7 @@ def install():
                         scope,reset_at=r.limit_scope(exc); _MANAGER.note_outcome(route,outcome,r._retry_after(exc),scope=scope,reset_at=reset_at)
                     return original(route,exc)
                 self._on_error=infra
+        @functools.wraps(prior_run)
         def run(self,method,tier,*a,**kw):
             wait=float(os.environ.get("FLEXFACTOR_PROVIDER_WAIT_MAX_S",DEFAULT_WAIT_MAX_S)); deadline=time.time()+max(0,wait); delay=1.0
             while True:

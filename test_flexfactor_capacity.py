@@ -7,6 +7,7 @@ backends so six program lanes cannot accidentally bypass the shared allowance.
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import tempfile
 import threading
@@ -193,6 +194,19 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
             rotator, lambda _route: backing, tier=rotation.STRONG,
             allow_paid=False,
         )
+
+    def test_capacity_wrapper_preserves_the_rotator_runtime_contract(self):
+        """The installed wrapper must remain transparent to runtime probes.
+
+        Desktop startup installs capacity admission before the stale-runtime
+        guard inspects the route loop.  Replacing ``_run`` without preserving
+        ``__wrapped__`` hid the per-route structured-result validator and made
+        the production checkout fail its own recurrence proof only when the
+        full suite shared one interpreter.
+        """
+        source = inspect.getsource(rotation.RotatingProvider._run)
+        self.assertIn("_result_validator", source)
+        self.assertIn("result_validator(result)", source)
 
     def test_six_real_rotating_providers_share_backend_allowance(self):
         active = 0

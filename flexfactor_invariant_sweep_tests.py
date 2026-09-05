@@ -523,6 +523,30 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "flexfactor_tenets.py::_terminate_process_tree": (
+        "Windows has no os.killpg equivalent, so timeout cleanup invokes only "
+        "the absolute System32 taskkill.exe path with /T /F; POSIX cleanup uses "
+        "os.killpg and never launches another process."
+    ),
+    "flexfactor_tenets.py::_run_bounded_process": (
+        "Optional local Tenets 0.13.3 context ranker launches only the exact "
+        "console script resolved from the active Python installation after exact "
+        "distribution-version validation; the child gets an empty PATH and "
+        "disabled GitPython executable, shell=False, and bounded time/output. "
+        "Linux requires an aggregate memory/PID-capped cgroup-v2 boundary with "
+        "atomic tree kill before launching a subreaper supervisor. Windows "
+        "starts suspended, joins an aggregate-capped kill-on-close Job Object, "
+        "and only then resumes."
+    ),
+    "flexfactor_tenets.py::_linux_supervise_command": (
+        "Dedicated -I/-S Linux supervisor launch boundary. The parent has "
+        "already resolved and version-validated the exact Tenets executable, "
+        "supplied the isolated environment and cwd, and bounded time/output. "
+        "Before shell=False Popen, this process joins its prepared cgroup, "
+        "arms parent-death signalling and an independent deadline, enables "
+        "child-subreaper mode, and proves procfs/pidfd inventory so setsid "
+        "descendants remain owned."
+    ),
     "obsidian_memory.py::run_aibus": (
         "Optional owner-memory bridge, independent of the audited target: "
         "it launches only the owner-configured Python interpreter and AI Bus "
@@ -1379,6 +1403,43 @@ class SweepIsWiredIntoCITests(unittest.TestCase):
         # Reasons must not outlive their module.
         stale = [m for m in self._NOT_IN_CI if m not in modules]
         self.assertEqual(stale, [], f"_NOT_IN_CI names modules that are gone: {stale}")
+
+
+class RepositoryGovernanceTests(unittest.TestCase):
+    """Production controls must not rely on an unwritten review convention."""
+
+    _WORKFLOWS = (
+        "production-readiness.yml",
+        "rotation.yml",
+        "tenets-context.yml",
+    )
+
+    def test_codeowners_protects_workflows_templates_and_security_policy(self):
+        codeowners = _read(os.path.join(_HERE, ".github", "CODEOWNERS"))
+        for rule in (
+                "* @buckeye7066",
+                "/.github/workflows/ @buckeye7066",
+                "/.github/ISSUE_TEMPLATE/ @buckeye7066",
+                "/.github/CODEOWNERS @buckeye7066",
+                "/SECURITY.md @buckeye7066"):
+            self.assertIn(rule, codeowners)
+
+    def test_pr_workflows_cancel_stale_heads_without_duplicate_branch_pushes(self):
+        for name in self._WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = _read(os.path.join(
+                    _HERE, ".github", "workflows", name))
+                self.assertIn("branches: [main]", workflow)
+                self.assertIn("github.event.pull_request.number || github.ref", workflow)
+                self.assertIn("cancel-in-progress: true", workflow)
+                for obsolete in (
+                        "cursor/production-ready/**",
+                        "production-ready/**",
+                        "fix/provider-capacity-orchestration",
+                        "feature/rotation-cursor-competitors",
+                        "copilot/**",
+                        "fix/tenets-context-integration"):
+                    self.assertNotIn(obsolete, workflow)
 
 
 if __name__ == "__main__":

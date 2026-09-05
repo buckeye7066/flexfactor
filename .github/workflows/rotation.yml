@@ -5,14 +5,14 @@ permissions:
 
 on:
   push:
-    branches:
-      - main
-      - "feature/rotation-cursor-competitors"
-      - "cursor/production-ready/**"
-      - "copilot/**"
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   unit-tests:

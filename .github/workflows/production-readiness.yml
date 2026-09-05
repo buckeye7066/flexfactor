@@ -8,13 +8,21 @@ name: production-readiness
 
 on:
   push:
-    branches: [main, "cursor/production-ready/**", "production-ready/**", "fix/provider-capacity-orchestration"]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A pull request already receives a pull_request run.  Keeping feature-branch
+# push triggers as well queued duplicate matrices, and every amended head kept
+# all of its obsolete matrices.  One stable group per PR/ref makes only the
+# newest exact head eligible to consume hosted capacity.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   tests:
@@ -152,6 +160,7 @@ jobs:
                    flexfactor_baseline_ledger_tests.py \
                    flexfactor_project_lookup_tests.py \
                    flexfactor_runtime_hardening_tests.py \
+                   flexfactor_tenets_tests.py \
                    flexfactor_wip_removal_guard_tests.py \
                    test_flexfactor_trust.py \
                    test_flexfactor_partial.py \

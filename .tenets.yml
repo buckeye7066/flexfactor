@@ -1,0 +1,27 @@
+ranking:
+  algorithm: balanced
+  threshold: 0.1
+  use_git: false
+
+context:
+  max_tokens: 100000
+
+ignore:
+  - .git/
+  - .venv/
+  - venv/
+  - __pycache__/
+  - node_modules/
+  - vendor/
+  - build/
+  - dist/
+  - out/
+  - .next/
+  - coverage/
+  - logs/
+  - runs/
+  - android/.gradle/
+  - android/build/
+  - "*.generated.*"
+  - "*_audit_report.md"
+  - "*_run_manifest_*.json"
