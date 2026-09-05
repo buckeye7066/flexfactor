@@ -4097,7 +4097,7 @@ def _rotation_route_provider(route):
             prov.meter = None      # RotatingProvider attaches the shared meter
             prov.client = anthropic.Anthropic(
                 base_url=route.base_url or None,
-                api_key=(os.environ.get(route.auth_env) if route.auth_env else "")
+                api_key=_route_credential(route.auth_env)
                         or os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY")
                         or os.environ.get("ANTHROPIC_API_KEY") or "")
             # __init__ is bypassed, so the lazy-rescue slots it would have
@@ -4413,6 +4413,36 @@ def model_mode_refusal(route, model_mode: str) -> str:
     return ""
 
 
+def _route_credential(auth_env: str) -> str:
+    """The credential this route will ACTUALLY be constructed with.
+
+    `_auto_activate_fcc_proxy` does not DELETE a real `ANTHROPIC_API_KEY` when
+    it turns on the free proxy -- it MOVES it to
+    `FLEXFACTOR_FALLBACK_ANTHROPIC_KEY` and blanks the original, and its own
+    docstring calls that "a strict improvement, not a loss of capability".
+    The Anthropic client construction has always honoured that move.
+
+    The usability FILTER did not. It read `os.environ.get(route.auth_env)`,
+    saw the blanked string, and excluded every real pay-as-you-go Anthropic
+    route as credential-less -- measured live 2026-09-05 on a
+    `--model-mode paid` run: `11x missing ANTHROPIC_API_KEY`, which is the
+    whole `anthropic_api` backend. Paid mode was then left with the FCC
+    subscription routes alone, all of which share ONE capacity allowance whose
+    limit is 1, so the run the owner asked to be FAST serialized instead.
+
+    Two halves of one decision disagreeing is the defect. This is the single
+    answer both now use, so they cannot drift apart again.
+    """
+    if not auth_env:
+        return ""
+    value = (os.environ.get(auth_env) or "").strip()
+    if value:
+        return value
+    if auth_env == "ANTHROPIC_API_KEY":
+        return (os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY") or "").strip()
+    return ""
+
+
 def _route_unusable_reason(route, model_mode: str) -> str:
     """Why this catalog route cannot be served here, or '' when it can.
 
@@ -4467,7 +4497,7 @@ def _route_unusable_reason(route, model_mode: str) -> str:
         healthy, reason = _ollama_route_health(route)
         if not healthy:
             return reason
-    if route.auth_env and not os.environ.get(route.auth_env):
+    if route.auth_env and not _route_credential(route.auth_env):
         return f"missing {route.auth_env}"
     if route.api == "anthropic" and not _provider_key_present("anthropic"):
         return "no anthropic credential in this environment"
@@ -7771,6 +7801,187 @@ def _publication_review_quality_gates(
         row.get("status") == "pass" for row in gates
     )
     return scoped
+
+
+# Completeness gates whose baseline state can be established from a checkout of
+# the publication boundary.  Everything in `_PUBLICATION_EVIDENCE_GATE_IDS` is
+# candidate-safety evidence and is retained unconditionally, so a baseline row
+# for it would change nothing.
+_PUBLICATION_BASELINE_GATE_IDS = frozenset({
+    "build",
+    "function-coverage",
+    "behavior",
+})
+
+
+def _boundary_completeness_gates(
+        project_dir: str, boundary_sha: str | None, stack: dict,
+        evidence_mod, run_id: str, candidate_gates: dict | None, *,
+        baseline_ok: bool | None, baseline_measured_boundary: bool,
+        candidate_e2e_ran: bool, pfx: str = "") -> dict:
+    """Deterministic gate states for the REMOTE publication boundary.
+
+    Publication review has to distinguish a completeness gate that was ALREADY
+    red on `refs/remotes/origin/<default>` from one this candidate turned red.
+    The caller used to synthesise a single `build` row, so every other
+    completeness gate (`function-coverage`, `behavior`) had no baseline state
+    at all: it could never be proven legacy, stayed in the candidate review,
+    and the certifier was told to reject a gate that predated the run.
+
+    Only rows whose evaluation GENUINELY ran against the boundary tree are
+    returned.  A row that could not be measured is OMITTED, never guessed -
+    `_publication_review_quality_gates` then retains the candidate's row, which
+    is the fail-closed direction.  Inventing a red baseline is exactly how a
+    candidate that deletes tests gets mislabelled as an unrelated legacy gap,
+    which is the hole an earlier autonomous patch opened and had reverted.
+
+    Returns a gate bundle shaped like `flexfactor_evidence.quality_gates`, with
+    a possibly empty `gates` list.
+    """
+    rows: list[dict] = []
+    # (a) build.  `baseline_ok` is a REAL measurement, taken in the real working
+    #     directory with the target's real dependencies installed - but it
+    #     measures the pre-mutation HEAD.  It only describes the publication
+    #     boundary when HEAD started there.  Otherwise it says nothing about
+    #     origin's tree and is dropped rather than mislabelled.
+    if baseline_measured_boundary and baseline_ok is not None:
+        rows.append({
+            "id": "build",
+            "name": "Compilation/build",
+            "status": "pass" if baseline_ok is True else "fail",
+            "evidence": {"result": baseline_ok, "commit": boundary_sha,
+                         "basis": "pre-mutation build gate at the boundary commit"},
+        })
+
+    # (b) The tree-derived completeness gates.  Checking out the boundary and
+    #     re-deriving them costs a repository index plus one coverage run, so it
+    #     is spent only when the candidate's own row is non-passing: a green row
+    #     has nothing to exonerate and is retained either way.
+    candidate_states = {
+        str(row.get("id") or ""): str(row.get("status") or "").lower()
+        for row in ((candidate_gates or {}).get("gates") or [])
+        if isinstance(row, dict) and str(row.get("id") or "")
+    }
+    wanted = {
+        gate_id for gate_id in (_PUBLICATION_BASELINE_GATE_IDS - {"build"})
+        if candidate_states.get(gate_id) in {"fail", "blocked"}
+    }
+    if wanted and boundary_sha and evidence_mod is not None:
+        rows.extend(_boundary_tree_gates(
+            project_dir, boundary_sha, stack, evidence_mod, run_id, wanted,
+            candidate_e2e_ran=candidate_e2e_ran, pfx=pfx))
+    return {"scope": "publication-boundary", "commit": boundary_sha,
+            "gates": rows}
+
+
+def _boundary_tree_gates(project_dir: str, boundary_sha: str, stack: dict,
+                         evidence_mod, run_id: str, wanted: set, *,
+                         candidate_e2e_ran: bool, pfx: str = "") -> list[dict]:
+    """Evaluate `wanted` completeness gates on a checkout of `boundary_sha`.
+
+    Never raises: an unavailable boundary yields no rows, and no rows means the
+    candidate keeps every completeness row in its review.
+    """
+    holder = None
+    work = None
+    trust_key = None
+    try:
+        holder = tempfile.mkdtemp(prefix="flexfactor-boundary-")
+        work = os.path.join(holder, "tree")
+        added = _git(["worktree", "add", "--detach", "--force", work,
+                      boundary_sha], project_dir)
+        if added.returncode != 0:
+            print(f"{pfx}publication baseline: boundary checkout unavailable "
+                  f"({_tail(added.stderr or '', 2)}); completeness gates stay "
+                  "in candidate review")
+            return []
+        # The boundary tree is THE SAME repository at an ancestor commit, which
+        # WE checked out into a temporary path. Trust is a property of the
+        # repository the owner named, not of the directory it happens to sit
+        # in - so without propagating it the boundary coverage run would be
+        # refused as untrusted third-party code and this gate could never
+        # produce evidence at all. The grant only ever MIRRORS an authorization
+        # the target already has (an unauthorized target grants nothing, and
+        # the refused run then leaves the row in candidate review), it is
+        # reference-counted, and it is revoked in `finally`.
+        if _execution_authorization(project_dir)[0] is not None:
+            trust_key = _grant_run_trust(work)
+        index = evidence_mod.build_repository_index(work, f"{run_id}-boundary")
+        coverage = evidence_mod.coverage_ledger(
+            index, run_id=f"{run_id}-boundary",
+            test_command=stack.get("full_suite_cmd") or stack.get("test_cmd"),
+            tests_ran=False, tests_passed=None,
+            generated_test_modules=[], e2e=None)
+        coverage_run = {"rows": [], "blocked": {}, "blocked_rejected": [],
+                        "meta": {"available": False, "artifacts": []}}
+        if "function-coverage" in wanted:
+            coverage_run = _direct_coverage_evidence(work, stack, index, pfx)
+            coverage = _ff_coverage.merge_into_function_coverage(
+                coverage, coverage_run["rows"],
+                blocked=coverage_run["blocked"],
+                blocked_rejected=coverage_run["blocked_rejected"])
+        gates = evidence_mod.quality_gates(
+            run_id=f"{run_id}-boundary",
+            baseline_ran=False, baseline_passed=None,
+            suite_command=stack.get("full_suite_cmd"),
+            suite_ran=False, suite_passed=None, tests_collected=False,
+            e2e=None,
+            rescan=evidence_mod.changed_file_rescan(index, []),
+            blast=evidence_mod.dependency_blast_radius(index, []),
+            secrets=evidence_mod.secret_findings(work, index),
+            index=index, coverage=coverage)
+        by_id = {str(row.get("id") or ""): row
+                 for row in (gates.get("gates") or []) if isinstance(row, dict)}
+        meta = coverage_run.get("meta") or {}
+        # A coverage tool that could not run on the boundary tree (missing
+        # dependencies in the fresh worktree, no grounded tool for the stack)
+        # produces an EMPTY artifact set, and an empty artifact set reads as
+        # "nothing is covered".  Accepting that would fabricate a red baseline
+        # and exonerate a candidate that really did delete coverage, so the row
+        # is only trusted when a coverage artifact was actually parsed.
+        coverage_trustworthy = bool(
+            meta.get("available")
+            and any(entry.get("parsed") for entry in (meta.get("artifacts") or [])))
+        out: list[dict] = []
+        for gate_id in sorted(wanted):
+            row = by_id.get(gate_id)
+            if not row:
+                continue
+            if gate_id == "function-coverage" and not coverage_trustworthy:
+                print(f"{pfx}publication baseline: boundary coverage produced no "
+                      "parsed artifact; function-coverage stays in candidate review")
+                continue
+            # `behavior` depends on a browser run that cannot be replayed
+            # against the boundary.  When this run executed no journeys the
+            # run-level input is identical on both sides and only the tree
+            # differs, so the comparison is faithful.  When it DID execute
+            # them the boundary row is not comparable and is dropped.
+            if gate_id == "behavior" and candidate_e2e_ran:
+                continue
+            # Only the id and the status are compared, and this bundle travels
+            # to the certifier inside the review summary. The full evidence
+            # payload (up to 200 symbol ids per list) would bloat that prompt
+            # without changing a single decision.
+            out.append({
+                "id": gate_id,
+                "name": row.get("name"),
+                "status": row.get("status"),
+                "evidence": {"basis": "measured on the publication boundary",
+                             "commit": boundary_sha},
+            })
+        return out
+    except Exception as ex:  # noqa: BLE001 - evidence, never a crash
+        print(f"{pfx}publication baseline: boundary evaluation failed "
+              f"({type(ex).__name__}: {ex}); completeness gates stay in "
+              "candidate review")
+        return []
+    finally:
+        _revoke_run_trust(trust_key)
+        if work:
+            _git(["worktree", "remove", "--force", work], project_dir)
+            _git(["worktree", "prune"], project_dir)
+        if holder:
+            shutil.rmtree(holder, ignore_errors=True)
 
 
 def _publication_safety_ready(quality_gates: dict | None,
@@ -22231,18 +22442,29 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     coverage=coverage_evidence,
                     suite_evidence={"exit_code": suite_exit_code,
                                     "output_tail": suite_log})
+                # The comparison baseline is the REMOTE publication boundary,
+                # measured - not synthesised. A single fabricated `build` row
+                # left every other completeness gate without a baseline state,
+                # so a gate that was already red on origin could never be
+                # proven legacy: it stayed in the candidate review and the
+                # certifier was told to reject a red gate this run did not
+                # cause. Rows that could not be measured are still absent, and
+                # absence still means "retained" - the fail-closed direction.
+                publication_baseline_gates = _boundary_completeness_gates(
+                    project_dir, publication_review_baseline, stack,
+                    evidence_mod, evidence_run_id, gates_evidence,
+                    baseline_ok=baseline_ok,
+                    baseline_measured_boundary=bool(
+                        initial_commit
+                        and publication_review_baseline
+                        and initial_commit == publication_review_baseline),
+                    candidate_e2e_ran=bool((e2e or {}).get("ran")),
+                    pfx=pfx)
                 review_summary = {
                     "review_scope": "candidate-publication-safety",
+                    "publication_baseline": publication_baseline_gates,
                     "quality_gates": _publication_review_quality_gates(
-                        gates_evidence,
-                        {"gates": [{
-                            "id": "build",
-                            "status": (
-                                "pass" if baseline_ok is True else
-                                "fail" if baseline_ok is False else "blocked"
-                            ),
-                        }]},
-                    ),
+                        gates_evidence, publication_baseline_gates),
                     "changed_file_rescan": rescan_evidence,
                     "blast_radius": blast_evidence,
                     "secret_findings": secret_evidence,
