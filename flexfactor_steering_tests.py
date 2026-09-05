@@ -387,7 +387,14 @@ class SteeringTests(unittest.TestCase):
         )
 
     def test_guidance_canonicalization_resolves_windows_junction_identity(self):
-        real = os.path.abspath(self.project)
+        # ``self.project`` can live under an 8.3 SHORT path: the GitHub Windows
+        # runner's TEMP is C:\Users\RUNNER~1\..., and `_canonical` resolves that
+        # to C:\Users\runneradmin\... So the physical identity has to be built
+        # the same way `_canonical` builds it, or the assertion compares a short
+        # spelling against a long one and fails for a reason that has nothing to
+        # do with junctions. Measured on the runner 2026-09-04:
+        #   'c:\\users\\runner~1\\...' != 'c:\\users\\runneradmin\\...'
+        real = os.path.realpath(os.path.abspath(self.project))
         alias = os.path.join(self.root, "Target Junction")
         original_realpath = fs.os.path.realpath
 
