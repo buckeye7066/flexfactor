@@ -17,12 +17,16 @@ the rest of the catalog down with it.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -153,49 +157,49 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             p = cp.CliProvider("claude-code", "m", "claude")
             p.complete("SECRET_PROMPT_TEXT {\"a\": 1}")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("SECRET_PROMPT_TEXT", seen["input"])
         self.assertNotIn("SECRET_PROMPT_TEXT", " ".join(seen["argv"]))
 
     def test_a_nonzero_exit_raises_rather_than_returning_empty(self):
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 2, stdout="", stderr="boom")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_an_EMPTY_answer_is_a_failure_not_a_clean_review(self):
         """An empty result recorded as success is the silent-no-op class."""
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 0, stdout="   ", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_a_timeout_is_bounded_and_reported(self):
         def fake_run(argv, **kw):
             raise subprocess.TimeoutExpired(argv, kw.get("timeout", 1))
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude", timeout=1).complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_every_call_passes_a_timeout(self):
         """An unbounded wait is what froze a live run for 25+ minutes."""
@@ -204,12 +208,12 @@ class CliProviderBehaviourTests(unittest.TestCase):
         def fake_run(argv, **kw):
             seen["timeout"] = kw.get("timeout")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("claude-code", "m", "claude").complete("x")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIsNotNone(seen["timeout"])
         self.assertGreater(seen["timeout"], 0)
 
@@ -229,24 +233,24 @@ class CliProviderBehaviourTests(unittest.TestCase):
                         'Here you go: {"ok": 1} — done'):
             def fake_run(argv, **kw):
                 return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
-            real = subprocess.run
-            subprocess.run = fake_run
+            real = cp._run_process_tree
+            cp._run_process_tree = fake_run
             try:
                 out = cp.CliProvider("claude-code", "m", "claude").structured("x", {})
             finally:
-                subprocess.run = real
+                cp._run_process_tree = real
             self.assertEqual(out, {"ok": 1})
 
     def test_unparseable_json_raises_instead_of_returning_junk(self):
         def fake_run(argv, **kw):
             return subprocess.CompletedProcess(argv, 0, stdout="no json here", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             with self.assertRaises(cp.CliUnavailable):
                 cp.CliProvider("claude-code", "m", "claude").structured("x", {})
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
 
     def test_structured_accepts_the_core_provider_call_shape(self):
         """Fix generation passes system, prompt, schema as three positionals."""
@@ -255,14 +259,14 @@ class CliProviderBehaviourTests(unittest.TestCase):
         def fake_run(argv, **kw):
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}', stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             out = cp.CliProvider("codex-cli", "m", "codex").structured(
                 "SYSTEM RULE", "make the fix", {"type": "object"},
                 max_tokens=123, model="ignored", salvage_truncated=True)
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertEqual(out, {"ok": True})
         self.assertIn("SYSTEM RULE", seen["input"])
         self.assertIn("make the fix", seen["input"])
@@ -281,14 +285,14 @@ class CliProviderBehaviourTests(unittest.TestCase):
                 stderr="",
             )
 
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             result = cp.CliProvider("codex-cli", "gpt-5.6", "codex").grade(
                 "grade this candidate"
             )
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertEqual(96, result["grade"])
         self.assertIs(result["meets_goal"], True)
         self.assertIn('"meets_goal": {"type": "boolean"}', seen["input"])
@@ -303,20 +307,20 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
+        real = cp._run_process_tree
 
-        subprocess.run = fake_run
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("claude-code", "m", "claude").complete("p", system="THEME_MARKER")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("THEME_MARKER", " ".join(seen["argv"]) + (seen["input"] or ""))
 
-        subprocess.run = fake_run
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider("codex-cli", "m", "codex").complete("p", system="THEME_MARKER")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         # codex exec takes no --append-system-prompt, so it must ride the prompt.
         self.assertIn("THEME_MARKER", seen["input"])
 
@@ -327,15 +331,15 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             cp.CliProvider(
                 "copilot-cli", "claude-sonnet-4.6", "copilot"
             ).complete(
                 "PROMPT", system="SYSTEM")
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertIn("-s", seen["argv"])
         self.assertIn("--no-ask-user", seen["argv"])
         self.assertNotIn("--allow-all-tools", seen["argv"])
@@ -351,13 +355,13 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["argv"] = argv
             seen["input"] = kw.get("input")
             return subprocess.CompletedProcess(argv, 0, stdout="OK", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             self.assertTrue(cp.CliProvider(
                 "copilot-cli", "auto", "copilot").ping())
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertNotIn("--version", seen["argv"])
         self.assertIn("Reply with OK", seen["input"])
 
@@ -369,13 +373,13 @@ class CliProviderBehaviourTests(unittest.TestCase):
             seen["input"] = kw.get("input")
             seen["timeout"] = kw.get("timeout")
             return subprocess.CompletedProcess(argv, 0, stdout="OK", stderr="")
-        real = subprocess.run
-        subprocess.run = fake_run
+        real = cp._run_process_tree
+        cp._run_process_tree = fake_run
         try:
             self.assertTrue(cp.CliProvider(
                 "codex-cli", "codex", "codex", timeout=600).ping())
         finally:
-            subprocess.run = real
+            cp._run_process_tree = real
         self.assertNotIn("--version", seen["argv"])
         self.assertIn("--ephemeral", seen["argv"])
         self.assertIn("read-only", seen["argv"])
@@ -436,7 +440,7 @@ class ChatGPTSubscriptionTransportTests(unittest.TestCase):
         oauth = cs.CodexOAuth("secret", "acct", "test")
         with mock.patch.object(cs, "load_exportable_oauth", return_value=oauth), \
              mock.patch.object(cs, "ChatGPTSubscriptionClient", return_value=fake), \
-             mock.patch.object(subprocess, "run") as run:
+             mock.patch.object(cp, "_run_process_tree") as run:
             provider = cp.CliProvider("codex-cli", "codex", "/bin/codex")
             self.assertEqual(provider.complete("PROMPT", system="SYSTEM"), "OK")
         run.assert_not_called()
@@ -447,8 +451,14 @@ class ChatGPTSubscriptionTransportTests(unittest.TestCase):
     def test_managed_work_mode_without_exportable_oauth_fails_before_spawn(self):
         with mock.patch.object(cs, "load_exportable_oauth", return_value=None), \
              mock.patch.object(cp, "_inside_managed_codex_session", return_value=True), \
-             mock.patch.object(subprocess, "run") as run:
-            provider = cp.CliProvider("codex-cli", "codex", "/opt/codex/bin/codex")
+             mock.patch.object(cp, "_run_process_tree") as run:
+            provider = cp.CliProvider(
+                "codex-cli", "codex",
+                # Absolute on BOTH platforms: ntpath.isabs() is False for a
+                # driveless "/opt/..." path, so on Windows the guard under
+                # test was skipped and this failed for an unrelated reason.
+                os.path.abspath(
+                    os.path.join(os.sep, "opt", "codex", "bin", "codex")))
             with self.assertRaisesRegex(cp.CliUnavailable, "brokers.*credential"):
                 provider.ping()
         run.assert_not_called()
@@ -542,6 +552,246 @@ class ChatGPTSubscriptionTransportTests(unittest.TestCase):
         self.assertIn("quota exhausted", message)
         self.assertIn("retry after 12s", message)
         self.assertNotIn("TOP-SECRET", message)
+
+
+
+class CliTimeoutIsActuallyBoundedTests(unittest.TestCase):
+    """The advertised per-call timeout must be the real ceiling.
+
+    THE DEFECT THESE EXIST TO PREVENT
+    ---------------------------------
+    `_run_cli` used `subprocess.run(..., timeout=N)`. On expiry `run` kills
+    only the DIRECT child and then, on Windows, calls `communicate()` a SECOND
+    time with NO timeout - which joins the daemon reader threads, which block
+    until EOF, which never arrives while a descendant still holds the inherited
+    write handle. Measured 2026-09-05 on Windows 11 / CPython 3.14.6: a
+    `timeout=3` call against a child whose worker lived 20s raised after 24.0s
+    and 25.7s - an 8x overrun of a budget the rotation ladder trusts.
+
+    IMPORTANT - why neither test below asserts on elapsed time. Whether the
+    worker wins the race to inherit the pipe handle before the child exits is
+    NOT deterministic: in a measured 12-run sweep only 2 runs overran (24.0s,
+    25.7s); the other 10 returned in ~3.3s. A wall-clock assertion would
+    therefore pass against the unpatched code roughly 80% of the time - a
+    tripwire that mostly does not trip is worse than none. These tests pin the
+    cleanup properties that make the bound hold instead: the tree is really
+    killed, the pipes are neither re-drained nor closed, and the child is
+    given a group to kill.
+    """
+
+    @staticmethod
+    def _alive(pid):
+        """Liveness without psutil. NB: `os.kill(pid, 0)` is unusable here -
+        on Windows it does not probe, it calls TerminateProcess."""
+        if os.name == "nt":
+            tasklist = shutil.which("tasklist")
+            if tasklist is None:                               # pragma: no cover
+                raise unittest.SkipTest("tasklist unavailable to probe liveness")
+            proc = subprocess.run(
+                [tasklist, "/FI", "PID eq %d" % pid, "/NH"],
+                capture_output=True, text=True, timeout=30, check=False)
+            return str(pid) in (proc.stdout or "")
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            return False
+        # A SIGKILLed worker whose parent has already exited lingers as a
+        # zombie until its new reaper collects it, and `kill(pid, 0)` still
+        # succeeds for one. Reaped-or-not is not the question this asks.
+        try:
+            with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)[-1].split()
+            if fields and fields[0] == "Z":
+                return False
+        except OSError:
+            pass
+        return True
+
+    def _reap(self, pid):
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (OSError, ProcessLookupError):
+            pass
+
+    def test_expiry_kills_the_worker_the_cli_spawned_not_just_the_cli(self):
+        """A killed CLI whose worker survives is what holds the pipes open.
+
+        Deterministic: the child is still running at expiry, so the tree walk
+        reaches its worker. This is the shape of an agent CLI that farms the
+        real job out to a subprocess.
+        """
+        if not sys.executable:                                 # pragma: no cover
+            self.skipTest("no interpreter available to spawn the probe tree")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Real script files, not `-c`: a `-c` program carrying a Windows
+            # path is mangled by list2cmdline's backslash rules and the child
+            # then silently does not do what the test believes it does.
+            worker_py = os.path.join(tmp, "worker.py")
+            child_py = os.path.join(tmp, "child.py")
+            pidfile = os.path.join(tmp, "worker.pid")
+            with open(worker_py, "w", encoding="utf-8") as handle:
+                handle.write("import time\ntime.sleep(180)\n")
+            with open(child_py, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "import os, subprocess, sys, time\n"
+                    "here = os.path.dirname(os.path.abspath(__file__))\n"
+                    "p = subprocess.Popen(\n"
+                    "    [sys.executable, os.path.join(here, 'worker.py')])\n"
+                    "with open(os.path.join(here, 'worker.pid'), 'w') as fh:\n"
+                    "    fh.write(str(p.pid))\n"
+                    "time.sleep(180)\n")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                cp._run_process_tree(
+                    [sys.executable, child_py], input="",
+                    capture_output=True, text=True, timeout=4.0, shell=False)
+            with open(pidfile, encoding="utf-8") as handle:
+                worker = int(handle.read().strip())
+        try:
+            # taskkill/killpg are asynchronous; poll rather than assert instantly.
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline and self._alive(worker):
+                time.sleep(0.2)
+            self.assertFalse(
+                self._alive(worker),
+                "the worker the CLI spawned survived the timeout; it keeps the "
+                "captured pipes open and the advertised timeout stops binding")
+        finally:
+            self._reap(worker)
+
+    def test_expiry_never_redrains_or_closes_the_pipes(self):
+        """The other half, and the one a `taskkill` grep would miss.
+
+        A cleanup path that kills the tree and THEN calls `communicate()` again
+        or closes the streams reintroduces the unbounded wait: the second
+        `communicate()` re-joins the same blocked reader threads, and
+        `close()` blocks on the BufferedReader lock the still-reading daemon
+        thread holds. Both were measured taking the full descendant lifetime.
+        """
+        closed = []
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def close(self):
+                closed.append(self.name)
+
+        outer = self
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.pid = 4242
+                self.args = argv
+                self.kwargs = kwargs
+                self.communicate_calls = 0
+                self.killed = False
+                self.waited = False
+                self.stdin = Stream("stdin")
+                self.stdout = Stream("stdout")
+                self.stderr = Stream("stderr")
+                outer.spawned = self
+
+            def communicate(self, input=None, timeout=None):
+                self.communicate_calls += 1
+                raise subprocess.TimeoutExpired(self.args, timeout or 0)
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return -9
+
+            # Popen is a context manager and subprocess.run uses it as one.
+            # Without these, a regression would fail on a TypeError instead of
+            # on the property this test exists to pin.
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                for stream in (self.stdout, self.stderr, self.stdin):
+                    if stream is not None:
+                        stream.close()
+                self.wait()
+
+        guards = [mock.patch.object(subprocess, "Popen", FakePopen),
+                  # No real taskkill for a fabricated pid...
+                  mock.patch.object(cp.shutil, "which", return_value=None)]
+        if hasattr(os, "killpg"):
+            # ...and emphatically no real killpg either: pid 4242 may well be a
+            # live process group on whatever machine runs this suite.
+            guards.append(mock.patch.object(cp.os, "killpg"))
+        with contextlib.ExitStack() as stack:
+            for guard in guards:
+                stack.enter_context(guard)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                cp._run_process_tree(
+                    ["cli"], input="body", capture_output=True, text=True,
+                    timeout=1.0, shell=False)
+
+        spawned = self.spawned
+        self.assertEqual(
+            spawned.communicate_calls, 1,
+            "communicate() was called again after expiry; that re-joins the "
+            "blocked reader threads and restores the unbounded wait")
+        self.assertEqual(
+            closed, [],
+            "the pipes were closed from the calling thread after expiry; "
+            "close() blocks on the lock the reading daemon thread holds")
+        self.assertTrue(spawned.killed, "the child was not killed on expiry")
+        self.assertTrue(spawned.waited, "the killed child was never reaped")
+
+    def test_the_process_group_is_isolated_so_the_tree_can_be_killed(self):
+        """Without its own group/session there is no tree to terminate."""
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                self.pid = 1
+                self.args = argv
+                self.kwargs = kwargs
+                self.stdin = self.stdout = self.stderr = None
+
+            def communicate(self, input=None, timeout=None):
+                return ("out", "err")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            @property
+            def returncode(self):
+                return 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.wait()
+
+        captured = {}
+
+        class Recording(FakePopen):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                captured.update(kwargs)
+
+        with mock.patch.object(subprocess, "Popen", Recording):
+            done = cp._run_process_tree(["cli"], input="b", capture_output=True,
+                                        text=True, timeout=1.0)
+        self.assertEqual((done.returncode, done.stdout, done.stderr),
+                         (0, "out", "err"))
+        if os.name == "nt":
+            self.assertTrue(
+                captured.get("creationflags", 0)
+                & getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                "the CLI was not given its own process group")
+        else:
+            self.assertTrue(captured.get("start_new_session"),
+                            "the CLI was not given its own session")
 
 
 if __name__ == "__main__":
