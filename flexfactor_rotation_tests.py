@@ -1442,10 +1442,6 @@ class RouteRefusal403Tests(unittest.TestCase):
         self.assertEqual(R._classify(exc), "auth_failed")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 # --------------------------------------------------------------------------- #
 # A route failure must name the route that ACTUALLY failed, and a model the
 # provider has retired must leave the rotation.
@@ -1610,3 +1606,6 @@ class RetiredModelClassificationTests(RotationTestCase):
         picked = {rot.next_route().route.id for _ in range(4)}
         self.assertEqual(picked, {alive.id},
                          "rotation kept drawing a model the provider retired")
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
