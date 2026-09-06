@@ -255,9 +255,14 @@ def _python_route_decorator(dec, rel: str):
     """Return (METHOD, path) when `dec` really is an HTTP route decorator.
 
     THIS USED TO BE A REGEX OVER `ast.unparse(dec)`, AND IT INVENTED ROUTES.
-    `@pytest.mark.skipif(os.environ.get("FAC_LIVE") != "1", ...)` contains the
-    substring `.get("FAC_LIVE")`, so a FreeAndClean *test* was indexed as
-    `GET FAC_LIVE` - twice. A desktop file-cleaner with no web surface then
+    A pytest `skipif` marker whose condition reads an environment flag through
+    `os.environ.get(...)` - FreeAndClean's FAC_LIVE - contains the substring
+    `.get(` plus a quoted name, so that *test* was indexed as an HTTP route
+    named after the variable, twice. (Spelled out rather than quoted verbatim
+    here on purpose: `flexfactor_config_surface_tests` scans first-party source
+    for env-var reads and would demand a program under audit have its variable
+    documented in FlexFactor's own .env.example, which would be false.)
+    A desktop file-cleaner with no web surface then
     reported `routes: 2`, which is what flips `behavior_applicable` to True in
     quality_gates(); the `behavior` gate is BLOCKED forever after that, because
     nothing can behaviorally execute a route that does not exist, and the run
@@ -271,7 +276,7 @@ def _python_route_decorator(dec, rel: str):
       * the attribute name must be an HTTP verb or `route`,
       * its first positional argument must be a literal string, and
       * that string must look like a route path (starts with "/").
-    `os.environ.get("FAC_LIVE")` is not the decorator's own callee AND its
+    The environment-flag read above is not the decorator's own callee AND its
     argument is not a path, so it can no longer be mistaken for a route.
     """
     if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):

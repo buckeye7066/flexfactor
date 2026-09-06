@@ -367,7 +367,7 @@
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
-      "content_hash": "21ec08c8bd866e556c388200bd619c4a48981210c4a8cca50c4ff81dca28980d",
+      "content_hash": "bf1da36f493b58dba1d740f5f60a9b90481939aa547615321b670621db6e8982",
       "observed_at": "2026-09-06T16:45:00Z",
       "excerpt": "Fail-closed gate ledger."
     },

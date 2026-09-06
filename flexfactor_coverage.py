@@ -1042,12 +1042,24 @@ def merge_into_function_coverage(fc: dict, rows: list[dict], *,
     # not covered, and it is not merely missing either.
     merged["function_blocked_total"] = gate["blocked"]
     merged["function_blocked_without_reason_total"] = len(gate["blocked_without_reason"])
+    # UNMEASURABLE is a FOURTH state and must be named here too. The gate
+    # already separates "no configured tool can instrument this language" from
+    # "the tool looked and found no execution"; if this loop collapsed the
+    # first into "unproven", the per-function surface would contradict the gate
+    # beside it - exactly the two-surfaces-drift failure this repo keeps
+    # hitting. It is still NOT covered, only differently uncovered.
+    merged["function_unmeasurable_total"] = gate.get("unmeasurable", 0)
+    unmeasurable_ids = set(gate.get("unmeasurable_ids") or [])
     for fn in merged["functions"]:
         if fn.get("id") in set(gate["blocked_ids"]):
             fn["coverage_state"] = "blocked-with-reason"
             fn["blocked_reason"] = gate["blocked_reasons"].get(fn.get("id"))
         elif fn.get("direct_function_coverage"):
             fn["coverage_state"] = "direct"
+        elif fn.get("id") in unmeasurable_ids:
+            fn["coverage_state"] = "unmeasurable"
+            fn["unmeasurable_reason"] = (
+                gate.get("unmeasurable_reasons") or {}).get(fn.get("id"))
         else:
             fn["coverage_state"] = "unproven"
     merged["function_coverage_basis"] = (
