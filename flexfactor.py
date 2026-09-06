@@ -3533,6 +3533,41 @@ def _check_structured_type(data, schema: dict, text: str):
                 raise StructuredOutputShapeError(
                     "Program-understanding output's 'purpose' must be a string, "
                     f"not {type(data.get('purpose')).__name__}")
+        # ABSENCE IS NOT A NEGATIVE ANSWER.
+        # The decoy guard below is deliberately lenient: a response carrying
+        # SOME required keys is treated as a normal partial answer. That is
+        # right for review schemas whose callers use fail-safe .get() defaults
+        # - and catastrophic for `FINAL_REVIEW_SCHEMA`, whose caller reads
+        # absence as a substantive negative verdict:
+        #     data.get("commit") != final_sha        -> "reviewer named a
+        #                                                different commit" (HIGH)
+        #     data.get("evidence_consistent") is True -> False
+        # On the FreeAndClean run freeandclean-20260905-070934-191057-33300-0000
+        # the judges omitted both fields on ALL SIX chunks, so the ledger filed
+        # six HIGH findings reading `expected 9582def..., reviewer said None`.
+        # The reviewer named NOTHING; it did not name something DIFFERENT. That
+        # made `independent-final-review` mathematically unpassable, and with it
+        # `run_complete` - the run could only ever end "interrupted".
+        # A response that omits a field this caller cannot interpret is a
+        # MALFORMED PROVIDER RESPONSE, so raise here and let the rotation retry
+        # on another route (the existing StructuredOutputShapeError path), the
+        # same way every other shape fault is handled.
+        if schema is globals().get("FINAL_REVIEW_SCHEMA"):
+            # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings`
+            # absent is safely an empty list and `reason` is prose, so neither
+            # is demanded here - demanding them would fail routes that answer
+            # the question correctly.
+            missing = []
+            if not str(data.get("commit") or "").strip():
+                missing.append("commit")
+            if not str(data.get("verdict") or "").strip():
+                missing.append("verdict")
+            if not isinstance(data.get("evidence_consistent"), bool):
+                missing.append("evidence_consistent")
+            if missing:
+                raise StructuredOutputShapeError(
+                    "Final-review output omitted required field(s) whose absence "
+                    "cannot be read as an answer: " + ", ".join(missing))
         # DECOY-OBJECT GUARD (measured 2026-08-14 probing the extraction order).
         # _extract_json_object returns the FIRST balanced {...} span, so a
         # response like `Here you go: {"ok":1}\n{"findings":[...` hands back the
@@ -19559,6 +19594,36 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     runnable = [c for c in cmds if c.get("available")]
     meta["candidates"] = [{k: v for k, v in c.items() if k != "argv"} | {"argv": list(c.get("argv") or [])}
                           for c in cmds]
+    # PRODREADY'S CONTRACT IS detect -> INSTALL -> fix -> score, and the ONE
+    # thing standing between this machine and direct function evidence was that
+    # `coverage` is not importable in ANY interpreter here. With no artifact,
+    # `direct_function_rows` labels all 596 FreeAndClean functions
+    # "module-execution-only (NOT direct)", the `function-coverage` gate fails
+    # 0/596, and `run_complete` can never be reached - measured on run
+    # freeandclean-20260905-070934-191057-33300-0000. Detecting a missing free
+    # dev tool and then declining to install it is the detect-only behaviour
+    # prodready exists to replace. Install it, record the attempt as evidence,
+    # and re-ask; a failed install (offline, containment) stays UNPROVEN with
+    # its reason on the record - nothing is ever assumed installed.
+    if eco == "python" and not runnable and spec["test_cmd"]:
+        import importlib.util as _ilu
+        if _ilu.find_spec("coverage") is None:
+            argv = [sys.executable, "-m", "pip", "install", "--quiet",
+                    "--disable-pip-version-check", "coverage"]
+            print(f"{pfx}coverage: not importable - installing it")
+            ins = _run(argv, project_dir, timeout=600)
+            _ilu.invalidate_caches()
+            meta["install"] = {"argv": argv, "rc": ins.returncode,
+                               "tail": _tail((ins.stdout or "") + (ins.stderr or ""), 8)}
+            if ins.returncode == 0 and _ilu.find_spec("coverage") is not None:
+                try:
+                    cmds = _ff_coverage.coverage_commands(project_dir, spec)
+                except Exception as ex:  # noqa: BLE001 - evidence, never a crash
+                    cmds = []
+                    meta["error"] = f"coverage_commands: {type(ex).__name__}: {ex}"
+                runnable = [c for c in cmds if c.get("available")]
+                meta["candidates"] = [{k: v for k, v in c.items() if k != "argv"}
+                                      | {"argv": list(c.get("argv") or [])} for c in cmds]
     if runnable and spec["test_cmd"]:
         meta["available"] = True
         for c in runnable:

@@ -25,7 +25,7 @@ import os
 import re
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 try:
@@ -248,6 +248,54 @@ def _is_test(rel: str) -> bool:
     return any(m in low for m in TEST_MARKERS)
 
 
+ROUTE_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "route")
+
+
+def _python_route_decorator(dec, rel: str):
+    """Return (METHOD, path) when `dec` really is an HTTP route decorator.
+
+    THIS USED TO BE A REGEX OVER `ast.unparse(dec)`, AND IT INVENTED ROUTES.
+    `@pytest.mark.skipif(os.environ.get("FAC_LIVE") != "1", ...)` contains the
+    substring `.get("FAC_LIVE")`, so a FreeAndClean *test* was indexed as
+    `GET FAC_LIVE` - twice. A desktop file-cleaner with no web surface then
+    reported `routes: 2`, which is what flips `behavior_applicable` to True in
+    quality_gates(); the `behavior` gate is BLOCKED forever after that, because
+    nothing can behaviorally execute a route that does not exist, and the run
+    can never reach `run_complete`. (Measured on the FreeAndClean prodready run
+    freeandclean-20260905-070934-191057-33300-0000, which stopped incomplete
+    with `behavior` blocked and `routes: 2` recorded as evidence.)
+
+    So match the DECORATOR ITSELF, structurally, instead of any nested call
+    anywhere inside it:
+      * it must be a call whose callee is an attribute (`app.get`, `bp.route`),
+      * the attribute name must be an HTTP verb or `route`,
+      * its first positional argument must be a literal string, and
+      * that string must look like a route path (starts with "/").
+    `os.environ.get("FAC_LIVE")` is not the decorator's own callee AND its
+    argument is not a path, so it can no longer be mistaken for a route.
+    """
+    if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
+        return None
+    verb = dec.func.attr.lower()
+    if verb not in ROUTE_VERBS or not dec.args:
+        return None
+    first = dec.args[0]
+    if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+        return None
+    path = first.value
+    # A route path is a PATH. Frameworks mount at "/..."; a bare identifier (an
+    # env var name, a dict key) is not a route no matter what the callee is
+    # named.
+    if not path.startswith("/"):
+        return None
+    # A route declared inside a test file is that test's fixture surface, not
+    # the product's. Counting it makes `behavior` applicable to programs that
+    # ship no routes at all.
+    if _is_test(rel):
+        return None
+    return ("GET" if verb == "route" else verb.upper()), path
+
+
 def _symbol(symbol_id: str, name: str, kind: str, rel: str, line: int,
             end_line: int | None = None, exported: bool | None = None) -> dict:
     return {
@@ -284,14 +332,11 @@ def _parse_python(rel: str, text: str) -> dict:
                 else "function", rel, node.lineno, node.end_lineno,
                 not node.name.startswith("_")))
             for dec in node.decorator_list:
-                try:
-                    d = ast.unparse(dec)
-                except Exception:
-                    d = ""
-                m = re.search(r"\.(get|post|put|patch|delete|route)\((['\"])(.*?)\2", d)
-                if m:
-                    result["routes"].append({"id": f"{rel}:{node.lineno}:{m.group(3)}",
-                        "method": m.group(1).upper(), "path": m.group(3), "file": rel,
+                hit = _python_route_decorator(dec, rel)
+                if hit:
+                    method, path = hit
+                    result["routes"].append({"id": f"{rel}:{node.lineno}:{path}",
+                        "method": method, "path": path, "file": rel,
                         "line": node.lineno, "handler": q})
             parents.append(node.name)
             self.generic_visit(node)
@@ -305,8 +350,26 @@ def _parse_python(rel: str, text: str) -> dict:
                 result["imports"].append({"module": item.name, "line": node.lineno})
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            result["imports"].append({"module": "." * node.level + (node.module or ""),
-                                      "line": node.lineno})
+            base = "." * node.level + (node.module or "")
+            if node.level and not node.module:
+                # `from . import migrate` NAMES ITS TARGET IN `names`, NOT IN
+                # `module` (which is None). Recording only the dots threw the
+                # target away and emitted module ".", which resolves to
+                # nothing - so dependency_blast_radius() filed it in
+                # `unresolved_local_imports` and quality_gates() failed the
+                # `blast-radius` gate on it. FreeAndClean has 7 of these
+                # (storage_auto/storage_finalize/storage_strategy/volumes),
+                # which is why its prodready run could never reach
+                # `run_complete`. Any Python package using the ordinary
+                # relative-import form hit this. Emit one import per bound
+                # name, in the canonical relative form (".migrate").
+                for item in node.names:
+                    if item.name == "*":
+                        continue
+                    result["imports"].append({"module": base + item.name,
+                                              "line": node.lineno})
+                return
+            result["imports"].append({"module": base, "line": node.lineno})
 
         def visit_Call(self, node: ast.Call) -> None:
             try:
@@ -559,6 +622,38 @@ def changed_file_rescan(after: dict, changed: Iterable[str]) -> dict:
             "complete": all(r["rescanned"] for r in rows), "files": rows}
 
 
+def _resolve_relative_import(owner: str | None, module: str,
+                             known: set[str]) -> set[str]:
+    """Resolve a dotted RELATIVE import against the importing file's package.
+
+    `from . import migrate` in `system_cleaner/storage_auto.py` targets
+    `system_cleaner/migrate.py` (or that name's package `__init__.py`). The
+    generic stem map cannot express "relative to the importer", so it matched
+    on bare basenames only - and for a bare `from . import X` the indexer used
+    to record module "." with the name discarded, which matched nothing at all
+    and failed the `blast-radius` gate. Level is honoured exactly: one leading
+    dot means the importer's own package, each extra dot walks one package up.
+    Returns an empty set for absolute imports and for anything off the tree.
+    """
+    if not owner or not module.startswith("."):
+        return set()
+    level = len(module) - len(module.lstrip("."))
+    tail = module[level:]
+    base = PurePosixPath(str(owner).replace("\\", "/")).parent
+    for _ in range(level - 1):
+        if base == PurePosixPath("."):
+            return set()          # walked above the repository root
+        base = base.parent
+    parts = [p for p in tail.split(".") if p]
+    stem = base.joinpath(*parts) if parts else base
+    out = set()
+    for cand in (f"{stem}.py", f"{stem}/__init__.py"):
+        cand = cand.lstrip("./") if cand.startswith("./") else cand
+        if cand in known:
+            out.add(cand)
+    return out
+
+
 def dependency_blast_radius(index: dict, changed: Iterable[str]) -> dict:
     """Conservative reverse-import closure. Unknown mappings are surfaced."""
     changed_set = {str(p).replace("\\", "/") for p in changed}
@@ -570,11 +665,19 @@ def dependency_blast_radius(index: dict, changed: Iterable[str]) -> dict:
             stems.setdefault(key, set()).add(rel)
     reverse: dict[str, set[str]] = {f: set() for f in source_files}
     unresolved = []
+    known = {str(f["path"]).replace("\\", "/") for f in index.get("files", [])}
     for imp in index.get("imports", []):
         owner, module = imp.get("file"), str(imp.get("module") or "")
-        keys = {module, module.lstrip("."), module.replace(".", "/"),
-                Path(module.replace(".", "/")).name}
-        targets = set().union(*(stems.get(k, set()) for k in keys))
+        # RESOLVE RELATIVE IMPORTS THE WAY PYTHON DOES, against the importing
+        # file's own package - before falling back to the basename stems.
+        # The stem map matches on bare names, so two `migrate.py` in different
+        # packages resolve to each other; anchoring on the importer removes
+        # that ambiguity for exactly the imports that carry a package anchor.
+        targets = _resolve_relative_import(owner, module, known)
+        if not targets:
+            keys = {module, module.lstrip("."), module.replace(".", "/"),
+                    Path(module.replace(".", "/")).name}
+            targets = set().union(*(stems.get(k, set()) for k in keys))
         if not targets and module.startswith((".", "@/", "~/")):
             unresolved.append({"file": owner, "module": module, "line": imp.get("line")})
         for target in targets:

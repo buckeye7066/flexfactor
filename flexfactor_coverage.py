@@ -46,6 +46,45 @@ FORMAT_GO = "go-coverprofile"
 FORMAT_JACOCO = "jacoco-xml"
 FORMAT_COBERTURA = "cobertura-xml"
 
+# WHICH SOURCE LANGUAGES EACH COVERAGE FORMAT CAN EVEN SPEAK ABOUT.
+# `direct_coverage_gate` demands total == direct + blocked, so before this
+# table a PowerShell function in a Python project counted as a project failure
+# that no amount of testing could clear: `python -m coverage` cannot instrument
+# a .ps1 file, ever. FreeAndClean carries 57 such functions (run_cleaner.ps1,
+# update_all.ps1, reposync.ps1, Run-FreeAndClean-Storage.ps1), which is one
+# reason its prodready run could not reach `run_complete` no matter how many
+# defects were fixed.
+# "Outside what the configured tooling can measure" and "the project never
+# exercised it" are DIFFERENT FACTS. They get different buckets here, and the
+# unmeasurable one is reported by name and reason so it can never read as
+# coverage.
+FORMAT_EXTENSIONS = {
+    FORMAT_PY_JSON: {".py", ".pyi"},
+    FORMAT_PY_SQLITE: {".py", ".pyi"},
+    FORMAT_ISTANBUL: {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"},
+    FORMAT_LCOV: {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+                  ".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".swift"},
+    FORMAT_GO: {".go"},
+    FORMAT_JACOCO: {".java", ".kt", ".kts", ".scala", ".groovy"},
+    FORMAT_COBERTURA: {".py", ".pyi", ".java", ".kt", ".rb", ".php", ".cs"},
+}
+
+
+def measurable_extensions(coverage: dict) -> set[str]:
+    """Extensions the coverage evidence actually in hand can speak about.
+
+    Empty when no artifact was parsed - and then NOTHING is excused as
+    unmeasurable, because with no tool report there is nothing to reason from.
+    """
+    exts: set[str] = set()
+    fmts = [f for f in ((coverage or {}).get("formats") or []) if f]
+    single = (coverage or {}).get("format")
+    if single and single not in fmts:
+        fmts.append(single)
+    for fmt in fmts:
+        exts |= FORMAT_EXTENSIONS.get(fmt, set())
+    return exts
+
 # Formats whose artifacts carry explicit per-function hit records.
 FUNCTION_RECORD_FORMATS = {FORMAT_PY_JSON, FORMAT_ISTANBUL, FORMAT_LCOV,
                            FORMAT_JACOCO, FORMAT_COBERTURA}
@@ -666,6 +705,7 @@ def direct_function_rows(index: dict, coverage: dict) -> list[dict]:
     cov_files = (coverage or {}).get("files") or {}
     fmt = (coverage or {}).get("format") or "none"
     artifact = (coverage or {}).get("artifact")
+    measurable = measurable_extensions(coverage)
     rows: list[dict] = []
     for sym in (index or {}).get("symbols", []):
         if not str(sym.get("kind", "")).endswith("function"):
@@ -678,6 +718,13 @@ def direct_function_rows(index: dict, coverage: dict) -> list[dict]:
         base = {"id": sym.get("id"), "file": rel, "line": line, "name": sym.get("name")}
         matched_rel, rec = _match_file(rel, cov_files)
         if rec is None:
+            ext = os.path.splitext(rel)[1].lower()
+            if measurable and ext not in measurable:
+                rows.append({**base, "status": "unmeasurable", "evidence": None,
+                             "reason": f"no coverage tool configured here instruments "
+                                       f"{ext or 'this file type'}; parsed evidence covers "
+                                       f"{', '.join(sorted(measurable))}"})
+                continue
             rows.append({**base, "status": "unproven", "evidence": None,
                          "reason": "no coverage artifact covers this file"})
             continue
@@ -911,8 +958,17 @@ def direct_function_gate(rows: list[dict], *, blocked=None,
             blocked_ids.append(decl.id)
             reasons[decl.id] = decl.reason
     blocked_set = set(blocked_ids)
+    # Rows the configured coverage tooling CANNOT speak about (a .ps1 function
+    # under `python -m coverage`). Held apart from `unproven`, which means the
+    # tool looked and found no execution.
+    unmeasurable_ids = [r["id"] for r in rows
+                        if r.get("status") == "unmeasurable" and r["id"] not in blocked_set]
+    unmeasurable_set = set(unmeasurable_ids)
+    unmeasurable_reasons = {r["id"]: str(r.get("reason") or "") for r in rows
+                            if r["id"] in unmeasurable_set}
     unproven_ids = [r["id"] for r in rows
-                    if r.get("status") != "direct" and r["id"] not in blocked_set]
+                    if r.get("status") not in ("direct", "unmeasurable")
+                    and r["id"] not in blocked_set]
     total = len(rows)
     accounted = (len(blocked_ids) + len(blocked_without_reason)
                  + len(unknown_blocked) + len(superseded) + len(unreadable))
@@ -925,10 +981,17 @@ def direct_function_gate(rows: list[dict], *, blocked=None,
     return {
         "schema": COVERAGE_ROWS_SCHEMA,
         "total": total, "direct": len(direct_ids), "unproven": len(unproven_ids),
-        "blocked": len(blocked_ids),
-        "complete": (total == len(direct_ids) + len(blocked_ids)
+        "blocked": len(blocked_ids), "unmeasurable": len(unmeasurable_ids),
+        # An UNMEASURABLE function closes the accounting the same way a blocked
+        # one does - it is named, its reason is recorded, and it is reported as
+        # NOT covered. What it must not do is make the gate unreachable: before
+        # this, a repo whose PowerShell the Python coverage tool cannot see
+        # could not pass `function-coverage` at any level of testing.
+        "complete": (total == len(direct_ids) + len(blocked_ids) + len(unmeasurable_ids)
                      and not rejected and not unknown_blocked),
         "unproven_ids": unproven_ids, "blocked_ids": blocked_ids,
+        "unmeasurable_ids": unmeasurable_ids,
+        "unmeasurable_reasons": unmeasurable_reasons,
         "blocked_reasons": reasons,
         "blocked_without_reason": blocked_without_reason,
         "unknown_blocked_ids": unknown_blocked,
