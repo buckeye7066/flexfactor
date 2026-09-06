@@ -1981,6 +1981,92 @@ way would excuse a real defect that cannot reach a service it needs.
 - **Not a repo-rewards defect.** Its build and its 19 pre-existing test files
   were green throughout; the only red tests in the tree were the ones FlexFactor
   generated and never ran.
+## "STOPPED" was a GATE VERDICT, not a crash (2026-09-06, live FreeAndClean)
+
+The dashboard showed FreeAndClean `STOPPED (incomplete)` after ~24 hours, 10
+resumes, 3 commits, 64/82 file fixes and $20.11 of a $25 cap. Nothing had
+crashed. The process exited NORMALLY, wrote `status: "interrupted"`, and the
+reason is in its own checkpoint and gate evidence:
+
+    ~/.flexfactor/runs/<run-id>/checkpoint.json          status / phase / error
+    ~/.flexfactor/evidence/<hash>/<run-id>/quality-gates.json   which gate, and why
+
+`run_complete` requires EVERY quality gate green. Five defects **in FlexFactor**
+made four of them unreachable, so the run could only ever end "interrupted" — no
+amount of fixing the audited program would have changed that. Read the gate
+evidence FIRST; a stopped panel says nothing about which layer failed.
+
+1. **ABSENCE READ AS A NEGATIVE ASSERTION.** `FINAL_REVIEW_SCHEMA` requires
+   `commit` and `evidence_consistent`, but `_check_structured_type` is
+   deliberately lenient — a response carrying SOME required keys is a normal
+   partial answer. The judges omitted both on **all six chunks**, so
+   `data.get("commit") != final_sha` filed six HIGH findings reading
+   `expected 9582def..., reviewer said None`. **The reviewer named NOTHING; it
+   did not name something DIFFERENT.** `independent-final-review` was
+   mathematically unpassable.
+   The guard is now in **`_judge`**, the chokepoint every judging call passes
+   through, and deliberately **AFTER `refuse_clean_if_partial`**. Placed in the
+   shape guard it fired before the partial-output machinery and turned a
+   TRUNCATED final review into a hard error — breaking section 12's contract
+   that salvaged findings are kept as failure evidence. Truncation EXPLAINS an
+   absence; a complete response omitting the field does not, and that one is a
+   retryable provider fault.
+2. **THE ROUTE DETECTOR INVENTED ROUTES.** It regexed
+   `\.(get|post|...)\(` over the UNPARSED decorator, so an environment-flag
+   read inside a `@pytest.mark.skipif` became an HTTP route — twice. A desktop
+   file-cleaner with no web surface reported `routes: 2`, which flips
+   `behavior_applicable` to True, and `behavior` is BLOCKED forever after that
+   because nothing can behaviorally execute a route that does not exist. Now
+   matched STRUCTURALLY on the decorator itself (callee attribute is the verb,
+   first positional arg a literal starting with `/`), test files excluded.
+3. **`from . import X` WAS UNRESOLVABLE.** `ast.ImportFrom` puts the target in
+   `names`, not in `module` (which is `None`), so the indexer recorded module
+   `"."` and threw the target away. **Every Python package using the ordinary
+   relative-import form** failed `blast-radius`; FreeAndClean had 7. The indexer
+   emits one import per bound name (`.migrate`), and resolution is anchored on
+   the importing file's own package with the dot level honoured — so two
+   same-named modules in different packages no longer resolve to each other.
+4. **A `.ps1` FUNCTION COUNTED AS A COVERAGE FAILURE.** `direct_function_gate`
+   required `total == direct + blocked`, and `python -m coverage` cannot
+   instrument PowerShell, ever. FreeAndClean's 57 PowerShell functions made
+   `function-coverage` unreachable at any level of testing. `FORMAT_EXTENSIONS`
+   + an **`unmeasurable`** bucket now separates "outside what the configured
+   tooling can measure" from "the project never exercised it". Unmeasurable rows
+   close the accounting, are reported by id AND reason, carry
+   `coverage_state: "unmeasurable"` on the per-function surface, and **never
+   read as covered**. Nothing is excused when no artifact was parsed at all.
+5. **prodready DETECTED a missing free dev tool and stopped there.** `coverage`
+   is not importable in any interpreter on this machine, so `coverage_commands`
+   returned `available: False`, no artifact was produced, and all 596 functions
+   stayed `module-execution-only (NOT direct)` — **0/596**. prodready's contract
+   is detect → **INSTALL** → fix → score. It installs it now, records the
+   attempt as evidence, and re-asks; a failed install (offline, containment)
+   stays UNPROVEN with its reason on the record.
+
+**Measured on FreeAndClean after the fixes:** `unresolved_local_imports`
+**7 → 0**; phantom routes **2 → 0**; direct function evidence **0/596 → 403
+direct + 57 unmeasurable + 136 genuinely unproven**. The gate still fails on
+those 136 — a real FreeAndClean test gap, not a FlexFactor bug. **No gate was
+weakened**; `flexfactor_completion_gate_tests.py` pins each defect on the exact
+shape that produced it (23 tests, 15 of which fail on the parent commit).
+
+### Two traps this hit, both of which fail CI without naming the cause
+
+- **Editing `flexfactor.py` or `flexfactor_evidence.py` invalidates the purpose
+  contract.** `.flexfactor-purpose.json` binds its `evidence` records to source
+  files by **sha256**. Change a cited file and `_contract_from_registry` rejects
+  the WHOLE contract, `contract_from_repo` returns `None`, and
+  `PurposeContractTests::test_repos_own_contract_file_is_readable_end_to_end`
+  fails on both platforms saying only "must load". **Re-attest the digests (and
+  `observed_at`) in the same commit.** `.gitattributes` pins `*.py text eol=lf`,
+  so hash the LF bytes.
+- **Docstrings are scanned for environment variables.**
+  `flexfactor_config_surface_tests.test_every_runtime_variable_is_documented`
+  regexes first-party source for `os.environ.get("NAME")` and demands each hit
+  appear in `.env.example`. A **docstring** quoting an audited program's variable
+  trips it. Reword the prose — documenting another program's variable in
+  FlexFactor's own config surface would make that surface lie.
+
 ## Obsidian AI Bus — recall before you derive
 
 This repo shares the machine's Obsidian vault (`G:\Obsidian Vault`) with every other
