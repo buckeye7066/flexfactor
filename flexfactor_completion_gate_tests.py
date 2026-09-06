@@ -20,6 +20,7 @@ import unittest
 import flexfactor as ff
 import flexfactor_coverage as ffc
 import flexfactor_evidence as ffe
+import flexfactor_partial as ffp
 
 
 class FinalReviewAbsenceIsNotAnAnswer(unittest.TestCase):
@@ -31,34 +32,73 @@ class FinalReviewAbsenceIsNotAnAnswer(unittest.TestCase):
     `expected 9582def..., reviewer said None` -- the reviewer named NOTHING, it
     did not name something DIFFERENT -- and `independent-final-review` became
     mathematically unpassable.
+
+    The guard lives in `_judge`, the chokepoint every judging call passes
+    through, and deliberately AFTER the partial-output downgrade: truncation
+    already explains an absence, and a salvaged answer has already been made
+    unable to authorize anything.
     """
 
-    def _check(self, data):
-        return ff._check_structured_type(data, ff.FINAL_REVIEW_SCHEMA, "{}")
+    class _Provider:
+        """A provider whose structured() returns exactly what it was given."""
+
+        judge_model = "judge-x"
+        model = "author-x"
+
+        def __init__(self, payload, *, truncated=False):
+            self._payload = payload
+            self._truncated = truncated
+
+        def structured(self, system, prompt, schema, max_tokens=8000, model=None,
+                       salvage_truncated=False, **kwargs):
+            data = ff._check_structured_type(self._payload, schema, "{}")
+            if self._truncated:
+                return ff._mark_partial(data, '{"verdict": "appr', "anthropic")
+            return data
+
+    def setUp(self):
+        ff._PARTIAL_OUTPUT_EVENTS.clear()
+
+    def _judge(self, payload, *, truncated=False):
+        return ff._judge(self._Provider(payload, truncated=truncated),
+                         "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
 
     def test_the_exact_response_that_failed_the_run_is_now_a_provider_fault(self):
         with self.assertRaises(ff.StructuredOutputShapeError) as caught:
-            self._check({"verdict": "approve", "findings": [], "reason": "fine"})
+            self._judge({"verdict": "approve", "findings": [], "reason": "fine"})
         message = str(caught.exception)
         self.assertIn("commit", message)
         self.assertIn("evidence_consistent", message)
 
     def test_a_complete_answer_still_passes_even_with_an_empty_reason(self):
-        data = self._check({"verdict": "approve", "commit": "9582def",
-                            "evidence_consistent": True, "findings": [], "reason": ""})
+        data = self._judge({"verdict": "approve", "commit": "9582def",
+                            "evidence_consistent": True, "findings": [],
+                            "reason": ""})
         self.assertEqual(data["commit"], "9582def")
 
     def test_a_genuine_negative_answer_is_not_touched(self):
         # evidence_consistent=False is a REAL verdict and must flow through.
-        data = self._check({"verdict": "reject", "commit": "9582def",
+        data = self._judge({"verdict": "reject", "commit": "9582def",
                             "evidence_consistent": False, "findings": [],
                             "reason": "evidence does not support the change"})
         self.assertIs(data["evidence_consistent"], False)
 
     def test_an_empty_commit_string_is_not_an_attestation(self):
         with self.assertRaises(ff.StructuredOutputShapeError):
-            self._check({"verdict": "approve", "commit": "   ",
-                         "evidence_consistent": True, "findings": [], "reason": "r"})
+            self._judge({"verdict": "approve", "commit": "   ",
+                         "evidence_consistent": True, "findings": [],
+                         "reason": "r"})
+
+    def test_a_TRUNCATED_answer_is_downgraded_not_raised(self):
+        """Section 12 keeps salvaged findings as failure evidence.
+
+        Truncation already explains why `commit` is missing, and the partial
+        machinery has already forced the verdict off `approve`. Raising here
+        would discard a salvaged review the run is entitled to see.
+        """
+        data = self._judge({"verdict": "approve", "findings": []}, truncated=True)
+        self.assertNotEqual(data["verdict"], "approve")
+        self.assertTrue(ffp.is_partial_structured(data))
 
     def test_other_schemas_keep_their_deliberate_leniency(self):
         # The partial-answer tolerance exists for review schemas whose callers

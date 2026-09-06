@@ -3533,41 +3533,6 @@ def _check_structured_type(data, schema: dict, text: str):
                 raise StructuredOutputShapeError(
                     "Program-understanding output's 'purpose' must be a string, "
                     f"not {type(data.get('purpose')).__name__}")
-        # ABSENCE IS NOT A NEGATIVE ANSWER.
-        # The decoy guard below is deliberately lenient: a response carrying
-        # SOME required keys is treated as a normal partial answer. That is
-        # right for review schemas whose callers use fail-safe .get() defaults
-        # - and catastrophic for `FINAL_REVIEW_SCHEMA`, whose caller reads
-        # absence as a substantive negative verdict:
-        #     data.get("commit") != final_sha        -> "reviewer named a
-        #                                                different commit" (HIGH)
-        #     data.get("evidence_consistent") is True -> False
-        # On the FreeAndClean run freeandclean-20260905-070934-191057-33300-0000
-        # the judges omitted both fields on ALL SIX chunks, so the ledger filed
-        # six HIGH findings reading `expected 9582def..., reviewer said None`.
-        # The reviewer named NOTHING; it did not name something DIFFERENT. That
-        # made `independent-final-review` mathematically unpassable, and with it
-        # `run_complete` - the run could only ever end "interrupted".
-        # A response that omits a field this caller cannot interpret is a
-        # MALFORMED PROVIDER RESPONSE, so raise here and let the rotation retry
-        # on another route (the existing StructuredOutputShapeError path), the
-        # same way every other shape fault is handled.
-        if schema is globals().get("FINAL_REVIEW_SCHEMA"):
-            # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings`
-            # absent is safely an empty list and `reason` is prose, so neither
-            # is demanded here - demanding them would fail routes that answer
-            # the question correctly.
-            missing = []
-            if not str(data.get("commit") or "").strip():
-                missing.append("commit")
-            if not str(data.get("verdict") or "").strip():
-                missing.append("verdict")
-            if not isinstance(data.get("evidence_consistent"), bool):
-                missing.append("evidence_consistent")
-            if missing:
-                raise StructuredOutputShapeError(
-                    "Final-review output omitted required field(s) whose absence "
-                    "cannot be read as an answer: " + ", ".join(missing))
         # DECOY-OBJECT GUARD (measured 2026-08-14 probing the extraction order).
         # _extract_json_object returns the FIRST balanced {...} span, so a
         # response like `Here you go: {"ok":1}\n{"findings":[...` hands back the
@@ -4037,7 +4002,47 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
     # clean/keep/approve/ready/pass is downgraded HERE, at the one judging
     # chokepoint, so no caller can read a truncated answer as authorization.
-    return _ff_partial.refuse_clean_if_partial(data)
+    data = _ff_partial.refuse_clean_if_partial(data)
+    # ABSENCE IS NOT A NEGATIVE ANSWER.
+    # _check_structured_type is deliberately lenient: a response carrying SOME
+    # required keys is a normal partial answer. That is right for review
+    # schemas whose callers use fail-safe .get() defaults - and catastrophic
+    # for FINAL_REVIEW_SCHEMA, whose caller reads absence as a substantive
+    # NEGATIVE verdict:
+    #     data.get("commit") != final_sha         -> "reviewer named a
+    #                                                 DIFFERENT commit" (HIGH)
+    #     data.get("evidence_consistent") is True -> False
+    # On the FreeAndClean run freeandclean-20260905-070934-191057-33300-0000
+    # the judges omitted both fields on ALL SIX chunks, so the ledger filed six
+    # HIGH findings reading `expected 9582def..., reviewer said None`. The
+    # reviewer named NOTHING; it did not name something DIFFERENT. That made
+    # `independent-final-review` mathematically unpassable, and with it
+    # `run_complete` - the run could only ever end "interrupted".
+    # A COMPLETE response that omits a field this caller cannot interpret is a
+    # malformed provider response, so raise and let the rotation retry on
+    # another route, exactly as every other shape fault is handled.
+    # A TRUNCATED one is exempt: truncation already EXPLAINS the absence, and
+    # the partial machinery above has already made it unable to authorize
+    # anything. Raising there would throw away salvaged findings that section
+    # 12 keeps as failure evidence.
+    if (schema is globals().get("FINAL_REVIEW_SCHEMA")
+            and isinstance(data, dict)
+            and not _ff_partial.is_partial_structured(data)):
+        # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings`
+        # absent is safely an empty list and `reason` is prose, so neither is
+        # demanded - demanding them would fail routes that answer correctly.
+        missing = []
+        if not str(data.get("commit") or "").strip():
+            missing.append("commit")
+        if not str(data.get("verdict") or "").strip():
+            missing.append("verdict")
+        if not isinstance(data.get("evidence_consistent"), bool):
+            missing.append("evidence_consistent")
+        if missing:
+            raise StructuredOutputShapeError(
+                "Final-review output omitted required field(s) whose absence "
+                "cannot be read as an answer: " + ", ".join(missing))
+    return data
 
 
 def _provider_key_present(name: str) -> bool:
