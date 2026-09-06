@@ -22820,6 +22820,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # the request itself has to be in the immutable evidence.
             "model_mode": normalize_model_mode(getattr(args, "model_mode", "free")),
             "paid_models": str(getattr(args, "paid_models", "both") or "both").lower(),
+            # ...and, beside the request, whether it was actually HONOURED.
+            # Recording a requested value alone let the manifest imply a
+            # choice the run never made.
+            "inert_flags_not_enforced": list(
+                getattr(args, "inert_flags_named", []) or []),
             "cross_verification_requested": bool(getattr(args, "use_both", False)),
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
@@ -23586,6 +23591,58 @@ def _program_failure_reasons(r: dict, *, apply_requested: bool) -> list[str]:
         if barren:
             reasons.append(barren)
     return reasons
+
+
+#: Route-selection flags that argparse still ACCEPTS but nothing enforces.
+#: Each maps to the sentence a user needs: what it does not do, and what the
+#: real lever is.
+_INERT_ROUTE_FLAGS = {
+    "--model-mode": (
+        "every mode now normalizes to the single best-available ladder "
+        "(MODEL_MODES is ('best',) and model_mode_refusal() admits every "
+        "route); to change which capacity is used, change the CATALOG "
+        "(AI_ROTATE_CATALOG) or the per-allowance limit "
+        "(FLEXFACTOR_PROVIDER_MAX_INFLIGHT)"),
+    "--paid-models": (
+        "no route filter reads it; it is recorded in the run manifest and "
+        "otherwise ignored"),
+}
+
+
+def _warn_inert_route_flags(raw_argv) -> list[str]:
+    """Say out loud that a retired route flag will not be honoured.
+
+    Checked against the RAW argv, exactly like `--no-push`/`--no-merge`,
+    because a parsed value cannot distinguish "the owner asked for this" from
+    "this is the default".
+
+    WHY (measured 2026-09-05): the owner explicitly authorised a paid path and
+    the run was launched with `--model-mode paid --paid-models both`. Neither
+    is enforced any more. The run went on using the flat-rate subscription --
+    correct for the ladder, but NOT what was asked -- while
+    `_write_run_manifest` filed both values under a comment reading "the
+    request itself has to be in the immutable evidence". So the evidence
+    recorded a choice the run never made, and the only place the retirement
+    was mentioned was `normalize_model_mode`, which the audit path reaches at
+    MANIFEST-WRITE time, i.e. after the run is over.
+
+    A flag that is accepted, recorded as a choice, and silently unenforced is
+    worse than one that errors: it manufactures false confidence. Deleting it
+    is not the answer either -- that is argparse exit 2 for every existing
+    launcher and scheduled task (the documented launcher-drift trap). So it
+    keeps working, and it says what it is.
+
+    Returns the flags that were named, so callers can record them.
+    """
+    named = []
+    for token in [str(a) for a in (raw_argv or [])]:
+        flag = token.split("=", 1)[0]
+        if flag in _INERT_ROUTE_FLAGS and flag not in named:
+            named.append(flag)
+    for flag in named:
+        print(f"  [inert-flag] {flag} is RETIRED and NOT enforced: "
+              f"{_INERT_ROUTE_FLAGS[flag]}.", file=sys.stderr)
+    return named
 
 
 def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
@@ -25059,6 +25116,10 @@ def main(argv=None) -> int:
         # invocation (exit 2) before anything runs or spends.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        # BEFORE anything runs or spends: name every route flag that will not
+        # be honoured. Saying it at the end (which is where
+        # normalize_model_mode is reached) is too late to change the decision.
+        args.inert_flags_named = _warn_inert_route_flags(rest)
         # The competitor gate stays MANDATORY — that half of the product
         # contract is unchanged and the flag remains inert on purpose.
         args.competitors = True
