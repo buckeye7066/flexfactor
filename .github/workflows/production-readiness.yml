@@ -155,6 +155,7 @@ jobs:
                    flexfactor_dashboard_tests.py \
                    flexfactor_purpose_wiring_tests.py \
                    flexfactor_model_mode_tests.py \
+                   flexfactor_inert_flag_tests.py \
                    flexfactor_paid_credential_tests.py \
                    flexfactor_route_fault_tests.py \
                    flexfactor_baseline_ledger_tests.py \
