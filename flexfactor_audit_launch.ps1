@@ -51,7 +51,7 @@ if (-not [string]::IsNullOrWhiteSpace($costRaw) -and
     exit 2
 }
 
-$cliArgs = @("audit", "--model-mode", "best", "--max-cost", "$cost",
+$cliArgs = @("audit", "--max-cost", "$cost",
              "--max-cycles", "6", "--apply", "--yes", "--auto-clean")
 foreach ($program in $programs) { $cliArgs += @("--program", $program) }
 if (-not [string]::IsNullOrWhiteSpace($sessionPrompt)) {

@@ -87,8 +87,7 @@ try {
         if ([string]::IsNullOrWhiteSpace($goal)) { throw "A refactor goal is required." }
         $threshold = Read-BoundedInteger "Acceptance threshold (0-100, Enter = 90)" 90 0 100
         $cliArgs = @("refactor", "--goal", $goal, "--threshold", "$threshold",
-                     "--max-iterations", "6", "--max-cost", "$cost",
-                     "--model-mode", "best")
+                     "--max-iterations", "6", "--max-cost", "$cost")
         foreach ($target in $targets) { $cliArgs += @("--file", $target) }
     } elseif ($mode -eq "2") {
         $targets = @(Read-FlexFactorTargets "program" @($args))
@@ -96,14 +95,14 @@ try {
         if ($contextConsent -cne "YES") {
             throw "Scout cancelled; program source context was not sent."
         }
-        $cliArgs = @("scout", "--max-cost", "$cost", "--model-mode", "best",
+        $cliArgs = @("scout", "--max-cost", "$cost",
                      "--allow-remote-program-context")
         foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     } else {
         $label = if ($mode -eq "3") { "audit program" } else { "production program" }
         $targets = @(Read-FlexFactorTargets $label @($args))
         $command = if ($mode -eq "3") { "audit" } else { "prodready" }
-        $cliArgs = @($command, "--model-mode", "best", "--max-cost", "$cost",
+        $cliArgs = @($command, "--max-cost", "$cost",
                      "--max-cycles", "6", "--apply", "--yes", "--auto-clean")
         foreach ($target in $targets) { $cliArgs += @("--program", $target) }
     }

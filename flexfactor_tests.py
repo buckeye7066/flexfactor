@@ -12431,8 +12431,22 @@ class LauncherOpenAIKeyTests(unittest.TestCase):
         self.assertNotIn("freecc", text)
 
     def test_launcher_has_one_model_policy_and_no_provider_menu(self):
+        """One policy, stated in the banner and NOT re-asserted as a dead flag.
+
+        This used to require `"--model-mode", "best"` in the launcher. That was
+        a proxy for the intent -- and it outlived the flag: `--model-mode` has
+        been inert since MODEL_MODES became ("best",), so PR #164 made it print
+        "RETIRED and NOT enforced" on the raw argv. Because the launcher passed
+        it, the notice fired on EVERY owner run. The assertion that was meant to
+        protect the single-policy design was pinning the defect in place.
+
+        The intent is unchanged and is now checked directly: the banner states
+        the policy, no menu offers an alternative, and the launcher forwards no
+        flag the runtime does not honour.
+        """
         text = self._launcher_text()
-        self.assertIn('"--model-mode", "best"', text)
+        self.assertNotIn("--model-mode", text)
+        self.assertNotIn("--paid-models", text)
         self.assertIn("strongest paid capacity first", text)
         self.assertNotIn("Provider [", text)
         self.assertNotIn("Model mode [", text)
@@ -20030,7 +20044,10 @@ class WindowsConsoleUtf8RegressionTests(unittest.TestCase):
             src = fh.read()
         self.assertIn('$env:PYTHONUTF8 = "1"', src)
         self.assertIn('$env:PYTHONIOENCODING = "utf-8"', src)
-        self.assertIn('"--model-mode", "best"', src)
+        # Not `assertIn('"--model-mode", "best"')`: that flag is RETIRED, and a
+        # launcher that passes it makes the runtime print an inert-flag notice
+        # on every run. The shared ladder is the only path either way.
+        self.assertNotIn("--model-mode", src)
         self.assertNotIn("--single", src)
         self.assertNotIn("--economy", src)
         self.assertNotIn("--provider", src)

@@ -29,5 +29,5 @@ if (-not $Rest -or $Rest.Count -eq 0) {
 }
 
 Write-Host "The Glimmer-only bypass is retired; using FlexFactor's standard model ladder." -ForegroundColor Cyan
-Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $Rest + @("--model-mode", "best"))
+Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $Rest)
 exit $LASTEXITCODE
