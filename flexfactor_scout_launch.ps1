@@ -56,7 +56,7 @@ if ($contextConsent -cne "YES") {
     exit 2
 }
 
-$cliArgs = @("scout", "--model-mode", "best", "--max-cost", "$cost",
+$cliArgs = @("scout", "--max-cost", "$cost",
              "--allow-remote-program-context")
 foreach ($program in $programs) { $cliArgs += @("--program", $program) }
 
