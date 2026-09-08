@@ -98,6 +98,10 @@ class RotationError(RuntimeError):
         self.reasons = reasons or {}
 
 
+class ProviderHealthError(RuntimeError):
+    """A route explicitly failed its health check; try another route."""
+
+
 class ReviewerSeparationError(RotationError):
     """Independent review is impossible under the current route identities."""
 
@@ -1174,7 +1178,7 @@ class Rotator:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
-                 transport_dead | model_retired | malformed_output | error
+                 transport_dead | model_retired | health_failed | malformed_output | error
         """
         now = time.time() if now is None else now
 
@@ -1241,6 +1245,13 @@ class Rotator:
                 # route, not evidence that its provider is sick.
                 cooldowns[f"route:{route.id}"] = now + float(
                     retry_after_seconds or TRANSPORT_DEAD_COOLDOWN)
+                strikes.pop(route.id, None)
+                return
+
+            if outcome == "health_failed":
+                # Explicit failed health is about this route, not its ledger.
+                # Do not escalate prior route strikes to healthy siblings.
+                cooldowns[route_key] = now + float(retry_after_seconds or ROUTE_ERROR_COOLDOWN)
                 strikes.pop(route.id, None)
                 return
 
@@ -1609,21 +1620,29 @@ class RotatingProvider:
             return provider
 
     def _run(self, method: str, tier: str, *args, **kwargs) -> Any:
-        """One rotated attempt per healthy pool, then give up honestly.
+        """Bound pool failures separately from route-only health/retirement.
 
-        Bounded by the number of distinct pools rather than a fixed retry count:
-        retrying the same ledger cannot help, and every other ledger deserves a
-        turn before the call is declared impossible.
+        Generic failures keep the pool bound. A failed route cannot consume
+        healthy siblings' attempts; route-only failures extend the bound up to
+        the eligible route count. Preflight may impose a stricter total cap.
         """
         intent = self._complete_intent(kwargs.pop("intent", None))
         result_validator = kwargs.pop("_result_validator", None)
+        attempt_limit = kwargs.pop("_attempt_limit", None)
+        if attempt_limit is not None and (not isinstance(attempt_limit, int) or attempt_limit < 1):
+            raise ValueError("attempt limit must be a positive integer")
         # Budget attempts across EVERY tier this call may actually be served
         # from: next_route demotes DOWN TIER_CHAIN when the requested tier has
         # no candidate, so counting only the requested tier's pools starved a
         # demoted call (frontier has few pools, light has many) of the serving
         # tier's rotation.
         tiers = TIER_CHAIN[TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT):]
-        attempts = max(1, len({r.pool for t in tiers for r in self.catalog_routes(t)}))
+        eligible = {r.id: r for t in tiers for r in self.catalog_routes(t)}
+        attempts = max(1, len({r.pool for r in eligible.values()}))
+        route_bound = max(1, len(eligible))
+        if attempt_limit is not None:
+            route_bound = min(route_bound, attempt_limit)
+        attempts = min(attempts, route_bound)
         last_error: Optional[BaseException] = None
         shape_failed_routes: List[
             Tuple[Route, Optional[Tuple[float, str]]]] = []
@@ -1649,7 +1668,9 @@ class RotatingProvider:
                     releaser(failed_route, expected_until)
 
         allow_paid_for_call = self._allow_paid
-        for attempt in range(attempts):
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
             extra: Dict[str, Any] = {}
@@ -1753,6 +1774,11 @@ class RotatingProvider:
                     shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
+                if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
+                    # A dead route has not consumed its healthy siblings' pool.
+                    # Extend only route-scoped failures, bounded by identities
+                    # and by the caller's total preflight transport-call cap.
+                    attempts = min(route_bound, attempts + 1)
                 continue
             self.rotator.report(route, "ok")
             if intent is not None and intent.role:
@@ -1901,6 +1927,14 @@ class RotatingProvider:
         return result
 
     def ping(self, *args, **kwargs):
+        def validate_health(result):
+            if result is False:
+                raise ProviderHealthError("model route returned a failed health verdict")
+            return result
+
+        # Reject inside the attempt so the failed route is recorded and cooled.
+        # Checking only in the caller would report this route as successful.
+        kwargs["_result_validator"] = validate_health
         return self._run("ping", self._judge_tier, *args, **kwargs)
 
 
@@ -2053,6 +2087,8 @@ def _classify(exc: BaseException) -> str:
     # Checked last among the specific outcomes: the branches above describe an
     # allowance or a credential, which a retired model id is not. Reaching here
     # with a 404 that names the model means the endpoint is permanently gone.
+    if isinstance(exc, ProviderHealthError):
+        return "health_failed"
     if is_model_retired_error(exc):
         return "model_retired"
     return "error"
@@ -2095,6 +2131,8 @@ def _is_retryable(exc: BaseException) -> bool:
                         SyntaxError, IndentationError, AssertionError)):
         return False
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
+        return True
     if isinstance(status, int) and status in (400, 404, 422):
         # A ROUTE-CAPABILITY 400/404 (output ceiling, context window, an
         # unsupported parameter, a model this backend does not serve) is bad on

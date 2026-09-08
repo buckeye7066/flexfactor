@@ -4215,6 +4215,11 @@ def _rotation_route_provider(route):
 # process instead of once per program in a batch run.
 _ROTATION_REASON_PRINTED: set[str] = set()
 _LAST_ROTATION_USABLE = 0   # usable route count of the last rotation build
+#: How many DISTINCT routes preflight may prove dead before it declares the
+#: ladder unusable. Each failed ping benches its own route, so every retry
+#: draws a different one. Bounded on purpose: a catalog can hold hundreds of
+#: routes and preflight must not tour them all before the run starts.
+PREFLIGHT_PING_ATTEMPTS = 3
 # Same guard for the catalog-staleness warning, keyed by catalog PATH: the fact
 # is about the file, so it is worth saying once and worthless said per route.
 # LOCKED, unlike its sibling above: a `--parallel` batch builds providers from
@@ -4851,13 +4856,57 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
     if not getattr(args, "no_preflight", False):
         ping = getattr(primary, "ping", None)
         if callable(ping):
-            try:
-                if ping() is False:
-                    raise RuntimeError("model route returned a failed health verdict")
-            except Exception as exc:  # route/pool is already benched by rotation
+            # ONE DEAD ROUTE IS NOT A DEAD LADDER. The failed ping benches its
+            # own route (that is what the old comment here observed), so the
+            # next attempt draws a DIFFERENT one -- but the old code returned
+            # immediately and threw the whole run away.
+            #
+            # Measured 2026-09-05: a catalog of 169 routes over 7 pools died in
+            # 25 log lines because the first route probed was Google's retired
+            # `gemini-2.5-pro`, which 404s "no longer available to new users".
+            # The run reported "the best-available model ladder has no live
+            # inference route" and stopped before cycle 1. 168 live routes were
+            # never asked.
+            #
+            # Retries only while there is something else to draw: a single-route
+            # ladder (or a fixed provider) keeps exactly the old one-shot
+            # behaviour, because re-pinging the same dead transport three times
+            # just burns three deadlines.
+            from flexfactor_rotation import (ProviderHealthError, RotationError, RotatingProvider,
+                                             PinUnavailable, ReviewerSeparationError,
+                                             _is_retryable)
+
+            route_budget = max(1, min(PREFLIGHT_PING_ATTEMPTS, _LAST_ROTATION_USABLE))
+            rotating = isinstance(primary, RotatingProvider)
+            # Production rotation owns route accounting and receives ONE total
+            # transport budget. Opaque providers retain the bounded outer loop.
+            attempts = 1 if rotating else route_budget
+            failures: list[str] = []
+            for attempt in range(1, attempts + 1):
+                try:
+                    healthy = ping(_attempt_limit=route_budget) if rotating else ping()
+                    if healthy is False:
+                        raise ProviderHealthError("model route returned a failed health verdict")
+                    failures = []
+                    break
+                except Exception as exc:  # this route is benched; try the next
+                    failures.append(f"{type(exc).__name__}: {exc}")
+                    # Cancellation, policy refusals and programming errors are
+                    # not transport outages. Never retry them across providers.
+                    terminal = isinstance(exc, (PinUnavailable, ReviewerSeparationError))
+                    cause = exc.__cause__ if isinstance(exc, RotationError) else None
+                    if terminal or not _is_retryable(cause or exc):
+                        break
+                    if attempt < attempts:
+                        print(f"  [preflight] route {attempt}/{attempts} failed its "
+                              f"health check ({type(exc).__name__}); "
+                              "trying the next one", file=sys.stderr)
+            if failures:
                 _PROVIDER_DIAGNOSIS = (
-                    "the best-available model ladder has no live inference route: "
-                    f"{type(exc).__name__}: {exc}"
+                    "preflight found no live inference route "
+                    f"after {len(failures)} bounded probe(s), "
+                    f"transport-attempt limit {route_budget}; "
+                    "untried routes may remain: " + "; ".join(failures)
                 )
                 return []
     providers: list[tuple[str, object]] = [("best-available", primary)]

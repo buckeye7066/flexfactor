@@ -325,15 +325,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "4db8410d76d6269106578b1c673c5da0be57569e04cc634afed72765d7cd5a0c",
-      "observed_at": "2026-09-05T14:20:00Z",
+      "content_hash": "e46796602f22ccc6bd6404ed6f13427e26df2b43f81b749d38272912f9d5f8e6",
+      "observed_at": "2026-09-08T06:31:37Z",
       "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "19c29a9f5c90674975ca50591d4322e0db93c382e4bc3ad4185000ac413d7387",
-      "observed_at": "2026-09-06T16:45:00Z",
+      "content_hash": "cfea4321da029f4848be7ea70d4d3ce78d844f89e10bc02f637dada74ff06399",
+      "observed_at": "2026-09-08T06:31:37Z",
       "excerpt": "Modes, verification, review, publication."
     },
     {
