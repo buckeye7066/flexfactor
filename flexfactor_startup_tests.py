@@ -69,6 +69,9 @@ class StartupStateTests(unittest.TestCase):
                                   "--no-preflight", "--no-dashboard", "--no-tests",
                                   "--no-e2e", "--no-full-suite", "--max-cycles", "1"])
             with patch.object(evidence.EventLedger, "emit", capture), \
+                 patch.object(ff, "BRAIN_PATH", str(Path(root) / "state" / "brain.json")), \
+                 patch.object(ff, "STATUS_PATH", str(Path(root) / "state" / "status.json")), \
+                 patch.object(ff, "RUNS_PATH", str(Path(root) / "state" / "runs")), \
                  patch.object(ff, "_review_all", side_effect=fail_reviews), \
                  patch.object(ff, "build_audit_providers", return_value=[("stub", _StubProvider())]), \
                  patch.object(ff, "_ensure_program_understanding", side_effect=lambda *a, **k: _unit_purpose_understanding()), \
