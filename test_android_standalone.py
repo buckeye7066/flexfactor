@@ -397,7 +397,13 @@ class ManagedAndroidInvariants(unittest.TestCase):
             self.assertIn(provider, workflow.lower())
         self.assertIn('--threshold "$THRESHOLD"', workflow)
         self.assertIn('--max-iterations "$MAX_ITERATIONS"', workflow)
-        self.assertIn("--model-mode best", workflow)
+        # NOT `assertIn("--model-mode best")`: that flag is RETIRED and the
+        # runtime prints an inert-flag notice for it on the raw argv, so a
+        # workflow that passes it tells every mobile run that its request is
+        # being ignored. Desktop parity is the single shared ladder, which is
+        # what you get by passing nothing.
+        self.assertNotIn("--model-mode", workflow)
+        self.assertNotIn("--paid-models", workflow)
         self.assertNotIn("--economy", workflow)
         self.assertNotIn("--single", workflow)
         self.assertIn("--auto-clean", workflow)
