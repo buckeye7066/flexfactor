@@ -4872,15 +4872,20 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             # ladder (or a fixed provider) keeps exactly the old one-shot
             # behaviour, because re-pinging the same dead transport three times
             # just burns three deadlines.
-            from flexfactor_rotation import (ProviderHealthError, RotationError,
+            from flexfactor_rotation import (ProviderHealthError, RotationError, RotatingProvider,
                                              PinUnavailable, ReviewerSeparationError,
                                              _is_retryable)
 
-            attempts = max(1, min(PREFLIGHT_PING_ATTEMPTS, _LAST_ROTATION_USABLE))
+            route_budget = max(1, min(PREFLIGHT_PING_ATTEMPTS, _LAST_ROTATION_USABLE))
+            rotating = isinstance(primary, RotatingProvider)
+            # Production rotation owns route accounting and receives ONE total
+            # transport budget. Opaque providers retain the bounded outer loop.
+            attempts = 1 if rotating else route_budget
             failures: list[str] = []
             for attempt in range(1, attempts + 1):
                 try:
-                    if ping() is False:
+                    healthy = ping(_attempt_limit=route_budget) if rotating else ping()
+                    if healthy is False:
                         raise ProviderHealthError("model route returned a failed health verdict")
                     failures = []
                     break
@@ -4899,7 +4904,8 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             if failures:
                 _PROVIDER_DIAGNOSIS = (
                     "preflight found no live inference route "
-                    f"after {len(failures)} bounded attempt(s); "
+                    f"after {len(failures)} bounded probe(s), "
+                    f"transport-attempt limit {route_budget}; "
                     "untried routes may remain: " + "; ".join(failures)
                 )
                 return []

@@ -257,5 +257,86 @@ class RealRotatorPreflightTests(unittest.TestCase):
         self.assertIn('untried routes may remain', ff._PROVIDER_DIAGNOSIS)
 
 
+class ReviewSharedPoolTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        import flexfactor_rotation as rotation
+        from flexfactor_rotation_tests import route, catalog
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.rotation = rotation
+        self.routes = [route(f'backend/model{i}', 'shared', cost=rotation.PAID_METERED)
+                       for i in range(5)]
+        self.store = rotation.StateStore(self.tmp.name + '/state.json')
+        self.rotator = rotation.Rotator(catalog=catalog(*self.routes), store=self.store)
+
+    def test_failed_health_clears_route_strikes_without_cooling_siblings(self):
+        r = self.routes[0]
+        self.rotator.report(r, 'error', now=1)
+        self.rotator.report(r, 'error', now=40)
+        outcome = self.rotation._classify(self.rotation.ProviderHealthError('unhealthy'))
+        self.rotator.report(r, outcome, now=80)
+        state = self.store.read()
+        self.assertNotIn(r.pool, state.get('cooldowns', {}))
+        self.assertNotIn(r.id, state.get('strikes', {}))
+        self.assertEqual(state['cooldowns']['route:' + r.id], 110)
+        self.assertTrue(self.rotator.has_usable_route(self.rotation.FRONTIER, allow_paid=True))
+
+    def test_failed_health_is_not_reported_as_model_retirement(self):
+        self.assertEqual(self.rotation._classify(self.rotation.ProviderHealthError('unhealthy')), 'health_failed')
+
+    def _provider(self, outcomes):
+        from types import SimpleNamespace
+        self.calls = []
+        pending = iter(outcomes)
+        def factory(selected):
+            def call(*args, **kwargs):
+                self.calls.append(selected.id)
+                value = next(pending)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+            return SimpleNamespace(complete=call, ping=call)
+        return self.rotation.RotatingProvider(self.rotator, factory,
+                    judge_tier=self.rotation.FRONTIER, allow_paid=True, paid_first=True)
+
+    def test_retired_models_do_not_spend_healthy_siblings_pool_budget(self):
+        from flexfactor_rotation_tests import Boom
+        retired = lambda: Boom('model no longer available', status_code=404)
+        provider = self._provider([retired(), retired(), retired(), retired(), 'healthy'])
+        self.assertEqual(provider.complete('test'), 'healthy')
+        self.assertEqual(len(set(self.calls)), 5)
+
+    def test_generic_errors_keep_the_original_pool_bound(self):
+        provider = self._provider([TimeoutError('timed out'), 'healthy'])
+        with self.assertRaises(self.rotation.RotationError):
+            provider.complete('test')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_direct_preflight_cap_limits_actual_transport_calls(self):
+        from flexfactor_rotation_tests import Boom
+        retired = lambda: Boom('model no longer available', status_code=404)
+        provider = self._provider([retired(), retired(), retired(), True])
+        with self.assertRaises(self.rotation.RotationError):
+            provider.ping(_attempt_limit=3)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(set(self.calls)), 3)
+
+    def test_false_health_uses_distinct_siblings_within_transport_cap(self):
+        provider = self._provider([False, False, True])
+        self.assertTrue(provider.ping(_attempt_limit=3))
+        self.assertEqual(len(set(self.calls)), 3)
+        self.assertNotIn('shared', self.store.read().get('cooldowns', {}))
+
+    def test_all_retired_routes_are_tried_at_most_once(self):
+        from flexfactor_rotation_tests import Boom
+        retired = lambda: Boom('model no longer available', status_code=404)
+        provider = self._provider([retired() for _ in self.routes])
+        with self.assertRaises(self.rotation.RotationError):
+            provider.complete('test')
+        self.assertEqual(len(self.calls), len(self.routes))
+        self.assertEqual(len(set(self.calls)), len(self.routes))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
