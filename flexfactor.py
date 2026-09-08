@@ -4002,7 +4002,47 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
     # clean/keep/approve/ready/pass is downgraded HERE, at the one judging
     # chokepoint, so no caller can read a truncated answer as authorization.
-    return _ff_partial.refuse_clean_if_partial(data)
+    data = _ff_partial.refuse_clean_if_partial(data)
+    # ABSENCE IS NOT A NEGATIVE ANSWER.
+    # _check_structured_type is deliberately lenient: a response carrying SOME
+    # required keys is a normal partial answer. That is right for review
+    # schemas whose callers use fail-safe .get() defaults - and catastrophic
+    # for FINAL_REVIEW_SCHEMA, whose caller reads absence as a substantive
+    # NEGATIVE verdict:
+    #     data.get("commit") != final_sha         -> "reviewer named a
+    #                                                 DIFFERENT commit" (HIGH)
+    #     data.get("evidence_consistent") is True -> False
+    # On the FreeAndClean run freeandclean-20260905-070934-191057-33300-0000
+    # the judges omitted both fields on ALL SIX chunks, so the ledger filed six
+    # HIGH findings reading `expected 9582def..., reviewer said None`. The
+    # reviewer named NOTHING; it did not name something DIFFERENT. That made
+    # `independent-final-review` mathematically unpassable, and with it
+    # `run_complete` - the run could only ever end "interrupted".
+    # A COMPLETE response that omits a field this caller cannot interpret is a
+    # malformed provider response, so raise and let the rotation retry on
+    # another route, exactly as every other shape fault is handled.
+    # A TRUNCATED one is exempt: truncation already EXPLAINS the absence, and
+    # the partial machinery above has already made it unable to authorize
+    # anything. Raising there would throw away salvaged findings that section
+    # 12 keeps as failure evidence.
+    if (schema is globals().get("FINAL_REVIEW_SCHEMA")
+            and isinstance(data, dict)
+            and not _ff_partial.is_partial_structured(data)):
+        # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings`
+        # absent is safely an empty list and `reason` is prose, so neither is
+        # demanded - demanding them would fail routes that answer correctly.
+        missing = []
+        if not str(data.get("commit") or "").strip():
+            missing.append("commit")
+        if not str(data.get("verdict") or "").strip():
+            missing.append("verdict")
+        if not isinstance(data.get("evidence_consistent"), bool):
+            missing.append("evidence_consistent")
+        if missing:
+            raise StructuredOutputShapeError(
+                "Final-review output omitted required field(s) whose absence "
+                "cannot be read as an answer: " + ", ".join(missing))
+    return data
 
 
 def _provider_key_present(name: str) -> bool:
@@ -4832,24 +4872,35 @@ def build_audit_providers(args, meter: CostMeter | None = None) -> list[tuple[st
             # ladder (or a fixed provider) keeps exactly the old one-shot
             # behaviour, because re-pinging the same dead transport three times
             # just burns three deadlines.
-            attempts = (PREFLIGHT_PING_ATTEMPTS if _LAST_ROTATION_USABLE > 1 else 1)
+            from flexfactor_rotation import (ProviderHealthError, RotationError,
+                                             PinUnavailable, ReviewerSeparationError,
+                                             _is_retryable)
+
+            attempts = max(1, min(PREFLIGHT_PING_ATTEMPTS, _LAST_ROTATION_USABLE))
             failures: list[str] = []
             for attempt in range(1, attempts + 1):
                 try:
                     if ping() is False:
-                        raise RuntimeError("model route returned a failed health verdict")
+                        raise ProviderHealthError("model route returned a failed health verdict")
                     failures = []
                     break
                 except Exception as exc:  # this route is benched; try the next
                     failures.append(f"{type(exc).__name__}: {exc}")
+                    # Cancellation, policy refusals and programming errors are
+                    # not transport outages. Never retry them across providers.
+                    terminal = isinstance(exc, (PinUnavailable, ReviewerSeparationError))
+                    cause = exc.__cause__ if isinstance(exc, RotationError) else None
+                    if terminal or not _is_retryable(cause or exc):
+                        break
                     if attempt < attempts:
                         print(f"  [preflight] route {attempt}/{attempts} failed its "
-                              f"health check ({type(exc).__name__}); the route is "
-                              "benched, trying the next one", file=sys.stderr)
+                              f"health check ({type(exc).__name__}); "
+                              "trying the next one", file=sys.stderr)
             if failures:
                 _PROVIDER_DIAGNOSIS = (
-                    "the best-available model ladder has no live inference route "
-                    f"after {len(failures)} attempt(s): " + "; ".join(failures)
+                    "preflight found no live inference route "
+                    f"after {len(failures)} bounded attempt(s); "
+                    "untried routes may remain: " + "; ".join(failures)
                 )
                 return []
     providers: list[tuple[str, object]] = [("best-available", primary)]
@@ -19591,6 +19642,36 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
     runnable = [c for c in cmds if c.get("available")]
     meta["candidates"] = [{k: v for k, v in c.items() if k != "argv"} | {"argv": list(c.get("argv") or [])}
                           for c in cmds]
+    # PRODREADY'S CONTRACT IS detect -> INSTALL -> fix -> score, and the ONE
+    # thing standing between this machine and direct function evidence was that
+    # `coverage` is not importable in ANY interpreter here. With no artifact,
+    # `direct_function_rows` labels all 596 FreeAndClean functions
+    # "module-execution-only (NOT direct)", the `function-coverage` gate fails
+    # 0/596, and `run_complete` can never be reached - measured on run
+    # freeandclean-20260905-070934-191057-33300-0000. Detecting a missing free
+    # dev tool and then declining to install it is the detect-only behaviour
+    # prodready exists to replace. Install it, record the attempt as evidence,
+    # and re-ask; a failed install (offline, containment) stays UNPROVEN with
+    # its reason on the record - nothing is ever assumed installed.
+    if eco == "python" and not runnable and spec["test_cmd"]:
+        import importlib.util as _ilu
+        if _ilu.find_spec("coverage") is None:
+            argv = [sys.executable, "-m", "pip", "install", "--quiet",
+                    "--disable-pip-version-check", "coverage"]
+            print(f"{pfx}coverage: not importable - installing it")
+            ins = _run(argv, project_dir, timeout=600)
+            _ilu.invalidate_caches()
+            meta["install"] = {"argv": argv, "rc": ins.returncode,
+                               "tail": _tail((ins.stdout or "") + (ins.stderr or ""), 8)}
+            if ins.returncode == 0 and _ilu.find_spec("coverage") is not None:
+                try:
+                    cmds = _ff_coverage.coverage_commands(project_dir, spec)
+                except Exception as ex:  # noqa: BLE001 - evidence, never a crash
+                    cmds = []
+                    meta["error"] = f"coverage_commands: {type(ex).__name__}: {ex}"
+                runnable = [c for c in cmds if c.get("available")]
+                meta["candidates"] = [{k: v for k, v in c.items() if k != "argv"}
+                                      | {"argv": list(c.get("argv") or [])} for c in cmds]
     if runnable and spec["test_cmd"]:
         meta["available"] = True
         for c in runnable:
@@ -22852,6 +22933,11 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # the request itself has to be in the immutable evidence.
             "model_mode": normalize_model_mode(getattr(args, "model_mode", "free")),
             "paid_models": str(getattr(args, "paid_models", "both") or "both").lower(),
+            # ...and, beside the request, whether it was actually HONOURED.
+            # Recording a requested value alone let the manifest imply a
+            # choice the run never made.
+            "inert_flags_not_enforced": list(
+                getattr(args, "inert_flags_named", []) or []),
             "cross_verification_requested": bool(getattr(args, "use_both", False)),
             "converged": converged, "stop_reason": stop_reason,
             "suite_status": suite_status, "clean_files": brain_clean, "usd": round(meter.usd, 4),
@@ -23618,6 +23704,58 @@ def _program_failure_reasons(r: dict, *, apply_requested: bool) -> list[str]:
         if barren:
             reasons.append(barren)
     return reasons
+
+
+#: Route-selection flags that argparse still ACCEPTS but nothing enforces.
+#: Each maps to the sentence a user needs: what it does not do, and what the
+#: real lever is.
+_INERT_ROUTE_FLAGS = {
+    "--model-mode": (
+        "every mode now normalizes to the single best-available ladder "
+        "(MODEL_MODES is ('best',) and model_mode_refusal() admits every "
+        "route); to change which capacity is used, change the CATALOG "
+        "(AI_ROTATE_CATALOG) or the per-allowance limit "
+        "(FLEXFACTOR_PROVIDER_MAX_INFLIGHT)"),
+    "--paid-models": (
+        "no route filter reads it; it is recorded in the run manifest and "
+        "otherwise ignored"),
+}
+
+
+def _warn_inert_route_flags(raw_argv) -> list[str]:
+    """Say out loud that a retired route flag will not be honoured.
+
+    Checked against the RAW argv, exactly like `--no-push`/`--no-merge`,
+    because a parsed value cannot distinguish "the owner asked for this" from
+    "this is the default".
+
+    WHY (measured 2026-09-05): the owner explicitly authorised a paid path and
+    the run was launched with `--model-mode paid --paid-models both`. Neither
+    is enforced any more. The run went on using the flat-rate subscription --
+    correct for the ladder, but NOT what was asked -- while
+    `_write_run_manifest` filed both values under a comment reading "the
+    request itself has to be in the immutable evidence". So the evidence
+    recorded a choice the run never made, and the only place the retirement
+    was mentioned was `normalize_model_mode`, which the audit path reaches at
+    MANIFEST-WRITE time, i.e. after the run is over.
+
+    A flag that is accepted, recorded as a choice, and silently unenforced is
+    worse than one that errors: it manufactures false confidence. Deleting it
+    is not the answer either -- that is argparse exit 2 for every existing
+    launcher and scheduled task (the documented launcher-drift trap). So it
+    keeps working, and it says what it is.
+
+    Returns the flags that were named, so callers can record them.
+    """
+    named = []
+    for token in [str(a) for a in (raw_argv or [])]:
+        flag = token.split("=", 1)[0]
+        if flag in _INERT_ROUTE_FLAGS and flag not in named:
+            named.append(flag)
+    for flag in named:
+        print(f"  [inert-flag] {flag} is RETIRED and NOT enforced: "
+              f"{_INERT_ROUTE_FLAGS[flag]}.", file=sys.stderr)
+    return named
 
 
 def _audit_exit_code(results: list[dict], *, apply_requested: bool) -> int:
@@ -25091,6 +25229,10 @@ def main(argv=None) -> int:
         # invocation (exit 2) before anything runs or spends.
         _add_egress_args(parser)
         args = parser.parse_args(rest)
+        # BEFORE anything runs or spends: name every route flag that will not
+        # be honoured. Saying it at the end (which is where
+        # normalize_model_mode is reached) is too late to change the decision.
+        args.inert_flags_named = _warn_inert_route_flags(rest)
         # The competitor gate stays MANDATORY — that half of the product
         # contract is unchanged and the flag remains inert on purpose.
         args.competitors = True

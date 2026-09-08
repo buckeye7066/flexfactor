@@ -98,6 +98,10 @@ class RotationError(RuntimeError):
         self.reasons = reasons or {}
 
 
+class ProviderHealthError(RuntimeError):
+    """A route explicitly failed its health check; try another route."""
+
+
 class ReviewerSeparationError(RotationError):
     """Independent review is impossible under the current route identities."""
 
@@ -1901,6 +1905,14 @@ class RotatingProvider:
         return result
 
     def ping(self, *args, **kwargs):
+        def validate_health(result):
+            if result is False:
+                raise ProviderHealthError("model route returned a failed health verdict")
+            return result
+
+        # Reject inside the attempt so the failed route is recorded and cooled.
+        # Checking only in the caller would report this route as successful.
+        kwargs["_result_validator"] = validate_health
         return self._run("ping", self._judge_tier, *args, **kwargs)
 
 
@@ -2095,6 +2107,8 @@ def _is_retryable(exc: BaseException) -> bool:
                         SyntaxError, IndentationError, AssertionError)):
         return False
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
+        return True
     if isinstance(status, int) and status in (400, 404, 422):
         # A ROUTE-CAPABILITY 400/404 (output ceiling, context window, an
         # unsupported parameter, a model this backend does not serve) is bad on
