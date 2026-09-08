@@ -317,25 +317,62 @@ class EntryPointParityTests(unittest.TestCase):
         cases = (
             ("flexfactor_launch.ps1", [target], ["2", "", "YES", ""],
              {"ANTHROPIC_API_KEY": "test-placeholder", "OPENAI_API_KEY": ""},
-             [script, "scout", "--max-cost", "150", "--model-mode", "best",
+             [script, "scout", "--max-cost", "150",
               "--allow-remote-program-context", "--program", target]),
             ("flexfactor_audit_launch.ps1", [target], ["", ""],
              {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
               "OPENAI_API_KEY": "test-placeholder"},
-             [script, "audit", "--model-mode", "best", "--max-cost", "150",
+             [script, "audit", "--max-cost", "150",
               "--max-cycles", "6", "--apply", "--yes", "--auto-clean",
               "--program", target]),
             ("flexfactor_scout_launch.ps1", [target], ["", "YES", ""],
              {"OPENAI_API_KEY": "test-placeholder",
               "FLEXFACTOR_REPO_REWARDS_URL": "http://127.0.0.1:3000"},
-             [script, "scout", "--model-mode", "best", "--max-cost", "150",
+             [script, "scout", "--max-cost", "150",
               "--allow-remote-program-context", "--program", target]),
             ("flexfactor_glimmer_launch.ps1", ["audit", "--program", target], [], {},
-             [script, "audit", "--program", target, "--model-mode", "best"]),
+             [script, "audit", "--program", target]),
         )
         for name, args, answers, env, expected in cases:
             with self.subTest(launcher=name):
                 self.assertEqual(_run_launcher(name, args, answers, env), expected)
+
+    def test_no_launcher_forwards_a_retired_route_flag(self):
+        """A shipped entry point must never pass a flag nothing enforces.
+
+        `_warn_inert_route_flags` prints a RETIRED-and-NOT-enforced notice for
+        every inert route flag on the RAW argv, so that the owner is told when
+        a choice they made is not honoured. Until 2026-09-08 four launchers and
+        the mobile workflow hard-coded `--model-mode best` themselves, so that
+        notice fired on EVERY interactive run -- an owner who never asked for
+        the flag was told their request was being ignored. That is the warning
+        machinery slandering its own product.
+
+        The fix is to stop passing it. This test is the guard: the warning must
+        only ever be reachable by a human who actually typed the flag.
+        """
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import flexfactor as ff
+        inert = tuple(ff._INERT_ROUTE_FLAGS)
+        self.assertTrue(inert, "no inert flags declared; guard would be vacuous")
+
+        shipped = [os.path.join(HERE, n) for n in LAUNCHERS + (WINDOWS_APP_ENTRY,)]
+        wf = os.path.join(HERE, ".github", "workflows")
+        if os.path.isdir(wf):
+            shipped += [os.path.join(wf, n) for n in sorted(os.listdir(wf))
+                        if n.endswith((".yml", ".yaml"))]
+        for path in shipped:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                source = stream.read()
+            for flag in inert:
+                if flag in source:
+                    self.fail(
+                        "%s forwards the retired flag %s; it would trigger the "
+                        "inert-flag notice on every run"
+                        % (os.path.basename(path), flag))
 
 
 class CleanInstallTests(unittest.TestCase):
