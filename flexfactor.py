@@ -2275,6 +2275,20 @@ class AnthropicProvider:
         (spaced 6s); between attempts `_recover_transport` restarts a dead
         proxy and swaps in a fresh HTTP client so a wedged pooled connection
         or a crashed fcc-server no longer strands the job."""
+        # Anthropic-compatible proxies may silently discard output_config.
+        # Give the model the SAME schema in its instructions on the first
+        # attempt too; otherwise it must guess the field names and the
+        # mandatory understanding gate rejects an otherwise usable route.
+        schema = (fmt.get("format") or {}).get("schema")
+        if schema:
+            schema_instruction = (
+                "Return one JSON value matching this JSON Schema. Include all "
+                "required fields with the declared types. Return JSON only.\n"
+                + json.dumps(schema, ensure_ascii=False)
+            )
+            system = ([{"type": "text", "text": system}]
+                      if isinstance(system, str) else list(system))
+            system.append({"type": "text", "text": schema_instruction})
         call_kwargs = dict(model=model, max_tokens=max_tokens, system=system,
                            output_config=fmt, messages=messages)
         if _fallback_hold_active():
@@ -19811,6 +19825,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     checkpoint = None
     evidence_mod = None
     evidence_ledger = None
+    terminal_event_emitted = False
     evidence_run_id = ""
     evidence_state_root = ""
     baseline_code_index = None
@@ -20168,6 +20183,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # BUILD AND CAPTURE UNDER ONE LOCK. The diagnosis is a module-level
         # return channel, so keep its write and read atomic for embedders that
         # invoke multiple program audits in one process.
+        if checkpoint is not None:
+            checkpoint.set_phase("checking model availability")
+        report(phase="checking model availability")
         with _PROVIDER_BUILD_LOCK:
             providers = build_audit_providers(args, meter)
             _diagnosis = _PROVIDER_DIAGNOSIS
@@ -20188,6 +20206,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # contract exists, execute the inference now that a provider exists and
         # refuse to begin the sweep unless it identifies users, end-to-end
         # journeys, acceptance criteria, and exact repository citations.
+        if checkpoint is not None:
+            checkpoint.set_phase("establishing program understanding")
+        report(phase="establishing program understanding")
         (purpose_contract, purpose_confidence, purpose_mutation_authorized,
          purpose_auth_reason) = _ensure_program_understanding(
             author, display_name, project_dir, context_blob=purpose_context,
@@ -23120,6 +23141,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     defects_found=len(all_findings), files_fixed=len(applied_files),
                     spend_usd=round(meter.usd, 6),
                     final_commit=(evidence or {}).get("final_commit"))
+                terminal_event_emitted = True
         if checkpoint is not None:
             # THE TERMINAL WRITE WAS THE ONE WRITE THAT COULD NOT BE ALLOWED TO
             # FAIL SILENTLY, AND IT WAS THE ONLY ONE WRAPPED IN A BLANKET
@@ -23291,15 +23313,34 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         result["error"] = str(ex)
         result["error_traceback"] = _tb.format_exc()[-6000:]
         print(result["error_traceback"], file=sys.stderr)
-        if checkpoint is not None:
-            with contextlib.suppress(Exception):
-                checkpoint.finish(status="interrupted", error=str(ex)[:200])
-        try:
-            _PROGRESS.update(index, phase="error", done=True, error=str(ex)[:200])
-        except Exception:
-            pass
         return result
     finally:
+        # Setup/understanding refusals return normally, so the exception
+        # handler never persisted them. They left a dead run labelled
+        # "starting"/"running" with no terminal event or resumable diagnosis.
+        if result.get("error"):
+            error = str(result["error"])
+            if checkpoint is not None:
+                finalized = False
+                for attempt in range(4):
+                    with contextlib.suppress(Exception):
+                        finalized = checkpoint.finish(status="interrupted", error=error)
+                    if finalized:
+                        break
+                    if attempt < 3:
+                        time.sleep(0.25 * (attempt + 1))
+                        with contextlib.suppress(Exception):
+                            checkpoint.reopen()
+                if not finalized:
+                    print(f"{pfx}CHECKPOINT NOT FINALIZED - startup failure could "
+                          "not be persisted; inspect checkpoint permissions.", file=sys.stderr)
+                    _ledger("checkpoint", "startup failure checkpoint could not be finalized")
+            with contextlib.suppress(Exception):
+                _PROGRESS.update(index, phase="error", done=True, error=error)
+            if evidence_ledger is not None and not terminal_event_emitted:
+                with contextlib.suppress(Exception):
+                    evidence_ledger.emit("run.incomplete", complete=False,
+                                         stop_reason=error)
         _restore_wip_if_active(project_dir if "project_dir" in dir() else None, result, pfx)
         console_meter.stop()  # erase the meter line + restore builtins.print
         _release_audit_lock(lock_path)
