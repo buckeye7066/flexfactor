@@ -6569,8 +6569,19 @@ def _find_local_project(*name_hints: str) -> str | None:
             entries = os.listdir(root)
         except OSError:
             continue
-        root_dirs.extend(os.path.join(root, e) for e in entries
-                         if os.path.isdir(os.path.join(root, e)))
+        # Metadata probes on unrelated entries can take minutes on a mounted
+        # drive. Only names that could win either matching tier need a stat.
+        # Keep the global passes below so exact/visible precedence is unchanged.
+        for entry in entries:
+            slug = _slugify(entry)
+            squashed = slug.replace("-", "")
+            if (slug not in exact and not any(
+                    slug.startswith(c) or squashed.startswith(c)
+                    for c in prefix_cands)):
+                continue
+            full = os.path.join(root, entry)
+            if os.path.isdir(full):
+                root_dirs.append(full)
 
     # A HIDDEN sibling is a config/data directory, not a source checkout, and
     # `_slugify` cannot tell them apart: the leading dot is not alnum, so it

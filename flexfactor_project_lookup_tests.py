@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import flexfactor as ff
 
@@ -98,6 +99,25 @@ class HiddenSiblingTests(unittest.TestCase):
     def test_no_candidate_returns_none(self):
         self._mk("something-else")
         self.assertIsNone(ff._find_local_project("Ellie"))
+
+    def test_unrelated_entries_need_no_metadata_probe(self):
+        self._mk("GrantFlow", "unrelated-mounted-folder")
+        real_isdir = os.path.isdir
+
+        def checked_isdir(path):
+            if os.path.basename(path) == "unrelated-mounted-folder":
+                self.fail("startup probed an unrelated directory")
+            return real_isdir(path)
+
+        with patch.object(ff.os.path, "isdir", side_effect=checked_isdir):
+            self.assertEqual(ff._find_local_project("GrantFlow"),
+                             os.path.join(self.root, "GrantFlow"))
+
+    def test_later_root_exact_match_beats_earlier_prefix(self):
+        self._mk("GrantFlow-backup", "second-root/GrantFlow")
+        ff._PROJECT_ROOTS = [self.root, os.path.join(self.root, "second-root")]
+        self.assertEqual(ff._find_local_project("GrantFlow"),
+                         os.path.join(self.root, "second-root", "GrantFlow"))
 
 
 if __name__ == "__main__":
