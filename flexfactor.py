@@ -19825,6 +19825,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
     checkpoint = None
     evidence_mod = None
     evidence_ledger = None
+    terminal_event_emitted = False
     evidence_run_id = ""
     evidence_state_root = ""
     baseline_code_index = None
@@ -23140,6 +23141,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     defects_found=len(all_findings), files_fixed=len(applied_files),
                     spend_usd=round(meter.usd, 6),
                     final_commit=(evidence or {}).get("final_commit"))
+                terminal_event_emitted = True
         if checkpoint is not None:
             # THE TERMINAL WRITE WAS THE ONE WRITE THAT COULD NOT BE ALLOWED TO
             # FAIL SILENTLY, AND IT WAS THE ONLY ONE WRAPPED IN A BLANKET
@@ -23335,7 +23337,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     _ledger("checkpoint", "startup failure checkpoint could not be finalized")
             with contextlib.suppress(Exception):
                 _PROGRESS.update(index, phase="error", done=True, error=error)
-            if evidence_ledger is not None:
+            if evidence_ledger is not None and not terminal_event_emitted:
                 with contextlib.suppress(Exception):
                     evidence_ledger.emit("run.incomplete", complete=False,
                                          stop_reason=error)

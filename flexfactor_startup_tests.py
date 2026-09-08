@@ -48,6 +48,36 @@ class StartupSchemaTests(unittest.TestCase):
 
 
 class StartupStateTests(unittest.TestCase):
+    def test_failed_reviews_emit_only_one_terminal_event(self):
+        from flexfactor_tests import (AuditPipelineIntegrationTests, _RepoFixture,
+                                      _StubProvider, _unit_purpose_understanding)
+        import flexfactor_evidence as evidence
+        fixture = AuditPipelineIntegrationTests()
+        emitted = []
+        real_emit = evidence.EventLedger.emit
+
+        def capture(ledger, name, **attributes):
+            emitted.append(name)
+            return real_emit(ledger, name, **attributes)
+
+        def fail_reviews(_reviewers, _root, files, *args, **kwargs):
+            return {}, [], set(), {}, set(files)
+
+        with _RepoFixture({"app.py": "print('hello')\n"}, production=True) as root, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            args = fixture._args(["audit", "--program", root, "--no-bootstrap",
+                                  "--no-preflight", "--no-dashboard", "--no-tests",
+                                  "--no-e2e", "--no-full-suite", "--max-cycles", "1"])
+            with patch.object(evidence.EventLedger, "emit", capture), \
+                 patch.object(ff, "_review_all", side_effect=fail_reviews), \
+                 patch.object(ff, "build_audit_providers", return_value=[("stub", _StubProvider())]), \
+                 patch.object(ff, "_ensure_program_understanding", side_effect=lambda *a, **k: _unit_purpose_understanding()), \
+                 patch.object(ff, "_full_gate", return_value=(None, "offline fixture")):
+                result = ff.audit_one_program(root, args, 0, 1, None)
+                self.assertIn("review never completed", result["error"])
+        self.assertEqual(emitted.count("run.incomplete"), 1)
+        self.assertNotIn("run.finished", emitted)
+
     def test_setup_refusal_finalizes_checkpoint_and_dashboard(self):
         with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as stack:
             checkpoint = state.new_run(root, program="demo", project_dir=root,
