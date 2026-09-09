@@ -11,13 +11,13 @@ import argparse
 import json
 import os
 import queue
-from pathlib import Path
 import re
 import shlex
 import socket
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 
 class UpdateError(RuntimeError):
@@ -44,9 +44,27 @@ class SourceUpdater:
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never",
                    GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=10 -o ServerAliveCountMax=1",
                    GIT_SSH_VARIANT="ssh")
+        # Windows command lookup includes the current checkout. Personal files
+        # such as an untracked git.exe must never become updater executables.
+        executable = None
+        for directory in os.get_exec_path(env):
+            folder = Path(directory.strip('"'))
+            if not folder.is_absolute():
+                continue
+            try:
+                candidate = (folder / ("git.exe" if os.name == "nt" else "git")).resolve()
+            except OSError:
+                continue
+            if self.root in candidate.parents or candidate.parent == self.root:
+                continue
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                executable = str(candidate)
+                break
+        if executable is None:
+            raise UpdateError("Git is not installed on a trusted absolute PATH outside this checkout.")
         try:
             result = subprocess.run(
-                ["git", "-C", str(self.root), *args], capture_output=True,
+                [executable, "-C", str(self.root), *args], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=timeout,
                 env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -75,7 +93,11 @@ class SourceUpdater:
     def ensure_idle_checkout(self):
         git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
         if (git_dir / "source-app-update.lock").exists() and not self._owns_update_lock:
-            raise UpdateBusy("Another update is active. Wait for it to finish before opening the app.")
+            raise UpdateBusy(
+                "An update lock is present. Wait if an update is running. After an interrupted update or restart, "
+                "close all app/updater windows and confirm no Git operation is running. Review git status; "
+                "only if the checkout is clean and no update is active, remove this updater's marker and retry: "
+                + str(git_dir / "source-app-update.lock"))
         ports = self.idle_port if isinstance(self.idle_port, list) else [self.idle_port]
         for idle_port in ports:
             if idle_port is None:

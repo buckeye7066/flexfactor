@@ -1,17 +1,16 @@
 """Hermetic source update tests using local Git repositories, never live GitHub."""
-import os
 import io
-from contextlib import redirect_stderr
-from pathlib import Path
+import os
+import socket
 import subprocess
 import tempfile
-import socket
 import threading
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
 from unittest.mock import patch
 
 from source_app_update import SourceUpdater, UpdateError, begin_apply, prompt
-
 
 class FixtureUpdater(SourceUpdater):
     def trusted_source(self):
@@ -104,6 +103,13 @@ class UpdateTests(unittest.TestCase):
     def test_untrusted_origin_is_rejected(self):
         with self.assertRaises(UpdateError):
             SourceUpdater(self.client, "buckeye7066/example").check()
+
+    def test_checkout_executable_cannot_replace_installed_git(self):
+        fake = self.client / ('git.exe' if os.name == 'nt' else 'git')
+        fake.write_text('untrusted personal file, never executable updater code')
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': str(self.client) + os.pathsep + os.environ['PATH']}):
+            self.assertEqual(self.updater.git('rev-parse', 'HEAD'), self.original)
 
     def test_url_rewrites_are_rejected(self):
         canonical = "https://github.com/buckeye7066/example.git"
