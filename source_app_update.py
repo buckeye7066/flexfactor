@@ -1,7 +1,8 @@
 """Opt-in updates for authenticated Git source installs (Python standard library).
 
 Run before starting the app: --prompt exits 10 after a successful update so the
-launcher can restart itself and refresh dependencies. --check is JSON, --apply
+launcher can restart itself and refresh dependencies; exit 20 aborts startup
+after a busy or failed update. --check is JSON, --apply
 requires the revision displayed by a prior check. Never resets or stashes files.
 """
 from __future__ import annotations
@@ -9,27 +10,61 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
+import queue
 import re
+import shlex
+import socket
 import subprocess
+import sys
+import threading
+from pathlib import Path
 
 
 class UpdateError(RuntimeError):
     pass
 
 
+class UpdateBusy(UpdateError):
+    pass
+
+
 class SourceUpdater:
-    def __init__(self, root, repo):
+    def __init__(self, root, repo, idle_port=None):
         self.root = Path(root).resolve()
         if not re.fullmatch(r"buckeye7066/[A-Za-z0-9_.-]+", repo):
             raise UpdateError("The update repository is not trusted.")
         self.repo = repo
+        ports = idle_port if isinstance(idle_port, list) else [idle_port]
+        if any(port is not None and not 1 <= port <= 65535 for port in ports):
+            raise UpdateError("The app port must be between 1 and 65535.")
+        self.idle_port = idle_port
+        self._owns_update_lock = False
 
     def git(self, *args, timeout=30):
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never",
+                   GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=10 -o ServerAliveCountMax=1",
+                   GIT_SSH_VARIANT="ssh")
+        # Windows command lookup includes the current checkout. Personal files
+        # such as an untracked git.exe must never become updater executables.
+        executable = None
+        for directory in os.get_exec_path(env):
+            folder = Path(directory.strip('"'))
+            if not folder.is_absolute():
+                continue
+            try:
+                candidate = (folder / ("git.exe" if os.name == "nt" else "git")).resolve()
+            except OSError:
+                continue
+            if self.root in candidate.parents or candidate.parent == self.root:
+                continue
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                executable = str(candidate)
+                break
+        if executable is None:
+            raise UpdateError("Git is not installed on a trusted absolute PATH outside this checkout.")
         try:
             result = subprocess.run(
-                ["git", "-C", str(self.root), *args], capture_output=True,
+                [executable, "-C", str(self.root), *args], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=timeout,
                 env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -56,6 +91,26 @@ class SourceUpdater:
         return url
 
     def ensure_idle_checkout(self):
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+        if (git_dir / "source-app-update.lock").exists() and not self._owns_update_lock:
+            raise UpdateBusy(
+                "An update lock is present. Wait if an update is running. After an interrupted update or restart, "
+                "close all app/updater windows and confirm no Git operation is running. Review git status; "
+                "only if the checkout is clean and no update is active, remove this updater's marker and retry: "
+                + str(git_dir / "source-app-update.lock"))
+        ports = self.idle_port if isinstance(self.idle_port, list) else [self.idle_port]
+        for idle_port in ports:
+            if idle_port is None:
+                continue
+            try:
+                # An exclusive bind proves the port is available without
+                # connecting to the game or relying on Windows refusal timing.
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    probe.bind(("127.0.0.1", idle_port))
+            except OSError as exc:
+                raise UpdateBusy("Close the local app server before updating. The port is occupied or unavailable; no source was changed.") from exc
         if self.git("symbolic-ref", "--short", "HEAD") != "main":
             raise UpdateError("Switch to main before updating; your current branch was preserved.")
         if self.git("status", "--porcelain", "--untracked-files=no"):
@@ -85,8 +140,11 @@ class SourceUpdater:
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
-            raise UpdateError("Another update is active. If it was interrupted, review the repository before removing its update lock.") from exc
+            raise UpdateBusy("Another update is active. If it was interrupted, review the repository before removing its update lock.") from exc
+        except OSError as exc:
+            raise UpdateError("Could not create the update lock. Check folder permissions; no source was changed.") from exc
         try:
+            self._owns_update_lock = True
             os.close(fd)
             state = self.check()
             if state["latest"] != expected:
@@ -94,9 +152,6 @@ class SourceUpdater:
             if state["status"] == "current":
                 return state
             self.ensure_idle_checkout()
-            # Every entry point (including --apply and Update-App.cmd) leaves
-            # dependency work for the normal launcher. Record it before source
-            # replacement so an interrupted launcher cannot lose the obligation.
             if self.repo.lower() == "buckeye7066/flexfactor":
                 try:
                     (git_dir / "flexfactor-refresh-needs-install").write_text(expected, encoding="ascii")
@@ -110,14 +165,36 @@ class SourceUpdater:
                 raise UpdateError("The installed revision did not match the selected update.")
             return {"status": "updated", "current": expected, "latest": expected}
         finally:
-            lock.unlink(missing_ok=True)
+            self._owns_update_lock = False
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError as exc:
+                raise UpdateError("The update lock could not be removed. Review folder permissions before opening the app.") from exc
+
+
+def begin_apply(updater, expected):
+    """Keep Git/network work off Tk's event loop; return one result or error."""
+    completed = queue.Queue(maxsize=1)
+
+    def work():
+        try:
+            completed.put(updater.apply(expected))
+        except UpdateError as exc:
+            completed.put(exc)
+        except Exception:
+            completed.put(UpdateError("The update could not finish. Review the installed revision before opening the app."))
+
+    threading.Thread(target=work, name="source-app-update", daemon=True).start()
+    return completed
 
 
 def prompt(updater, name):
     try:
         state = updater.check()
+    except UpdateBusy as exc:
+        print(f"{name} update check: {exc}")
+        return 20  # never start another app instance during source replacement
     except UpdateError as exc:
-        # Expected unavailability is status, not a native stderr failure in PS5.
         print(f"{name} update check: {exc}")
         return 0  # offline/sign-in problems must not prevent using the installed app
     if state["status"] != "available":
@@ -127,7 +204,18 @@ def prompt(updater, name):
         from tkinter import messagebox
         window = tk.Tk()
     except Exception:
-        print(f"{name}: update {state['latest'][:12]} available. Run source_app_update.py --repo {updater.repo} --apply {state['latest']} to install.")
+        command = [sys.executable, str(Path(__file__).resolve()), "--repo", updater.repo,
+                   "--root", str(updater.root), "--apply", state["latest"]]
+        ports = updater.idle_port if isinstance(updater.idle_port, list) else [updater.idle_port]
+        for port in ports:
+            if port is not None:
+                command.extend(["--idle-port", str(port)])
+        if os.name == "nt":
+            rendered = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in command)
+            terminal = "PowerShell"
+        else:
+            rendered, terminal = shlex.join(command), "a terminal"
+        print(f"{name}: update {state['latest'][:12]} available. Run in {terminal}:\n{rendered}")
         return 0
     window.title(f"{name} update")
     window.resizable(False, False)
@@ -146,14 +234,22 @@ def prompt(updater, name):
         later_button.configure(state="disabled")
         window.protocol("WM_DELETE_WINDOW", lambda: None)
         status.set("Updating…")
-        window.update_idletasks()
-        try:
-            applied = updater.apply(state["latest"])
-            result[0] = 10 if applied["status"] == "updated" else 0
+        completed = begin_apply(updater, state["latest"])
+
+        def poll():
+            try:
+                applied = completed.get_nowait()
+            except queue.Empty:
+                window.after(75, poll)
+                return
+            if isinstance(applied, UpdateError):
+                result[0] = 20
+                messagebox.showerror(f"{name} update", str(applied), parent=window)
+            else:
+                result[0] = 10 if applied["status"] == "updated" else 0
             window.destroy()
-        except UpdateError as exc:
-            messagebox.showerror(f"{name} update", str(exc), parent=window)
-            window.destroy()
+
+        window.after(75, poll)
 
     update_button = tk.Button(controls, text="Update", width=12, command=install)
     update_button.pack(side="left", padx=6)
@@ -168,13 +264,14 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--name", default="This app")
+    parser.add_argument("--idle-port", type=int, action="append", help="Refuse updates while this server port is occupied (repeat for multiple servers)")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--check", action="store_true")
     action.add_argument("--prompt", action="store_true")
     action.add_argument("--apply", metavar="REVISION")
     args = parser.parse_args()
     try:
-        updater = SourceUpdater(args.root, args.repo)
+        updater = SourceUpdater(args.root, args.repo, idle_port=args.idle_port)
         if args.prompt:
             return prompt(updater, args.name)
         print(json.dumps(updater.apply(args.apply) if args.apply else updater.check()))

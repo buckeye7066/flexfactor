@@ -1,14 +1,16 @@
 """Hermetic source update tests using local Git repositories, never live GitHub."""
-import os
 import io
-from contextlib import redirect_stderr
-from pathlib import Path
+import os
+import socket
 import subprocess
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
+from unittest.mock import patch
 
-from source_app_update import SourceUpdater, UpdateError, prompt
-
+from source_app_update import SourceUpdater, UpdateError, begin_apply, prompt
 
 class FixtureUpdater(SourceUpdater):
     def trusted_source(self):
@@ -102,6 +104,13 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(UpdateError):
             SourceUpdater(self.client, "buckeye7066/example").check()
 
+    def test_checkout_executable_cannot_replace_installed_git(self):
+        fake = self.client / ('git.exe' if os.name == 'nt' else 'git')
+        fake.write_text('untrusted personal file, never executable updater code')
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': str(self.client) + os.pathsep + os.environ['PATH']}):
+            self.assertEqual(self.updater.git('rev-parse', 'HEAD'), self.original)
+
     def test_url_rewrites_are_rejected(self):
         canonical = "https://github.com/buckeye7066/example.git"
         self.run_git(self.client, "remote", "set-url", "origin", canonical)
@@ -151,6 +160,68 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(UpdateError):
             self.updater.apply(latest)
         self.assertEqual(self.run_git(self.client, "rev-parse", "HEAD"), self.original)
+
+    def test_busy_update_check_aborts_launch(self):
+        (self.client / '.git' / 'source-app-update.lock').write_text('active')
+        self.assertEqual(prompt(self.updater, 'Fixture'), 20)
+
+    def test_lock_permission_error_returns_actionable_update_error(self):
+        latest = self.newer()
+        with patch('source_app_update.os.open', side_effect=PermissionError('fixture denial')):
+            with self.assertRaises(UpdateError):
+                self.updater.apply(latest)
+        self.assertEqual(self.run_git(self.client, 'rev-parse', 'HEAD'), self.original)
+
+    def test_update_worker_returns_before_slow_git_finishes(self):
+        latest = self.newer()
+        entered, release = threading.Event(), threading.Event()
+        original = self.updater.apply
+        def delayed(expected):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError('fixture timed out')
+            return original(expected)
+        self.updater.apply = delayed
+        completed = begin_apply(self.updater, latest)
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(completed.empty())
+        finally:
+            release.set()
+        self.assertEqual(completed.get(timeout=30)['status'], 'updated')
+
+    def test_running_server_prevents_update(self):
+        self.newer()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            self.updater.idle_port = listener.getsockname()[1]
+            with self.assertRaises(UpdateError):
+                self.updater.check()
+
+    def test_either_app_server_blocks_startup(self):
+        with socket.socket() as unused:
+            unused.bind(('127.0.0.1', 0))
+            free_port = unused.getsockname()[1]
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            self.updater.idle_port = [free_port, listener.getsockname()[1]]
+            self.assertEqual(prompt(self.updater, 'Fixture'), 20)
+
+    def test_server_starting_after_notice_prevents_apply(self):
+        latest = self.newer()
+        with socket.socket() as unused:
+            unused.bind(('127.0.0.1', 0))
+            port = unused.getsockname()[1]
+        self.updater.idle_port = port
+        self.assertEqual(self.updater.check()['status'], 'available')
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', port))
+            listener.listen()
+            with self.assertRaises(UpdateError):
+                self.updater.apply(latest)
+        self.assertEqual(self.run_git(self.client, 'rev-parse', 'HEAD'), self.original)
 
 
 if __name__ == "__main__":
