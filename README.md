@@ -212,3 +212,7 @@ python source_app_update.py --repo buckeye7066/flexfactor --apply FULL_REVISION
 Git metadata cannot self-update through this source path. This is not a signed
 Windows/macOS/iOS installer or an app-store release. Existing installations
 need this updater installed once before they can notify about future versions.
+
+## Build target selection
+
+See [build targets and supported artifacts](docs/BUILD-TARGETS.md).

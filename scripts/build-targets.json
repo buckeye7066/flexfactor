@@ -1,0 +1,99 @@
+{
+  "name": "flexfactor",
+  "guidance": "Existing pyproject.toml setuptools backend and CI wheel command; Android Gradle project with documented Gradle 8.13, JDK 21, Android SDK 36 and build-tools 35.0.0. Python package output is a wheel, not a Windows EXE or macOS app. Android output is a debug APK, not a signed store release.",
+  "targets": {
+    "windows": {
+      "hosts": [
+        "win32",
+        "darwin",
+        "linux"
+      ],
+      "format": "Python wheel (requires Python >=3.12 and separately installed runtime dependencies)",
+      "output": "dist/*.whl",
+      "notice": "Portable Python package; target is recipient intent, not native OS certification. Windows/Linux have existing CI; macOS runtime remains unverified.",
+      "commands": [
+        [
+          "python",
+          "-m",
+          "pip",
+          "wheel",
+          ".",
+          "--no-deps",
+          "--no-build-isolation",
+          "--no-index",
+          "--wheel-dir",
+          "dist"
+        ]
+      ]
+    },
+    "linux": {
+      "hosts": [
+        "win32",
+        "darwin",
+        "linux"
+      ],
+      "format": "Python wheel (requires Python >=3.12 and separately installed runtime dependencies)",
+      "output": "dist/*.whl",
+      "notice": "Portable Python package; target is recipient intent, not native OS certification. Windows/Linux have existing CI; macOS runtime remains unverified.",
+      "commands": [
+        [
+          "python",
+          "-m",
+          "pip",
+          "wheel",
+          ".",
+          "--no-deps",
+          "--no-build-isolation",
+          "--no-index",
+          "--wheel-dir",
+          "dist"
+        ]
+      ]
+    },
+    "macos": {
+      "hosts": [
+        "win32",
+        "darwin",
+        "linux"
+      ],
+      "format": "Python wheel (requires Python >=3.12 and separately installed runtime dependencies)",
+      "output": "dist/*.whl",
+      "notice": "Portable Python package; target is recipient intent, not native OS certification. Windows/Linux have existing CI; macOS runtime remains unverified.",
+      "commands": [
+        [
+          "python",
+          "-m",
+          "pip",
+          "wheel",
+          ".",
+          "--no-deps",
+          "--no-build-isolation",
+          "--no-index",
+          "--wheel-dir",
+          "dist"
+        ]
+      ]
+    },
+    "android": {
+      "hosts": [
+        "win32",
+        "darwin",
+        "linux"
+      ],
+      "format": "Android debug APK",
+      "output": "android/app/build/outputs/apk/debug/app-debug.apk",
+      "notice": "Requires preinstalled Gradle 8.13, JDK 21, Android SDK 36/build tools 35.0.0 and cached Gradle dependencies. Offline build does not provision missing tools.",
+      "commands": [
+        [
+          "gradle",
+          "--offline",
+          "--no-daemon",
+          "-Pandroid.builder.sdkDownload=false",
+          "-p",
+          "android",
+          "assembleDebug"
+        ]
+      ]
+    }
+  }
+}
