@@ -523,6 +523,18 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    "source_app_update.py::git": (
+        "Owner-invoked source-install bootstrap for FlexFactor itself, before "
+        "the runtime and its dependencies are imported. It never receives an "
+        "audited target's commands: Git argv is fixed, shell execution is off, "
+        "and origin plus effective URL must match the app's GitHub repository. "
+        "The bounded check fetches metadata only; applying requires the owner's "
+        "explicit selection, a clean main branch, the selected revision and a "
+        "fast-forward with hooks disabled and ignored-file overwrites refused. "
+        "This does not claim containment for Git's owner-configured transport "
+        "or credential helpers. It cannot import the runtime chokepoint before "
+        "the launcher's dependency preparation has run."
+    ),
     "flexfactor_tenets.py::_terminate_process_tree": (
         "Windows has no os.killpg equivalent, so timeout cleanup invokes only "
         "the absolute System32 taskkill.exe path with /T /F; POSIX cleanup uses "
