@@ -1377,20 +1377,14 @@ public final class MainActivity extends Activity {
             }
             @Override public void onUpdateAvailable(String versionName) {
                 if (destroyed || isFinishing()) return;
-                pendingStartupUpdate = true;
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
-                        || getPackageManager().canRequestPackageInstalls()) {
-                    pendingStartupUpdate = false;
-                    startUpdate();
-                    return;
-                }
+                // Checking never downloads or opens an installer. Even a device
+                // that already allows this source waits for the user's Update click.
+                pendingStartupUpdate = false;
                 new AlertDialog.Builder(MainActivity.this)
                         .setTitle("FlexFactor " + versionName + " is available")
-                        .setMessage("Android needs Allow from this source before FlexFactor can install its verified signed update.")
+                        .setMessage("Update to download the verified signed release. Your settings and saved runs are kept.")
                         .setNegativeButton("Later", null)
-                        .setPositiveButton("Allow updates", (dialog, which) -> startActivity(
-                                new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                        Uri.parse("package:" + getPackageName()))))
+                        .setPositiveButton("Update", (dialog, which) -> startUpdate())
                         .show();
             }
             @Override public void onError(String message) {
@@ -1529,3 +1523,4 @@ public final class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }
+

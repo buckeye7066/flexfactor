@@ -499,7 +499,9 @@ class ManagedAndroidInvariants(unittest.TestCase):
         launch = launch.split("private void resetUpdateButton", 1)[0]
         self.assertIn("new AppUpdater(this).check", launch)
         self.assertIn("onUpdateAvailable", launch)
-        self.assertIn("Allow updates", launch)
+        self.assertIn('.setPositiveButton("Update",', launch)
+        self.assertIn('.setNegativeButton("Later",', launch)
+        self.assertNotIn("startUpdate();", launch)
         self.assertIn("void check(CheckCallback callback)", updater)
 
 
