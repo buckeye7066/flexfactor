@@ -183,3 +183,32 @@ from an older exact source tag, and every release stays draft until all three
 assets and the tag target are verified immediately around publication.
 
 For failure diagnosis, see [docs/troubleshooting.md](docs/troubleshooting.md).
+
+
+
+## Installed source updates
+
+The desktop launcher checks the original `buckeye7066/flexfactor` GitHub source
+and offers **Update** or **Later** before starting. Updating requires the user's
+existing GitHub/Git sign-in for private repositories; credentials are never
+bundled. Only clean `main` checkouts can fast-forward. Modified files, divergent
+branches, untracked files and ignored personal data are not reset or stashed.
+Close other running instances before updating. Dependencies are reconciled by
+the app's launcher before it starts the new source.
+
+Check manually without replacing installed code:
+
+```sh
+python source_app_update.py --repo buckeye7066/flexfactor --check
+```
+
+Install only the revision returned by that check:
+
+```sh
+python source_app_update.py --repo buckeye7066/flexfactor --apply FULL_REVISION
+```
+
+`Update-App.cmd` opens the Update/Later choice on Windows. ZIP downloads without
+Git metadata cannot self-update through this source path. This is not a signed
+Windows/macOS/iOS installer or an app-store release. Existing installations
+need this updater installed once before they can notify about future versions.
