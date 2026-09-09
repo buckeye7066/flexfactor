@@ -37,6 +37,9 @@ function Invoke-FlexFactorSourceRefresh {
     Invoke-FlexFactorPython -Repo $Repository -PyArgs @(
         (Join-Path $Repository 'source_app_update.py'), '--repo', 'buckeye7066/flexfactor',
         '--name', 'FlexFactor', '--prompt')
+    if ($LASTEXITCODE -eq 20) {
+        Stop-FlexFactorSourceRefresh 'Update is busy or could not finish. Retry after reviewing its message.' 20
+    }
     if ($LASTEXITCODE -eq 10) {
         Set-Content -LiteralPath $marker -Value 'accepted source update: prepare dependencies' -Encoding Ascii
         Restart-FlexFactorLauncher -LauncherPath $LauncherPath -ForwardedArgs $ForwardedArgs
