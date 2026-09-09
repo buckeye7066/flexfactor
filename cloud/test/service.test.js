@@ -107,10 +107,10 @@ function storedClaim(request, overrides = {}) {
 }
 
 test("the reusable workflow is pinned to the release that carries this client", () => {
-  assert.equal(ENGINE_REF, "android-v3.5.3");
+  assert.equal(ENGINE_REF, "android-v3.5.4");
   assert.match(
     mobileWorkflow(),
-    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.3$/m,
+    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.4$/m,
   );
   for (const mode of ["refactor", "scout", "audit", "prodready"]) {
     assert.match(mobileWorkflow(), new RegExp(mode));
