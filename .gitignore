@@ -63,3 +63,6 @@ node_modules/
 # Test debris: a literal "~" directory appears when a path with a tilde is
 # used without expanduser. It is never legitimate repo content.
 /~/
+
+# Wheels produced by the documented build target.
+/dist/
