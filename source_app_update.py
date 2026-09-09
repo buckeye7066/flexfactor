@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import sys
 
 
 class UpdateError(RuntimeError):
@@ -46,6 +45,7 @@ class SourceUpdater:
         allowed = {
             f"https://github.com/{self.repo}", f"https://github.com/{self.repo}.git",
             f"git@github.com:{self.repo}.git", f"ssh://git@github.com/{self.repo}.git",
+            f"git@github.com:{self.repo}", f"ssh://git@github.com/{self.repo}",
         }
         if url.lower() not in {x.lower() for x in allowed}:
             raise UpdateError("Updates require this app's original GitHub repository.")
@@ -94,6 +94,14 @@ class SourceUpdater:
             if state["status"] == "current":
                 return state
             self.ensure_idle_checkout()
+            # Every entry point (including --apply and Update-App.cmd) leaves
+            # dependency work for the normal launcher. Record it before source
+            # replacement so an interrupted launcher cannot lose the obligation.
+            if self.repo.lower() == "buckeye7066/flexfactor":
+                try:
+                    (git_dir / "flexfactor-refresh-needs-install").write_text(expected, encoding="ascii")
+                except OSError as exc:
+                    raise UpdateError("Could not record dependency preparation; no source was updated.") from exc
             # Fast-forward only: no merge commit, conflict resolution, force, reset,
             # stash, clean, or overwriting ignored personal files such as .env/data.
             self.git("-c", "core.hooksPath=", "merge", "--ff-only",
@@ -109,7 +117,8 @@ def prompt(updater, name):
     try:
         state = updater.check()
     except UpdateError as exc:
-        print(f"{name} update check: {exc}", file=sys.stderr)
+        # Expected unavailability is status, not a native stderr failure in PS5.
+        print(f"{name} update check: {exc}")
         return 0  # offline/sign-in problems must not prevent using the installed app
     if state["status"] != "available":
         return 0

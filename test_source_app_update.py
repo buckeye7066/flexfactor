@@ -1,5 +1,7 @@
 """Hermetic source update tests using local Git repositories, never live GitHub."""
 import os
+import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import subprocess
 import tempfile
@@ -125,7 +127,30 @@ class UpdateTests(unittest.TestCase):
 
     def test_unavailable_check_keeps_installed_app_usable(self):
         updater = SourceUpdater(self.client, "buckeye7066/example")
-        self.assertEqual(prompt(updater, "Fixture"), 0)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertEqual(prompt(updater, "Fixture"), 0)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_suffixless_trusted_ssh_origins_remain_supported(self):
+        for url in ("git@github.com:buckeye7066/example", "ssh://git@github.com/buckeye7066/example"):
+            self.run_git(self.client, "remote", "set-url", "origin", url)
+            self.assertEqual(SourceUpdater(self.client, "buckeye7066/example").trusted_source(), url)
+
+    def test_manual_flexfactor_apply_records_dependency_work(self):
+        latest = self.newer()
+        self.updater.repo = "buckeye7066/flexfactor"
+        self.updater.apply(latest)
+        marker = self.client / ".git" / "flexfactor-refresh-needs-install"
+        self.assertEqual(marker.read_text(), latest)
+
+    def test_dependency_marker_failure_preserves_installed_source(self):
+        latest = self.newer()
+        self.updater.repo = "buckeye7066/flexfactor"
+        (self.client / ".git" / "flexfactor-refresh-needs-install").mkdir()
+        with self.assertRaises(UpdateError):
+            self.updater.apply(latest)
+        self.assertEqual(self.run_git(self.client, "rev-parse", "HEAD"), self.original)
 
 
 if __name__ == "__main__":
