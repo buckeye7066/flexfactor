@@ -47,6 +47,80 @@ def real_catalog(*routes: rotation.Route) -> rotation.Catalog:
         age_seconds=0.0, path="<capacity-test>")
 
 
+class CapacityStateReplaceTests(unittest.TestCase):
+    """Live 2026-09-11 (tinystats demo): update() did ONE os.replace onto
+    provider-capacity.json. read() opens that file without the lock, so on
+    Windows any concurrent reader turns the replace into PermissionError
+    [WinError 5]; rotation classifies PermissionError as NOT retryable, so a
+    local state-file race killed a model call and was ledgered as a provider
+    fault."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "capacity.json")
+        self.store = cap.CapacityState(self.path)
+        self.store.update(lambda data: data.__setitem__("next_ticket", 7))
+
+    def _leftover_temps(self):
+        return [n for n in os.listdir(self.tmp.name) if n.startswith("capacity-")]
+
+    def test_a_transient_sharing_violation_is_retried_and_the_write_lands(self):
+        from unittest import mock
+        real = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(dst)
+            if len(calls) <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        with mock.patch.object(cap.os, "replace", side_effect=flaky), \
+                mock.patch.object(cap.time, "sleep"):
+            self.store.update(lambda data: data.__setitem__("next_ticket", 42))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.store.read()["next_ticket"], 42)
+        self.assertEqual(self._leftover_temps(), [])
+
+    def test_a_persistent_sharing_violation_still_raises_after_a_bounded_wait(self):
+        from unittest import mock
+        calls = []
+
+        def denied(src, dst):
+            calls.append(dst)
+            raise PermissionError(13, "Access is denied")
+
+        with mock.patch.object(cap.os, "replace", side_effect=denied), \
+                mock.patch.object(cap.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                self.store.update(lambda data: data.__setitem__("next_ticket", 99))
+        self.assertEqual(len(calls), cap.REPLACE_ATTEMPTS)
+        self.assertEqual(self.store.read()["next_ticket"], 7, "a failed write must not half-land")
+        self.assertEqual(self._leftover_temps(), [])
+
+    @unittest.skipUnless(os.name == "nt", "the sharing violation is Windows semantics")
+    def test_a_real_open_reader_on_windows_no_longer_fails_the_update(self):
+        """The OS-level shape itself: a handle held open on the target makes a bare
+        os.replace raise PermissionError; update() must outlast a brief reader."""
+        reader = open(self.path, "r", encoding="utf-8")
+        with self.assertRaises(PermissionError):
+            probe = os.path.join(self.tmp.name, "probe.json")
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            try:
+                os.replace(probe, self.path)
+            finally:
+                if os.path.exists(probe):
+                    os.unlink(probe)
+        release = threading.Timer(0.15, reader.close)
+        release.start()
+        self.addCleanup(release.cancel)
+        self.addCleanup(reader.close)
+        self.store.update(lambda data: data.__setitem__("next_ticket", 11))
+        self.assertEqual(self.store.read()["next_ticket"], 11)
+
+
 class CapacityTests(unittest.TestCase):
     def setUp(self):
         name = "FLEXFACTOR_PROVIDER_MAX_INFLIGHT"
