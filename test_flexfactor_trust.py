@@ -83,5 +83,39 @@ class TrustBoundaryTests(unittest.TestCase):
                     _ = real_home
 
 
+    def test_an_unreadable_policy_is_named_in_the_refusal(self):
+        """A JSON typo must not read as 'no trusted_repos configured' while
+        the file on disk lists every repository the owner trusts."""
+        with tempfile.TemporaryDirectory() as home:
+            bad = os.path.join(home, "policy.json")
+            with open(bad, "w", encoding="utf-8") as fh:
+                fh.write('{"trusted_repos": ["C:\\Users\\owner\\GrantFlow"]}')
+            with tempfile.TemporaryDirectory() as proj:
+                old_path = trust.POLICY_PATH
+                old_env = os.environ.pop("FLEXFACTOR_TRUSTED_REPOS", None)
+                trust.POLICY_PATH = bad
+                try:
+                    d = trust.trust_decision(proj)
+                finally:
+                    trust.POLICY_PATH = old_path
+                    if old_env is not None:
+                        os.environ["FLEXFACTOR_TRUSTED_REPOS"] = old_env
+                self.assertFalse(d.allowed)
+                self.assertIn("could not be read", d.reason)
+                self.assertIn(bad, d.reason)
+
+    def test_the_loader_reads_an_explicit_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            p = os.path.join(home, "policy.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump({"trusted_repos": ["C:/x"]}, fh)
+            old_env = os.environ.pop("FLEXFACTOR_TRUSTED_REPOS", None)
+            try:
+                self.assertEqual(trust.load_trusted_repo_rules(p), (["C:/x"], p))
+            finally:
+                if old_env is not None:
+                    os.environ["FLEXFACTOR_TRUSTED_REPOS"] = old_env
+
+
 if __name__ == "__main__":
     unittest.main()

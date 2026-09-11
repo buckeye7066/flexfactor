@@ -55,27 +55,32 @@ def _norm_path(path: str) -> str:
         return os.path.normcase(os.path.abspath(path))
 
 
-def load_trusted_repo_rules() -> tuple[list[str], str]:
-    """Return (rules, source). Empty rules => no repo is trusted for unattended exec."""
+def load_trusted_repo_rules(path: str | None = None) -> tuple[list[str], str]:
+    """Return (rules, source). Empty rules => no repo is trusted for unattended exec.
+
+    `path` lets `flexfactor policy show` report the very file it names with the
+    same parsing the gate uses, instead of a second reader that could drift.
+    """
+    policy_path = path or POLICY_PATH
     env = (os.environ.get("FLEXFACTOR_TRUSTED_REPOS") or "").strip()
     if env:
         sep = ";" if os.name == "nt" else (";" if ";" in env else ":")
         rules = [p.strip() for p in env.split(sep) if p.strip()]
         return rules, "env:FLEXFACTOR_TRUSTED_REPOS"
     try:
-        with open(POLICY_PATH, "r", encoding="utf-8") as fh:
+        with open(policy_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return [], f"missing:{POLICY_PATH}"
+        return [], f"missing:{policy_path}"
     except Exception as ex:
-        return [], f"unreadable:{POLICY_PATH}:{type(ex).__name__}"
+        return [], f"unreadable:{policy_path}:{type(ex).__name__}"
     if not isinstance(data, dict):
-        return [], f"invalid:{POLICY_PATH}"
+        return [], f"invalid:{policy_path}"
     rules = data.get("trusted_repos") or data.get("trusted_repositories") or []
     if not isinstance(rules, list):
-        return [], f"invalid_trusted_repos:{POLICY_PATH}"
+        return [], f"invalid_trusted_repos:{policy_path}"
     out = [str(r).strip() for r in rules if str(r).strip()]
-    return out, POLICY_PATH
+    return out, policy_path
 
 
 def trust_decision(project_dir: str, *,
@@ -96,6 +101,20 @@ def trust_decision(project_dir: str, *,
             policy_source="cli",
         )
     rules, source = load_trusted_repo_rules()
+    if not rules and source.startswith(("unreadable:", "invalid")):
+        # A JSON typo is not "no policy". Saying "no trusted_repos configured"
+        # while the file lists every trusted repository sends the owner to
+        # add entries that are already there (live 2026-09-11).
+        return TrustDecision(
+            allowed=False,
+            reason=(f"the owner policy could not be read ({source}), so its "
+                    "trusted_repos are being IGNORED and no repository is "
+                    "trusted. Fix the JSON (Windows paths need doubled "
+                    "backslashes or forward slashes), or pass --trust-repo "
+                    "(run-level; recorded in the manifest; not a sandbox)."),
+            normalized_root=root,
+            policy_source=source,
+        )
     if not rules:
         return TrustDecision(
             allowed=False,

@@ -11151,6 +11151,51 @@ class PolicyCommandTests(unittest.TestCase):
         self.assertIn("all high-risk refused", out)
         self.assertIn("all findings block", out)
 
+    def test_show_is_loud_when_the_policy_file_is_unparseable(self):
+        """LIVE 2026-09-11: a single unescaped backslash in a Windows path made
+        policy.json invalid JSON. `policy show` printed '(present)', 'none'
+        and 'none', exited 0 - while every gate, the trust gate included, was
+        silently ignoring the whole file."""
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".flexfactor", "policy.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"trusted_repos": ["C:\\Users\\owner\\GrantFlow"]}')
+            with self._home(tmp), self._no_env(), \
+                    mock.patch.dict(os.environ, {"FLEXFACTOR_TRUSTED_REPOS": ""}):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ff.main(["policy", "show"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNREADABLE", out)
+        self.assertIn("NO repository is trusted", out)
+
+    def test_show_lists_the_trusted_repositories_the_trust_gate_reads(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".flexfactor", "policy.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"trusted_repos": ["C:/work/api", "C:/work/web"]}, fh)
+            with self._home(tmp), self._no_env(), \
+                    mock.patch.dict(os.environ, {"FLEXFACTOR_TRUSTED_REPOS": ""}):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ff.main(["policy", "show"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 rule(s)", out)
+        self.assertIn("C:/work/api", out)
+        self.assertIn("C:/work/web", out)
+
     def test_policy_mode_not_swallowed_by_implicit_refactor(self):
         # `policy` must dispatch to its own parser, not become
         # `refactor policy` (which would demand --file/--goal and exit 2).
