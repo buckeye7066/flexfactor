@@ -655,5 +655,46 @@ class ModelRefusalRotatesTests(RouteFaultTestCase):
                           __import__("inspect").getsource(ff.AnthropicProvider))
 
 
+# --------------------------------------------------------------------------- #
+# 6. A grader that ignores the grade schema is the ROUTE's fault: rotate.
+# --------------------------------------------------------------------------- #
+
+GRADE_ISSUES_SHAPE = "grade response field 'issues' must be an array of strings"
+
+
+class MalformedGradeRotatesTests(RouteFaultTestCase):
+    """LIVE 2026-09-11: a real `flexfactor refactor` exited 1 after 443s. One
+    rotated grader route answered `issues` in the wrong shape, `_parse_grade`
+    raised a plain ValueError, `_is_retryable` called that fatal, and the whole
+    refactor ended - although a structured call that ignores its schema
+    (StructuredOutputShapeError) already rotates to another model."""
+
+    def test_the_grade_shape_error_is_a_typed_value_error(self):
+        self.assertTrue(issubclass(ff.GradeShapeError, ValueError),
+                        "existing `except ValueError` callers must keep working")
+        with self.assertRaises(ff.GradeShapeError):
+            ff._parse_grade(json.dumps({"grade": 100, "meets_goal": True,
+                                        "rationale": "ok", "issues": [1]}))
+        with self.assertRaises(ff.GradeShapeError):
+            ff._parse_grade("not json at all")
+
+    def test_a_malformed_grade_is_retryable_and_classified_as_malformed(self):
+        exc = ff.GradeShapeError(GRADE_ISSUES_SHAPE)
+        self.assertTrue(R.is_malformed_output(exc))
+        self.assertTrue(R._is_retryable(exc))
+
+    def test_a_malformed_grade_moves_the_call_to_another_route(self):
+        prov = self.provider(
+            catalog(route("gemini/gemini-2.5-pro", "gemini:paid"),
+                    route("openai_api/gpt-5", "openai:paid")),
+            failures={"gemini/gemini-2.5-pro": ff.GradeShapeError(GRADE_ISSUES_SHAPE)})
+        self.assertEqual(prov.structured("s", "p", {}), {"by": "openai_api/gpt-5"})
+
+    def test_a_plain_value_error_is_still_fatal(self):
+        """Only the grader-contract shape rotates; a programming ValueError
+        must not tour every pool reproducing the same bug."""
+        self.assertFalse(R._is_retryable(ValueError("invalid literal for int()")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

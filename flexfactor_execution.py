@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -680,6 +681,11 @@ def run_sequential_queue(mode: str, targets: Iterable[object],
             orchestrator.finish_target(index, 130, note="operator interruption")
             raise
         except Exception as exc:
+            # SAY IT. The receipt alone is not enough: live 2026-09-11 a
+            # 443-second refactor ended with only 'status=failed' on screen
+            # while the reason sat in a JSON file nobody was told to open.
+            print(f"[orchestrator] target {index + 1}/{total} FAILED: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
             code = orchestrator.finish_target(
                 index, 1, note=f"{type(exc).__name__}: {exc}"
             )

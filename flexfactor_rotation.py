@@ -1666,7 +1666,7 @@ class RotatingProvider:
             failure; the error hook has already retained the provider failure.
             """
             if (last_error is None
-                    or type(last_error).__name__ != "StructuredOutputShapeError"):
+                    or not is_malformed_output(last_error)):
                 return
             releaser = getattr(self.rotator, "release_route_cooldown", None)
             if not callable(releaser):
@@ -1775,7 +1775,7 @@ class RotatingProvider:
                 if not payload_fault and not is_model_refusal(exc):
                     scope, reset_at = limit_scope(exc)
                     outcome = ("malformed_output"
-                               if type(exc).__name__ == "StructuredOutputShapeError"
+                               if is_malformed_output(exc)
                                else _classify(exc))
                     reported = self.rotator.report(
                         route, outcome, _retry_after(exc),
@@ -1792,7 +1792,7 @@ class RotatingProvider:
                     except Exception:  # noqa: BLE001 - a ledger must never break a call
                         pass
                 last_error = exc
-                if type(exc).__name__ == "StructuredOutputShapeError":
+                if is_malformed_output(exc):
                     shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
@@ -2099,6 +2099,18 @@ _MODEL_REFUSAL_MARKERS = ("model refused", "refusalstopdetails",
                           "stop_reason=refusal")
 
 
+# An answer that ignored the requested contract. The request was valid and
+# this model did not follow it, so another model can answer the same call.
+# GradeShapeError is the grader's twin of StructuredOutputShapeError (live
+# 2026-09-11: a refactor died on one route's malformed `issues`).
+_MALFORMED_OUTPUT_TYPES = ("StructuredOutputShapeError", "GradeShapeError")
+
+
+def is_malformed_output(exc: Optional[BaseException]) -> bool:
+    """True when a route answered outside the schema it was given."""
+    return exc is not None and type(exc).__name__ in _MALFORMED_OUTPUT_TYPES
+
+
 def is_model_refusal(exc: BaseException) -> bool:
     """True when a model's safety layer declined the request."""
     if type(exc).__name__ == "ModelRefusalError":
@@ -2182,7 +2194,7 @@ def _is_retryable(exc: BaseException) -> bool:
         # A different model FAMILY is a different classifier; _run excludes
         # the refusing family for the rest of the call.
         return True
-    if type(exc).__name__ == "StructuredOutputShapeError":
+    if is_malformed_output(exc):
         # The request and schema are valid; this particular model ignored
         # them. Another model can answer the same call correctly, so keep the
         # single paid-to-free ladder moving instead of terminating the run.

@@ -1359,6 +1359,17 @@ class EgressBlockedError(RuntimeError):
     must not abort the sweep' handler degrades it to a per-file skip."""
 
 
+class GradeShapeError(ValueError):
+    """A grader route answered outside the grade contract.
+
+    The grading twin of StructuredOutputShapeError: the request was valid and
+    THIS model ignored the schema (live 2026-09-11 a rotated grader returned
+    `issues` that were not strings and a 443-second refactor ended on it).
+    Typed so rotation hands the call to another model; still a ValueError so
+    every existing caller and test that expects one keeps working.
+    """
+
+
 class StructuredOutputShapeError(RuntimeError):
     """A model answered, but its JSON did not match the requested schema.
 
@@ -3091,33 +3102,33 @@ def _ollama_route_health(route) -> tuple[bool, str]:
 def _parse_grade(text: str) -> Grade:
     data, _ = _extract_json_object(text)
     if data is None:
-        raise ValueError(f"grade response was not JSON; head={text[:200]!r}")
+        raise GradeShapeError(f"grade response was not JSON; head={text[:200]!r}")
     if not isinstance(data, dict):
-        raise ValueError(
+        raise GradeShapeError(
             f"grade response was {type(data).__name__}, expected an object"
         )
     required = {"grade", "meets_goal", "rationale", "issues"}
     missing = sorted(required - set(data))
     extra = sorted(set(data) - required)
     if missing:
-        raise ValueError("grade response omitted required field(s): "
+        raise GradeShapeError("grade response omitted required field(s): "
                          + ", ".join(missing))
     if extra:
-        raise ValueError("grade response contained unknown field(s): "
+        raise GradeShapeError("grade response contained unknown field(s): "
                          + ", ".join(extra))
     if type(data["grade"]) is not int:
-        raise ValueError("grade response field 'grade' must be an integer")
+        raise GradeShapeError("grade response field 'grade' must be an integer")
     if type(data["meets_goal"]) is not bool:
-        raise ValueError("grade response field 'meets_goal' must be a boolean")
+        raise GradeShapeError("grade response field 'meets_goal' must be a boolean")
     if not isinstance(data["rationale"], str):
-        raise ValueError("grade response field 'rationale' must be a string")
+        raise GradeShapeError("grade response field 'rationale' must be a string")
     raw_issues = data["issues"]
     if (not isinstance(raw_issues, list)
             or any(not isinstance(issue, str) for issue in raw_issues)):
-        raise ValueError("grade response field 'issues' must be an array of strings")
+        raise GradeShapeError("grade response field 'issues' must be an array of strings")
     grade = max(0, min(100, data["grade"]))  # schema cannot express this range
     if grade < 100 and not raw_issues:
-        raise ValueError("a sub-100 grade must include at least one concrete issue")
+        raise GradeShapeError("a sub-100 grade must include at least one concrete issue")
     return Grade(
         grade=grade,
         meets_goal=data["meets_goal"],

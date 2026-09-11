@@ -318,22 +318,22 @@
     {
       "kind": "source",
       "locator": "flexfactor_execution.py",
-      "content_hash": "d7c5133e2acffbf449565584354cde7fe20d51f27c35630d1770ffb427de0205",
-      "observed_at": "2026-09-05T12:57:54Z",
+      "content_hash": "a692ef4abd9b0812fbde089f1b769b96722790fa0fd6ac6ddf5d41a27f99cf6a",
+      "observed_at": "2026-09-11T21:44:23.711339+00:00",
       "excerpt": "Sequential queue and six passes."
     },
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "a5ae91c850681d457e42d838efa01b2826e7795753959b45cfef257960f6d7de",
-      "observed_at": "2026-09-11T07:49:33.522057+00:00",
+      "content_hash": "050c14349cf3837fdf080acbf5297175a578bd25632d029aede0c00bed5528b1",
+      "observed_at": "2026-09-11T21:44:23.711339+00:00",
       "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "c13fdaba71b7cbbdeaeeb604cac9b79d3d1b9294419b1316df9261430e788d22",
-      "observed_at": "2026-09-11T08:25:18.007882+00:00",
+      "content_hash": "76baee6d0ebe1fef434898510f15c356cee53655c4438dcc25246eee675ee73a",
+      "observed_at": "2026-09-11T21:44:23.711339+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {

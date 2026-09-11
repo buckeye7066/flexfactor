@@ -171,7 +171,7 @@ SIGNATURES: List[Tuple[str, str, str]] = [
     (r"ModuleNotFoundError: No module named '([^']+)'", KIND_ENV,
      "A Python dependency is missing in the interpreter that ran. Install it in that interpreter "
      "(`python -m pip install <module>`), or point the run at the project's venv."),
-    (r"StructuredOutputShapeError|understanding field\(s\) must be arrays of strings|"
+    (r"StructuredOutputShapeError|GradeShapeError|understanding field\(s\) must be arrays of strings|"
      r"program-understanding output omitted required non-empty field", KIND_PROVIDER,
      "A model returned JSON that did not match the requested program-understanding schema. "
      "FlexFactor safely normalizes lossless one-item/string envelopes and rotates to the next "
