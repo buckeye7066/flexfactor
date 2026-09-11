@@ -565,6 +565,18 @@ class BudgetExceededError(RuntimeError):
     Raised by the reservation chokepoint so no call site can spend past the cap."""
 
 
+class ModelRefusalError(RuntimeError):
+    """The provider's safety layer declined THIS request on THIS model family.
+
+    A refusal (Anthropic `stop_reason == "refusal"`) is a classification of one
+    payload by one family's classifier - live 2026-09-11 a benign 6-file
+    scratch repository drew category 'cyber' from claude-fable-5 and
+    claude-fable-5-1 alike. It is TYPED so rotation can hand the same call to
+    a different family instead of ending it; it stays a RuntimeError so
+    every existing `except RuntimeError` keeps working.
+    """
+
+
 class OutputBudgetError(RuntimeError):
     """The model stopped because it hit its OUTPUT token ceiling, not because it
     finished. A TYPE, not a phrase (live GrantFlow 2026-08-16): `_fix_files` used
@@ -2152,7 +2164,7 @@ class AnthropicProvider:
                   "paid OpenAI (free proxy stays primary)")
             return oai.complete(instruction)
         if message.stop_reason == "refusal":
-            raise RuntimeError(f"Model refused the rewrite (stop_details={message.stop_details}).")
+            raise ModelRefusalError(f"Model refused the rewrite (stop_details={message.stop_details}).")
         return "".join(b.text for b in message.content if b.type == "text").strip()
 
     def grade(self, prompt: str) -> Grade:
@@ -2179,7 +2191,7 @@ class AnthropicProvider:
                   "paid OpenAI (free proxy stays primary)")
             return oai.grade(prompt)
         if message.stop_reason == "refusal":
-            raise RuntimeError(f"Model refused to grade (stop_details={message.stop_details}).")
+            raise ModelRefusalError(f"Model refused to grade (stop_details={message.stop_details}).")
         if not text:
             raise RuntimeError("Grader returned no text content to parse.")
         try:
@@ -2223,7 +2235,7 @@ class AnthropicProvider:
             return oai.structured(system, prompt, schema, max_tokens=max_tokens,
                                   model=oai_model, salvage_truncated=salvage_truncated)
         if message.stop_reason == "refusal":
-            raise RuntimeError(f"Model refused (stop_details={message.stop_details}).")
+            raise ModelRefusalError(f"Model refused (stop_details={message.stop_details}).")
         if message.stop_reason == "max_tokens":
             raise OutputBudgetError(
                 f"Model output hit the {max_tokens}-token budget (file too large to "

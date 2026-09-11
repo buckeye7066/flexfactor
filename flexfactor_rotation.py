@@ -1178,7 +1178,8 @@ class Rotator:
         """Record what a call did so the next pick is better informed.
 
         outcome: ok | rate_limited | quota_exhausted | auth_failed |
-                 transport_dead | model_retired | health_failed | malformed_output | error
+                 transport_dead | model_retired | health_failed | malformed_output |
+                 model_refused | error
         """
         now = time.time() if now is None else now
 
@@ -1253,6 +1254,15 @@ class Rotator:
                 # Do not escalate prior route strikes to healthy siblings.
                 cooldowns[route_key] = now + float(retry_after_seconds or ROUTE_ERROR_COOLDOWN)
                 strikes.pop(route.id, None)
+                return
+
+            if outcome == "model_refused":
+                # One payload declined by one family's safety classifier.
+                # Step off THIS route briefly so the call moves on, but add no
+                # strike and never touch the pool: three refusals of three
+                # different files are not evidence the provider is sick.
+                cooldowns[route_key] = now + float(
+                    retry_after_seconds or ROUTE_ERROR_COOLDOWN)
                 return
 
             if outcome == "model_retired":
@@ -1668,6 +1678,8 @@ class RotatingProvider:
                     releaser(failed_route, expected_until)
 
         allow_paid_for_call = self._allow_paid
+        # Families whose safety layer already refused THESE bytes in this call.
+        refused_families: set = set()
         attempt = 0
         while attempt < attempts:
             attempt += 1
@@ -1713,6 +1725,13 @@ class RotatingProvider:
                     f"{type(last_error).__name__}: {last_error}",
                     getattr(exc, "reasons", None)) from last_error
             route = selection.route
+            if (refused_families
+                    and route_model_family(route) in refused_families):
+                # Same classifier, same bytes, same verdict: do not pay for it.
+                # Cooling the route keeps next_route from handing it back.
+                self.rotator.report(route, "model_refused")
+                attempts = min(route_bound, attempts + 1)
+                continue
             self.model = route.model
             if self._on_route:
                 self._on_route(selection)
@@ -1774,6 +1793,13 @@ class RotatingProvider:
                     shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
+                if is_model_refusal(exc):
+                    family = route_model_family(route)
+                    if family not in _OPAQUE_MODEL_FAMILIES:
+                        refused_families.add(family)
+                    # A refusal is not a pool failure; do not let it consume a
+                    # healthy pool's attempt.
+                    attempts = min(route_bound, attempts + 1)
                 if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
                     # A dead route has not consumed its healthy siblings' pool.
                     # Extend only route-scoped failures, bounded by identities
@@ -1983,6 +2009,11 @@ _ROUTE_CAPABILITY_MARKERS = (
     #       '<acct>'" (the route exists in the catalog, not on the account)
     "not a chat model", "v1/completions", "not supported in the v1",
     "not found for account", "no such model", "no endpoints found",
+    # An OpenAI-compatible gateway answering 200 with `choices: null` / [] is
+    # the ROUTE declining or failing internally (flexfactor.OpenAIProvider
+    # raises this text precisely so rotation moves off that route). Without
+    # the marker `_is_retryable` said no and the call died on the spot.
+    "returned a response with no choices",
 )
 
 
@@ -2053,6 +2084,25 @@ def is_payload_fault(exc: BaseException) -> bool:
     return any(m in blob for m in _PAYLOAD_FAULT_MARKERS)
 
 
+# A model's SAFETY REFUSAL. MEASURED 2026-09-11: `flexfactor scout` on a
+# benign scratch repository exited 2 at purpose inference because
+# anthropic_api/claude-fable-5 answered stop_reason=refusal (category
+# 'cyber') and the call was never offered to any of the other ~1200 routes.
+# A refusal is a verdict of ONE model family's classifier on these bytes:
+# another family routinely answers them, the same family refuses them again
+# (claude-fable-5-1 did, in the same run), and the provider is not sick.
+_MODEL_REFUSAL_MARKERS = ("model refused", "refusalstopdetails",
+                          "stop_reason=refusal")
+
+
+def is_model_refusal(exc: BaseException) -> bool:
+    """True when a model's safety layer declined the request."""
+    if type(exc).__name__ == "ModelRefusalError":
+        return True
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(m in blob for m in _MODEL_REFUSAL_MARKERS)
+
+
 def is_route_capability_error(exc: BaseException) -> bool:
     """True when a 4xx names a limit/capability of THIS route specifically.
 
@@ -2070,6 +2120,8 @@ def is_route_capability_error(exc: BaseException) -> bool:
 
 def _classify(exc: BaseException) -> str:
     """Map a provider exception onto a rotation outcome."""
+    if is_model_refusal(exc):
+        return "model_refused"
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
     blob = f"{type(exc).__name__} {exc}".lower()
     if status == 429 or "rate limit" in blob or "rate_limit" in blob:
@@ -2122,6 +2174,10 @@ def _is_retryable(exc: BaseException) -> bool:
     if is_payload_fault(exc):
         # The next route gets the identical bytes and refuses them identically.
         return False
+    if is_model_refusal(exc):
+        # A different model FAMILY is a different classifier; _run excludes
+        # the refusing family for the rest of the call.
+        return True
     if type(exc).__name__ == "StructuredOutputShapeError":
         # The request and schema are valid; this particular model ignored
         # them. Another model can answer the same call correctly, so keep the

@@ -61,6 +61,11 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "The route's output/context ceiling is below what was requested. FlexFactor learns the ceiling "
      "from this 400 and retries once; if it recurs, the prompt unit must shrink (fewer findings per "
      "call) or the route should be excluded for large files."),
+    (r"Model refused|RefusalStopDetails|stop_reason=refusal", KIND_PROVIDER,
+     "The model's safety classifier declined this request (a false positive on "
+     "ordinary code is common). FlexFactor hands the call to a different model "
+     "family and does not strike the route; if EVERY family refuses, the request "
+     "text itself needs review."),
     (r"Interactions API|only supports Interactions", KIND_PROVIDER,
      "This is a 'deep research' product, not a chat model; it can never serve code work through this "
      "transport. It is on the unfit list (deep-research); refresh the catalog if it reappears."),
