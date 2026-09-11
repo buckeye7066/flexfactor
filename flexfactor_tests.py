@@ -11151,6 +11151,112 @@ class PolicyCommandTests(unittest.TestCase):
         self.assertIn("all high-risk refused", out)
         self.assertIn("all findings block", out)
 
+    def test_show_is_loud_when_the_policy_file_is_unparseable(self):
+        """LIVE 2026-09-11: a single unescaped backslash in a Windows path made
+        policy.json invalid JSON. `policy show` printed '(present)', 'none'
+        and 'none', exited 0 - while every gate, the trust gate included, was
+        silently ignoring the whole file."""
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".flexfactor", "policy.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"trusted_repos": ["C:\\Users\\owner\\GrantFlow"]}')
+            import flexfactor_trust as _trust_mod
+            with self._home(tmp), self._no_env(), \
+                    mock.patch.object(_trust_mod, "POLICY_PATH", path), \
+                    mock.patch.dict(os.environ, {"FLEXFACTOR_TRUSTED_REPOS": ""}):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ff.main(["policy", "show"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("UNREADABLE", out)
+        self.assertIn("ignored", out)
+
+    def test_show_lists_the_trusted_repositories_the_trust_gate_reads(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".flexfactor", "policy.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"trusted_repos": ["C:/work/api", "C:/work/web"]}, fh)
+            import flexfactor_trust as _trust_mod
+            with self._home(tmp), self._no_env(), \
+                    mock.patch.object(_trust_mod, "POLICY_PATH", path), \
+                    mock.patch.dict(os.environ, {"FLEXFACTOR_TRUSTED_REPOS": ""}):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = ff.main(["policy", "show"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 rule(s)", out)
+        self.assertIn("C:/work/api", out)
+        self.assertIn("C:/work/web", out)
+
+    def _show(self, tmp, policy_text, env=None, gate_path=None):
+        import io
+        import flexfactor_trust as _trust_mod
+        from contextlib import redirect_stdout
+        from unittest import mock
+        path = os.path.join(tmp, ".flexfactor", "policy.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(policy_text)
+        values = {"FLEXFACTOR_ALLOW_CLASSES": "", "FLEXFACTOR_ALLOW_EGRESS": "",
+                  "FLEXFACTOR_TRUSTED_REPOS": ""}
+        values.update(env or {})
+        buf = io.StringIO()
+        with self._home(tmp), mock.patch.dict(os.environ, values), \
+                mock.patch.object(_trust_mod, "POLICY_PATH", gate_path or path), \
+                redirect_stdout(buf):
+            rc = ff.main(["policy", "show"])
+        return rc, buf.getvalue()
+
+    def test_show_says_environment_overrides_still_apply_when_the_file_is_corrupt(self):
+        """Review on #175: the warning claimed nothing was unlocked, then the
+        effective-state lines below it showed the env overrides that were."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._show(tmp, '{"allow_classes": [broken',
+                                 env={"FLEXFACTOR_ALLOW_CLASSES": "deploy"})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("no command class unlocked", out)
+        self.assertIn("environment overrides", out)
+        self.assertIn("high-risk command classes unlocked: deploy", out)
+
+    def test_show_rejects_a_falsy_trusted_repos_of_the_wrong_type(self):
+        """Review on #175: {"trusted_repos": {}} collapsed through `or` into
+        'nothing configured' and exited 0."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = self._show(tmp, '{"trusted_repos": {}}')
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a JSON array", out)
+
+    def test_show_lists_what_the_trust_gate_actually_reads(self):
+        """Review on #175: `show` resolved ~ at call time while the gate reads
+        the path bound at import; the command must report the gate's file."""
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as gate_dir:
+            gate_file = os.path.join(gate_dir, "policy.json")
+            with open(gate_file, "w", encoding="utf-8") as fh:
+                _json.dump({"trusted_repos": ["C:/gate-reads-this"]}, fh)
+            rc, out = self._show(tmp, _json.dumps({"trusted_repos": ["C:/show-only"]}),
+                                 gate_path=gate_file)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("C:/gate-reads-this", out)
+        self.assertNotIn("C:/show-only", out)
+        self.assertIn(gate_file, out)
+
     def test_policy_mode_not_swallowed_by_implicit_refactor(self):
         # `policy` must dispatch to its own parser, not become
         # `refactor policy` (which would demand --file/--goal and exit 2).

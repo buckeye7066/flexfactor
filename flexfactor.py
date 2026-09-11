@@ -24736,16 +24736,63 @@ def run_policy(args) -> int:
               "specific command classes / egress categories.")
         return 0
     # show: the EFFECTIVE state (file + env combined), for debugging gates.
-    print(f"policy file: {path} ({'present' if os.path.exists(path) else 'absent'})")
+    present = os.path.exists(path)
+    print(f"policy file: {path} ({'present' if present else 'absent'})")
+    # Every gate loader swallows a parse error and fails closed. That is the
+    # right runtime behaviour and the WRONG thing for the debugging surface
+    # to repeat: live 2026-09-11 an unescaped backslash made the file invalid
+    # JSON and this command printed "(present)", "none", "none", exit 0.
+    problem = ""
+    if present:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                problem = (f"top level is {type(loaded).__name__}, "
+                           "expected a JSON object")
+        except (OSError, ValueError) as exc:
+            problem = f"{type(exc).__name__}: {exc}"
+    if problem:
+        print(f"POLICY FILE UNREADABLE - every gate is IGNORING the file: {problem}")
+        print("  effect: every entry in the FILE (command classes, egress categories, "
+              "trusted_repos) is ignored until it parses; environment overrides "
+              "shown below still apply (Windows paths need doubled backslashes "
+              "or forward slashes).")
     print(f"env FLEXFACTOR_ALLOW_CLASSES: {os.environ.get('FLEXFACTOR_ALLOW_CLASSES') or '(unset)'}")
     print(f"env FLEXFACTOR_ALLOW_EGRESS:  {os.environ.get('FLEXFACTOR_ALLOW_EGRESS') or '(unset)'}")
+    print(f"env FLEXFACTOR_TRUSTED_REPOS: {os.environ.get('FLEXFACTOR_TRUSTED_REPOS') or '(unset)'}")
     cmd_allow = sorted(_cmd_policy._load_policy_allow() & _cmd_policy.HIGH_RISK)
     egress_allow = sorted(_egress._load_policy_allow())
     print("high-risk command classes unlocked: "
           + (", ".join(cmd_allow) if cmd_allow else "(none - all high-risk refused)"))
     print("egress categories allowed: "
           + (", ".join(egress_allow) if egress_allow else "(none - all findings block)"))
-    return 0
+    # The THIRD gate reading this file. It was never shown, so the one list
+    # that decides whether a repository may be built at all was invisible.
+    import flexfactor_trust as _policy_trust
+    # Ask the gate's OWN loader with the gate's OWN path. In a long-lived or
+    # embedded process ~ can move after flexfactor_trust was imported, and a
+    # second path here would list a repository the gate then refuses.
+    rules, source = _policy_trust.load_trusted_repo_rules()
+    gate_path = _policy_trust.POLICY_PATH
+    if (os.path.normcase(os.path.abspath(gate_path))
+            != os.path.normcase(os.path.abspath(path))):
+        print(f"trust gate reads: {gate_path}")
+    if rules:
+        print(f"trusted repositories (unattended install/build/test): "
+              f"{len(rules)} rule(s) from {source}")
+        for rule in rules:
+            print(f"  - {rule}")
+    else:
+        print("trusted repositories: (none - an untrusted repository needs "
+              "--trust-repo or a trusted_repos entry)")
+        if source.startswith("invalid_trusted_repos"):
+            problem = problem or "trusted_repos is not a JSON array"
+            print("  trusted_repos is present but is not a JSON array; it is IGNORED.")
+        elif source.startswith(("unreadable:", "invalid:")) and not problem:
+            problem = f"the trust gate's policy file is unusable ({source})"
+            print(f"  {problem}")
+    return 1 if problem else 0
 
 
 def _add_egress_args(parser) -> None:
