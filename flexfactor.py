@@ -24753,10 +24753,11 @@ def run_policy(args) -> int:
         except (OSError, ValueError) as exc:
             problem = f"{type(exc).__name__}: {exc}"
     if problem:
-        print(f"POLICY FILE UNREADABLE - every gate is IGNORING it: {problem}")
-        print("  effect: no command class unlocked, no egress category allowed, "
-              "and NO repository is trusted until the file parses "
-              "(Windows paths need doubled backslashes or forward slashes).")
+        print(f"POLICY FILE UNREADABLE - every gate is IGNORING the file: {problem}")
+        print("  effect: every entry in the FILE (command classes, egress categories, "
+              "trusted_repos) is ignored until it parses; environment overrides "
+              "shown below still apply (Windows paths need doubled backslashes "
+              "or forward slashes).")
     print(f"env FLEXFACTOR_ALLOW_CLASSES: {os.environ.get('FLEXFACTOR_ALLOW_CLASSES') or '(unset)'}")
     print(f"env FLEXFACTOR_ALLOW_EGRESS:  {os.environ.get('FLEXFACTOR_ALLOW_EGRESS') or '(unset)'}")
     print(f"env FLEXFACTOR_TRUSTED_REPOS: {os.environ.get('FLEXFACTOR_TRUSTED_REPOS') or '(unset)'}")
@@ -24769,7 +24770,14 @@ def run_policy(args) -> int:
     # The THIRD gate reading this file. It was never shown, so the one list
     # that decides whether a repository may be built at all was invisible.
     import flexfactor_trust as _policy_trust
-    rules, source = _policy_trust.load_trusted_repo_rules(path)
+    # Ask the gate's OWN loader with the gate's OWN path. In a long-lived or
+    # embedded process ~ can move after flexfactor_trust was imported, and a
+    # second path here would list a repository the gate then refuses.
+    rules, source = _policy_trust.load_trusted_repo_rules()
+    gate_path = _policy_trust.POLICY_PATH
+    if (os.path.normcase(os.path.abspath(gate_path))
+            != os.path.normcase(os.path.abspath(path))):
+        print(f"trust gate reads: {gate_path}")
     if rules:
         print(f"trusted repositories (unattended install/build/test): "
               f"{len(rules)} rule(s) from {source}")
@@ -24781,6 +24789,9 @@ def run_policy(args) -> int:
         if source.startswith("invalid_trusted_repos"):
             problem = problem or "trusted_repos is not a JSON array"
             print("  trusted_repos is present but is not a JSON array; it is IGNORED.")
+        elif source.startswith(("unreadable:", "invalid:")) and not problem:
+            problem = f"the trust gate's policy file is unusable ({source})"
+            print(f"  {problem}")
     return 1 if problem else 0
 
 

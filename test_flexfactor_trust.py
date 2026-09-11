@@ -117,5 +117,26 @@ class TrustBoundaryTests(unittest.TestCase):
                     os.environ["FLEXFACTOR_TRUSTED_REPOS"] = old_env
 
 
+    def test_a_present_trusted_repos_of_the_wrong_type_is_invalid_even_when_falsy(self):
+        """Review on #175: `or` turned {}, "", 0, false and null into 'no rules'."""
+        with tempfile.TemporaryDirectory() as home:
+            p = os.path.join(home, "policy.json")
+            old_env = os.environ.pop("FLEXFACTOR_TRUSTED_REPOS", None)
+            try:
+                for value in ({}, "", 0, False, None):
+                    with open(p, "w", encoding="utf-8") as fh:
+                        json.dump({"trusted_repos": value}, fh)
+                    rules, source = trust.load_trusted_repo_rules(p)
+                    self.assertEqual(rules, [], value)
+                    self.assertTrue(source.startswith("invalid_trusted_repos:"),
+                                    (value, source))
+                with open(p, "w", encoding="utf-8") as fh:
+                    json.dump({"trusted_repos": [], "trusted_repositories": ["C:/y"]}, fh)
+                self.assertEqual(trust.load_trusted_repo_rules(p), (["C:/y"], p))
+            finally:
+                if old_env is not None:
+                    os.environ["FLEXFACTOR_TRUSTED_REPOS"] = old_env
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -76,9 +76,19 @@ def load_trusted_repo_rules(path: str | None = None) -> tuple[list[str], str]:
         return [], f"unreadable:{policy_path}:{type(ex).__name__}"
     if not isinstance(data, dict):
         return [], f"invalid:{policy_path}"
-    rules = data.get("trusted_repos") or data.get("trusted_repositories") or []
-    if not isinstance(rules, list):
-        return [], f"invalid_trusted_repos:{policy_path}"
+    # A PRESENT value of the wrong type is invalid even when it is falsy
+    # ({}, "", 0, false, null): `or` used to collapse it into "no rules
+    # configured". An empty trusted_repos still falls back to the older key.
+    rules: list = []
+    for key in ("trusted_repos", "trusted_repositories"):
+        if key not in data:
+            continue
+        value = data[key]
+        if not isinstance(value, list):
+            return [], f"invalid_trusted_repos:{policy_path}"
+        if value:
+            rules = value
+            break
     out = [str(r).strip() for r in rules if str(r).strip()]
     return out, policy_path
 
