@@ -793,15 +793,21 @@ def _now_iso() -> str:
 
 @contextlib.contextmanager
 def _brain_file_lock(timeout: float = 10.0):
+    """Serialize brain.json read-modify-write across FlexFactor processes."""
+    with _exclusive_lock_file(BRAIN_PATH + ".lock", timeout):
+        yield
+
+
+@contextlib.contextmanager
+def _exclusive_lock_file(lock_path: str, timeout: float = 10.0):
     """Best-effort cross-PROCESS advisory lock (exclusive lock file) so two
     FlexFactor processes can't interleave read-modify-write and lose a record.
     Steals a lock older than `timeout` (crashed holder) and, failing everything,
     proceeds unlocked rather than blocking a run forever."""
-    lock_path = BRAIN_PATH + ".lock"
     fd = None
     deadline = time.time() + timeout
     try:
-        os.makedirs(os.path.dirname(BRAIN_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     except OSError:
         pass
     while True:
@@ -1103,15 +1109,19 @@ class ProgressBus:
     def _flush_locked(self, drop_gone: bool = False) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            payload = {"updated": _now_iso(),
-                       "programs": self._other_entries(drop_gone)
-                       + [self.programs[k] for k in sorted(self.programs)]}
-            # Per-process temp name: two processes sharing one ".tmp" can
-            # interleave their writes into a file that is neither payload.
-            tmp = f"{self.path}.{self.pid}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            os.replace(tmp, self.path)
+            # Read, merge and replace are ONE cross-process transaction. Two
+            # processes flushing at once otherwise both read the same snapshot
+            # and the later replace erases the other's new entry.
+            with _exclusive_lock_file(self.path + ".lock", timeout=5.0):
+                payload = {"updated": _now_iso(),
+                           "programs": self._other_entries(drop_gone)
+                           + [self.programs[k] for k in sorted(self.programs)]}
+                # Per-process temp name: two processes sharing one ".tmp" can
+                # interleave their writes into a file that is neither payload.
+                tmp = f"{self.path}.{self.pid}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                os.replace(tmp, self.path)
         except OSError:
             pass  # progress reporting is best-effort; never break the audit
 
@@ -19777,7 +19787,8 @@ def _acquire_audit_lock(project_dir: str) -> str | None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # The legacy name is still honoured while a process from before the
         # rename holds it, so an upgrade can never double-run one program.
-        for held in (path, _legacy_audit_lock_path(project_dir)):
+        legacy = _legacy_audit_lock_path(project_dir)
+        for held in (path, legacy):
             if not os.path.exists(held):
                 continue
             try:
@@ -19786,6 +19797,14 @@ def _acquire_audit_lock(project_dir: str) -> str | None:
                 pid = 0
             if pid and pid != os.getpid() and _pid_alive(pid):
                 return None
+            if held == legacy and pid != os.getpid():
+                # Confirmed stale: nothing releases the legacy name any more,
+                # so a leftover file would falsely refuse this folder name
+                # forever once an unrelated process reuses the recorded PID.
+                try:
+                    os.remove(legacy)
+                except OSError:
+                    pass
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(str(os.getpid()))
         return path
@@ -25026,20 +25045,22 @@ def _obituary_stamp_status(status_path: str, pid: int) -> None:
     Another process's panel is skipped: that run may be alive and well, and
     stamping it DIED would repeat, from the crash path, the cross-process
     overwrite fixed in ProgressBus. A panel with no pid predates owner
-    stamping and keeps the old treatment."""
-    st = json.loads(_read_text_safe(status_path, 1 << 20) or "{}")
-    for prog in st.get("programs", []):
-        owner_pid = prog.get("pid")
-        if owner_pid not in (None, "") and str(owner_pid) != str(pid):
-            continue
-        if not prog.get("done"):
-            prog["phase"] = (f"DIED (pid {pid} exited during "
-                             f"'{prog.get('phase', '?')}')")
-            prog["done"] = True
-            prog["errors"] = int(prog.get("errors") or 0) + 1
-    st["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
-    with open(status_path, "w", encoding="utf-8") as fh:
-        json.dump(st, fh)
+    stamping and keeps the old treatment. The read-modify-write holds the same
+    status lock as ProgressBus, or a stale snapshot erases a sibling's flush."""
+    with _exclusive_lock_file(status_path + ".lock", timeout=5.0):
+        st = json.loads(_read_text_safe(status_path, 1 << 20) or "{}")
+        for prog in st.get("programs", []):
+            owner_pid = prog.get("pid")
+            if owner_pid not in (None, "") and str(owner_pid) != str(pid):
+                continue
+            if not prog.get("done"):
+                prog["phase"] = (f"DIED (pid {pid} exited during "
+                                 f"'{prog.get('phase', '?')}')")
+                prog["done"] = True
+                prog["errors"] = int(prog.get("errors") or 0) + 1
+        st["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(status_path, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
 
 
 _CRASH_LOG_FH = None

@@ -4038,6 +4038,70 @@ class StatusFileSharedAcrossProcessesTests(unittest.TestCase):
             with mock.patch.object(ff, "_pid_alive", return_value=False):
                 got = ff._acquire_audit_lock(proj)
             self.assertEqual(got, ff._audit_lock_path(proj))
+            # A confirmed-dead legacy lock is removed on takeover. Left behind,
+            # a later unrelated process reusing its PID would falsely refuse
+            # every audit of this folder name until someone deleted the file.
+            self.assertFalse(os.path.exists(legacy))
+            ff._release_audit_lock(got)
+            with mock.patch.object(ff, "_pid_alive", return_value=True):
+                self.assertEqual(ff._acquire_audit_lock(proj),
+                                 ff._audit_lock_path(proj))
+
+    def test_concurrent_flushes_from_two_processes_keep_both_panels(self):
+        """PR #180 review: per-PID temp names stopped temp-file collisions but
+        not the race itself. Bus A reads the snapshot; bus B (another process)
+        flushes inside that window; A then replaces the file with its stale
+        view and B's panel is gone. The read-merge-replace must be serialized
+        across buses, not only within one."""
+        import threading as _threading
+        a = ff.ProgressBus(self.path)
+        b = ff.ProgressBus(self.path)
+        real_other = ff.ProgressBus._other_entries
+        raced = {}
+
+        def a_reads_then_b_flushes(bus, drop_gone):
+            rows = real_other(bus, drop_gone)
+            if bus is a and not raced:
+                raced["thread"] = _threading.Thread(
+                    target=lambda: b.update(1, name="b-run", phase="reviewing"))
+                raced["thread"].start()
+                raced["thread"].join(timeout=0.5)  # B would finish here unserialized
+            return rows
+
+        with mock.patch.object(ff.ProgressBus, "_other_entries",
+                               a_reads_then_b_flushes):
+            a.update(1, name="a-run", phase="fixing")
+            raced["thread"].join(timeout=10)
+        self.assertFalse(raced["thread"].is_alive())
+        self.assertEqual(sorted(p.get("name") for p in self._read()),
+                         ["a-run", "b-run"])
+
+    def test_the_crash_obituary_does_not_race_a_live_flush(self):
+        """The obituary's read-modify-write takes the same status lock, so a
+        dying process cannot replace the file with a snapshot that predates a
+        sibling run's flush."""
+        import threading as _threading
+        live = ff.ProgressBus(self.path)
+        live.update(1, name="live-run", phase="fixing", done=False)
+        me = os.getpid()
+        real_read = ff._read_text_safe
+        raced = {}
+
+        def read_then_sibling_flushes(path, limit):
+            text = real_read(path, limit)
+            if path == self.path and not raced:
+                raced["thread"] = _threading.Thread(
+                    target=lambda: live.update(1, defects=7))
+                raced["thread"].start()
+                raced["thread"].join(timeout=0.5)
+            return text
+
+        with mock.patch.object(ff, "_read_text_safe", read_then_sibling_flushes):
+            ff._obituary_stamp_status(self.path, me + 99999)
+            raced["thread"].join(timeout=10)
+        self.assertFalse(raced["thread"].is_alive())
+        (panel,) = self._read()
+        self.assertEqual(panel.get("defects"), 7)
 
 
 class GradePayloadValidationTests(unittest.TestCase):
