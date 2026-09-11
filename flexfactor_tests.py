@@ -1869,6 +1869,9 @@ class RotationDefaultProviderTests(unittest.TestCase):
             provider = ff._rotation_route_provider(route)
         self.assertIs(provider, stub)
         self.assertIs(provider._allow_cross_family_rescue, False)
+        # The rotator owns fallback, so the route hands a dead transport back
+        # instead of re-rolling it (see flexfactor_route_fault_tests).
+        self.assertIs(provider._hand_back_transport_failures, True)
 
     def test_unusable_routes_are_dropped_with_named_reasons(self):
         import flexfactor_rotation as fr

@@ -646,6 +646,71 @@ class ModelRefusalRotatesTests(RouteFaultTestCase):
         self.assertEqual(len(calls), 1, "a refusal must not be re-sent")
         slept.assert_not_called()
 
+    def _dead_transport_call(self, *, rotated):
+        """Drive _stream_structured against a transport that times out every time."""
+        import types
+        from unittest import mock
+
+        class ReadTimeout(Exception):
+            pass
+
+        calls = []
+
+        def fake_stream(_client, **kwargs):
+            calls.append(kwargs)
+            raise ReadTimeout("The read operation timed out")
+
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        prov._paid_client_obj = None
+        prov._oai_rescue = None
+        prov._allow_cross_family_rescue = False
+        if rotated:
+            prov._hand_back_transport_failures = True
+        recover = mock.Mock()
+        prov._recover_transport = recover
+        raised = None
+        with mock.patch.object(ff, "_stream_with_deadline", side_effect=fake_stream), \
+                mock.patch.object(ff, "_fallback_hold_active", return_value=False), \
+                mock.patch.object(ff, "_fallback_available", return_value=False), \
+                mock.patch.object(ff.time, "sleep") as slept:
+            try:
+                prov._stream_structured(
+                    model="nvidia_nim/deepseek", max_tokens=100, system="s",
+                    messages=[{"role": "user", "content": "p"}],
+                    fmt={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+            except Exception as exc:  # noqa: BLE001 - the shape is what is asserted
+                raised = exc
+        return types.SimpleNamespace(calls=calls, slept=slept, recover=recover,
+                                     raised=raised, timeout_type=ReadTimeout)
+
+    def test_a_rotated_route_hands_a_dead_transport_back_after_one_attempt(self):
+        """Live 2026-09-11: one purpose-inference call spent ~25 minutes re-rolling
+        a single FCC->NIM route that answered 504 three times, while FCC's own
+        /health stayed 200 (so no paid hold armed) and the rotator - with 1,200
+        other routes - never got a turn. A rotated route must fail FAST so the
+        ladder can fall back."""
+        got = self._dead_transport_call(rotated=True)
+        self.assertEqual(len(got.calls), 1, "a rotated route must not re-roll its own dead transport")
+        self.assertIsInstance(got.raised, got.timeout_type,
+                              "the original transport error must reach the rotator unchanged")
+        got.slept.assert_not_called()
+        got.recover.assert_not_called()
+
+    def test_the_handed_back_timeout_is_retryable_for_the_rotator(self):
+        import flexfactor_rotation as fr
+        got = self._dead_transport_call(rotated=True)
+        self.assertTrue(fr._is_retryable(got.raised),
+                        "the rotator must treat the handed-back timeout as a reason to draw another route")
+
+    def test_a_fixed_provider_still_retries_its_only_transport(self):
+        """Control: with no rotator behind it, re-rolling the one transport is the
+        only recovery, so the three spaced attempts stay."""
+        got = self._dead_transport_call(rotated=False)
+        self.assertEqual(len(got.calls), 3)
+        self.assertEqual(got.recover.call_count, 2)
+        self.assertEqual(got.slept.call_count, 2)
+
     def test_the_anthropic_provider_raises_the_typed_refusal(self):
         self.assertTrue(issubclass(ff.ModelRefusalError, RuntimeError),
                         "existing `except RuntimeError` callers must keep working")
