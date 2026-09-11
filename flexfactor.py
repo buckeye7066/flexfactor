@@ -6452,6 +6452,27 @@ def _sleep_one_second() -> None:
 REPO_REWARDS_MAX_QUERY_CHARS = 500
 
 
+def _clamp_repo_rewards_query(query: str) -> str:
+    """Clamp to the service's limit as JAVASCRIPT counts it, on a word boundary.
+
+    The route checks String.length, i.e. UTF-16 code units, where a character
+    outside the BMP (an emoji) is 2. Python's len() counts it once, so a query
+    of 499 Python characters could still be 749 units and draw the same 400.
+    """
+    if len(query.encode("utf-16-le")) // 2 <= REPO_REWARDS_MAX_QUERY_CHARS:
+        return query
+    units = 0
+    kept: list[str] = []
+    for ch in query:
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if units + width > REPO_REWARDS_MAX_QUERY_CHARS:
+            break
+        kept.append(ch)
+        units += width
+    cut = "".join(kept)
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).strip()
+
+
 def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
                         attempts: int = 3) -> list[dict]:
     """POST one query to Repo Rewards and return its ranked results (possibly empty).
@@ -6466,10 +6487,7 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
     # (repo-rewards src/app/api/search/route.ts). Callers build queries up to
     # 600 characters, so clamp HERE, at the one door every caller uses, and
     # cut on a word boundary so the query still reads as a query.
-    query = " ".join(str(query or "").split())
-    if len(query) > REPO_REWARDS_MAX_QUERY_CHARS:
-        cut = query[:REPO_REWARDS_MAX_QUERY_CHARS]
-        query = (cut.rsplit(" ", 1)[0] if " " in cut else cut).strip()
+    query = _clamp_repo_rewards_query(" ".join(str(query or "").split()))
     payload: dict = {"query": query}
     if lens:
         payload["lens"] = lens
@@ -6485,7 +6503,17 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
                 return json.loads(resp.read().decode("utf-8")).get("results") or []
         except urllib.error.HTTPError as e:
             last_err = e
-            if 400 <= int(getattr(e, "code", 0) or 0) < 500:
+            code = int(getattr(e, "code", 0) or 0)
+            if code in (408, 429):
+                # Alive and asking for patience: a later attempt can succeed.
+                # Honour Retry-After, bounded so one query cannot stall a gate.
+                try:
+                    wait = float((e.headers or {}).get("Retry-After") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    wait = 0.0
+                if attempt < attempts and wait > 0:
+                    time.sleep(min(wait, 30.0))
+            elif 400 <= code < 500:
                 # The server ANSWERED: the request itself is refused. The same
                 # bytes get the same verdict, so re-sending them only waits.
                 break
