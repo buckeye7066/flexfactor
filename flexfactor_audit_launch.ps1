@@ -63,7 +63,7 @@ Write-Host "FlexFactor Audit" -ForegroundColor Cyan
 Write-Host "$($programs.Count) target(s), one at a time, in the selected order." -ForegroundColor DarkGray
 Write-Host "The orchestrator starts with the strongest paid capacity and descends to free." -ForegroundColor DarkGray
 Write-Host "Pass 1 covers the repository; later passes cover only the preceding verified edit delta." -ForegroundColor DarkGray
-Write-Host "Between passes 1 and 2, the top three competitor capabilities are attempted." -ForegroundColor DarkGray
+Write-Host "Between passes 1 and 2, the competitor gate researches the configured target (FLEXFACTOR_TOP_COMPETITORS, default 25)." -ForegroundColor DarkGray
 Write-Host "Success requires independent review and the exact commit on origin's default branch." -ForegroundColor DarkGray
 Write-Host ""
 Invoke-FlexFactorPython -Repo $PSScriptRoot -PyArgs (@($script) + $cliArgs)

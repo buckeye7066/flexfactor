@@ -3999,6 +3999,59 @@ class GradePayloadValidationTests(unittest.TestCase):
             }))
 
 
+class CompetitorGateStatesItsRealTargetTests(unittest.TestCase):
+    """LIVE 2026-09-11: purpose contract v0.4 (f329fe5) raised the competitor
+    research target from 3 to a configurable default of 25, but the audit
+    launcher and the console banner still promised "the top three competitor
+    capabilities". A real audit of a 6-file repository then sat 50+ minutes in
+    that gate while every line on screen described a three-item job."""
+
+    def test_the_gate_banner_prints_the_target_it_actually_researches(self):
+        import argparse
+        import contextlib
+        import io as _io
+
+        class _Stop(Exception):
+            pass
+
+        class _Module:
+            @staticmethod
+            def research_competitors(*_a, **kwargs):
+                seen["target"] = kwargs.get("target")
+                raise ff.BudgetExceededError("stop after the banner")
+
+        seen = {}
+        out = _io.StringIO()
+        with mock.patch.object(ff, "_competitors_module", return_value=_Module()), \
+                mock.patch.object(ff, "resolve_repo_rewards_url",
+                                  return_value=(None, "not used in this test")), \
+                mock.patch.object(ff, "_scout_program_profile",
+                                  return_value=(None, "not used in this test")), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(_io.StringIO()):
+            ff._run_top_competitor_gate(
+                args=argparse.Namespace(competitor_count=None), pfx="[t] ",
+                report=lambda **k: None, checkpoint=None, display_name="demo",
+                purpose_blob="Program: demo", stack={}, purpose_reviewer=object(),
+                author=None, cross=None, project_dir=tempfile.gettempdir(),
+                all_files=[], meter=None, baseline_ok=True, oversized=set(),
+                noop_stats={}, errors_total=0, done_set=set(), total_to_review=0,
+                git=False, branch="", prev_branch="", purpose_contract=None)
+        text = out.getvalue()
+        target = seen.get("target")
+        self.assertEqual(target, ff._ff_execution.TOP_COMPETITORS)
+        self.assertIn(f"up to {target} competitors", text)
+        self.assertNotIn("top three competitors", text)
+
+    def test_the_audit_launcher_does_not_promise_three(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(ff.__file__)),
+                            "flexfactor_audit_launch.ps1")
+        with open(path, encoding="utf-8") as fh:
+            launcher = fh.read()
+        self.assertNotIn("top three competitor", launcher)
+        self.assertIn("FLEXFACTOR_TOP_COMPETITORS", launcher)
+
+
 class GeneratedTestSourcePreflightTests(unittest.TestCase):
     """Audit/Production Ready parse every generated test before any write."""
 
@@ -17934,8 +17987,14 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
                       "not through _judge")
         self.assertIn("allow_credentialed_firecrawl=", call)
         self.assertIn("source_inspector=inspect_public_competitor_source", call)
-        self.assertIn("TOP_COMPETITORS", call,
-                      "the inter-pass gate must remain fixed at the top three")
+        # Contract v0.4 (f329fe5) made the target the orchestrator's configured
+        # TOP_COMPETITORS (default 25). It is computed once as gate_target, so
+        # the console banner and this call cannot state different numbers.
+        self.assertIn("target=gate_target", call)
+        self.assertIn("_ff_execution.TOP_COMPETITORS",
+                      src[:src.index("research_competitors(")],
+                      "the inter-pass gate must use the orchestrator's "
+                      "configured competitor target")
 
 
 class CompetitorCoverageHonestyTests(unittest.TestCase):

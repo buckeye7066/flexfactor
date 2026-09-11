@@ -13736,7 +13736,13 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         return outcome
 
     rr_url, rr_note = resolve_repo_rewards_url(args, auto_start=False)
-    print(f"{pfx}BETWEEN PASSES 1 AND 2 - top three competitors: "
+    # Say the number this gate will actually research. Contract v0.4 made it
+    # a configurable default of 25; the banner kept promising three, and a
+    # 6-file audit sat 50+ minutes here with nothing saying why (2026-09-11).
+    gate_target = int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+                      or _ff_execution.TOP_COMPETITORS)
+    print(f"{pfx}BETWEEN PASSES 1 AND 2 - competitor gate: researching up to "
+          f"{gate_target} competitors (FLEXFACTOR_TOP_COMPETITORS); "
           f"Repo Rewards -> {rr_note}")
     rr_fn = (lambda query: repo_rewards_search(rr_url, query)) if rr_url else None
     scout_profile, scout_error = _scout_program_profile(
@@ -13765,8 +13771,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
             source_inspector=inspect_public_competitor_source,
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
-            target=int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
-                       or _ff_execution.TOP_COMPETITORS),
+            target=gate_target,
             allow_credentialed_firecrawl=True,
             log=lambda message: print(f"{pfx}{message}"),
             file_list=all_files,
