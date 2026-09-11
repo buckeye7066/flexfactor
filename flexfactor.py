@@ -1046,7 +1046,7 @@ class ProgressBus:
     """Thread-safe shared progress state, one entry per program index."""
 
     def __init__(self, path: str = STATUS_PATH):
-        import time as _bus_time
+        import secrets as _bus_secrets
         self.path = path
         self.programs: dict[int, dict] = {}
         self._lock = threading.Lock()
@@ -1058,7 +1058,9 @@ class ProgressBus:
         # ERROR. Entries now carry who wrote them, and a flush replaces
         # only its own.
         self.pid = os.getpid()
-        self.owner = f"{self.pid}-{_bus_time.time_ns():x}"
+        # Random, not clock-derived: Windows' clock is coarse enough that two
+        # buses built back to back shared a time_ns() token (CI, PR #180).
+        self.owner = f"{self.pid}-{_bus_secrets.token_hex(8)}"
 
     def update(self, index: int, **fields) -> None:
         with self._lock:

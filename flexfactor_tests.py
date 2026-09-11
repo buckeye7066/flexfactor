@@ -3973,6 +3973,17 @@ class StatusFileSharedAcrossProcessesTests(unittest.TestCase):
         self.assertEqual(sorted(p.get("phase") for p in progs), ["error", "fixing"])
         self.assertIn(4, [p.get("defects") for p in progs])
 
+    def test_two_buses_in_one_process_never_share_an_owner(self):
+        """CI on windows-latest, PR #180: the owner token was pid + time_ns(),
+        and Windows' clock is coarse enough that two buses created back to back
+        got the SAME token - the second then treated the live run's entry as its
+        own and dropped it. Simulate the coarse clock deterministically."""
+        import time as _time
+        with mock.patch.object(_time, "time_ns", return_value=1_700_000_000_000_000_000):
+            first = ff.ProgressBus(self.path)
+            second = ff.ProgressBus(self.path)
+        self.assertNotEqual(first.owner, second.owner)
+
     def test_reset_drops_the_panels_of_processes_that_are_gone(self):
         with open(self.path, "w", encoding="utf-8") as fh:
             json.dump({"updated": "x", "programs": [
