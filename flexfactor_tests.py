@@ -3939,6 +3939,171 @@ class ScoutSourcePreflightTests(unittest.TestCase):
             self.assertEqual("skipped-unverified", result.status)
 
 
+class StatusFileSharedAcrossProcessesTests(unittest.TestCase):
+    """LIVE 2026-09-11: a real audit of scratch repo `tinystats` had run 21
+    minutes (defects 3, $0.86) when a second FlexFactor process - a prodready of
+    a DIFFERENT repository that is also named tinystats - was refused by the
+    audit lock in 6 seconds. It still rewrote ~/.flexfactor/status.json with
+    only its own entry, so the dashboard showed the healthy run as
+    'ERROR: another FlexFactor audit of tinystats is already running', $0.00,
+    and 70 seconds later the file still said so. The refusal itself was false:
+    the lock was keyed on the folder NAME, not the repository."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ff-status-share-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "status.json")
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)["programs"]
+
+    def test_a_second_process_does_not_erase_a_live_runs_panel(self):
+        live = ff.ProgressBus(self.path)
+        live.update(1, name="tinystats", dir="C:/a/tinystats", phase="fixing",
+                    defects=3, done=False)
+        second = ff.ProgressBus(self.path)
+        second.reset()
+        second.update(1, name="tinystats", dir="C:/b/tinystats", phase="error",
+                      done=True, error="refused")
+        self.assertEqual(sorted(p.get("phase") for p in self._read()),
+                         ["error", "fixing"])
+        live.update(1, defects=4)
+        progs = self._read()
+        self.assertEqual(sorted(p.get("phase") for p in progs), ["error", "fixing"])
+        self.assertIn(4, [p.get("defects") for p in progs])
+
+    def test_two_buses_in_one_process_never_share_an_owner(self):
+        """CI on windows-latest, PR #180: the owner token was pid + time_ns(),
+        and Windows' clock is coarse enough that two buses created back to back
+        got the SAME token - the second then treated the live run's entry as its
+        own and dropped it. Simulate the coarse clock deterministically."""
+        import time as _time
+        with mock.patch.object(_time, "time_ns", return_value=1_700_000_000_000_000_000):
+            first = ff.ProgressBus(self.path)
+            second = ff.ProgressBus(self.path)
+        self.assertNotEqual(first.owner, second.owner)
+
+    def test_reset_drops_the_panels_of_processes_that_are_gone(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"updated": "x", "programs": [
+                {"index": 1, "name": "old", "phase": "done", "done": True,
+                 "pid": 4242, "owner": "4242-dead"},
+                {"index": 2, "name": "legacy-no-owner", "phase": "done",
+                 "done": True}]}, fh)
+        with mock.patch.object(ff, "_pid_alive", return_value=False):
+            ff.ProgressBus(self.path).reset()
+        self.assertEqual(self._read(), [])
+
+    def test_the_crash_obituary_only_declares_its_own_panels_dead(self):
+        me = os.getpid()
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"updated": "x", "programs": [
+                {"index": 1, "name": "mine", "phase": "fixing", "done": False,
+                 "pid": me},
+                {"index": 1, "name": "other-live-run", "phase": "fixing",
+                 "done": False, "pid": me + 1},
+                {"index": 2, "name": "legacy", "phase": "fixing", "done": False}]}, fh)
+        ff._obituary_stamp_status(self.path, me)
+        by_name = {p["name"]: p for p in self._read()}
+        self.assertTrue(by_name["mine"]["phase"].startswith("DIED"))
+        self.assertTrue(by_name["legacy"]["phase"].startswith("DIED"))
+        self.assertEqual(by_name["other-live-run"]["phase"], "fixing")
+        self.assertFalse(by_name["other-live-run"]["done"])
+
+    def test_two_repositories_with_the_same_folder_name_get_different_locks(self):
+        a = os.path.join(self.tmp, "one", "tinystats")
+        b = os.path.join(self.tmp, "two", "tinystats")
+        os.makedirs(a)
+        os.makedirs(b)
+        self.assertNotEqual(ff._audit_lock_path(a), ff._audit_lock_path(b))
+        self.assertEqual(ff._audit_lock_path(a), ff._audit_lock_path(a + os.sep))
+        self.assertTrue(os.path.basename(ff._audit_lock_path(a))
+                        .startswith("audit-tinystats"))
+
+    def test_a_live_lock_from_before_the_upgrade_still_refuses_a_double_run(self):
+        """An older FlexFactor still running holds the basename lock; the new
+        name must not let the same program be audited twice meanwhile."""
+        proj = os.path.join(self.tmp, "repo", "tinystats")
+        os.makedirs(proj)
+        home = os.path.join(self.tmp, "home")
+        with mock.patch("os.path.expanduser",
+                        side_effect=lambda p: p.replace("~", home, 1)):
+            legacy = os.path.join(home, ".flexfactor", "audit-tinystats.lock")
+            os.makedirs(os.path.dirname(legacy))
+            with open(legacy, "w", encoding="utf-8") as fh:
+                fh.write(str(os.getpid() + 1))
+            with mock.patch.object(ff, "_pid_alive", return_value=True):
+                self.assertIsNone(ff._acquire_audit_lock(proj))
+            with mock.patch.object(ff, "_pid_alive", return_value=False):
+                got = ff._acquire_audit_lock(proj)
+            self.assertEqual(got, ff._audit_lock_path(proj))
+            # A confirmed-dead legacy lock is removed on takeover. Left behind,
+            # a later unrelated process reusing its PID would falsely refuse
+            # every audit of this folder name until someone deleted the file.
+            self.assertFalse(os.path.exists(legacy))
+            ff._release_audit_lock(got)
+            with mock.patch.object(ff, "_pid_alive", return_value=True):
+                self.assertEqual(ff._acquire_audit_lock(proj),
+                                 ff._audit_lock_path(proj))
+
+    def test_concurrent_flushes_from_two_processes_keep_both_panels(self):
+        """PR #180 review: per-PID temp names stopped temp-file collisions but
+        not the race itself. Bus A reads the snapshot; bus B (another process)
+        flushes inside that window; A then replaces the file with its stale
+        view and B's panel is gone. The read-merge-replace must be serialized
+        across buses, not only within one."""
+        import threading as _threading
+        a = ff.ProgressBus(self.path)
+        b = ff.ProgressBus(self.path)
+        real_other = ff.ProgressBus._other_entries
+        raced = {}
+
+        def a_reads_then_b_flushes(bus, drop_gone):
+            rows = real_other(bus, drop_gone)
+            if bus is a and not raced:
+                raced["thread"] = _threading.Thread(
+                    target=lambda: b.update(1, name="b-run", phase="reviewing"))
+                raced["thread"].start()
+                raced["thread"].join(timeout=0.5)  # B would finish here unserialized
+            return rows
+
+        with mock.patch.object(ff.ProgressBus, "_other_entries",
+                               a_reads_then_b_flushes):
+            a.update(1, name="a-run", phase="fixing")
+            raced["thread"].join(timeout=10)
+        self.assertFalse(raced["thread"].is_alive())
+        self.assertEqual(sorted(p.get("name") for p in self._read()),
+                         ["a-run", "b-run"])
+
+    def test_the_crash_obituary_does_not_race_a_live_flush(self):
+        """The obituary's read-modify-write takes the same status lock, so a
+        dying process cannot replace the file with a snapshot that predates a
+        sibling run's flush."""
+        import threading as _threading
+        live = ff.ProgressBus(self.path)
+        live.update(1, name="live-run", phase="fixing", done=False)
+        me = os.getpid()
+        real_read = ff._read_text_safe
+        raced = {}
+
+        def read_then_sibling_flushes(path, limit):
+            text = real_read(path, limit)
+            if path == self.path and not raced:
+                raced["thread"] = _threading.Thread(
+                    target=lambda: live.update(1, defects=7))
+                raced["thread"].start()
+                raced["thread"].join(timeout=0.5)
+            return text
+
+        with mock.patch.object(ff, "_read_text_safe", read_then_sibling_flushes):
+            ff._obituary_stamp_status(self.path, me + 99999)
+            raced["thread"].join(timeout=10)
+        self.assertFalse(raced["thread"].is_alive())
+        (panel,) = self._read()
+        self.assertEqual(panel.get("defects"), 7)
+
+
 class GradePayloadValidationTests(unittest.TestCase):
     """Every reviewer route must satisfy the complete no-op authorization schema."""
 

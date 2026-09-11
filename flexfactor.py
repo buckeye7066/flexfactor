@@ -793,15 +793,21 @@ def _now_iso() -> str:
 
 @contextlib.contextmanager
 def _brain_file_lock(timeout: float = 10.0):
+    """Serialize brain.json read-modify-write across FlexFactor processes."""
+    with _exclusive_lock_file(BRAIN_PATH + ".lock", timeout):
+        yield
+
+
+@contextlib.contextmanager
+def _exclusive_lock_file(lock_path: str, timeout: float = 10.0):
     """Best-effort cross-PROCESS advisory lock (exclusive lock file) so two
     FlexFactor processes can't interleave read-modify-write and lose a record.
     Steals a lock older than `timeout` (crashed holder) and, failing everything,
     proceeds unlocked rather than blocking a run forever."""
-    lock_path = BRAIN_PATH + ".lock"
     fd = None
     deadline = time.time() + timeout
     try:
-        os.makedirs(os.path.dirname(BRAIN_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     except OSError:
         pass
     while True:
@@ -1046,30 +1052,76 @@ class ProgressBus:
     """Thread-safe shared progress state, one entry per program index."""
 
     def __init__(self, path: str = STATUS_PATH):
+        import secrets as _bus_secrets
         self.path = path
         self.programs: dict[int, dict] = {}
         self._lock = threading.Lock()
+        # ONE FILE, MANY PROCESSES. Every FlexFactor process writes this
+        # status file, and each bus only knows its OWN programs. Rewriting
+        # the whole file from that partial view erased every other run:
+        # live 2026-09-11 a prodready refused by the audit lock in six
+        # seconds replaced a healthy 21-minute audit's panel with its own
+        # ERROR. Entries now carry who wrote them, and a flush replaces
+        # only its own.
+        self.pid = os.getpid()
+        # Random, not clock-derived: Windows' clock is coarse enough that two
+        # buses built back to back shared a time_ns() token (CI, PR #180).
+        self.owner = f"{self.pid}-{_bus_secrets.token_hex(8)}"
 
     def update(self, index: int, **fields) -> None:
         with self._lock:
-            p = self.programs.setdefault(index, {"index": index})
+            p = self.programs.setdefault(
+                index, {"index": index, "pid": self.pid, "owner": self.owner})
             p.update(fields)
             self._flush_locked()
 
     def reset(self) -> None:
+        """Clear THIS run's panels and those of processes that are gone.
+
+        A live sibling run's panels are not ours to clear."""
         with self._lock:
             self.programs = {}
-            self._flush_locked()
+            self._flush_locked(drop_gone=True)
 
-    def _flush_locked(self) -> None:
+    def _other_entries(self, drop_gone: bool) -> list[dict]:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                current = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        rows = current.get("programs") if isinstance(current, dict) else None
+        kept: list[dict] = []
+        for entry in rows if isinstance(rows, list) else []:
+            if not isinstance(entry, dict) or entry.get("owner") == self.owner:
+                continue
+            if drop_gone:
+                try:
+                    pid = int(entry.get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                # No pid = written before owners existed: the old reset
+                # semantics (clear it) still apply.
+                if not pid or not _pid_alive(pid):
+                    continue
+            kept.append(entry)
+        return kept
+
+    def _flush_locked(self, drop_gone: bool = False) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            payload = {"updated": _now_iso(),
-                       "programs": [self.programs[k] for k in sorted(self.programs)]}
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            os.replace(tmp, self.path)
+            # Read, merge and replace are ONE cross-process transaction. Two
+            # processes flushing at once otherwise both read the same snapshot
+            # and the later replace erases the other's new entry.
+            with _exclusive_lock_file(self.path + ".lock", timeout=5.0):
+                payload = {"updated": _now_iso(),
+                           "programs": self._other_entries(drop_gone)
+                           + [self.programs[k] for k in sorted(self.programs)]}
+                # Per-process temp name: two processes sharing one ".tmp" can
+                # interleave their writes into a file that is neither payload.
+                tmp = f"{self.path}.{self.pid}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                os.replace(tmp, self.path)
         except OSError:
             pass  # progress reporting is best-effort; never break the audit
 
@@ -19704,9 +19756,23 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _audit_lock_path(project_dir: str) -> str:
+def _legacy_audit_lock_path(project_dir: str) -> str:
+    """The pre-2026-09-11 lock name: the folder NAME only."""
     slug = _slugify(os.path.basename(os.path.normpath(project_dir))) or "program"
     return os.path.join(os.path.expanduser("~"), ".flexfactor", f"audit-{slug}.lock")
+
+
+def _audit_lock_path(project_dir: str) -> str:
+    """One lock per REPOSITORY. Keyed on the folder name alone, two different
+    checkouts that share a name refused each other (live 2026-09-11: a
+    prodready of one `tinystats` was told another audit of it was running
+    while a different `tinystats` was being audited)."""
+    import hashlib as _lock_hashlib
+    norm = os.path.normcase(os.path.realpath(os.path.normpath(project_dir)))
+    slug = _slugify(os.path.basename(norm)) or "program"
+    digest = _lock_hashlib.sha256(norm.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    return os.path.join(os.path.expanduser("~"), ".flexfactor",
+                        f"audit-{slug}-{digest}.lock")
 
 
 def _acquire_audit_lock(project_dir: str) -> str | None:
@@ -19719,13 +19785,26 @@ def _acquire_audit_lock(project_dir: str) -> str | None:
     path = _audit_lock_path(project_dir)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.exists(path):
+        # The legacy name is still honoured while a process from before the
+        # rename holds it, so an upgrade can never double-run one program.
+        legacy = _legacy_audit_lock_path(project_dir)
+        for held in (path, legacy):
+            if not os.path.exists(held):
+                continue
             try:
-                pid = int(_read_text_safe(path, 100).strip() or 0)
+                pid = int(_read_text_safe(held, 100).strip() or 0)
             except ValueError:
                 pid = 0
             if pid and pid != os.getpid() and _pid_alive(pid):
                 return None
+            if held == legacy and pid != os.getpid():
+                # Confirmed stale: nothing releases the legacy name any more,
+                # so a leftover file would falsely refuse this folder name
+                # forever once an unrelated process reuses the recorded PID.
+                try:
+                    os.remove(legacy)
+                except OSError:
+                    pass
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(str(os.getpid()))
         return path
@@ -20010,8 +20089,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["trust_repo_override"] = True
         lock_path = _acquire_audit_lock(project_dir)
         if lock_path is None:
+            held = [p for p in (_audit_lock_path(project_dir),
+                                _legacy_audit_lock_path(project_dir))
+                    if os.path.exists(p)]
             msg = (f"another FlexFactor audit of {display_name} is already running; "
-                   f"refusing to double-run (stale? delete {_audit_lock_path(project_dir)})")
+                   f"refusing to double-run (stale? delete "
+                   f"{' or '.join(held) or _audit_lock_path(project_dir)})")
             print(f"{pfx}error: {msg}", file=sys.stderr)
             result["error"] = msg
             _ledger("setup", result["error"])
@@ -24939,17 +25022,8 @@ def _arm_death_instrumentation() -> None:
             return
         # Unclean end: stamp the status file so 'fixing' can never be the last word.
         try:
-            sp = os.path.join(state_dir, "status.json")
-            st = json.loads(_read_text_safe(sp, 1 << 20) or "{}")
-            for prog in st.get("programs", []):
-                if not prog.get("done"):
-                    prog["phase"] = (f"DIED (pid {os.getpid()} exited during "
-                                     f"'{prog.get('phase', '?')}')")
-                    prog["done"] = True
-                    prog["errors"] = int(prog.get("errors") or 0) + 1
-            st["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
-            with open(sp, "w", encoding="utf-8") as fh:
-                json.dump(st, fh)
+            _obituary_stamp_status(os.path.join(state_dir, "status.json"),
+                                   os.getpid())
         except Exception:
             pass
         # Release every audit lock THIS pid owns (never another live run's).
@@ -24963,6 +25037,30 @@ def _arm_death_instrumentation() -> None:
         except Exception:
             pass
     atexit.register(_obituary)
+
+
+def _obituary_stamp_status(status_path: str, pid: int) -> None:
+    """Mark THIS process's unfinished panels as died.
+
+    Another process's panel is skipped: that run may be alive and well, and
+    stamping it DIED would repeat, from the crash path, the cross-process
+    overwrite fixed in ProgressBus. A panel with no pid predates owner
+    stamping and keeps the old treatment. The read-modify-write holds the same
+    status lock as ProgressBus, or a stale snapshot erases a sibling's flush."""
+    with _exclusive_lock_file(status_path + ".lock", timeout=5.0):
+        st = json.loads(_read_text_safe(status_path, 1 << 20) or "{}")
+        for prog in st.get("programs", []):
+            owner_pid = prog.get("pid")
+            if owner_pid not in (None, "") and str(owner_pid) != str(pid):
+                continue
+            if not prog.get("done"):
+                prog["phase"] = (f"DIED (pid {pid} exited during "
+                                 f"'{prog.get('phase', '?')}')")
+                prog["done"] = True
+                prog["errors"] = int(prog.get("errors") or 0) + 1
+        st["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(status_path, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
 
 
 _CRASH_LOG_FH = None
