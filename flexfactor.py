@@ -6448,6 +6448,10 @@ def _sleep_one_second() -> None:
     time.sleep(1)
 
 
+#: Repo Rewards /api/search rejects longer queries with HTTP 400.
+REPO_REWARDS_MAX_QUERY_CHARS = 500
+
+
 def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
                         attempts: int = 3) -> list[dict]:
     """POST one query to Repo Rewards and return its ranked results (possibly empty).
@@ -6458,6 +6462,14 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
     tries. A genuine empty/HTTP result is returned immediately (not retried), and
     after the last attempt we degrade to a warning so one bad query never aborts
     the whole scout run."""
+    # The service rejects anything longer with HTTP 400 "query too long"
+    # (repo-rewards src/app/api/search/route.ts). Callers build queries up to
+    # 600 characters, so clamp HERE, at the one door every caller uses, and
+    # cut on a word boundary so the query still reads as a query.
+    query = " ".join(str(query or "").split())
+    if len(query) > REPO_REWARDS_MAX_QUERY_CHARS:
+        cut = query[:REPO_REWARDS_MAX_QUERY_CHARS]
+        query = (cut.rsplit(" ", 1)[0] if " " in cut else cut).strip()
     payload: dict = {"query": query}
     if lens:
         payload["lens"] = lens
@@ -6471,6 +6483,12 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return json.loads(resp.read().decode("utf-8")).get("results") or []
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if 400 <= int(getattr(e, "code", 0) or 0) < 500:
+                # The server ANSWERED: the request itself is refused. The same
+                # bytes get the same verdict, so re-sending them only waits.
+                break
         except (urllib.error.URLError, OSError) as e:
             last_err = e  # connection-level: server may be restarting -> retry
         except ValueError as e:

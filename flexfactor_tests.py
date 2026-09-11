@@ -11086,6 +11086,73 @@ class PaidRescueStampedeTests(unittest.TestCase):
         self.assertEqual(ff._price_for("ollama@gpt-4o"), ff._DEFAULT_PRICE)
 
 
+class RepoRewardsSearchContractTests(unittest.TestCase):
+    """LIVE 2026-09-11: Repo Rewards' /api/search rejects any query longer than
+    500 characters (repo-rewards src/app/api/search/route.ts) with HTTP 400
+    {"error": "query too long"} - measured, a 589-character query came back
+    400 in 3.4s. FlexFactor clamped queries to 600 and treated the 400 as a
+    connection drop, so it sent the same rejected bytes three times, waited
+    for the port between tries, and returned nothing for that query."""
+
+    def _run(self, side_effect):
+        import io as _io
+        import urllib.error
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(json.loads(req.data.decode("utf-8")))
+            result = side_effect(len(sent))
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                mock.patch.object(ff, "_server_is_up", return_value=True), \
+                mock.patch.object(ff, "_sleep_one_second", return_value=None), \
+                mock.patch("sys.stdout", new=_io.StringIO()):
+            out = ff.repo_rewards_search("https://rr.example.invalid", "q " * 400)
+        return out, sent, urllib.error
+
+    def test_a_query_never_exceeds_the_services_500_character_limit(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"results": [{"repo": {"fullName": "a/b"}}]}'
+
+        out, sent, _ = self._run(lambda n: _Resp())
+        self.assertEqual(len(sent), 1)
+        self.assertLessEqual(len(sent[0]["query"]), 500)
+        self.assertTrue(sent[0]["query"].strip())
+        self.assertEqual(out, [{"repo": {"fullName": "a/b"}}])
+
+    def test_an_http_4xx_is_a_verdict_and_is_not_retried(self):
+        import urllib.error
+
+        def reject(_n):
+            return urllib.error.HTTPError(
+                "https://rr.example.invalid/api/search", 400, "Bad Request",
+                {}, None)
+
+        out, sent, _ = self._run(reject)
+        self.assertEqual(out, [])
+        self.assertEqual(len(sent), 1, "a 400 must not be re-sent")
+
+    def test_a_connection_drop_is_still_retried(self):
+        import urllib.error
+
+        def drop(_n):
+            return urllib.error.URLError(ConnectionResetError("reset by peer"))
+
+        out, sent, _ = self._run(drop)
+        self.assertEqual(out, [])
+        self.assertEqual(len(sent), 3)
+
+
 class PolicyCommandTests(unittest.TestCase):
     """`flexfactor policy init|show`: the owner-policy template must be
     deny-by-default, never overwrite, and reflect what the gates enforce."""
