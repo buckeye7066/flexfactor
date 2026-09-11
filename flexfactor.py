@@ -2207,6 +2207,11 @@ class AnthropicProvider:
             raise RuntimeError("Grader returned no text content to parse.")
         try:
             return _parse_grade(text)
+        except GradeShapeError as exc:
+            # Keep the TYPE: rotation can move a schema-ignoring grader to
+            # another model only when it sees GradeShapeError (review on #176).
+            raise GradeShapeError(f"Grader returned unparseable output ({exc}); "
+                                  f"head={text[:200]!r}") from exc
         except Exception as exc:
             raise RuntimeError(f"Grader returned unparseable output ({exc}); head={text[:200]!r}")
 
@@ -4846,7 +4851,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
               + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
     global _LAST_ROTATION_USABLE
     _LAST_ROTATION_USABLE = len(usable)
-    return fr.RotatingProvider(rotator, _rotation_route_provider,
+    provider = fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=author_tier,
                                allow_paid=True, meter=meter,
                                on_route=_announce,
@@ -4860,6 +4865,11 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
                                # --max-cost still bounds the total spend.
                                paid_first=paid_first,
                                role_coordinator=role_coordinator)
+    # Validate every grade INSIDE its rotation attempt. CLI/Cursor graders
+    # return raw dicts/text, and a malformed one checked only after grade()
+    # returned could never be rotated away from (review on #176).
+    provider.grade_validator = _normalize_grade
+    return provider
 
 
 # Set by build_audit_providers when it returns [] so the caller can explain WHY

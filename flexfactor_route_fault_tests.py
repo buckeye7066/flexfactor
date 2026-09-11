@@ -696,5 +696,91 @@ class MalformedGradeRotatesTests(RouteFaultTestCase):
         self.assertFalse(R._is_retryable(ValueError("invalid literal for int()")))
 
 
+# --------------------------------------------------------------------------- #
+# 7. Review on #176: the grade-shape fix must reach every grader path.
+# --------------------------------------------------------------------------- #
+
+_BAD_GRADE = {"grade": 100, "meets_goal": True, "rationale": "ok", "issues": [1]}
+_GOOD_GRADE = {"grade": 100, "meets_goal": True, "rationale": "ok", "issues": []}
+
+
+class GradeShapeReachesRotationTests(RouteFaultTestCase):
+    def _grading_provider(self, payloads):
+        # Grading is a REVIEWER call on the judge (light) tier, and independent
+        # review excludes opaque model families - so the routes must be light
+        # tier with recognized families, like real graders.
+        rot = R.Rotator(catalog=catalog(*[route(rid, f"pool:{rid}", tier=R.LIGHT)
+                                          for rid in payloads]),
+                        store=self.store, app="flexfactor")
+
+        class _Grader:
+            def __init__(self, rt):
+                self.route = rt
+                self.model = rt.model
+                self.judge_model = rt.model
+                self.meter = None
+                self.calls = 0
+
+            def grade(self, *a, **k):
+                self.calls += 1
+                return payloads[self.route.id]
+
+        prov = R.RotatingProvider(rot, _Grader)
+        prov.grade_validator = ff._normalize_grade
+        return prov
+
+    def test_a_malformed_subscription_grade_is_rejected_inside_the_attempt(self):
+        """CLI/Cursor graders return raw dicts/text; validated only after
+        grade() returned, a malformed one could never be rotated away from."""
+        prov = self._grading_provider({"openai_api/gpt-5-mini": _BAD_GRADE})
+        with self.assertRaises(Exception) as ctx:
+            prov.grade("p")
+        self.assertIn("GradeShapeError", str(ctx.exception))
+
+    def test_a_rotated_grade_comes_back_normalized(self):
+        prov = self._grading_provider({"anthropic_api/claude-sonnet-5": _BAD_GRADE,
+                                       "openai_api/gpt-5-mini": _GOOD_GRADE})
+        result = prov.grade("p")
+        self.assertIsInstance(result, ff.Grade)
+        self.assertEqual(result.issues, [])
+
+    def test_the_anthropic_grader_keeps_the_grade_shape_type(self):
+        """AnthropicProvider.grade wrapped every parse failure in RuntimeError,
+        which rotation treats as fatal."""
+        import contextlib
+        import types
+        from unittest import mock
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        prov.meter = None
+        prov.judge_model = "claude-fable-5"
+        prov._meter = lambda *a, **k: None
+        text = '{"grade": 100, "meets_goal": true, "rationale": "x", "issues": [1]}'
+        msg = types.SimpleNamespace(
+            stop_reason="end_turn", stop_details=None,
+            content=[types.SimpleNamespace(type="text", text=text)])
+        with mock.patch.object(ff.AnthropicProvider, "_stream_structured", return_value=msg), \
+                mock.patch.object(ff, "_budget_guard", return_value=contextlib.nullcontext()):
+            with self.assertRaises(ff.GradeShapeError):
+                prov.grade("p")
+
+    def test_malformed_graders_stay_cooled_when_the_whole_ladder_fails(self):
+        """The cooldown release exists for a structured call's corrective retry;
+        grade() has none, so releasing it re-offered the same malformed graders
+        to the next target."""
+        prov = self.provider(
+            catalog(route("anthropic_api/claude-sonnet-5", "pool:a", tier=R.LIGHT),
+                    route("openai_api/gpt-5-mini", "pool:b", tier=R.LIGHT)),
+            failures={"anthropic_api/claude-sonnet-5": ff.GradeShapeError(
+                          "grade response field 'issues' must be an array of strings"),
+                      "openai_api/gpt-5-mini": ff.GradeShapeError(
+                          "grade response field 'issues' must be an array of strings")})
+        with self.assertRaises(Exception):
+            prov.grade("p")
+        cooldowns = self.store.read().get("cooldowns") or {}
+        self.assertIn("route:anthropic_api/claude-sonnet-5", cooldowns)
+        self.assertIn("route:openai_api/gpt-5-mini", cooldowns)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

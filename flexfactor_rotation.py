@@ -1636,6 +1636,10 @@ class RotatingProvider:
         """
         intent = self._complete_intent(kwargs.pop("intent", None))
         result_validator = kwargs.pop("_result_validator", None)
+        if result_validator is None and method == "grade":
+            # The owner of this provider may attach a grade contract check;
+            # applying it here makes a malformed grade a per-attempt failure.
+            result_validator = getattr(self, "grade_validator", None)
         attempt_limit = kwargs.pop("_attempt_limit", None)
         if attempt_limit is not None and (not isinstance(attempt_limit, int) or attempt_limit < 1):
             raise ValueError("attempt limit must be a positive integer")
@@ -1666,7 +1670,7 @@ class RotatingProvider:
             failure; the error hook has already retained the provider failure.
             """
             if (last_error is None
-                    or not is_malformed_output(last_error)):
+                    or type(last_error).__name__ != "StructuredOutputShapeError"):
                 return
             releaser = getattr(self.rotator, "release_route_cooldown", None)
             if not callable(releaser):
@@ -1792,7 +1796,9 @@ class RotatingProvider:
                     except Exception:  # noqa: BLE001 - a ledger must never break a call
                         pass
                 last_error = exc
-                if is_malformed_output(exc):
+                # Only a structured call has the bounded corrective retry the
+                # release exists for; a malformed GRADER stays cooled (#176).
+                if type(exc).__name__ == "StructuredOutputShapeError":
                     shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
