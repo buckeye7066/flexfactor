@@ -522,5 +522,138 @@ class AccountWideAllowanceTests(RouteFaultTestCase):
         self.assertNotEqual(R.allowance_key(paid), R.allowance_key(or_free("a/one")))
 
 
+# --------------------------------------------------------------------------- #
+# 5. A model's SAFETY REFUSAL is a property of that model family: rotate.
+# --------------------------------------------------------------------------- #
+
+# The exact provider text from the live 2026-09-11 scout of a benign 6-file
+# scratch repository (tinystats: a mean() helper and a port parser).
+ANTHROPIC_CYBER_REFUSAL = (
+    "Model refused (stop_details=RefusalStopDetails(category='cyber', "
+    "explanation=\"This request triggered restrictions on violative cyber "
+    "content and was blocked under Anthropic's Usage Policy.\", type='refusal'))."
+)
+
+
+class ModelRefusalRotatesTests(RouteFaultTestCase):
+    """LIVE 2026-09-11: `flexfactor scout` on a benign repo exited 2 at purpose
+    inference. The ladder picked anthropic_api/claude-fable-5, the provider
+    answered stop_reason=refusal (category cyber), AnthropicProvider raised a
+    bare RuntimeError, and `_is_retryable` said no - so ONE false-positive
+    safety classification ended the call while ~1200 other routes, most of
+    them other model families, never got a turn."""
+
+    def test_a_refusal_is_retried_on_a_different_family(self):
+        prov = self.provider(
+            catalog(route("anthropic_api/claude-fable-5", "anthropic:paid"),
+                    route("openai_api/gpt-5", "openai:paid")),
+            failures={"anthropic_api/claude-fable-5":
+                      ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL)})
+        self.assertEqual(prov.structured("s", "p", {}),
+                         {"by": "openai_api/gpt-5"})
+
+    def test_the_legacy_untyped_refusal_text_is_recognised_too(self):
+        exc = RuntimeError(ANTHROPIC_CYBER_REFUSAL)
+        self.assertTrue(R.is_model_refusal(exc))
+        self.assertTrue(R._is_retryable(exc))
+
+    def test_the_refusing_family_is_not_asked_again_in_the_same_call(self):
+        """Two Claude routes refuse identically; the second must never be
+        spent on the same bytes once the first said no."""
+        prov = self.provider(
+            catalog(route("anthropic_api/claude-fable-5", "anthropic:a"),
+                    route("anthropic_api/claude-fable-5-1", "anthropic:b"),
+                    route("openai_api/gpt-5", "openai:paid")),
+            failures={
+                "anthropic_api/claude-fable-5":
+                    ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL),
+                "anthropic_api/claude-fable-5-1":
+                    ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL),
+            })
+        self.assertEqual(prov.structured("s", "p", {}),
+                         {"by": "openai_api/gpt-5"})
+        claude_calls = sum(f.calls for rid, f in self.built.items()
+                           if "claude" in rid)
+        self.assertLessEqual(claude_calls, 1)
+
+    def test_a_refusal_never_cools_the_pool(self):
+        """A payload-specific classification is not evidence the provider is
+        sick; three of them must not bench a whole pool for five minutes."""
+        prov = self.provider(
+            catalog(route("anthropic_api/claude-fable-5", "anthropic:paid"),
+                    route("openai_api/gpt-5", "openai:paid")),
+            failures={"anthropic_api/claude-fable-5":
+                      ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL)})
+        for _ in range(4):
+            prov.structured("s", "p", {})
+        state = self.store.read()
+        self.assertNotIn("anthropic:paid", state.get("cooldowns") or {})
+        self.assertNotIn("anthropic_api/claude-fable-5",
+                         state.get("strikes") or {})
+
+    def test_when_every_family_refuses_the_refusal_surfaces(self):
+        """Rotation must never turn a universal refusal into a silent success."""
+        prov = self.provider(
+            catalog(route("anthropic_api/claude-fable-5", "anthropic:paid")),
+            failures={"anthropic_api/claude-fable-5":
+                      ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL)})
+        with self.assertRaises(Exception) as ctx:
+            prov.structured("s", "p", {})
+        self.assertIn("Model refused", str(ctx.exception))
+
+    def test_a_refusal_leaves_no_shared_cooldown_for_unrelated_calls(self):
+        """Review on #174: a 30s route cooldown in the SHARED rotation state made
+        unrelated calls and other workers skip a healthy route - fatal in a
+        catalog where it is the only usable route. The refusal was about the
+        bytes of one call, so only that call may step around it."""
+        rid = "anthropic_api/claude-fable-5"
+        prov = self.provider(
+            catalog(route(rid, "anthropic:paid")),
+            failures={rid: ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL)})
+        with self.assertRaises(Exception):
+            prov.structured("s", "refused bytes", {})
+        self.built[rid].fail_with = None
+        self.assertEqual(prov.structured("s", "different bytes", {}), {"by": rid})
+        self.assertNotIn(f"route:{rid}", self.store.read().get("cooldowns") or {})
+
+    def test_a_structured_refusal_is_not_re_sent_inside_the_provider(self):
+        """Review on #174: _stream_structured re-rolled a refusal (no parseable
+        text) three times with 6s sleeps before anyone read stop_reason, sending
+        the refused bytes to the same family again and possibly on to the paid
+        rescue - defeating the same-family exclusion."""
+        import types
+        from unittest import mock
+        calls = []
+        refusal = types.SimpleNamespace(stop_reason="refusal", content=[],
+                                        stop_details="category=cyber", usage=None)
+
+        def fake_stream(_client, **kwargs):
+            calls.append(kwargs)
+            return refusal
+
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        with mock.patch.object(ff, "_stream_with_deadline", side_effect=fake_stream), \
+                mock.patch.object(ff, "_fallback_hold_active", return_value=False), \
+                mock.patch.object(ff, "_fallback_available", return_value=True), \
+                mock.patch.object(ff, "_paid_message_unused", create=True), \
+                mock.patch.object(ff.time, "sleep") as slept:
+            got = prov._stream_structured(
+                model="claude-fable-5", max_tokens=100, system="s",
+                messages=[{"role": "user", "content": "p"}],
+                fmt={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        self.assertIs(got, refusal)
+        self.assertEqual(len(calls), 1, "a refusal must not be re-sent")
+        slept.assert_not_called()
+
+    def test_the_anthropic_provider_raises_the_typed_refusal(self):
+        self.assertTrue(issubclass(ff.ModelRefusalError, RuntimeError),
+                        "existing `except RuntimeError` callers must keep working")
+        for site in ("Model refused the rewrite", "Model refused to grade",
+                     "Model refused (stop_details"):
+            self.assertIn(f"raise ModelRefusalError(f\"{site}", 
+                          __import__("inspect").getsource(ff.AnthropicProvider))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
