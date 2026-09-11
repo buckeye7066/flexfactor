@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -683,6 +684,16 @@ def run_sequential_queue(mode: str, targets: Iterable[object],
             code = orchestrator.finish_target(
                 index, 1, note=f"{type(exc).__name__}: {exc}"
             )
+            # SAY IT. The receipt alone is not enough: live 2026-09-11 a
+            # 443-second refactor ended with only 'status=failed' on screen
+            # while the reason sat in a JSON file nobody was told to open.
+            # Best-effort and AFTER finish_target: a closed or broken stderr
+            # must never leave the durable receipt item running (#176).
+            try:
+                print(f"[orchestrator] target {index + 1}/{total} FAILED: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
             results.append(code)
             continue
         code = orchestrator.finish_target(index, code)

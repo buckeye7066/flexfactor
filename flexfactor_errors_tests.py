@@ -354,5 +354,16 @@ class EnvironmentalBuildFailureTests(unittest.TestCase):
         self.assertNotEqual(E.KIND_ENV, E.KIND_PROGRAM)
 
 
+class GradeShapeSignatureTests(unittest.TestCase):
+    def test_a_grade_shape_error_gets_a_grade_specific_diagnosis(self):
+        """Review on #176: it matched the program-understanding row and told the
+        operator about envelope normalization _parse_grade never does."""
+        kind, sugg = E.classify(
+            "GradeShapeError: grade response field 'issues' must be an array of strings")
+        self.assertEqual(kind, E.KIND_PROVIDER)
+        self.assertIn("grade", sugg.lower())
+        self.assertNotIn("program-understanding", sugg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

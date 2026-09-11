@@ -1359,6 +1359,17 @@ class EgressBlockedError(RuntimeError):
     must not abort the sweep' handler degrades it to a per-file skip."""
 
 
+class GradeShapeError(ValueError):
+    """A grader route answered outside the grade contract.
+
+    The grading twin of StructuredOutputShapeError: the request was valid and
+    THIS model ignored the schema (live 2026-09-11 a rotated grader returned
+    `issues` that were not strings and a 443-second refactor ended on it).
+    Typed so rotation hands the call to another model; still a ValueError so
+    every existing caller and test that expects one keeps working.
+    """
+
+
 class StructuredOutputShapeError(RuntimeError):
     """A model answered, but its JSON did not match the requested schema.
 
@@ -2196,6 +2207,11 @@ class AnthropicProvider:
             raise RuntimeError("Grader returned no text content to parse.")
         try:
             return _parse_grade(text)
+        except GradeShapeError as exc:
+            # Keep the TYPE: rotation can move a schema-ignoring grader to
+            # another model only when it sees GradeShapeError (review on #176).
+            raise GradeShapeError(f"Grader returned unparseable output ({exc}); "
+                                  f"head={text[:200]!r}") from exc
         except Exception as exc:
             raise RuntimeError(f"Grader returned unparseable output ({exc}); head={text[:200]!r}")
 
@@ -3091,33 +3107,33 @@ def _ollama_route_health(route) -> tuple[bool, str]:
 def _parse_grade(text: str) -> Grade:
     data, _ = _extract_json_object(text)
     if data is None:
-        raise ValueError(f"grade response was not JSON; head={text[:200]!r}")
+        raise GradeShapeError(f"grade response was not JSON; head={text[:200]!r}")
     if not isinstance(data, dict):
-        raise ValueError(
+        raise GradeShapeError(
             f"grade response was {type(data).__name__}, expected an object"
         )
     required = {"grade", "meets_goal", "rationale", "issues"}
     missing = sorted(required - set(data))
     extra = sorted(set(data) - required)
     if missing:
-        raise ValueError("grade response omitted required field(s): "
+        raise GradeShapeError("grade response omitted required field(s): "
                          + ", ".join(missing))
     if extra:
-        raise ValueError("grade response contained unknown field(s): "
+        raise GradeShapeError("grade response contained unknown field(s): "
                          + ", ".join(extra))
     if type(data["grade"]) is not int:
-        raise ValueError("grade response field 'grade' must be an integer")
+        raise GradeShapeError("grade response field 'grade' must be an integer")
     if type(data["meets_goal"]) is not bool:
-        raise ValueError("grade response field 'meets_goal' must be a boolean")
+        raise GradeShapeError("grade response field 'meets_goal' must be a boolean")
     if not isinstance(data["rationale"], str):
-        raise ValueError("grade response field 'rationale' must be a string")
+        raise GradeShapeError("grade response field 'rationale' must be a string")
     raw_issues = data["issues"]
     if (not isinstance(raw_issues, list)
             or any(not isinstance(issue, str) for issue in raw_issues)):
-        raise ValueError("grade response field 'issues' must be an array of strings")
+        raise GradeShapeError("grade response field 'issues' must be an array of strings")
     grade = max(0, min(100, data["grade"]))  # schema cannot express this range
     if grade < 100 and not raw_issues:
-        raise ValueError("a sub-100 grade must include at least one concrete issue")
+        raise GradeShapeError("a sub-100 grade must include at least one concrete issue")
     return Grade(
         grade=grade,
         meets_goal=data["meets_goal"],
@@ -4835,7 +4851,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
               + (f", pinned to '{pin}'" if pin else "") + drop_note, file=sys.stderr)
     global _LAST_ROTATION_USABLE
     _LAST_ROTATION_USABLE = len(usable)
-    return fr.RotatingProvider(rotator, _rotation_route_provider,
+    provider = fr.RotatingProvider(rotator, _rotation_route_provider,
                                tier=author_tier, judge_tier=author_tier,
                                allow_paid=True, meter=meter,
                                on_route=_announce,
@@ -4849,6 +4865,11 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
                                # --max-cost still bounds the total spend.
                                paid_first=paid_first,
                                role_coordinator=role_coordinator)
+    # Validate every grade INSIDE its rotation attempt. CLI/Cursor graders
+    # return raw dicts/text, and a malformed one checked only after grade()
+    # returned could never be rotated away from (review on #176).
+    provider.grade_validator = _normalize_grade
+    return provider
 
 
 # Set by build_audit_providers when it returns [] so the caller can explain WHY

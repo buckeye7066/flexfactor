@@ -177,6 +177,12 @@ SIGNATURES: List[Tuple[str, str, str]] = [
      "FlexFactor safely normalizes lossless one-item/string envelopes and rotates to the next "
      "model for ambiguous output. If this is the terminal entry, every usable route failed the "
      "same bounded call; inspect the per-route entries rather than changing the target program."),
+    (r"GradeShapeError|grade response (?:field|omitted|contained|was)", KIND_PROVIDER,
+     "A grader model answered outside the grade contract (integer grade, boolean meets_goal, "
+     "string rationale, issues as an array of strings; a sub-100 grade must name an issue). "
+     "FlexFactor rotates the grade call to another model and keeps the malformed route "
+     "cooled; if this is the terminal entry, every usable grader failed the same call - "
+     "inspect the per-route entries."),
     (r"pytest|(?:^|\n)\s*FAILED(?:\s+[^\r\n]+::|\s*\()|AssertionError|Error: .* test",
      KIND_PROGRAM,
      "The program's own test suite is red. Open the named test, read its assertion, and fix the "

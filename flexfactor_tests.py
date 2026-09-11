@@ -1620,6 +1620,14 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertIsInstance(providers[0][1], fr.RotatingProvider)
         self.assertIn("[rotation] ON:", err.getvalue())
 
+    def test_every_rotating_provider_validates_grades_inside_the_attempt(self):
+        """Review on #176: the build site must attach the grade validator, or a
+        malformed subscription grade escapes rotation."""
+        self._write_catalog([self._route("groq/llama-x", tier="frontier")])
+        provider = ff._build_rotating_provider(self.Args, None, "best", quiet=True)
+        self.assertIsNotNone(provider)
+        self.assertIs(provider.grade_validator, ff._normalize_grade)
+
     def test_ai_time_catalog_is_authoritative_over_builtin_guesses(self):
         self._write_catalog([self._route("groq/llama-x", tier="frontier")])
         provider = ff._build_rotating_provider(self.Args, None, "best", quiet=True)

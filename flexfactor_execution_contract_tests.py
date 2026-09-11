@@ -456,6 +456,56 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("RuntimeError: first target broke",
                       snapshot["items"][0]["note"])
 
+    def test_a_failed_target_is_reported_on_screen_not_only_in_the_receipt(self):
+        """LIVE 2026-09-11: a refactor target raised, the queue recorded
+        'ValueError: grade response field ...' in its JSON receipt, and the
+        console showed only 'status=failed' - 443 seconds of work ending with
+        no reason anyone watching could read."""
+        import contextlib
+        import io
+        root = tempfile.mkdtemp(prefix="ff-queue-visible-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+
+        def runner(_target, _index, _total, _coordinator):
+            raise ValueError("grade response field 'issues' must be an array of strings")
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = execution.run_sequential_queue(
+                "refactor", ["only"], runner,
+                state_path=os.path.join(root, "queue.json"), queue_id="visible",
+            )
+        self.assertEqual(code, 1)
+        shown = err.getvalue()
+        self.assertIn("target 1/1", shown)
+        self.assertIn("ValueError: grade response field 'issues' must be an array of strings",
+                      shown)
+
+    def test_a_broken_stderr_cannot_leave_a_failed_target_running(self):
+        """Review on #176: the new print ran BEFORE finish_target, so a closed
+        or broken stderr left the durable receipt item running."""
+        import sys as _sys
+        from unittest import mock
+        root = tempfile.mkdtemp(prefix="ff-queue-brokenpipe-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+
+        class _Broken:
+            def write(self, *_a):
+                raise BrokenPipeError("stderr pipe is gone")
+
+            def flush(self):
+                raise BrokenPipeError("stderr pipe is gone")
+
+        def runner(*_a):
+            raise ValueError("boom")
+
+        with mock.patch.object(_sys, "stderr", _Broken()):
+            code, coordinator = execution.run_sequential_queue(
+                "refactor", ["only"], runner,
+                state_path=os.path.join(root, "queue.json"), queue_id="broken")
+        self.assertEqual(code, 1)
+        self.assertEqual(coordinator.snapshot()["items"][0]["status"], "failed")
+
     def test_queue_runner_reuses_a_preloaded_orchestrator(self):
         coordinator = self._coordinator(("one",))
 
