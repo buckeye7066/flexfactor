@@ -19710,7 +19710,12 @@ def _direct_coverage_evidence(project_dir: str, stack: dict, index: dict,
                     "--disable-pip-version-check", "coverage"]
             print(f"{pfx}coverage: not importable - installing it")
             ins = _run(argv, project_dir, timeout=600)
-            _ilu.invalidate_caches()
+            # invalidate_caches lives on importlib, NOT importlib.util: the
+            # old `_ilu.invalidate_caches()` raised AttributeError on every
+            # Python repo without coverage, so no such audit could converge
+            # (live launcher run, 2026-09-11).
+            import importlib as _importlib
+            _importlib.invalidate_caches()
             meta["install"] = {"argv": argv, "rc": ins.returncode,
                                "tail": _tail((ins.stdout or "") + (ins.stderr or ""), 8)}
             if ins.returncode == 0 and _ilu.find_spec("coverage") is not None:
