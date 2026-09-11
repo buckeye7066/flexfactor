@@ -17987,8 +17987,14 @@ class CompetitorIdeaAuthorTierTests(unittest.TestCase):
                       "not through _judge")
         self.assertIn("allow_credentialed_firecrawl=", call)
         self.assertIn("source_inspector=inspect_public_competitor_source", call)
-        self.assertIn("TOP_COMPETITORS", call,
-                      "the inter-pass gate must remain fixed at the top three")
+        # Contract v0.4 (f329fe5) made the target the orchestrator's configured
+        # TOP_COMPETITORS (default 25). It is computed once as gate_target, so
+        # the console banner and this call cannot state different numbers.
+        self.assertIn("target=gate_target", call)
+        self.assertIn("_ff_execution.TOP_COMPETITORS",
+                      src[:src.index("research_competitors(")],
+                      "the inter-pass gate must use the orchestrator's "
+                      "configured competitor target")
 
 
 class CompetitorCoverageHonestyTests(unittest.TestCase):
