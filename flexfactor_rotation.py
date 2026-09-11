@@ -1257,12 +1257,10 @@ class Rotator:
                 return
 
             if outcome == "model_refused":
-                # One payload declined by one family's safety classifier.
-                # Step off THIS route briefly so the call moves on, but add no
-                # strike and never touch the pool: three refusals of three
-                # different files are not evidence the provider is sick.
-                cooldowns[route_key] = now + float(
-                    retry_after_seconds or ROUTE_ERROR_COOLDOWN)
+                # One payload declined by one family's safety classifier. That
+                # says nothing about the route's health, so NO shared state
+                # changes: no strike, no cooldown, never the pool. The
+                # exclusion lives inside RotatingProvider._run, for that call.
                 return
 
             if outcome == "model_retired":
@@ -1678,8 +1676,10 @@ class RotatingProvider:
                     releaser(failed_route, expected_until)
 
         allow_paid_for_call = self._allow_paid
-        # Families whose safety layer already refused THESE bytes in this call.
+        # Routes and families whose safety layer already refused THESE bytes.
+        # Call-local on purpose: another call's bytes may be answered fine.
         refused_families: set = set()
+        refused_route_ids: set = set()
         attempt = 0
         while attempt < attempts:
             attempt += 1
@@ -1725,11 +1725,12 @@ class RotatingProvider:
                     f"{type(last_error).__name__}: {last_error}",
                     getattr(exc, "reasons", None)) from last_error
             route = selection.route
-            if (refused_families
-                    and route_model_family(route) in refused_families):
+            if (route.id in refused_route_ids
+                    or (refused_families
+                        and route_model_family(route) in refused_families)):
                 # Same classifier, same bytes, same verdict: do not pay for it.
-                # Cooling the route keeps next_route from handing it back.
-                self.rotator.report(route, "model_refused")
+                # No shared cooldown is written; selection already moved this
+                # pool to the back of the least-recently-used order.
                 attempts = min(route_bound, attempts + 1)
                 continue
             self.model = route.model
@@ -1769,7 +1770,9 @@ class RotatingProvider:
                 # never make the failure invisible.
                 payload_fault = is_payload_fault(exc)
                 malformed_cooldown: Optional[Tuple[float, str]] = None
-                if not payload_fault:
+                # A refusal is not charged to the route either: it is a verdict
+                # on these bytes, handled call-locally below.
+                if not payload_fault and not is_model_refusal(exc):
                     scope, reset_at = limit_scope(exc)
                     outcome = ("malformed_output"
                                if type(exc).__name__ == "StructuredOutputShapeError"
@@ -1794,6 +1797,7 @@ class RotatingProvider:
                 if payload_fault or not _is_retryable(exc):
                     raise
                 if is_model_refusal(exc):
+                    refused_route_ids.add(route.id)
                     family = route_model_family(route)
                     if family not in _OPAQUE_MODEL_FAMILIES:
                         refused_families.add(family)

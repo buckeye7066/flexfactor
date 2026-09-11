@@ -2353,6 +2353,13 @@ class AnthropicProvider:
                     self._recover_transport()
                     time.sleep(6.0)
                 continue
+            if getattr(message, "stop_reason", None) == "refusal":
+                # A REFUSAL IS AN ANSWER. Re-rolling it re-sent the refused
+                # bytes to the same model family up to three times, with 6s
+                # sleeps and possibly on to _paid_message, before the caller
+                # ever read stop_reason. Hand it straight back so
+                # ModelRefusalError reaches the rotator on the FIRST refusal.
+                return message
             text = next((b.text for b in message.content if b.type == "text"), None)
             if text:
                 data, _ = _extract_json_object(text)

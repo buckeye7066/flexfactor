@@ -601,6 +601,51 @@ class ModelRefusalRotatesTests(RouteFaultTestCase):
             prov.structured("s", "p", {})
         self.assertIn("Model refused", str(ctx.exception))
 
+    def test_a_refusal_leaves_no_shared_cooldown_for_unrelated_calls(self):
+        """Review on #174: a 30s route cooldown in the SHARED rotation state made
+        unrelated calls and other workers skip a healthy route - fatal in a
+        catalog where it is the only usable route. The refusal was about the
+        bytes of one call, so only that call may step around it."""
+        rid = "anthropic_api/claude-fable-5"
+        prov = self.provider(
+            catalog(route(rid, "anthropic:paid")),
+            failures={rid: ff.ModelRefusalError(ANTHROPIC_CYBER_REFUSAL)})
+        with self.assertRaises(Exception):
+            prov.structured("s", "refused bytes", {})
+        self.built[rid].fail_with = None
+        self.assertEqual(prov.structured("s", "different bytes", {}), {"by": rid})
+        self.assertNotIn(f"route:{rid}", self.store.read().get("cooldowns") or {})
+
+    def test_a_structured_refusal_is_not_re_sent_inside_the_provider(self):
+        """Review on #174: _stream_structured re-rolled a refusal (no parseable
+        text) three times with 6s sleeps before anyone read stop_reason, sending
+        the refused bytes to the same family again and possibly on to the paid
+        rescue - defeating the same-family exclusion."""
+        import types
+        from unittest import mock
+        calls = []
+        refusal = types.SimpleNamespace(stop_reason="refusal", content=[],
+                                        stop_details="category=cyber", usage=None)
+
+        def fake_stream(_client, **kwargs):
+            calls.append(kwargs)
+            return refusal
+
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        with mock.patch.object(ff, "_stream_with_deadline", side_effect=fake_stream), \
+                mock.patch.object(ff, "_fallback_hold_active", return_value=False), \
+                mock.patch.object(ff, "_fallback_available", return_value=True), \
+                mock.patch.object(ff, "_paid_message_unused", create=True), \
+                mock.patch.object(ff.time, "sleep") as slept:
+            got = prov._stream_structured(
+                model="claude-fable-5", max_tokens=100, system="s",
+                messages=[{"role": "user", "content": "p"}],
+                fmt={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        self.assertIs(got, refusal)
+        self.assertEqual(len(calls), 1, "a refusal must not be re-sent")
+        slept.assert_not_called()
+
     def test_the_anthropic_provider_raises_the_typed_refusal(self):
         self.assertTrue(issubclass(ff.ModelRefusalError, RuntimeError),
                         "existing `except RuntimeError` callers must keep working")
