@@ -3939,6 +3939,96 @@ class ScoutSourcePreflightTests(unittest.TestCase):
             self.assertEqual("skipped-unverified", result.status)
 
 
+class StatusFileSharedAcrossProcessesTests(unittest.TestCase):
+    """LIVE 2026-09-11: a real audit of scratch repo `tinystats` had run 21
+    minutes (defects 3, $0.86) when a second FlexFactor process - a prodready of
+    a DIFFERENT repository that is also named tinystats - was refused by the
+    audit lock in 6 seconds. It still rewrote ~/.flexfactor/status.json with
+    only its own entry, so the dashboard showed the healthy run as
+    'ERROR: another FlexFactor audit of tinystats is already running', $0.00,
+    and 70 seconds later the file still said so. The refusal itself was false:
+    the lock was keyed on the folder NAME, not the repository."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ff-status-share-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "status.json")
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)["programs"]
+
+    def test_a_second_process_does_not_erase_a_live_runs_panel(self):
+        live = ff.ProgressBus(self.path)
+        live.update(1, name="tinystats", dir="C:/a/tinystats", phase="fixing",
+                    defects=3, done=False)
+        second = ff.ProgressBus(self.path)
+        second.reset()
+        second.update(1, name="tinystats", dir="C:/b/tinystats", phase="error",
+                      done=True, error="refused")
+        self.assertEqual(sorted(p.get("phase") for p in self._read()),
+                         ["error", "fixing"])
+        live.update(1, defects=4)
+        progs = self._read()
+        self.assertEqual(sorted(p.get("phase") for p in progs), ["error", "fixing"])
+        self.assertIn(4, [p.get("defects") for p in progs])
+
+    def test_reset_drops_the_panels_of_processes_that_are_gone(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"updated": "x", "programs": [
+                {"index": 1, "name": "old", "phase": "done", "done": True,
+                 "pid": 4242, "owner": "4242-dead"},
+                {"index": 2, "name": "legacy-no-owner", "phase": "done",
+                 "done": True}]}, fh)
+        with mock.patch.object(ff, "_pid_alive", return_value=False):
+            ff.ProgressBus(self.path).reset()
+        self.assertEqual(self._read(), [])
+
+    def test_the_crash_obituary_only_declares_its_own_panels_dead(self):
+        me = os.getpid()
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"updated": "x", "programs": [
+                {"index": 1, "name": "mine", "phase": "fixing", "done": False,
+                 "pid": me},
+                {"index": 1, "name": "other-live-run", "phase": "fixing",
+                 "done": False, "pid": me + 1},
+                {"index": 2, "name": "legacy", "phase": "fixing", "done": False}]}, fh)
+        ff._obituary_stamp_status(self.path, me)
+        by_name = {p["name"]: p for p in self._read()}
+        self.assertTrue(by_name["mine"]["phase"].startswith("DIED"))
+        self.assertTrue(by_name["legacy"]["phase"].startswith("DIED"))
+        self.assertEqual(by_name["other-live-run"]["phase"], "fixing")
+        self.assertFalse(by_name["other-live-run"]["done"])
+
+    def test_two_repositories_with_the_same_folder_name_get_different_locks(self):
+        a = os.path.join(self.tmp, "one", "tinystats")
+        b = os.path.join(self.tmp, "two", "tinystats")
+        os.makedirs(a)
+        os.makedirs(b)
+        self.assertNotEqual(ff._audit_lock_path(a), ff._audit_lock_path(b))
+        self.assertEqual(ff._audit_lock_path(a), ff._audit_lock_path(a + os.sep))
+        self.assertTrue(os.path.basename(ff._audit_lock_path(a))
+                        .startswith("audit-tinystats"))
+
+    def test_a_live_lock_from_before_the_upgrade_still_refuses_a_double_run(self):
+        """An older FlexFactor still running holds the basename lock; the new
+        name must not let the same program be audited twice meanwhile."""
+        proj = os.path.join(self.tmp, "repo", "tinystats")
+        os.makedirs(proj)
+        home = os.path.join(self.tmp, "home")
+        with mock.patch("os.path.expanduser",
+                        side_effect=lambda p: p.replace("~", home, 1)):
+            legacy = os.path.join(home, ".flexfactor", "audit-tinystats.lock")
+            os.makedirs(os.path.dirname(legacy))
+            with open(legacy, "w", encoding="utf-8") as fh:
+                fh.write(str(os.getpid() + 1))
+            with mock.patch.object(ff, "_pid_alive", return_value=True):
+                self.assertIsNone(ff._acquire_audit_lock(proj))
+            with mock.patch.object(ff, "_pid_alive", return_value=False):
+                got = ff._acquire_audit_lock(proj)
+            self.assertEqual(got, ff._audit_lock_path(proj))
+
+
 class GradePayloadValidationTests(unittest.TestCase):
     """Every reviewer route must satisfy the complete no-op authorization schema."""
 
