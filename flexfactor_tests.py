@@ -15368,6 +15368,46 @@ class PurposeContractTests(unittest.TestCase):
         self.assertTrue(c.acceptance_criteria)
 
 
+class CoverageAutoInstallRunsTests(unittest.TestCase):
+    """LIVE 2026-09-11: a real `flexfactor_audit_launch.ps1` run on a Python
+    scratch repository ended with 'deterministic evidence generation failed:
+    module 'importlib.util' has no attribute 'invalidate_caches''. The step
+    that installs `coverage` when no interpreter has it (PR #166, meant to make
+    completion REACHABLE) crashed on every Python project without coverage,
+    so no such audit could converge."""
+
+    def test_a_missing_coverage_install_completes_and_is_recorded(self):
+        import importlib
+        import importlib.util
+        import subprocess
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *a, **k):
+            if name == "coverage":
+                return None
+            return real_find_spec(name, *a, **k)
+
+        installed = subprocess.CompletedProcess([], 0, "Successfully installed coverage", "")
+        with tempfile.TemporaryDirectory() as proj:
+            with mock.patch.object(importlib.util, "find_spec", side_effect=find_spec), \
+                    mock.patch.object(importlib, "invalidate_caches",
+                                      wraps=importlib.invalidate_caches) as invalidated, \
+                    mock.patch.object(ff, "_run", return_value=installed) as ran, \
+                    mock.patch.object(ff._ff_coverage, "coverage_commands", return_value=[]), \
+                    mock.patch.object(ff._ff_coverage, "detect_coverage_artifacts", return_value=[]), \
+                    mock.patch.object(ff._ff_coverage, "direct_function_rows", return_value=[]), \
+                    mock.patch.object(ff._ff_coverage, "load_blocked_declarations",
+                                      return_value=([], [], {})), \
+                    mock.patch("sys.stdout", new=io.StringIO()):
+                result = ff._direct_coverage_evidence(
+                    proj, {"is_python": True, "test_cmd": ["python", "-m", "pytest", "-q"]},
+                    {}, "")
+        self.assertEqual(result["meta"]["install"]["rc"], 0)
+        self.assertIn("coverage", ran.call_args.args[0])
+        invalidated.assert_called()
+
+
 class EvidenceBackedProgramUnderstandingTests(unittest.TestCase):
     """A gathered ledger is not understanding until a cited contract exists."""
 
