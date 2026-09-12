@@ -1815,6 +1815,16 @@ class RotatingProvider:
                     # Extend only route-scoped failures, bounded by identities
                     # and by the caller's total preflight transport-call cap.
                     attempts = min(route_bound, attempts + 1)
+                if is_malformed_output(exc):
+                    # A route that answered outside its schema has not consumed
+                    # its siblings. The budget above counts POOLS and a pool
+                    # routinely holds several routes (the built-in catalog
+                    # reuses each Anthropic/OpenAI pool across tiers), so a
+                    # valid sibling in the malformed route's pool was never
+                    # asked and the call failed on one bad answer (review on
+                    # #183). Bounded by eligible route identities, like the
+                    # refusal and dead-route extensions.
+                    attempts = min(route_bound, attempts + 1)
                 continue
             self.rotator.report(route, "ok")
             if intent is not None and intent.role:
