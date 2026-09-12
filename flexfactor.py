@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-r"""FlexFactor 0.6.2 — managed code improvement with four modes.
+r"""FlexFactor 0.6.3 — managed code improvement with four modes.
 
 Refactor, Scout, Audit, and Production Ready share one durable orchestrator and
 one quality-first paid-to-free model ladder. A request may contain up to 30
 targets, which always run one at a time. Audit and Production Ready use at most
 six semantic passes: the whole repository first, the exact preceding edit delta
-thereafter, with the top-three competitor capability gate between passes 1 and
+thereafter, with the configured competitor capability gate between passes 1 and
 2.
 
 Code-changing runs fail closed. They require Git, an ``origin``, a named branch,
@@ -739,7 +739,7 @@ MAX_BRAIN_PROJECTS = 40  # keep the most recently audited projects; prune the re
 # gated). A mismatch invalidates the stored clean set so files get re-reviewed
 # under the new policy instead of being trusted from an incompatible past run.
 POLICY_VERSION = "2026-08-17"
-TOOL_VERSION = "0.6.2"
+TOOL_VERSION = "0.6.3"
 
 # --------------------------------------------------------------------------- #
 # RESUME STATE. One directory per RUN, deliberately NOT inside brain.json.
@@ -1595,6 +1595,57 @@ def _egress_gate(text: str) -> str:
             "anyway, or allow categories via FLEXFACTOR_ALLOW_EGRESS / "
             "~/.flexfactor/policy.json {\"allow_egress\": [...]}.")
     return out
+
+
+def _model_args_for_repository(args, project_dir: str):
+    """Classify all Git-visible text before choosing any source-serving route.
+
+    A finding anywhere makes the repository local by default, even when the
+    first prompt is a clean README. Incomplete reads also default local. The
+    per-call gate still checks subsequent/generated source before cloud egress.
+    Only the owner's existing sharing/redaction flags or category policy can
+    authorize an exception; repository content cannot grant one.
+    """
+    scoped = argparse.Namespace(**vars(args))
+    categories: set[str] = set()
+    unreadable: list[str] = []
+    scanned = 0
+    try:
+        manifest = _repository_review_manifest(project_dir)
+        if manifest.get("source") != "git-tracked-and-untracked-nonignored":
+            unreadable.append("authoritative Git source enumeration unavailable")
+        unreadable.extend(manifest["blocking_files"])
+        allowed = _egress._load_policy_allow()
+        for rel in manifest["reviewable_files"]:
+            source, _reason = _read_complete_structural_text(project_dir, rel)
+            if source is None:
+                unreadable.append(rel)
+                continue
+            scanned += 1
+            action, _out, findings = _egress.gate_text(source, mode="block", allow=allowed)
+            if action == "blocked":
+                categories.update(item["category"] for item in findings)
+    except Exception as exc:
+        # Enumeration or classification failure must never authorize egress.
+        unreadable.append(f"classification unavailable ({type(exc).__name__})")
+    classification = "sensitive" if categories else "unknown" if unreadable else "ordinary"
+    exception = ("allow_sensitive" if getattr(args, "allow_sensitive", False)
+                 else "redact" if getattr(args, "redact", False) else None)
+    scoped._source_local_only = classification != "ordinary" and exception is None
+    scoped._source_classification = {
+        "classification": classification,
+        "basis": "git-visible-text-secret-pii-scan",
+        "files_scanned": scanned,
+        "categories": sorted(categories),
+        "unreadable": unreadable,
+        "exception": exception,
+        "local_only": scoped._source_local_only,
+    }
+    print(f"  [source] {classification}; {scanned} text file(s) classified; "
+          + ("local models required" if scoped._source_local_only
+             else f"cloud exception: {exception}" if exception
+             else "cloud payload scanning remains enforced"), file=sys.stderr)
+    return scoped
 
 
 def _cached_system(system: str) -> list[dict]:
@@ -4152,11 +4203,15 @@ def _reasoning_extra_body(route) -> dict | None:
     """
     if os.environ.get("FLEXFACTOR_CLOUD_REASONING", "").lower() == "full":
         return None
-    base = str(getattr(route, "base_url", "") or "").lower()
-    if "openrouter.ai" in base:
+    try:
+        base = urllib.parse.urlsplit(str(getattr(route, "base_url", "") or ""))
+        host = base.hostname if base.scheme == "https" else None
+    except ValueError:
+        return None
+    if host == "openrouter.ai":
         # OpenRouter's unified reasoning parameter.
         return {"reasoning": {"effort": "low"}}
-    if "integrate.api.nvidia.com" in base:
+    if host == "integrate.api.nvidia.com":
         # NIM chat templates (DeepSeek/Qwen/Nemotron) honour this kwarg.
         return {"chat_template_kwargs": {"thinking": False}}
     return None
@@ -4418,7 +4473,8 @@ def _rotation_route_provider(route):
         from providers.cursor_provider import make_cursor_provider
         return make_cursor_provider(route)
     if route.api == "ollama":
-        return OllamaProvider(wire, judge_model=wire)
+        return OllamaProvider(wire, judge_model=wire,
+                              base_url=route.base_url or None)
     if route.api == "anthropic":
         # Env-configured on purpose: the free/subscription Anthropic route IS
         # the FCC proxy, whose base URL + token _auto_activate_fcc_proxy has
@@ -5048,7 +5104,9 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
               + ", ".join(hydrated), file=sys.stderr)
     usable, dropped = [], {}
     for route in catalog.enabled():
-        why = _route_unusable_reason(route, model_mode)
+        why = ("repository source requires local processing"
+               if getattr(args, "_source_local_only", False) and route.api != "ollama"
+               else _route_unusable_reason(route, model_mode))
         if why:
             dropped[why] = dropped.get(why, 0) + 1
         else:
@@ -5125,7 +5183,8 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
                                # paid tiers, then use independent free families.
                                # --max-cost still bounds the total spend.
                                paid_first=paid_first,
-                               role_coordinator=role_coordinator)
+                               role_coordinator=role_coordinator,
+                               payload_guard=_egress_gate)
     # Validate every grade INSIDE its rotation attempt. CLI/Cursor graders
     # return raw dicts/text, and a malformed one checked only after grade()
     # returned could never be rotated away from (review on #176).
@@ -5683,7 +5742,7 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
         before_sha = (before.stdout or "").strip() if before.returncode == 0 else ""
         status = _commit_and_sync(
             project_dir, branch, branch, args,
-            f"top-three competitor capabilities for {rel}", stack,
+            f"configured competitor capabilities for {rel}", stack,
         )
         after = _git(["rev-parse", "HEAD"], project_dir)
         after_sha = (after.stdout or "").strip() if after.returncode == 0 else ""
@@ -5794,7 +5853,7 @@ def run(args) -> int:
     # Every mode uses the same orchestrator-owned paid-to-free ladder.
     meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
     try:
-        provider = _best_available_provider(args, meter)
+        provider = _best_available_provider(_model_args_for_repository(args, root), meter)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -6748,10 +6807,10 @@ def repo_rewards_search(base_url: str, query: str, lens: str | None = None,
     # (repo-rewards src/app/api/search/route.ts). Callers build queries up to
     # 600 characters, so clamp HERE, at the one door every caller uses, and
     # cut on a word boundary so the query still reads as a query.
-    query = _clamp_repo_rewards_query(" ".join(str(query or "").split()))
+    query = _clamp_repo_rewards_query(" ".join(_egress_gate(str(query or "")).split()))
     payload: dict = {"query": query}
     if lens:
-        payload["lens"] = lens
+        payload["lens"] = _egress_gate(str(lens))
     data = json.dumps(payload).encode("utf-8")
     url = base_url.rstrip("/") + "/api/search"
 
@@ -10611,16 +10670,6 @@ def _run_scout_impl(args) -> int:
     # 2. Characterize the entered program locally, then enforce the separate
     # cloud-context boundary before constructing or calling a remote provider.
     display_name, context = resolve_program_input(args.program)
-    if not allow_remote_program_context(args):
-        print("error: Scout profiling would send this program's source/README/file tree "
-              "to a cloud LLM, but remote program-context sharing is not enabled.",
-              file=sys.stderr)
-        print("Re-run with --allow-remote-program-context or set "
-              "FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1. "
-              "The best-available ladder may use a hosted model before its free "
-              "fallback.", file=sys.stderr)
-        return 2
-
     execution_orchestrator = getattr(args, "execution_orchestrator", None)
     apply_dir = resolve_project_dir(args.program, display_name)
     if not apply_dir or not os.path.isdir(apply_dir):
@@ -10637,8 +10686,18 @@ def _run_scout_impl(args) -> int:
         )
 
     meter = CostMeter(getattr(args, "max_cost", 150.0) or None)
+    model_args = _model_args_for_repository(args, apply_dir)
+    if not allow_remote_program_context(args) and not model_args._source_local_only:
+        print("error: Scout profiling would send this program's source/README/file tree "
+              "to a cloud LLM, but remote program-context sharing is not enabled.",
+              file=sys.stderr)
+        print("Re-run with --allow-remote-program-context or set "
+              "FLEXFACTOR_ALLOW_REMOTE_PROGRAM_CONTEXT=1. "
+              "The best-available ladder may use a hosted model before its free "
+              "fallback.", file=sys.stderr)
+        return 2
     try:
-        provider = _best_available_provider(args, meter)
+        provider = _best_available_provider(model_args, meter)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -13959,7 +14018,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
                              errors_total: int, done_set: set[str],
                              total_to_review: int, git: bool, branch: str,
                              prev_branch: str, purpose_contract) -> dict:
-    """Research and implement the top three competitors after pass one.
+    """Research the configured competitor target after pass one.
 
     This is the orchestrator's mandatory pass-1/pass-2 gate. Research failure
     is recorded, not fatal; unsafe or unverified mutations remain fail-closed.
@@ -13977,9 +14036,9 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         "committed": False,
         "attempted": True,
     }
-    report(phase="top-three competitor gate (between passes 1 and 2)")
+    report(phase="configured competitor gate (between passes 1 and 2)")
     if checkpoint is not None:
-        checkpoint.set_phase("top-three competitor gate (between passes 1 and 2)")
+        checkpoint.set_phase("configured competitor gate (between passes 1 and 2)")
     module = _competitors_module()
     if module is None:
         outcome["research"] = {
@@ -13992,7 +14051,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
             "coverage_note": "competitor gate could not run",
             "rr_endpoint": "(not used)",
         }
-        outcome["notes"].append("top-three competitor gate: module unavailable")
+        outcome["notes"].append("configured competitor gate: module unavailable")
         print(f"{pfx}competitor gate INCOMPLETE: module unavailable", file=sys.stderr)
         return outcome
 
@@ -14041,12 +14100,12 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
             scout_error=scout_error,
         )
     except BudgetExceededError:
-        outcome["notes"].append("top-three competitor gate stopped at the cost cap")
+        outcome["notes"].append("configured competitor gate stopped at the cost cap")
         print(f"{pfx}competitor gate INCOMPLETE: cost cap reached", file=sys.stderr)
         return outcome
     except Exception as exc:
         outcome["notes"].append(
-            f"top-three competitor gate failed: {type(exc).__name__}: {exc}"
+            f"configured competitor gate failed: {type(exc).__name__}: {exc}"
         )
         print(f"{pfx}competitor gate INCOMPLETE: {module._ascii(exc)}", file=sys.stderr)
         return outcome
@@ -14103,7 +14162,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         if git and applied:
             status = _commit_and_sync(
                 project_dir, branch, prev_branch, args,
-                "top-three competitor improvements (between passes 1 and 2)",
+                "configured competitor improvements (between passes 1 and 2)",
                 stack,
             )
             outcome["committed"] = "committed" in status
@@ -14225,6 +14284,7 @@ def _competitors_module():
     try:
         import flexfactor_competitors as _fc
         _fc.set_license_oracle(_license_compatible)
+        _fc.set_egress_guard(_egress_gate)
         return _fc
     except Exception:
         return None
@@ -20593,7 +20653,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             checkpoint.set_phase("checking model availability")
         report(phase="checking model availability")
         with _PROVIDER_BUILD_LOCK:
-            providers = build_audit_providers(args, meter)
+            model_args = _model_args_for_repository(args, project_dir)
+            result["source_classification"] = model_args._source_classification
+            providers = build_audit_providers(model_args, meter)
             _diagnosis = _PROVIDER_DIAGNOSIS
         if not providers:
             why = _diagnosis or "no LLM API key found"
@@ -24545,6 +24607,7 @@ def _write_run_manifest(project_dir: str, a: dict, *,
         "purpose_mutation_authorized": a.get("purpose_mutation_authorized"),
         "purpose_evidence_summary": a.get("purpose_evidence_summary"),
         "trust_repo_override": bool(a.get("trust_repo_override")),
+        "source_classification": a.get("source_classification"),
         "wip_restore": a.get("wip_restore"),
         "partial_output_event_count": len(_PARTIAL_OUTPUT_EVENTS),
         "verification_note": a.get("verification_note"),
@@ -25390,7 +25453,7 @@ def main(argv=None) -> int:
                             dest="repo_rewards_url", help="Base URL of the Repo Rewards service.")
         parser.add_argument("--top", type=int, default=8,
                             help="Compatibility argument; the shared product contract "
-                                 "researches the fixed top three.")
+                                 "uses the configured competitor target (25 by default).")
         parser.add_argument("--no-auto-start", action="store_false", dest="auto_start",
                             help="Don't try to auto-launch Repo Rewards if it's down.")
         # Accepted for compatibility - both .ps1 launchers still pass it. The

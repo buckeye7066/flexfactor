@@ -1,4 +1,4 @@
-# FlexFactor - Recovery and rollback (0.6.2)
+# FlexFactor - Recovery and rollback (0.6.3)
 
 ## 1. Orphan WIP transaction (audit / prodready with `--allow-dirty`)
 
@@ -68,9 +68,11 @@ Never `git push --mirror` / `--all` while a ref is retained.
   never continued (fresh run). `--recheck` ignores checkpoints.
 - `prune` keeps `DEFAULT_KEEP_RUNS`.
 
-## 5. Scout apply rollback (separate mechanism)
+## 5. Scout apply rollback
 
-`apply_integration`: per-file byte backups keyed by repo-relative path, new
-files tracked in `created`, restore/unlink on any failure (build, npm, policy);
-no sandbox branch; dirty tree -> `skipped-dirty` unless `--allow-dirty`. Not
-the orphan-WIP transaction (BLOCKED item).
+`apply_integration` uses the same orphan-WIP capture and fingerprinted restore
+as Audit when `--allow-dirty` is authorized. Inside that transaction,
+`_apply_integration_impl` keeps per-file byte backups and tracks newly created
+files for rollback. A retained change must pass real build/test gates,
+independent exact-commit review, and remote-default publication. A dirty tree
+without authorization remains `skipped-dirty`.

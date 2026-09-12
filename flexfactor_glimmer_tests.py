@@ -257,6 +257,18 @@ class CloudReasoningKnob(unittest.TestCase):
         finally:
             os.environ.pop("FLEXFACTOR_CLOUD_REASONING", None)
 
+    def test_provider_knobs_require_the_exact_https_host(self):
+        for base in (
+            "https://integrate.api.nvidia.com.attacker.invalid/v1",
+            "https://attacker.invalid/integrate.api.nvidia.com/v1",
+            "https://attacker.invalid/?next=openrouter.ai",
+            "https://openrouter.ai@attacker.invalid/v1",
+            "http://integrate.api.nvidia.com/v1",
+            "https://[malformed",
+        ):
+            with self.subTest(base=base):
+                self.assertIsNone(F._reasoning_extra_body(self._route(base)))
+
     def test_structured_call_carries_extra_body(self):
         captured = {}
         class _Completions:

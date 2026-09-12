@@ -23,7 +23,7 @@
     },
     {
       "id": "cb-3",
-      "text": "Every model call uses one strongest-paid-to-free ladder; legacy flags cannot select another production path.",
+      "text": "Every model call follows one strongest-paid-to-free ladder within source policy. Cloud SDK, CLI, Cursor and research payloads cross the egress gate.",
       "confidence": "verified",
       "evidence_refs": [
         1,
@@ -217,8 +217,10 @@
     {
       "id": "i-9",
       "text": "Source is classified before cloud calls; sensitive repositories use local processing unless the owner explicitly approves an exception.",
-      "confidence": "supported",
+      "confidence": "verified",
       "evidence_refs": [
+        1,
+        2,
         5,
         8
       ]
@@ -249,7 +251,7 @@
     "M. Rescan, blast radius, secrets, and direct coverage complete or BLOCK.",
     "N. Live UI journeys cover roles, routes, controls, forms, accessibility, and performance.",
     "O. Capture WIP outside candidate ancestry; restore only on matching fingerprint.",
-    "P. Default report-only; explicit apply precedes mutation; never push checkpoints or force-push.",
+    "P. Audit and Production Ready run real repair and publication; Scout apply requires explicit authorization; never push checkpoints or force-push.",
     "Q. Protected branches use PRs and remain incomplete until merged.",
     "R. Fresh fetch proves the reviewed SHA on the authoritative default branch.",
     "S. Wheel, cloud, APK, and source identify the same release.",
@@ -263,8 +265,8 @@
   "resolved_contradictions": [
     {
       "id": "rc-1",
-      "text": "An earlier contract required every Audit and Production Ready run to apply changes, while the owner directive requires report-only/apply-off by default.",
-      "resolution": "The current owner directive controls: report-only is default, apply requires explicit authorization, and mandatory-mutation behavior remains a gap.",
+      "text": "The earlier report-only default contradicted the standing owner instruction.",
+      "resolution": "Audit and Production Ready perform real repair/publication with no dry-run path. Scout apply remains explicitly authorized. The September 12 Obsidian handoff reaffirms this instruction.",
       "confidence": "supported",
       "evidence_refs": [
         2,
@@ -278,26 +280,6 @@
       "id": "g-1",
       "text": "Windows raw-socket isolation is best effort, so untrusted dependency execution cannot yet satisfy the containment requirement.",
       "confidence": "verified",
-      "evidence_refs": [
-        2,
-        5,
-        8
-      ]
-    },
-    {
-      "id": "g-2",
-      "text": "Audit and Production Ready still mandate apply/publication instead of preserving report-only as the default.",
-      "confidence": "verified",
-      "evidence_refs": [
-        2,
-        5,
-        8
-      ]
-    },
-    {
-      "id": "g-3",
-      "text": "Cloud-source classification and sensitive-repository local-default enforcement lack verified implementation evidence.",
-      "confidence": "unknown",
       "evidence_refs": [
         2,
         5,
@@ -325,15 +307,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "a29779a84d339c3d1b53292fe7a67ca5b99daff240c9eab6e1858fe954df168c",
-      "observed_at": "2026-09-12T03:37:28.553219+00:00",
+      "content_hash": "dabbc752bf50cb9cfb97562e089200ee049315fff5721f0079e548da86e55cd2",
+      "observed_at": "2026-09-12T05:43:04.970890+00:00",
       "excerpt": "Model ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "ba71c234619bb1543369107cef6c4b16e9663ac84587075f039ca180447b6184",
-      "observed_at": "2026-09-12T04:02:14.805229+00:00",
+      "content_hash": "3063b40b50e0b2c0b9b2196d5b6966a6c45a3de11ac1bc4ebdfac5f148e94fbc",
+      "observed_at": "2026-09-12T05:49:55.124271+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {
@@ -353,8 +335,8 @@
     {
       "kind": "documentation",
       "locator": "docs/PURPOSE.md",
-      "content_hash": "46aeaff587bd92cdda8eba6a86db89454dfdcb8796ce4da2389d815102ac4e06",
-      "observed_at": "2026-09-05T07:02:50Z",
+      "content_hash": "9d29ec377af0181a30e8587d56cd7c0bf615fc49c7707f9b54469180819cff8e",
+      "observed_at": "2026-09-12T05:43:04.970890+00:00",
       "excerpt": "Owner requirements and reconciliation."
     },
     {
@@ -374,8 +356,8 @@
     {
       "kind": "documentation",
       "locator": "docs/purpose-contract.md",
-      "content_hash": "e26f23317f3e19404bc55424a8633e2a76c43c61df9e0eb00c23bb5f519db76e",
-      "observed_at": "2026-09-05T07:02:50Z",
+      "content_hash": "a14fc594264568767f24625392f315386dc191759fdcdbeda3047316a9584a7c",
+      "observed_at": "2026-09-12T05:43:04.970890+00:00",
       "excerpt": "Owner target and acceptance."
     }
   ],

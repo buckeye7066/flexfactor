@@ -1,7 +1,7 @@
 # FlexFactor current gap register
 
-This register describes product limits that remain after the 0.6.2 / Android
-3.5.3 / cloud 1.1.3 architecture change. Historical measurements belong in
+This register describes product limits that remain after the 0.6.3 / Android
+3.5.5 / cloud 1.1.4 architecture change. Historical measurements belong in
 release reports and are not current-state claims.
 
 ## Closed by this release
@@ -9,7 +9,7 @@ release reports and are not current-state claims.
 - Ten-target parallel execution is replaced by one durable 30-target sequential
   orchestrator.
 - Audit/Production Ready are capped at six semantic passes: whole repository,
-  top-three competitor gate, then exact verified edit deltas.
+  configured competitor gate (25 by default), then exact verified edit deltas.
 - Paid/free/provider routes are replaced by one strongest-paid-to-free
   availability ladder.
 - Separate ladder instances share all author-family identities; a final reviewer
@@ -22,6 +22,14 @@ release reports and are not current-state claims.
 - Android has a durable sequential queue and idempotent crash recovery.
 - The local Termux browser launch/provider endpoints are retired; managed mobile
   is the only phone launch product.
+- All four modes classify Git-visible text before model selection. A detected
+  secret/PII signature or incomplete read requires local processing unless the
+  owner explicitly requests sharing or redaction. SDK, subscription CLI, and
+  Cursor routes share a payload gate; local Ollama retains its loopback-only
+  transport. Classification uses known secret/PII signatures and does not
+  establish that an otherwise ordinary repository is public.
+- The governing contract now follows the standing owner directive: Audit and
+  Production Ready perform real repair/publication, with no report-only path.
 
 ## Deliberate limits
 
