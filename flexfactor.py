@@ -4112,9 +4112,25 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     on the strong author model. Judging calls opt into truncation salvage: a
     partial findings/verdict list is safe here (fail-safe .get() defaults +
     the until-clean loop re-reviews), whereas generation must fail loudly."""
-    data = provider.structured(system, prompt, schema, max_tokens=max_tokens,
-                               model=getattr(provider, "judge_model", None),
-                               salvage_truncated=True, **_judge_intent(provider, schema))
+    call_kwargs = dict(max_tokens=max_tokens,
+                       model=getattr(provider, "judge_model", None),
+                       salvage_truncated=True, **_judge_intent(provider, schema))
+    final_review = schema is globals().get("FINAL_REVIEW_SCHEMA")
+    validated_call = getattr(provider, "structured_validated", None)
+    if final_review and callable(validated_call):
+        # THE RETRY MUST HAPPEN WHERE THE ROUTES ARE. Raising after
+        # provider.structured() returned is too late on a RotatingProvider:
+        # its route loop has already finished and reported the route healthy,
+        # so one malformed answer blocked the chunk outright. Live demo run
+        # tinystats-demo-20260911-182701-000449-34728-0000 blocked BOTH final
+        # review chunks this way ("omitted required field(s) ... commit,
+        # verdict, evidence_consistent") and publication was refused without
+        # a second route ever being asked. Handing the check to the rotator
+        # as its validator descends the SAME call to the next usable route.
+        data = validated_call(system, prompt, schema,
+                              validator=_final_review_readable, **call_kwargs)
+    else:
+        data = provider.structured(system, prompt, schema, **call_kwargs)
     # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
     # clean/keep/approve/ready/pass is downgraded HERE, at the one judging
     # chokepoint, so no caller can read a truncated answer as authorization.
@@ -4135,29 +4151,39 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     # `independent-final-review` mathematically unpassable, and with it
     # `run_complete` - the run could only ever end "interrupted".
     # A COMPLETE response that omits a field this caller cannot interpret is a
-    # malformed provider response, so raise and let the rotation retry on
-    # another route, exactly as every other shape fault is handled.
-    # A TRUNCATED one is exempt: truncation already EXPLAINS the absence, and
-    # the partial machinery above has already made it unable to authorize
-    # anything. Raising there would throw away salvaged findings that section
-    # 12 keeps as failure evidence.
-    if (schema is globals().get("FINAL_REVIEW_SCHEMA")
-            and isinstance(data, dict)
-            and not _ff_partial.is_partial_structured(data)):
-        # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings`
-        # absent is safely an empty list and `reason` is prose, so neither is
-        # demanded - demanding them would fail routes that answer correctly.
-        missing = []
-        if not str(data.get("commit") or "").strip():
-            missing.append("commit")
-        if not str(data.get("verdict") or "").strip():
-            missing.append("verdict")
-        if not isinstance(data.get("evidence_consistent"), bool):
-            missing.append("evidence_consistent")
-        if missing:
-            raise StructuredOutputShapeError(
-                "Final-review output omitted required field(s) whose absence "
-                "cannot be read as an answer: " + ", ".join(missing))
+    # malformed provider response. On a rotating provider the check already
+    # ran per route (above); on a fixed provider there is no other route, so
+    # it raises here and the chunk is blocked with the reason on the record.
+    if final_review:
+        data = _final_review_readable(data)
+    return data
+
+
+def _final_review_readable(data):
+    """Return *data* unchanged, or raise when a COMPLETE final review omits a
+    field whose absence would be read as a negative verdict.
+
+    A TRUNCATED answer is exempt: truncation already EXPLAINS the absence, and
+    the partial machinery has already made it unable to authorize anything.
+    Raising there would throw away salvaged findings that section 12 keeps as
+    failure evidence.
+    """
+    if not isinstance(data, dict) or _ff_partial.is_partial_structured(data):
+        return data
+    # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings` absent is
+    # safely an empty list and `reason` is prose, so neither is demanded -
+    # demanding them would fail routes that answer correctly.
+    missing = []
+    if not str(data.get("commit") or "").strip():
+        missing.append("commit")
+    if not str(data.get("verdict") or "").strip():
+        missing.append("verdict")
+    if not isinstance(data.get("evidence_consistent"), bool):
+        missing.append("evidence_consistent")
+    if missing:
+        raise StructuredOutputShapeError(
+            "Final-review output omitted required field(s) whose absence "
+            "cannot be read as an answer: " + ", ".join(missing))
     return data
 
 

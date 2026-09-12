@@ -906,5 +906,103 @@ class GradeShapeReachesRotationTests(RouteFaultTestCase):
         self.assertIn("route:openai_api/gpt-5-mini", cooldowns)
 
 
+# --------------------------------------------------------------------------- #
+# 8. A final review that omits its verdict fields is the ROUTE's fault: rotate.
+# --------------------------------------------------------------------------- #
+
+_OMITTED_FINAL_REVIEW = {"findings": [], "reason": "looks fine"}
+_COMPLETE_FINAL_REVIEW = {"verdict": "approve", "commit": "06f136a",
+                          "evidence_consistent": True, "findings": [],
+                          "reason": "complete"}
+
+
+class MalformedFinalReviewRotatesTests(RouteFaultTestCase):
+    """LIVE 2026-09-12, demo run tinystats-demo-20260911-182701-000449-34728-0000:
+    BOTH final-review chunks were blocked with `Final-review output omitted
+    required field(s) ... commit, verdict, evidence_consistent`, so publication
+    was refused. `_judge` raised that AFTER provider.structured() had returned,
+    i.e. after the rotator had already finished its route loop and reported the
+    route healthy - so no second route was ever asked, although the comment
+    beside the raise promised exactly that."""
+
+    def _reviewing_provider(self, payloads):
+        # Final review is a REVIEWER call on the judge (light) tier, and
+        # independent review excludes opaque model families.
+        rot = R.Rotator(catalog=catalog(*[route(rid, f"pool:{rid}", tier=R.LIGHT)
+                                          for rid in payloads]),
+                        store=self.store, app="flexfactor")
+        calls = []
+
+        class _Reviewer:
+            def __init__(self, rt):
+                self.route = rt
+                self.model = rt.model
+                self.judge_model = rt.model
+                self.meter = None
+
+            def structured(self, *a, **k):
+                calls.append(self.route.id)
+                return dict(payloads[self.route.id])
+
+        return R.RotatingProvider(rot, _Reviewer), calls
+
+    def test_an_omitted_final_review_moves_the_same_call_to_another_route(self):
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": _OMITTED_FINAL_REVIEW,
+            "openai_api/gpt-5-mini": _COMPLETE_FINAL_REVIEW,
+        })
+        data = ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertEqual(data["verdict"], "approve")
+        self.assertEqual(data["commit"], "06f136a")
+        self.assertEqual(sorted(calls), sorted(["anthropic_api/claude-sonnet-5",
+                                                "openai_api/gpt-5-mini"]),
+                         "the malformed route and exactly one other route answer")
+
+    def test_a_complete_first_answer_is_used_without_asking_another_route(self):
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": _COMPLETE_FINAL_REVIEW,
+            "openai_api/gpt-5-mini": _COMPLETE_FINAL_REVIEW,
+        })
+        ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertEqual(len(calls), 1)
+
+    def test_when_every_route_omits_the_fields_the_call_still_fails_closed(self):
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": _OMITTED_FINAL_REVIEW,
+            "openai_api/gpt-5-mini": _OMITTED_FINAL_REVIEW,
+        })
+        with self.assertRaises(Exception) as caught:
+            ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertIn("omitted required field", str(caught.exception))
+        self.assertEqual(len(calls), 2, "every route got its turn before failing")
+
+    def test_a_truncated_final_review_is_kept_as_evidence_not_rotated_away(self):
+        """Section 12: truncation EXPLAINS the absence, and the partial machinery
+        already forbids it from authorizing anything."""
+        salvaged = ff._mark_partial({"verdict": "approve", "findings": []},
+                                    '{"verdict": "appr', "anthropic")
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": salvaged,
+            "openai_api/gpt-5-mini": _COMPLETE_FINAL_REVIEW,
+        })
+        data = ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(data["verdict"], "approve")
+
+    def test_other_schemas_keep_the_plain_structured_path(self):
+        class _Provider:
+            judge_model = "judge-x"
+            model = "author-x"
+
+            def structured(self, *a, **k):
+                return {"findings": []}
+
+            def structured_validated(self, *a, **k):
+                raise AssertionError("only FINAL_REVIEW_SCHEMA is validated per route")
+
+        data = ff._judge(_Provider(), "sys", "prompt", ff.AUDIT_FINDINGS_SCHEMA)
+        self.assertEqual(data["findings"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
