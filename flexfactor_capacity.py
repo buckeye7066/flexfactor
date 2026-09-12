@@ -37,6 +37,21 @@ def _pid_alive(pid):
     except OSError: return True
     return True
 
+# Windows refuses os.replace onto a file another handle holds open (a reader in
+# another FlexFactor process, or AV scanning it): PermissionError [WinError 5].
+# Readers hold it for milliseconds, so a short bounded retry outlasts them;
+# a persistent refusal still raises. Live 2026-09-11 a single bare replace
+# killed a rotated model call, because rotation never retries PermissionError.
+REPLACE_ATTEMPTS=12
+
+def _replace_retrying(src,dst):
+    delay=.01
+    for attempt in range(1,REPLACE_ATTEMPTS+1):
+        try: return os.replace(src,dst)
+        except PermissionError:
+            if attempt==REPLACE_ATTEMPTS: raise
+            time.sleep(delay); delay=min(.25,delay*2)
+
 def state_path():
     root=os.environ.get("FLEXFACTOR_STATE_DIR") or os.path.join(os.path.expanduser("~"),".flexfactor")
     return os.environ.get("FLEXFACTOR_PROVIDER_CAPACITY_STATE") or os.path.join(root,"provider-capacity.json")
@@ -92,7 +107,7 @@ class CapacityState:
                 with os.fdopen(fd,"w",encoding="utf-8",newline="\n") as f:
                     json.dump(data,f,indent=1,sort_keys=True); f.write("\n"); f.flush()
                     with contextlib.suppress(OSError): os.fsync(f.fileno())
-                os.replace(tmp,self.path)
+                _replace_retrying(tmp,self.path)
             finally:
                 with contextlib.suppress(OSError):
                     if os.path.exists(tmp): os.unlink(tmp)
