@@ -1039,6 +1039,51 @@ def _resume_checkpoint_for(rs_module, recovered: dict | None, *, program: str,
         return None  # checkpointing is protection, never a new failure mode
 
 
+def _resume_carried_changes(checkpoint, project_dir: str,
+                            initial_commit: str | None) -> list[str]:
+    """First-party sources THIS run already committed before an interruption.
+
+    A resumed process starts with an empty applied set, although earlier
+    processes of the same run committed verified repairs. Live demo run
+    tinystats-demo-20260911-182701-000449-34728-0000: cycles 1 and 2 committed
+    cli.py and stats_utils.py (636f554, 06f136a); after the resume the
+    process printed "Generating focused regression tests for changed
+    behavior..." and generated nothing, and the capability gate reported
+    "target stats_utils.py was not changed". The run could never publish the
+    repairs it had made.
+
+    The evidence is git, not the checkpoint's say-so. The checkpoint records
+    the commit the run STARTED from; the carried set is exactly the
+    first-party sources changed between that commit and this process's HEAD.
+    Only commits `_commit_and_sync` let through a passing publication gate
+    exist on that range. A recorded start that is no longer an ancestor of
+    HEAD (history rewritten between processes) proves nothing, carries
+    nothing, and is re-anchored at the current HEAD.
+    """
+    data = getattr(checkpoint, "data", None)
+    if not isinstance(data, dict) or not initial_commit:
+        return []
+    recorded = str(data.get("start_commit") or "").strip()
+    if recorded == initial_commit:
+        return []
+    if recorded:
+        ancestry = _git(["merge-base", "--is-ancestor", recorded, initial_commit],
+                        project_dir)
+        if ancestry.returncode == 0:
+            diff = _git(["diff", "--name-only", "--no-renames",
+                         f"{recorded}..{initial_commit}"], project_dir)
+            if diff.returncode == 0:
+                return _existing_changed_sources(
+                    project_dir, (diff.stdout or "").splitlines())
+            return []
+    try:
+        checkpoint.set(start_commit=initial_commit)
+        checkpoint.save(force=True)
+    except Exception:  # noqa: BLE001 - checkpointing is protection, never a new failure mode
+        pass
+    return []
+
+
 # --------------------------------------------------------------------------- #
 # Live progress bus. The audit writes a per-program status snapshot to a JSON
 # file after every state change; the dashboard (flexfactor_dashboard.py) polls
@@ -20381,6 +20426,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = "could not resolve the exact pre-mutation commit"
             print(f"{pfx}error: {result['error']}", file=sys.stderr)
             return result
+        resume_carried_sources = _resume_carried_changes(
+            checkpoint, project_dir, initial_commit)
+        if resume_carried_sources:
+            print(f"{pfx}resume: {len(resume_carried_sources)} source file(s) this run "
+                  "committed before the interruption carry forward as changed: "
+                  + ", ".join(resume_carried_sources[:10])
+                  + (" ..." if len(resume_carried_sources) > 10 else ""))
 
         # Purpose context: the program's own metadata (README, package metadata,
         # file tree) travels with every per-file review so defects are judged
@@ -20796,7 +20848,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # 3. Cycle: review -> fix -> commit -> (next cycle re-reads the saved code).
         file_findings: dict[str, list[dict]] = {}
         all_findings: list[dict] = []
-        applied_set: set[str] = set()
+        # A resumed run starts from what its earlier processes already
+        # committed (git-proven by _resume_carried_changes), so focused
+        # regression tests and capability delivery still see those repairs.
+        applied_set: set[str] = set(resume_carried_sources)
         unverified_set: set[str] = set()
         fix_notes: list[str] = []
         run_clean: set[str] = set()  # files confirmed clean THIS run (drop from review)
@@ -22990,12 +23045,20 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 ((evidence or {}).get("quality_gates") or {}),
             ).get("passed") is True
         )
+        # Capability delivery is judged on what THIS RUN changed, not only on
+        # what the competitor pass itself wrote. A target repaired earlier in
+        # the run - or by an earlier process of it, see
+        # _resume_carried_changes - is changed all the same; live demo run
+        # tinystats-demo-20260911-182701-000449-34728-0000 reported "target
+        # stats_utils.py was not changed" about a file its own cycles had
+        # committed. Delivery still requires a capability-bound generated test
+        # that passes, so no pass's say-so is counted.
         _competitor_applied = set(
             (competitor_research or {}).get("applied_files") or []
-        )
+        ) | set(applied_set)
         _competitor_unverified = set(
             (competitor_research or {}).get("unverified_files") or []
-        )
+        ) | set(unverified_set)
         competitor_research = _ff_product_invariants.stamp_competitor_implementation(
             competitor_research=competitor_research,
             applied_files=_competitor_applied,

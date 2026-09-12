@@ -15,12 +15,98 @@ produced it. All run offline: no credentials, no network, no tokens spent.
 from __future__ import annotations
 
 import inspect
+import os
+import subprocess
+import tempfile
 import unittest
 
 import flexfactor as ff
 import flexfactor_coverage as ffc
 import flexfactor_evidence as ffe
 import flexfactor_partial as ffp
+import flexfactor_runstate as ffrs
+
+
+class ResumeCarriesTheRunsCommittedRepairs(unittest.TestCase):
+    """DEFECT: a resumed run forgot the repairs its earlier processes committed.
+
+    Live demo run `tinystats-demo-20260911-182701-000449-34728-0000`: cycles 1
+    and 2 committed cli.py and stats_utils.py. After the resume the process
+    started from an empty applied set, printed "Generating focused regression
+    tests for changed behavior..." and generated nothing, and
+    `selected-capabilities-delivered` reported "target stats_utils.py was not
+    changed" about a file the run itself had committed - so publication could
+    never follow the repair.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.repo = os.path.join(self._tmp.name, "repo")
+        os.makedirs(self.repo)
+        self.git("init", "-q", "-b", "main")
+        self.write("stats_utils.py", "def mean(v):\n    return sum(v) // len(v)\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        self.start = self.git("rev-parse", "HEAD")
+        self.runs = os.path.join(self._tmp.name, "runs")
+        self.checkpoint = ffrs.new_run(self.runs, program="demo", project_dir=self.repo,
+                                       mode="prodready", policy="test-policy")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=self.repo, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def write(self, rel, text):
+        path = os.path.join(self.repo, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+
+    def reloaded(self):
+        return ffrs.load(self.runs, self.checkpoint.run_id)
+
+    def test_a_fresh_run_records_where_it_started_and_carries_nothing(self):
+        self.assertEqual(
+            ff._resume_carried_changes(self.checkpoint, self.repo, self.start), [])
+        self.assertEqual(self.reloaded().data.get("start_commit"), self.start)
+
+    def test_a_resumed_process_carries_what_its_earlier_process_committed(self):
+        ff._resume_carried_changes(self.checkpoint, self.repo, self.start)
+        self.write("stats_utils.py", "def mean(v):\n    return sum(v) / len(v)\n")
+        self.write("tests/test_stats_utils.py", "def test_mean():\n    pass\n")
+        self.write("demo_audit_report.md", "# report\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "FlexFactor audit cycle 1")
+        head = self.git("rev-parse", "HEAD")
+        # The kill: a new process reloads the checkpoint from disk.
+        carried = ff._resume_carried_changes(self.reloaded(), self.repo, head)
+        self.assertEqual(carried, ["stats_utils.py"],
+                         "only first-party sources carry; tests and reports are not repairs")
+
+    def test_rewritten_history_carries_nothing_and_reanchors(self):
+        ff._resume_carried_changes(self.checkpoint, self.repo, self.start)
+        self.git("checkout", "-q", "--orphan", "rewritten")
+        self.write("stats_utils.py", "x = 1\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "unrelated history")
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head), [])
+        self.assertEqual(self.reloaded().data.get("start_commit"), head)
+
+    def test_no_checkpoint_carries_nothing(self):
+        self.assertEqual(ff._resume_carried_changes(None, self.repo, self.start), [])
+
+    def test_the_audit_seeds_its_evidence_from_the_carried_changes(self):
+        source = inspect.getsource(ff.audit_one_program)
+        self.assertIn("_resume_carried_changes(", source)
+        self.assertIn("applied_set: set[str] = set(resume_carried_sources)", source)
+        self.assertIn(") | set(applied_set)", source)
+        self.assertIn(") | set(unverified_set)", source)
 
 
 class FinalReviewAbsenceIsNotAnAnswer(unittest.TestCase):
