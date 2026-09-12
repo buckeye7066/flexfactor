@@ -1003,6 +1003,66 @@ class MalformedFinalReviewRotatesTests(RouteFaultTestCase):
         data = ff._judge(_Provider(), "sys", "prompt", ff.AUDIT_FINDINGS_SCHEMA)
         self.assertEqual(data["findings"], [])
 
+    _FINDING = {"severity": "high", "file": "cli.py", "line": 3,
+                "title": "mean printed as an integer",
+                "reproduction": "python cli.py 2 4 6 prints 4"}
+
+    def test_a_rejection_that_omits_its_commit_is_kept_not_rotated_away(self):
+        """Review on #183: rotating a malformed REJECTION discarded its findings,
+        and the next route's approve could authorize publication."""
+        rejection = {"verdict": "reject", "findings": [self._FINDING],
+                     "reason": "the candidate prints the wrong mean"}
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": rejection,
+            "openai_api/gpt-5-mini": _COMPLETE_FINAL_REVIEW,
+        })
+        data = ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertEqual(data["verdict"], "reject")
+        self.assertEqual(calls, ["anthropic_api/claude-sonnet-5"])
+
+    def test_findings_without_a_verdict_are_kept_as_evidence(self):
+        prov, calls = self._reviewing_provider({
+            "anthropic_api/claude-sonnet-5": {"findings": [self._FINDING]},
+            "openai_api/gpt-5-mini": _COMPLETE_FINAL_REVIEW,
+        })
+        data = ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(data.get("verdict"), "approve")
+        self.assertEqual(data["findings"], [self._FINDING])
+
+    def _pool_sharing_provider(self, payloads, state_dir):
+        store = R.StateStore(os.path.join(state_dir, "rotation-state.json"))
+        rot = R.Rotator(catalog=catalog(*[route(rid, "pool:shared", tier=R.LIGHT)
+                                          for rid in payloads]),
+                        store=store, app="flexfactor")
+        calls = []
+
+        class _Reviewer:
+            def __init__(self, rt):
+                self.route = rt
+                self.model = rt.model
+                self.judge_model = rt.model
+                self.meter = None
+
+            def structured(self, *a, **k):
+                calls.append(self.route.id)
+                return dict(payloads[self.route.id])
+
+        return R.RotatingProvider(rot, _Reviewer), calls
+
+    def test_a_malformed_route_does_not_hide_a_valid_sibling_in_its_pool(self):
+        """Review on #183: the attempt budget counted POOLS, so a valid route
+        sharing the malformed route's pool was never asked. Both draw orders are
+        run: under the defect, whichever order draws the malformed route first
+        fails."""
+        ids = ("anthropic_api/claude-sonnet-5", "openai_api/gpt-5-mini")
+        for malformed, valid in (ids, ids[::-1]):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as d:
+                prov, _calls = self._pool_sharing_provider(
+                    {malformed: _OMITTED_FINAL_REVIEW, valid: _COMPLETE_FINAL_REVIEW}, d)
+                data = ff._judge(prov, "sys", "prompt", ff.FINAL_REVIEW_SCHEMA)
+                self.assertEqual(data["verdict"], "approve")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

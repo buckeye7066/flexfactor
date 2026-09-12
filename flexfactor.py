@@ -4170,6 +4170,16 @@ def _final_review_readable(data):
     """
     if not isinstance(data, dict) or _ff_partial.is_partial_structured(data):
         return data
+    verdict = str(data.get("verdict") or "").strip().lower()
+    findings = data.get("findings")
+    if (verdict and verdict != "approve") or (isinstance(findings, list) and findings):
+        # A REJECTION IS EVIDENCE, NOT A SHAPE FAULT. Raising here on a
+        # rotating provider would discard a negative verdict and its findings
+        # and let the next route's approve authorize publication (review on
+        # #183). The caller already reads a missing commit or
+        # evidence_consistent on this answer as the rejection it is, so it
+        # stays fail-closed without being rotated away.
+        return data
     # Only the three fields whose ABSENCE FLIPS A VERDICT. `findings` absent is
     # safely an empty list and `reason` is prose, so neither is demanded -
     # demanding them would fail routes that answer correctly.
