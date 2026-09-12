@@ -646,6 +646,130 @@ class ModelRefusalRotatesTests(RouteFaultTestCase):
         self.assertEqual(len(calls), 1, "a refusal must not be re-sent")
         slept.assert_not_called()
 
+    def _dead_transport_call(self, *, rotated):
+        """Drive _stream_structured against a transport that times out every time."""
+        import types
+        from unittest import mock
+
+        class ReadTimeout(Exception):
+            pass
+
+        calls = []
+
+        def fake_stream(_client, **kwargs):
+            calls.append(kwargs)
+            raise ReadTimeout("The read operation timed out")
+
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        prov._paid_client_obj = None
+        prov._oai_rescue = None
+        prov._allow_cross_family_rescue = False
+        if rotated:
+            prov._hand_back_transport_failures = True
+        recover = mock.Mock()
+        prov._recover_transport = recover
+        raised = None
+        with mock.patch.object(ff, "_stream_with_deadline", side_effect=fake_stream), \
+                mock.patch.object(ff, "_fallback_hold_active", return_value=False), \
+                mock.patch.object(ff, "_fallback_available", return_value=False), \
+                mock.patch.object(ff.time, "sleep") as slept:
+            try:
+                prov._stream_structured(
+                    model="nvidia_nim/deepseek", max_tokens=100, system="s",
+                    messages=[{"role": "user", "content": "p"}],
+                    fmt={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+            except Exception as exc:  # noqa: BLE001 - the shape is what is asserted
+                raised = exc
+        return types.SimpleNamespace(calls=calls, slept=slept, recover=recover,
+                                     raised=raised, timeout_type=ReadTimeout)
+
+    def test_a_rotated_route_hands_a_dead_transport_back_after_one_attempt(self):
+        """Live 2026-09-11: one purpose-inference call spent ~25 minutes re-rolling
+        a single FCC->NIM route that answered 504 three times, while FCC's own
+        /health stayed 200 (so no paid hold armed) and the rotator - with 1,200
+        other routes - never got a turn. A rotated route must fail FAST so the
+        ladder can fall back."""
+        got = self._dead_transport_call(rotated=True)
+        self.assertEqual(len(got.calls), 1, "a rotated route must not re-roll its own dead transport")
+        self.assertIsInstance(got.raised, got.timeout_type,
+                              "the original transport error must reach the rotator unchanged")
+        got.slept.assert_not_called()
+        # Review on #181: the transport is still recovered (FCC restart + fresh
+        # client) before the hand-back, or a dead local proxy is never restarted
+        # and this route fails fast for the rest of the run.
+        got.recover.assert_called_once()
+
+    def test_a_rotated_free_route_keeps_patient_free_retries_for_backpressure(self):
+        """Review on #181: a 429/overloaded free backend is ALIVE. Handing that
+        back would cool the free route at once and let a paid-first ladder move
+        the call onto metered capacity - paying to skip a queue."""
+        from unittest import mock
+
+        class Overloaded(Exception):
+            status_code = 429
+
+        calls = []
+
+        def busy(_client, **kwargs):
+            calls.append(kwargs)
+            raise Overloaded("rate limit: too many requests")
+
+        prov = object.__new__(ff.AnthropicProvider)
+        prov.client = object()
+        prov._paid_client_obj = None
+        prov._oai_rescue = None
+        prov._allow_cross_family_rescue = False
+        prov._hand_back_transport_failures = True
+        prov._recover_transport = mock.Mock()
+        with mock.patch.object(ff, "_stream_with_deadline", side_effect=busy), \
+                mock.patch.object(ff, "_fallback_hold_active", return_value=False), \
+                mock.patch.object(ff, "_fallback_available", return_value=True), \
+                mock.patch.object(ff.time, "sleep") as slept:
+            with self.assertRaises(RuntimeError) as ctx:
+                prov._stream_structured(
+                    model="nvidia_nim/deepseek", max_tokens=100, system="s",
+                    messages=[{"role": "user", "content": "p"}],
+                    fmt={"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        self.assertEqual(len(calls), 3, "backpressure keeps its spaced FREE retries")
+        self.assertEqual(slept.call_count, 2)
+        self.assertIn("not billing a paid rescue", str(ctx.exception))
+
+    def test_a_handed_back_stream_deadline_is_retryable_for_the_rotator(self):
+        """Review on #181: neither StreamDeadlineError message contains a retry
+        marker, so the rotator would abort the call instead of drawing a route."""
+        import flexfactor_rotation as fr
+        for text in ("stream produced no first event within 600s wall clock "
+                     "(FCC keep-alive hang mode; healthy queued call measures ~308s "
+                     "here); call abandoned - retry on a fresh client",
+                     "stream stalled: 130s with no event after 4 event(s) (idle "
+                     "budget 120s); call abandoned - retry on a fresh client"):
+            self.assertTrue(fr._is_retryable(ff.StreamDeadlineError(text)), text)
+
+    def test_a_stream_deadline_on_one_route_falls_back_to_another(self):
+        """The fallback itself, through a real Rotator: the first route's deadline
+        hands the call to a different pool instead of ending it."""
+        prov = self.provider(
+            catalog(route("fcc/deepseek", "fcc:subscription"),
+                    route("groq/backup", "groq:free-tier")),
+            failures={"fcc/deepseek": ff.StreamDeadlineError(
+                "stream produced no first event within 600s wall clock")})
+        self.assertEqual(prov.complete("x"), "completed by groq/backup")
+
+    def test_the_handed_back_timeout_is_retryable_for_the_rotator(self):
+        import flexfactor_rotation as fr
+        got = self._dead_transport_call(rotated=True)
+        self.assertTrue(fr._is_retryable(got.raised),
+                        "the rotator must treat the handed-back timeout as a reason to draw another route")
+
+    def test_a_fixed_provider_still_retries_its_only_transport(self):
+        """Control: with no rotator behind it, re-rolling the one transport is the
+        only recovery, so the three spaced attempts stay."""
+        got = self._dead_transport_call(rotated=False)
+        self.assertEqual(len(got.calls), 3)
+        self.assertEqual(got.recover.call_count, 2)
+        self.assertEqual(got.slept.call_count, 2)
+
     def test_the_anthropic_provider_raises_the_typed_refusal(self):
         self.assertTrue(issubclass(ff.ModelRefusalError, RuntimeError),
                         "existing `except RuntimeError` callers must keep working")

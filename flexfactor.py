@@ -2409,6 +2409,21 @@ class AnthropicProvider:
                         "free backend is alive but under sustained backpressure "
                         f"after 3 attempts ({str(exc)[:160]}); not billing a paid "
                         "rescue for a queue")
+                if getattr(self, "_hand_back_transport_failures", False):
+                    # A ROTATED route has other routes behind it. Re-rolling the
+                    # same dead upstream gave one call three first-event budgets
+                    # plus sleeps: live 2026-09-11 a purpose inference sat ~25
+                    # minutes on NIM 504s (FCC /health stayed 200, so no hold
+                    # armed) while 1,200 other routes waited. Backpressure was
+                    # handled above and keeps its patient FREE retries. Recover
+                    # the transport first - a dead local FCC proxy is restarted
+                    # here and nowhere else - then hand the failure to the
+                    # rotator, which benches this route and draws another.
+                    try:
+                        self._recover_transport()
+                    except Exception:  # noqa: BLE001 - recovery must never mask the route failure
+                        pass
+                    raise exc
                 if isinstance(exc, StreamDeadlineError):
                     _note_free_path_hang(str(exc)[:160])
                     if _fallback_available() and _fallback_hold_active():
@@ -4250,6 +4265,9 @@ def _rotation_route_provider(route):
             prov._paid_client_obj = None
             prov._oai_rescue = None
             prov._allow_cross_family_rescue = False
+            # Other routes stand behind this one: a dead transport goes back to
+            # the rotator on its first failure instead of being re-rolled here.
+            prov._hand_back_transport_failures = True
             return prov
         prov = AnthropicProvider(wire, judge_model=wire)
         # A route selected as Anthropic may use paid Anthropic rescue, but it
@@ -4257,6 +4275,10 @@ def _rotation_route_provider(route):
         # RotatingProvider observe the failure and select OpenAI as a distinct
         # outer-ladder route so author/reviewer separation stays provable.
         prov._allow_cross_family_rescue = False
+        # Same reason the rescue stays off: the ROTATOR owns fallback. A free
+        # FCC route whose upstream answers 504 must not hold the call through
+        # three same-route re-rolls while the ladder's other routes sit idle.
+        prov._hand_back_transport_failures = True
         return prov
     if route.api == "gemini":
         import openai

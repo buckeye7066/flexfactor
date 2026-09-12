@@ -2208,6 +2208,13 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, (TypeError, AttributeError, NameError, ImportError,
                         SyntaxError, IndentationError, AssertionError)):
         return False
+    if type(exc).__name__ == "StreamDeadlineError":
+        # FlexFactor's own bound on a stream that produced no (further) event.
+        # Neither of its messages carries a retry marker, so without this a
+        # rotated route that hands its deadline back would END the call instead
+        # of letting the ladder try another route (review on #181). Matched by
+        # name: this module never imports flexfactor.
+        return True
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
     if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
         return True
